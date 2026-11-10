@@ -1,0 +1,39 @@
+VESPER UI U2 — STATIC QA
+Checks passed: 29/29
+
+Source structural checks only. No C# compilation, Visual Studio Designer run, Windows rendering, performance or accessibility test performed.
+
+[PASS] Designer contains real masthead, toolbar, grid and footer
+[PASS] Designer includes search, Show and Sort labels
+[PASS] Designer includes Add and Settings buttons
+[PASS] Designer includes 1222x820 form and native title bar
+[PASS] No second runtime-built main control tree
+[PASS] Runtime retains designer Init
+[PASS] Main list preserves virtual-mode DataGridView
+[PASS] Six columns and checkbox-only selection
+[PASS] Responsive list width calculation
+[PASS] No per-row UI controls
+[PASS] Settings content has no outer horizontal scrolling
+[PASS] Appearance motion note is separate row
+[PASS] Settings note widths respond to resize
+[PASS] Designer asset fallback probes compiled source path
+[PASS] Stable light, dark and optional botanical
+[PASS] Compiled icon still the illustrated asset
+[PASS] No project package dependencies introduced
+[PASS] Real file delete command disabled
+[PASS] Native WinForms net10 target maintained
+[PASS] Solution unchanged
+[PASS] Balanced C# punctuation: AddDownloadForm.cs
+[PASS] Balanced C# punctuation: DownloadDetailsForm.cs
+[PASS] Balanced C# punctuation: DownloadGrid.cs
+[PASS] Balanced C# punctuation: Form1.Designer.cs
+[PASS] Balanced C# punctuation: Form1.cs
+[PASS] Balanced C# punctuation: Program.cs
+[PASS] Balanced C# punctuation: SettingsForm.cs
+[PASS] Balanced C# punctuation: VesperModels.cs
+[PASS] Balanced C# punctuation: VesperSearchFrame.cs
+
+Additional designer hardening checks:
+[PASS] Public zero-argument designer-visible control classes.
+[PASS] DownloadGrid.Columns marked non-serializable to prevent designer-generated duplicate column instances.
+[PASS] All custom events using internal record types kept internal.

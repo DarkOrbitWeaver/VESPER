@@ -1,0 +1,27 @@
+PASS  Existing designer-backed Form1 preserved
+PASS  Existing .NET 10 WinForms project unchanged target
+PASS  No NuGet packages referenced
+PASS  Native resize/title bar not replaced
+PASS  Virtualized list rather than controls per row
+PASS  Original designer untouched
+PASS  Three density options in UI
+PASS  UI-only in-memory sample records
+PASS  Search, status filter and sorting
+PASS  Checkbox-only selection and shared context menu
+PASS  Separate Add/Settings/Details forms
+PASS  Split action and collapsed destination
+PASS  Delete file disabled in simulated UI
+PASS  Open and show folder disabled until verification
+PASS  No network/download engine calls
+PASS  No destructive/file-writing APIs
+PASS  No unnecessary timers
+PASS  Provided PNG/ICO assets included and nonempty
+PASS  Asset images have alpha
+PASS  Project XML well-formed
+PASS  Baseline default and experimental fork opt-in
+PASS  Native sample accessibility metadata populated
+PASS  No dynamic GDI Font allocation per row painting
+PASS  Basic C# brace/paren sanity (not compilation)
+
+24/24 checks passed
+Build: NOT RUN (dotnet SDK absent; Windows runtime unavailable).

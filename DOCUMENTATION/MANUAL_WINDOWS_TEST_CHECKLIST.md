@@ -1,0 +1,24 @@
+# Native UI acceptance checklist (not executed)
+
+- [ ] `dotnet restore` + Release build on Windows 11 with .NET 10.
+- [ ] Form has real Windows caption, usable minimize/maximize/resize, no custom titlebar.
+- [ ] Default v8.3 clean light surface shows list; footer always 30 logical pixels.
+- [ ] Search text filters rows by filename and file type without shifting list origin.
+- [ ] Every state filter and sort mode acts on only sample records.
+- [ ] Clicking a regular row does not select it or change the record.
+- [ ] Clicking checkbox cell toggles selection and selection-only toolbar replaces search area.
+- [ ] Header checkbox toggles all visible rows; Ctrl+F clears checked selection.
+- [ ] Clicking file-type icon opens independent Details; right-click and ellipsis open same menu.
+- [ ] Keyboard arrows, Space, Enter, Shift+F10 and screen reader announcements work.
+- [ ] Queue and completed states show NO fake progress bars or speeds; missing is distinct from failed.
+- [ ] Completed and missing Details show no irrelevant speed/ETA; no simulated file can be opened or deleted.
+- [ ] Add Download validates HTTP and HTTPS URLs, rejects torrent, collapsed Save-to expands and browses a folder.
+- [ ] Download and queue chevron both create demo-only queue entries with explicit message.
+- [ ] Settings Save applies changes to this session; Cancel changes nothing.
+- [ ] Hide missing completed records does not hide paused/active records.
+- [ ] Density 34/46/58 at 100/125/150/200% DPI and increased OS text size shows no clipping.
+- [ ] Light/dark/system themes and high contrast checked.
+- [ ] v9 header branch, if enabled, remains noninteractive and clear of all controls and footer.
+- [ ] Idle CPU stable, no ongoing animation, GDI/working set/scroll with 10,000 demo rows measured.
+- [ ] Illustrated ICO looks sharp enough in real Windows taskbar / Explorer at 16/24/32/48 sizes.
+- [ ] Changing settings does not contact any download endpoint or alter files on disk.

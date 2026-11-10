@@ -1,0 +1,1070 @@
+diff -ruN source/VESPER/DownloadGrid.cs source_U2/VESPER/DownloadGrid.cs
+--- source/VESPER/DownloadGrid.cs	2026-11-09 21:46:08.434541906 +0000
++++ source_U2/VESPER/DownloadGrid.cs	2026-11-09 22:11:14.501199132 +0000
+@@ -2,7 +2,7 @@
+ 
+ // Virtual-mode DataGridView retains native scrolling, focus, accessibility and keyboard navigation.
+ // Owner drawing is restricted to the six columns; no per-row WinForms controls or painting-time I/O.
+-internal sealed class DownloadGrid : DataGridView
++public sealed class DownloadGrid : DataGridView
+ {
+     private IReadOnlyList<DownloadItem> _items = [];
+     private readonly HashSet<Guid> _checked = [];
+@@ -18,8 +18,13 @@
+     private readonly Font _captionFont = new("Segoe UI", 7.5F);
+ 
+     public event Action? CheckStateChanged;
+-    public event Action<DownloadItem>? DetailsRequested;
+-    public event Action<DownloadItem, Point>? MenuRequested;
++    internal event Action<DownloadItem>? DetailsRequested;
++    internal event Action<DownloadItem, Point>? MenuRequested;
++
++    // Prevent Visual Studio's designer from serializing constructor-owned columns
++    // a second time when the form is saved.
++    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
++    public new DataGridViewColumnCollection Columns => base.Columns;
+ 
+     public DownloadGrid()
+     {
+@@ -46,7 +51,7 @@
+         ColumnHeadersHeightSizeMode=DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+         for (int i=0;i<6;i++)
+             Columns.Add(new DataGridViewTextBoxColumn { Name=$"col{i}", SortMode=DataGridViewColumnSortMode.NotSortable, ReadOnly=true });
+-        Columns[0].HeaderText="☐";
++        Columns[0].HeaderText="";
+         Columns[1].HeaderText="Name";
+         Columns[2].HeaderText="Activity";
+         Columns[3].HeaderText="Transfer";
+@@ -91,12 +96,12 @@
+         ApplyAppearance(VesperPalette.Light, Density.Compact);
+     }
+ 
+-    public IReadOnlyList<DownloadItem> VisibleItems => _items;
+-    public bool IsChecked(DownloadItem item) => _checked.Contains(item.Id);
+-    public IReadOnlyList<DownloadItem> CheckedItems => _items.Where(x => _checked.Contains(x.Id)).ToList();
++    internal IReadOnlyList<DownloadItem> VisibleItems => _items;
++    internal bool IsChecked(DownloadItem item) => _checked.Contains(item.Id);
++    internal IReadOnlyList<DownloadItem> CheckedItems => _items.Where(x => _checked.Contains(x.Id)).ToList();
+     public int CheckedCount => _checked.Count;
+ 
+-    public void SetItems(IReadOnlyList<DownloadItem> items)
++    internal void SetItems(IReadOnlyList<DownloadItem> items)
+     {
+         _items=items;
+         // Filtering removes hidden checkboxes from batch selection, so actions remain predictable.
+@@ -130,7 +135,7 @@
+         if (!_checked.Add(item.Id)) _checked.Remove(item.Id);
+         Invalidate(); CheckStateChanged?.Invoke();
+     }
+-    public void ApplyAppearance(VesperPalette palette, Density density)
++    internal void ApplyAppearance(VesperPalette palette, Density density)
+     {
+         _palette=palette;
+         _density=density;
+@@ -150,22 +155,51 @@
+     private void SizeColumns()
+     {
+         if (Columns.Count!=6 || IsDisposed) return;
+-        int area=Math.Max(600,ClientSize.Width - (Controls.OfType<VScrollBar>().Any(x=>x.Visible) ? SystemInformation.VerticalScrollBarWidth : 0));
++        int area=Math.Max(0,ClientSize.Width - (Controls.OfType<VScrollBar>().Any(x=>x.Visible) ? SystemInformation.VerticalScrollBarWidth : 0) - 2);
++        if (area < UiKit.Scale(this, 650)) return; // No intermediate overflow during designer / resize layout.
+         int logicalArea=(int)Math.Round(area*96.0/DeviceDpi);
+-        int checkbox=UiKit.Scale(this,46), menu=UiKit.Scale(this,35);
+-        int size=UiKit.Scale(this, logicalArea<950?82:110);
+-        int activity=UiKit.Scale(this,Math.Clamp((int)(logicalArea*.245),195,295));
+-        int transfer=UiKit.Scale(this,Math.Clamp((int)(logicalArea*.145),113,180));
+-        int name=Math.Max(UiKit.Scale(this,145),area-checkbox-menu-size-activity-transfer-2);
++        int checkbox=UiKit.Scale(this,50), menu=UiKit.Scale(this,39);
++        int size=UiKit.Scale(this, logicalArea<950?92:150);
++        int activity=UiKit.Scale(this,Math.Clamp((int)(logicalArea*.245),190,300));
++        int transfer=UiKit.Scale(this,Math.Clamp((int)(logicalArea*.155),115,190));
++        int name=Math.Max(UiKit.Scale(this,160),area-checkbox-menu-size-activity-transfer);
+         int[] widths=[checkbox,name,activity,transfer,size,menu];
+         for (int i=0;i<widths.Length;i++) Columns[i].Width=widths[i];
+     }
+ 
+     protected override void OnCellPainting(DataGridViewCellPaintingEventArgs e)
+     {
+-        if (e.RowIndex<0 || e.RowIndex>=_items.Count)
++        if (e.RowIndex == -1 && e.ColumnIndex >= 0)
++        {
++            // Native virtualization, with a subdued stable-v8.3 column header.
++            e.Handled = true;
++            Graphics head = e.Graphics;
++            Rectangle b = e.CellBounds;
++            using (var fill = new SolidBrush(_palette.Secondary)) head.FillRectangle(fill, b);
++            using (var edge = new Pen(_palette.Border))
++                head.DrawLine(edge, b.Left, b.Bottom - 1, b.Right, b.Bottom - 1);
++            if (e.ColumnIndex == 0)
++            {
++                CheckBoxRendererPaint(head, new Rectangle(
++                    b.Left + UiKit.Scale(this, 20),
++                    b.Top + (b.Height - UiKit.Scale(this, 16))/2,
++                    UiKit.Scale(this, 16), UiKit.Scale(this, 16)),
++                    _items.Count > 0 && _items.All(x => _checked.Contains(x.Id)));
++            }
++            else if (e.ColumnIndex != 5)
++            {
++                Draw(head, Columns[e.ColumnIndex].HeaderText, _headerFont, _palette.Muted,
++                    new Rectangle(b.Left + UiKit.Scale(this, 8), b.Top,
++                        Math.Max(2,b.Width - UiKit.Scale(this,16)), b.Height),
++                    TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
++            }
++            else Draw(head, "⋮", _headerFont, _palette.Muted, b,
++                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
++            return;
++        }
++        if (e.RowIndex < 0 || e.RowIndex >= _items.Count)
+         {
+-            base.OnCellPainting(e);return;
++            base.OnCellPainting(e); return;
+         }
+         e.Handled=true;
+         DownloadItem job=_items[e.RowIndex];
+diff -ruN source/VESPER/Form1.Designer.cs source_U2/VESPER/Form1.Designer.cs
+--- source/VESPER/Form1.Designer.cs	2026-11-09 21:26:34.760627140 +0000
++++ source_U2/VESPER/Form1.Designer.cs	2026-11-09 22:02:37.292429510 +0000
+@@ -1,39 +1,334 @@
+-﻿namespace VESPER
+-{
+-    partial class Form1
+-    {
+-        /// <summary>
+-        ///  Required designer variable.
+-        /// </summary>
+-        private System.ComponentModel.IContainer components = null;
+-
+-        /// <summary>
+-        ///  Clean up any resources being used.
+-        /// </summary>
+-        /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
+-        protected override void Dispose(bool disposing)
+-        {
+-            if (disposing && (components != null))
+-            {
+-                components.Dispose();
+-            }
+-            base.Dispose(disposing);
+-        }
+-
+-        #region Windows Form Designer generated code
+-
+-        /// <summary>
+-        ///  Required method for Designer support - do not modify
+-        ///  the contents of this method with the code editor.
+-        /// </summary>
+-        private void InitializeComponent()
+-        {
+-            components = new System.ComponentModel.Container();
+-            AutoScaleMode = AutoScaleMode.Font;
+-            ClientSize = new Size(800, 450);
+-            Text = "Form1";
+-        }
+-
+-        #endregion
+-    }
+-}
++namespace VESPER;
++
++// The form's actual UI components live here so Visual Studio's WinForms Designer
++// displays and allows editing the main screen. Runtime events/data are in Form1.cs.
++partial class Form1
++{
++    private System.ComponentModel.IContainer? components = null;
++    private Panel _mast = null!;
++    private Panel _toolbar = null!;
++    private Panel _normalTools = null!;
++    private Panel _selectedTools = null!;
++    private Panel _footer = null!;
++    private VesperSearchFrame _searchFrame = null!;
++    private TextBox _search = null!;
++    private ComboBox _filter = null!;
++    private ComboBox _sort = null!;
++    private Label _showLabel = null!;
++    private Label _sortLabel = null!;
++    private Label _footerLabel = null!;
++    private Label _selectedLabel = null!;
++    private Label _brandText = null!;
++    private Label _brandCaption = null!;
++    private Button _add = null!;
++    private Button _settings = null!;
++    private Button _pause = null!;
++    private Button _resume = null!;
++    private Button _remove = null!;
++    private Button _clear = null!;
++    private PictureBox _brandIcon = null!;
++    private DownloadGrid _grid = null!;
++
++    protected override void Dispose(bool disposing)
++    {
++        if (disposing) components?.Dispose();
++        base.Dispose(disposing);
++    }
++
++    #region Windows Form Designer generated code
++    private void InitializeComponent()
++    {
++        components = new System.ComponentModel.Container();
++        _mast = new Panel();
++        _brandIcon = new PictureBox();
++        _brandText = new Label();
++        _brandCaption = new Label();
++        _add = new Button();
++        _settings = new Button();
++        _toolbar = new Panel();
++        _normalTools = new Panel();
++        _searchFrame = new VesperSearchFrame();
++        _search = new TextBox();
++        _showLabel = new Label();
++        _filter = new ComboBox();
++        _sortLabel = new Label();
++        _sort = new ComboBox();
++        _selectedTools = new Panel();
++        _selectedLabel = new Label();
++        _pause = new Button();
++        _resume = new Button();
++        _remove = new Button();
++        _clear = new Button();
++        _footer = new Panel();
++        _footerLabel = new Label();
++        _grid = new DownloadGrid();
++        _mast.SuspendLayout();
++        ((System.ComponentModel.ISupportInitialize)_brandIcon).BeginInit();
++        _toolbar.SuspendLayout();
++        _normalTools.SuspendLayout();
++        _searchFrame.SuspendLayout();
++        _selectedTools.SuspendLayout();
++        _footer.SuspendLayout();
++        ((System.ComponentModel.ISupportInitialize)_grid).BeginInit();
++        SuspendLayout();
++        // 
++        // _mast
++        // 
++        _mast.BackColor = Color.White;
++        _mast.Dock = DockStyle.Top;
++        _mast.Name = "mastheadPanel";
++        _mast.Size = new Size(1222, 76);
++        _mast.TabIndex = 0;
++        _mast.Controls.AddRange(new Control[] { _brandIcon, _brandText, _brandCaption, _add, _settings });
++        // 
++        // _brandIcon
++        // 
++        _brandIcon.BackColor = Color.Transparent;
++        _brandIcon.Location = new Point(21, 11);
++        _brandIcon.Name = "mothLogo";
++        _brandIcon.Size = new Size(57, 53);
++        _brandIcon.SizeMode = PictureBoxSizeMode.Zoom;
++        _brandIcon.TabStop = false;
++        // 
++        // _brandText
++        // 
++        _brandText.AutoSize = true;
++        _brandText.Font = new Font("Georgia", 23F, FontStyle.Regular);
++        _brandText.ForeColor = Color.FromArgb(49, 57, 52);
++        _brandText.Location = new Point(91, 10);
++        _brandText.Name = "wordmark";
++        _brandText.Text = "VESPER";
++        // 
++        // _brandCaption
++        // 
++        _brandCaption.AutoSize = true;
++        _brandCaption.Font = new Font("Segoe UI", 7F);
++        _brandCaption.ForeColor = Color.FromArgb(104, 116, 107);
++        _brandCaption.Location = new Point(92, 49);
++        _brandCaption.Name = "wordmarkCaption";
++        _brandCaption.Text = "D O W N L O A D   M A N A G E R";
++        // 
++        // _add
++        // 
++        _add.Anchor = AnchorStyles.Top | AnchorStyles.Right;
++        _add.BackColor = Color.FromArgb(61, 105, 75);
++        _add.FlatAppearance.BorderColor = Color.FromArgb(61, 105, 75);
++        _add.FlatStyle = FlatStyle.Flat;
++        _add.ForeColor = Color.White;
++        _add.Location = new Point(1009, 21);
++        _add.Name = "addDownloadButton";
++        _add.Size = new Size(146, 35);
++        _add.TabIndex = 0;
++        _add.Text = "+  Add download";
++        _add.UseVisualStyleBackColor = false;
++        // 
++        // _settings
++        // 
++        _settings.AccessibleName = "Settings";
++        _settings.Anchor = AnchorStyles.Top | AnchorStyles.Right;
++        _settings.BackColor = Color.White;
++        _settings.FlatAppearance.BorderColor = Color.FromArgb(217, 222, 214);
++        _settings.FlatStyle = FlatStyle.Flat;
++        _settings.Font = new Font("Segoe UI Symbol", 13F);
++        _settings.ForeColor = Color.FromArgb(49, 57, 52);
++        _settings.Location = new Point(1167, 21);
++        _settings.Name = "settingsButton";
++        _settings.Size = new Size(35, 35);
++        _settings.TabIndex = 1;
++        _settings.Text = "⚙";
++        _settings.UseVisualStyleBackColor = false;
++        // 
++        // _toolbar
++        // 
++        _toolbar.BackColor = Color.FromArgb(248, 249, 246);
++        _toolbar.Dock = DockStyle.Top;
++        _toolbar.Name = "toolbarPanel";
++        _toolbar.Size = new Size(1222, 56);
++        _toolbar.TabIndex = 1;
++        _toolbar.Controls.Add(_selectedTools);
++        _toolbar.Controls.Add(_normalTools);
++        // 
++        // _normalTools
++        // 
++        _normalTools.Dock = DockStyle.Fill;
++        _normalTools.Name = "searchAndFilterPanel";
++        _normalTools.Size = new Size(1222, 56);
++        _normalTools.Controls.AddRange(new Control[] { _searchFrame, _showLabel, _filter, _sortLabel, _sort });
++        // 
++        // _searchFrame
++        // 
++        _searchFrame.BackColor = Color.White;
++        _searchFrame.Location = new Point(24, 12);
++        _searchFrame.Name = "searchFrame";
++        _searchFrame.Size = new Size(413, 32);
++        _searchFrame.TabIndex = 0;
++        _searchFrame.Controls.Add(_search);
++        // 
++        // _search
++        // 
++        _search.BorderStyle = BorderStyle.None;
++        _search.BackColor = Color.White;
++        _search.Font = new Font("Segoe UI", 9F);
++        _search.ForeColor = Color.FromArgb(49, 57, 52);
++        _search.Location = new Point(37, 7);
++        _search.Name = "searchDownloadsTextBox";
++        _search.PlaceholderText = "Search downloads";
++        _search.Size = new Size(364, 18);
++        _search.TabIndex = 0;
++        // 
++        // _showLabel
++        // 
++        _showLabel.AutoSize = true;
++        _showLabel.ForeColor = Color.FromArgb(104, 116, 107);
++        _showLabel.Location = new Point(851, 19);
++        _showLabel.Name = "showFilterLabel";
++        _showLabel.Text = "Show";
++        // 
++        // _filter
++        // 
++        _filter.DropDownStyle = ComboBoxStyle.DropDownList;
++        _filter.FlatStyle = FlatStyle.Flat;
++        _filter.FormattingEnabled = true;
++        _filter.Items.AddRange(new object[] { "Everything", "Downloading", "Paused", "Queued", "Completed", "Needs attention" });
++        _filter.Location = new Point(887, 14);
++        _filter.Name = "filterComboBox";
++        _filter.Size = new Size(147, 26);
++        _filter.TabIndex = 1;
++        // 
++        // _sortLabel
++        // 
++        _sortLabel.AutoSize = true;
++        _sortLabel.ForeColor = Color.FromArgb(104, 116, 107);
++        _sortLabel.Location = new Point(1044, 19);
++        _sortLabel.Name = "sortCaptionLabel";
++        _sortLabel.Text = "Sort";
++        // 
++        // _sort
++        // 
++        _sort.DropDownStyle = ComboBoxStyle.DropDownList;
++        _sort.FlatStyle = FlatStyle.Flat;
++        _sort.FormattingEnabled = true;
++        _sort.Items.AddRange(new object[] { "Newest first", "Name", "Size", "Status" });
++        _sort.Location = new Point(1074, 14);
++        _sort.Name = "sortComboBox";
++        _sort.Size = new Size(124, 26);
++        _sort.TabIndex = 2;
++        // 
++        // _selectedTools
++        // 
++        _selectedTools.Dock = DockStyle.Fill;
++        _selectedTools.Name = "selectedActionsPanel";
++        _selectedTools.Size = new Size(1222, 56);
++        _selectedTools.Visible = false;
++        _selectedTools.Controls.AddRange(new Control[] { _selectedLabel, _pause, _resume, _remove, _clear });
++        // 
++        // _selectedLabel
++        // 
++        _selectedLabel.AutoSize = true;
++        _selectedLabel.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
++        _selectedLabel.Location = new Point(25, 20);
++        _selectedLabel.Name = "selectedCountLabel";
++        _selectedLabel.Text = "0 selected";
++        // 
++        // _pause / _resume / _remove / _clear
++        // 
++        _pause.BackColor = Color.White;
++        _pause.FlatAppearance.BorderColor = Color.FromArgb(217, 222, 214);
++        _pause.FlatStyle = FlatStyle.Flat;
++        _pause.ForeColor = Color.FromArgb(49, 57, 52);
++        _pause.Location = new Point(134, 12);
++        _pause.Name = "pauseSelectionButton";
++        _pause.Size = new Size(82, 32);
++        _pause.Text = "Pause";
++        _pause.UseVisualStyleBackColor = false;
++        _resume.BackColor = Color.White;
++        _resume.FlatAppearance.BorderColor = Color.FromArgb(217, 222, 214);
++        _resume.FlatStyle = FlatStyle.Flat;
++        _resume.ForeColor = Color.FromArgb(49, 57, 52);
++        _resume.Location = new Point(223, 12);
++        _resume.Name = "resumeSelectionButton";
++        _resume.Size = new Size(82, 32);
++        _resume.Text = "Resume";
++        _resume.UseVisualStyleBackColor = false;
++        _remove.BackColor = Color.White;
++        _remove.FlatAppearance.BorderColor = Color.FromArgb(217, 222, 214);
++        _remove.FlatStyle = FlatStyle.Flat;
++        _remove.ForeColor = Color.FromArgb(49, 57, 52);
++        _remove.Location = new Point(312, 12);
++        _remove.Name = "removeSelectionButton";
++        _remove.Size = new Size(82, 32);
++        _remove.Text = "Remove";
++        _remove.UseVisualStyleBackColor = false;
++        _clear.BackColor = Color.White;
++        _clear.FlatAppearance.BorderColor = Color.FromArgb(217, 222, 214);
++        _clear.FlatStyle = FlatStyle.Flat;
++        _clear.ForeColor = Color.FromArgb(49, 57, 52);
++        _clear.Location = new Point(1061, 12);
++        _clear.Name = "clearSelectionButton";
++        _clear.Size = new Size(137, 32);
++        _clear.Text = "Clear selection";
++        _clear.UseVisualStyleBackColor = false;
++        // 
++        // 
++        // _grid
++        // 
++        _grid.Dock = DockStyle.Fill;
++        _grid.Location = new Point(0, 132);
++        _grid.Name = "downloadGrid";
++        _grid.Size = new Size(1222, 658);
++        _grid.TabIndex = 2;
++        // 
++        // _footer
++        // 
++        _footer.BackColor = Color.FromArgb(242, 244, 239);
++        _footer.Dock = DockStyle.Bottom;
++        _footer.Name = "footerPanel";
++        _footer.Size = new Size(1222, 30);
++        _footer.TabIndex = 3;
++        _footer.Controls.Add(_footerLabel);
++        // 
++        // _footerLabel
++        // 
++        _footerLabel.Dock = DockStyle.Fill;
++        _footerLabel.Font = new Font("Segoe UI", 8F);
++        _footerLabel.ForeColor = Color.FromArgb(104, 116, 107);
++        _footerLabel.Location = Point.Empty;
++        _footerLabel.Name = "statusFooterLabel";
++        _footerLabel.Padding = new Padding(23, 0, 0, 0);
++        _footerLabel.Text = "UI preview  ·  2 sample downloads  ·  1 queued";
++        _footerLabel.TextAlign = ContentAlignment.MiddleLeft;
++        // 
++        // Form1
++        // 
++        AutoScaleDimensions = new SizeF(96F, 96F);
++        AutoScaleMode = AutoScaleMode.Dpi;
++        BackColor = Color.FromArgb(248, 249, 246);
++        ClientSize = new Size(1222, 820);
++        Font = new Font("Segoe UI", 9F);
++        KeyPreview = true;
++        MinimumSize = new Size(790, 500);
++        Name = "Form1";
++        StartPosition = FormStartPosition.CenterScreen;
++        Text = "VESPER — Download Manager (UI Preview)";
++        Controls.Add(_grid);
++        Controls.Add(_footer);
++        Controls.Add(_toolbar);
++        Controls.Add(_mast);
++        _mast.ResumeLayout(false);
++        _mast.PerformLayout();
++        ((System.ComponentModel.ISupportInitialize)_brandIcon).EndInit();
++        _normalTools.ResumeLayout(false);
++        _normalTools.PerformLayout();
++        _searchFrame.ResumeLayout(false);
++        _searchFrame.PerformLayout();
++        _selectedTools.ResumeLayout(false);
++        _selectedTools.PerformLayout();
++        _toolbar.ResumeLayout(false);
++        _footer.ResumeLayout(false);
++        ((System.ComponentModel.ISupportInitialize)_grid).EndInit();
++        ResumeLayout(false);
++        PerformLayout();
++    }
++
++    #endregion
++}
+diff -ruN source/VESPER/Form1.cs source_U2/VESPER/Form1.cs
+--- source/VESPER/Form1.cs	2026-11-09 21:46:08.434863231 +0000
++++ source_U2/VESPER/Form1.cs	2026-11-09 22:07:47.985960789 +0000
+@@ -6,149 +6,128 @@
+ {
+     private readonly List<DownloadItem> _records = DownloadItem.Examples();
+     private readonly VesperPreferences _prefs = new();
+-    private DownloadGrid _grid = null!;
+-    private Panel _mast = null!, _toolbar = null!, _normalTools = null!, _selectedTools = null!, _footer = null!;
+-    private TextBox _search = null!;
+-    private ComboBox _filter = null!, _sort = null!;
+-    private Label _footerLabel = null!, _selectedLabel = null!, _brandText = null!, _brandCaption = null!;
+-    private Button _add = null!, _settings = null!, _pause = null!, _resume = null!, _remove = null!, _clear = null!;
+-    private PictureBox _brandIcon = null!;
+     private Image? _logoImage, _botanicalLight, _botanicalDark;
+     private DownloadItem? _menuTarget;
+     private readonly ContextMenuStrip _menu = new();
+     private VesperPalette _colors=VesperPalette.Light;
+-    private bool _building;
+ 
+     public Form1()
+     {
+         InitializeComponent();
+-        Text="VESPER — Download Manager (UI Preview)";
+-        StartPosition=FormStartPosition.CenterScreen;
+-        MinimumSize=new Size(790,500);
+-        ClientSize=new Size(1222,820);
+-        AutoScaleMode=AutoScaleMode.Dpi;
+-        KeyPreview=true;
+-        Font=new Font("Segoe UI",9F);
+-        try { Icon=new Icon(UiKit.Asset("VESPER-Illustrated.ico")); }
+-        catch { /* Keep Windows default if asset copy is unavailable. */ }
+-        _logoImage=UiKit.LoadImage("moth-mark-transparent-96.png");
+-        _botanicalLight=UiKit.LoadImage("header-branch-light-720x288.png");
+-        _botanicalDark=UiKit.LoadImage("header-branch-dark-720x288.png");
+-        BuildLayout();
+-        _menu.Opening += (_,e) => BuildRowMenu(e);
++        try { Icon = new Icon(UiKit.Asset("VESPER-Illustrated.ico")); }
++        catch { /* The Windows executable still has its compiled-in icon. */ }
++        _logoImage = UiKit.LoadImage("moth-mark-transparent-96.png");
++        _botanicalLight = UiKit.LoadImage("header-branch-light-720x288.png");
++        _botanicalDark = UiKit.LoadImage("header-branch-dark-720x288.png");
++        _brandIcon.Image = _logoImage;
++        WireInteractions();
+         ApplyAppearance();
+         RefreshList();
+     }
+ 
+-    private void BuildLayout()
++    private void WireInteractions()
+     {
+-        _building=true;
+-        SuspendLayout();
+-        _mast=new Panel { Height=76, Dock=DockStyle.Top };
+-        _toolbar=new Panel { Height=56, Dock=DockStyle.Top };
+-        _footer=new Panel { Height=30, Dock=DockStyle.Bottom };
+-        _grid=new DownloadGrid { Dock=DockStyle.Fill, TabIndex=4 };
+-        _grid.CheckStateChanged+=UpdateSelectedTools;
+-        _grid.DetailsRequested+=ShowDetails;
+-        _grid.MenuRequested+=(job,position)=> { _menuTarget=job; _menu.Show(position); };
+-        Controls.Add(_grid);Controls.Add(_footer);Controls.Add(_toolbar);Controls.Add(_mast);
+-
+-        _brandIcon=new PictureBox { SizeMode=PictureBoxSizeMode.Zoom, Image=_logoImage, Size=new Size(57,53), Location=new Point(17,10), TabStop=false };
+-        _brandText=new Label { Text="VESPER", Font=new Font("Georgia",24F), AutoSize=true, Location=new Point(91,7) };
+-        _brandCaption=new Label { Text="D O W N L O A D   M A N A G E R",Font=new Font("Segoe UI",7F),AutoSize=true,Location=new Point(91,48) };
+-        _add=UiKit.Button("＋  Add download",_colors,true);
+-        _add.Size=new Size(146,35);
+-        _add.Click+=(_,_)=>AddDownload();
+-        _settings=UiKit.Button("⚙",_colors);
+-        _settings.Size=new Size(37,35);
+-        _settings.AccessibleName="Settings";
+-        _settings.Click+=(_,_)=>OpenSettings();
+-        _mast.Controls.AddRange([_brandIcon,_brandText,_brandCaption,_add,_settings]);
+-        _mast.Paint+=(s,e)=>PaintMast(e.Graphics);
+-        _mast.Resize+=(_,_)=>LayoutMast();
++        _grid.CheckStateChanged += UpdateSelectedTools;
++        _grid.DetailsRequested += ShowDetails;
++        _grid.MenuRequested += (job, position) => { _menuTarget = job; _menu.Show(position); };
++        _menu.Opening += (_, e) => BuildRowMenu(e);
++        _add.Click += (_, _) => AddDownload();
++        _settings.Click += (_, _) => OpenSettings();
++        _mast.Paint += (_, e) => PaintMast(e.Graphics);
++        _mast.Resize += (_, _) => LayoutMast();
++        _search.TextChanged += (_, _) => RefreshList();
++        _searchFrame.Resize += (_, _) =>
++        {
++            _search.Width = Math.Max(40, _searchFrame.ClientSize.Width - UiKit.Scale(this, 50));
++            _search.Top = Math.Max(2, (_searchFrame.ClientSize.Height - _search.Height) / 2);
++        };
++        _filter.SelectedIndexChanged += (_, _) => RefreshList();
++        _sort.SelectedIndexChanged += (_, _) => RefreshList();
++        _normalTools.Resize += (_, _) => LayoutNormalToolbar();
++        _selectedTools.Resize += (_, _) => LayoutSelectedToolbar();
++        _toolbar.Resize += (_, _) => { LayoutNormalToolbar(); LayoutSelectedToolbar(); };
++        _footer.Paint += (_, e) =>
++        {
++            using var border = new Pen(_colors.Border);
++            e.Graphics.DrawLine(border, 0, 0, _footer.Width, 0);
++        };
++        _pause.Click += (_, _) => BatchChange(JobStatus.Downloading, JobStatus.Paused);
++        _resume.Click += (_, _) => BatchChange(JobStatus.Paused, JobStatus.Queued);
++        _remove.Click += (_, _) => RemoveDemoRecords(_grid.CheckedItems);
++        _clear.Click += (_, _) => _grid.ClearChecks();
++        _filter.SelectedIndex = 0;
++        _sort.SelectedIndex = 0;
+         LayoutMast();
+-
+-        _normalTools=new Panel { Dock=DockStyle.Fill };
+-        _selectedTools=new Panel { Dock=DockStyle.Fill, Visible=false };
+-        _toolbar.Controls.Add(_normalTools);
+-        _toolbar.Controls.Add(_selectedTools);
+-        _search=new TextBox { PlaceholderText="Search downloads", BorderStyle=BorderStyle.FixedSingle, Font=new Font("Segoe UI",9F), TabIndex=1 };
+-        _search.TextChanged+=(_,_)=>RefreshList();
+-        _filter=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Font=new Font("Segoe UI",9F),TabIndex=2 };
+-        _filter.Items.AddRange(["Everything","Downloading","Paused","Queued","Completed","Needs attention"]);
+-        _filter.SelectedIndex=0;
+-        _filter.SelectedIndexChanged+=(_,_)=>RefreshList();
+-        _sort=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Font=new Font("Segoe UI",9F),TabIndex=3 };
+-        _sort.Items.AddRange(["Newest first","Name","Size","Status"]);
+-        _sort.SelectedIndex=0;
+-        _sort.SelectedIndexChanged+=(_,_)=>RefreshList();
+-        _normalTools.Controls.AddRange([_search,_filter,_sort]);
+-        _normalTools.Resize+=(_,_)=>LayoutNormalToolbar();
+-        _selectedLabel=UiKit.Label("0 selected",_colors,9,true);
+-        _pause=UiKit.Button("Pause",_colors);
+-        _resume=UiKit.Button("Resume",_colors);
+-        _remove=UiKit.Button("Remove",_colors);
+-        _clear=UiKit.Button("Clear selection",_colors);
+-        _pause.Click+=(_,_)=>BatchChange(JobStatus.Downloading,JobStatus.Paused);
+-        _resume.Click+=(_,_)=>BatchChange(JobStatus.Paused,JobStatus.Queued);
+-        _remove.Click+=(_,_)=>RemoveDemoRecords(_grid.CheckedItems);
+-        _clear.Click+=(_,_)=>_grid.ClearChecks();
+-        _selectedTools.Controls.AddRange([_selectedLabel,_pause,_resume,_remove,_clear]);
+-        _selectedTools.Resize+=(_,_)=>LayoutSelectedToolbar();
+-        _toolbar.Resize+=(_,_)=>{LayoutNormalToolbar();LayoutSelectedToolbar();};
+-        LayoutNormalToolbar();LayoutSelectedToolbar();
+-
+-        _footerLabel=new Label { Dock=DockStyle.Fill, TextAlign=ContentAlignment.MiddleLeft, Font=new Font("Segoe UI",8F),Padding=new Padding(22,0,0,0) };
+-        _footer.Controls.Add(_footerLabel);
+-        _footer.Paint+=(s,e)=> { using var p=new Pen(_colors.Border);e.Graphics.DrawLine(p,0,0,_footer.Width,0); };
+-        ResumeLayout(performLayout:true);
+-        _building=false;
++        LayoutNormalToolbar();
++        LayoutSelectedToolbar();
+     }
+ 
+     private void LayoutMast()
+     {
+-        if (_mast==null)return;
+-        int margin=UiKit.Scale(this,22);
+-        int right=_mast.ClientSize.Width-margin;
+-        _settings.Location=new Point(right-_settings.Width,UiKit.Scale(this,21));
+-        _add.Location=new Point(_settings.Left-UiKit.Scale(this,12)-_add.Width,_settings.Top);
++        if (_mast is null || _settings is null) return;
++        int right = _mast.ClientSize.Width - UiKit.Scale(this, 20);
++        _settings.Location = new Point(right - _settings.Width, UiKit.Scale(this, 21));
++        _add.Location = new Point(_settings.Left - UiKit.Scale(this, 12) - _add.Width, _settings.Top);
+     }
++
+     private void LayoutNormalToolbar()
+     {
+-        if (_search==null)return;
+-        int m=UiKit.Scale(this,24), top=UiKit.Scale(this,12), h=UiKit.Scale(this,32);
+-        int gap=UiKit.Scale(this,12),fw=UiKit.Scale(this,149),sw=UiKit.Scale(this,124);
+-        int right=_normalTools.ClientSize.Width-m;
+-        _sort.SetBounds(right-sw,top,sw,h);
+-        _filter.SetBounds(_sort.Left-gap-fw,top,fw,h);
+-        _search.SetBounds(m,top,Math.Max(UiKit.Scale(this,180),Math.Min(UiKit.Scale(this,412),_filter.Left-m-UiKit.Scale(this,65))),h);
++        if (_searchFrame is null || _normalTools is null) return;
++        int margin = UiKit.Scale(this, 24);
++        int top = UiKit.Scale(this, 12);
++        int h = UiKit.Scale(this, 32);
++        int gap = UiKit.Scale(this, 12);
++        int filterW = UiKit.Scale(this, 148);
++        int sortW = UiKit.Scale(this, 124);
++        int right = _normalTools.ClientSize.Width - margin;
++        int sortX = right - sortW;
++        _sort.SetBounds(sortX, top + UiKit.Scale(this, 1), sortW, h);
++        _sortLabel.Location = new Point(sortX - UiKit.Scale(this, 7) - _sortLabel.Width,
++            top + (h - _sortLabel.Height) / 2);
++        int filterX = _sortLabel.Left - gap - filterW;
++        _filter.SetBounds(filterX, top + UiKit.Scale(this, 1), filterW, h);
++        _showLabel.Location = new Point(filterX - UiKit.Scale(this, 7) - _showLabel.Width,
++            top + (h - _showLabel.Height) / 2);
++        _searchFrame.SetBounds(margin, top,
++            Math.Max(UiKit.Scale(this, 155), Math.Min(UiKit.Scale(this, 413), _showLabel.Left - margin - UiKit.Scale(this, 28))), h);
++        _search.Width = Math.Max(40, _searchFrame.Width - UiKit.Scale(this, 50));
+     }
++
+     private void LayoutSelectedToolbar()
+     {
+-        if (_selectedLabel==null)return;
+-        int top=UiKit.Scale(this,12),h=UiKit.Scale(this,32),gap=UiKit.Scale(this,7),x=UiKit.Scale(this,25);
+-        _selectedLabel.Location=new Point(x,top+UiKit.Scale(this,7));
+-        x+=UiKit.Scale(this,105);
+-        foreach (var b in new[]{_pause,_resume,_remove})
++        if (_selectedLabel is null || _selectedTools is null) return;
++        int top = UiKit.Scale(this, 12), h = UiKit.Scale(this, 32), gap = UiKit.Scale(this, 7);
++        int x = UiKit.Scale(this, 25);
++        _selectedLabel.Location = new Point(x, top + (h - _selectedLabel.Height) / 2);
++        x += UiKit.Scale(this, 108);
++        foreach (var b in new[] { _pause, _resume, _remove })
+         {
+-            b.SetBounds(x,top,UiKit.Scale(this,82),h);x+=UiKit.Scale(this,82)+gap;
++            b.SetBounds(x, top, UiKit.Scale(this, 82), h);
++            x += UiKit.Scale(this, 82) + gap;
+         }
+-        _clear.SetBounds(Math.Max(x,_selectedTools.Width-UiKit.Scale(this,160)),top,UiKit.Scale(this,137),h);
++        _clear.SetBounds(_selectedTools.Width - UiKit.Scale(this, 24) - UiKit.Scale(this, 137),
++            top, UiKit.Scale(this, 137), h);
+     }
++
+     private void PaintMast(Graphics g)
+     {
+         if (_mast==null) return;
+         g.Clear(_colors.Surface);
+-        if (_prefs.Botanical && !SystemInformation.HighContrast)
++        if (!SystemInformation.HighContrast)
+         {
+-            Image? art=UiKit.IsDark(_prefs)?_botanicalDark:_botanicalLight;
++            // Stable v8.3 already has a whisper-light branch in the masthead.
++            // Optional v9 merely strengthens the accent; neither mode covers data.
++            Image? art = UiKit.IsDark(_prefs) ? _botanicalDark : _botanicalLight;
+             if (art is not null)
+             {
+-                var dest=new Rectangle(Math.Max(275,_mast.Width-510),-32,375,150);
+-                using var attributes=new System.Drawing.Imaging.ImageAttributes();
+-                var m=new System.Drawing.Imaging.ColorMatrix { Matrix33=0.24f };
+-                attributes.SetColorMatrix(m);
+-                g.DrawImage(art,dest,0,0,art.Width,art.Height,GraphicsUnit.Pixel,attributes);
++                var dest = new Rectangle(Math.Max(275, _mast.Width - 510), -32, 375, 150);
++                using var attributes = new System.Drawing.Imaging.ImageAttributes();
++                var matrix = new System.Drawing.Imaging.ColorMatrix
++                {
++                    Matrix33 = _prefs.Botanical ? 0.24f : 0.09f
++                };
++                attributes.SetColorMatrix(matrix);
++                g.DrawImage(art, dest, 0, 0, art.Width, art.Height, GraphicsUnit.Pixel, attributes);
+             }
+         }
+         using var border=new Pen(_colors.Border);
+@@ -176,7 +155,14 @@
+             b.FlatAppearance.MouseOverBackColor=main?_colors.GreenHover:_colors.Secondary;
+         }
+         _selectedLabel.ForeColor=_colors.Text;
+-        _search.BackColor=_colors.Surface;_search.ForeColor=_colors.Text;
++        _searchFrame.BackColor = _colors.Surface;
++        _searchFrame.OutlineColor = _colors.Border;
++        _searchFrame.SearchIconColor = _colors.Muted;
++        _searchFrame.Invalidate();
++        _search.BackColor = _colors.Surface;
++        _search.ForeColor = _colors.Text;
++        _showLabel.ForeColor = _colors.Muted;
++        _sortLabel.ForeColor = _colors.Muted;
+         foreach(var combo in new[]{_filter,_sort})
+         {
+             combo.BackColor=_colors.Surface;combo.ForeColor=_colors.Text;
+@@ -187,7 +173,7 @@
+ 
+     private void RefreshList()
+     {
+-        if (_building||_grid==null||_search==null)return;
++        if (_grid is null || _search is null || _filter is null || _sort is null) return;
+         IEnumerable<DownloadItem> list=_records;
+         if (_prefs.HideMissingCompleted) list=list.Where(r=>r.Status!=JobStatus.Missing);
+         string term=_search.Text.Trim();
+@@ -211,7 +197,10 @@
+         };
+         _grid.SetItems(list.ToList());
+         int active=_records.Count(x=>x.Status==JobStatus.Downloading),queued=_records.Count(x=>x.Status==JobStatus.Queued);
+-        _footerLabel.Text=$"UI PREVIEW · Sample records only · No real downloads   |   {_records.Count} records · {active} sample active · {queued} queued";
++        var parts = new List<string> { "UI PREVIEW · sample data" };
++        if (active > 0) parts.Add($"{active} downloading");
++        if (queued > 0) parts.Add($"{queued} queued");
++        _footerLabel.Text = string.Join("    |    ", parts);
+         UpdateSelectedTools();
+     }
+     private static double SizeEstimate(string s)
+@@ -226,7 +215,8 @@
+         int n=_grid.CheckedCount;
+         _selectedTools.Visible=n>0;
+         _normalTools.Visible=n==0;
+-        _selectedTools.BringToFront();
++        if (n>0) _selectedTools.BringToFront();
++        else _normalTools.BringToFront();
+         _selectedLabel.Text=$"{n} selected";
+         var chosen=_grid.CheckedItems;
+         _pause.Enabled=chosen.Any(j=>j.Status==JobStatus.Downloading);
+diff -ruN source/VESPER/SettingsForm.cs source_U2/VESPER/SettingsForm.cs
+--- source/VESPER/SettingsForm.cs	2026-11-09 21:34:18.851477886 +0000
++++ source_U2/VESPER/SettingsForm.cs	2026-11-09 22:06:36.482616881 +0000
+@@ -7,16 +7,21 @@
+     private readonly Panel _content;
+     private readonly Dictionary<string,Panel> _pages=[];
+     private readonly Dictionary<string,Button> _nav=[];
++    private readonly Font _navRegular = new("Segoe UI",9F);
++    private readonly Font _navSelected = new("Segoe UI",9F,FontStyle.Bold);
+     public VesperPreferences Result => _edit.Clone();
+ 
++    // Visual Studio can instantiate this form to display its sample UI in the Designer.
++    public SettingsForm() : this(new VesperPreferences()) { }
++
+     public SettingsForm(VesperPreferences current)
+     {
+         _edit=current.Clone();_p=UiKit.Palette(_edit);
+         Text="VESPER Settings — UI Preview";
+         Font=new Font("Segoe UI",9F);
+         StartPosition=FormStartPosition.CenterParent;
+-        ClientSize=new Size(760,510);
+-        MinimumSize=new Size(670,480);
++        ClientSize=new Size(800,510);
++        MinimumSize=new Size(710,555);
+         BackColor=_p.Surface;ForeColor=_p.Text;
+         var title=UiKit.Label("Settings",_p,17,true);title.Location=new Point(25,21);
+         var navPanel=new Panel { Dock=DockStyle.Left,Width=182,BackColor=_p.Secondary };
+@@ -32,20 +37,27 @@
+             btn.Click+=(_,_)=>Switch(tab);
+             navPanel.Controls.Add(btn);_nav[tab]=btn;
+         }
+-        _content=new Panel { Dock=DockStyle.Fill,BackColor=_p.Surface,AutoScroll=true };
+-        var footer=new Panel { Dock=DockStyle.Bottom,Height=72,BackColor=_p.Surface };
+-        var previewNote=UiKit.Label("Settings affect only the current UI preview session. No transfer engine is connected.",_p,8);
+-        previewNote.ForeColor=_p.Muted;previewNote.Location=new Point(20,8);
+-        var cancel=UiKit.Button("Cancel",_p);cancel.Size=new Size(85,33);cancel.DialogResult=DialogResult.Cancel;
+-        var save=UiKit.Button("Save",_p,true);save.Size=new Size(85,33);
++        _content=new Panel { Dock=DockStyle.Fill,BackColor=_p.Surface,AutoScroll=false };
++        var footer=new Panel { Dock=DockStyle.Bottom,Height=66,BackColor=_p.Surface };
++        var cancel=UiKit.Button("Cancel",_p);
++        cancel.Size=new Size(85,33);
++        cancel.DialogResult=DialogResult.Cancel;
++        var save=UiKit.Button("Save settings",_p,true);
++        save.Size=new Size(114,33);
+         save.Click+=(_,_)=> { DialogResult=DialogResult.OK;Close(); };
+-        footer.Controls.AddRange([previewNote,cancel,save]);
++        footer.Controls.AddRange([cancel,save]);
+         footer.Resize+=(_,_)=>
+         {
+-            save.Location=new Point(footer.Width-105,30);
+-            cancel.Location=new Point(save.Left-96,30);
+-            previewNote.MaximumSize=new Size(Math.Max(0,footer.Width-30),40);
++            save.Location=new Point(footer.Width-21-save.Width,17);
++            cancel.Location=new Point(save.Left-11-cancel.Width,17);
++        };
++        footer.Paint+=(_,e)=>
++        {
++            using var pen=new Pen(_p.Border);
++            e.Graphics.DrawLine(pen,0,0,footer.Width,0);
+         };
++        AcceptButton=save;
++        CancelButton=cancel;
+         Controls.Add(_content);Controls.Add(navPanel);Controls.Add(footer);
+         titleSpacer.Controls.Add(title);title.Location=new Point(19,22);
+         BuildDownloads();BuildTransfers();BuildAppearance();
+@@ -55,16 +67,34 @@
+     {
+         var p=new Panel { Dock=DockStyle.Fill,Visible=false,BackColor=_p.Surface,AutoScroll=true };
+         var t=UiKit.Label(heading,_p,15,true);t.Location=new Point(25,25);
+-        var sub=UiKit.Label(subtitle,_p,8);sub.ForeColor=_p.Muted;sub.Location=new Point(25,58);
++        var sub=UiKit.Label(subtitle,_p,8);
++        sub.AutoSize=false;
++        sub.ForeColor=_p.Muted;
++        sub.Location=new Point(25,57);
++        sub.Size=new Size(420,32);
++        sub.Anchor=AnchorStyles.Left|AnchorStyles.Top|AnchorStyles.Right;
++        p.Resize += (_, _) => sub.Width=Math.Max(100,p.ClientSize.Width-53);
+         p.Controls.AddRange([t,sub]);
+         _pages[key]=p;_content.Controls.Add(p);return p;
+     }
+     private void Switch(string key)
+     {
+         foreach(var (k,p) in _pages)p.Visible=k==key;
+-        foreach(var (k,b) in _nav) {b.BackColor=k==key?_p.Surface:_p.Secondary;b.Font=new Font("Segoe UI",9F,k==key?FontStyle.Bold:FontStyle.Regular);}
++        foreach(var (k,b) in _nav)
++        {
++            b.BackColor=k==key?_p.Surface:_p.Secondary;
++            b.ForeColor=k==key?_p.Green:_p.Text;
++            b.Font=k==key?_navSelected:_navRegular;
++        }
+         if(_pages.TryGetValue(key,out var current))current.BringToFront();
+     }
++    protected override void OnFormClosed(FormClosedEventArgs e)
++    {
++        _navRegular.Dispose();
++        _navSelected.Dispose();
++        base.OnFormClosed(e);
++    }
++
+     private void BuildDownloads()
+     {
+         var page=NewPage("Downloads","Downloads","Where new downloads would be saved.");
+@@ -81,18 +111,27 @@
+         };
+         page.Resize+=(_,_)=>
+         {
+-            browse.Left=Math.Max(330,page.ClientSize.Width-120);
++            browse.Left=Math.Max(300,page.ClientSize.Width-119);
+             folder.Width=Math.Max(185,browse.Left-35);
+         };
+         var subFolders=new CheckBox { Text="Create subfolders by file category",Checked=_edit.CategoryFolders,AutoSize=true,Location=new Point(25,192),ForeColor=_p.Text };
+         subFolders.CheckedChanged+=(_,_)=>_edit.CategoryFolders=subFolders.Checked;
+         var note=UiKit.Label("Off by default. Changing this never moves existing downloads.",_p,8);
+         note.ForeColor=_p.Muted;note.Location=new Point(45,216);
++        note.AutoSize=false;note.Size=new Size(400,34);
++        note.Anchor=AnchorStyles.Left|AnchorStyles.Top|AnchorStyles.Right;
+         var hideMissing=new CheckBox { Text="Hide missing completed files in the list",Checked=_edit.HideMissingCompleted,AutoSize=true,Location=new Point(25,268),ForeColor=_p.Text };
+         hideMissing.CheckedChanged+=(_,_)=>_edit.HideMissingCompleted=hideMissing.Checked;
+         var help=UiKit.Label("Only completed records are hidden; paused and recoverable entries remain visible.",_p,8);
+         help.ForeColor=_p.Muted;help.Location=new Point(45,294);
++        help.AutoSize=false;help.Size=new Size(400,48);
++        help.Anchor=AnchorStyles.Left|AnchorStyles.Top|AnchorStyles.Right;
+         page.Controls.AddRange([folderLabel,folder,browse,subFolders,note,hideMissing,help]);
++        page.Resize += (_, _) =>
++        {
++            note.Width=Math.Max(180,page.ClientSize.Width-75);
++            help.Width=Math.Max(180,page.ClientSize.Width-75);
++        };
+     }
+     private void BuildTransfers()
+     {
+@@ -118,26 +157,53 @@
+     }
+     private void BuildAppearance()
+     {
+-        var page=NewPage("Appearance","Appearance","Clean v8.3 is the default; botanical v9 is optional.");
+-        var theme=UiKit.Label("Color theme",_p,9,true);theme.Location=new Point(25,105);
+-        var themeBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Location=new Point(25,132),Width=225 };
+-        themeBox.Items.AddRange(["System","Light","Dark"]);themeBox.SelectedIndex=(int)_edit.Theme;
++        var page=NewPage("Appearance","Appearance","Clean v8.3 is the default. Botanical v9 is optional.");
++
++        var theme=UiKit.Label("Color theme",_p,9,true);
++        theme.Location=new Point(25,100);
++        var themeBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,
++            FlatStyle=FlatStyle.Flat,Location=new Point(25,125),Width=225 };
++        themeBox.Items.AddRange(["System","Light","Dark"]);
++        themeBox.SelectedIndex=(int)_edit.Theme;
+         themeBox.SelectedIndexChanged+=(_,_)=>_edit.Theme=(ThemeChoice)themeBox.SelectedIndex;
+-        var density=UiKit.Label("List density",_p,9,true);density.Location=new Point(25,184);
+-        var densityBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Location=new Point(25,211),Width=225 };
++
++        var density=UiKit.Label("List density",_p,9,true);
++        density.Location=new Point(25,178);
++        var densityBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,
++            FlatStyle=FlatStyle.Flat,Location=new Point(25,203),Width=225 };
+         densityBox.Items.AddRange(["Extra compact · 34 px","Compact · 46 px","Comfortable · 58 px"]);
+         densityBox.SelectedIndex=(int)_edit.Density;
+         densityBox.SelectedIndexChanged+=(_,_)=>_edit.Density=(Density)densityBox.SelectedIndex;
+-        var botanical=new CheckBox { AutoSize=true,Text="Enable v9 botanical accents",Checked=_edit.Botanical,ForeColor=_p.Text,Location=new Point(25,277) };
++
++        var botanical=new CheckBox { AutoSize=true,Text="Enable v9 botanical accents",
++            Checked=_edit.Botanical,ForeColor=_p.Text,Location=new Point(25,265) };
+         botanical.CheckedChanged+=(_,_)=>_edit.Botanical=botanical.Checked;
+-        var botanicalNote=UiKit.Label("Subtle header decoration only. No overlay on rows or footer.",_p,8);
+-        botanicalNote.ForeColor=_p.Muted;botanicalNote.Location=new Point(45,300);
+-        var motion=UiKit.Label("Motion preference",_p,9,true);motion.Location=new Point(25,341);
+-        var motionBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,Location=new Point(25,367),Width=225 };
+-        motionBox.Items.AddRange(["Off","Subtle","Botanical flourish"]);motionBox.SelectedIndex=(int)_edit.Motion;
++        var botanicalNote=UiKit.Label("Subtle header decoration only. Never covers rows or the footer.",_p,8);
++        botanicalNote.AutoSize=false;
++        botanicalNote.ForeColor=_p.Muted;
++        botanicalNote.Location=new Point(45,290);
++        botanicalNote.Size=new Size(445,36);
++
++        var motion=UiKit.Label("Motion preference",_p,9,true);
++        motion.Location=new Point(25,334);
++        var motionBox=new ComboBox { DropDownStyle=ComboBoxStyle.DropDownList,
++            FlatStyle=FlatStyle.Flat,Location=new Point(25,358),Width=225 };
++        motionBox.Items.AddRange(["Off","Subtle","Botanical flourish"]);
++        motionBox.SelectedIndex=(int)_edit.Motion;
+         motionBox.SelectedIndexChanged+=(_,_)=>_edit.Motion=(MotionChoice)motionBox.SelectedIndex;
+-        var motionNote=UiKit.Label("Animation is not implemented in the preview. No idle loops.",_p,8);
+-        motionNote.ForeColor=_p.Muted;motionNote.Location=new Point(265,370);
+-        page.Controls.AddRange([theme,themeBox,density,densityBox,botanical,botanicalNote,motion,motionBox,motionNote]);
++        var motionNote=UiKit.Label("Preview only: no animations or idle rendering loops are running.",_p,8);
++        motionNote.AutoSize=false;
++        motionNote.ForeColor=_p.Muted;
++        motionNote.Location=new Point(25,390);
++        motionNote.Size=new Size(470,38);
++
++        page.Controls.AddRange([theme,themeBox,density,densityBox,botanical,botanicalNote,
++            motion,motionBox,motionNote]);
++        page.Resize+=(_,_)=>
++        {
++            int inside=Math.Max(170,page.ClientSize.Width-70);
++            botanicalNote.Width=inside;
++            motionNote.Width=Math.Max(170,page.ClientSize.Width-52);
++        };
+     }
+ }
+diff -ruN source/VESPER/VesperModels.cs source_U2/VESPER/VesperModels.cs
+--- source/VESPER/VesperModels.cs	2026-11-09 21:46:08.435378117 +0000
++++ source_U2/VESPER/VesperModels.cs	2026-11-09 22:08:23.051117893 +0000
+@@ -72,7 +72,31 @@
+ 
+ internal static class UiKit
+ {
+-    public static string Asset(string name) => Path.Combine(AppContext.BaseDirectory, "Assets", name);
++    // In the VS WinForms Designer the execution base can be the design host,
++    // not the app's bin folder. Resolve once at UI startup; never in Paint.
++    public static string Asset(string name)
++    {
++        string[] roots =
++        [
++            AppContext.BaseDirectory,
++            Path.GetDirectoryName(typeof(UiKit).Assembly.Location) ?? AppContext.BaseDirectory,
++            Environment.CurrentDirectory
++        ];
++        foreach (string root in roots)
++        {
++            DirectoryInfo? dir;
++            try { dir = new DirectoryInfo(root); }
++            catch { continue; }
++            for (int depth = 0; dir is not null && depth < 7; depth++, dir = dir.Parent)
++            {
++                string direct = Path.Combine(dir.FullName, "Assets", name);
++                if (File.Exists(direct)) return direct;
++                string project = Path.Combine(dir.FullName, "VESPER", "Assets", name);
++                if (File.Exists(project)) return project;
++            }
++        }
++        return Path.Combine(AppContext.BaseDirectory, "Assets", name);
++    }
+     public static int Scale(Control control, int px) => (int)Math.Round(px * control.DeviceDpi / 96d);
+     public static bool IsDark(VesperPreferences p) => p.Theme == ThemeChoice.Dark ||
+         (p.Theme == ThemeChoice.System && SystemInformation.HighContrast == false && IsSystemDark());
+diff -ruN source/VESPER/VesperSearchFrame.cs source_U2/VESPER/VesperSearchFrame.cs
+--- source/VESPER/VesperSearchFrame.cs	1970-01-01 00:00:00.000000000 +0000
++++ source_U2/VESPER/VesperSearchFrame.cs	2026-11-09 22:11:14.501359774 +0000
+@@ -0,0 +1,42 @@
++using System.Drawing.Drawing2D;
++
++namespace VESPER;
++
++/// <summary>A lightweight, designer-visible native WinForms search field surround.</summary>
++public sealed class VesperSearchFrame : Panel
++{
++    public Color OutlineColor { get; set; } = Color.FromArgb(217, 222, 214);
++    public Color SearchIconColor { get; set; } = Color.FromArgb(124, 142, 127);
++
++    public VesperSearchFrame()
++    {
++        DoubleBuffered = true;
++        BackColor = Color.White;
++        SetStyle(ControlStyles.ResizeRedraw, true);
++    }
++
++    protected override void OnPaint(PaintEventArgs e)
++    {
++        base.OnPaint(e);
++        var g = e.Graphics;
++        g.SmoothingMode = SmoothingMode.AntiAlias;
++        var bounds = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
++        using (var border = new Pen(OutlineColor))
++        using (var outline = new GraphicsPath())
++        {
++            int radius = Math.Min(6, Math.Max(2, bounds.Height / 4));
++            int d = radius * 2;
++            outline.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
++            outline.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
++            outline.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
++            outline.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
++            outline.CloseFigure();
++            g.DrawPath(border, outline);
++        }
++        float cx = 17f * DeviceDpi / 96f, cy = Height / 2f - 2f;
++        float r = 4f * DeviceDpi / 96f;
++        using var searchPen = new Pen(SearchIconColor, Math.Max(1f, DeviceDpi / 96f));
++        g.DrawEllipse(searchPen, cx-r, cy-r, 2*r, 2*r);
++        g.DrawLine(searchPen, cx+r*.7f, cy+r*.7f, cx+r*1.75f, cy+r*1.75f);
++    }
++}
