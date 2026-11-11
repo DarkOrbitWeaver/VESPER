@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Drawing.Drawing2D;
+using Vesper.Engine;
+using Vesper.MediaResolver.Core;
 
 namespace VESPER;
 
@@ -22,6 +24,7 @@ public sealed class DownloadGrid : ScrollableControl
     private int _focusRow;
     private int _hoverColumn = -1;
     private string _tipText = "";
+    private (DownloadItem Item, Rectangle Threshold, bool Details)? _filePress;
     private readonly int[] _columnWidths = new int[6];
     private int _contentWidth;
 
@@ -36,8 +39,32 @@ public sealed class DownloadGrid : ScrollableControl
     [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     internal string EmptyHint { get; set; } = "";
 
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    internal Image? EmptyIllustration { get; set; }
+
+    private readonly Dictionary<string, Bitmap?> _posters = [];
+    private readonly CancellationTokenSource _posterLifetime = new();
+    private bool _loadingPosters;
+
+    private readonly Font _emptyFont = new("Georgia", 19F, FontStyle.Italic);
+
     /// <summary>Repaints rows after an in-place change (progress tick). Only visible rows are drawn.</summary>
-    internal void RefreshRows() => Invalidate();
+    internal void RefreshRows(IReadOnlyList<JobSnapshot> changes)
+    {
+        int first = Math.Clamp(-AutoScrollPosition.Y / Math.Max(1, _rowHeight), 0, _items.Count);
+        int last = Math.Min(_items.Count, first + Math.Max(0, (ClientSize.Height - _headerHeight) / Math.Max(1, _rowHeight) + 2));
+        for (int index = first; index < last; index++)
+        {
+            Guid id = _items[index].Id;
+            foreach (JobSnapshot snapshot in changes)
+            {
+                if (snapshot.Id != id) continue;
+                var row = Rectangle.Intersect(RowRectangle(index), BodyBounds);
+                if (!row.IsEmpty) Invalidate(row);
+                break;
+            }
+        }
+    }
 
     public DownloadGrid()
     {
@@ -68,6 +95,7 @@ public sealed class DownloadGrid : ScrollableControl
         UpdateScrollArea();
         Invalidate();
         if (changed) CheckStateChanged?.Invoke();
+        LoadVisiblePosters();
     }
 
     public void PruneChecks(IEnumerable<Guid> allowed)
@@ -87,7 +115,7 @@ public sealed class DownloadGrid : ScrollableControl
 
     public void CheckAllVisible()
     {
-        bool all = _items.Count > 0 && _items.All(item => _checked.Contains(item.Id));
+        bool all = _items.Count > 0 && _items.Count == _checked.Count;
         foreach (var item in _items)
         {
             if (all) _checked.Remove(item.Id);
@@ -108,6 +136,7 @@ public sealed class DownloadGrid : ScrollableControl
                 if (_items[i].Id == item.Id) { index = i; break; }
         }
         if (index >= 0) Invalidate(RowRectangle(index));
+        Invalidate(new Rectangle(0, 0, _columnWidths[0], _headerHeight));
         CheckStateChanged?.Invoke();
     }
 
@@ -116,15 +145,18 @@ public sealed class DownloadGrid : ScrollableControl
         _palette = palette;
         _density = density;
         BackColor = palette.Surface;
+        if (density != Density.Gallery) ClearPosters();
         _headerHeight = UiKit.Scale(this, 37);
         _rowHeight = UiKit.Scale(this, density switch
         {
             Density.ExtraCompact => 34,
             Density.Comfortable => 58,
+            Density.Gallery => 84,
             _ => 46
         });
         UpdateScrollArea();
         Invalidate();
+        LoadVisiblePosters();
     }
 
     private void UpdateScrollArea()
@@ -139,18 +171,79 @@ public sealed class DownloadGrid : ScrollableControl
         base.OnResize(e);
         CalculateColumns();
         Invalidate();
+        LoadVisiblePosters();
+    }
+
+    protected override void OnLayout(LayoutEventArgs e)
+    {
+        base.OnLayout(e);
+        CalculateColumns();
     }
 
     protected override void OnScroll(ScrollEventArgs se)
     {
         base.OnScroll(se);
         Invalidate();
+        LoadVisiblePosters();
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         // ScrollableControl raises OnScroll when the offset really changes.
         base.OnMouseWheel(e);
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        LoadVisiblePosters();
+    }
+
+    private async void LoadVisiblePosters()
+    {
+        if (_loadingPosters || !IsHandleCreated || !Visible || _density != Density.Gallery || SystemInformation.HighContrast)
+            return;
+        _loadingPosters = true;
+        SecureHttpClient? http = null;
+        try
+        {
+            var token = _posterLifetime.Token;
+            while (!token.IsCancellationRequested && _density == Density.Gallery && Visible)
+            {
+                int first = Math.Clamp(-AutoScrollPosition.Y / Math.Max(1, _rowHeight), 0, _items.Count);
+                int last = Math.Min(_items.Count, first + Math.Clamp(ClientSize.Height / Math.Max(1, _rowHeight) + 1, 1, 20));
+                Uri? next = null;
+                string? key = null;
+                for (int i = first; i < last; i++)
+                {
+                    string? url = _items[i].Snapshot?.MediaThumbnailUrl;
+                    if (url is null || _posters.ContainsKey(url) || !MediaPoster.TryUri(url, out var uri)) continue;
+                    next = uri;
+                    key = url;
+                    break;
+                }
+                if (next is null || key is null) break;
+
+                http ??= new SecureHttpClient(new ResolverOptions { MaxConcurrentRequests = 1 });
+                Bitmap? image = await MediaPoster.LoadAsync(http, next, 220, 124, token);
+                if (token.IsCancellationRequested || _density != Density.Gallery) { image?.Dispose(); break; }
+                if (_posters.Count == 32)
+                {
+                    string oldest = _posters.Keys.First();
+                    _posters.Remove(oldest, out var retired);
+                    retired?.Dispose();
+                }
+                _posters.Add(key, image);
+                if (image is not null) Invalidate();
+            }
+        }
+        finally { http?.Dispose(); _loadingPosters = false; }
+    }
+
+    private void ClearPosters()
+    {
+        foreach (var bitmap in _posters.Values) bitmap?.Dispose();
+        _posters.Clear();
     }
 
     private void CalculateColumns()
@@ -191,9 +284,11 @@ public sealed class DownloadGrid : ScrollableControl
         => new(0, _headerHeight + AutoScrollPosition.Y + row * _rowHeight,
             Math.Max(1, _contentWidth), _rowHeight);
 
+    private Rectangle BodyBounds => new(0, _headerHeight, _contentWidth, Math.Max(0, ClientSize.Height - _headerHeight));
+
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        // OnPaint clears the buffered surface and draws the visible rows.
+        // OnPaint fills the damaged area and draws the intersecting rows.
         // Do not erase it separately before every hover/scroll repaint.
     }
 
@@ -201,21 +296,34 @@ public sealed class DownloadGrid : ScrollableControl
     {
         base.OnPaint(e);
         Graphics g = e.Graphics;
-        g.Clear(_palette.Surface);
-        CalculateColumns();
+        using (var background = new SolidBrush(_palette.Surface))
+            g.FillRectangle(background, e.ClipRectangle);
         int scrolled = -AutoScrollPosition.Y;
-        int first = Math.Clamp(scrolled / Math.Max(1, _rowHeight), 0, _items.Count);
-        int visible = (ClientSize.Height - _headerHeight) / Math.Max(1, _rowHeight) + 3;
-        int last = Math.Min(_items.Count, first + Math.Max(0, visible));
-        var original = g.Save();
-        g.SetClip(new Rectangle(0, _headerHeight, _contentWidth, Math.Max(0, ClientSize.Height - _headerHeight)));
-        for (int i = first; i < last; i++) PaintRow(g, i);
-        g.Restore(original);
-        PaintHeader(g);
+        var dirtyRows = Rectangle.Intersect(e.ClipRectangle, BodyBounds);
+        if (dirtyRows.Height > 0 && _items.Count > 0)
+        {
+            int rowHeight = Math.Max(1, _rowHeight);
+            int first = Math.Clamp((scrolled + dirtyRows.Top - _headerHeight) / rowHeight, 0, _items.Count);
+            int last = Math.Min(_items.Count, (scrolled + dirtyRows.Bottom - _headerHeight + rowHeight - 1) / rowHeight);
+            var original = g.Save();
+            g.SetClip(dirtyRows, CombineMode.Intersect);
+            for (int i = first; i < last; i++) PaintRow(g, i);
+            g.Restore(original);
+        }
+        if (e.ClipRectangle.Top < _headerHeight) PaintHeader(g);
         if (_items.Count == 0)
         {
             var text = new Rectangle(20, _headerHeight + Math.Max(40, (Height - _headerHeight) / 3), Width - 40, 50);
-            Draw(g, EmptyTitle, _nameFont, _palette.Text, text,
+            if (EmptyIllustration is { } illustration && EmptyTitle == "No downloads yet")
+            {
+                int area = ClientSize.Height - _headerHeight;
+                int width = Math.Min(UiKit.Scale(this, 345), Math.Min(Width / 2, Math.Max(1, area - 64)));
+                int height = width * illustration.Height / illustration.Width;
+                int top = _headerHeight + Math.Max(4, (area - height - UiKit.Scale(this, 70)) / 2);
+                g.DrawImage(illustration, (Width - width) / 2, top, width, height);
+                text.Y = top + height;
+            }
+            Draw(g, EmptyTitle, EmptyIllustration is not null && EmptyTitle == "No downloads yet" ? _emptyFont : _nameFont, _palette.Text, text,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
             if (EmptyHint.Length > 0)
                 Draw(g, EmptyHint, _subFont, _palette.Muted, new Rectangle(text.X, text.Bottom - 6, text.Width, 40),
@@ -227,7 +335,7 @@ public sealed class DownloadGrid : ScrollableControl
     {
         using (var fill = new SolidBrush(_palette.Secondary))
             g.FillRectangle(fill, 0, 0, _contentWidth, _headerHeight);
-        using (var pen = new Pen(_palette.Border))
+        using (var pen = new Pen(_palette.Divider))
             g.DrawLine(pen, 0, _headerHeight - 1, _contentWidth, _headerHeight - 1);
         for (int col = 0; col < 6; col++)
         {
@@ -235,13 +343,27 @@ public sealed class DownloadGrid : ScrollableControl
             if (col == 0)
             {
                 PaintCheck(g, Center(rect, UiKit.Scale(this, 16)),
-                    _items.Count > 0 && _items.All(item => _checked.Contains(item.Id)));
+                    _items.Count > 0 && _items.Count == _checked.Count);
             }
             else if (col != 5)
             {
-                string heading = col switch { 1 => "Name", 2 => "Activity", 3 => "Transfer", 4 => "Size", _ => "" };
+                (string heading, VesperIcon icon) = col switch
+                {
+                    1 => ("Name", VesperIcon.File),
+                    2 => ("Activity", VesperIcon.Activity),
+                    3 => ("Transfer", VesperIcon.Gauge),
+                    _ => ("Size", VesperIcon.Storage)
+                };
+                int x = rect.X + UiKit.Scale(this, 8);
+                if (_palette.Botanical)
+                {
+                    int size = UiKit.Scale(this, 15);
+                    VesperDrawing.Icon(g, icon, new Rectangle(x, (_headerHeight - size) / 2, size, size),
+                        VesperDrawing.Ink(icon, _palette));
+                    x += size + UiKit.Scale(this, 7);
+                }
                 Draw(g, heading, _headerFont, _palette.Muted,
-                    new Rectangle(rect.X + UiKit.Scale(this, 8), 0, rect.Width - UiKit.Scale(this, 16), _headerHeight),
+                    new Rectangle(x, 0, Math.Max(1, rect.Right - x), _headerHeight),
                     TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
             }
         }
@@ -251,16 +373,16 @@ public sealed class DownloadGrid : ScrollableControl
     {
         DownloadItem item = _items[index];
         Rectangle row = RowRectangle(index);
-        Color color = _checked.Contains(item.Id)
-            ? (_palette.Surface.R > 150 ? Color.FromArgb(233, 242, 230) : Color.FromArgb(41, 68, 49))
+        bool isChecked = _checked.Contains(item.Id);
+        Color color = isChecked && !_palette.HighContrast
+            ? _palette.Selection
             : index == _hoverRow ? _palette.Secondary : _palette.Surface;
         using (var brush = new SolidBrush(color)) g.FillRectangle(brush, row);
-        using (var pen = new Pen(_palette.Surface.R > 150
-            ? Color.FromArgb(232, 236, 230) : Color.FromArgb(52, 63, 55)))
+        using (var pen = new Pen(_palette.Divider))
             g.DrawLine(pen, row.Left + UiKit.Scale(this, 12), row.Bottom - 1, row.Right - UiKit.Scale(this, 12), row.Bottom - 1);
 
         int pad = UiKit.Scale(this, 8);
-        PaintCheck(g, Center(Cell(0, row.Y, row.Height), UiKit.Scale(this, 16)), _checked.Contains(item.Id));
+        PaintCheck(g, Center(Cell(0, row.Y, row.Height), UiKit.Scale(this, 16)), isChecked);
         PaintName(g, item, Cell(1, row.Y, row.Height), pad);
         PaintActivity(g, item, Cell(2, row.Y, row.Height), pad);
         PaintTransfer(g, item, Cell(3, row.Y, row.Height), pad);
@@ -291,32 +413,47 @@ public sealed class DownloadGrid : ScrollableControl
             for (int delta = -1; delta <= 1; delta++)
                 g.FillEllipse(brush, centerX - radius, centerY + delta * gap - radius, radius * 2, radius * 2);
         }
+        if (Focused && ShowFocusCues && index == _focusRow)
+            VesperDrawing.FocusOutline(g, Rectangle.Inflate(row, -3, -2), _palette.Text);
     }
 
     private void PaintName(Graphics g, DownloadItem item, Rectangle rect, int pad)
     {
         int iconSize = UiKit.Scale(this, _density == Density.ExtraCompact ? 24 : 31);
         var icon = new Rectangle(rect.Left + pad, rect.Top + (rect.Height - iconSize) / 2, iconSize, iconSize);
-        var state = g.Save();
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (var rounded = VesperDrawing.Rounded(new Rectangle(icon.X, icon.Y, icon.Width - 1, icon.Height - 1), 4))
-        {
-            using var brush = new SolidBrush(_palette.Secondary);
-            using var edge = new Pen(_palette.Border);
-            g.FillPath(brush, rounded);
-            g.DrawPath(edge, rounded);
-        }
-        g.Restore(state);
         var glyph = item.FileType switch
         {
             "Audio" => VesperIcon.Audio, "Video" => VesperIcon.Video,
             "Disc image" => VesperIcon.Disc, "Archive" => VesperIcon.Archive,
-            "eBook" => VesperIcon.Book, _ => VesperIcon.File
+            "eBook" => VesperIcon.Book, "Document" => VesperIcon.Document,
+            "Media" => VesperIcon.Layers, _ => VesperIcon.File
         };
-        VesperDrawing.Icon(g, glyph, Center(icon, UiKit.Scale(this, _density == Density.ExtraCompact ? 17 : 20)),
-            item.Status == JobStatus.Missing ? _palette.Muted : _palette.MutedGreen);
         int x = icon.Right + UiKit.Scale(this, 10);
-        int nameY = _density == Density.ExtraCompact ? rect.Y : rect.Y + UiKit.Scale(this, 2);
+        if (_density == Density.Gallery && rect.Width >= UiKit.Scale(this, 200)
+            && item.Snapshot?.MediaThumbnailUrl is { } url && _posters.TryGetValue(url, out var poster)
+            && poster is not null)
+        {
+            var frame = new Rectangle(icon.Left, rect.Top + (rect.Height - UiKit.Scale(this, 54)) / 2,
+                UiKit.Scale(this, 96), UiKit.Scale(this, 54));
+            double scale = Math.Min(frame.Width / (double)poster.Width, frame.Height / (double)poster.Height);
+            int imageWidth = Math.Max(1, (int)(poster.Width * scale));
+            int imageHeight = Math.Max(1, (int)(poster.Height * scale));
+            g.DrawImage(poster, new Rectangle(frame.X + (frame.Width - imageWidth) / 2,
+                frame.Y + (frame.Height - imageHeight) / 2, imageWidth, imageHeight));
+            x = frame.Right + UiKit.Scale(this, 10);
+        }
+        else
+        {
+            Color ink = item.Status == JobStatus.Missing ? _palette.Muted : VesperDrawing.Ink(glyph, _palette);
+            var state = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var rounded = VesperDrawing.Rounded(icon, UiKit.Scale(this, 5)))
+            using (var brush = new SolidBrush(_palette.HighContrast ? _palette.Surface : VesperDrawing.Mix(_palette.Surface, ink, 0.10f)))
+                g.FillPath(brush, rounded);
+            g.Restore(state);
+            VesperDrawing.Icon(g, glyph, Center(icon, UiKit.Scale(this, _density == Density.ExtraCompact ? 17 : 20)), ink);
+        }
+        int nameY = _density == Density.ExtraCompact ? rect.Y : rect.Y + UiKit.Scale(this, _density == Density.Gallery ? 20 : 2);
         int nameH = _density == Density.ExtraCompact ? rect.Height : UiKit.Scale(this, 22);
         var bounds = new Rectangle(x, nameY, Math.Max(1, rect.Right - x - pad), nameH);
         Draw(g, item.Name, _nameFont, item.Status == JobStatus.Missing ? _palette.Muted : _palette.Text,
@@ -329,31 +466,38 @@ public sealed class DownloadGrid : ScrollableControl
             g.DrawLine(line, x, bounds.Top + nameH / 2, Math.Min(bounds.Right, x + measured), bounds.Top + nameH / 2);
         }
         if (_density != Density.ExtraCompact)
-            Draw(g, item.FileType + " · " + item.Extension, _subFont, _palette.Muted,
+        {
+            string caption = item.FileType + " · " + item.Extension;
+            if (_density == Density.Gallery && item.Snapshot is { MediaProvider.Length: > 0 } media)
+                caption = media.MediaProvider + " · " + item.Extension
+                    + (string.IsNullOrWhiteSpace(media.MediaQuality) ? "" : " · " + MediaTransferBridge.DisplayQuality(media.MediaQuality));
+            Draw(g, caption, _subFont, _palette.Muted,
                 new Rectangle(x, nameY + nameH - UiKit.Scale(this, 2), bounds.Width, UiKit.Scale(this, 18)),
                 TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
+        }
     }
 
     private void PaintActivity(Graphics g, DownloadItem item, Rectangle rect, int pad)
     {
         var (label, icon, color) = item.Status switch
         {
-            JobStatus.Downloading => ("Downloading", VesperIcon.Download, _palette.Green),
+            JobStatus.Downloading => ("Downloading", VesperIcon.Download, _palette.MutedGreen),
             JobStatus.Paused => ("Paused", VesperIcon.Pause, _palette.Amber),
-            JobStatus.Queued => ("Queued", VesperIcon.Info, _palette.Muted),
-            JobStatus.Completed => ("Completed", VesperIcon.Check, _palette.Green),
+            JobStatus.Queued => ("Queued", VesperIcon.Layers, _palette.Muted),
+            JobStatus.Completed => ("Completed", VesperIcon.Check, _palette.MutedGreen),
             JobStatus.Missing => ("File missing", VesperIcon.Warning, _palette.Amber),
             JobStatus.NeedsLink => ("Needs link", VesperIcon.Warning, _palette.Red),
             JobStatus.Waiting => ("Waiting for network", VesperIcon.Info, _palette.Muted),
-            JobStatus.Verifying => ("Verifying", VesperIcon.Info, _palette.Green),
+            JobStatus.Verifying => ("Verifying", VesperIcon.Shield, _palette.MutedGreen),
             JobStatus.Resolving => ("Resolving", VesperIcon.Info, _palette.Muted),
             JobStatus.WaitingRetry => ("Waiting to retry", VesperIcon.Clock, _palette.Amber),
             JobStatus.NeedsAttention => ("Needs attention", VesperIcon.Warning, _palette.Red),
-            JobStatus.Processing => ("Finishing", VesperIcon.Info, _palette.Green),
+            JobStatus.Processing => ("Finishing", VesperIcon.Info, _palette.MutedGreen),
             JobStatus.Failed => ("Failed", VesperIcon.Warning, _palette.Red),
             JobStatus.Cancelled => ("Cancelled", VesperIcon.Info, _palette.Muted),
             _ => ("Suspect integrity", VesperIcon.Warning, _palette.Red)
         };
+        if (_palette.HighContrast) color = _palette.Text;
         bool progress = item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink
             or JobStatus.NeedsAttention or JobStatus.WaitingRetry or JobStatus.Waiting or JobStatus.Failed;
         int iconSize = UiKit.Scale(this, 14);
@@ -418,6 +562,16 @@ public sealed class DownloadGrid : ScrollableControl
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (_filePress is { } press)
+        {
+            if (e.Button != MouseButtons.Left) _filePress = null;
+            else if (!press.Threshold.Contains(e.Location))
+            {
+                _filePress = null;
+                if (CreateFileDrop(press.Item) is { } data) DoDragDrop(data, DragDropEffects.Copy);
+                return;
+            }
+        }
         var (row, column) = Hit(e.Location);
         if (row != _hoverRow)
         {
@@ -435,6 +589,7 @@ public sealed class DownloadGrid : ScrollableControl
         string tip = row >= 0 ? column switch
         {
             0 => "Select download",
+            1 when CanDragFile(_items[row]) => link ? "Click for details or drag the file" : "Drag the file to another app",
             1 when link => "Open download details",
             5 => "More actions",
             _ => ""
@@ -470,6 +625,7 @@ public sealed class DownloadGrid : ScrollableControl
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+        _filePress = null;
         var (row, col) = Hit(e.Location);
         if (e.Button == MouseButtons.Left) Focus();
         if (row < 0)
@@ -477,18 +633,63 @@ public sealed class DownloadGrid : ScrollableControl
             if (col == 0 && e.Button == MouseButtons.Left) CheckAllVisible();
             return;
         }
+        int previous = _focusRow;
         _focusRow = row;
+        if (previous != row)
+        {
+            Invalidate(RowRectangle(previous));
+            Invalidate(RowRectangle(row));
+        }
         DownloadItem item = _items[row];
         if (e.Button == MouseButtons.Right || e.Button == MouseButtons.Left && col == 5)
             MenuRequested?.Invoke(item, PointToScreen(e.Location));
         else if (e.Button == MouseButtons.Left && col == 0) Toggle(item);
-        else if (e.Button == MouseButtons.Left && col == 1 && e.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48))
-            DetailsRequested?.Invoke(item);
+        else if (e.Button == MouseButtons.Left && col == 1)
+        {
+            bool details = e.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48);
+            if (CanDragFile(item))
+            {
+                Size drag = SystemInformation.DragSize;
+                _filePress = (item, new Rectangle(e.X - drag.Width / 2, e.Y - drag.Height / 2, drag.Width, drag.Height), details);
+            }
+            else if (details) DetailsRequested?.Invoke(item);
+        }
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        var press = _filePress;
+        _filePress = null;
+        if (e.Button == MouseButtons.Left && press is { Details: true } file && file.Threshold.Contains(e.Location)
+            && ClientRectangle.Contains(e.Location) && Hit(e.Location) is (>= 0, 1) hit && _items[hit.row] == file.Item)
+            DetailsRequested?.Invoke(file.Item);
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        base.OnMouseCaptureChanged(e);
+        if (!Capture) _filePress = null;
+    }
+
+    private static bool CanDragFile(DownloadItem item) =>
+        item.Snapshot is { State: JobState.Completed, FileMissing: false, FinalPath.Length: > 0 };
+
+    private static DataObject? CreateFileDrop(DownloadItem item)
+    {
+        if (!CanDragFile(item) || item.Snapshot?.FinalPath is not { } path) return null;
+        FileCheck check = PathSafety.Inspect(path);
+        if (!check.Exists || check.IsDirectory) return null;
+
+        var data = new DataObject();
+        data.SetData(DataFormats.FileDrop, autoConvert: false, new[] { path });
+        return data;
     }
 
     protected override void OnMouseDoubleClick(MouseEventArgs e)
     {
         base.OnMouseDoubleClick(e);
+        _filePress = null;
         var (row, column) = Hit(e.Location);
         // The owner revalidates the path and only opens a genuinely completed, present file.
         if (e.Button == MouseButtons.Left && row >= 0 && column is not (0 or 5)) OpenRequested?.Invoke(_items[row]);
@@ -499,6 +700,9 @@ public sealed class DownloadGrid : ScrollableControl
         Keys.Up or Keys.Down or Keys.Home or Keys.End or Keys.PageUp or Keys.PageDown => true,
         _ => base.IsInputKey(keyData)
     };
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(RowRectangle(_focusRow)); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(RowRectangle(_focusRow)); }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
@@ -549,20 +753,25 @@ public sealed class DownloadGrid : ScrollableControl
         using var path = VesperDrawing.Rounded(new Rectangle(rect.X, rect.Y, rect.Width - 1, rect.Height - 1), 3);
         using (var fill = new SolidBrush(selected ? _palette.Green : _palette.Surface)) g.FillPath(fill, path);
         using (var border = new Pen(selected ? _palette.Green : _palette.MutedGreen)) g.DrawPath(border, path);
-        if (selected) VesperDrawing.Icon(g, VesperIcon.Check, Center(rect, Math.Max(8, rect.Width - 5)), Color.White);
+        if (selected) VesperDrawing.Icon(g, VesperIcon.Check, Center(rect, Math.Max(8, rect.Width - 5)), _palette.ActionInk);
         g.Restore(original);
     }
 
     private static void Draw(Graphics g, string text, Font font, Color color, Rectangle rect, TextFormatFlags flags)
     {
         if (rect.Width > 0 && rect.Height > 0 && text.Length > 0)
-            TextRenderer.DrawText(g, text, font, rect, color, flags | TextFormatFlags.NoPrefix);
+            TextRenderer.DrawText(g, text, font, rect, color,
+                flags | TextFormatFlags.NoPrefix | TextFormatFlags.PreserveGraphicsClipping);
     }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !IsDisposed)
         {
+            _posterLifetime.Cancel();
+            _posterLifetime.Dispose();
+            ClearPosters();
+            _emptyFont.Dispose();
             _tips.Dispose();
             _textFont.Dispose(); _headerFont.Dispose(); _nameFont.Dispose(); _subFont.Dispose();
         }

@@ -37,4 +37,37 @@ public sealed partial class DownloadEngine
         }
         return result;
     }
+
+    /// <summary>
+    /// Replacement links for an interrupted merge job (for example after signed URLs expired). Accepted only when every
+    /// track of the new plan is byte-identical by provider evidence (same role, format id, exact size, codec and
+    /// encoding identity such as YouTube itag + last-modified + content length). Then only the URLs change and the
+    /// committed bytes are continued; otherwise nothing on disk changes and the user is told to start a separate copy.
+    /// </summary>
+    public RescueResult RefreshMergePlan(Guid id, string replacementPlanJson, DateTimeOffset? expiresAt = null)
+    {
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
+            if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
+            if (job.State == JobState.Completed) return Rejected("The download is already complete.");
+            if (!MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out var current, out _))
+                return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
+            if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var next, out var error))
+                return Rejected(error);
+            if (!current.CanContinueWith(next, out var why)) return Rejected(why);
+            if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+            job.MediaPlanJson = next.ToJson();
+            job.SourceUrl = next.Tracks[0].Url;
+            job.MediaExpiresAt = expiresAt;
+            if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
+                (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
+            SaveLocked(job);
+            Changed(job);
+        }
+        FlushOutbox();
+        ScheduleNext();
+        return new RescueResult(true, RescueMode.R0, "The refreshed source matches the saved tracks byte-for-byte by provider identity. Download continues.", 0);
+    }
 }

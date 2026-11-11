@@ -1,115 +1,82 @@
-# VESPER — media-engine reliability update
+# VESPER Media Engine 3.0 — Engineering Report
 
-**Baseline:** `b0c5ac14877dc729280b5eb210123f23da6ae067`
-**Working branch:** `work/media-discovery-reliability`
-**Verification environment:** Linux x64, temporary .NET SDK 10.0.404, 2026-11-11.
+Branch: `media-engine-3.0` (based on verified `main` @ `fbf40a9c7ac23f975870e486a5bff903558ddc85`). Date of all live evidence: **2026-11-11**.
+Environment: Linux x86_64 sandbox, .NET SDK 10.0.404. **Windows was not available**: the WinForms app was only cross-compiled on Linux (`-p:EnableWindowsTargeting=true`), which is *not* Windows verification.
 
-This updates the actual existing C#/.NET 10 WinForms solution. It is an incremental implementation, **not a claim of completed yt-dlp parity or universal site compatibility**.
-The source ZIP contains the existing application, extension, native helper, SQLite engine, settings/history architecture, tests and release scripts with the changes below.
+## 1. Root cause of "title and thumbnail but no stream" (YouTube)
 
-## Root causes confirmed in source
+Measured live from this network on 2026-11-11:
 
-1. A failed YouTube adapter could fetch the same HTML again through the generic fallback. The fetched response is now reused within that call.
-2. Browser-observed candidates were considered only after a watch-page extraction attempt. Validated candidates now get the direct shared discovery path first.
-3. The discovery form waited for final resolution before starting known artwork. YouTube's fallback poster URL explained how a thumbnail could coexist with no playback result.
-   Metadata/progress events, independent early poster fetching, bounded image caching and background image decoding now separate those operations explicitly.
-4. Plain adaptive tracks could prevent trying a usable HLS alternative. HLS and DASH fallback are now considered when no complete source-muxed representation exists, with independent manifest requests run concurrently.
-5. Missing playback data was indistinguishable from genuinely absent media. YouTube now reports browser/playback-context, cipher/SABR, identity and access limitations accurately.
-6. DASH representations existed in the resolver but had no desktop transfer path. A supported clear fMP4 path now reaches the same engine, queue, persistence and finalization from native and browser entry points.
-7. HTTP concurrency permits covered headers, not response bodies. Permits now remain held through body consumption/disposal; thumbnail bodies and whole discovery have deadlines.
-8. HLS ignored unsafe range/discontinuity/init changes, and regression `.ts` payloads were arbitrary bytes. The engine now validates actual TS/fMP4 structures and fixtures contain generated media.
-9. Generic observed `video/mp4`/`video/webm` URLs did not prove audio presence. Media handoffs now check bounded track metadata before publication; ordinary HTTP downloads remain unaffected.
-10. A durable `Completed` record could be observed just before runner cleanup, causing an immediate remove action to race. Snapshots remain `Finalizing` until cleanup removes the active session.
+| Client / path | Result |
+|---|---|
+| Watch-page `ytInitialPlayerResponse` (the only path in 3.0's predecessor) | formats ciphered / server-ABR only → no usable URL |
+| `WEB` player API | `UNPLAYABLE` |
+| `TVHTML5`, `ANDROID_VR` | `LOGIN_REQUIRED` ("confirm you're not a bot") |
+| `IOS`, `ANDROID` | URLs returned, **first 1 MiB served, mid-file range → HTTP 403** (GVS proof-of-origin enforcement) |
+| `VISIONOS` + watch-page `visitorData` + `signatureTimestamp` | **OK, direct URLs up to 2160p60, full ranges served (206) at 10–45 MB/s, no `n` challenge** |
 
-## Implemented source changes
+In addition, `MediaTransferBridge.PlayableOnly` dropped every selection needing `MuxAudioVideo`, so even working adaptive (HD) formats could never be downloaded.
 
-### Discovery / performance
+## 2. What was implemented
 
-- Structured per-call timing and request measurements with no raw signed query strings in the measurement model.
-- Early metadata and source-format publication; known posters do not imply playback access.
-- Per-call scratch isolation, page reuse, direct adapter dispatch, browser-first observed candidate processing.
-- Complete cache keys, short successful metadata caching, expiry margin, exclusion of credential-bearing nested results.
-- Reused HTTP clients; body-level concurrency; explicit 35-second overall discovery deadline; caller cancellation remains distinct from timeout.
-- Independent thumbnail connection bound, deadline, 768 KiB response cap, pixel/dimension limits, eight-entry per-window cache and background decoding.
-- Native explicitly selected batches resolve up to four items concurrently while preserving selection order and partial failures.
-- Internet Archive derivative grouping uses the source's `original` identity instead of duplicating chapters by bitrate filename.
+**YouTube (`src/Vesper.MediaResolver/Extractors/YouTubeAdapter.cs`, `YouTubeClients.cs`)**
+- Layered pipeline: one watch-page request (metadata, captions, `VISITOR_DATA`, `STS`, consent handled with a youtube.com-scoped `SOCS=CAI` reject-all cookie) → ordered InnerTube client strategies (`ResolverOptions.YouTubeClients`, default `["visionos"]`) → watch-page fallback restricted to formats that need no player transform.
+- **Capability verification**: a strategy only wins after a 1-byte range probe near the end of one of its media URLs succeeds. This is what catches the "first MiB only" trap that produced false successes.
+- All client identifiers in one file; profiles document *why* `ios`/`android_vr` are not used (PO token / upstream 403) instead of silently trying them.
+- Error ladder that ranks facts about the video (DRM > region > login > live > unavailable > bot gate > rate limit > PO token > player-transform) above strategy/network noise, with a privacy-preserving strategy trail in `Diagnostic` (no signed URLs, cookies or tokens).
+- Format model: unique ids for DRC and multi-language tracks (`yt-140-drc-en.4`), HDR10/HLG from `colorInfo`, 360° flag, OTF/SABR/cipher/`n` formats counted and reported, **byte identity** `youtube:{id}:{itag}:{lmt}:{clen}` in the new `MediaRepresentation.ContentIdentity`.
+- Self-contained HLS alternative fetched **concurrently** with the byte probe when no muxed HTTP format exists.
+- Playlists: 2026 `lockupViewModel` entries and classic renderers; continuation through `youtubei/v1/browse`, bounded by `MaxCollectionItems`/`MaxCollectionPages`, honest `IsComplete`. URL forms: watch, `youtu.be`, Shorts, live, embed, `youtube-nocookie`, `music.youtube.com`.
+- No signature/n-challenge execution, no token manufacturing, no DRM/login/age bypass.
 
-### Correct transfer / recovery
+**Native remuxing (`src/Vesper.Engine/Media/Mux/`)** — pure C#, no dependencies, **remux only (never transcodes)**
+- `Mp4Demuxer`: progressive (stbl) and fragmented (moof/trun, all tfhd/trun flag combinations, default-base-is-moof, signed CTO), bounded moov/moof sizes, every sample range checked against the file, encrypted entries (`encv/enca/sinf`) rejected as DRM.
+- `WebmDemuxer`: EBML with known/unknown-size clusters, SimpleBlock/BlockGroup, lacing preserved, ContentEncodings (encryption/compression) rejected; only block headers are read.
+- `Mp4Muxer`: flat MP4 with **moov before mdat** (progressive playback), interleaved ~0.5 s chunks, stts/ctts(v1 for negative)/stss/stsc/stsz/stco→co64 when > 4 GiB, edit lists preserved, sample entries copied byte-for-byte (keeps avcC/av1C/esds/colr HDR metadata).
+- `MatroskaMuxer`: WebM/MKV with decode-order interleave, PTS timestamps (B-frames), keyframe-aligned clusters, Cues, SeekHead, Opus `CodecDelay`/`SeekPreRoll`.
+- `MediaMerger`: chooses the container from **actually demuxed** codecs (MP4: H.264/HEVC/AV1+AAC/MP3; WebM: VP8/VP9/AV1+Opus/Vorbis; otherwise MKV), refuses illegal requests (e.g. VP9 as `.mp4`), and **re-reads the output** to prove track count, codecs, per-track sample count, payload bytes and duration.
 
-- Versioned immutable DASH fMP4 plans, separate small transactional cursor, exact ordered fragments and byte-range checks.
-- Clear fMP4 structural checks: initialization, clear supported sample descriptions, track IDs/defaults, sample offsets, media ranges, fragment ordering, decode-time continuity and required populated tracks.
-- HLS master audio-group matching, ended VOD requirement, resolved redirect bases, proper implicit byte-range resource checks, complete init-map identity and explicit encrypted-map IV requirement.
-- MPEG-TS packet, clear-payload, CRC-checked PAT/PMT, single-program track/PES validation; raw AAC/discontinuity/mux-required cases are not disguised as valid TS.
-- Committed-prefix SHA-256 verification on resume; changed/legacy/unverifiable state stops without deleting data. HLS reconstructs TS state while hashing the existing prefix.
-- MP4/WebM audio-presence guard for HTTP media handoffs. Video-only observed files are retained as partials with an explanation, not published as silent successes.
-- On-demand original-page HTTP source refresh in Rescue: exact provider/media/format identities, then the existing trusted byte-identity rules. Fragment-plan refresh remains unavailable.
-- Additive SQLite migration 3; durable format ID and plan metadata; DPAPI protection of sensitive source state on Windows; collision-safe migration backups.
-- No-overwrite output publishing and finalization cancellation preserved. Recovery manifests retain streaming kind instead of incorrectly restoring fragments as ordinary HTTP jobs.
+**Merge job (`JobKind.Merge = 3`, `MergeTransfer.cs`, `MediaMergePlan.cs`)**
+- Tracks are downloaded into regions of the job's partial file with ≤ 8 MiB range requests (3 bounded workers) through the existing checkpoint pipeline → durable progress, pause/resume, crash recovery, per-chunk retries (3 attempts) and global/job rate limits are all reused.
+- After download: demux → remux to `.merging` → flush → validate → SHA-256 → atomic swap (tracks kept as `.tracks` sidecar) → commit cursor → existing no-overwrite `FinalizeAsync`. Sidecars are deleted only after publication. A crash between renames is reconciled on restart. A failed merge never deletes downloaded data; nothing is published unless validation passed.
+- Missing audio in an "audio" stream → `NeedsAttention: missing-audio`, nothing published (tested end-to-end).
+- **Expiring URLs**: `DownloadEngine.RefreshMergePlan` accepts a re-resolved plan only when every track's role, format id, exact size, codec and provider identity match (plan fingerprint deliberately excludes URLs); otherwise nothing on disk changes. No SQLite migration was needed (job kind is an integer; `MediaPlanJson` already existed).
+- Audio-only downloads with provider identity also use this job (chunked ranges, validated, normalised to flat M4A / WebM, no transcoding).
 
-### Integration / release
+**Shared path (desktop + extension)**: `MediaTransferBridge` (used by `Form1`, `BrowserBridgeHandler` and the live runner via a linked source file) is now capability-aware: video-only formats are offered only when a natively mergeable audio exists (`MergeCapability`, `FormatPreferences.NativeMergeOnly`); an exact video-only pick is paired with the preferred mergeable audio; merges with differing request contexts or unknown sizes are refused.
 
-- `MediaTransferBridge.cs` is shared by native and browser media selection and the developer transfer tool.
-- Existing branding/WinForms controls retained; no redesign, new downloader, JavaScript download engine or service.
-- XML docs fixed with exact constructor/method parameter names. Single-item xUnit assertions use `Assert.Single`, including its predicate overload; no analyzer suppression added.
-- Existing native-host/Chrome extension/installer registration logic preserved. No browser download takeover behavior was changed.
-- Release output/version checks and extension-test invocation hardened. Added source-only, no-overwrite packaging script and Windows CI for both .NET test projects and extension regressions.
-- See `reports/CHANGED_FILES.txt` for every modified/added source file.
+**Live runner**: `tools/Vesper.LiveCheck` + `tests/live/corpus.tsv` + `scripts/run-live.sh` (resolve → bridge → real engine job → VESPER validation → optional ffprobe/ffmpeg decode via `--ffmpeg-dir`; dev tools are never committed or bundled).
 
-## Verification actually executed
+## 3. Tests (all executed in this environment)
 
-| Check | Baseline run | Updated Release run |
-|---|---:|---:|
-| Engine tests | 161 passed | **211 passed, 2 Windows DPAPI tests skipped** |
-| Media resolver tests | 294 passed | **314 passed** |
-| Extension tests | 6 passed | **6 passed** |
-| Full solution cross-build | Baseline tests built their projects | **Succeeded, 0 warnings / 0 errors** |
-| Developer benchmark build | Built separately against the exact baseline | **Succeeded, 0 warnings / 0 errors** |
+| Suite | Before (baseline) | After |
+|---|---|---|
+| `Vesper.Tests` (engine) | 211 passed, 2 skipped | **221 passed, 0 failed, 2 skipped** (DPAPI tests are Windows-only) |
+| `Vesper.MediaResolver.Tests` | 314 passed | **322 passed, 0 failed** |
 
-The two skipped tests are not treated as passed. WinForms execution, DPAPI integration, installer/native registration and Windows CI execution remain unverified on this Linux host.
-Full build/test logs and TRX files are under `reports/validation`.
+New: 10 merge tests (real H.264/AAC/VP9/Opus CC0 fixtures, sample-by-sample payload equality, container legality, truncation/size corruption/random bytes/encrypted entries, plan identity/SSRF rules, two **end-to-end merge jobs through the real engine** incl. missing-audio refusal) and 8 YouTube strategy tests (session values, POST headers, single byte probe, no cookie leakage to googlevideo, PO-token trap, bot-gate ranking, continuation paging, URL forms, merge capability). Six existing YouTube tests were updated because the primary path changed from page-only to player API; their intent (page fetched once, Mix not enumerated, ciphered/challenge formats omitted, typed playability errors) is preserved and asserted.
 
-New coverage includes DASH assembly/ranges/invalid offsets/timelines, actual source-muxed tracks, media-track absence, TS program CRCs, HLS ranges/keys/groups, partial corruption and resume,
-expired links, media identity mismatch, file-link rescue rejection for streaming plans, cancellation, concurrent output collisions, body concurrency/deadlines, browser handoff, cache isolation and Archive duplicate grouping.
-Existing playlist pagination/quality fallback/missing-audio/security tests were retained. No separate-track muxing test is claimed because no muxer was added.
+## 4. Live results (details: `MEDIA_ENGINE_COMPATIBILITY.md`, raw: `reports/live/2026-11-11/`)
 
-## Live evidence
+Independently validated with ffprobe + ffmpeg 7.0.2 (full decode `-xerror`, or head 90 s + tail 60 s for files > 400 MB): standard 240p (AV1+AAC→MP4), `youtu.be`/Music audio (AAC→M4A), nocookie embed, **1080p60 H.264+AAC→MP4 (267.8 MB)**, **2160p60 VP9+AAC→MKV (1.37 GB)**, Spanish dubbed track (AAC→M4A), 3 Shorts (AV1+AAC→MP4, AV1+Opus→WebM), 96-minute completed livestream (H.264+AAC→MP4, 215.7 MB), PeerTube HLS→MP4, Bandcamp MP3, Internet Archive AVI.
 
-- **Mux public HLS:** five discovered qualities. A selected low-bandwidth stream completed (22,418,060 bytes) and the resulting H.264/AAC file fully decoded with an independent current FFmpeg tool.
-- **Akamai public DASH:** nine deduplicated representations. The selectable complete audio stream completed (5,278,733 bytes) and independently probed/decoded as AAC/M4A.
-- **Internet Archive public-domain LibriVox collection:** 12 chapters enumerated; exactly two explicitly selected items queued, no media bodies downloaded during that check.
-  Metadata was available at ~365 ms; thumbnail bytes at ~533 ms, without blocking enumeration (~387 ms).
-- **YouTube:** three actual .NET attempts returned `BrowserContextRequired`; no live YouTube media success claimed. A separate curl path returned HTTP 403.
-- **Vimeo:** the tested URL returned `DrmProtected` from the resolver, without a successful transfer. This is not an independent DRM diagnosis.
-- The first isolated FFmpeg 7.0.2 TS validation tool crashed. Its failure is recorded; a different current build subsequently probed and fully decoded the identical output successfully.
+Success on the defined supported set (YouTube VOD/Shorts/collections, PeerTube, Bandcamp, Internet Archive, podcast RSS, Vimeo): **18 / 20 = 90 %** — below the 95 % target. Failures: YouTube Mix (watch pages no longer embed the Mix panel; needs the `next` endpoint) and Vimeo (reported DRM; unverified whether a clear rendition exists).
 
-Exact URLs, raw results and tested scope are in `MEDIA_ENGINE_COMPATIBILITY.md` and `reports/benchmarks`.
+## 5. VESPER vs yt-dlp 2026.10.26 (same machine, network, formats; yt-dlp without a JS runtime = its `visionos`-only mode)
 
-## Measured speed, not marketing
+| Scenario | VESPER wall (median of 3) | yt-dlp wall (median of 3) | VESPER peak RSS | yt-dlp peak RSS* | Output |
+|---|---|---|---|---|---|
+| Big Buck Bunny 1080p60, itags 299+140 (268 MB) | **4.46 s** (5.91/3.48/4.46) | **18.40 s** (13.64/33.20/18.40) | 113–124 MiB | 60–62 MiB | both h264 1920×1080@60 + aac, duration 634.62 s |
+| NASA Short, 788+140 (5.3 MB) | **2.44 s** (2.05/5.46/2.44) | **5.16 s** (5.16/6.81/3.72) | 102–110 MiB | 74–79 MiB | both AV1+AAC |
 
-With a deterministic 40 ms-per-request fixture, browser-assisted discovery changed from two requests / **81.42 ms median** to one request / **40.78 ms median** across 20 cold-resolver samples.
-The missing-player fallback also dropped from two requests to one, but remained a failure, not a manufactured success.
-Public HLS/DASH discovery succeeded; real-network variation, JIT and cache effects are reported separately in `reports/BENCHMARKS.md`.
-No current yt-dlp executable timing was run; **no faster-than-yt-dlp claim is made**.
+\*largest process in the measured tree (`scripts/measure.py`, `RUSAGE_CHILDREN`). VESPER uses 3 parallel range workers; yt-dlp used its defaults (one connection per track) plus ffmpeg for merging. Network variance is large (yt-dlp 13.6–33.2 s). VESPER's discovery took ~0.4–2.1 s with 5 requests (page, player API, byte probe, HLS master/media). **VESPER used ~1.5–2× more memory.** A first comparison run was invalid (my harness mangled multi-audio itags) and is archived, not used.
 
-## Dependencies and research
+## 6. Requires integration review
+- `Vesper.Engine`: new `JobKind.Merge`, `MergeTransfer`, `RefreshMergePlan`, sidecar cleanup in `RestartFromScratch`, add-time plan validation.
+- `MediaTransferBridge.cs` behaviour change (HD YouTube now produces merge jobs; YouTube audio-only now produces single-track merge jobs).
+- UI: no UI files changed. `RescueForm` still calls `RefreshMediaSourceAsync` (HTTP jobs only); wiring merge-job refresh into the UI (`RefreshMergePlan`) is left to the UI owner.
+- `SecureHttpClient.PostJsonAsync`/`ProbeRangeAsync` (same validated path as GET).
+- `tests/Vesper.Tests/TestSupport.cs`: `FaultServer.Extra` payload registry.
 
-**New application/runtime dependencies: none.** No Python, yt-dlp executable/package, FFmpeg, Chromium, Electron, service or new native-language source project was added.
-Existing NuGet references/versions are retained. DPAPI uses the Windows OS API. The console benchmark references the existing two C# libraries and is not launched by the app.
-Temporary SDK/FFmpeg tools were installed outside the deliverable solely for compiling, fixture generation and independent validation; their binaries are not in the ZIP.
-
-Real yt-dlp source was inspected at commit `412e7f0a4b0588fe884a02b344ac66a06538475b`, including `YoutubeDL.py`, extractor dispatch, YouTube player/format/token handling,
-TikTok rehydration, Instagram access handling and common HLS/DASH parsers. It informed lazy dispatch, phase separation, precise failures and explicit post-processing capability checks.
-No extractor code was copied or mechanically translated; no yt-dlp dependency or runtime was introduced. Existing repository licensing was not replaced.
-
-## Remaining work
-
-Read `MEDIA_ENGINE_LIMITATIONS.md` before treating this as production-complete. In particular: no general separate-track muxer, live YouTube not resolved here, no signature/n/SABR solution,
-no large YouTube continuation/channel implementation, no signed-fragment-plan refresh, no native subtitle downloading, and no added Instagram/Facebook/X/Twitch/SoundCloud adapters.
-The existing library ranking supports more preferences than the compact native UI exposes; advanced language/HDR/frame-rate/subtitle controls were not expanded in this update.
-
-## Local Windows validation
-
-1. Build `VESPER.slnx` with .NET 10 and run `scripts/Run-Tests.ps1`. The two DPAPI cases run on Windows rather than skip.
-2. Exercise the actual WinForms discovery, cancellation, Rescue and extension/native-host handoff with media you are authorized to access.
-3. Use `scripts/Build-Release.ps1` for normal tested Windows packaging; existing outputs are never silently removed.
-4. `scripts/Package-Source.ps1` (PowerShell 7) creates a filtered source ZIP without build output or external runtimes.
+## 7. Smallest next actions
+1. Mix/radio via InnerTube `next` (bounded snapshot). 2. Vimeo DRM report investigation. 3. Merge-job refresh wiring in UI. 4. Optional, explicitly approved JS evaluator (e.g. Jint, pure managed, BSD-2) for signature/n challenges — this is what "made for kids" videos and non-visionOS clients need; not added without approval. 5. Live HLS capture. 6. Windows run of the full suite and a packaged build.

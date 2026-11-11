@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
+    <UseAppHost>true</UseAppHost>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
@@ -22,15 +23,24 @@
 
   <!-- The engine, native host, tests and extension live in subfolders and have their own projects. -->
   <ItemGroup>
-    <Compile Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
-    <EmbeddedResource Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
-    <None Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
+    <Compile Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
+    <EmbeddedResource Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
+    <None Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Assets\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\VESPER-Illustrated.ico;Assets\VESPER-Light.ico;Assets\VESPER-Dark.ico;Assets\VESPER-Illustrated-256.png;Assets\moth-mark-transparent-64.png;Assets\moth-mark-transparent-96.png;Assets\header-branch-light-720x288.png;Assets\header-branch-dark-720x288.png;Assets\Botanical\butterfly.png;Assets\Botanical\empty-hero.png;Assets\Botanical\header.png;Assets\Botanical\sprig.png;Assets\Botanical\hills-left.png;Assets\Botanical\hills.png" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="src\Vesper.Engine\Vesper.Engine.csproj" />
     <ProjectReference Include="src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />
+    <ProjectReference Include="src\Vesper.NativeHost\Vesper.NativeHost.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <Target Name="CopyDevelopmentBrowserHelper" AfterTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT' and '$(RuntimeIdentifier)' == '' and '$(DesignTimeBuild)' != 'true'">
+    <ItemGroup>
+      <DevelopmentHelper Include="src\Vesper.NativeHost\bin\$(Configuration)\net10.0\vesper-host.exe;src\Vesper.NativeHost\bin\$(Configuration)\net10.0\vesper-host.dll;src\Vesper.NativeHost\bin\$(Configuration)\net10.0\vesper-host.deps.json;src\Vesper.NativeHost\bin\$(Configuration)\net10.0\vesper-host.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DevelopmentHelper)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

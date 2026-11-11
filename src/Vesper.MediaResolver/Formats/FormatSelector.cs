@@ -30,11 +30,13 @@ public static class FormatSelector
 
     private sealed class Combo
     {
-        public Combo(MediaRepresentation v, MediaRepresentation? a, string? preferredContainer)
+        public Combo(MediaRepresentation v, MediaRepresentation? a, string? preferredContainer, bool nativeMerge = false)
         {
             V = v;
             A = a;
-            Container = a is null ? v.Container : CodecInfo.ChooseMuxContainer(v.VideoCodec, a.AudioCodec, preferredContainer);
+            Container = a is null ? v.Container
+                : nativeMerge ? MergeCapability.MergeContainer(v, a, preferredContainer)
+                : CodecInfo.ChooseMuxContainer(v.VideoCodec, a.AudioCodec, preferredContainer);
         }
 
         public MediaRepresentation V { get; }
@@ -61,8 +63,9 @@ public static class FormatSelector
             if (audios.Count == 0) combos.Add(new Combo(v, null, p.Container));          // source genuinely has no audio stream
             else if (p.AllowMuxing)
             {
-                var a = PickAudio(audios, p, v);
-                if (a is not null) combos.Add(new Combo(v, a, p.Container));
+                var pool = p.NativeMergeOnly ? audios.Where(x => MergeCapability.MergeContainer(v, x) is not null).ToList() : audios;
+                var a = pool.Count == 0 ? null : PickAudio(pool, p, v);
+                if (a is not null) combos.Add(new Combo(v, a, p.Container, p.NativeMergeOnly));
             }
         }
 

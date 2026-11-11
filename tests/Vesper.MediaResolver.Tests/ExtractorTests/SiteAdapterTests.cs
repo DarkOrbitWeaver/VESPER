@@ -340,8 +340,37 @@ public class SiteAdapterTests
 
     private const string MixUrl = "https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k&start_radio=1&pp=oAcB";
 
-    private static FakeHttpHandler YtServer() => new FakeHttpHandler()
-        .AddFile("https://www.youtube.com/watch?v=EK3tCffac5k", "youtube_watch.html", "text/html");
+    private const string PlayerApi = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+    private static readonly long YtExpiry = DateTimeOffset.UtcNow.AddHours(6).ToUnixTimeSeconds();
+    private static string YtMediaUrl(int itag, long size) => $"https://rr1---sn-fixture.googlevideo.com/videoplayback?expire={YtExpiry}&itag={itag}&clen={size}";
+
+    private static string YtFormat(int itag, string mime, long size, int? height = null, string extra = "", string? url = null) =>
+        $"{{\"itag\":{itag},\"url\":\"{url ?? YtMediaUrl(itag, size)}\",\"mimeType\":\"{mime.Replace("\"", "\\\"")}\",\"contentLength\":\"{size}\",\"lastModified\":\"170000000000000{itag % 10}\""
+        + (height is null ? "" : $",\"height\":{height},\"width\":{height * 16 / 9},\"fps\":30") + extra + "}";
+
+    /// <summary>InnerTube player answer (visionOS strategy): 5 usable formats, one ciphered, one carrying the n challenge.</summary>
+    private static readonly string YtApiPlayer =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},\"videoDetails\":{\"videoId\":\"EK3tCffac5k\",\"title\":\"Fixture Video\",\"lengthSeconds\":\"212\",\"author\":\"Fixture Channel\"},\"streamingData\":{\"adaptiveFormats\":["
+        + string.Join(",",
+            YtFormat(401, "video/mp4; codecs=\"av01.0.12M.08\"", 900, 2160),
+            YtFormat(137, "video/mp4; codecs=\"avc1.640028\"", 800, 1080),
+            YtFormat(248, "video/webm; codecs=\"vp9\"", 700, 1080),
+            YtFormat(140, "audio/mp4; codecs=\"mp4a.40.2\"", 300, extra: ",\"audioChannels\":2,\"audioSampleRate\":\"44100\""),
+            YtFormat(251, "audio/webm; codecs=\"opus\"", 250, extra: ",\"audioChannels\":2,\"audioSampleRate\":\"48000\""),
+            "{\"itag\":299,\"signatureCipher\":\"s=abc&url=https%3A%2F%2Fexample.com\",\"mimeType\":\"video/mp4; codecs=\\\"avc1.64002a\\\"\",\"height\":1080}",
+            YtFormat(136, "video/mp4; codecs=\"avc1.4d401f\"", 600, 720, url: "https://rr1---sn-fixture.googlevideo.com/videoplayback?expire=4102444800&itag=136&n=abcdef"))
+        + "]}}";
+
+    private static FakeHttpHandler YtServer()
+    {
+        var h = new FakeHttpHandler()
+            .AddFile("https://www.youtube.com/watch?v=EK3tCffac5k", "youtube_watch.html", "text/html")
+            .Add(PlayerApi, YtApiPlayer, "application/json");
+        foreach (var (itag, size) in new[] { (401, 900L), (137, 800L), (248, 700L), (140, 300L), (251, 250L) })
+            h.AddMedia(YtMediaUrl(itag, size), "video/mp4", (int)size);
+        return h;
+    }
 
     private static string YtPage(string playerJson) => "<html><script>var ytInitialPlayerResponse = " + playerJson + ";</script></html>";
 
@@ -353,7 +382,8 @@ public class SiteAdapterTests
 
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
         var item = res.Item!;
-        Assert.Single(h.Requests);                                          // the mix is NOT enumerated
+        Assert.Equal(1, h.Count("watch?v=EK3tCffac5k"));                    // the watch page is fetched once
+        Assert.DoesNotContain(h.Requests, r => r.Url.AbsoluteUri.Contains("list=") || r.Url.AbsolutePath.EndsWith("/browse")); // the mix is NOT enumerated
         Assert.Equal("EK3tCffac5k", item.MediaId);
         Assert.Equal("Fixture Video", item.Title);
         Assert.Equal(TimeSpan.FromSeconds(212), item.Duration);
@@ -362,10 +392,12 @@ public class SiteAdapterTests
         Assert.True(item.Related.IsDynamic);
         Assert.Equal("RDEK3tCffac5k", item.Related.Id);
 
-        Assert.Equal(5, item.Representations.Count);                        // signatureCipher format omitted, not faked
-        Assert.DoesNotContain(item.Representations, r => r.Id == "yt-299");
+        Assert.Equal(5, item.Representations.Count);                        // ciphered and n-challenge formats omitted, not faked
+        Assert.DoesNotContain(item.Representations, r => r.Id is "yt-299" or "yt-136");
         Assert.Contains(res.Notes, n => n.Contains("signature"));
         Assert.Contains(res.Notes, n => n.Contains("throttl"));
+        Assert.Contains(res.Notes, n => n.Contains("'visionos'"));
+        Assert.All(item.Representations, r => Assert.StartsWith("youtube:EK3tCffac5k:", r.ContentIdentity));
         Assert.Equal(4, item.Chapters.Count);
         Assert.Equal(TimeSpan.FromSeconds(212), item.Chapters[^1].End);
         Assert.Equal(2, item.Subtitles.Count);

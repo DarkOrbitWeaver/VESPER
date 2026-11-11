@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing.Drawing2D;
 using static VESPER.MediaTransferBridge;
 using Vesper.Engine;
 using Vesper.MediaResolver.Core;
@@ -25,9 +26,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly SecureHttpClient _thumbnails = new(new ResolverOptions { MaxConcurrentRequests = 1 });
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Panel _body;
+    private readonly Panel _canvas;
     private readonly Panel _footer;
+    private readonly Label _heading;
+    private readonly Font _headingFont;
     private readonly Panel _posterFrame;
-    private readonly PictureBox _poster;
+    private Bitmap? _poster;
     private readonly Label _title;
     private readonly Label _source;
     private readonly Label _status;
@@ -44,6 +48,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperButton _viewPage;
     private readonly VesperButton _cancel;
     private readonly List<MediaRepresentation> _playableFormats = [];
+    private readonly Panel _presetOptions;
+    private readonly List<MediaQualityOption> _presets = [];
+    private readonly MediaItem? _sample;
 
     private MediaItem? _item;
     private List<CollectionEntry>? _collection;
@@ -51,6 +58,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private bool _busy;
     private bool _truncated;
     private bool _hasMetadata;
+    private bool _arranging;
+    private int _presetIndex;
     private CancellationTokenSource? _attempt;
     private CancellationTokenSource? _posterLoad;
     private Uri? _posterUrl;
@@ -59,46 +68,43 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     public IReadOnlyList<MediaDownloadChoice> Selections { get; private set; } = [];
     public bool QueueOnly { get; private set; }
 
-    public MediaDiscoveryForm(VesperPreferences preferences, Uri url)
+    public MediaDiscoveryForm(VesperPreferences preferences, Uri url, MediaItem? sample = null)
     {
         _url = url;
+        _sample = sample;
         _colors = UiKit.Palette(preferences);
         VesperWindowChrome.Brand(this);
         Text = "Discover media — VESPER";
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(650, 366 + VesperDialogChrome.HeaderHeight);
-        MinimumSize = new Size(540, 310 + VesperDialogChrome.HeaderHeight);
         Font = new Font("Segoe UI", 9F);
         BackColor = _colors.Surface;
         ForeColor = _colors.Text;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
 
-        _body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
+        _body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface, AutoScroll = true, TabIndex = 0 };
+        _canvas = new Panel { Dock = DockStyle.Top, BackColor = _colors.Surface };
+        _body.Controls.Add(_canvas);
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
         _footer.Paint += (_, e) =>
         {
-            using var line = new Pen(_colors.Border);
+            using var line = new Pen(_colors.Divider);
             e.Graphics.DrawLine(line, 0, 0, _footer.Width, 0);
         };
 
-        var heading = L("Find media", 17, bold: true);
-        heading.SetBounds(24, 19, 560, 34);
-        _body.Controls.Add(heading);
-
-        _posterFrame = new VesperPanel { BackColor = _colors.Secondary };
-        _posterFrame.Paint += (_, e) =>
+        _headingFont = UiKit.Heading(_colors, 18);
+        _heading = new Label
         {
-            using var pen = new Pen(_colors.Border);
-            e.Graphics.DrawRectangle(pen, 0, 0, _posterFrame.Width - 1, _posterFrame.Height - 1);
-            if (_poster?.Image is null)
-                VesperDrawing.Icon(e.Graphics, VesperIcon.Video,
-                    new Rectangle((_posterFrame.Width - 27) / 2, (_posterFrame.Height - 27) / 2, 27, 27), _colors.MutedGreen);
+            Text = "Find media", Font = _headingFont, ForeColor = _colors.Text,
+            TextAlign = ContentAlignment.MiddleLeft
         };
-        _poster = new PictureBox { Dock = DockStyle.Fill, BackColor = Color.Transparent, SizeMode = PictureBoxSizeMode.Zoom, TabStop = false, Visible = false };
-        _posterFrame.Controls.Add(_poster);
-        _body.Controls.Add(_posterFrame);
+        _canvas.Controls.Add(_heading);
+
+        _posterFrame = new VesperPanel { BackColor = _colors.Surface, AccessibleName = "Media thumbnail", TabStop = false };
+        _posterFrame.Paint += (_, e) => PaintPoster(e.Graphics);
+        _canvas.Controls.Add(_posterFrame);
 
         _title = L("Checking link…", 11, bold: true);
         _title.AutoEllipsis = true;
@@ -109,26 +115,41 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _notice = L("", 8.5f, muted: true);
         _notice.TextAlign = ContentAlignment.TopLeft;
         _notice.AutoEllipsis = false;
-        _body.Controls.AddRange([_title, _source, _status, _notice]);
+        _canvas.Controls.AddRange([_title, _source, _status, _notice]);
 
         _viewPage = B("View original", 128, symbol: VesperIcon.Link, quiet: true);
+        _viewPage.TextAlign = ContentAlignment.MiddleLeft;
         _viewPage.Click += (_, _) => OpenOriginal();
-        _body.Controls.Add(_viewPage);
+        _canvas.Controls.Add(_viewPage);
 
         _qualityLabel = L("Quality", 9, bold: true);
-        _quality = new VesperChoice { Width = 370, Height = 34 };
+        _quality = new VesperChoice { AccessibleName = "Playlist quality", Symbol = VesperIcon.Quality };
         _quality.ApplyPalette(_colors);
-        _quality.SetItems("Best available with audio", "Balanced", "Smallest suitable", "Audio only", "Custom format…");
-        _quality.SelectedIndexChanged += (_, _) => UpdateQualityUi();
+        _quality.SetItems("Best available with audio", "Balanced", "Smallest suitable", "Audio only");
         _customLabel = L("Exact available format", 8.5f, muted: true);
-        _customFormat = new VesperChoice { Width = 572, Height = 34 };
+        _customFormat = new VesperChoice { AccessibleName = "Exact format", Symbol = VesperIcon.Layers };
         _customFormat.ApplyPalette(_colors);
         _customFormat.SelectedIndexChanged += (_, _) => UpdateChoiceSummary();
-        _body.Controls.AddRange([_qualityLabel, _quality, _customLabel, _customFormat]);
+        _canvas.Controls.AddRange([_qualityLabel, _quality, _customLabel, _customFormat]);
+        _presetOptions = new Panel { BackColor = _colors.Surface, Visible = false, TabIndex = 3 };
+        (string Title, VesperIcon Icon)[] presets =
+        [
+            ("Best quality", VesperIcon.Crown), ("Balanced", VesperIcon.Quality), ("Smallest", VesperIcon.Leaf),
+            ("Audio only", VesperIcon.Audio), ("More formats", VesperIcon.Layers)
+        ];
+        for (int i = 0; i < presets.Length; i++)
+        {
+            var (title, icon) = presets[i];
+            var option = new MediaQualityOption(title, icon, _colors) { TabIndex = i };
+            _presets.Add(option);
+            _presetOptions.Controls.Add(option);
+        }
+        _presets[0].Checked = true;
+        _canvas.Controls.Add(_presetOptions);
 
         _collectionButton = B("Browse playlist", 152, VesperIcon.Queue);
         _collectionButton.Click += async (_, _) => await LoadCollectionAsync();
-        _body.Controls.Add(_collectionButton);
+        _canvas.Controls.Add(_collectionButton);
 
         _entries = new CheckedListBox
         {
@@ -137,7 +158,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Font = new Font("Segoe UI", 9), IntegralHeight = false, HorizontalScrollbar = true
         };
         _entries.ItemCheck += (_, _) => BeginInvoke(() => UpdateCollectionActions());
-        _body.Controls.Add(_entries);
+        _canvas.Controls.Add(_entries);
 
         _cancel = B("Cancel", 88);
         _cancel.DialogResult = DialogResult.Cancel;
@@ -148,8 +169,17 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _download.Click += async (_, _) => await MakeSelectionsAsync(queueOnly: false);
         _retry.Click += async (_, _) => await DiscoverAsync();
         _footer.Controls.AddRange([_cancel, _queue, _download, _retry]);
+        for (int i = 0; i < _presets.Count; i++)
+        {
+            int index = i;
+            _presets[i].CheckedChanged += (_, _) =>
+            {
+                if (_presets[index].Checked) SelectPreset(index);
+            };
+        }
 
         _body.Resize += (_, _) => LayoutBody();
+        _canvas.Resize += (_, _) => LayoutBody();
         _footer.Resize += (_, _) => LayoutFooter();
         Controls.Add(_body);
         Controls.Add(_footer);
@@ -157,11 +187,23 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         CancelButton = _cancel;
         AcceptButton = _download;
         Render(ViewState.Inspecting);
-        Shown += async (_, _) => await DiscoverAsync();
-        FormClosing += (_, _) => { _lifetime.Cancel(); _attempt?.Cancel(); _posterLoad?.Cancel(); };
-        FormClosed += (_, _) =>
+        Shown += async (_, _) =>
         {
-            _poster.Image?.Dispose();
+            FitToContent();
+            if (_sample is null) { await DiscoverAsync(); return; }
+            SetBusy(true, "Checking available media…");
+            await Task.Yield();
+            if (IsDisposed || _lifetime.IsCancellationRequested) return;
+            DisplayItem(_sample);
+            SetBusy(false);
+        };
+        DpiChanged += (_, _) => BeginInvoke(() => { if (!IsDisposed) FitToContent(); });
+        FormClosing += (_, _) => { _lifetime.Cancel(); _attempt?.Cancel(); _posterLoad?.Cancel(); };
+        Disposed += (_, _) =>
+        {
+            _lifetime.Cancel();
+            _poster?.Dispose();
+            _headingFont.Dispose();
             _resolver.Dispose();
             _thumbnails.Dispose();
             _attempt?.Dispose();
@@ -186,7 +228,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private Label L(string text, float size, bool bold = false, bool muted = false) => new()
     {
-        Text = text, AutoSize = false, BackColor = Color.Transparent,
+        Text = text, AutoSize = false,
         ForeColor = muted ? _colors.Muted : _colors.Text,
         Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
         TextAlign = ContentAlignment.MiddleLeft
@@ -201,53 +243,108 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private void LayoutBody()
     {
-        int width = _body.ClientSize.Width;
-        if (width < 200) return;
-        _posterFrame.SetBounds(24, 68, 126, 79);
-        _title.SetBounds(167, 70, Math.Max(80, width - 195), 27);
-        _source.SetBounds(167, 99, Math.Max(80, width - 195), 19);
-        _viewPage.SetBounds(159, 122, 146, 30);
-        _status.SetBounds(24, 167, width - 48, _state is ViewState.Unavailable ? 70 : 40);
-        _qualityLabel.SetBounds(24, 207, width - 48, 22);
-        _quality.SetBounds(24, 231, width - 48, 34);
-        _customLabel.SetBounds(24, 272, width - 48, 20);
-        _customFormat.SetBounds(24, 295, width - 48, 34);
-        _collectionButton.SetBounds(24, 278, 162, 34);
-        _entries.SetBounds(24, 318, width - 48, Math.Max(88, _body.ClientSize.Height - 374));
-        _notice.SetBounds(24, _state is ViewState.Collection ? _body.ClientSize.Height - 48 :
-            _state is ViewState.Ready ? (_customFormat.Visible ? 339 : 280) : 239,
-            width - 48, 43);
+        if (_arranging || _body.ClientSize.Width < S(150)) return;
+        _arranging = true;
+        try
+        {
+            _canvas.Height = S(BodyHeight());
+            int width = _canvas.ClientSize.Width;
+            int margin = S(24), contentWidth = Math.Max(1, width - 2 * margin);
+            void Place(Control control, int x, int y, int w, int h) =>
+                control.SetBounds(x, S(y), Math.Max(1, w), S(h));
+
+            int posterWidth = S(width < S(480) ? 104 : 132);
+            int textLeft = margin + posterWidth + S(17);
+            int titleWidth = width - margin - textLeft;
+            Place(_heading, margin, 13, contentWidth, 38);
+            Place(_posterFrame, margin, 60, posterWidth, 74);
+            Place(_title, textLeft, 60, titleWidth, 28);
+            Place(_source, textLeft, 88, titleWidth, 19);
+            Place(_viewPage, textLeft - S(13), 108, Math.Min(S(145), titleWidth), 28);
+
+            bool playlist = _state == ViewState.Ready && _item?.Related is not null;
+            int statusWidth = contentWidth - (playlist ? S(172) : 0);
+            Place(_status, margin, 153, statusWidth, _state == ViewState.Unavailable ? 57 : 34);
+            Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
+            Place(_qualityLabel, margin, 185, contentWidth, 22);
+            Place(_quality, margin, 211, contentWidth, 34);
+            Place(_entries, margin, 256, contentWidth, 152);
+            Place(_presetOptions, margin, 211, contentWidth, 181);
+            for (int i = 0; i < _presets.Count; i++)
+                _presets[i].SetBounds(0, S(i * 37), contentWidth, S(i < 4 ? 37 : 33));
+            Place(_customLabel, margin, 398, contentWidth, 18);
+            Place(_customFormat, margin, 419, contentWidth, 34);
+            int noticeY = _state switch
+            {
+                ViewState.Ready => IsExactFormat ? 464 : 402,
+                ViewState.Collection => 417,
+                ViewState.Unavailable => 213,
+                _ => 191
+            };
+            Place(_notice, margin, noticeY, contentWidth, 40);
+        }
+        finally { _arranging = false; }
     }
+
+    private int S(int logicalPixels) => UiKit.Scale(this, logicalPixels);
 
     private void LayoutFooter()
     {
         int width = _footer.ClientSize.Width;
-        _cancel.SetBounds(24, 13, 88, 35);
-        _download.SetBounds(width - 24 - 130, 13, 130, 35);
-        _queue.SetBounds(_download.Left - 8 - 122, 13, 122, 35);
-        _retry.SetBounds(width - 24 - 122, 13, 122, 35);
+        int margin = S(width < S(430) ? 12 : 24), y = S(13), height = S(35);
+        _cancel.SetBounds(margin, y, S(88), height);
+        _download.SetBounds(width - margin - S(130), y, S(130), height);
+        _queue.SetBounds(_download.Left - S(8 + 122), y, S(122), height);
+        _retry.SetBounds(width - margin - S(122), y, S(122), height);
+    }
+
+    private bool IsExactFormat => _state == ViewState.Ready && _presetIndex == 4;
+
+    private int BodyHeight() => _state switch
+    {
+        ViewState.Ready => IsExactFormat ? 510 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448,
+        ViewState.Collection => 464,
+        ViewState.Unavailable => 260,
+        _ => 214
+    };
+
+    private void FitToContent()
+    {
+        Rectangle work = Screen.FromControl(Visible ? this : Owner ?? this).WorkingArea;
+        int inset = S(12);
+        int desiredHeight = S(BodyHeight()) + _footer.Height + VesperDialogChrome.VerticalInset(this);
+        int height = Math.Min(desiredHeight, Math.Max(1, work.Height - 2 * inset));
+        int width = Math.Min(ClientSize.Width, Math.Max(1, work.Width - 2 * inset));
+        if (ClientSize != new Size(width, height)) ClientSize = new Size(width, height);
+        if (Visible && work.IntersectsWith(Bounds))
+        {
+            int x = Math.Clamp(Left, work.Left, Math.Max(work.Left, work.Right - Width));
+            int y = Math.Clamp(Top, work.Top, Math.Max(work.Top, work.Bottom - Height));
+            if (Location != new Point(x, y)) Location = new Point(x, y);
+        }
+        LayoutBody();
+        LayoutFooter();
     }
 
     private void Render(ViewState state)
     {
+        if (_state != state) _body.AutoScrollPosition = Point.Empty;
         _state = state;
         bool ready = state is ViewState.Ready;
         bool list = state is ViewState.Collection;
-        _qualityLabel.Visible = _quality.Visible = ready || list;
+        _qualityLabel.Visible = ready || list;
+        _quality.Visible = list;
+        _presetOptions.Visible = ready;
         _collectionButton.Visible = ready && _item?.Related is not null;
         _entries.Visible = list;
         _download.Visible = _queue.Visible = ready || list;
         _retry.Visible = state == ViewState.Unavailable;
         _cancel.Text = state == ViewState.Unavailable ? "Close" : "Cancel";
         _viewPage.Visible = !list;
+        _notice.Visible = state != ViewState.Inspecting;
         UpdateQualityUi();
-        // A smaller failure window eliminates the dead, misleading blank area.
-        int bodyHeight = list ? 484 : ready ? (_customFormat.Visible ? 383 : 325) : state == ViewState.Unavailable ? 286 : 276;
-        int desired = bodyHeight + _footer.Height + VesperDialogChrome.HeaderHeight + 2;
-        if (ClientSize.Height != desired) ClientSize = new Size(ClientSize.Width, desired);
-        LayoutBody();
-        LayoutFooter();
-        SetButtonsEnabled(ready && _playableFormats.Count > 0 || list && _entries.CheckedIndices.Count > 0);
+        FitToContent();
+        if (!ready) SetButtonsEnabled(list && _entries.CheckedIndices.Count > 0);
     }
 
     private async Task DiscoverAsync()
@@ -293,13 +390,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, attempt), attempt);
             if (_lifetime.IsCancellationRequested || IsDisposed) return;
             if (result.Item is { } item)
-            {
-                _item = item;
-                _title.Text = string.IsNullOrWhiteSpace(item.Title) ? "Media source" : item.Title;
-                _source.Text = $"{item.Provider}" + (item.Duration is { } d ? $"  ·  {d:hh\\:mm\\:ss}" : "");
-                _ = LoadThumbnailAsync(item.Thumbnail);
-                UpdatePlayableFormats(item);
-            }
+                DisplayItem(item);
             else if (result.Collection is { } collection)
                 await DisplayCollectionAsync(collection);
             else
@@ -319,6 +410,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 "Check your connection or try browser-assisted discovery.");
         }
         finally { if (!IsDisposed) SetBusy(false); }
+    }
+
+    private void DisplayItem(MediaItem item)
+    {
+        _item = item;
+        _title.Text = string.IsNullOrWhiteSpace(item.Title) ? "Media source" : item.Title;
+        _source.Text = item.Provider + (item.Duration is { } duration ? $"  ·  {duration:hh\\:mm\\:ss}" : "");
+        _ = LoadThumbnailAsync(item.Thumbnail);
+        UpdatePlayableFormats(item);
     }
 
     private void ShowUnavailable(string reason, string hint)
@@ -345,6 +445,39 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 .FirstOrDefault(x => x.StartsWith("v=", StringComparison.OrdinalIgnoreCase))?.Substring(2);
         if (id is { Length: 11 } && id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
             _ = LoadThumbnailAsync(new Uri($"https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+    }
+
+    private void PaintPoster(Graphics graphics)
+    {
+        Rectangle frame = _posterFrame.ClientRectangle;
+        if (_poster is not { } image)
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using var shape = VesperDrawing.Rounded(frame, S(6));
+            using var wash = new SolidBrush(_colors.Secondary);
+            graphics.FillPath(wash, shape);
+            int size = S(23);
+            VesperDrawing.Icon(graphics, VesperIcon.Video,
+                new Rectangle((frame.Width - size) / 2, (frame.Height - size) / 2, size, size), _colors.MutedGreen);
+            return;
+        }
+
+        double ratio = Math.Min((double)frame.Width / image.Width, (double)frame.Height / image.Height);
+        int width = (int)(ratio * image.Width), height = (int)(ratio * image.Height);
+        var target = new Rectangle((frame.Width - width) / 2, (frame.Height - height) / 2, width, height);
+        using var corners = VesperDrawing.Rounded(target, S(5));
+        GraphicsState old = graphics.Save();
+        graphics.SetClip(corners, CombineMode.Intersect);
+        graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+        graphics.DrawImage(image, target);
+        graphics.Restore(old);
+    }
+
+    private void ReplacePoster(Bitmap? image)
+    {
+        _poster?.Dispose();
+        _poster = image;
+        _posterFrame.Invalidate();
     }
 
     private async Task LoadThumbnailAsync(Uri? url)
@@ -377,10 +510,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             }, token);
             if (image is null) return;
             if (token.IsCancellationRequested || IsDisposed) { image.Dispose(); return; }
-            _poster.Image?.Dispose();
-            _poster.Image = image;
-            _poster.Visible = true;
-            _posterFrame.Invalidate();
+            ReplacePoster(image);
         }
         catch (Exception ex) when (ex is IOException or ArgumentException or OutOfMemoryException
             or System.Net.Http.HttpRequestException or Vesper.MediaResolver.Models.MediaResolverException
@@ -391,7 +521,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private void UpdatePlayableFormats(MediaItem item)
     {
         _playableFormats.Clear();
-        _playableFormats.AddRange(PlayableOnly(item).Representations
+        var candidates = PlayableOnly(item);
+        _playableFormats.AddRange(candidates.Representations
+            .Where(r => Prepare(candidates, FormatPreferences.BestQuality, r).Choice is not null)
             .OrderByDescending(r => r.Height ?? 0)
             .ThenByDescending(r => r.FrameRate ?? 0)
             .ThenByDescending(r => r.BitrateKbps ?? 0)
@@ -399,11 +531,13 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         if (_playableFormats.Count == 0)
         {
             ShowUnavailable(item.Representations.Count > 0
-                ? "Media was found, but none of its formats have an implemented complete transfer path."
-                : "This page did not provide a playable download stream.",
-                "Separate-track muxing, unsupported containers and credential-dependent transfers are unavailable; no silent file will be queued.");
+                ? "Media found, but none of its formats are ready to download."
+                : "This page did not provide a downloadable stream.",
+                "Try again or open the original page and look for media with the VESPER browser extension.");
             return;
         }
+
+        _item = item with { Representations = _playableFormats.ToArray() };
 
         string[] options = _playableFormats.Select(r =>
         {
@@ -417,23 +551,52 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         }).ToArray();
         _customFormat.SetItems(options);
         _status.Text = $"{_playableFormats.Count} compatible format{(_playableFormats.Count == 1 ? "" : "s")} available.";
-        _notice.Text = "Only formats VESPER can finish are selectable. Separate streams are not silently queued.";
+        FormatPreferences[] preferences = [FormatPreferences.BestQuality, FormatPreferences.BalancedQuality,
+            FormatPreferences.SmallestSuitable, FormatPreferences.AudioOnly];
+        for (int i = 0; i < preferences.Length; i++)
+        {
+            var result = Prepare(_item, preferences[i]);
+            if (result.Choice is { } choice)
+            {
+                string container = choice.Kind == JobKind.Hls ? "" : Path.GetExtension(choice.FileName).TrimStart('.').ToUpperInvariant();
+                _presets[i].SetFormat(choice.Quality ?? "Available source", container, available: true);
+            }
+            else _presets[i].SetFormat("Unavailable for this source", "", available: false);
+        }
+        _notice.Text = "";
         Render(ViewState.Ready);
-        UpdateChoiceSummary();
+    }
+
+    internal void SetPreviewState(int preset, bool pressed = false)
+    {
+        if (_sample is null) return;
+        _presets[preset].Checked = true;
+        _presets[preset].Focus();
+        _download.PreviewPressed = pressed;
+        _download.Invalidate();
+    }
+
+    internal void SetPreviewPoster(Bitmap image)
+    {
+        if (_sample is null) throw new InvalidOperationException("A preview sample is required.");
+        ReplacePoster(image);
+    }
+
+    private void SelectPreset(int index)
+    {
+        _presetIndex = index;
+        if (_state != ViewState.Ready) return;
+        UpdateQualityUi();
+        FitToContent();
+        if (IsExactFormat && _customFormat.Visible) _body.ScrollControlIntoView(_customFormat);
     }
 
     private void UpdateQualityUi()
     {
-        bool custom = (_state is ViewState.Ready) && _quality.SelectedIndex == 4 && _playableFormats.Count > 0;
+        bool custom = IsExactFormat && _playableFormats.Count > 0;
         _customLabel.Visible = _customFormat.Visible = custom;
         _customFormat.Enabled = custom && !_busy;
-        _quality.Enabled = !_busy && (_state is ViewState.Ready or ViewState.Collection);
-        if (_state == ViewState.Ready && _body is not null && ClientSize.Height > 0)
-        {
-            int wanted = (custom ? 383 : 325) + _footer.Height + VesperDialogChrome.HeaderHeight + 2;
-            if (ClientSize.Height != wanted) ClientSize = new Size(ClientSize.Width, wanted);
-        }
-        if (_body is not null) LayoutBody();
+        _quality.Enabled = !_busy && _state == ViewState.Collection;
         UpdateChoiceSummary();
     }
 
@@ -444,24 +607,26 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         var result = Prepare(_item, prefs, SelectedExactRepresentation());
         if (result.Choice is { } choice)
             _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
-                ? $"Selected: {choice.Quality ?? "Available source"}. Audio is unconfirmed and will be checked before publication."
-                : $"Selected: {choice.Quality ?? "Available source"}. Only implemented transfer paths are offered.";
+                ? "Audio is unconfirmed and will be checked before publication."
+                : IsExactFormat ? choice.Quality ?? "" : "";
         else
             _notice.Text = result.Error ?? "This preference isn't available for the source.";
+        _notice.ForeColor = result.Choice is null ? _colors.Red : _colors.Muted;
+        _notice.Visible = _notice.Text.Length > 0;
         SetButtonsEnabled(result.Choice is not null);
     }
 
     private MediaRepresentation? SelectedExactRepresentation() =>
-        _state == ViewState.Ready && _quality.SelectedIndex == 4 &&
+        IsExactFormat &&
         _customFormat.SelectedIndex >= 0 && _customFormat.SelectedIndex < _playableFormats.Count
             ? _playableFormats[_customFormat.SelectedIndex] : null;
 
-    private FormatPreferences CurrentPreferences() => _quality.SelectedIndex switch
+    private FormatPreferences CurrentPreferences() => (_state == ViewState.Collection ? _quality.SelectedIndex : _presetIndex) switch
     {
-        1 => FormatPreferences.BalancedQuality with { AllowMuxing = false },
-        2 => FormatPreferences.SmallestSuitable with { AllowMuxing = false },
-        3 => FormatPreferences.AudioOnly with { AllowMuxing = false },
-        _ => FormatPreferences.BestQuality with { AllowMuxing = false }
+        1 => FormatPreferences.BalancedQuality,
+        2 => FormatPreferences.SmallestSuitable,
+        3 => FormatPreferences.AudioOnly,
+        _ => FormatPreferences.BestQuality
     };
 
     private async Task LoadCollectionAsync()
@@ -493,6 +658,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private Task DisplayCollectionAsync(MediaCollection collection)
     {
+        _quality.SelectedIndex = _presetIndex < 4 ? _presetIndex : 0;
         _item = null;
         _playableFormats.Clear();
         _collection = collection.Entries.Take(200).ToList();
@@ -576,6 +742,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 MessageBox.Show(this,
                     "One or more media links expire within an hour. Queuing them may cause a 'Needs new link' status later. Queue anyway?",
                     "Temporary media links", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (_sample is not null)
+            {
+                _status.Text = "Preview selection prepared. Sample data stays offline.";
+                return;
+            }
             Selections = jobs;
             QueueOnly = queueOnly;
             DialogResult = DialogResult.OK;
@@ -602,12 +773,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _retry.Enabled = !_busy;
         _collectionButton.Enabled = !_busy;
         _entries.Enabled = !_busy;
-        _quality.Enabled = !_busy && (_state is ViewState.Ready or ViewState.Collection);
-        _customFormat.Enabled = !_busy && _state == ViewState.Ready && _quality.SelectedIndex == 4;
-        bool allowed = _state == ViewState.Ready && _playableFormats.Count > 0 ||
-            _state == ViewState.Collection && _entries.CheckedIndices.Count > 0;
-        SetButtonsEnabled(allowed);
-        if (!busy && _state == ViewState.Ready) UpdateChoiceSummary();
+        _quality.Enabled = !_busy && _state == ViewState.Collection;
+        _presetOptions.Enabled = !_busy;
+        _customFormat.Enabled = !_busy && IsExactFormat;
+        if (!busy && _state == ViewState.Ready)
+        {
+            UpdateChoiceSummary();
+            FitToContent();
+        }
+        else SetButtonsEnabled(_state == ViewState.Collection && _entries.CheckedIndices.Count > 0);
     }
 
     private void SetButtonsEnabled(bool enabled)

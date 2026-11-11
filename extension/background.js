@@ -6,10 +6,9 @@ const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
 const MAX_SOURCES = 25;
 const DEFAULTS = {
-  handoff: 'default',          // default = VESPER decides, download, queue
+  handoff: 'download',         // default = VESPER decides, download, queue
   intercept: true,             // enabled by default when the user explicitly installs the extension; can be disabled
-  extensions: ['zip', 'rar', '7z', 'iso', 'exe', 'msi', 'dmg', 'pdf', 'mp4', 'mkv', 'webm', 'mp3', 'flac', 'epub', 'tar', 'gz'],
-  useSignIn: false             // forward cookies for the download's own site, only with explicit consent
+  useSignIn: true              // Chrome still requires the user to grant cookie access
 };
 
 // ---------------------------------------------------------------- native messaging
@@ -44,21 +43,37 @@ async function settings() {
 
 // A submission is written down BEFORE it is sent and erased only after VESPER acknowledged it. If the browser
 // restarts mid-flight the popup shows it as unconfirmed; resending reuses the same id, which VESPER de-duplicates.
-async function submit(items, mode, { authorized = false } = {}) {
-  const request = envelope('submit', { mode: mode || 'ask', items, authorized });
-  const { pending = {} } = await chrome.storage.local.get('pending');
-  pending[request.id] = { request: { ...request, items: items.map(stripSecrets) }, at: Date.now() };
-  await chrome.storage.local.set({ pending });
-  await updateBadge();
-
-  const reply = await nativeRequest(request);
-  if (reply.ok || reply.code === 'duplicate' || reply.code === 'cancelled') {
-    const current = (await chrome.storage.local.get('pending')).pending || {};
-    delete current[request.id];
-    await chrome.storage.local.set({ pending: current });
+let pendingWrites = Promise.resolve();
+function changePending(change) {
+  const write = pendingWrites.then(async () => {
+    const { pending = {} } = await chrome.storage.local.get('pending');
+    change(pending);
+    await chrome.storage.local.set({ pending });
     await updateBadge();
+  });
+  pendingWrites = write.catch(() => {});
+  return write;
+}
+
+async function submit(items, mode, { authorized = false, chromeDownloadId } = {}) {
+  const request = envelope('submit', { mode: mode || 'ask', items, authorized,
+    confirmTransfer: chromeDownloadId !== undefined });
+  await changePending(pending => {
+    pending[request.id] = { request: { ...request, authorized: false, items: items.map(stripSecrets) },
+      at: Date.now(), chromeDownloadId };
+  });
+  return sendSubmission(request, chromeDownloadId);
+}
+
+async function sendSubmission(request, chromeDownloadId) {
+  const reply = await nativeRequest(request);
+  let chromePaused = false;
+  if (chromeDownloadId !== undefined && reply.ok && reply.results?.[0]?.transferReady === true)
+    chromePaused = await pauseChromeDownload(chromeDownloadId, request.items[0].url);
+  if (reply.ok || reply.code === 'duplicate' || reply.code === 'cancelled') {
+    await changePending(pending => { delete pending[request.id]; });
   }
-  return reply;
+  return chromeDownloadId === undefined ? reply : { ...reply, chromePaused };
 }
 
 const stripSecrets = (item) => { const { cookie, authorization, ...safe } = item; return safe; };   // secrets are never stored
@@ -67,13 +82,8 @@ async function retryPending(id) {
   const { pending = {} } = await chrome.storage.local.get('pending');
   const entry = pending[id];
   if (!entry) return { ok: false, code: 'gone', message: 'That request is no longer pending.' };
-  const reply = await nativeRequest(entry.request);
-  if (reply.ok || reply.code === 'duplicate' || reply.code === 'cancelled') {
-    delete pending[id];
-    await chrome.storage.local.set({ pending });
-    await updateBadge();
-  }
-  return reply;
+  const enriched = await withSignIn(entry.request.items);
+  return sendSubmission({ ...entry.request, ...enriched }, entry.chromeDownloadId);
 }
 
 async function updateBadge() {
@@ -83,16 +93,22 @@ async function updateBadge() {
   await chrome.action.setBadgeText({ text: count ? '!' : '' });
 }
 
-async function withSignIn(items, pageUrl) {
+async function withSignIn(items) {
+  const safe = items.map(stripSecrets);
   const prefs = await settings();
-  if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] }))) return { items, authorized: false };
+  if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] })))
+    return { items: safe, authorized: false };
   const enriched = [];
-  for (const item of items) {
-    // Only the cookies the browser would send to this exact address, never the whole cookie jar.
-    const cookies = await chrome.cookies.getAll({ url: item.url });
-    enriched.push({ ...item, cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; ') || undefined });
+  for (const item of safe) {
+    let cookie;
+    try {
+      const matches = await chrome.cookies.getAll({ url: item.url });
+      const header = matches.map(c => `${c.name}=${c.value}`).join('; ');
+      if (header && header.length <= 8192 && !/[\r\n\0]/.test(header)) cookie = header;
+    } catch { /* access can be revoked while the download is being sent */ }
+    enriched.push(cookie ? { ...item, cookie } : item);
   }
-  return { items: enriched, authorized: true };
+  return { items: enriched, authorized: enriched.some(item => item.cookie !== undefined) };
 }
 
 // ---------------------------------------------------------------- media sources per tab (kept in session storage)
@@ -207,9 +223,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         state.poster = message.poster || state.poster;
         if (message.unsupported) state.unsupported = message.unsupported;
         await saveTabState(tabId, state);
-        if (message.src && /^https?:/i.test(message.src)) {
-          const hls = /\.m3u8(\?|$)/i.test(message.src);
-          await addSource(tabId, { url: message.src, kind: hls ? 'hls' : 'direct', mime: '', bytes: null });
+        if (!message.unsupported && message.src && /^https?:/i.test(message.src)) {
+          const kind = /\.m3u8(?:[?#]|$)/i.test(message.src) ? 'hls'
+            : /\.mpd(?:[?#]|$)/i.test(message.src) ? 'dash' : 'direct';
+          await addSource(tabId, { url: message.src, kind, mime: '', bytes: null });
         }
         return { ok: true };
       }
@@ -218,7 +235,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const { pending = {} } = await chrome.storage.local.get('pending');
         return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => ({ id, at: p.at, count: p.request.items.length })) };
       }
-      case 'hello': return nativeRequest(envelope('hello'), 15000);
+      case 'hello': return nativeRequest(envelope('hello'), 20000);
+      case 'chrome-downloads': return listChromeDownloads();
+      case 'move-download': return moveChromeDownload(message.downloadId, 'download');
+      case 'media-options': {
+        // Use the actual sender's frame. Prefer its player over unrelated requests in the tab.
+        const page = sender.url || sender.tab?.url;
+        if (!/^https?:\/\//i.test(page || ''))
+          return { ok: false, code: 'invalid', message: 'This page cannot be inspected.' };
+        const player = /^https?:\/\//i.test(message.playerUrl || '') ? message.playerUrl : null;
+        const state = await tabState(sender.tab?.id);
+        const candidates = player
+          ? [{ url: player, kind: /\.m3u8(?:[?#]|$)/i.test(player) ? 'hls'
+            : /\.mpd(?:[?#]|$)/i.test(player) ? 'dash' : 'direct' }]
+          : state.sources.slice(0, 25).map(s => ({ url: s.url, kind: s.kind, mimeType: s.mime || undefined }));
+        return nativeRequest(envelope('media-options', { url: page, pageTitle: message.title, candidates }), 60000);
+      }
+      case 'media-select': {
+        const { mediaSession, formatChoice, mode } = message;
+        if (!/^[a-f0-9]{32}$/i.test(mediaSession || '') || !Number.isInteger(formatChoice) || formatChoice < 0 ||
+            formatChoice >= 64 || !['queue', 'download'].includes(mode))
+          return { ok: false, code: 'invalid', message: 'Choose an available format.' };
+        return nativeRequest(envelope('media-select', {
+          id: `${mediaSession}-${formatChoice}-${mode}`, mediaSession, formatChoice, mode
+        }), 25000);
+      }
       case 'native-picker': {
         const tabId = sender.tab?.id ?? message.tabId;
         const state = await tabState(tabId);
@@ -237,7 +278,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'describe': return describe(message.url, message.duration);
       case 'retry': return retryPending(message.id);
       case 'submit': {
-        const { items, authorized } = await withSignIn(message.items.map((i) => ({ referer: message.pageUrl, userAgent: navigator.userAgent, ...i })), message.pageUrl);
+        const { items, authorized } = await withSignIn(message.items.map((i) => ({ referer: message.pageUrl, userAgent: navigator.userAgent, ...i })));
         const prefs = await settings();
         const mode = message.mode || (prefs.handoff === 'default' ? 'ask' : prefs.handoff);
         return submit(items, mode, { authorized });
@@ -254,16 +295,21 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({ id: 'vesper-link', title: 'Download link with VESPER', contexts: ['link'] });
   chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
+  chrome.contextMenus.create({ id: 'vesper-active-downloads', title: 'Move an active Chrome download…', contexts: ['action'] });
   await updateBadge();
 });
 
 chrome.runtime.onStartup.addListener(updateBadge);
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === 'vesper-active-downloads') {
+    await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
+    return;
+  }
   const url = info.menuItemId === 'vesper-link' ? info.linkUrl : info.srcUrl;
   if (!url || !/^https?:/i.test(url)) return;      // blob: and data: URLs cannot be fetched by another program
   const prefs = await settings();
-  const { items, authorized } = await withSignIn([{ url, referer: tab?.url, userAgent: navigator.userAgent }], tab?.url);
+  const { items, authorized } = await withSignIn([{ url, referer: tab?.url, userAgent: navigator.userAgent }]);
   const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
   flash(tab?.id, reply);
 });
@@ -277,23 +323,69 @@ function flash(tabId, reply) {
 
 // ---------------------------------------------------------------- opt-in takeover of ordinary downloads
 
-chrome.downloads.onCreated.addListener(async (item) => {
-  const prefs = await settings();
-  if (!prefs.intercept || !/^https?:/i.test(item.finalUrl || item.url)) return;
-  const name = (item.filename || item.finalUrl || item.url).split(/[\\/]/).pop().split('?')[0];
-  const extension = (name.split('.').pop() || '').toLowerCase();
-  if (!prefs.extensions.includes(extension)) return;
+const browserTransfers = new Map();
+const browserUrl = item => item.finalUrl || item.url;
+const canMove = item => item?.state === 'in_progress' && item.danger === 'safe'
+  && !item.incognito && /^https?:\/\//i.test(browserUrl(item) || '');
 
-  const url = item.finalUrl || item.url;
-  const { items, authorized } = await withSignIn([{ url, referer: item.referrer || undefined, userAgent: navigator.userAgent }], item.referrer);
-  // Hand off first; only cancel the browser's own download once VESPER has actually accepted it.
-  const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
-  // Cancel only after VESPER accepted THIS file; never cancel if another batch item succeeded.
-  const accepted = reply.ok && Array.isArray(reply.results) &&
-    reply.results.some(r => ['started', 'queued', 'already-submitted'].includes(r.status));
-  if (accepted) {
-    await chrome.downloads.cancel(item.id).catch(() => {});
-    await chrome.downloads.erase({ id: item.id }).catch(() => {});
-  }
-  // On any failure the browser keeps its download: interception must never silently break downloading.
+function browserName(item) {
+  const name = item.filename?.split(/[\\/]/).pop();
+  if (name && !/\.crdownload$/i.test(name)) return name;
+  try { return new URL(browserUrl(item)).pathname.split('/').pop() || ''; }
+  catch { return ''; }
+}
+
+async function listChromeDownloads() {
+  const downloads = await chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 });
+  return { ok: true, downloads: downloads.filter(canMove).slice(0, 8).map(item => ({
+    id: item.id, name: browserName(item) || 'Download', paused: item.paused
+  })) };
+}
+
+async function pauseChromeDownload(id, url) {
+  try {
+    const [item] = await chrome.downloads.search({ id });
+    if (!canMove(item) || browserUrl(item) !== url) return false;
+    if (!item.paused) await chrome.downloads.pause(id);
+    const [current] = await chrome.downloads.search({ id });
+    return current?.state === 'in_progress' && current.paused;
+  } catch { return false; }
+}
+
+async function moveChromeDownload(id, mode) {
+  if (!Number.isInteger(id)) return { ok: false, code: 'invalid', message: 'Choose a Chrome download.' };
+  if (browserTransfers.has(id)) return browserTransfers.get(id);
+  const move = (async () => {
+    const [item] = await chrome.downloads.search({ id });
+    if (!canMove(item)) return { ok: false, code: 'gone', message: 'This Chrome download is no longer available to move.' };
+    const { pending = {} } = await chrome.storage.local.get('pending');
+    const unconfirmed = Object.entries(pending).find(([, entry]) => entry.chromeDownloadId === id);
+    if (unconfirmed) return retryPending(unconfirmed[0]);
+    const { items, authorized } = await withSignIn([{
+      url: browserUrl(item), fileName: browserName(item) || undefined,
+      referer: item.referrer || undefined, userAgent: navigator.userAgent
+    }]);
+    return submit(items, mode, { authorized, chromeDownloadId: id });
+  })();
+  browserTransfers.set(id, move);
+  try { return await move; }
+  finally { browserTransfers.delete(id); }
+}
+
+async function captureChromeDownload(item) {
+  if (!canMove(item)) return;
+  try {
+    const prefs = await settings();
+    if (!prefs.intercept) return;
+    await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff);
+  } catch { /* Leave the Chrome download alone if handoff is unavailable. */ }
+}
+
+chrome.downloads.onCreated.addListener(captureChromeDownload);
+chrome.downloads.onChanged.addListener(async change => {
+  if (change.danger?.current !== 'safe' || change.danger.previous === 'safe') return;
+  try {
+    const [item] = await chrome.downloads.search({ id: change.id });
+    await captureChromeDownload(item);
+  } catch { /* Chrome still owns this transfer. */ }
 });

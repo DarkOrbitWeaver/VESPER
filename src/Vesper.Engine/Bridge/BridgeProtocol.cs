@@ -9,9 +9,10 @@ public sealed record BridgeItem(string Url, string? FileName, string Kind, strin
 public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType);
 
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
-    IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null);
+    IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
+    Guid? MediaSession = null, int? FormatChoice = null);
 
-public sealed record BridgeResult(string Url, string Status, string? JobId, string Message);
+public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null);
 
 public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, string Message,
     IReadOnlyList<BridgeResult>? Results = null, object? Data = null, string? AppVersion = null)
@@ -23,8 +24,8 @@ public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, stri
 
 /// <summary>
 /// Chrome native-messaging framing and strict validation of everything the browser may ask for.
-/// The browser can request: hello, probe (describe a link), submit (add links). It can NOT choose a destination
-/// folder, a file path, a program to run or any desktop action: such fields are never read.
+/// Handles browser connection, discovery, and download requests. The desktop resolves
+/// format selections from its own session and controls all destination paths.
 /// </summary>
 public static class BridgeProtocol
 {
@@ -96,7 +97,8 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "probe" or "submit" or "media-picker")) { error = "Unknown request type."; return false; }
+            if (type is not ("hello" or "probe" or "submit" or "media-picker" or "media-options" or "media-select"))
+            { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
             if (mode is not ("ask" or "download" or "queue")) { error = "Unknown mode."; return false; }
@@ -104,11 +106,13 @@ public static class BridgeProtocol
             var items = new List<BridgeItem>();
             var hints = new List<BridgeMediaHint>();
             string? probeUrl = null;
-            if (type is "probe" or "media-picker")
+            Guid? mediaSession = null;
+            int? formatChoice = null;
+            if (type is "probe" or "media-picker" or "media-options")
             {
                 probeUrl = Str(root, "url");
                 if (!UrlPolicy.TryParse(probeUrl, out _, out error)) return false;
-                if (type == "media-picker" && root.TryGetProperty("candidates", out JsonElement candidates))
+                if (type is ("media-picker" or "media-options") && root.TryGetProperty("candidates", out JsonElement candidates))
                 {
                     if (candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 25)
                     { error = "At most 25 media hints are accepted."; return false; }
@@ -127,6 +131,15 @@ public static class BridgeProtocol
                     }
                 }
             }
+            else if (type == "media-select")
+            {
+                if (mode == "ask" || !Guid.TryParseExact(Str(root, "mediaSession"), "N", out Guid session)
+                    || !root.TryGetProperty("formatChoice", out var choice) || choice.ValueKind != JsonValueKind.Number
+                    || !choice.TryGetInt32(out int index) || index is < 0 or >= 64)
+                { error = "Invalid media selection."; return false; }
+                mediaSession = session;
+                formatChoice = index;
+            }
             else if (type == "submit")
             {
                 if (!root.TryGetProperty("items", out JsonElement array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() is 0 or > MaxItems)
@@ -139,8 +152,11 @@ public static class BridgeProtocol
                     items.Add(item!);
                 }
             }
-            request = new BridgeRequest(id, type, mode, probeUrl, items,
-                hints, type == "media-picker" ? (Str(root, "pageTitle") is { Length: <= 300 } title ? title : null) : null);
+            bool confirmTransfer = type == "submit" && items.Count == 1
+                && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
+            string? pageTitle = type is ("media-picker" or "media-options") && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
+            request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
+                confirmTransfer, mediaSession, formatChoice);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)

@@ -8,7 +8,7 @@ namespace VESPER;
 /// where a file is saved is decided here (settings or the Quick Download window), never by the request.
 /// "Success" is reported only after the engine has actually accepted the job.
 /// </summary>
-internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, Func<VesperPreferences> preferences)
+internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, Func<VesperPreferences> preferences)
 {
     public async Task<BridgeResponse> HandleAsync(BridgeRequest request, CancellationToken ct)
     {
@@ -23,6 +23,12 @@ internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, F
 
             case "media-picker":
                 return await NativeMediaPickerAsync(request, ct);
+
+            case "media-options":
+                return await MediaOptionsAsync(request, ct);
+
+            case "media-select":
+                return SelectBrowserMedia(request);
 
             case "submit":
                 return await SubmitAsync(request, ct);
@@ -41,14 +47,7 @@ internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, F
         if (!Uri.TryCreate(request.Url, UriKind.Absolute, out Uri? page))
             return BridgeResponse.Fail(request.Id, "invalid", "The media page address is invalid.");
 
-        var hints = new BrowserDiscoveryMessage
-        {
-            Schema = BrowserDiscoveryMessage.CurrentSchema,
-            PageUrl = page.AbsoluteUri,
-            Title = request.PageTitle,
-            Candidates = (request.Candidates ?? []).Select(h => new BrowserMediaCandidate
-            { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network" }).ToList()
-        };
+        var hints = MediaHints(request, page);
         var finished = new TaskCompletionSource<(IReadOnlyList<MediaDownloadChoice> Jobs, bool Queue)>(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
@@ -73,16 +72,7 @@ internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, F
             var results = new List<BridgeResult>();
             foreach (var (job, i) in jobs.Select((item, index) => (item, index)))
             {
-                AddResult added = engine.Add(new AddRequest(job.Url, StartNow: !queue,
-                    FileName: job.FileName, Referer: job.Referer, UserAgent: job.UserAgent,
-                    Kind: job.Kind, RequestId: $"{request.Id}:{i}", OriginalPageUrl: job.OriginalPageUrl,
-                    MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
-                    MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
-                    MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId));
-                results.Add(new BridgeResult(UrlPolicy.Redact(job.Url),
-                    added.Status == AddStatus.Added ? queue ? "queued" : "started"
-                    : added.Status == AddStatus.AlreadySubmitted ? "already-submitted" : "rejected",
-                    added.Ok ? added.JobId.ToString("D") : null, added.Message));
+                results.Add(QueueMedia(job, queue, $"{request.Id}:{i}"));
             }
             return results.Any(x => x.Status is "started" or "queued" or "already-submitted")
                 ? BridgeResponse.Success(request.Id, results: results)
@@ -138,13 +128,53 @@ internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, F
                 AddStatus.DestinationUnavailable => "destination",
                 _ => "invalid"
             };
-            results.Add(new BridgeResult(UrlPolicy.Redact(item.Url), status, added.Ok || added.Status == AddStatus.Duplicate ? added.JobId.ToString("D") : null, added.Message));
+            bool? transferReady = request.ConfirmTransfer && added.Ok
+                ? await ConfirmTransferAsync(added.JobId, startNow, ct) : null;
+            results.Add(new BridgeResult(UrlPolicy.Redact(item.Url), status,
+                added.Ok || added.Status == AddStatus.Duplicate ? added.JobId.ToString("D") : null, added.Message, transferReady));
         }
 
         bool anyAccepted = results.Any(r => r.Status is "started" or "queued" or "already-submitted");
         if (anyAccepted) return BridgeResponse.Success(request.Id, results: results);
         bool allDuplicate = results.All(r => r.Status == "duplicate");
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
+    }
+
+    private async Task<bool> ConfirmTransferAsync(Guid id, bool startNow, CancellationToken ct)
+    {
+        var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Inspect(JobSnapshot snapshot)
+        {
+            if (snapshot.Id != id) return;
+            if (snapshot.State == JobState.Completed && !snapshot.FileMissing ||
+                snapshot.ProgressBytes > 0 && snapshot.State is (JobState.Downloading or JobState.Verifying or JobState.Finalizing))
+                ready.TrySetResult(true);
+            else if (snapshot.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed
+                or JobState.Cancelled or JobState.Suspect or JobState.Paused or JobState.Completed)
+                ready.TrySetResult(false);
+        }
+        void InspectProgress(IReadOnlyList<JobSnapshot> snapshots)
+        {
+            foreach (JobSnapshot snapshot in snapshots) Inspect(snapshot);
+        }
+
+        engine.JobChanged += Inspect;
+        engine.Progress += InspectProgress;
+        try
+        {
+            if (engine.Snapshot(id) is not { } current) return false;
+            Inspect(current);
+            // Queued downloads can wait indefinitely. Keep Chrome running if VESPER
+            // cannot confirm receipt before this request returns.
+            if (!startNow) return ready.Task.IsCompletedSuccessfully && ready.Task.Result;
+            try { return await ready.Task.WaitAsync(TimeSpan.FromSeconds(8), ct); }
+            catch (TimeoutException) { return false; }
+        }
+        finally
+        {
+            engine.JobChanged -= Inspect;
+            engine.Progress -= InspectProgress;
+        }
     }
 
     /// <summary>Shows the compact Quick Download window on the UI thread and waits for the user's choice.</summary>

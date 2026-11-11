@@ -6,16 +6,22 @@ namespace VESPER;
 internal static class VesperMenuTheme
 {
     private static readonly Dictionary<(VesperIcon Symbol, int Color, int Dpi), Image> IconCache = [];
+    private static readonly Queue<(VesperIcon Symbol, int Color, int Dpi)> IconOrder = [];
     private static readonly Font MenuFont = new("Segoe UI", 9F);
 
     public static Image IconImage(VesperIcon symbol, VesperPalette palette, int dpi = 96)
     {
-        var key = (symbol, palette.Muted.ToArgb(), dpi);
+        Color color = VesperDrawing.Ink(symbol, palette);
+        var key = (symbol, color.ToArgb(), dpi);
         if (IconCache.TryGetValue(key, out Image? cached)) return cached;
         int size = Math.Max(16, (int)Math.Round(20d * dpi / 96));
         var bitmap = new Bitmap(size, size);
         using (var graphics = Graphics.FromImage(bitmap))
-            VesperDrawing.Icon(graphics, symbol, new Rectangle(2, 2, size - 4, size - 4), palette.Muted);
+            VesperDrawing.Icon(graphics, symbol, new Rectangle(2, 2, size - 4, size - 4), color);
+        // ToolStripItems may still reference an evicted image, so do not dispose it here.
+        // Once those items release it, normal image finalization reclaims the handle.
+        if (IconOrder.Count >= 128) IconCache.Remove(IconOrder.Dequeue());
+        IconOrder.Enqueue(key);
         return IconCache[key] = bitmap;
     }
 
@@ -61,7 +67,7 @@ internal static class VesperMenuTheme
 
     private static void Style(ToolStripDropDown menu, VesperPalette palette, bool withIcons)
     {
-        menu.Renderer = new VesperMenuRenderer(palette);
+        menu.Renderer = palette.HighContrast ? new ToolStripSystemRenderer() : new VesperMenuRenderer(palette);
         menu.BackColor = palette.Surface;
         menu.ForeColor = palette.Text;
         menu.Font = MenuFont;

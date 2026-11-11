@@ -12,31 +12,33 @@ public sealed class VesperSearchFrame : Panel
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color SearchIconColor { get; set; } = Color.FromArgb(124, 142, 127);
 
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color FillColor { get; set; } = Color.White;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color FocusColor { get; set; } = Color.FromArgb(115, 148, 124);
+
     public VesperSearchFrame()
     {
         DoubleBuffered = true;
-        BackColor = Color.White;
-        SetStyle(ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.ResizeRedraw | ControlStyles.Opaque, true);
     }
+
+    protected override void OnEnter(EventArgs e) { base.OnEnter(e); Invalidate(); }
+    protected override void OnLeave(EventArgs e) { base.OnLeave(e); Invalidate(); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        VesperPanel.PaintBackdrop(this, e);
         base.OnPaint(e);
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        var bounds = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
-        using (var border = new Pen(OutlineColor))
-        using (var outline = new GraphicsPath())
-        {
-            int radius = Math.Min(6, Math.Max(2, bounds.Height / 4));
-            int d = radius * 2;
-            outline.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
-            outline.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
-            outline.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-            outline.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
-            outline.CloseFigure();
-            g.DrawPath(border, outline);
-        }
+        var bounds = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
+        using var border = new Pen(ContainsFocus ? FocusColor : OutlineColor);
+        using var fill = new SolidBrush(FillColor);
+        using var outline = VesperDrawing.Rounded(bounds, UiKit.Scale(this, 5));
+        g.FillPath(fill, outline);
+        g.DrawPath(border, outline);
         float cx = 17f * DeviceDpi / 96f, cy = Height / 2f - 2f;
         float r = 4f * DeviceDpi / 96f;
         using var searchPen = new Pen(SearchIconColor, Math.Max(1f, DeviceDpi / 96f));

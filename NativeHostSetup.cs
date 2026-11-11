@@ -69,24 +69,41 @@ internal static class NativeHostSetup
     public static bool HostPresent => File.Exists(HostExecutable);
     public static bool ExtensionPresent => File.Exists(Path.Combine(ExtensionFolder, "manifest.json"));
 
+    // Refresh a registration owned by this checkout without replacing an installed copy.
+    public static bool HasDevelopmentRegistration
+    {
+        get
+        {
+            string? root = ProjectFolder;
+            if (root is null || ReadRegisteredHost() is not { } path) return false;
+            string relative = Path.GetRelativePath(root, path);
+            return relative.StartsWith("bin" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                || relative.StartsWith(Path.Combine("src", "Vesper.NativeHost", "bin") + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
     public static bool IsRegistered
     {
         get
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(BrowserKeys[0]);
-            if (key?.GetValue(null) as string != ManifestPath || !File.Exists(ManifestPath)) return false;
-            try
-            {
-                using JsonDocument manifest = JsonDocument.Parse(File.ReadAllText(ManifestPath));
-                string? registeredHost = manifest.RootElement.GetProperty("path").GetString();
-                return registeredHost is not null && File.Exists(registeredHost)
-                    && string.Equals(Path.GetFullPath(registeredHost), Path.GetFullPath(HostExecutable), StringComparison.OrdinalIgnoreCase);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException)
-            {
-                return false;
-            }
+            return ReadRegisteredHost() is { } path && File.Exists(path)
+                && string.Equals(path, Path.GetFullPath(HostExecutable), StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    private static string? ReadRegisteredHost()
+    {
+        try
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(BrowserKeys[0]);
+            if (key?.GetValue(null) as string != ManifestPath || !File.Exists(ManifestPath)) return null;
+            using JsonDocument manifest = JsonDocument.Parse(File.ReadAllText(ManifestPath));
+            string? path = manifest.RootElement.GetProperty("path").GetString();
+            return Path.IsPathFullyQualified(path ?? "") ? Path.GetFullPath(path!) : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException
+            or InvalidOperationException or ArgumentException or System.Security.SecurityException) { return null; }
     }
 
     /// <summary>Returns an error message, or null when the helper was registered.</summary>

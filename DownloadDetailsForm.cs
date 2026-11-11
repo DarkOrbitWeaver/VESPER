@@ -7,7 +7,7 @@ namespace VESPER;
 /// what makes sense for the current state. Updates arrive through engine events, not polling.
 /// </summary>
 [System.ComponentModel.DesignerCategory("Form")]
-internal sealed class DownloadDetailsForm : Form
+internal sealed class DownloadDetailsForm : VesperPopupForm
 {
     private readonly DownloadEngine _engine;
     private readonly DownloadActions _actions;
@@ -21,6 +21,9 @@ internal sealed class DownloadDetailsForm : Form
     private int _progressWidth;
     private JobSnapshot _job;
     private bool _building;
+    private bool _showDiagnostics;
+    private readonly CancellationTokenSource _posterLifetime = new();
+    private Bitmap? _poster;
 
     public DownloadDetailsForm(DownloadEngine engine, DownloadActions actions, JobSnapshot job, VesperPreferences preferences)
     {
@@ -44,7 +47,7 @@ internal sealed class DownloadDetailsForm : Form
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 66, BackColor = _colors.Surface };
         _footer.Paint += (_, e) =>
         {
-            using var line = new Pen(_colors.Border);
+            using var line = new Pen(_colors.Divider);
             e.Graphics.DrawLine(line, 19, 0, _footer.Width - 19, 0);
         };
         _close = NewButton("Close", 83, primary: false);
@@ -58,6 +61,7 @@ internal sealed class DownloadDetailsForm : Form
         _engine.JobChanged += OnJobChanged;
         _engine.Progress += OnProgress;
         Build();
+        Shown += async (_, _) => await LoadPosterAsync();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -65,6 +69,17 @@ internal sealed class DownloadDetailsForm : Form
         _engine.JobChanged -= OnJobChanged;
         _engine.Progress -= OnProgress;
         base.OnFormClosed(e);
+    }
+
+    private async Task LoadPosterAsync()
+    {
+        if (!MediaPoster.TryUri(_job.MediaThumbnailUrl, out var uri)) return;
+        using var http = new Vesper.MediaResolver.Core.SecureHttpClient(new Vesper.MediaResolver.Core.ResolverOptions());
+        Bitmap? poster = await MediaPoster.LoadAsync(http, uri, 300, 170, _posterLifetime.Token);
+        if (poster is null) return;
+        if (IsDisposed || _posterLifetime.IsCancellationRequested) { poster.Dispose(); return; }
+        _poster = poster;
+        Build();
     }
 
     // ---- live updates ---------------------------------------------------------------------------------------------
@@ -118,7 +133,7 @@ internal sealed class DownloadDetailsForm : Form
     private Label Text_(string text, int x, int y, int width, int height, float size = 9, bool bold = false, bool muted = false) => new()
     {
         Text = text, AutoSize = false, AutoEllipsis = true, Location = new Point(x, y), Size = new Size(width, height),
-        BackColor = Color.Transparent, ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
+        ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
         Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
     };
 
@@ -137,45 +152,51 @@ internal sealed class DownloadDetailsForm : Form
                 if (!ReferenceEquals(control, _close)) control.Dispose();
             }
 
-            const int margin = 24, textX = 87, valueX = 164;
+            const int margin = 24, valueX = 164;
+            int textX = _poster is null ? 87 : 156;
             int bodyWidth = ClientSize.Width, contentWidth = bodyWidth - 2 * margin;
 
-            var emblem = new Panel { Location = new Point(margin, 18), Size = new Size(49, 49), BackColor = _colors.Surface };
+            var emblem = new VesperPanel { Location = new Point(margin, 18), Size = new Size(49, 49), BackColor = _colors.Surface };
             emblem.Paint += (_, e) =>
             {
                 VesperIcon symbol = DownloadItem.From(_job).FileType switch
                 {
                     "Audio" => VesperIcon.Audio, "Video" => VesperIcon.Video, "Archive" => VesperIcon.Archive,
-                    "Disc image" => VesperIcon.Disc, "eBook" => VesperIcon.Book, _ => VesperIcon.File
+                    "Disc image" => VesperIcon.Disc, "eBook" => VesperIcon.Book,
+                    "Document" => VesperIcon.Document, "Media" => VesperIcon.Layers, _ => VesperIcon.File
                 };
                 Graphics g = e.Graphics;
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 using (var outline = VesperDrawing.Rounded(new Rectangle(1, 1, 47, 47), 7))
                 {
                     using var fill = new SolidBrush(_colors.Secondary);
-                    using var stroke = new Pen(_colors.Border);
                     g.FillPath(fill, outline);
-                    g.DrawPath(stroke, outline);
                 }
-                VesperDrawing.Icon(g, symbol, new Rectangle(11, 11, 27, 27), _colors.MutedGreen);
+                VesperDrawing.Icon(g, symbol, new Rectangle(11, 11, 27, 27), VesperDrawing.Ink(symbol, _colors));
             };
-            _content.Controls.Add(emblem);
+            if (_poster is { } poster)
+            {
+                emblem.Dispose();
+                _content.Controls.Add(new PictureBox { Image = poster, SizeMode = PictureBoxSizeMode.Zoom,
+                    Location = new Point(margin, 16), Size = new Size(116, 66), AccessibleName = "Media thumbnail" });
+            }
+            else _content.Controls.Add(emblem);
 
-            Label name = Text_(_job.FileName, textX, 13, bodyWidth - textX - margin, 28, 10F, bold: true);
+            Label name = Text_(_job.FileName, textX, 9, bodyWidth - textX - margin, 38, 10F, bold: true);
             _content.Controls.Add(name);
             _tips.SetToolTip(name, _job.FileName);
             DownloadItem item = DownloadItem.From(_job);
-            _content.Controls.Add(Text_($"{item.FileType} · {item.Extension}  ({item.Size})", textX, 39, bodyWidth - textX - margin, 19, 8.25F, muted: true));
+            _content.Controls.Add(Text_($"{item.FileType} · {item.Extension}", textX, 48, bodyWidth - textX - margin, 19, 8.25F, muted: true));
 
             (string status, VesperIcon icon, Color ink) = StatusLine();
-            Label state = Text_(status, textX + 19, 62, bodyWidth - textX - margin - 19, 21, 9, bold: true);
+            Label state = Text_(status, textX + 19, 70, bodyWidth - textX - margin - 19, 21, 9, bold: true);
             state.ForeColor = ink;
             _content.Controls.Add(state);
-            var stateIcon = new Panel { Location = new Point(textX, 64), Size = new Size(16, 16), BackColor = _colors.Surface };
+            var stateIcon = new Panel { Location = new Point(textX, 72), Size = new Size(16, 16), BackColor = _colors.Surface };
             stateIcon.Paint += (_, e) => VesperDrawing.Icon(e.Graphics, icon, new Rectangle(0, 0, 16, 16), ink);
             _content.Controls.Add(stateIcon);
 
-            int y = 100;
+            int y = 108;
             _progressFill = null;
             if (_job.Fraction is double fraction && _job.ProgressBytes > 0 && _job.State != JobState.Completed)
             {
@@ -201,7 +222,7 @@ internal sealed class DownloadDetailsForm : Form
                 _content.Controls.Add(note);
                 y += note.Height + 6;
             }
-            _content.Controls.Add(new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 1), BackColor = _colors.Border });
+            _content.Controls.Add(new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 1), BackColor = _colors.Divider });
             y += 12;
 
             foreach ((string key, string value) in Fields())
@@ -209,18 +230,44 @@ internal sealed class DownloadDetailsForm : Form
                 VesperIcon glyph = key switch
                 {
                     "Progress" => VesperIcon.Download, "Transfer" or "Bandwidth" => VesperIcon.Gauge, "Time left" => VesperIcon.Clock,
-                    "Source" => VesperIcon.Link, "Save to" or "Last known path" or "Partial file" => VesperIcon.Folder,
-                    "Integrity" or "Recovery" => VesperIcon.Check, _ => VesperIcon.File
+                    "Source" or "Original page" => VesperIcon.Link, "Save to" or "Last known path" or "Partial file" => VesperIcon.Folder,
+                    "Integrity" or "Recovery" => VesperIcon.Shield, "Size" => VesperIcon.Storage,
+                    "Quality" => VesperIcon.Quality,
+                    "Source link expires" => VesperIcon.Clock, _ => VesperIcon.File
                 };
                 var fieldIcon = new Panel { Location = new Point(margin, y + 6), Size = new Size(15, 15), BackColor = _colors.Surface };
-                fieldIcon.Paint += (_, e) => VesperDrawing.Icon(e.Graphics, glyph, new Rectangle(0, 0, 15, 15), _colors.MutedGreen);
+                fieldIcon.Paint += (_, e) => VesperDrawing.Icon(e.Graphics, glyph, new Rectangle(0, 0, 15, 15), VesperDrawing.Ink(glyph, _colors));
                 _content.Controls.Add(fieldIcon);
                 _content.Controls.Add(Text_(key, margin + 23, y, valueX - margin - 31, 28, 8.5F, muted: true));
                 Label field = Text_(value, valueX, y, bodyWidth - valueX - margin, 28, 8.8F);
+                if (key == "Original page" && Uri.TryCreate(_job.OriginalPageUrl, UriKind.Absolute, out var uri)
+                    && uri.Scheme is "http" or "https")
+                {
+                    var link = new LinkLabel { Text = _job.MediaProvider is { Length: > 0 } provider ? $"{provider} · {uri.Host}" : uri.Host, AccessibleName = $"Open original page on {uri.Host}",
+                        Bounds = field.Bounds, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true,
+                        LinkColor = _colors.Link,
+                        ActiveLinkColor = _colors.Text, VisitedLinkColor = _colors.Link, LinkBehavior = LinkBehavior.AlwaysUnderline };
+                    link.LinkClicked += (_, _) => OpenOriginal(uri);
+                    _content.Controls.Add(link);
+                    _tips.SetToolTip(link, value);
+                    field.Dispose();
+                    y += 31;
+                    continue;
+                }
                 _content.Controls.Add(field);
                 _live[key] = field;
                 _tips.SetToolTip(field, key == "Source" ? "Use the row menu → Copy source URL for the full link." : value);
                 y += 31;
+            }
+
+            if (_job.MediaExpiresAt is not null)
+            {
+                var diagnostics = new LinkLabel { Text = _showDiagnostics ? "Hide technical details" : "Show technical details",
+                    Location = new Point(margin, y), Size = new Size(contentWidth, 25), LinkColor = _colors.Link,
+                    ActiveLinkColor = _colors.Text, VisitedLinkColor = _colors.Link };
+                diagnostics.LinkClicked += (_, _) => { _showDiagnostics = !_showDiagnostics; Build(); };
+                _content.Controls.Add(diagnostics);
+                y += 29;
             }
 
             ClientSize = new Size(bodyWidth, VesperDialogChrome.HeaderHeight + y + 13 + _footer.Height);
@@ -251,8 +298,8 @@ internal sealed class DownloadDetailsForm : Form
         return _job.State switch
         {
             JobState.Completed when _job.FileMissing => ("Completed · file missing", VesperIcon.Warning, _colors.Amber),
-            JobState.Completed => ("Completed", VesperIcon.Check, _colors.Green),
-            JobState.Downloading => (_job.Fraction is null ? "Downloading" : $"Downloading ({percent}%)", VesperIcon.Download, _colors.Green),
+            JobState.Completed => ("Completed", VesperIcon.Check, _colors.MutedGreen),
+            JobState.Downloading => (_job.Fraction is null ? "Downloading" : $"Downloading ({percent}%)", VesperIcon.Download, _colors.MutedGreen),
             JobState.Resolving => ("Contacting server", VesperIcon.Info, _colors.Muted),
             JobState.Paused => ("Paused", VesperIcon.Pause, _colors.Amber),
             JobState.Queued => ("Queued", VesperIcon.Queue, _colors.Muted),
@@ -260,8 +307,8 @@ internal sealed class DownloadDetailsForm : Form
             JobState.WaitingForRetry => ("Waiting to retry", VesperIcon.Clock, _colors.Amber),
             JobState.NeedsLink => ("Needs a new link", VesperIcon.Warning, _colors.Red),
             JobState.NeedsAttention => ("Needs attention", VesperIcon.Warning, _colors.Red),
-            JobState.Verifying => ("Verifying checksum", VesperIcon.Info, _colors.Green),
-            JobState.Finalizing => ("Finishing", VesperIcon.Info, _colors.Green),
+            JobState.Verifying => ("Verifying checksum", VesperIcon.Shield, _colors.MutedGreen),
+            JobState.Finalizing => ("Finishing", VesperIcon.Check, _colors.MutedGreen),
             JobState.Suspect => ("Suspect integrity", VesperIcon.Warning, _colors.Red),
             JobState.Failed => ("Failed", VesperIcon.Warning, _colors.Red),
             _ => ("Cancelled", VesperIcon.Info, _colors.Muted)
@@ -302,9 +349,8 @@ internal sealed class DownloadDetailsForm : Form
         if (_job.OriginalPageUrl is { Length: > 0 } original)
         {
             yield return ("Original page", UrlPolicy.Redact(original));
-            if (_job.MediaProvider is { Length: > 0 } provider) yield return ("Provider", provider);
-            if (_job.MediaQuality is { Length: > 0 } quality) yield return ("Quality", quality);
-            if (_job.MediaExpiresAt is { } expiry) yield return ("Source link expires", expiry.ToLocalTime().ToString("g"));
+            if (_job.MediaQuality is { Length: > 0 } quality) yield return ("Quality", MediaTransferBridge.DisplayQuality(quality));
+            if (_showDiagnostics && _job.MediaExpiresAt is { } expiry) yield return ("Source link expires", expiry.ToLocalTime().ToString("g"));
         }
         else if (_job.SourceUrl.Length > 0) yield return ("Source", UrlPolicy.Redact(_job.SourceUrl));
         if (_job.Sha256Verified) yield return ("Integrity", "Matches the trusted SHA-256");
@@ -322,17 +368,16 @@ internal sealed class DownloadDetailsForm : Form
         _ => ""
     };
 
+    private void OpenOriginal(Uri uri)
+    {
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true }); }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        { MessageBox.Show(this, ex.Message, "Open source", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+    }
+
     private IEnumerable<(string Text, bool Primary, Action Action)> Actions()
     {
         JobSnapshot j = _job;
-        if (j.OriginalPageUrl is { Length: > 0 } original && Uri.TryCreate(original, UriKind.Absolute, out Uri? source)
-            && (source.Scheme is "https" or "http"))
-            yield return ("View original", false, () =>
-            {
-                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(source.AbsoluteUri) { UseShellExecute = true }); }
-                catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-                { MessageBox.Show(this, ex.Message, "Open source", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
-            });
         switch (j.State)
         {
             case JobState.Completed when j.FileMissing: yield return ("Locate file", true, () => _actions.Locate(j)); break;
@@ -380,7 +425,13 @@ internal sealed class DownloadDetailsForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _tips.Dispose();
+        if (disposing && !IsDisposed)
+        {
+            _posterLifetime.Cancel();
+            _posterLifetime.Dispose();
+            _poster?.Dispose();
+            _tips.Dispose();
+        }
         base.Dispose(disposing);
     }
 }

@@ -14,6 +14,7 @@ internal sealed class RescueForm : VesperPopupForm
     private readonly DownloadEngine _engine;
     private readonly JobSnapshot _job;
     private readonly VesperPalette _colors;
+    private readonly Panel _footer;
     private readonly TextBox _url;
     private readonly TextBox _sha;
     private readonly Label _pieceLabel;
@@ -64,14 +65,14 @@ internal sealed class RescueForm : VesperPopupForm
         {
             Text = "Advanced verification (optional)", AutoSize = true,
             Location = new Point(23, 163),
-            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
-            BackColor = _colors.Surface, Font = new Font("Segoe UI", 8.5F)
+            LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
+            Font = new Font("Segoe UI", 8.5F)
         };
         _advanced.LinkClicked += (_, _) => ToggleAdvanced();
         _refreshSource = new LinkLabel
         {
             Text = "Refresh original media link", AutoSize = true, Location = new Point(322, 163),
-            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green, BackColor = _colors.Surface,
+            LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
             Font = new Font("Segoe UI", 8.5F), Visible = job.Kind == JobKind.Http
                 && job.OriginalPageUrl is not null && job.MediaId is not null && job.MediaFormatId is not null
         };
@@ -97,37 +98,39 @@ internal sealed class RescueForm : VesperPopupForm
         _result.AutoEllipsis = false;
         _result.TextAlign = ContentAlignment.TopLeft;
 
-        var footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
-        footer.Paint += (_, e) => { using var pen = new Pen(_colors.Border); e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0); };
+        _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
+        _footer.Paint += (_, e) => { using var pen = new Pen(_colors.Divider); e.Graphics.DrawLine(pen, 0, 0, _footer.Width, 0); };
         _cancel = new VesperButton { Text = "Close", Width = 85, Height = 34, DialogResult = DialogResult.Cancel };
         _separateCopy = new VesperButton { Text = "Download as new copy", Width = 170, Height = 34, Visible = false };
         _replace = new VesperButton { Text = "Replace link", Width = 130, Height = 34, Primary = true, Symbol = VesperIcon.Link };
         foreach (VesperButton b in new[] { _cancel, _separateCopy, _replace }) b.ApplyPalette(_colors);
         _replace.Click += async (_, _) => await ReplaceAsync();
         _separateCopy.Click += (_, _) => StartSeparateCopy();
-        footer.Controls.AddRange([_cancel, _separateCopy, _replace]);
-        footer.Resize += (_, _) =>
+        _footer.Controls.AddRange([_cancel, _separateCopy, _replace]);
+        void LayoutFooter()
         {
-            _replace.SetBounds(footer.Width - 23 - 130, 14, 130, 34);
-            _separateCopy.SetBounds(_replace.Left - 8 - 170, 14, 170, 34);
-            _cancel.SetBounds(23, 14, 85, 34);
-        };
+            _replace.SetBounds(_footer.Width - S(23 + 130), S(14), S(130), S(34));
+            _separateCopy.SetBounds(_replace.Left - S(8 + 170), S(14), S(170), S(34));
+            _cancel.SetBounds(S(23), S(14), S(85), S(34));
+        }
+        _footer.Resize += (_, _) => LayoutFooter();
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
         body.Controls.AddRange([name, status, linkLabel, urlFrame, _advanced, _shaLabel, _shaFrame,
             _pieceButton, _pieceLabel, _result, _refreshSource]);
         Controls.Add(body);
-        Controls.Add(footer);
+        Controls.Add(_footer);
         VesperDialogChrome.Attach(this, "VESPER  /  Replace link", _colors, VesperIcon.Link);
         CancelButton = _cancel;
         AcceptButton = _replace;
-        Shown += (_, _) => _url.Focus();
+        Shown += (_, _) => { LayoutAdvanced(); LayoutFooter(); _url.Focus(); };
+        DpiChanged += (_, _) => BeginInvoke(() => { if (!IsDisposed) { LayoutAdvanced(); LayoutFooter(); } });
         LayoutAdvanced();
     }
 
     private Label Text_(string text, float size, bool bold = false, bool muted = false) => new()
     {
-        Text = text, AutoSize = false, AutoEllipsis = true, BackColor = Color.Transparent,
+        Text = text, AutoSize = false, AutoEllipsis = true,
         ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
         Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
     };
@@ -148,12 +151,18 @@ internal sealed class RescueForm : VesperPopupForm
         LayoutAdvanced();
     }
 
+    private int S(int px) => IsHandleCreated ? UiKit.Scale(this, px) : px;
+
     private void LayoutAdvanced()
     {
         _shaLabel.Visible = _shaFrame.Visible = _pieceButton.Visible = _pieceLabel.Visible = _advancedVisible;
         _advanced.Text = _advancedVisible ? "Hide advanced verification" : "Advanced verification (optional)";
-        _result.SetBounds(23, _advancedVisible ? 310 : 191, 474, _advancedVisible ? 82 : 62);
-        ClientSize = new Size(520, (_advancedVisible ? 472 : 330) + VesperDialogChrome.HeaderHeight);
+        int messageY = _advancedVisible ? 310 : 191;
+        _result.SetBounds(S(23), S(messageY), S(474), S(70));
+        _result.Visible = _result.Text.Length > 0;
+        int body = messageY + (_result.Text.Length > 0 ? 78 : 17);
+        int chrome = IsHandleCreated ? VesperDialogChrome.VerticalInset(this) : VesperDialogChrome.HeaderHeight + 2;
+        ClientSize = new Size(S(520), S(body) + _footer.Height + chrome);
     }
 
     private void ChoosePieceFile()
@@ -263,5 +272,6 @@ internal sealed class RescueForm : VesperPopupForm
     {
         _result.ForeColor = error ? _colors.Red : _colors.Text;
         _result.Text = text;
+        LayoutAdvanced();
     }
 }

@@ -160,6 +160,38 @@ public sealed class SecureHttpClient : IDisposable
         return result.ToArray();
     }
 
+    /// <summary>
+    /// POSTs a small JSON body to an API endpoint through the same validated path as GET (URL policy, connect-time
+    /// DNS filtering, per-hop redirect checks, timeouts, response caps). Credentials follow the context's host scoping.
+    /// </summary>
+    public async Task<HttpTextResponse> PostJsonAsync(Uri url, string json, MediaRequestContext? ctx,
+        IReadOnlyDictionary<string, string>? headers, CancellationToken ct, int? maxBytes = null)
+    {
+        if (json.Length > 64 * 1024) throw new MediaResolverException(MediaErrors.TooLarge("JSON request body exceeds 64 KiB"));
+        using var resp = await SendAsync(HttpMethod.Post, url, ctx, ct, req =>
+        {
+            req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            if (headers is not null)
+                foreach (var kv in headers) req.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
+            if (ctx?.AcceptLanguage is null) req.Headers.TryAddWithoutValidation("Accept-Language", "en-US,en;q=0.8");
+        }).ConfigureAwait(false);
+        int status = (int)resp.StatusCode;
+        int limit = status >= 400 ? _o.MaxErrorBodyBytes : maxBytes ?? _o.MaxJsonBytes;
+        string body = await ReadLimitedAsync(resp, limit, ct).ConfigureAwait(false);
+        return new HttpTextResponse(resp.RequestMessage?.RequestUri ?? url, status, body, resp.Content.Headers.ContentType?.MediaType, []);
+    }
+
+    /// <summary>
+    /// Requests exactly one byte at <paramref name="offset"/> and returns the HTTP status. Used to prove that a media URL
+    /// serves data beyond its first bytes (some clients' URLs are cut off after ~1 MiB without a proof-of-origin token).
+    /// </summary>
+    public async Task<int> ProbeRangeAsync(Uri url, MediaRequestContext? ctx, long offset, CancellationToken ct)
+    {
+        using var resp = await SendAsync(HttpMethod.Get, url, ctx, ct,
+            req => req.Headers.Range = new RangeHeaderValue(offset, offset)).ConfigureAwait(false);
+        return (int)resp.StatusCode;
+    }
+
     /// <summary>HEAD first; if the server refuses, a 1-byte ranged GET. The body is never downloaded.</summary>
     public async Task<ProbeResult> ProbeAsync(Uri url, MediaRequestContext? ctx, CancellationToken ct)
     {

@@ -1,0 +1,25 @@
+# platform	scenario	mode	url   (curated public, non-DRC corpus; see MEDIA_ENGINE_COMPATIBILITY.md)
+youtube	standard video (first upload, 240p)	balanced	https://www.youtube.com/watch?v=jNQXAC9IVRw
+youtube	youtu.be short link	audio	https://youtu.be/jNQXAC9IVRw
+youtube	YouTube Music URL	audio	https://music.youtube.com/watch?v=jNQXAC9IVRw
+youtube	privacy-enhanced embed URL	smallest	https://www.youtube-nocookie.com/embed/jNQXAC9IVRw
+youtube	1080p60 H.264 + AAC merge (Big Buck Bunny)	h1080	https://www.youtube.com/watch?v=aqz-KE-bpKQ
+youtube	2160p60 4K best (Big Buck Bunny)	h2160	https://www.youtube.com/watch?v=aqz-KE-bpKQ
+youtube	HDR + 4K discovery (Costa Rica HDR)	discover	https://www.youtube.com/watch?v=LXb3EKWsInQ
+youtube	multi-language audio tracks discovery	discover	https://www.youtube.com/watch?v=0e3GPea1Tyg
+youtube	non-default audio language download (es)	audio:es	https://www.youtube.com/watch?v=0e3GPea1Tyg
+youtube	Shorts	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q
+youtube	Shorts	balanced	https://www.youtube.com/shorts/-62C9R_41Sc
+youtube	Shorts	balanced	https://www.youtube.com/shorts/myZ9kn9MIWQ
+youtube	completed livestream recording	smallest	https://www.youtube.com/watch?v=M3HKLzjvKPc
+youtube	completed livestream recording	smallest	https://www.youtube.com/watch?v=MRg4uIpJ3xE
+youtube	playlist with continuation (NASA uploads, bounded)	collection	https://www.youtube.com/playlist?list=UULA_DiR1FfKNvjuUpBHmylQ
+youtube	Mix / radio (dynamic snapshot)	collection	https://www.youtube.com/watch?v=jNQXAC9IVRw&list=RDjNQXAC9IVRw&start_radio=1
+internet-archive	public film	smallest	https://archive.org/details/BigBuckBunny_124
+vimeo	public video	smallest	https://vimeo.com/76979871
+peertube	public video (framatube)	smallest	https://framatube.org/videos/watch/9c9de5e8-0a1e-484a-b099-e80766180a6d
+bandcamp	public test track	audio	https://youtube-dl.bandcamp.com/track/youtube-dl-test-song
+podcast	RSS feed	collection	https://feeds.npr.org/510289/podcast.xml
+soundcloud	public track (no adapter)	audio	https://soundcloud.com/forss/flickermood
+twitch	public clip/VOD (no adapter)	discover	https://www.twitch.tv/videos/2000000000
+x	public post video (no adapter)	discover	https://x.com/NASA/status/1800000000000000000
