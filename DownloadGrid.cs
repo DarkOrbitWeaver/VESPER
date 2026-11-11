@@ -28,6 +28,16 @@ public sealed class DownloadGrid : ScrollableControl
     public event Action? CheckStateChanged;
     internal event Action<DownloadItem>? DetailsRequested;
     internal event Action<DownloadItem, Point>? MenuRequested;
+    internal event Action<DownloadItem>? OpenRequested;
+
+    /// <summary>Shown when the list is empty. Set by the owner: "No downloads yet" differs from "No matches".</summary>
+    [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    internal string EmptyTitle { get; set; } = "No matching downloads";
+    [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    internal string EmptyHint { get; set; } = "";
+
+    /// <summary>Repaints rows after an in-place change (progress tick). Only visible rows are drawn.</summary>
+    internal void RefreshRows() => Invalidate();
 
     public DownloadGrid()
     {
@@ -40,7 +50,7 @@ public sealed class DownloadGrid : ScrollableControl
         AccessibleName = "Downloads";
         AccessibleDescription = "Use the arrow keys to browse downloads. Space selects a record, Enter opens details, and Shift+F10 opens actions.";
         if (LicenseManager.UsageMode == LicenseUsageMode.Designtime)
-            _items = DownloadItem.Examples(); // Visual Studio preview data only.
+            _items = DownloadItem.DesignerSamples(); // Visual Studio designer preview only.
         ApplyAppearance(VesperPalette.Light, Density.Compact);
     }
 
@@ -205,8 +215,11 @@ public sealed class DownloadGrid : ScrollableControl
         if (_items.Count == 0)
         {
             var text = new Rectangle(20, _headerHeight + Math.Max(40, (Height - _headerHeight) / 3), Width - 40, 50);
-            Draw(g, "No matching downloads", _nameFont, _palette.Muted, text,
+            Draw(g, EmptyTitle, _nameFont, _palette.Text, text,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            if (EmptyHint.Length > 0)
+                Draw(g, EmptyHint, _subFont, _palette.Muted, new Rectangle(text.X, text.Bottom - 6, text.Width, 40),
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.WordBreak);
         }
     }
 
@@ -333,9 +346,16 @@ public sealed class DownloadGrid : ScrollableControl
             JobStatus.NeedsLink => ("Needs link", VesperIcon.Warning, _palette.Red),
             JobStatus.Waiting => ("Waiting for network", VesperIcon.Info, _palette.Muted),
             JobStatus.Verifying => ("Verifying", VesperIcon.Info, _palette.Green),
-            _ => ("Suspect", VesperIcon.Warning, _palette.Red)
+            JobStatus.Resolving => ("Resolving", VesperIcon.Info, _palette.Muted),
+            JobStatus.WaitingRetry => ("Waiting to retry", VesperIcon.Clock, _palette.Amber),
+            JobStatus.NeedsAttention => ("Needs attention", VesperIcon.Warning, _palette.Red),
+            JobStatus.Processing => ("Finishing", VesperIcon.Info, _palette.Green),
+            JobStatus.Failed => ("Failed", VesperIcon.Warning, _palette.Red),
+            JobStatus.Cancelled => ("Cancelled", VesperIcon.Info, _palette.Muted),
+            _ => ("Suspect integrity", VesperIcon.Warning, _palette.Red)
         };
-        bool progress = item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink;
+        bool progress = item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink
+            or JobStatus.NeedsAttention or JobStatus.WaitingRetry or JobStatus.Waiting or JobStatus.Failed;
         int iconSize = UiKit.Scale(this, 14);
         int statusHeight = UiKit.Scale(this, _density == Density.ExtraCompact ? 18 : 21);
         int statusY = progress ? rect.Y + UiKit.Scale(this, _density == Density.ExtraCompact ? 2 : 4)
@@ -351,7 +371,7 @@ public sealed class DownloadGrid : ScrollableControl
         string percentText = _density == Density.ExtraCompact ? $"{percent}%" : item.Status switch
         {
             JobStatus.Paused => $"{percent}% saved",
-            JobStatus.NeedsLink => $"{percent}% retained",
+            JobStatus.NeedsLink or JobStatus.NeedsAttention or JobStatus.Failed => $"{percent}% retained",
             _ => $"{percent}%"
         };
         Draw(g, percentText, _subFont, _palette.Muted,
@@ -362,7 +382,7 @@ public sealed class DownloadGrid : ScrollableControl
         var bar = new Rectangle(rect.Left + pad, barTop, Math.Max(1, rect.Width - pad * 2), barHeight);
         using (var track = new SolidBrush(_palette.Border)) g.FillRectangle(track, bar);
         using (var fill = new SolidBrush(item.Status == JobStatus.Paused ? _palette.Amber
-            : item.Status == JobStatus.NeedsLink ? _palette.MutedGreen : _palette.Green))
+            : item.Status is JobStatus.NeedsLink or JobStatus.NeedsAttention or JobStatus.Failed ? _palette.MutedGreen : _palette.Green))
             g.FillRectangle(fill, bar.X, bar.Y, (int)(bar.Width * percent / 100d), bar.Height);
     }
 
@@ -464,6 +484,14 @@ public sealed class DownloadGrid : ScrollableControl
         else if (e.Button == MouseButtons.Left && col == 0) Toggle(item);
         else if (e.Button == MouseButtons.Left && col == 1 && e.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48))
             DetailsRequested?.Invoke(item);
+    }
+
+    protected override void OnMouseDoubleClick(MouseEventArgs e)
+    {
+        base.OnMouseDoubleClick(e);
+        var (row, column) = Hit(e.Location);
+        // The owner revalidates the path and only opens a genuinely completed, present file.
+        if (e.Button == MouseButtons.Left && row >= 0 && column is not (0 or 5)) OpenRequested?.Invoke(_items[row]);
     }
 
     protected override bool IsInputKey(Keys keyData) => (keyData & Keys.KeyCode) switch

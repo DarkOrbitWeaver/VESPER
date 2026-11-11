@@ -175,20 +175,20 @@ partial class Form1
         _footerLabel.Padding = new Padding(21, 0, 0, 0);
         _footerLabel.Font = new Font("Segoe UI", 8F);
         _footerLabel.ForeColor = Color.FromArgb(104, 116, 107);
-        _footerLabel.Text = "DEMO · no files transferred     |     2 downloading     |     1 queued";
+        _footerLabel.Text = "";
         _footerLabel.TextAlign = ContentAlignment.MiddleLeft;
         _footer.Controls.Add(_footerLabel);
         // Form
         AutoScaleDimensions = new SizeF(96F, 96F);
         AutoScaleMode = AutoScaleMode.Dpi;
         BackColor = Color.White;
-        ClientSize = new Size(950, 530);
+        ClientSize = new Size(950, 625);
         Font = new Font("Segoe UI", 9F);
         KeyPreview = true;
-        MinimumSize = new Size(830, 490);
+        MinimumSize = new Size(830, 540);
         Name = "Form1";
         StartPosition = FormStartPosition.CenterScreen;
-        Text = "VESPER — Download Manager (UI Preview)";
+        Text = "VESPER — Download Manager";
         Controls.Add(_grid);
         Controls.Add(_footer);
         Controls.Add(_toolbar);

@@ -7,9 +7,30 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>Assets\VESPER-Illustrated.ico</ApplicationIcon>
+    <AssemblyName>VESPER</AssemblyName>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
+    <Product>VESPER</Product>
+    <Company>VESPER</Company>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ForceDesignerDpiUnaware>true</ForceDesignerDpiUnaware>
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
+
+  <!-- The engine, native host, tests and extension live in subfolders and have their own projects. -->
+  <ItemGroup>
+    <Compile Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
+    <EmbeddedResource Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
+    <None Remove="src\**;tests\**;extension\**;scripts\**;release\**" />
+  </ItemGroup>
+
   <ItemGroup>
     <Content Include="Assets\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <ProjectReference Include="src\Vesper.Engine\Vesper.Engine.csproj" />
+    <ProjectReference Include="src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />
   </ItemGroup>
 
 </Project>

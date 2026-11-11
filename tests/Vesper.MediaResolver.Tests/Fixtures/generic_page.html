@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Generic Page</title>
+<meta property="og:title" content="OG Generic Title">
+<meta property="og:image" content="/thumb.jpg">
+<meta property="og:video:type" content="video/mp4">
+<meta property="og:video" content="https://media.generic-fixture.example/og.mp4">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"VideoObject","name":"LD Title","contentUrl":"https://media.generic-fixture.example/ld.mp4","duration":"PT1M30S","thumbnailUrl":["https://media.generic-fixture.example/t.jpg"]}</script>
+</head>
+<body>
+<video width="640" height="360" poster="/poster.jpg">
+  <source src="/files/clip-360.mp4" type="video/mp4">
+  <source src="clip.webm" type="video/webm">
+  <track kind="subtitles" src="/subs/en.vtt" srclang="en" label="English">
+</video>
+<audio src="https://media.generic-fixture.example/audio.mp3"></audio>
+<script>var player = {hls: "https:\/\/media.generic-fixture.example\/live\/stream.m3u8?token=1"};</script>
+<iframe src="https://ads.generic-fixture.example/ad.html"></iframe>
+</body>
+</html>

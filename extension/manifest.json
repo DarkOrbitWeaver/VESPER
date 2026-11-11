@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "VESPER Download Manager",
+  "short_name": "VESPER",
+  "version": "1.0.0",
+  "description": "Send downloads and supported media from your browser to the VESPER desktop app. No accounts, no analytics.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5citp4xKuBoD7jOIuGX5lYqpCdbnk9j93sccVmd/OHR1pvPPJ6RKcRpTAAktV3f6JoaGfBUnD9Yb4UE0ZAZQecnNGV6dvS8tA9ir1FAaVHyI2emwIe/7AgS2rolnHoAVofuhEeErpID1Bwx/FCjZb2WUGxsy9K6OUE5VKLmVt2zDIO3Gdo4N1hYb3oPlIEOEn0CAxvzwjAoPzP9QzXNWxolBU5x+XfsZTlrDUe6wQXVo18Ugfx1jRzzqGGz61MCYoXNnUzH8nwaO8fb1urFM0PWQHCUGGfIcBfJ2eR+eelfp9dPw3ewDgiJc+fEpDY7yJvpSezWr4h13kzWlvllz3wIDAQAB",
+  "icons": { "16": "icons/vesper-16.png", "32": "icons/vesper-32.png", "48": "icons/vesper-48.png", "128": "icons/vesper-128.png" },
+  "action": {
+    "default_title": "VESPER",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/vesper-16.png", "32": "icons/vesper-32.png" }
+  },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["nativeMessaging", "contextMenus", "storage", "downloads", "webRequest"],
+  "optional_permissions": ["cookies"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    { "resources": ["icons/moth-64.png"], "matches": ["http://*/*", "https://*/*"] }
+  ]
+}

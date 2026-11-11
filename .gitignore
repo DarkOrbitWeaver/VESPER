@@ -3,3 +3,8 @@ bin/
 obj/
 *.user
 *.suo
+release/
+*.corrupt-*
+*.bak-v*
+node_modules/
+TestResults/

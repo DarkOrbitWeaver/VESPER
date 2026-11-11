@@ -1,0 +1,9 @@
+{
+  "metadata": { "identifier": "fixture_album", "title": "Fixture Album", "mediatype": "audio", "creator": "Fixture Band" },
+  "files": [
+    { "name": "01 - First.mp3", "source": "original", "format": "VBR MP3", "size": "4000000", "length": "180", "title": "First", "bitrate": "192" },
+    { "name": "01 - First.ogg", "source": "derivative", "format": "Ogg Vorbis", "size": "3000000", "length": "180" },
+    { "name": "02 - Second.mp3", "source": "original", "format": "VBR MP3", "size": "5000000", "length": "200", "title": "Second" },
+    { "name": "03 - Third.mp3", "source": "original", "format": "VBR MP3", "size": "3000000", "length": "150", "title": "Third" }
+  ]
+}

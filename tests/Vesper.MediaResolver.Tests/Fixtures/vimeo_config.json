@@ -1,0 +1,22 @@
+{
+  "video": {
+    "id": 76979871,
+    "title": "Fixture Vimeo Video",
+    "duration": 62,
+    "owner": { "name": "Fixture Owner" },
+    "thumbs": { "640": "https://i.vimeocdn.com/video/1-640.jpg", "1280": "https://i.vimeocdn.com/video/1-1280.jpg", "base": "https://i.vimeocdn.com/video/1" }
+  },
+  "request": {
+    "files": {
+      "progressive": [
+        { "quality": "360p", "width": 640, "height": 360, "fps": 25, "mime": "video/mp4", "url": "https://vod.vimeo-fixture.example/360.mp4?expires=4000000000&sig=abc" },
+        { "quality": "720p", "width": 1280, "height": 720, "fps": 25, "mime": "video/mp4", "url": "https://vod.vimeo-fixture.example/720.mp4?expires=4000000000&sig=def" }
+      ],
+      "hls": {
+        "default_cdn": "primary",
+        "cdns": { "primary": { "url": "https://adaptive.vimeo-fixture.example/master.m3u8" } }
+      }
+    },
+    "text_tracks": [ { "lang": "en", "label": "English", "url": "/texttrack/1.vtt", "kind": "subtitles" } ]
+  }
+}

@@ -1,24 +1,32 @@
+using Vesper.Engine;
+
 namespace VESPER;
 
-// UI preview only. Information comes from DownloadItem, not the disk or network.
+/// <summary>
+/// Compact, state-aware details for one download. Everything shown comes from the engine; actions are limited to
+/// what makes sense for the current state. Updates arrive through engine events, not polling.
+/// </summary>
 [System.ComponentModel.DesignerCategory("Form")]
 internal sealed class DownloadDetailsForm : Form
 {
-    private readonly DownloadItem _item;
+    private readonly DownloadEngine _engine;
+    private readonly DownloadActions _actions;
     private readonly VesperPalette _colors;
-    private readonly Action? _changed;
     private readonly Panel _content;
     private readonly Panel _footer;
     private readonly ToolTip _tips = new();
     private readonly VesperButton _close;
-    private bool _updating;
+    private readonly Dictionary<string, Label> _live = [];
+    private Panel? _progressFill;
+    private int _progressWidth;
+    private JobSnapshot _job;
+    private bool _building;
 
-    public DownloadDetailsForm() : this(DownloadItem.Examples()[3], new VesperPreferences()) { }
-
-    public DownloadDetailsForm(DownloadItem item, VesperPreferences preferences, Action? changed = null)
+    public DownloadDetailsForm(DownloadEngine engine, DownloadActions actions, JobSnapshot job, VesperPreferences preferences)
     {
-        _item = item;
-        _changed = changed;
+        _engine = engine;
+        _actions = actions;
+        _job = job;
         _colors = UiKit.Palette(preferences);
         VesperWindowChrome.Brand(this);
         Text = "Download details — VESPER";
@@ -30,8 +38,7 @@ internal sealed class DownloadDetailsForm : Form
         ForeColor = _colors.Text;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        MaximizeBox = false;
-        MinimizeBox = false;
+        MaximizeBox = MinimizeBox = false;
 
         _content = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 66, BackColor = _colors.Surface };
@@ -40,44 +47,89 @@ internal sealed class DownloadDetailsForm : Form
             using var line = new Pen(_colors.Border);
             e.Graphics.DrawLine(line, 19, 0, _footer.Width - 19, 0);
         };
-        _close = Button("Close", 83);
+        _close = NewButton("Close", 83, primary: false);
         _close.DialogResult = DialogResult.Cancel;
         _close.Click += (_, _) => Close();
         Controls.Add(_content);
         Controls.Add(_footer);
         VesperDialogChrome.Attach(this, "Download details", _colors);
         CancelButton = _close;
+
+        _engine.JobChanged += OnJobChanged;
+        _engine.Progress += OnProgress;
         Build();
     }
 
-    private VesperButton Button(string text, int width, bool primary = false)
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _engine.JobChanged -= OnJobChanged;
+        _engine.Progress -= OnProgress;
+        base.OnFormClosed(e);
+    }
+
+    // ---- live updates ---------------------------------------------------------------------------------------------
+
+    private void OnJobChanged(JobSnapshot s)
+    {
+        if (s.Id == _job.Id) Post(() => Apply(s));
+    }
+
+    private void OnProgress(IReadOnlyList<JobSnapshot> batch)
+    {
+        JobSnapshot? mine = batch.FirstOrDefault(s => s.Id == _job.Id);
+        if (mine is not null) Post(() => Apply(mine));
+    }
+
+    private void Post(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke(action); }
+        catch (InvalidOperationException) { /* closing */ }
+    }
+
+    private void Apply(JobSnapshot s)
+    {
+        bool structural = s.State != _job.State || s.Message != _job.Message || s.FileMissing != _job.FileMissing
+            || s.FileName != _job.FileName || s.Reason != _job.Reason || s.SourceUrl != _job.SourceUrl;
+        _job = s;
+        if (structural) Build(); else UpdateLive();
+    }
+
+    private void UpdateLive()
+    {
+        foreach ((string key, Label label) in _live)
+        {
+            string value = Fields().FirstOrDefault(f => f.Key == key).Value ?? label.Text;
+            if (label.Text != value) label.Text = value;
+        }
+        if (_progressFill is not null)
+            _progressFill.Width = (int)(_progressWidth * Math.Clamp(_job.Fraction ?? 0, 0, 1));
+    }
+
+    // ---- layout ---------------------------------------------------------------------------------------------------
+
+    private VesperButton NewButton(string text, int width, bool primary)
     {
         var button = new VesperButton { Text = text, Primary = primary, Size = new Size(width, 33) };
         button.ApplyPalette(_colors);
         return button;
     }
 
-    private Label Label(string text, int x, int y, int width, int height, float fontSize = 9,
-        bool bold = false, bool muted = false)
+    private Label Text_(string text, int x, int y, int width, int height, float size = 9, bool bold = false, bool muted = false) => new()
     {
-        return new Label
-        {
-            Text = text, AutoSize = false, AutoEllipsis = true,
-            Location = new Point(x, y), Size = new Size(width, height),
-            BackColor = Color.Transparent,
-            ForeColor = muted ? _colors.Muted : _colors.Text,
-            Font = new Font("Segoe UI", fontSize, bold ? FontStyle.Bold : FontStyle.Regular),
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-    }
+        Text = text, AutoSize = false, AutoEllipsis = true, Location = new Point(x, y), Size = new Size(width, height),
+        BackColor = Color.Transparent, ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
+        Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
+    };
 
     private void Build()
     {
-        if (_updating) return;
-        _updating = true;
+        if (_building) return;
+        _building = true;
         try
         {
             _tips.RemoveAll();
+            _live.Clear();
             foreach (Control control in _content.Controls.Cast<Control>().ToArray()) control.Dispose();
             foreach (Control control in _footer.Controls.Cast<Control>().ToArray())
             {
@@ -85,31 +137,18 @@ internal sealed class DownloadDetailsForm : Form
                 if (!ReferenceEquals(control, _close)) control.Dispose();
             }
 
-            const int margin = 24;
-            const int textX = 87;
-            const int valueX = 164;
-            int bodyWidth = ClientSize.Width;
-            int contentWidth = bodyWidth - 2 * margin;
+            const int margin = 24, textX = 87, valueX = 164;
+            int bodyWidth = ClientSize.Width, contentWidth = bodyWidth - 2 * margin;
 
-            // One recognizable file icon replaces the old repeated headings.
-            var emblem = new Panel
-            {
-                Location = new Point(margin, 18), Size = new Size(49, 49),
-                BackColor = _colors.Surface
-            };
+            var emblem = new Panel { Location = new Point(margin, 18), Size = new Size(49, 49), BackColor = _colors.Surface };
             emblem.Paint += (_, e) =>
             {
-                var symbol = _item.FileType switch
+                VesperIcon symbol = DownloadItem.From(_job).FileType switch
                 {
-                    "Audio" => VesperIcon.Audio,
-                    "Video" => VesperIcon.Video,
-                    "Archive" => VesperIcon.Archive,
-                    "Disc image" => VesperIcon.Disc,
-                    "eBook" => VesperIcon.Book,
-                    _ => VesperIcon.File
+                    "Audio" => VesperIcon.Audio, "Video" => VesperIcon.Video, "Archive" => VesperIcon.Archive,
+                    "Disc image" => VesperIcon.Disc, "eBook" => VesperIcon.Book, _ => VesperIcon.File
                 };
-                var g = e.Graphics;
-                var old = g.SmoothingMode;
+                Graphics g = e.Graphics;
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 using (var outline = VesperDrawing.Rounded(new Rectangle(1, 1, 47, 47), 7))
                 {
@@ -119,18 +158,17 @@ internal sealed class DownloadDetailsForm : Form
                     g.DrawPath(stroke, outline);
                 }
                 VesperDrawing.Icon(g, symbol, new Rectangle(11, 11, 27, 27), _colors.MutedGreen);
-                g.SmoothingMode = old;
             };
             _content.Controls.Add(emblem);
 
-            var name = Label(_item.Name, textX, 13, bodyWidth - textX - margin, 28, 10F, bold: true);
+            Label name = Text_(_job.FileName, textX, 13, bodyWidth - textX - margin, 28, 10F, bold: true);
             _content.Controls.Add(name);
-            _tips.SetToolTip(name, _item.Name);
-            _content.Controls.Add(Label($"{_item.FileType} · {_item.Extension}  ({_item.Size})",
-                textX, 39, bodyWidth - textX - margin, 19, 8.25F, muted: true));
+            _tips.SetToolTip(name, _job.FileName);
+            DownloadItem item = DownloadItem.From(_job);
+            _content.Controls.Add(Text_($"{item.FileType} · {item.Extension}  ({item.Size})", textX, 39, bodyWidth - textX - margin, 19, 8.25F, muted: true));
 
-            (string status, VesperIcon icon, Color ink) = Status();
-            var state = Label(status + " · demo", textX + 19, 62, bodyWidth - textX - margin - 19, 21, 9, true);
+            (string status, VesperIcon icon, Color ink) = StatusLine();
+            Label state = Text_(status, textX + 19, 62, bodyWidth - textX - margin - 19, 21, 9, bold: true);
             state.ForeColor = ink;
             _content.Controls.Add(state);
             var stateIcon = new Panel { Location = new Point(textX, 64), Size = new Size(16, 16), BackColor = _colors.Surface };
@@ -138,139 +176,206 @@ internal sealed class DownloadDetailsForm : Form
             _content.Controls.Add(stateIcon);
 
             int y = 100;
-            if (_item.Percent is int percent && _item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink)
+            _progressFill = null;
+            if (_job.Fraction is double fraction && _job.ProgressBytes > 0 && _job.State != JobState.Completed)
             {
-                var progress = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 4), BackColor = _colors.Border };
-                var fill = new Panel
+                _progressWidth = contentWidth;
+                var track = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 4), BackColor = _colors.Border };
+                _progressFill = new Panel
                 {
-                    Location = Point.Empty,
-                    Size = new Size(contentWidth * Math.Clamp(percent, 0, 100) / 100, 4),
-                    BackColor = _item.Status == JobStatus.Paused ? _colors.Amber : _colors.Green
+                    Location = Point.Empty, Size = new Size((int)(contentWidth * fraction), 4),
+                    BackColor = _job.State is JobState.Downloading ? _colors.Green : _job.State == JobState.Paused ? _colors.Amber : _colors.MutedGreen
                 };
-                progress.Controls.Add(fill);
-                _content.Controls.Add(progress);
+                track.Controls.Add(_progressFill);
+                _content.Controls.Add(track);
                 y += 19;
             }
 
-            string? explanation = _item.Status switch
+            if (Explanation() is { Length: > 0 } explanation)
             {
-                JobStatus.Missing => "The saved file could not be found at its recorded location.",
-                JobStatus.NeedsLink => "The original link needs replacing. Saved progress is not discarded.",
-                _ => null
-            };
-            if (explanation is not null)
-            {
-                var note = Label(explanation, margin, y, contentWidth, 37, 8.5F, muted: true);
+                Label note = Text_(explanation, margin, y, contentWidth, 54, 8.5F, muted: true);
                 note.AutoEllipsis = false;
+                note.TextAlign = ContentAlignment.TopLeft;
+                int lines = Math.Max(1, (int)Math.Ceiling(TextRenderer.MeasureText(explanation, note.Font).Width / (double)(contentWidth - 6)));
+                note.Height = Math.Min(70, 8 + lines * 16);
                 _content.Controls.Add(note);
-                y += 43;
+                y += note.Height + 6;
             }
-            var divider = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 1), BackColor = _colors.Border };
-            _content.Controls.Add(divider);
+            _content.Controls.Add(new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 1), BackColor = _colors.Border });
             y += 12;
 
-            foreach (var (key, value) in Fields())
+            foreach ((string key, string value) in Fields())
             {
                 VesperIcon glyph = key switch
                 {
-                    "Progress" => VesperIcon.Download,
-                    "Transfer" or "Bandwidth" => VesperIcon.Gauge,
-                    "Time left" => VesperIcon.Clock,
-                    "Source" => VesperIcon.Link,
-                    "Save to" or "Last known path" => VesperIcon.Folder,
-                    _ => VesperIcon.File
+                    "Progress" => VesperIcon.Download, "Transfer" or "Bandwidth" => VesperIcon.Gauge, "Time left" => VesperIcon.Clock,
+                    "Source" => VesperIcon.Link, "Save to" or "Last known path" or "Partial file" => VesperIcon.Folder,
+                    "Integrity" or "Recovery" => VesperIcon.Check, _ => VesperIcon.File
                 };
                 var fieldIcon = new Panel { Location = new Point(margin, y + 6), Size = new Size(15, 15), BackColor = _colors.Surface };
                 fieldIcon.Paint += (_, e) => VesperDrawing.Icon(e.Graphics, glyph, new Rectangle(0, 0, 15, 15), _colors.MutedGreen);
                 _content.Controls.Add(fieldIcon);
-                _content.Controls.Add(Label(key, margin + 23, y, valueX - margin - 31, 28, 8.5F, muted: true));
-                var field = Label(value, valueX, y, bodyWidth - valueX - margin, 28, 8.8F);
+                _content.Controls.Add(Text_(key, margin + 23, y, valueX - margin - 31, 28, 8.5F, muted: true));
+                Label field = Text_(value, valueX, y, bodyWidth - valueX - margin, 28, 8.8F);
                 _content.Controls.Add(field);
-                _tips.SetToolTip(field, value);
+                _live[key] = field;
+                _tips.SetToolTip(field, key == "Source" ? "Use the row menu → Copy source URL for the full link." : value);
                 y += 31;
             }
-            // The footer contains all actions: no oversized disclosure panel.
-            int height = VesperDialogChrome.HeaderHeight + y + 13 + _footer.Height;
-            ClientSize = new Size(bodyWidth, height);
 
-            _footer.Controls.Add(Label("DEMO · No files or transfers verified", 23, 5, 335, 18, 7.7F, muted: true));
-            int actionY = 27;
-            int x = 23;
-            foreach (var (text, primary) in Actions())
+            ClientSize = new Size(bodyWidth, VesperDialogChrome.HeaderHeight + y + 13 + _footer.Height);
+
+            int actionY = 17, x = 23;
+            foreach ((string text, bool primary, Action action) in Actions())
             {
-                int buttonWidth = text.Length > 13 ? 145 : 102;
-                var action = Button(text, buttonWidth, primary);
-                action.SetBounds(x, actionY, buttonWidth, 33);
-                action.Click += (_, _) => PerformDemoAction(text);
-                _footer.Controls.Add(action);
-                x += buttonWidth + 8;
+                int width = Math.Max(92, TextRenderer.MeasureText(text, Font).Width + 40);
+                VesperButton button = NewButton(text, width, primary);
+                button.SetBounds(x, actionY, width, 33);
+                button.Click += (_, _) => action();
+                _footer.Controls.Add(button);
+                x += width + 8;
             }
             _close.SetBounds(_footer.Width - 23 - 83, actionY, 83, 33);
             _close.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _footer.Controls.Add(_close);
             _footer.Invalidate();
         }
-        finally { _updating = false; }
+        finally { _building = false; }
     }
 
-    private (string Text, VesperIcon Icon, Color Color) Status() => _item.Status switch
+    // ---- content by state -----------------------------------------------------------------------------------------
+
+    private (string Text, VesperIcon Icon, Color Color) StatusLine()
     {
-        JobStatus.Missing => ("File missing", VesperIcon.Warning, _colors.Amber),
-        JobStatus.NeedsLink => ("Needs link", VesperIcon.Warning, _colors.Red),
-        JobStatus.Downloading => ($"Downloading ({_item.Percent ?? 0}%)", VesperIcon.Download, _colors.Green),
-        JobStatus.Paused => ("Paused", VesperIcon.Pause, _colors.Amber),
-        JobStatus.Completed => ("Completed", VesperIcon.Check, _colors.Green),
-        JobStatus.Queued => ("Queued", VesperIcon.Queue, _colors.Muted),
-        _ => ("Waiting", VesperIcon.Info, _colors.Muted)
+        int percent = _job.Fraction is double f ? (int)Math.Floor(f * 100) : 0;
+        return _job.State switch
+        {
+            JobState.Completed when _job.FileMissing => ("Completed · file missing", VesperIcon.Warning, _colors.Amber),
+            JobState.Completed => ("Completed", VesperIcon.Check, _colors.Green),
+            JobState.Downloading => (_job.Fraction is null ? "Downloading" : $"Downloading ({percent}%)", VesperIcon.Download, _colors.Green),
+            JobState.Resolving => ("Contacting server", VesperIcon.Info, _colors.Muted),
+            JobState.Paused => ("Paused", VesperIcon.Pause, _colors.Amber),
+            JobState.Queued => ("Queued", VesperIcon.Queue, _colors.Muted),
+            JobState.WaitingForNetwork => ("Waiting for network", VesperIcon.Info, _colors.Amber),
+            JobState.WaitingForRetry => ("Waiting to retry", VesperIcon.Clock, _colors.Amber),
+            JobState.NeedsLink => ("Needs a new link", VesperIcon.Warning, _colors.Red),
+            JobState.NeedsAttention => ("Needs attention", VesperIcon.Warning, _colors.Red),
+            JobState.Verifying => ("Verifying checksum", VesperIcon.Info, _colors.Green),
+            JobState.Finalizing => ("Finishing", VesperIcon.Info, _colors.Green),
+            JobState.Suspect => ("Suspect integrity", VesperIcon.Warning, _colors.Red),
+            JobState.Failed => ("Failed", VesperIcon.Warning, _colors.Red),
+            _ => ("Cancelled", VesperIcon.Info, _colors.Muted)
+        };
+    }
+
+    private string Explanation() => _job.State switch
+    {
+        JobState.Completed when _job.FileMissing => "The saved file is no longer at its recorded location. The download itself did not fail.",
+        JobState.NeedsLink => $"The link no longer works. {(_job.CommittedBytes > 0 ? $"{Formatting.Bytes(_job.CommittedBytes)} is saved. " : "")}" +
+            "VESPER checks that a replacement serves the same file before reusing any saved data.",
+        JobState.Paused when _job.CommittedBytes > 0 => $"{Formatting.Bytes(_job.CommittedBytes)} is saved safely and will be reused.",
+        JobState.Completed or JobState.Downloading or JobState.Queued or JobState.Resolving => _job.State == JobState.Downloading ? _job.Message : "",
+        _ => _job.Message
     };
 
     private IEnumerable<(string Key, string Value)> Fields()
     {
-        if (_item.Percent.HasValue) yield return ("Progress", $"{_item.Percent}% saved (sample)");
-        if (!string.IsNullOrWhiteSpace(_item.Transfer)) yield return ("Transfer", _item.Transfer);
-        if (!string.IsNullOrWhiteSpace(_item.Eta)) yield return ("Time left", _item.Eta);
-        if (!_item.Percent.HasValue) yield return ("Size", _item.Size);
-        string destination = string.IsNullOrWhiteSpace(_item.Destination)
-            ? "%USERPROFILE%\\Downloads\\" + _item.Name
-            : Path.Combine(_item.Destination, _item.Name);
-        yield return (_item.Status == JobStatus.Missing ? "Last known path" : "Save to", destination + " (sample)");
-        if (!string.IsNullOrWhiteSpace(_item.SourceUrl)) yield return ("Source", _item.SourceUrl);
-        if (_item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink)
-            yield return ("Bandwidth", _item.RateCap);
+        bool unfinished = _job.State != JobState.Completed;
+        if (_job.TotalBytes is long total && (unfinished && _job.ProgressBytes > 0))
+        {
+            string progress = _job.State == JobState.Downloading
+                ? $"{Formatting.Bytes(_job.ProgressBytes)} of {Formatting.Bytes(total)}"
+                : $"{Formatting.Bytes(_job.CommittedBytes)} saved of {Formatting.Bytes(total)}";
+            yield return ("Progress", progress);
+        }
+        else if (unfinished && _job.CommittedBytes > 0) yield return ("Progress", $"{Formatting.Bytes(_job.CommittedBytes)} saved");
+
+        if (_job.State == JobState.Downloading && _job.SpeedBytesPerSecond > 0)
+            yield return ("Transfer", $"{Formatting.Rate(_job.SpeedBytesPerSecond)} · {_job.Connections} connection{(_job.Connections == 1 ? "" : "s")}");
+        if (_job.Eta is { } eta) yield return ("Time left", Formatting.Eta(eta));
+        if (_job.TotalBytes is null || !unfinished || _job.ProgressBytes == 0)
+            yield return ("Size", _job.TotalBytes is long t ? Formatting.Bytes(t) : "Unknown");
+
+        string path = _job.State == JobState.Completed ? _job.FinalPath ?? "" : Path.Combine(_job.Destination, _job.FileName);
+        yield return (_job.State == JobState.Completed && _job.FileMissing ? "Last known path" : "Save to", PathSafety.ForDisplay(path));
+        if (unfinished && _job.CommittedBytes > 0) yield return ("Partial file", PathSafety.ForDisplay(_job.PartialPath));
+        if (_job.OriginalPageUrl is { Length: > 0 } original)
+        {
+            yield return ("Original page", UrlPolicy.Redact(original));
+            if (_job.MediaProvider is { Length: > 0 } provider) yield return ("Provider", provider);
+            if (_job.MediaQuality is { Length: > 0 } quality) yield return ("Quality", quality);
+            if (_job.MediaExpiresAt is { } expiry) yield return ("Source link expires", expiry.ToLocalTime().ToString("g"));
+        }
+        else if (_job.SourceUrl.Length > 0) yield return ("Source", UrlPolicy.Redact(_job.SourceUrl));
+        if (_job.Sha256Verified) yield return ("Integrity", "Matches the trusted SHA-256");
+        else if (_job.HasExpectedHash && unfinished) yield return ("Integrity", "A trusted SHA-256 will be checked at the end");
+        if (_job.Rescue is not (RescueMode.None or RescueMode.R4)) yield return ("Recovery", RescueText(_job.Rescue));
+        if (_job.State is JobState.Downloading or JobState.Paused or JobState.Queued or JobState.WaitingForRetry)
+            yield return ("Bandwidth", Formatting.RateLimit(_job.SpeedLimitBytes));
     }
 
-    private IEnumerable<(string Text, bool Primary)> Actions()
+    private static string RescueText(RescueMode mode) => mode switch
     {
-        return _item.Status switch
+        RescueMode.R0 => "Same file confirmed by strong identity",
+        RescueMode.R1 => "Continued from a new link; final checksum is mandatory",
+        RescueMode.R1b => "Verified piece by piece against trusted checksums",
+        _ => ""
+    };
+
+    private IEnumerable<(string Text, bool Primary, Action Action)> Actions()
+    {
+        JobSnapshot j = _job;
+        if (j.OriginalPageUrl is { Length: > 0 } original && Uri.TryCreate(original, UriKind.Absolute, out Uri? source)
+            && (source.Scheme is "https" or "http"))
+            yield return ("View original", false, () =>
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(source.AbsoluteUri) { UseShellExecute = true }); }
+                catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+                { MessageBox.Show(this, ex.Message, "Open source", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            });
+        switch (j.State)
         {
-            JobStatus.Missing => [("Locate file", true), ("Download again", false)],
-            JobStatus.NeedsLink => [("Replace link", true)],
-            JobStatus.Downloading => [("Pause", false)],
-            JobStatus.Paused => [("Resume", true)],
-            JobStatus.Completed => [("Show in folder", false)],
-            _ => []
-        };
+            case JobState.Completed when j.FileMissing: yield return ("Locate file", true, () => _actions.Locate(j)); break;
+            case JobState.Completed:
+                yield return ("Open", true, () => _actions.Open(j));
+                yield return ("Show in folder", false, () => _actions.ShowFolder(j));
+                break;
+            case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry:
+                yield return ("Pause", false, () => _engine.Pause(j.Id));
+                break;
+            case JobState.Paused: yield return ("Resume", true, () => _engine.Resume(j.Id)); break;
+            case JobState.Queued: yield return ("Start now", true, () => _engine.StartNow(j.Id)); break;
+            case JobState.NeedsLink: yield return ("Replace link", true, () => _actions.ReplaceLink(j)); break;
+            case JobState.Failed:
+                yield return ("Try again", true, () => _engine.Resume(j.Id));
+                yield return ("Replace link", false, () => _actions.ReplaceLink(j));
+                break;
+            case JobState.Suspect:
+                yield return ("Show partial file", false, () => _actions.ShowFolder(j));
+                if (j.CommittedBytes > 0) yield return ("Start over…", false, () => _actions.StartOver(j));
+                break;
+            case JobState.NeedsAttention:
+                foreach (var action in AttentionActions(j)) yield return action;
+                break;
+        }
     }
 
-    private void PerformDemoAction(string action)
+    private IEnumerable<(string, bool, Action)> AttentionActions(JobSnapshot j)
     {
-        if (action == "Pause")
+        switch (j.Reason)
         {
-            _item.Status = JobStatus.Paused;
-            _item.Transfer = "";
-            _item.Eta = "";
-            _changed?.Invoke();
-            Build();
+            case "no-validator":
+                yield return ("Resume anyway…", true, () => _actions.ApproveUnverified(j));
+                yield return ("Replace link", false, () => _actions.ReplaceLink(j));
+                break;
+            case "changed" or "range-ignored" or "range-rejected" or "bad-range" or "piece-mismatch" or "html" or "auth" or "forbidden":
+                yield return ("Replace link", true, () => _actions.ReplaceLink(j));
+                if (j.CommittedBytes > 0) yield return ("Start over…", false, () => _actions.StartOver(j));
+                break;
+            default:
+                yield return ("Try again", true, () => _engine.Resume(j.Id));
+                break;
         }
-        else if (action == "Resume")
-        {
-            _item.Status = JobStatus.Queued;
-            _changed?.Invoke();
-            Build();
-        }
-        else
-            MessageBox.Show(this, $"{action} requires the future download engine or a verified file. Nothing was changed.",
-                "UI demonstration", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     protected override void Dispose(bool disposing)

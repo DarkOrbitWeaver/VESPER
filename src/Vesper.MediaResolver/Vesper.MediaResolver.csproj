@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Zero third-party dependencies: System.Net.Http, System.Text.Json and System.Xml.Linq ship with .NET. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Vesper.MediaResolver</RootNamespace>
+    <AssemblyName>Vesper.MediaResolver</AssemblyName>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Vesper.MediaResolver.Tests" />
+    <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />
+  </ItemGroup>
+
+</Project>

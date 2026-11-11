@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace VESPER;
 
-// A small OS-managed shadow, where Windows supports it, without custom shadow bitmaps.
+// Keep native window-manager shadows without rendering a large bitmap or running an animation.
 internal class VesperPopupForm : Form
 {
     public VesperPopupForm() => DoubleBuffered = true;
@@ -19,11 +19,11 @@ internal class VesperPopupForm : Form
     }
 }
 
-// Secondary windows share a dedicated header and an inset content host.
-// Explicit bounds avoid Dock.Fill painting underneath the caption.
+// All secondary windows have one layout contract: an inset shell, a fixed caption,
+// and a content viewport beneath it. Docking is resolved explicitly before reparenting.
 internal static class VesperDialogChrome
 {
-    public const int HeaderHeight = 43;
+    public const int HeaderHeight = 43; // logical pixels at 96 DPI
     private const int WmNcLButtonDown = 0xA1;
     private static readonly IntPtr HtCaption = new(2);
 
@@ -39,40 +39,45 @@ internal static class VesperDialogChrome
         form.FormBorderStyle = FormBorderStyle.None;
         form.ShowInTaskbar = false;
         form.StartPosition = FormStartPosition.CenterParent;
-        form.BackColor = palette.Border;
 
-        // Keep each dialog's existing docking order, but contain it entirely below
-        // the header. This also leaves a one-pixel perimeter visible for contrast.
-        Control[] original = form.Controls.Cast<Control>().ToArray();
-        var body = new VesperPanel { BackColor = palette.Surface, TabStop = false };
-        body.SuspendLayout();
-        for (int i = original.Length - 1; i >= 0; i--)
-        {
-            form.Controls.Remove(original[i]);
-            body.Controls.Add(original[i]);
-        }
-        body.ResumeLayout();
+        bool dark = palette.Surface.GetBrightness() < 0.5f;
+        Color edge = SystemInformation.HighContrast ? SystemColors.WindowFrame
+            : dark ? Color.FromArgb(83, 102, 87) : Color.FromArgb(177, 189, 177);
+        form.BackColor = edge; // A real perimeter remains visible even when child panels cover the form.
 
+        // Capture the original layout before moving controls to a different parent.
+        // WinForms can otherwise dock a Fill control across a Left sidebar (or under
+        // the caption) when a zero-size intermediate parent is first created.
+        var originals = form.Controls.Cast<Control>()
+            .Select(control => (Control: control, Dock: control.Dock)).ToArray();
+
+        var shell = new VesperPanel { BackColor = palette.Surface, TabStop = false };
+        var content = new VesperPanel { BackColor = palette.Surface, TabStop = false };
         var header = new VesperPanel { BackColor = palette.Secondary, TabStop = false };
-        var label = new Label
+
+        foreach (var (control, _) in originals)
+        {
+            form.Controls.Remove(control);
+            control.Dock = DockStyle.None;
+            // These were docked controls; their bounds are owned by LayoutContent below.
+            control.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            content.Controls.Add(control);
+        }
+
+        var caption = new Label
         {
             Text = title,
             Font = new Font("Segoe UI", 9F, FontStyle.Bold),
             ForeColor = palette.Text,
-            AutoSize = false,
+            BackColor = Color.Transparent,
             TextAlign = ContentAlignment.MiddleLeft,
-            Location = new Point(45, 0),
-            Height = HeaderHeight,
-            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            AutoSize = false
         };
         var close = new VesperButton
         {
-            Symbol = VesperIcon.Close,
-            Quiet = true,
-            AccessibleName = "Close dialog",
-            Size = new Size(30, 30),
-            Cursor = Cursors.Hand,
-            TabStop = true
+            Symbol = VesperIcon.Close, Quiet = true,
+            AccessibleName = "Close dialog", Size = new Size(30, 30),
+            Cursor = Cursors.Hand, TabStop = true
         };
         close.ApplyPalette(palette);
         close.Click += (_, _) =>
@@ -80,23 +85,80 @@ internal static class VesperDialogChrome
             form.DialogResult = DialogResult.Cancel;
             form.Close();
         };
-        header.Controls.AddRange([label, close]);
+        header.Controls.AddRange([caption, close]);
         header.Paint += (_, e) =>
         {
-            VesperDrawing.Icon(e.Graphics, icon, new Rectangle(16, 12, 19, 19), palette.Green);
-            using var pen = new Pen(palette.Border);
-            e.Graphics.DrawLine(pen, 0, header.Height - 1, header.Width, header.Height - 1);
+            int size = Math.Max(14, (int)Math.Round(19d * form.DeviceDpi / 96));
+            VesperDrawing.Icon(e.Graphics, icon, new Rectangle(15, (header.Height - size) / 2, size, size), palette.Green);
+            using var divider = new Pen(palette.Border);
+            e.Graphics.DrawLine(divider, 0, header.Height - 1, header.Width, header.Height - 1);
         };
+
+        shell.Controls.AddRange([content, header]);
+        form.Controls.Add(shell);
+
+        void LayoutContent()
+        {
+            int left = 0, top = 0;
+            int right = content.ClientSize.Width, bottom = content.ClientSize.Height;
+
+            // Reserve entire bottom/top strips before the sidebars and fill region.
+            // This avoids Settings' content appearing underneath its navigation.
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.Bottom))
+            {
+                int height = control.Height;
+                bottom = Math.Max(top, bottom - height);
+                control.SetBounds(left, bottom, Math.Max(1, right - left), height);
+            }
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.Top))
+            {
+                int height = control.Height;
+                control.SetBounds(left, top, Math.Max(1, right - left), height);
+                top += height;
+            }
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.Left))
+            {
+                int width = control.Width;
+                control.SetBounds(left, top, width, Math.Max(1, bottom - top));
+                left += width;
+            }
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.Right))
+            {
+                int width = control.Width;
+                right = Math.Max(left, right - width);
+                control.SetBounds(right, top, width, Math.Max(1, bottom - top));
+            }
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.Fill))
+                control.SetBounds(left, top, Math.Max(1, right - left), Math.Max(1, bottom - top));
+
+            foreach (var (control, dock) in originals.Where(x => x.Dock == DockStyle.None))
+                control.PerformLayout();
+        }
 
         void LayoutChrome()
         {
-            int width = form.ClientSize.Width;
-            int height = form.ClientSize.Height;
-            header.SetBounds(1, 1, Math.Max(1, width - 2), HeaderHeight);
-            body.SetBounds(1, HeaderHeight + 1, Math.Max(1, width - 2),
-                Math.Max(1, height - HeaderHeight - 2));
-            label.Width = Math.Max(50, header.Width - 105);
-            close.Location = new Point(Math.Max(0, header.Width - 44), 6);
+            int inset = Math.Max(1, (int)Math.Round(form.DeviceDpi / 96d));
+            int headerHeight = (int)Math.Round(HeaderHeight * form.DeviceDpi / 96d);
+            shell.SetBounds(inset, inset,
+                Math.Max(1, form.ClientSize.Width - 2 * inset),
+                Math.Max(1, form.ClientSize.Height - 2 * inset));
+            // Clip the inset surface too, or it hides the perimeter at the corners.
+            using (var inside = VesperDrawing.Rounded(new Rectangle(0, 0,
+                shell.ClientSize.Width, shell.ClientSize.Height),
+                Math.Max(8, (int)Math.Round(11d * form.DeviceDpi / 96))))
+            {
+                Region? oldRegion = shell.Region;
+                shell.Region = new Region(inside);
+                oldRegion?.Dispose();
+            }
+            header.SetBounds(0, 0, shell.ClientSize.Width, headerHeight);
+            content.SetBounds(0, headerHeight, shell.ClientSize.Width,
+                Math.Max(1, shell.ClientSize.Height - headerHeight));
+            caption.SetBounds(42, 0, Math.Max(50, header.Width - 105), header.Height);
+            int buttonSize = Math.Max(28, (int)Math.Round(30d * form.DeviceDpi / 96));
+            close.SetBounds(Math.Max(0, header.Width - buttonSize - 18),
+                (header.Height - buttonSize) / 2, buttonSize, buttonSize);
+            LayoutContent();
         }
 
         void StartDrag(object? sender, MouseEventArgs e)
@@ -106,27 +168,31 @@ internal static class VesperDialogChrome
             SendMessage(form.Handle, WmNcLButtonDown, HtCaption, IntPtr.Zero);
         }
         header.MouseDown += StartDrag;
-        label.MouseDown += StartDrag;
+        caption.MouseDown += StartDrag;
 
-        form.Controls.Add(body);
-        form.Controls.Add(header);
+        content.Resize += (_, _) => LayoutContent();
         form.ClientSizeChanged += (_, _) =>
         {
             LayoutChrome();
             Shape(form);
         };
-        form.Shown += (_, _) => Shape(form);
+        form.Shown += (_, _) =>
+        {
+            LayoutChrome();
+            Shape(form);
+        };
         form.Paint += (_, e) =>
         {
             if (form.ClientSize.Width < 8 || form.ClientSize.Height < 8) return;
-            GraphicsState old = e.Graphics.Save();
+            GraphicsState previous = e.Graphics.Save();
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            using var outline = VesperDrawing.Rounded(new Rectangle(0, 0,
+            using var path = VesperDrawing.Rounded(new Rectangle(0, 0,
                 form.ClientSize.Width - 1, form.ClientSize.Height - 1), 12);
-            using var pen = new Pen(palette.Border);
-            e.Graphics.DrawPath(pen, outline);
-            e.Graphics.Restore(old);
+            using var stroke = new Pen(edge);
+            e.Graphics.DrawPath(stroke, path);
+            e.Graphics.Restore(previous);
         };
+
         LayoutChrome();
         form.ResumeLayout(true);
         Shape(form);
@@ -135,10 +201,12 @@ internal static class VesperDialogChrome
 
     private static void Shape(Form form)
     {
-        if (form.Width < 20 || form.Height < 20) return;
-        using var path = VesperDrawing.Rounded(new Rectangle(0, 0, form.Width, form.Height), 12);
-        Region? old = form.Region;
+        if (form.ClientSize.Width < 20 || form.ClientSize.Height < 20) return;
+        int radius = Math.Max(10, (int)Math.Round(12d * form.DeviceDpi / 96));
+        using var path = VesperDrawing.Rounded(new Rectangle(0, 0,
+            form.ClientSize.Width, form.ClientSize.Height), radius);
+        Region? previous = form.Region;
         form.Region = new Region(path);
-        old?.Dispose();
+        previous?.Dispose();
     }
 }
