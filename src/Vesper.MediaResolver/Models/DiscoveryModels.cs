@@ -1,4 +1,5 @@
 using Vesper.MediaResolver.Security;
+using Vesper.MediaResolver.Core;
 
 namespace Vesper.MediaResolver.Models;
 
@@ -14,6 +15,9 @@ public sealed class DiscoveryOptions
     public int EmbedDepth { get; init; }
 }
 
+/// <summary>Source metadata is independent of transfer compatibility. A poster never implies a playable stream.</summary>
+public sealed record DiscoveryProgress(string? Title = null, Uri? Thumbnail = null, int RepresentationCount = 0);
+
 public sealed class MediaDiscoveryRequest
 {
     public required Uri Url { get; init; }
@@ -22,6 +26,18 @@ public sealed class MediaDiscoveryRequest
     public BrowserDiscoveryMessage? Browser { get; init; }
 
     public DiscoveryOptions Options { get; init; } = new();
+
+    /// <summary>Optional incremental metadata; implementations must not block the network pipeline.</summary>
+    public IProgress<DiscoveryProgress>? Progress { get; init; }
+
+    internal HttpTextResponse? PageResponse { get; set; }
+
+    internal void Publish(DiscoveryProgress update)
+    {
+        DiscoveryTrace.Current.Value?.Observe(update);
+        try { Progress?.Report(update); }
+        catch (Exception) { /* Optional observer failures must not change discovery results. */ }
+    }
 
     public DiscoveryMode Mode => Browser is null ? DiscoveryMode.Native : DiscoveryMode.BrowserAssisted;
 

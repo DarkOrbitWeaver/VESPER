@@ -104,8 +104,11 @@ public sealed partial class DownloadEngine : IDisposable
         {
             Id = job.Id, Kind = job.Kind, FileName = job.FileName, SourceUrl = job.SourceUrl, Destination = job.DestinationFolder,
             OriginalPageUrl = job.OriginalPageUrl, MediaProvider = job.MediaProvider, MediaId = job.MediaId,
-            MediaQuality = job.MediaQuality, MediaThumbnailUrl = job.MediaThumbnailUrl, MediaExpiresAt = job.MediaExpiresAt,
-            PartialPath = job.PartialPath, FinalPath = job.FinalPath, State = job.State, Reason = job.Reason, Message = job.Message,
+            MediaQuality = job.MediaQuality, MediaFormatId = job.MediaFormatId, MediaThumbnailUrl = job.MediaThumbnailUrl, MediaExpiresAt = job.MediaExpiresAt,
+            PartialPath = job.PartialPath, FinalPath = job.FinalPath,
+            // Completion is durable already, but actions must not race the runner's final cleanup.
+            State = job.State == JobState.Completed && session is not null ? JobState.Finalizing : job.State,
+            Reason = job.Reason, Message = job.Message,
             TotalBytes = job.TotalBytes, CommittedBytes = committed, ProgressBytes = progress,
             SpeedBytesPerSecond = job.State == JobState.Downloading ? speed : 0, Eta = eta, Connections = session?.Connections ?? 0,
             Priority = job.Priority, SpeedLimitBytes = job.SpeedLimitBytes, QueueOrder = job.QueueOrder,

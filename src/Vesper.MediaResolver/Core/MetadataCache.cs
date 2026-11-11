@@ -30,9 +30,14 @@ internal sealed class MetadataCache
 
     public void Set(string key, MediaDiscoveryResult result, DateTimeOffset now, TimeSpan ttl)
     {
-        // Never cache beyond the earliest signed-URL expiry.
+        // Browser calls already bypass this cache. Adapters can also issue session cookies themselves.
+        var representations = result.Item?.Representations
+            ?? result.Collection?.Entries.SelectMany(e => e.Resolved?.Representations ?? []).ToArray() ?? [];
+        if (representations.Any(r => r.Context.HasCredentials)) return;
         var expires = now + ttl;
-        if (result.Item?.EarliestExpiry is { } exp && exp < expires) expires = exp;
+        foreach (var representation in representations)
+            if (representation.ExpiresAt is { } exp && exp - TimeSpan.FromSeconds(30) < expires)
+                expires = exp - TimeSpan.FromSeconds(30);
         if (expires <= now) return;
 
         lock (_gate)

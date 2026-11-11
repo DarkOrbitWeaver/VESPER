@@ -81,13 +81,21 @@ internal sealed partial class YouTubeAdapter : AdapterBase
 
     private async Task<MediaDiscoveryResult> ResolveVideoAsync(MediaDiscoveryRequest request, YtTarget t, CancellationToken ct)
     {
-        var page = await GetPageAsync(new Uri($"https://www.youtube.com/watch?v={t.VideoId}"), null, ct).ConfigureAwait(false);
+        var page = await GetPageAsync(new Uri($"https://www.youtube.com/watch?v={t.VideoId}"), request.AuthContext, ct).ConfigureAwait(false);
+        request.PageResponse = page;
         if (page.FinalUrl.Host.StartsWith("consent.", StringComparison.OrdinalIgnoreCase))
             return Fail(MediaErrors.BrowserContext("YouTube served a consent interstitial instead of the video page"));
 
         using var player = JsonBalanced.ExtractAfter(page.Content, "ytInitialPlayerResponse");
         if (player is null) return Fail(MediaErrors.SourceChanged("ytInitialPlayerResponse was not found in the watch page"));
         var root = player.RootElement;
+
+        var details = root.P("videoDetails");
+        string? returnedId = details.P("videoId").Str();
+        if (returnedId is not null && returnedId != t.VideoId)
+            return Fail(MediaErrors.SourceChanged("The player response belongs to a different video; no streams were accepted."));
+        var earlyThumb = details.P("thumbnail").P("thumbnails").Items().LastOrDefault();
+        request.Publish(new DiscoveryProgress(details.P("title").Str(), U(earlyThumb.P("url").Str())));
 
         string status = root.P("playabilityStatus").P("status").Str() ?? "";
         if (status != "OK")
@@ -97,18 +105,40 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             return Fail(MapStatus(status, reason));
         }
 
-        var details = root.P("videoDetails");
         string? videoId = details.P("videoId").Str() ?? t.VideoId;
         bool isLive = details.P("isLive").Bool() == true;
-        var ctx = new MediaRequestContext { UserAgent = Options.UserAgent };
+        if (isLive) return Fail(MediaErrors.Live("The player reports a live broadcast; VOD transfer only."));
+        var ctx = request.AuthContext with { UserAgent = Options.UserAgent, Referer = page.FinalUrl.AbsoluteUri };
 
         var reps = ParseFormats(root.P("streamingData"), ctx, out int cipherCount, out int drmCount, out bool throttled);
+        request.Publish(new DiscoveryProgress(RepresentationCount: reps.Count));
         var problems = new List<MediaError>();
         var audioTracks = new List<AudioTrack>();
         var subs = new List<SubtitleTrack>();
 
-        if (reps.Count == 0 && root.P("streamingData").P("hlsManifestUrl").Str() is { } hls && U(hls) is { } hlsUrl)
-            await TryAddManifestAsync(hlsUrl, ctx, "yt-hls-", reps, audioTracks, subs, problems, ct).ConfigureAwait(false);
+        // Direct adaptive tracks must not hide an available self-contained HLS representation.
+        // HLS and DASH are independent requests; use isolated lists and merge deterministically afterwards.
+        if (!reps.Any(r => r.Content == StreamContent.VideoAndAudio))
+        {
+            var tasks = new List<Task<(List<MediaRepresentation> Reps, List<AudioTrack> Audio, List<SubtitleTrack> Subs, List<MediaError> Errors)>>();
+            foreach (var (key, prefix) in new[] { ("hlsManifestUrl", "yt-hls-"), ("dashManifestUrl", "yt-dash-") })
+                if (U(root.P("streamingData").P(key).Str()) is { } manifest)
+                    tasks.Add(ResolveManifestAsync(manifest, prefix));
+            foreach (var resolved in await Task.WhenAll(tasks).ConfigureAwait(false))
+            {
+                reps.AddRange(resolved.Reps); audioTracks.AddRange(resolved.Audio);
+                subs.AddRange(resolved.Subs); problems.AddRange(resolved.Errors);
+                request.Publish(new DiscoveryProgress(RepresentationCount: reps.Count));
+            }
+
+            async Task<(List<MediaRepresentation>, List<AudioTrack>, List<SubtitleTrack>, List<MediaError>)> ResolveManifestAsync(Uri url, string prefix)
+            {
+                var streams = new List<MediaRepresentation>(); var audio = new List<AudioTrack>();
+                var captions = new List<SubtitleTrack>(); var errors = new List<MediaError>();
+                await TryAddManifestAsync(url, ctx, prefix, streams, audio, captions, errors, ct).ConfigureAwait(false);
+                return (streams, audio, captions, errors);
+            }
+        }
 
         if (reps.Count == 0)
         {
@@ -118,7 +148,12 @@ internal sealed partial class YouTubeAdapter : AdapterBase
                 return Fail(new MediaError(MediaErrorCode.BrowserContextRequired,
                     "YouTube only offers streams that need browser-side processing. Use the VESPER extension on the open page to supply them.",
                     $"{cipherCount} formats use signatureCipher; this library does not execute player scripts", false, true, false));
-            return Fail(problems.FirstOrDefault() ?? MediaErrors.NoMedia("streamingData contained no formats", browserMayHelp: true));
+            if (root.P("streamingData").P("serverAbrStreamingUrl").Str() is not null)
+                return Fail(MediaErrors.BrowserContext("YouTube supplied a server-ABR playback endpoint, not a supported HTTP/HLS/DASH media URL. No player emulation or verification bypass is attempted."));
+            int advertised = root.P("streamingData").P("formats").Items().Count() + root.P("streamingData").P("adaptiveFormats").Items().Count();
+            return Fail(problems.FirstOrDefault() ?? (advertised > 0
+                ? MediaErrors.BrowserContext($"The player advertises {advertised} formats but exposes no directly usable media URLs.")
+                : MediaErrors.BrowserContext("The watch page contains metadata but no playback URLs. This is not proof that the video has no media; authorized browser playback context may be required.")));
         }
 
         string description = details.P("shortDescription").Str() ?? "";

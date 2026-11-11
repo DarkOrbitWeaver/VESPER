@@ -7,6 +7,7 @@
            Use -SelfContained to bundle the runtime instead (much larger, no prerequisite).
 #>
 param(
+    [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
     [string]$Version = "1.0.0",
     [switch]$SkipTests,
     [switch]$SelfContained
@@ -26,12 +27,14 @@ if (-not $SkipTests) {
     Run "Engine, bridge and storage tests" { dotnet test tests/Vesper.Tests -c Release --nologo }
     Run "Media resolver tests" { dotnet test tests/Vesper.MediaResolver.Tests -c Release --nologo }
     if (Get-Command node -ErrorAction SilentlyContinue) {
-        Run "Extension logic tests" { node --test tests/extension }
+        $extensionTests = @(Get-ChildItem (Join-Path $root 'tests/extension') -Filter '*.test.mjs' -File | ForEach-Object FullName)
+        if ($extensionTests.Count -eq 0) { throw 'No extension regression tests were found.' }
+        Run "Extension logic tests" { node --test @extensionTests }
     } else { Write-Warning "Node.js not found: extension logic tests were skipped." }
 }
 
 $out = Join-Path $root "release\VESPER-$Version"
-if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+if ((Test-Path $out) -or (Test-Path "$out.zip")) { throw "Release output already exists: $out. Archive it or choose another version; nothing was overwritten." }
 $sc = if ($SelfContained) { "--self-contained" } else { "--no-self-contained" }
 
 Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none -o $out }
@@ -43,7 +46,7 @@ Copy-Item (Join-Path $root "scripts\Install.ps1"), (Join-Path $root "scripts\Uni
 Copy-Item (Join-Path $root "DOCUMENTATION\RELEASE.md") (Join-Path $out "RELEASE.md")
 
 $zip = "$out.zip"
-if (Test-Path $zip) { Remove-Item $zip -Force }
+if (Test-Path $zip) { throw "Release ZIP already exists: $zip. Nothing was overwritten." }
 Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" } | Set-Content (Join-Path $out "SHA256SUMS.txt")
 Compress-Archive -Path "$out\*" -DestinationPath $zip

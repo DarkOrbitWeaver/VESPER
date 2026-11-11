@@ -76,6 +76,7 @@ internal sealed class FaultServer : IAsyncDisposable
         switch (path)
         {
             case "/file": await Serve(ctx, V1, "\"p1\"", Modified); break;
+            case "/media/video-only.mp4": await Serve(ctx, File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", "video-only.mp4")), "\"video\"", Modified); break;
             case "/v2": await Serve(ctx, V2, "\"p2\"", Modified); break;
             case "/noetag": await Serve(ctx, V1, null, null); break;
             case "/lmonly": await Serve(ctx, V1, null, Modified); break;
@@ -140,7 +141,8 @@ internal sealed class FaultServer : IAsyncDisposable
     // ---- HLS fixtures: five 100 kB segments; the expected output is their concatenation --------------------------------
 
     public const int SegmentCount = 5;
-    public static byte[] HlsSegment(int index) => Payloads.Make(100_000, 100 + index);
+    public static byte[] HlsSegment(int index) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory,
+        "Fixtures", "Media", $"ts-{index}.ts"));
     public static byte[] HlsExpected() => Enumerable.Range(0, SegmentCount).SelectMany(HlsSegment).ToArray();
     public static readonly byte[] HlsKey = Payloads.Make(16, 77);
     public static readonly byte[] HlsIv = Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
@@ -185,6 +187,20 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/hls/drm/index.m3u8": await Text(Playlist("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\",KEYFORMAT=\"com.apple.streamingkeydelivery\"")); return;
             case "/hls/live/index.m3u8": await Text(Playlist("", endList: false)); return;
             case "/hls/enc/key.bin": res.ContentType = "application/octet-stream"; await res.Body.WriteAsync(HlsKey); return;
+        }
+
+        if (path == "/hls/fmp4/index.m3u8")
+        {
+            await Text("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"av-init.mp4\"\n#EXTINF:1,\nav-1.m4s\n#EXTINF:1,\nav-2.m4s\n#EXTINF:1,\nav-3.m4s\n#EXT-X-ENDLIST\n"); return;
+        }
+        if (path.StartsWith("/hls/fmp4/", StringComparison.Ordinal))
+        {
+            string name = path.Split('/').Last();
+            if (name is "av-init.mp4" or "av-1.m4s" or "av-2.m4s" or "av-3.m4s")
+            {
+                byte[] bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
+                res.ContentType = "video/mp4"; res.ContentLength = bytes.Length; await res.Body.WriteAsync(bytes); return;
+            }
         }
 
         string[] parts = path.Split('/');                       // /hls/<kind>/s<i>.ts

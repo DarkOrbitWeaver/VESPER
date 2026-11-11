@@ -54,6 +54,7 @@ internal sealed class InternetArchiveAdapter : AdapterBase
         string? creator = root.P("metadata").P("creator").Str();
         string mediaType = root.P("metadata").P("mediatype").Str() ?? "";
         var thumb = new Uri($"https://archive.org/services/img/{Uri.EscapeDataString(id)}");
+        request.Publish(new DiscoveryProgress(title, thumb));
 
         var video = new List<IaFile>();
         var audio = new List<IaFile>();
@@ -64,7 +65,10 @@ internal sealed class InternetArchiveAdapter : AdapterBase
             string? name = f.P("name").Str();
             if (string.IsNullOrEmpty(name) || f.P("source").Str() == "metadata") continue;
             string ext = Path.GetExtension(name).TrimStart('.');
-            string stem = name[..^(ext.Length == 0 ? 0 : ext.Length + 1)];
+            string groupName = f.P("original").Str() is { } original && AudioExt.Contains(Path.GetExtension(original).TrimStart('.'))
+                ? original : name;
+            string groupExt = Path.GetExtension(groupName);
+            string stem = groupName[..^(groupExt.Length)];
             var file = new IaFile(name, stem, ext, f.P("title").Str(), f.P("size").Long(), TextUtil.ParseDuration(f.P("length").Str()),
                 f.P("height").Int(), f.P("width").Int(), f.P("bitrate").Int());
 
@@ -97,7 +101,7 @@ internal sealed class InternetArchiveAdapter : AdapterBase
         if (wantedFile is not null)
         {
             string wantedStem = wantedFile.Contains('.') ? wantedFile[..wantedFile.LastIndexOf('.')] : wantedFile;
-            var match = groups.Where(g => g.Key == wantedStem).ToList();
+            var match = groups.Where(g => g.Key == wantedStem || g.Any(f => f.Name == wantedFile)).ToList();
             if (match.Count > 0) groups = match;
         }
 

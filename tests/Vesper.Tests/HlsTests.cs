@@ -74,4 +74,14 @@ public class HlsTests
         Assert.Equal(FaultServer.HlsExpected(), await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.True(server.Hits("/hls/plain/s0.ts") <= 1, "a committed segment must not be downloaded again");
     }
+    [Fact]
+    public async Task FragmentedMp4Hls_UsesValidatedInitAndFragmentsInsteadOfArbitraryConcatenation()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        var done = await h.WaitForStateAsync(AddHls(h, server, "/hls/fmp4/index.m3u8"), JobState.Completed);
+        byte[] expected = [.. DashTransferTests.Fixture("av-init.mp4"), .. DashTransferTests.Fixture("av-1.m4s"),
+            .. DashTransferTests.Fixture("av-2.m4s"), .. DashTransferTests.Fixture("av-3.m4s")];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!)); Assert.EndsWith(".mp4", done.FinalPath);
+    }
+
 }

@@ -7,6 +7,10 @@ namespace Vesper.MediaResolver.Protocols.Hls;
 /// <summary>Converts parsed HLS playlists into typed representations without inventing any information.</summary>
 public static class HlsRepresentationBuilder
 {
+    /// <summary>Build representations from the source master and an optional media-playlist probe.</summary>
+    /// <param name="master">Parsed master playlist.</param>
+    /// <param name="masterUrl">Final master URL used to resolve relative references.</param>
+    /// <param name="ctx">Authorized request context for manifests and media.</param>
     /// <param name="probe">One fetched media playlist used to learn container type, protection and duration (may be null).</param>
     public static ManifestResult FromMaster(HlsMasterPlaylist master, Uri masterUrl, MediaRequestContext ctx, HlsMediaPlaylist? probe)
     {

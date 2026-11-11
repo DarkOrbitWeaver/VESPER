@@ -1,0 +1,30 @@
+name: Media and engine regression
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  windows-regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore and build the existing solution
+        run: dotnet build VESPER.slnx -c Release --nologo -warnaserror
+      - name: Engine, media resolver, DPAPI and extension regressions
+        shell: pwsh
+        run: ./scripts/Run-Tests.ps1
+      - name: Build the developer benchmark without running network tests
+        run: dotnet build src/Vesper.MediaResolver.Benchmarks -c Release --nologo -warnaserror
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-results
+          path: release/test-results
+          if-no-files-found: warn

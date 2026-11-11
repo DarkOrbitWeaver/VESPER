@@ -1,0 +1,15 @@
+  Determining projects to restore...
+  Restored /app/VESPER/src/Vesper.Engine/Vesper.Engine.csproj (in 309 ms).
+  Restored /app/VESPER/tests/Vesper.Tests/Vesper.Tests.csproj (in 312 ms).
+  Vesper.Engine -> /app/VESPER/src/Vesper.Engine/bin/Release/net10.0/Vesper.Engine.dll
+  Vesper.Tests -> /app/VESPER/tests/Vesper.Tests/bin/Release/net10.0/Vesper.Tests.dll
+Test run for /app/VESPER/tests/Vesper.Tests/bin/Release/net10.0/Vesper.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:09.48]     Vesper.Tests.ProtectedMediaStateTests.MalformedProtectedState_FailsWithoutAnyPlaintextFallback [SKIP]
+[xUnit.net 00:00:09.49]     Vesper.Tests.ProtectedMediaStateTests.DpapiRoundTrip_DoesNotPersistTheSignedUrlInPlaintext [SKIP]
+  Skipped Vesper.Tests.ProtectedMediaStateTests.MalformedProtectedState_FailsWithoutAnyPlaintextFallback [1 ms]
+  Skipped Vesper.Tests.ProtectedMediaStateTests.DpapiRoundTrip_DoesNotPersistTheSignedUrlInPlaintext [1 ms]
+Results File: /tmp/vesper-final-results/engine.trx
+
+Passed!  - Failed:     0, Passed:   211, Skipped:     2, Total:   213, Duration: 26 s - Vesper.Tests.dll (net10.0)
+VSTEST_ARTIFACTS_DIRECTORY environment variable was not found, falling back to a user-private temporary directory. This is most likely caused by an outdated Microsoft.NET.Test.Sdk package reference in the test project.

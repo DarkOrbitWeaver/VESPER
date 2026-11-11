@@ -25,7 +25,9 @@ public sealed record AddRequest(
     string? MediaId = null,
     string? MediaQuality = null,
     string? MediaThumbnailUrl = null,
-    DateTimeOffset? MediaExpiresAt = null);
+    DateTimeOffset? MediaExpiresAt = null,
+    string? MediaPlanJson = null,
+    string? MediaFormatId = null);
 
 public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
 {
@@ -63,6 +65,11 @@ public sealed partial class DownloadEngine
         try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return new AddResult(AddStatus.Invalid, Guid.Empty, ex.Message); }
 
+        if (!Enum.IsDefined(request.Kind)) return new AddResult(AddStatus.Invalid, Guid.Empty, "Unsupported job kind.");
+        if (request.Kind == JobKind.Dash && (!DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out string planError)
+            || request.Secrets is { Count: > 0 }))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan without persisted credentials is required.");
+
         string? expected = null;
         if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) && !TryNormalizeSha256(request.ExpectedSha256, out expected))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A SHA-256 checksum has 64 hexadecimal characters.");
@@ -92,7 +99,8 @@ public sealed partial class DownloadEngine
 
             string normalized = UrlPolicy.Normalize(uri);
             DownloadJob? existing = _jobs.Values.FirstOrDefault(j => j.State is not (JobState.Completed or JobState.Cancelled)
-                && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized);
+                && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
+                && (request.Kind != JobKind.Dash || j.MediaPlanJson == request.MediaPlanJson));
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
@@ -109,9 +117,11 @@ public sealed partial class DownloadEngine
                 OriginalPageUrl = originalPage,
                 MediaProvider = request.MediaProvider is { Length: <= 80 } ? request.MediaProvider : null,
                 MediaId = request.MediaId is { Length: <= 256 } ? request.MediaId : null,
+                MediaFormatId = request.MediaFormatId is { Length: <= 256 } ? request.MediaFormatId : null,
                 MediaQuality = request.MediaQuality is { Length: <= 180 } ? request.MediaQuality : null,
                 MediaThumbnailUrl = request.MediaThumbnailUrl is { Length: <= 4096 } ? request.MediaThumbnailUrl : null,
                 MediaExpiresAt = request.MediaExpiresAt,
+                MediaPlanJson = request.Kind == JobKind.Dash ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.

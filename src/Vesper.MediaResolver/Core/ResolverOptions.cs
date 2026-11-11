@@ -9,6 +9,12 @@ public sealed class ResolverOptions
     public int MaxErrorBodyBytes { get; init; } = 256 * 1024;
 
     public TimeSpan RequestTimeout { get; init; } = TimeSpan.FromSeconds(20);
+    /// <summary>Whole-call deadline, including fallback, manifests, queueing and body reads.</summary>
+    public TimeSpan DiscoveryTimeout { get; init; } = TimeSpan.FromSeconds(35);
+
+    /// <summary>Called once per completed lookup; measurements contain no source URLs.</summary>
+    public Action<DiscoveryMeasurement>? Measurement { get; init; }
+
     public int MaxRedirects { get; init; } = 5;
     public int MaxConcurrentRequests { get; init; } = 4;
 

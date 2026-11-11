@@ -77,7 +77,8 @@ internal sealed class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, F
                     FileName: job.FileName, Referer: job.Referer, UserAgent: job.UserAgent,
                     Kind: job.Kind, RequestId: $"{request.Id}:{i}", OriginalPageUrl: job.OriginalPageUrl,
                     MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
-                    MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt));
+                    MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
+                    MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId));
                 results.Add(new BridgeResult(UrlPolicy.Redact(job.Url),
                     added.Status == AddStatus.Added ? queue ? "queued" : "started"
                     : added.Status == AddStatus.AlreadySubmitted ? "already-submitted" : "rejected",

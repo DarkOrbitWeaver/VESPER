@@ -17,13 +17,13 @@ internal sealed class DashTemplate
     public long PresentationTimeOffset { get; init; }
     public List<(long? T, long D, int R)>? Timeline { get; init; }
 
-    /// <summary>Merges AdaptationSet-level and Representation-level templates (child attributes override).</summary>
-    public static DashTemplate? Merge(XElement? parent, XElement? child)
+    /// <summary>Merges inherited templates from outermost to innermost; child attributes/timelines override parents.</summary>
+    public static DashTemplate? Merge(params XElement?[] templates)
     {
-        if (parent is null && child is null) return null;
-        string? A(string n) => child?.Attribute(n)?.Value ?? parent?.Attribute(n)?.Value;
-        var timelineEl = child?.Elements().FirstOrDefault(e => e.Name.LocalName == "SegmentTimeline")
-                         ?? parent?.Elements().FirstOrDefault(e => e.Name.LocalName == "SegmentTimeline");
+        var levels = templates.Where(t => t is not null).Reverse().ToArray();
+        if (levels.Length == 0) return null;
+        string? A(string n) => levels.Select(t => t?.Attribute(n)?.Value).FirstOrDefault(v => v is not null);
+        var timelineEl = levels.Select(t => t!.Elements().FirstOrDefault(e => e.Name.LocalName == "SegmentTimeline")).FirstOrDefault(t => t is not null);
 
         List<(long?, long, int)>? timeline = null;
         if (timelineEl is not null)
@@ -35,6 +35,7 @@ internal sealed class DashTemplate
                 if (!long.TryParse(s.Attribute("d")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) || d <= 0)
                     throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline entry without a valid duration"));
                 int r = int.TryParse(s.Attribute("r")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rv) ? rv : 0;
+                if (r < -1 || t < 0) throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid negative timeline time/repeat count"));
                 timeline.Add((t, d, r));
                 if (timeline.Count > 200_000) throw new MediaResolverException(MediaErrors.TooLarge("SegmentTimeline too long"));
             }
@@ -69,8 +70,9 @@ internal sealed class DashTemplate
         {
             long time = PresentationTimeOffset;
             bool first = true;
-            foreach (var (t, d, r) in Timeline)
+            for (int entry = 0; entry < Timeline.Count; entry++)
             {
+                var (t, d, r) = Timeline[entry];
                 if (t is { } tv) time = tv;
                 else if (first) time = PresentationTimeOffset;
                 first = false;
@@ -78,10 +80,18 @@ internal sealed class DashTemplate
                 long repeat = r;
                 if (repeat < 0)
                 {
-                    if (periodDurationSeconds is null)
-                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Open-ended S@r without a known period duration"));
-                    long end = PresentationTimeOffset + (long)Math.Ceiling(periodDurationSeconds.Value * Timescale);
-                    repeat = Math.Max(0, (end - time + d - 1) / d - 1);
+                    long? nextTime = entry + 1 < Timeline.Count ? Timeline[entry + 1].T : null;
+                    if (entry + 1 < Timeline.Count && nextTime is null)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("An open repeat needs the next entry's explicit start time"));
+                    if (nextTime is null && periodDurationSeconds is null)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Open-ended S@r without a next start time or period duration"));
+                    double boundary = nextTime ?? PresentationTimeOffset + Math.Ceiling(periodDurationSeconds!.Value * Timescale);
+                    if (!double.IsFinite(boundary) || boundary > long.MaxValue || boundary <= time)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid open-repeat boundary"));
+                    long distance = (long)boundary - time;
+                    if (nextTime is not null && distance % d != 0)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("The next timeline entry overlaps an open repeat"));
+                    repeat = distance / d + (distance % d == 0 ? 0 : 1) - 1;
                 }
                 for (long k = 0; k <= repeat; k++)
                 {
@@ -91,6 +101,8 @@ internal sealed class DashTemplate
                     double dur = (double)d / Timescale;
                     segments.Add(new MediaSegment(url, dur));
                     total += dur;
+                    if (time > long.MaxValue - d || number == long.MaxValue)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Timeline arithmetic overflow"));
                     time += d;
                     number++;
                 }

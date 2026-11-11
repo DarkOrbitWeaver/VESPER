@@ -1,0 +1,20 @@
+{
+    "programs": [
+
+    ],
+    "stream_groups": [
+
+    ],
+    "streams": [
+        {
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "duration": "634.354750",
+            "nb_read_packets": "14866"
+        }
+    ],
+    "format": {
+        "duration": "634.354750",
+        "size": "5278733"
+    }
+}
