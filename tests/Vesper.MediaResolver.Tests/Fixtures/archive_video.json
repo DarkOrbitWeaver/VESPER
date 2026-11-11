@@ -1,0 +1,10 @@
+{
+  "metadata": { "identifier": "fixture_movie", "title": "Fixture Movie", "mediatype": "movies", "creator": "Fixture Studio", "description": "A public domain fixture." },
+  "files": [
+    { "name": "fixture_movie.mp4", "format": "h.264", "source": "derivative", "size": "52428800", "length": "600.5", "height": "480", "width": "640" },
+    { "name": "fixture_movie.ogv", "format": "Ogg Video", "source": "derivative", "size": "41943040", "length": "600.5", "height": "360", "width": "480" },
+    { "name": "fixture_movie_meta.xml", "format": "Metadata", "source": "original" },
+    { "name": "fixture_movie.en.vtt", "format": "WebVTT", "source": "original", "size": "1000" },
+    { "name": "__ia_thumb.jpg", "format": "Item Tile", "source": "original" }
+  ]
+}

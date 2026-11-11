@@ -1,0 +1,11 @@
+{
+  "title": "Fixture Dailymotion Video",
+  "duration": 95,
+  "owner": { "screenname": "FixtureUser" },
+  "posters": { "240": "https://s1.dmcdn-fixture.example/240.jpg", "720": "https://s1.dmcdn-fixture.example/720.jpg" },
+  "qualities": {
+    "auto": [ { "type": "application/x-mpegURL", "url": "https://cdn.dmcdn-fixture.example/master.m3u8" } ],
+    "480": [ { "type": "video/mp4", "url": "https://cdn.dmcdn-fixture.example/480.mp4" } ]
+  },
+  "subtitles": { "enable": true, "data": { "en": { "label": "English", "urls": [ "https://static.dmcdn-fixture.example/en.vtt" ] } } }
+}

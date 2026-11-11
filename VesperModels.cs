@@ -1,16 +1,26 @@
 using System.Drawing;
+using Vesper.Engine;
 
 namespace VESPER;
 
-// UI-only data. Nothing here represents a verified file or persisted transfer.
-internal enum JobStatus { Downloading, Paused, Queued, Completed, Missing, NeedsLink, Waiting, Verifying, Suspect }
+internal enum JobStatus
+{
+    Downloading, Paused, Queued, Completed, Missing, NeedsLink, Waiting, Verifying, Suspect,
+    Resolving, WaitingRetry, NeedsAttention, Processing, Failed, Cancelled
+}
 internal enum Density { ExtraCompact, Compact, Comfortable }
 internal enum ThemeChoice { System, Light, Dark }
 internal enum MotionChoice { Off, Subtle, Botanical }
+internal enum BrowserAction { Ask, Download, Queue }
 
+/// <summary>
+/// What one list row shows. Built from an engine snapshot on the UI thread; every value is either taken from
+/// the engine or left empty. Nothing here is persisted and nothing is estimated.
+/// </summary>
 internal sealed class DownloadItem
 {
-    public Guid Id { get; } = Guid.NewGuid();
+    public Guid Id { get; init; }
+    public JobSnapshot? Snapshot { get; private set; }
     public string Name { get; set; } = "";
     public string FileType { get; set; } = "File";
     public string Extension { get; set; } = "";
@@ -23,18 +33,76 @@ internal sealed class DownloadItem
     public string Eta { get; set; } = "";
     public string Detail { get; set; } = "";
     public string RateCap { get; set; } = "Unlimited";
-    public DateTime CreatedUtc { get; } = DateTime.UtcNow;
+    public DateTime CreatedUtc { get; private set; } = DateTime.UtcNow;
+    public long SizeBytes { get; private set; }
 
-    // There is deliberately NO HasVerifiedFile, file delete/open, or transfer engine here.
-    public static List<DownloadItem> Examples() =>
+    public static DownloadItem From(JobSnapshot s)
+    {
+        string extension = Path.GetExtension(s.FileName).TrimStart('.').ToUpperInvariant();
+        return new DownloadItem
+        {
+            Id = s.Id, Snapshot = s, Name = s.FileName, Extension = extension, FileType = TypeOf(extension),
+            Size = s.TotalBytes is long total ? Formatting.Bytes(total)
+                : s.State == JobState.Completed ? Formatting.Bytes(s.CommittedBytes) : "Unknown",
+            SizeBytes = s.TotalBytes ?? s.CommittedBytes,
+            SourceUrl = s.SourceUrl, Destination = s.Destination, Status = Map(s), CreatedUtc = s.CreatedUtc,
+            Percent = s.State == JobState.Completed || s.ProgressBytes == 0 ? null : s.Fraction is double f ? (int)Math.Floor(f * 100) : null,
+            Transfer = TransferText(s), Eta = s.Eta is { } eta ? Formatting.Eta(eta) : "",
+            Detail = s.Message, RateCap = Formatting.RateLimit(s.SpeedLimitBytes)
+        };
+    }
+
+    /// <summary>Refreshes this row in place so the grid keeps its references and only repaints.</summary>
+    public void UpdateFrom(JobSnapshot s)
+    {
+        DownloadItem n = From(s);
+        (Snapshot, Name, Extension, FileType, Size, SizeBytes, SourceUrl, Destination, Status, Percent, Transfer, Eta, Detail, RateCap)
+            = (n.Snapshot, n.Name, n.Extension, n.FileType, n.Size, n.SizeBytes, n.SourceUrl, n.Destination, n.Status, n.Percent, n.Transfer, n.Eta, n.Detail, n.RateCap);
+    }
+
+    private static JobStatus Map(JobSnapshot s) => s.State switch
+    {
+        JobState.Queued => JobStatus.Queued,
+        JobState.Resolving => JobStatus.Resolving,
+        JobState.Downloading => JobStatus.Downloading,
+        JobState.Paused => JobStatus.Paused,
+        JobState.WaitingForNetwork => JobStatus.Waiting,
+        JobState.WaitingForRetry => JobStatus.WaitingRetry,
+        JobState.NeedsLink => JobStatus.NeedsLink,
+        JobState.NeedsAttention => JobStatus.NeedsAttention,
+        JobState.Verifying => JobStatus.Verifying,
+        JobState.Finalizing => JobStatus.Processing,
+        JobState.Completed => s.FileMissing ? JobStatus.Missing : JobStatus.Completed,
+        JobState.Failed => JobStatus.Failed,
+        JobState.Suspect => JobStatus.Suspect,
+        _ => JobStatus.Cancelled
+    };
+
+    private static string TransferText(JobSnapshot s) => s.State switch
+    {
+        JobState.Downloading when s.SpeedBytesPerSecond > 0 => Formatting.Rate(s.SpeedBytesPerSecond),
+        JobState.Downloading => s.Message,
+        JobState.Completed when s.FileMissing => "File not found",
+        JobState.Completed => s.CompletedUtc is { } done ? "Finished · " + done.ToLocalTime().ToString("MMM d, HH:mm") : "",
+        JobState.WaitingForRetry or JobState.WaitingForNetwork => s.Message,
+        _ => ""
+    };
+
+    private static string TypeOf(string extension) => extension switch
+    {
+        "MP3" or "WAV" or "FLAC" or "M4A" or "OGG" or "AAC" or "WEBA" => "Audio",
+        "MP4" or "MKV" or "WEBM" or "AVI" or "MOV" or "TS" or "M4V" => "Video",
+        "ZIP" or "RAR" or "7Z" or "GZ" or "TAR" or "XZ" => "Archive",
+        "ISO" or "IMG" => "Disc image",
+        "EPUB" => "eBook",
+        _ => "File"
+    };
+
+    /// <summary>Shown only inside the Visual Studio designer so the list is not empty there.</summary>
+    public static List<DownloadItem> DesignerSamples() =>
     [
-        new() { Name="Rain in the Forest.mp3", FileType="Audio", Extension="MP3", Size="12.8 MB", Status=JobStatus.Missing, Detail="Sample: previously completed item marked missing" },
-        new() { Name="Windows 11 24H2.iso", FileType="Disc image", Extension="ISO", Size="5.41 GB", Status=JobStatus.NeedsLink, Percent=88, Detail="Sample: replacement source would require validation" },
-        new() { Name="The Last Man on Earth (1964).mp4", FileType="Video", Extension="MP4", Size="1.57 GB", Status=JobStatus.Queued },
-        new() { Name="Landscape_Collection.zip", FileType="Archive", Extension="ZIP", Size="40.7 MB", Status=JobStatus.Downloading, Percent=12, Transfer="128 KB/s", Eta="≈5 min left" },
-        new() { Name="Blender-4.0-win64.zip", FileType="Archive", Extension="ZIP", Size="1.91 GB", Status=JobStatus.Completed },
-        new() { Name="Moby Dick — Illustrated Edition.epub", FileType="eBook", Extension="EPUB", Size="93.1 MB", Status=JobStatus.Paused, Percent=79 },
-        new() { Name="Nature Documentary — Episode 01.mp4", FileType="Video", Extension="MP4", Size="1.26 GB", Status=JobStatus.Downloading, Percent=64, Transfer="7.28 MB/s", Eta="≈1 min left" },
+        new() { Name = "Sample video.mp4", FileType = "Video", Extension = "MP4", Size = "1.26 GB", Status = JobStatus.Downloading, Percent = 64, Transfer = "7.28 MB/s", Eta = "1 min left" },
+        new() { Name = "Sample archive.zip", FileType = "Archive", Extension = "ZIP", Size = "40.7 MB", Status = JobStatus.Completed }
     ];
 }
 
@@ -43,7 +111,7 @@ internal sealed class VesperPreferences
     public ThemeChoice Theme { get; set; } = ThemeChoice.Light;
     public Density Density { get; set; } = Density.Compact;
     public MotionChoice Motion { get; set; } = MotionChoice.Subtle;
-    public bool Botanical { get; set; } = false; // v9 is opt-in only.
+    public bool Botanical { get; set; } = true; // New installs start with the illustrated header.
     public bool HideMissingCompleted { get; set; }
     public bool CategoryFolders { get; set; }
     public string DefaultFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
@@ -51,6 +119,18 @@ internal sealed class VesperPreferences
     public int GlobalRateLimitKbs { get; set; }
     public int PerTransferRateLimitKbs { get; set; }
     public List<int> BandwidthPresetsKbs { get; set; } = [128, 512, 2000];
+    public int MaxConnectionsPerJob { get; set; } = 4;
+    public bool NotifyOnFinish { get; set; } = true;
+    public bool WatchClipboard { get; set; }
+    public bool PreventSleep { get; set; }
+    public bool CloseToTray { get; set; } = true;
+    public bool AllowPrivateNetworks { get; set; }
+    public string ProxyMode { get; set; } = "Direct";
+    public string ProxyAddress { get; set; } = "";
+    public bool ScheduleEnabled { get; set; }
+    public string ScheduleStart { get; set; } = "01:00";
+    public string ScheduleEnd { get; set; } = "07:00";
+    public BrowserAction BrowserAction { get; set; } = BrowserAction.Ask;
     public VesperPreferences Clone()
     {
         var copy = (VesperPreferences)MemberwiseClone();

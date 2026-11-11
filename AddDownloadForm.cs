@@ -1,6 +1,6 @@
 namespace VESPER;
 
-// UI-only Add Download dialog. No request is issued and no output file is created.
+// Add Download. Validates links and the destination; the engine re-validates and creates the jobs.
 [System.ComponentModel.DesignerCategory("Form")]
 internal sealed class AddDownloadForm : VesperPopupForm
 {
@@ -12,7 +12,10 @@ internal sealed class AddDownloadForm : VesperPopupForm
     private readonly Panel _detected;
     private readonly Label _detectedTitle;
     private readonly Label _detectedNote;
+    private readonly LinkLabel _discoverLink;
     private readonly VesperButton _paste;
+    private readonly LinkLabel _multipleLinks;
+    private readonly VesperButton _openPage;
     private readonly VesperButton _destinationButton;
     private readonly Panel _destinationPanel;
     private readonly TextBox _destinationInput;
@@ -20,15 +23,17 @@ internal sealed class AddDownloadForm : VesperPopupForm
     private readonly VesperButton _download;
     private readonly VesperButton _queue;
     private bool _folderExpanded;
+    private bool _multiLine;
     private bool _layingOut;
 
     public IReadOnlyList<string> DownloadUrls { get; private set; } = [];
+    public IReadOnlyList<MediaDownloadChoice> MediaJobs { get; private set; } = [];
     public string? Destination { get; private set; }
     public bool QueueOnly { get; private set; }
 
     public AddDownloadForm() : this(new VesperPreferences()) { }
 
-    public AddDownloadForm(VesperPreferences preferences)
+    public AddDownloadForm(VesperPreferences preferences, string? initialUrl = null)
     {
         _prefs = preferences.Clone();
         _colors = UiKit.Palette(_prefs);
@@ -47,10 +52,19 @@ internal sealed class AddDownloadForm : VesperPopupForm
 
         var title = TextLabel("Add download", 16, true);
         title.SetBounds(23, 18, 440, 34);
-        var description = TextLabel("Paste an HTTP or HTTPS link. Files are not transferred in this demo.", 8.5F, muted: true);
+        var description = TextLabel("Paste one or more HTTP or HTTPS links, one per line.", 8.5F, muted: true);
         description.SetBounds(23, 52, 455, 23);
         var fieldLabel = TextLabel("Download link", 9, true);
-        fieldLabel.SetBounds(23, 84, 400, 22);
+        fieldLabel.SetBounds(23, 84, 310, 22);
+        _multipleLinks = new LinkLabel
+        {
+            Text = "Multiple links", AutoSize = false,
+            TextAlign = ContentAlignment.MiddleRight,
+            Location = new Point(352, 84), Size = new Size(133, 22),
+            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
+            BackColor = _colors.Surface, Font = new Font("Segoe UI", 8F)
+        };
+        _multipleLinks.Click += (_, _) => SetMultipleLinks(!_multiLine);
 
         _urlFrame = new VesperInputFrame
         {
@@ -60,14 +74,22 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _url = new TextBox
         {
             Name = "downloadUrl", BorderStyle = BorderStyle.None,
-            PlaceholderText = "Paste a download link…", Multiline = true,
-            ScrollBars = ScrollBars.None,
+            PlaceholderText = "Paste a download link…", Multiline = false,
+            WordWrap = false, ScrollBars = ScrollBars.None,
             Location = new Point(12, 12), Size = new Size(400, 22),
             BackColor = _colors.Surface, ForeColor = _colors.Text
         };
         _url.GotFocus += (_, _) => { _urlFrame.Active = true; _urlFrame.Invalidate(); };
         _url.LostFocus += (_, _) => { _urlFrame.Active = false; _urlFrame.Invalidate(); };
         _url.TextChanged += (_, _) => InspectUrl();
+        _url.KeyDown += (_, e) =>
+        {
+            if (!e.Control || e.KeyCode != Keys.V) return;
+            if (!TryReadClipboard(out string clipboard) || !clipboard.Contains('\n')) return;
+            SetMultipleLinks(true);
+            _url.SelectedText = clipboard;
+            e.SuppressKeyPress = true;
+        };
         _paste = MakeButton("", 31, symbol: VesperIcon.Clipboard);
         _paste.Quiet = true;
         _paste.AccessibleName = "Paste URL from clipboard";
@@ -80,8 +102,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
             }
             else
             {
-                try { if (Clipboard.ContainsText()) _url.Text = Clipboard.GetText(); }
-                catch { MessageBox.Show(this, "Clipboard is unavailable.", "Clipboard", MessageBoxButtons.OK, MessageBoxIcon.Information); }
+                if (TryReadClipboard(out string clipboard)) SetLinkText(clipboard);
+                else MessageBox.Show(this, "There isn't a usable link on the clipboard.", "Paste link", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             _url.Focus();
         };
@@ -92,9 +114,17 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _detected = new Panel { BackColor = _colors.Secondary, Size = new Size(462, 55), Visible = false };
         _detectedTitle = TextLabel("", 9, true);
         _detectedNote = TextLabel("", 8, muted: true);
-        _detectedTitle.SetBounds(12, 7, 437, 20);
+        _detectedTitle.SetBounds(12, 7, 308, 20);
         _detectedNote.SetBounds(12, 29, 437, 19);
-        _detected.Controls.AddRange([_detectedTitle, _detectedNote]);
+        _discoverLink = new LinkLabel
+        {
+            Text = "Find media", TextAlign = ContentAlignment.MiddleRight,
+            BackColor = Color.Transparent, LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
+            Location = new Point(340, 6), Size = new Size(108, 21), Visible = false,
+            Font = new Font("Segoe UI", 8.5F)
+        };
+        _discoverLink.Click += (_, _) => DiscoverVideo(allowGeneric: true);
+        _detected.Controls.AddRange([_detectedTitle, _detectedNote, _discoverLink]);
 
         _destinationButton = MakeButton("", 462, symbol: VesperIcon.Folder);
         _destinationButton.Name = "saveToToggle";
@@ -124,7 +154,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         browse.SetBounds(360, 22, 102, 34);
         browse.Click += (_, _) =>
         {
-            using var chooser = new FolderBrowserDialog { Description = "Choose a destination for this demonstration entry", UseDescriptionForTitle = true };
+            using var chooser = new FolderBrowserDialog { Description = "Choose a folder for this download", UseDescriptionForTitle = true };
             if (Directory.Exists(_destinationInput.Text)) chooser.SelectedPath = _destinationInput.Text;
             if (chooser.ShowDialog(this) == DialogResult.OK) _destinationInput.Text = chooser.SelectedPath;
         };
@@ -146,27 +176,44 @@ internal sealed class AddDownloadForm : VesperPopupForm
         var cancel = MakeButton("Cancel", 85);
         cancel.DialogResult = DialogResult.Cancel;
         _queue = MakeButton("Queue", 91, symbol: VesperIcon.Queue);
-        _queue.AccessibleName = "Add to queue (demonstration)";
+        _queue.AccessibleName = "Add to queue";
         _queue.Click += (_, _) => Accept(queueOnly: true);
         _download = MakeButton("Download", 122, primary: true, symbol: VesperIcon.Download);
         _download.Click += (_, _) => Accept(queueOnly: false);
-        _footer.Controls.AddRange([cancel, _queue, _download]);
+        _openPage = MakeButton("Find video", 154, primary: true, symbol: VesperIcon.Download);
+        _openPage.AccessibleName = "Discover available media formats";
+        _openPage.Visible = false;
+        _openPage.Click += (_, _) => DiscoverVideo();
+        _footer.Controls.AddRange([cancel, _queue, _download, _openPage]);
         _footer.Resize += (_, _) =>
         {
             cancel.SetBounds(23, 14, 85, 34);
             _download.SetBounds(_footer.Width - 23 - 122, 14, 122, 34);
             _queue.SetBounds(_download.Left - 8 - 91, 14, 91, 34);
+            _openPage.SetBounds(_footer.Width - 23 - 154, 14, 154, 34);
         };
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
-        body.Controls.AddRange([title, description, fieldLabel, _urlFrame, _hint,
+        body.Controls.AddRange([title, description, fieldLabel, _multipleLinks, _urlFrame, _hint,
             _detected, _destinationButton, _destinationPanel]);
         Controls.Add(body);
         Controls.Add(_footer);
         VesperDialogChrome.Attach(this, "VESPER  /  Add download", _colors, VesperIcon.Plus);
         CancelButton = cancel;
         AcceptButton = _download;
-        Shown += (_, _) => _url.Focus();
+        Shown += (_, _) =>
+        {
+            // Check once on opening; do not poll the clipboard in the background.
+            if (_url.TextLength == 0 && TryReadClipboard(out string clipboard))
+            {
+                string[] candidates = SplitLines(clipboard);
+                if (candidates.Length is > 0 and <= 30 && candidates.All(candidate =>
+                    Vesper.Engine.UrlPolicy.TryParse(candidate, out _, out _)))
+                    SetLinkText(clipboard);
+            }
+            _url.Focus();
+        };
+        if (!string.IsNullOrWhiteSpace(initialUrl)) SetLinkText(initialUrl.Trim());
         UpdateDestinationText();
         InspectUrl();
     }
@@ -192,60 +239,119 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _destinationButton.Text = "Save to   " + (path.Length > 48 ? "…" + path[^47..] : path);
     }
 
+    private static string[] SplitLines(string text) => text.Split(['\r', '\n'],
+        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static bool TryReadClipboard(out string text)
+    {
+        text = "";
+        try
+        {
+            if (!Clipboard.ContainsText()) return false;
+            text = Clipboard.GetText().Trim();
+            return text.Length is > 0 and <= 32768;
+        }
+        catch (System.Runtime.InteropServices.ExternalException) { return false; }
+    }
+
+    private void SetLinkText(string text)
+    {
+        if (SplitLines(text).Length > 1) SetMultipleLinks(true);
+        _url.Text = text.Trim();
+    }
+
+    private void SetMultipleLinks(bool enabled)
+    {
+        if (_multiLine == enabled) return;
+        if (!enabled && SplitLines(_url.Text).Length > 1)
+        {
+            MessageBox.Show(this, "Remove the extra links before switching back to one line.",
+                "Multiple links", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        _multiLine = enabled;
+        string previousText = _url.Text;
+        _url.Multiline = enabled;
+        _url.WordWrap = false;
+        _url.ScrollBars = enabled ? ScrollBars.Vertical : ScrollBars.None;
+        _url.Text = previousText;
+        _multipleLinks.Text = enabled ? "Single link" : "Multiple links";
+        LayoutContent();
+    }
+
     private void InspectUrl()
     {
         string[] links = SplitLinks();
         _paste.Symbol = _url.TextLength > 0 ? VesperIcon.Close : VesperIcon.Clipboard;
-        _paste.AccessibleName = _url.TextLength > 0 ? "Clear URL" : "Paste URL from clipboard";
+        _paste.AccessibleName = _url.TextLength > 0 ? "Clear links" : "Paste link from clipboard";
         _paste.Invalidate();
-        bool valid = links.Length > 0 && links.All(IsSupportedUrl);
-        bool invalid = links.Length > 0 && !valid;
+        bool valid = links.Length is > 0 and <= 200 && links.All(IsSupportedUrl);
+        bool hasMedia = links.Any(IsMediaLink);
+        bool allClassified = links.Length is > 0 and <= 200 &&
+            links.All(link => IsSupportedUrl(link) || IsMediaLink(link));
+        bool mediaRoute = hasMedia && allClassified;
+        bool invalid = links.Length > 0 && !allClassified;
         _urlFrame.BorderColor = invalid ? _colors.Red : _colors.Border;
         _urlFrame.FocusColor = invalid ? _colors.Red : _colors.MutedGreen;
         _urlFrame.Invalidate();
         _queue.Enabled = _download.Enabled = valid;
+        _queue.Visible = _download.Visible = !hasMedia;
+        _openPage.Visible = mediaRoute;
+        _discoverLink.Visible = !hasMedia && links.Length == 1 && valid;
         _detected.Visible = links.Length > 0;
         _detected.BackColor = invalid
             ? (_colors.Surface.R == 255 ? Color.FromArgb(253, 246, 243) : Color.FromArgb(54, 37, 35))
             : _colors.Secondary;
+        _detectedTitle.ForeColor = invalid ? _colors.Red : _colors.Text;
+
         if (links.Length == 0)
         {
-            _hint.Text = "Enter a link to continue";
+            _hint.Text = "Paste a file link to continue";
+        }
+        else if (mediaRoute)
+        {
+            int mediaCount = links.Count(IsMediaLink);
+            int fileCount = links.Length - mediaCount;
+            _hint.Text = "Media discovery is needed";
+            _detectedTitle.Text = fileCount == 0
+                ? mediaCount == 1 ? "Media page or stream" : $"{mediaCount} media sources"
+                : $"{mediaCount} media + {fileCount} direct file links";
+            _detectedNote.Text = "Choose media quality once; direct file links are added alongside it.";
+            _openPage.Text = "Find media";
         }
         else if (!valid)
         {
-            _hint.Text = "Check the link above";
-            _detectedTitle.Text = "Unsupported or invalid address";
-            _detectedTitle.ForeColor = _colors.Red;
-            _detectedNote.Text = "Only direct HTTP/HTTPS links are supported in this preview.";
+            _hint.Text = "Check the address above";
+            _detectedTitle.Text = "This link cannot be added as a file";
+            _detectedNote.Text = "Try a file URL, HLS playlist, or a supported video page.";
+        }
+        else if (links.Length > 1)
+        {
+            _hint.Text = "Links ready for checking";
+            _detectedTitle.Text = $"{links.Length} file addresses";
+            _detectedNote.Text = "VESPER will check each file when its download begins.";
         }
         else
         {
-            _hint.Text = "Ready · demonstration only";
-            _detectedTitle.ForeColor = _colors.Green;
-            if (links.Length > 1)
-            {
-                _detectedTitle.Text = $"{links.Length} links detected";
-                _detectedNote.Text = "Each becomes a sample entry. No files are downloaded.";
-            }
-            else
-            {
-                _detectedTitle.Text = "Link recognized";
-                _detectedNote.Text = "Choose Queue or Download to add a sample entry.";
-            }
+            _hint.Text = "Address format looks OK";
+            _detectedTitle.Text = "File link to check";
+            _detectedNote.Text = "VESPER checks the file when downloading. A webpage is not a file.";
         }
         LayoutContent();
     }
 
-    private string[] SplitLinks() => _url.Text.Split(['\r', '\n'],
-        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    private string[] SplitLinks() => SplitLines(_url.Text);
 
     private static bool IsSupportedUrl(string text) =>
-        Uri.TryCreate(text, UriKind.Absolute, out var url)
-        && (url.Scheme is "http" or "https")
-        && url.AbsolutePath.EndsWith(".torrent", StringComparison.OrdinalIgnoreCase) == false
-        && url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) == false
-        && url.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase) == false;
+        Vesper.Engine.UrlPolicy.TryParse(text, out Uri url, out _)
+        && !Vesper.Engine.MediaPageLinks.TryGetSite(url, out _)
+        && !url.AbsolutePath.EndsWith(".torrent", StringComparison.OrdinalIgnoreCase)
+        && !url.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsMediaLink(string text) =>
+        Vesper.Engine.UrlPolicy.TryParse(text, out Uri url, out _) &&
+        (Vesper.Engine.MediaPageLinks.TryGetSite(url, out _) ||
+         url.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase));
 
     private void LayoutContent()
     {
@@ -253,8 +359,12 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _layingOut = true;
         try
         {
-            int destinationY = _detected.Visible ? 248 : 192;
-            _detected.SetBounds(23, 181, 462, 55);
+            int extra = _multiLine ? 56 : 0;
+            _urlFrame.SetBounds(23, 107, 462, 43 + extra);
+            _url.SetBounds(12, 12, 400, 22 + extra);
+            _hint.SetBounds(23, 157 + extra, 462, 22);
+            _detected.SetBounds(23, 181 + extra, 462, 55);
+            int destinationY = (_detected.Visible ? 248 : 192) + extra;
             _destinationButton.SetBounds(23, destinationY, 462, 34);
             _destinationPanel.Visible = _folderExpanded;
             _destinationPanel.Location = new Point(23, destinationY + 43);
@@ -264,14 +374,69 @@ internal sealed class AddDownloadForm : VesperPopupForm
         finally { _layingOut = false; }
     }
 
+    private void DiscoverVideo(bool allowGeneric = false)
+    {
+        string[] links = SplitLinks();
+        if (links.Length is < 1 or > 200 ||
+            !links.All(link => IsSupportedUrl(link) || IsMediaLink(link))) return;
+        string[] media = allowGeneric ? links : links.Where(IsMediaLink).ToArray();
+        if (media.Length == 0) return;
+        Uri[] urls = media.Select(link => new Uri(link)).ToArray();
+        using var picker = urls.Length == 1
+            ? new MediaDiscoveryForm(_prefs, urls[0])
+            : new MediaDiscoveryForm(_prefs, urls);
+        if (picker.ShowDialog(this) != DialogResult.OK || picker.Selections.Count == 0)
+        {
+            string[] ordinary = allowGeneric ? [] : links.Where(IsSupportedUrl).ToArray();
+            if (ordinary.Length == 0 || MessageBox.Show(this,
+                $"Media discovery was cancelled or found no supported streams. Add the {ordinary.Length} ordinary file link(s) instead?",
+                "Add remaining files", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            MediaJobs = [];
+            DownloadUrls = ordinary.Select(link => new Uri(link).AbsoluteUri).ToArray();
+            Destination = _destinationInput.Text.Trim();
+            QueueOnly = false;
+            DialogResult = DialogResult.OK;
+            Close();
+            return;
+        }
+        MediaJobs = picker.Selections;
+        // Mixed batch: preserve ordinary files instead of dropping/rejecting them.
+        DownloadUrls = allowGeneric ? [] : links.Where(IsSupportedUrl).Select(link => new Uri(link).AbsoluteUri).ToArray();
+        Destination = _destinationInput.Text.Trim();
+        QueueOnly = picker.QueueOnly;
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+
+    private void OpenVideoPage()
+    {
+        string[] links = SplitLinks();
+        if (links.Length != 1 || !Vesper.Engine.UrlPolicy.TryParse(links[0], out Uri uri, out _)
+            || !Vesper.Engine.MediaPageLinks.TryGetSite(uri, out _)) return;
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri)
+                { UseShellExecute = true });
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            MessageBox.Show(this, "The browser couldn't open this page: " + ex.Message,
+                "Open video page", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        DialogResult = DialogResult.Cancel;
+        Close();
+    }
+
     private void Accept(bool queueOnly)
     {
         string[] links = SplitLinks();
-        if (links.Length == 0 || !links.All(IsSupportedUrl)) return;
+        if (links.Length is < 1 or > 200 || !links.All(IsSupportedUrl)) return;
         string folder = _destinationInput.Text.Trim();
-        if (string.IsNullOrWhiteSpace(folder) || !Path.IsPathFullyQualified(folder))
+        if (!Vesper.Engine.PathSafety.TryResolveFolder(folder, create: false, out string resolved, out string folderProblem)
+            && !(folderProblem.Contains("does not exist") && Path.IsPathFullyQualified(folder)))
         {
-            MessageBox.Show(this, "Choose an absolute destination folder path.", "Invalid destination",
+            MessageBox.Show(this, folderProblem, "Invalid destination",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }

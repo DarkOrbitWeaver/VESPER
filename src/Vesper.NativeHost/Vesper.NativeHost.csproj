@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Chrome starts this process per message, so it must start fast and stay tiny. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>vesper-host</AssemblyName>
+    <RootNamespace>Vesper.NativeHost</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TieredPGO>false</TieredPGO>
+    <TieredCompilationQuickJitForLoops>true</TieredCompilationQuickJitForLoops>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Vesper.Engine\Vesper.Engine.csproj" />
+  </ItemGroup>
+
+</Project>

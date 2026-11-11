@@ -1,0 +1,17 @@
+{
+  "code": 0,
+  "data": {
+    "dash": {
+      "duration": 212,
+      "video": [
+        { "id": 80, "baseUrl": "https://upos.bilivideo-fixture.example/v80.m4s?deadline=4000000000", "bandwidth": 2500000, "mimeType": "video/mp4", "codecs": "avc1.640032", "width": 1920, "height": 1080, "frameRate": "30.000" },
+        { "id": 64, "baseUrl": "https://upos.bilivideo-fixture.example/v64.m4s?deadline=4000000000", "bandwidth": 1500000, "mimeType": "video/mp4", "codecs": "avc1.640028", "width": 1280, "height": 720, "frameRate": "30.000" },
+        { "id": 125, "baseUrl": "https://upos.bilivideo-fixture.example/v125.m4s", "bandwidth": 6000000, "mimeType": "video/mp4", "codecs": "hev1.2.4.L150.90", "width": 3840, "height": 2160, "frameRate": "30.000" }
+      ],
+      "audio": [
+        { "id": 30280, "baseUrl": "https://upos.bilivideo-fixture.example/a192.m4s", "bandwidth": 192000, "codecs": "mp4a.40.2" },
+        { "id": 30216, "baseUrl": "https://upos.bilivideo-fixture.example/a64.m4s", "bandwidth": 64000, "codecs": "mp4a.40.2" }
+      ]
+    }
+  }
+}

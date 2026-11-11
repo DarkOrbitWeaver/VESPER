@@ -1,3 +1,12 @@
 <Solution>
   <Project Path="VESPER.csproj" />
+  <Folder Name="/src/">
+    <Project Path="src/Vesper.Engine/Vesper.Engine.csproj" />
+    <Project Path="src/Vesper.MediaResolver/Vesper.MediaResolver.csproj" />
+    <Project Path="src/Vesper.NativeHost/Vesper.NativeHost.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Vesper.Tests/Vesper.Tests.csproj" />
+    <Project Path="tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj" />
+  </Folder>
 </Solution>

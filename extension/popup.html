@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VESPER</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/vesper-48.png" alt="" width="28" height="28">
+    <div><h1>VESPER</h1><p id="status" role="status">Checking connection…</p></div>
+  </header>
+
+  <section id="pending" hidden>
+    <h2>Not confirmed</h2>
+    <p class="hint">These were sent but VESPER never confirmed them. Sending again is safe: duplicates are ignored.</p>
+    <ul id="pending-list"></ul>
+  </section>
+
+  <section id="media">
+    <h2>On this page</h2>
+    <p id="media-note" class="hint"></p>
+    <button id="open-native-picker" class="btn" type="button">Find formats in VESPER</button>
+    <ul id="media-list"></ul>
+    <div id="batch" class="row" hidden>
+      <button id="queue-selected" class="btn">Queue selected</button>
+      <button id="download-selected" class="btn primary">Download selected</button>
+    </div>
+    <p id="result" class="result" role="status" hidden></p>
+  </section>
+
+  <details>
+    <summary>Settings</summary>
+    <label>When VESPER receives a download
+      <select id="handoff">
+        <option value="default">Use VESPER’s own setting</option>
+        <option value="download">Download immediately</option>
+        <option value="queue">Add to queue</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="intercept"> Capture supported downloads with VESPER
+      <small>Enabled for supported file types. Disable here any time. If VESPER cannot accept a file, Chrome keeps it.</small></label>
+    <label class="check"><input type="checkbox" id="signin"> Use my sign-in for the download’s site
+      <small>Sends only the cookies for that exact address, only when you send a download. Needs your permission.</small></label>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

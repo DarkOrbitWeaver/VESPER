@@ -1,0 +1,222 @@
+using Vesper.Engine;
+
+namespace VESPER;
+
+/// <summary>
+/// Replace Link / Rescue Assistant. It never promises recovery up front: the engine checks the new link first and
+/// this dialog reports its verdict honestly. A rejected link changes nothing; the saved data stays untouched.
+/// </summary>
+[System.ComponentModel.DesignerCategory("Form")]
+internal sealed class RescueForm : VesperPopupForm
+{
+    private readonly DownloadEngine _engine;
+    private readonly JobSnapshot _job;
+    private readonly VesperPalette _colors;
+    private readonly TextBox _url;
+    private readonly TextBox _sha;
+    private readonly Label _pieceLabel;
+    private readonly Label _result;
+    private readonly VesperButton _replace;
+    private readonly VesperButton _separateCopy;
+    private readonly VesperButton _cancel;
+    private readonly LinkLabel _advanced;
+    private readonly Label _shaLabel;
+    private readonly VesperInputFrame _shaFrame;
+    private readonly VesperButton _pieceButton;
+    private bool _advancedVisible;
+    private string? _pieceJson;
+
+    public RescueForm(DownloadEngine engine, JobSnapshot job, VesperPreferences preferences)
+    {
+        _engine = engine;
+        _job = job;
+        _colors = UiKit.Palette(preferences);
+        VesperWindowChrome.Brand(this);
+        Text = "Replace link — VESPER";
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ClientSize = new Size(520, 330 + VesperDialogChrome.HeaderHeight);
+        MaximizeBox = MinimizeBox = false;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.CenterParent;
+        Font = new Font("Segoe UI", 9F);
+        BackColor = _colors.Surface;
+        ForeColor = _colors.Text;
+
+        var name = Text_(job.FileName, 11F, bold: true);
+        name.SetBounds(23, 16, 474, 26);
+        string kept = job.CommittedBytes > 0
+            ? $"{Formatting.Bytes(job.CommittedBytes)} saved{(job.TotalBytes is long t ? $" of {Formatting.Bytes(t)}" : "")}"
+            : "Nothing saved yet";
+        var status = Text_(kept + (job.Message.Length > 0 ? " · " + job.Message : ""), 8.5F, muted: true);
+        status.SetBounds(23, 44, 474, 38);
+        status.AutoEllipsis = false;
+
+        var linkLabel = Text_("New download link", 9, bold: true);
+        linkLabel.SetBounds(23, 90, 474, 20);
+        (VesperInputFrame urlFrame, _url) = InputBox(23, 112, 474);
+
+        _advanced = new LinkLabel
+        {
+            Text = "Advanced verification (optional)", AutoSize = true,
+            Location = new Point(23, 163),
+            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
+            BackColor = _colors.Surface, Font = new Font("Segoe UI", 8.5F)
+        };
+        _advanced.LinkClicked += (_, _) => ToggleAdvanced();
+        _shaLabel = Text_("Publisher-provided SHA-256", 9, bold: true);
+        _shaLabel.SetBounds(23, 194, 474, 20);
+        (_shaFrame, _sha) = InputBox(23, 216, 474);
+        _sha.PlaceholderText = "Paste a checksum only if the source provides one";
+        _sha.Text = "";
+
+        _pieceButton = new VesperButton { Text = "Choose piece checksums…", Width = 184, Height = 30 };
+        _pieceButton.ApplyPalette(_colors);
+        _pieceButton.SetBounds(23, 263, 184, 30);
+        _pieceButton.Click += (_, _) => ChoosePieceFile();
+        _pieceLabel = Text_("Only if the publisher provides a trusted checksum list.", 8, muted: true);
+        _pieceLabel.SetBounds(218, 263, 279, 30);
+        _pieceLabel.AutoEllipsis = false;
+
+        _result = Text_("", 8.75F);
+        _result.SetBounds(23, 191, 474, 62);
+        _result.AutoEllipsis = false;
+        _result.TextAlign = ContentAlignment.TopLeft;
+
+        var footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
+        footer.Paint += (_, e) => { using var pen = new Pen(_colors.Border); e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0); };
+        _cancel = new VesperButton { Text = "Close", Width = 85, Height = 34, DialogResult = DialogResult.Cancel };
+        _separateCopy = new VesperButton { Text = "Download as new copy", Width = 170, Height = 34, Visible = false };
+        _replace = new VesperButton { Text = "Replace link", Width = 130, Height = 34, Primary = true, Symbol = VesperIcon.Link };
+        foreach (VesperButton b in new[] { _cancel, _separateCopy, _replace }) b.ApplyPalette(_colors);
+        _replace.Click += async (_, _) => await ReplaceAsync();
+        _separateCopy.Click += (_, _) => StartSeparateCopy();
+        footer.Controls.AddRange([_cancel, _separateCopy, _replace]);
+        footer.Resize += (_, _) =>
+        {
+            _replace.SetBounds(footer.Width - 23 - 130, 14, 130, 34);
+            _separateCopy.SetBounds(_replace.Left - 8 - 170, 14, 170, 34);
+            _cancel.SetBounds(23, 14, 85, 34);
+        };
+
+        var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
+        body.Controls.AddRange([name, status, linkLabel, urlFrame, _advanced, _shaLabel, _shaFrame,
+            _pieceButton, _pieceLabel, _result]);
+        Controls.Add(body);
+        Controls.Add(footer);
+        VesperDialogChrome.Attach(this, "VESPER  /  Replace link", _colors, VesperIcon.Link);
+        CancelButton = _cancel;
+        AcceptButton = _replace;
+        Shown += (_, _) => _url.Focus();
+        LayoutAdvanced();
+    }
+
+    private Label Text_(string text, float size, bool bold = false, bool muted = false) => new()
+    {
+        Text = text, AutoSize = false, AutoEllipsis = true, BackColor = Color.Transparent,
+        ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
+        Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
+    };
+
+    private (VesperInputFrame, TextBox) InputBox(int x, int y, int width)
+    {
+        var frame = new VesperInputFrame { Location = new Point(x, y), Size = new Size(width, 36), BackColor = _colors.Surface, BorderColor = _colors.Border, FocusColor = _colors.MutedGreen };
+        var box = new TextBox { BorderStyle = BorderStyle.None, Location = new Point(10, 9), Width = width - 20, BackColor = _colors.Surface, ForeColor = _colors.Text };
+        box.GotFocus += (_, _) => { frame.Active = true; frame.Invalidate(); };
+        box.LostFocus += (_, _) => { frame.Active = false; frame.Invalidate(); };
+        frame.Controls.Add(box);
+        return (frame, box);
+    }
+
+    private void ToggleAdvanced()
+    {
+        _advancedVisible = !_advancedVisible;
+        LayoutAdvanced();
+    }
+
+    private void LayoutAdvanced()
+    {
+        _shaLabel.Visible = _shaFrame.Visible = _pieceButton.Visible = _pieceLabel.Visible = _advancedVisible;
+        _advanced.Text = _advancedVisible ? "Hide advanced verification" : "Advanced verification (optional)";
+        _result.SetBounds(23, _advancedVisible ? 310 : 191, 474, _advancedVisible ? 82 : 62);
+        ClientSize = new Size(520, (_advancedVisible ? 472 : 330) + VesperDialogChrome.HeaderHeight);
+    }
+
+    private void ChoosePieceFile()
+    {
+        using var picker = new OpenFileDialog { Title = "Trusted piece-hash file", Filter = "Piece hashes (*.json)|*.json|All files|*.*", CheckFileExists = true };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            if (new FileInfo(picker.FileName).Length > 8 * 1024 * 1024) { Show("That file is too large to be a piece-hash list.", error: true); return; }
+            string json = File.ReadAllText(picker.FileName);
+            if (!PieceMap.TryParse(json, out PieceMap map, out string problem)) { Show(problem, error: true); return; }
+            _pieceJson = json;
+            _pieceLabel.Text = $"{Path.GetFileName(picker.FileName)} · {map.PieceCount} pieces of {Formatting.Bytes(map.PieceLength)}";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Show("The file could not be read: " + ex.Message, error: true); }
+    }
+
+    private async Task ReplaceAsync()
+    {
+        string link = _url.Text.Trim();
+        if (link.Length == 0) { Show("Paste the new download link first.", error: true); return; }
+        if (UrlPolicy.TryParse(link, out Uri uri, out _) && MediaPageLinks.TryGetSite(uri, out string site))
+        {
+            Show($"That's a {site} video page, not a direct file. Open the page in your browser and use VESPER's butterfly if a downloadable format is found.", error: true);
+            return;
+        }
+
+        SetBusy(true);
+        Show("Checking the new link…", error: false);
+        try
+        {
+            RescueResult result = await _engine.ReplaceLinkAsync(_job.Id, link, new RescueInput(_sha.Text.Trim(), _pieceJson));
+            if (result.Accepted)
+            {
+                string message = result.RetainedBytes == 0
+                    ? "Link updated. VESPER will check the file when it starts."
+                    : result.Mode == RescueMode.R1
+                        ? "New link saved. Your existing data will be checked against the trusted checksum before the file is finished."
+                        : "Link updated. Your saved progress was kept where it could be safely reused.";
+                if (result.PiecesToRefetch > 0)
+                    message += $" {result.PiecesToRefetch} missing or damaged parts will be fetched.";
+                Show(message, error: false);
+                _replace.Visible = false;
+                _cancel.Text = "Done";
+            }
+            else
+            {
+                Show("This link can't safely continue the saved file. Your existing data was not changed. Try another link or download a new copy.", error: true);
+                _result.AccessibleDescription = result.Message;
+                _separateCopy.Visible = true;
+            }
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Show("Something went wrong while checking the link: " + ex.Message + "\nYour saved data was not changed.", error: true);
+        }
+        finally { SetBusy(false); }
+    }
+
+    private void StartSeparateCopy()
+    {
+        AddResult added = _engine.Add(new AddRequest(_url.Text.Trim(), DestinationFolder: _job.Destination, StartNow: false));
+        if (!added.Ok) { Show(added.Message, error: true); return; }
+        Show("A separate download was queued. The original partial file was left as it was.", error: false);
+        _separateCopy.Visible = false;
+    }
+
+    private void SetBusy(bool busy)
+    {
+        _replace.Enabled = !busy;
+        _url.Enabled = _sha.Enabled = _pieceButton.Enabled = _advanced.Enabled = !busy;
+        UseWaitCursor = busy;
+    }
+
+    private void Show(string text, bool error)
+    {
+        _result.ForeColor = error ? _colors.Red : _colors.Text;
+        _result.Text = text;
+    }
+}
