@@ -4,28 +4,52 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
-function load(nativeReplies = {}) {
+function load(nativeReplies = {}, { download, signInPermission = false, prefs = {} } = {}) {
   const listeners = [];
   const noop = () => {};
   const event = { addListener: (fn) => listeners.push(fn) };
-  const storage = () => ({ get: async () => ({}), set: async () => {}, remove: async () => {} });
+  const storage = () => {
+    const data = {};
+    return {
+      get: async key => structuredClone({ [key]: data[key] }),
+      set: async values => Object.assign(data, structuredClone(values)),
+      remove: async key => { delete data[key]; }
+    };
+  };
+  let onMessage, onCreated, onChanged;
   const sent = [];
+  const actions = [];
+  const cookieLookups = [];
+  const local = storage();
   const chrome = {
     runtime: {
-      onMessage: event, onInstalled: event, onStartup: event, lastError: undefined,
-      sendNativeMessage: (host, message, cb) => { sent.push(message); cb(nativeReplies[message.type] ?? { ok: false, code: 'host-error', message: 'no reply' }); }
+      onMessage: { addListener: fn => { onMessage = fn; } }, onInstalled: event, onStartup: event, lastError: undefined,
+      sendNativeMessage: (host, message, cb) => {
+        actions.push('native');
+        sent.push(message);
+        cb(nativeReplies[message.type] ?? { ok: false, code: 'host-error', message: 'no reply' });
+      }
     },
     webRequest: { onResponseStarted: event }, tabs: { onUpdated: event, onRemoved: event, query: async () => [] },
     contextMenus: { create: noop, removeAll: async () => {}, onClicked: event },
-    downloads: { onCreated: event, cancel: async () => {}, erase: async () => {} },
+    downloads: {
+      onCreated: { addListener: fn => { onCreated = fn; } },
+      onChanged: { addListener: fn => { onChanged = fn; } },
+      search: async ({ id }) => download && (id === undefined || download.id === id) ? [{ ...download }] : [],
+      pause: async () => { actions.push('pause'); download.paused = true; },
+      cancel: async () => actions.push('cancel'),
+      erase: async () => actions.push('erase')
+    },
     action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
-    storage: { sync: { get: async (d) => d, set: async () => {} }, local: storage(), session: storage() },
-    permissions: { contains: async () => false }, cookies: { getAll: async () => [] }
+    storage: { sync: { get: async (d) => ({ ...d, ...prefs }), set: async () => {} }, local, session: storage() },
+    permissions: { contains: async () => signInPermission },
+    cookies: { getAll: async ({ url }) => { cookieLookups.push(url); return [{ name: 'session', value: 'test-value' }]; } }
   };
-  const context = { chrome, crypto: { randomUUID: () => 'test-uuid-0001-aaaa' }, navigator: { userAgent: 'test' }, setTimeout, clearTimeout, console };
+  const context = { chrome, URL, crypto: { randomUUID: () => 'test-uuid-0001-aaaa' }, navigator: { userAgent: 'test' }, setTimeout, clearTimeout, console };
   vm.createContext(context);
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent };
+  return { describe: context.__describe, sent, actions, cookieLookups, local, onCreated, onChanged,
+    message: (msg, sender = {}) => new Promise(resolve => onMessage(msg, sender, resolve)) };
 }
 
 const hlsMaster = {
@@ -84,4 +108,103 @@ test('requests carry the protocol version and a valid id', async () => {
   assert.equal(sent[0].v, 1);
   assert.match(sent[0].id, /^[A-Za-z0-9_-]{8,64}$/);
   assert.equal(sent[0].type, 'probe');
+});
+
+const activeDownload = () => ({
+  id: 14, state: 'in_progress', danger: 'safe', paused: false, url: 'https://example.com/files/archive.zip',
+  filename: 'C:\\Downloads\\archive.zip'
+});
+
+test('automatic handoff pauses Chrome only after VESPER confirms data, keeping the original entry', async () => {
+  const file = activeDownload();
+  const app = load({ submit: { ok: true, results: [{ status: 'started', transferReady: true }] } }, { download: file });
+  await app.onCreated(file);
+  assert.deepEqual(app.actions, ['native', 'pause']);
+  assert.equal(app.sent[0].confirmTransfer, true);
+  assert.equal(app.sent[0].items[0].fileName, 'archive.zip');
+  assert.equal(file.paused, true);
+});
+
+test('automatic handoff includes extensionless files and starts them by default', async () => {
+  const file = { ...activeDownload(), url: 'https://example.com/export?receipt=42', filename: '' };
+  const app = load({}, { download: file });
+  await app.onCreated(file);
+  assert.equal(app.sent[0].items[0].url, file.url);
+  assert.equal(app.sent[0].mode, 'download');
+  assert.equal(file.paused, false);
+  assert.deepEqual(app.actions, ['native']);
+});
+
+test('automatic handoff waits for Chrome to clear a download', async () => {
+  const file = { ...activeDownload(), danger: 'asyncScanning' };
+  const app = load({ submit: { ok: true, results: [{ status: 'started', transferReady: true }] } }, { download: file });
+  await app.onCreated(file);
+  assert.equal(app.sent.length, 0);
+  file.danger = 'safe';
+  await app.onChanged({ id: file.id, danger: { previous: 'asyncScanning', current: 'safe' } });
+  assert.deepEqual(app.actions, ['native', 'pause']);
+});
+
+test('first-click discovery uses the actual player frame and its HTTP source', async () => {
+  const options = { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } };
+  const app = load({ 'media-options': options });
+  const sender = { url: 'https://player.example/embed', tab: { id: 5, url: 'https://example.com/watch' } };
+  const result = await app.message({ type: 'media-options', title: 'Example clip',
+    pageUrl: 'https://unrelated.example/', playerUrl: 'https://cdn.example/master.m3u8?key=1' }, sender);
+  assert.deepEqual(result, options);
+  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent[0].url, sender.url);
+  assert.equal(app.sent[0].candidates[0].kind, 'hls');
+  assert.equal(app.sent[0].pageTitle, 'Example clip');
+});
+
+test('format submission uses an opaque selection and rejects an out-of-range choice', async () => {
+  const app = load({ 'media-select': { ok: true } });
+  const mediaSession = 'edc1604be3d34136a798fca8addbcbcd';
+  const msg = { type: 'media-select', mediaSession, formatChoice: 2, mode: 'queue', url: 'https://unrelated.example' };
+  assert.equal((await app.message(msg)).ok, true);
+  assert.equal((await app.message({ ...msg, formatChoice: 64 })).ok, false);
+  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent[0].id, mediaSession + '-2-queue');
+  assert.equal(app.sent[0].url, undefined);
+});
+
+test('manual move starts in VESPER and leaves Chrome running if the host fails or only queues the file', async () => {
+  for (const reply of [{ ok: false, code: 'app-unavailable' }, { ok: true, results: [{ status: 'queued' }] }]) {
+    const file = activeDownload();
+    const app = load({ submit: reply }, { download: file, prefs: { intercept: false } });
+    const result = await app.message({ type: 'move-download', downloadId: file.id });
+    assert.equal(result.chromePaused, false);
+    assert.equal(app.sent[0].mode, 'download');
+    assert.deepEqual(app.actions, ['native']);
+  }
+});
+
+test('downloads awaiting Chrome safety review cannot be moved', async () => {
+  const file = { ...activeDownload(), danger: 'uncommon' };
+  const app = load({}, { download: file });
+  assert.equal((await app.message({ type: 'chrome-downloads' })).downloads.length, 0);
+  assert.equal((await app.message({ type: 'move-download', downloadId: file.id })).ok, false);
+  assert.equal(app.sent.length, 0);
+});
+
+test('sign-in defaults on after permission, retries reacquire cookies, and stored requests omit credentials', async () => {
+  const file = activeDownload();
+  const replies = { submit: { ok: false, code: 'host-error' } };
+  const app = load(replies, { download: file, signInPermission: true });
+  await app.message({ type: 'move-download', downloadId: file.id });
+  const id = app.sent[0].id;
+  assert.equal(app.sent[0].items[0].cookie, 'session=test-value');
+  assert.equal((await app.local.get('pending')).pending[id].request.items[0].cookie, undefined);
+  replies.submit = { ok: true, results: [{ status: 'already-submitted', transferReady: true }] };
+  assert.equal((await app.message({ type: 'retry', id })).chromePaused, true);
+  assert.equal(app.sent[1].id, id);
+  assert.deepEqual(app.cookieLookups, [file.url, file.url]);
+
+  for (const opts of [{ signInPermission: false }, { signInPermission: true, prefs: { useSignIn: false } }]) {
+    const optedOut = load(replies, { download: activeDownload(), ...opts });
+    await optedOut.message({ type: 'move-download', downloadId: file.id });
+    assert.equal(optedOut.cookieLookups.length, 0);
+    assert.equal(optedOut.sent[0].authorized, false);
+  }
 });

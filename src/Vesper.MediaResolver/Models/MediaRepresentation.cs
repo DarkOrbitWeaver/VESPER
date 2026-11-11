@@ -65,6 +65,12 @@ public sealed record MediaRepresentation
     public bool FileSizeIsEstimate { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
 
+    /// <summary>
+    /// Provider evidence identifying the exact encoded bytes (YouTube: video id, itag, last-modified, content length).
+    /// Null when the source offers no such evidence; then a refreshed URL can never continue saved bytes.
+    /// </summary>
+    public string? ContentIdentity { get; init; }
+
     public MediaRequestContext Context { get; init; } = MediaRequestContext.Empty;
     public Uri? ManifestUrl { get; init; }
     public SegmentPlan? Segments { get; init; }

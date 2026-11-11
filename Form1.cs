@@ -27,13 +27,11 @@ public partial class Form1 : Form
     private BridgeServer? _bridge;
     private DownloadItem? _menuTarget;
     private VesperPalette _colors = VesperPalette.Light;
-    private Image? _moth;
-    private Image? _branchLight;
-    private Image? _branchDark;
+
     private readonly bool _startHidden;
+    private BotanicalArt? _botanicalArt;
     private bool _allowVisible;
     private bool _exiting;
-    private bool _trayHintShown;
     private string? _lastClipboard;
     private string? _clipboardCandidate;
     private DateTime _lastAvailabilityCheck = DateTime.MinValue;
@@ -41,24 +39,32 @@ public partial class Form1 : Form
     /// <summary>Visual Studio designer entry point. Never starts an engine.</summary>
     public Form1() : this(new VesperPreferences(), null, false) { }
 
-    internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden)
+    internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden, bool botanicalPreview = false)
     {
         _prefs = preferences;
+        Disposed += (_, _) =>
+        {
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            _botanicalArt?.Dispose();
+            _rowMenu.Dispose();
+            _tooltips.Dispose();
+        };
         _engine = engine;
         _startHidden = startHidden;
         _allowVisible = !startHidden;
         InitializeComponent();
-        HandleCreated += (_, _) => VesperWindowChrome.Apply(this, UiKit.IsDark(_prefs));
+        HandleCreated += (_, _) => VesperWindowChrome.Apply(this, _colors);
 
         VesperWindowChrome.Brand(this);
-        _moth = UiKit.LoadImage("moth-mark-transparent-96.png");
-        _branchLight = UiKit.LoadImage("header-branch-light-720x288.png");
-        _branchDark = UiKit.LoadImage("header-branch-dark-720x288.png");
-        _brandIcon.Image = _moth;
-
+        if (botanicalPreview)
+        {
+            _settings.Text = "Settings";
+            _settings.Width = 104;
+        }
         if (engine is not null) _actions = new DownloadActions(this, engine, () => _prefs);
         WireEvents();
         ApplyAppearance();
+        SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
         if (engine is null) return;
 
         AttachEngine(engine);
@@ -143,7 +149,7 @@ public partial class Form1 : Form
             }
         }
         if (structural) RefreshList();
-        else { _grid.RefreshRows(); UpdateFooter(); }
+        else { _grid.RefreshRows(batch); UpdateFooter(); }
     }
 
     /// <summary>Tray notifications only for real transitions the user would want to know about.</summary>
@@ -166,23 +172,38 @@ public partial class Form1 : Form
 
     private void BuildTray()
     {
-        var menu = new ContextMenuStrip { ShowImageMargin = false };
-        menu.Items.Add("Open VESPER", null, (_, _) => ShowFromTray());
-        menu.Items.Add("Add download…", null, (_, _) => { ShowFromTray(); AddDownload(); });
+        var menu = new ContextMenuStrip();
+        void Add(string text, VesperIcon icon, EventHandler action)
+        {
+            var item = new ToolStripMenuItem(text, null, action) { Tag = icon };
+            menu.Items.Add(item);
+        }
+        Add("Open VESPER", VesperIcon.Quality, (_, _) => ShowFromTray());
+        Add("Add download…", VesperIcon.Plus, (_, _) => { ShowFromTray(); AddDownload(); });
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Pause all", null, (_, _) => _engine!.PauseAll());
-        menu.Items.Add("Resume all", null, (_, _) => _engine!.ResumeAll());
+        Add("Pause all", VesperIcon.Pause, (_, _) => _engine!.PauseAll());
+        Add("Resume all", VesperIcon.Play, (_, _) => _engine!.ResumeAll());
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Exit VESPER", null, (_, _) => ExitApplication());
-        VesperMenuTheme.Apply(menu, _colors);
+        Add("Exit VESPER", VesperIcon.Close, (_, _) => ExitApplication());
 
         _tray = new NotifyIcon { Icon = Icon, Text = "VESPER", Visible = true, ContextMenuStrip = menu };
+        ApplyTrayAppearance();
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowFromTray(); };
         _tray.BalloonTipClicked += (_, _) =>
         {
             if (_clipboardCandidate is { } link) { _clipboardCandidate = null; ShowFromTray(); AddDownload(link); }
             else ShowFromTray();
         };
+    }
+
+    private void ApplyTrayAppearance()
+    {
+        if (_tray?.ContextMenuStrip is not { } menu) return;
+        foreach (ToolStripMenuItem item in menu.Items.OfType<ToolStripMenuItem>())
+            if (item.Tag is VesperIcon icon)
+                item.Image = VesperMenuTheme.IconImage(icon, _colors, DeviceDpi);
+        VesperMenuTheme.Apply(menu, _colors, withIcons: true);
+        VesperMenuTheme.FormatItems(menu.Items, _colors, itemWidth: 180, dpi: DeviceDpi);
     }
 
     internal void RequestShow() => PostToUi(ShowFromTray);
@@ -202,15 +223,7 @@ public partial class Form1 : Form
         if (_engine is not null && !_exiting && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
-            if (_prefs.CloseToTray)
-            {
-                Hide();
-                if (!_trayHintShown)
-                {
-                    _trayHintShown = true;
-                    _tray?.ShowBalloonTip(3500, "VESPER is still running", "Downloads continue in the tray. Use the tray menu to exit.", ToolTipIcon.Info);
-                }
-            }
+            if (_prefs.CloseToTray) Hide();
             else ExitApplication();
             return;
         }
@@ -236,20 +249,26 @@ public partial class Form1 : Form
     {
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _bridge?.Dispose();
+        _tray?.ContextMenuStrip?.Dispose();
         _tray?.Dispose();
         EngineHost.HoldAwake(false);
         _engine?.Dispose();                       // stops transfers and makes their progress durable
-        _moth?.Dispose();
-        _branchLight?.Dispose();
-        _branchDark?.Dispose();
-        _rowMenu.Dispose();
-        _tooltips.Dispose();
         base.OnFormClosed(e);
     }
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
     {
         if (e.Mode == PowerModes.Resume) _engine?.WakeWaiting();   // connections made before sleep are dead
+    }
+
+    private void OnUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category is not (UserPreferenceCategory.Accessibility or UserPreferenceCategory.Color
+            or UserPreferenceCategory.General or UserPreferenceCategory.VisualStyle)) return;
+        PostToUi(() =>
+        {
+            if (UiKit.Palette(_prefs) != _colors) ApplyAppearance();
+        });
     }
 
     private void OnActivatedWindow()
@@ -338,7 +357,7 @@ public partial class Form1 : Form
         _remove.Click += (_, _) => _actions?.Remove(CheckedSnapshots());
         _clear.Click += (_, _) => _grid.ClearChecks();
 
-        _mast.Paint += (_, e) => PaintMast(e.Graphics);
+        _mast.Decoration = PaintMast;
         _mast.Resize += (_, _) => LayoutMast();
         _normalTools.Resize += (_, _) => LayoutToolbar();
         _selectedTools.Resize += (_, _) => LayoutSelectionToolbar();
@@ -352,10 +371,15 @@ public partial class Form1 : Form
             _search.Width = Math.Max(40, _searchFrame.ClientSize.Width - UiKit.Scale(this, 50));
             _search.Top = Math.Max(2, (_searchFrame.Height - _search.Height) / 2);
         };
-        _footer.Paint += (_, e) =>
+        _footer.Decoration = (graphics, _) =>
         {
-            using var pen = new Pen(_colors.Border);
-            e.Graphics.DrawLine(pen, 0, 0, _footer.Width, 0);
+            if (_botanicalArt is { } art)
+                art.PaintLandscape(graphics, _footer.ClientRectangle, _colors.IsDark);
+            else
+            {
+                using var pen = new Pen(_colors.Divider);
+                graphics.DrawLine(pen, 0, 0, _footer.Width, 0);
+            }
         };
 
         LayoutMast();
@@ -369,9 +393,14 @@ public partial class Form1 : Form
     private void LayoutMast()
     {
         int edge = UiKit.Scale(this, 20);
-        int y = UiKit.Scale(this, 21);
+        int y = Math.Max(0, (_mast.Height - _add.Height) / 2);
         _settings.SetBounds(_mast.ClientSize.Width - edge - _settings.Width, y, _settings.Width, _settings.Height);
         _add.Location = new Point(_settings.Left - UiKit.Scale(this, 12) - _add.Width, y);
+        _brandIcon.SetBounds(edge, UiKit.Scale(this, 10), UiKit.Scale(this, 62), UiKit.Scale(this, 55));
+        int brandX = _botanicalArt is null ? edge : _brandIcon.Right + UiKit.Scale(this, 9);
+        _brandText.Location = new Point(brandX, UiKit.Scale(this, 12));
+        _brandCaption.Location = new Point(brandX + UiKit.Scale(this, 1), UiKit.Scale(this, 49));
+        _mast.Invalidate(true);
     }
 
     private void LayoutToolbar()
@@ -381,24 +410,14 @@ public partial class Form1 : Form
         int top = UiKit.Scale(this, 12);
         int height = UiKit.Scale(this, 32);
         int gap = UiKit.Scale(this, 12);
-        int filterWidth = UiKit.Scale(this, width < UiKit.Scale(this, 940) ? 135 : 148);
-        int sortWidth = UiKit.Scale(this, width < UiKit.Scale(this, 940) ? 115 : 124);
-        bool showCaptions = width >= UiKit.Scale(this, 975);
-
-        _showLabel.Visible = _sortLabel.Visible = showCaptions;
+        int filterWidth = UiKit.Scale(this, 154);
+        int sortWidth = UiKit.Scale(this, 149);
         int sortX = width - margin - sortWidth;
         _sort.SetBounds(sortX, top, sortWidth, height);
-        _sortLabel.Location = new Point(sortX - UiKit.Scale(this, 8) - _sortLabel.Width,
-            top + (height - _sortLabel.Height) / 2);
-
-        int filterX = (showCaptions ? _sortLabel.Left : sortX) - gap - filterWidth;
+        int filterX = sortX - gap - filterWidth;
         _filter.SetBounds(filterX, top, filterWidth, height);
-        _showLabel.Location = new Point(filterX - UiKit.Scale(this, 8) - _showLabel.Width,
-            top + (height - _showLabel.Height) / 2);
-
-        int end = showCaptions ? _showLabel.Left : filterX;
-        int available = Math.Max(UiKit.Scale(this, 110), end - margin - UiKit.Scale(this, 18));
-        int preferredMax = UiKit.Scale(this, width < UiKit.Scale(this, 900) ? 350 : 413);
+        int available = Math.Max(UiKit.Scale(this, 110), filterX - margin - UiKit.Scale(this, 18));
+        int preferredMax = Math.Max(UiKit.Scale(this, 340), width / 2);
         _searchFrame.SetBounds(margin, top, Math.Min(available, preferredMax), height);
     }
 
@@ -425,61 +444,80 @@ public partial class Form1 : Form
             top, clearWidth, height);
     }
 
-    private void PaintMast(Graphics graphics)
+    private void PaintMast(Graphics graphics, Rectangle clip)
     {
-        graphics.Clear(_colors.Surface);
-        if (_prefs.Botanical && !SystemInformation.HighContrast)
+        if (_botanicalArt is { } art)
         {
-            Image? branch = UiKit.IsDark(_prefs) ? _branchDark : _branchLight;
-            if (branch is not null)
-            {
-                var destination = new Rectangle(Math.Max(245, _mast.Width - 405), -28, 265, 125);
-                using var attributes = new System.Drawing.Imaging.ImageAttributes();
-                var tint = new System.Drawing.Imaging.ColorMatrix { Matrix33 = UiKit.IsDark(_prefs) ? 0.42f : 0.48f };
-                attributes.SetColorMatrix(tint);
-                graphics.DrawImage(branch, destination, 0, 0, branch.Width, branch.Height, GraphicsUnit.Pixel, attributes);
-            }
+            int left = Math.Max(_brandText.Right, _brandCaption.Right) + UiKit.Scale(this, 16);
+            int right = _add.Left - UiKit.Scale(this, 20);
+            int width = Math.Clamp(right - left, 0, UiKit.Scale(this, 280));
+            int inset = UiKit.Scale(this, 3);
+            art.PaintHeader(graphics, _mast.ClientRectangle, clip,
+                new Rectangle(right - width, inset, width, Math.Max(0, _mast.Height - 2 * inset)), dialog: false);
+            return;
         }
-        using var border = new Pen(_colors.Border);
+        using var border = new Pen(_colors.Divider);
         graphics.DrawLine(border, 0, _mast.Height - 1, _mast.Width, _mast.Height - 1);
     }
 
     private void ApplyAppearance()
     {
         _colors = UiKit.Palette(_prefs);
-        VesperWindowChrome.Apply(this, UiKit.IsDark(_prefs));
+        if (_colors.Botanical) _botanicalArt ??= BotanicalArt.Acquire(_colors);
+        else
+        {
+            _grid.EmptyIllustration = _brandIcon.Image = null;
+            _botanicalArt?.Dispose();
+            _botanicalArt = null;
+        }
+        _grid.EmptyIllustration = _botanicalArt?.EmptyHero;
+        _brandIcon.Image = _botanicalArt?.Butterfly;
+        _brandIcon.Visible = _brandIcon.Image is not null;
+        VesperWindowChrome.Apply(this, _colors);
         BackColor = _colors.Back;
         ForeColor = _colors.Text;
         _mast.BackColor = _colors.Surface;
-        _toolbar.BackColor = _colors.Back;
-        _normalTools.BackColor = _colors.Back;
-        _selectedTools.BackColor = UiKit.IsDark(_prefs) ? Color.FromArgb(37, 63, 45) : Color.FromArgb(233, 241, 232);
-        _footer.BackColor = _colors.Secondary;
+        _toolbar.BackColor = _normalTools.BackColor = _colors.Botanical ? _colors.Surface : _colors.Back;
+        _selectedTools.BackColor = _colors.HighContrast ? _colors.Surface : _colors.Selection;
+        _footer.BackColor = _colors.Botanical ? _colors.Surface : _colors.Secondary;
+        _footer.Height = UiKit.Scale(this, _botanicalArt is null ? 30 : 48);
         _footerLabel.ForeColor = _colors.Muted;
         _brandText.ForeColor = _colors.Text;
         _brandCaption.ForeColor = _colors.Muted;
-        _brandIcon.BackColor = _colors.Surface;
         _selectedLabel.ForeColor = _colors.Text;
 
         foreach (var button in new[] { _add, _settings, _pause, _resume, _remove, _clear })
             button.ApplyPalette(_colors);
-        _searchFrame.BackColor = _colors.Surface;
+        _searchFrame.FillColor = _colors.Surface;
         _searchFrame.OutlineColor = _colors.Border;
-        _searchFrame.SearchIconColor = _colors.Muted;
+        _searchFrame.FocusColor = _colors.MutedGreen;
+        _searchFrame.SearchIconColor = VesperDrawing.Ink(VesperIcon.Search, _colors);
         _search.BackColor = _colors.Surface;
         _search.ForeColor = _colors.Text;
-        _showLabel.ForeColor = _sortLabel.ForeColor = _colors.Muted;
         _filter.ApplyPalette(_colors);
         _sort.ApplyPalette(_colors);
         _grid.ApplyAppearance(_colors, _prefs.Density);
         VesperMenuTheme.Apply(_rowMenu, _colors, withIcons: true);
         RefreshMenuStyle();
-        _mast.Invalidate();
+        ApplyTrayAppearance();
+        LayoutMast();
         _searchFrame.Invalidate();
-        _footer.Invalidate();
+        _footer.Invalidate(true);
     }
 
     // ---- list -----------------------------------------------------------------------------------------------------
+
+    internal event Action? PreviewAddRequested;
+    internal event Action? PreviewSettingsRequested;
+    internal void RefreshPreviewAppearance() => ApplyAppearance();
+
+    internal void LoadPreviewRows(IEnumerable<DownloadItem> rows)
+    {
+        if (_engine is not null) throw new InvalidOperationException("Sample data requires an offline window.");
+        _items.Clear();
+        foreach (var row in rows) _items.Add(row.Id, row);
+        RefreshList();
+    }
 
     private void RefreshList()
     {
@@ -561,7 +599,7 @@ public partial class Form1 : Form
 
     private void AddDownload(string? initialText = null)
     {
-        if (_engine is null) return;
+        if (_engine is null) { PreviewAddRequested?.Invoke(); return; }
         using var dialog = new AddDownloadForm(_prefs, initialText);
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
@@ -590,7 +628,7 @@ public partial class Form1 : Form
 
     private void OpenSettings()
     {
-        if (_engine is null) return;
+        if (_engine is null) { PreviewSettingsRequested?.Invoke(); return; }
         using var dialog = new SettingsForm(_prefs);
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
@@ -671,7 +709,7 @@ public partial class Form1 : Form
         Add("Copy source URL", VesperIcon.Clipboard, s => _actions?.CopyUrl(s));
         Add("Rename entry…", VesperIcon.Pencil, s => _actions?.Rename(s));
         _rowMenu.Items.Add(new ToolStripSeparator());
-        Add("Remove from list…", VesperIcon.Trash, s => _actions?.Remove([s]));
+        Add("Remove from list…", VesperIcon.RemoveList, s => _actions?.Remove([s]));
         Add("Delete downloaded file…", VesperIcon.Trash, s => _actions?.DeleteFile(s));
         BuildRateOptions();
         VesperMenuTheme.Apply(_rowMenu, _colors, withIcons: true);
@@ -777,6 +815,7 @@ public partial class Form1 : Form
         _grid.ApplyAppearance(_colors, _prefs.Density);
         VesperMenuTheme.Apply(_rowMenu, _colors, withIcons: true);
         RefreshMenuStyle();
+        ApplyTrayAppearance();
         LayoutMast();
         LayoutToolbar();
         LayoutSelectionToolbar();

@@ -20,7 +20,7 @@ public sealed class DiscoveryReliabilityTests
         using var resolver = new DefaultMediaResolver(handler: handler);
         var result = await resolver.ResolveAsync(new() { Url = new(Page) }, CancellationToken.None);
         Assert.Equal(MediaErrorCode.SourceChanged, result.Error!.Code);
-        Assert.Single(handler.Requests);
+        Assert.Equal(1, handler.Count(Page));                                  // the page itself is never fetched twice
     }
 
     [Fact]
@@ -35,7 +35,7 @@ public sealed class DiscoveryReliabilityTests
         Assert.Equal(MediaErrorCode.BrowserContextRequired, result.Error!.Code);
         Assert.Contains(updates, u => u.Title == "Metadata only");
         Assert.Contains("no playback", result.Error.Diagnostic);
-        Assert.Single(handler.Requests);
+        Assert.Equal(1, handler.Count(Page));
     }
 
     [Fact]
@@ -58,11 +58,14 @@ public sealed class DiscoveryReliabilityTests
     {
         const string manifest = "https://cdn.example.com/complete.m3u8";
         var handler = new FakeHttpHandler { Delay = TimeSpan.FromMilliseconds(25) };
-        handler.Add(Page, Player("""
+        const string player = """
             {"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"EK3tCffac5k","title":"Early metadata"},
              "streamingData":{"adaptiveFormats":[{"itag":140,"url":"https://cdn.example.com/audio.m4a","mimeType":"audio/mp4; codecs=\"mp4a.40.2\""}],
              "hlsManifestUrl":"https://cdn.example.com/complete.m3u8"}}
-            """)).Add(manifest, "#EXTM3U\n#EXTINF:2,\nsegment.ts\n#EXT-X-ENDLIST\n", "application/vnd.apple.mpegurl");
+            """;
+        // The InnerTube strategy answers first; its audio URL passes the byte probe while the manifest is fetched concurrently.
+        handler.Add(Page, Player(player)).Add("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", player, "application/json")
+            .AddMedia("https://cdn.example.com/audio.m4a", "audio/mp4").Add(manifest, "#EXTM3U\n#EXTINF:2,\nsegment.ts\n#EXT-X-ENDLIST\n", "application/vnd.apple.mpegurl");
         DiscoveryMeasurement? metrics = null;
         using var resolver = new DefaultMediaResolver(new ResolverOptions { Measurement = m => metrics = m }, handler);
         int requestsAtMetadata = -1;
@@ -75,7 +78,7 @@ public sealed class DiscoveryReliabilityTests
         Assert.Contains(result.Item.Representations, r => r.Content == StreamContent.AudioOnly);
         Assert.Equal(1, requestsAtMetadata);
         Assert.NotNull(metrics!.FirstMetadata);
-        Assert.Equal(2, metrics.NetworkRequests);
+        Assert.Equal(4, metrics.NetworkRequests);                           // page, player API, byte probe, manifest
     }
 
     [Fact]

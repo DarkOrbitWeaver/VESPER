@@ -50,6 +50,9 @@ public sealed record FormatPreferences
     /// <summary>False = only single-stream (already muxed) representations may be chosen.</summary>
     public bool AllowMuxing { get; init; } = true;
 
+    /// <summary>Pair video with audio only when VESPER's native remuxer can execute it (see <see cref="MergeCapability"/>).</summary>
+    public bool NativeMergeOnly { get; init; }
+
     public long? MaxFileSizeBytes { get; init; }
 
     public IReadOnlyList<string> SubtitleLanguages { get; init; } = [];

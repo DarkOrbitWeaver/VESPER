@@ -20,13 +20,20 @@ internal static class VesperWindowChrome
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr handle, int attribute, ref int value, int size);
 
-    public static void Apply(Form window, bool dark)
+    public static void Apply(Form window, VesperPalette palette)
     {
         if (!OperatingSystem.IsWindowsVersionAtLeast(10) || !window.IsHandleCreated) return;
         try
         {
-            int enabled = dark && !SystemInformation.HighContrast ? 1 : 0;
+            int enabled = palette.IsDark && !palette.HighContrast ? 1 : 0;
             DwmSetWindowAttribute(window.Handle, 20, ref enabled, sizeof(int));
+            if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+            {
+                int background = palette.Botanical ? ColorTranslator.ToWin32(palette.Back) : -1;
+                int text = palette.Botanical ? ColorTranslator.ToWin32(palette.Text) : -1;
+                DwmSetWindowAttribute(window.Handle, 35, ref background, sizeof(int)); // DWMWA_CAPTION_COLOR
+                DwmSetWindowAttribute(window.Handle, 36, ref text, sizeof(int)); // DWMWA_TEXT_COLOR
+            }
         }
         catch (DllNotFoundException) { }
         catch (EntryPointNotFoundException) { }

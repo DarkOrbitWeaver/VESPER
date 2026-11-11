@@ -23,3 +23,9 @@ Changes from `b0c5ac14877dc729280b5eb210123f23da6ae067` on `work/media-discovery
 large YouTube continuation/channel support, fragment-plan URL refresh, native subtitle downloading or untested site adapters.
 
 Verification and limitations: `MEDIA_ENGINE_REPORT.md`, `MEDIA_ENGINE_COMPATIBILITY.md`, `MEDIA_ENGINE_LIMITATIONS.md`, `reports/BENCHMARKS.md`.
+
+## 3.0 — 2026-11-11 (branch media-engine-3.0)
+- YouTube: layered InnerTube pipeline (visionOS client, watch-page session values, byte-probe verification, page fallback), byte identity, 2026 playlist markup + continuation, honest Mix/live diagnostics.
+- Native pure-C# remux (MP4/fMP4, WebM/Matroska readers; fast-start MP4 and WebM/MKV writers) with output re-validation; `JobKind.Merge` durable merge job; identity-gated `RefreshMergePlan`.
+- Capability-aware `MediaTransferBridge`; `MergeCapability`; `SecureHttpClient.PostJsonAsync`/`ProbeRangeAsync`.
+- Tests: engine 221 passed / 2 skipped, resolver 322 passed. Live runner `tools/Vesper.LiveCheck`; evidence in `reports/live/2026-11-11/`.

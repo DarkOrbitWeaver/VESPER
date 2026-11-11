@@ -54,20 +54,24 @@ internal sealed class SettingsForm : VesperPopupForm
         BackColor = _colors.Surface;
         ForeColor = _colors.Text;
 
-        _sidebar = new Panel { Dock = DockStyle.Left, Width = 166, BackColor = _colors.Secondary };
+        _sidebar = new Panel { Dock = DockStyle.Left, Width = 166, BackColor = _colors.Botanical ? _colors.Back : _colors.Secondary };
         _sidebar.Paint += (_, e) =>
         {
-            using var pen = new Pen(_colors.Border);
+            using var pen = new Pen(_colors.Divider);
             e.Graphics.DrawLine(pen, _sidebar.Width - 1, 0, _sidebar.Width - 1, _sidebar.Height);
         };
         var title = Label("Settings", 17, bold: true);
         title.SetBounds(20, 25, 138, 38);
         _sidebar.Controls.Add(title);
-        string[] tabs = ["Downloads", "Transfers", "Network", "Appearance", "Browser"];
+        (string Title, VesperIcon Icon)[] tabs =
+        [
+            ("Downloads", VesperIcon.Download), ("Transfers", VesperIcon.Gauge), ("Network", VesperIcon.Provider),
+            ("Appearance", VesperIcon.Leaf), ("Browser", VesperIcon.Link)
+        ];
         for (int i = 0; i < tabs.Length; i++)
         {
-            string tab = tabs[i];
-            var nav = Button(tab, 146);
+            var (tab, icon) = tabs[i];
+            var nav = Button(tab, 146, symbol: icon);
             nav.Name = "navigation" + tab;
             nav.NavigationItem = true;
             nav.TextAlign = ContentAlignment.MiddleLeft;
@@ -80,7 +84,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 59, BackColor = _colors.Surface };
         footer.Paint += (_, e) =>
         {
-            using var pen = new Pen(_colors.Border);
+            using var pen = new Pen(_colors.Divider);
             e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
         };
         var cancel = Button("Cancel", 87);
@@ -90,8 +94,9 @@ internal sealed class SettingsForm : VesperPopupForm
         footer.Controls.AddRange([cancel, save]);
         void LayoutFooter()
         {
-            save.SetBounds(footer.Width - 21 - 125, 13, 125, 34);
-            cancel.SetBounds(save.Left - 8 - 87, 13, 87, 34);
+            int S(int px) => IsHandleCreated ? UiKit.Scale(this, px) : px;
+            save.SetBounds(footer.Width - S(21 + 125), S(13), S(125), S(34));
+            cancel.SetBounds(save.Left - S(8 + 87), S(13), S(87), S(34));
         }
         footer.Resize += (_, _) => LayoutFooter();
         Controls.Add(_content);
@@ -116,8 +121,8 @@ internal sealed class SettingsForm : VesperPopupForm
         return new Label
         {
             Text = text, AutoSize = false,
-            Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
-            BackColor = Color.Transparent,
+            Font = bold && size >= 16 ? UiKit.Heading(_colors, size)
+                : new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
             ForeColor = muted ? _colors.Muted : _colors.Text,
             TextAlign = ContentAlignment.MiddleLeft
         };
@@ -160,7 +165,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private Panel Divider(int y) => new()
     {
-        BackColor = _colors.Border, Height = 1, Location = new Point(25, y), Width = 505,
+        BackColor = _colors.Divider, Height = 1, Location = new Point(25, y), Width = 505,
         Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
     };
 
@@ -529,18 +534,18 @@ internal sealed class SettingsForm : VesperPopupForm
 
         var density = Label("Download row height", 9, bold: true);
         density.SetBounds(25, 201, 250, 23);
-        var densityNote = Label("Compact is the default. Extra compact shows one line.", 8, muted: true);
+        var densityNote = Label("Gallery shows media thumbnails. Compact is the default.", 8, muted: true);
         densityNote.SetBounds(25, 226, 260, 35);
-        var densityChoice = Choice(["Compact · 46 px (default)", "Extra compact · 34 px", "Comfortable · 58 px"],
-            _draft.Density switch { Density.ExtraCompact => 1, Density.Comfortable => 2, _ => 0 }, 204);
+        var densityChoice = Choice(["Compact · 46 px (default)", "Extra compact · 34 px", "Comfortable · 58 px", "Gallery · 84 px"],
+            _draft.Density switch { Density.ExtraCompact => 1, Density.Comfortable => 2, Density.Gallery => 3, _ => 0 }, 204);
         densityChoice.SetBounds(326, 207, 204, 33);
         densityChoice.SelectedIndexChanged += (_, _) => _draft.Density = densityChoice.SelectedIndex switch
-        { 1 => Density.ExtraCompact, 2 => Density.Comfortable, _ => Density.Compact };
+        { 1 => Density.ExtraCompact, 2 => Density.Comfortable, 3 => Density.Gallery, _ => Density.Compact };
         var separator2 = Divider(279);
 
-        var botanical = Check("Extra theming", 25, 303, _draft.Botanical,
+        var botanical = Check("Botanical theme", 25, 303, _draft.Botanical,
             value => _draft.Botanical = value);
-        var botanicalNote = Label("Shows the leafy illustration in VESPER's header. The download list stays simple.", 8, muted: true);
+        var botanicalNote = Label("Illustrated headers, watercolor scenery, and a warm palette.", 8, muted: true);
         botanicalNote.SetBounds(45, 331, 470, 34);
         page.Controls.AddRange([theme, themeNote, themeChoice, separator1, density, densityNote,
             densityChoice, separator2, botanical, botanicalNote]);

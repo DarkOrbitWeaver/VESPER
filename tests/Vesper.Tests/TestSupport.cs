@@ -45,6 +45,8 @@ internal sealed class FaultServer : IAsyncDisposable
     public string BaseUrl { get; private set; } = "";
     public int Hits(string path) => _hits.GetValueOrDefault(path);
     public ConcurrentQueue<string> RangeHeaders { get; } = new();
+    /// <summary>Additional range-capable payloads by path (merge-job tests register synthetic media here).</summary>
+    public ConcurrentDictionary<string, byte[]> Extra { get; } = new();
 
     public FaultServer(int size = 2 * 1024 * 1024)
     {
@@ -72,6 +74,7 @@ internal sealed class FaultServer : IAsyncDisposable
         if (ctx.Request.Headers.TryGetValue("Range", out var range)) RangeHeaders.Enqueue(path + " " + range);
         HttpResponse res = ctx.Response;
         if (path.StartsWith("/hls/")) { await HandleHls(ctx, path); return; }
+        if (Extra.TryGetValue(path, out byte[]? extra)) { await Serve(ctx, extra, "\"x\"", Modified); return; }
 
         switch (path)
         {

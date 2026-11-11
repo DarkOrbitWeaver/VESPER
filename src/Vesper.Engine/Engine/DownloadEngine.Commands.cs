@@ -69,6 +69,9 @@ public sealed partial class DownloadEngine
         if (request.Kind == JobKind.Dash && (!DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out string planError)
             || request.Secrets is { Count: > 0 }))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan without persisted credentials is required.");
+        if (request.Kind == JobKind.Merge && (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out _)
+            || request.Secrets is { Count: > 0 } || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid media merge plan without credentials or file checksums is required.");
 
         string? expected = null;
         if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) && !TryNormalizeSha256(request.ExpectedSha256, out expected))
@@ -100,7 +103,7 @@ public sealed partial class DownloadEngine
             string normalized = UrlPolicy.Normalize(uri);
             DownloadJob? existing = _jobs.Values.FirstOrDefault(j => j.State is not (JobState.Completed or JobState.Cancelled)
                 && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
-                && (request.Kind != JobKind.Dash || j.MediaPlanJson == request.MediaPlanJson));
+                && (request.Kind is not (JobKind.Dash or JobKind.Merge) || j.MediaPlanJson == request.MediaPlanJson));
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
@@ -121,7 +124,7 @@ public sealed partial class DownloadEngine
                 MediaQuality = request.MediaQuality is { Length: <= 180 } ? request.MediaQuality : null,
                 MediaThumbnailUrl = request.MediaThumbnailUrl is { Length: <= 4096 } ? request.MediaThumbnailUrl : null,
                 MediaExpiresAt = request.MediaExpiresAt,
-                MediaPlanJson = request.Kind == JobKind.Dash ? request.MediaPlanJson : null,
+                MediaPlanJson = request.Kind is JobKind.Dash or JobKind.Merge ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.
@@ -329,6 +332,7 @@ public sealed partial class DownloadEngine
             try
             {
                 if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
+                if (!MergeTransfer.DeleteSidecars(job)) throw new IOException("A merge track file could not be deleted.");
                 RecoveryManifest.Delete(job.PartialPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

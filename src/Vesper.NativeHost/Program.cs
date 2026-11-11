@@ -50,18 +50,11 @@ internal static class Program
     {
         string pipe = BridgePipe.NameForCurrentUser();
 
-        if (request.Type == "hello")
-        {
-            bool running = await TryRequestAsync(pipe, rawJson, ct) is not null;
-            return Serialize(BridgeResponse.Success(request.Id, running ? "VESPER is running." : "VESPER is not running.",
-                data: new { hostVersion = "1.0.0", appRunning = running }));
-        }
-
         string? answer = await TryRequestAsync(pipe, rawJson, ct);
         if (answer is not null) return answer;
 
-        // The desktop app is not listening. A user-initiated submit or probe may start it; nothing else may.
-        if (!TryStartApp()) return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "VESPER is not running and could not be started. Open VESPER and try again."));
+        // A browser download or format request can wake the desktop.
+        if (!TryStartApp()) return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
 
         DateTime deadline = DateTime.UtcNow + LaunchWait;
         while (DateTime.UtcNow < deadline)
@@ -80,17 +73,45 @@ internal static class Program
         catch (IOException) { return null; }
     }
 
-    /// <summary>Starts VESPER from the fixed path next to this host. No user- or browser-supplied value reaches the command line.</summary>
     private static bool TryStartApp()
     {
-        string path = Path.Combine(AppContext.BaseDirectory, AppFileName);
-        if (!File.Exists(path)) return false;
+        string? path = FindApp();
+        if (path is null) return false;
         try
         {
-            Process.Start(new ProcessStartInfo(path, "--background") { UseShellExecute = false })?.Dispose();
-            return true;
+            using Process? process = Process.Start(new ProcessStartInfo(path, "--background")
+            {
+                UseShellExecute = false,
+                WorkingDirectory = Path.GetDirectoryName(path)!
+            });
+            return process is not null;
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException) { return false; }
+    }
+
+    private static string? FindApp()
+    {
+        string installed = Path.Combine(AppContext.BaseDirectory, AppFileName);
+        if (File.Exists(installed)) return installed;
+
+        // The F5 helper lives under src/Vesper.NativeHost/bin/{Debug,Release}.
+        // Resolve only the matching desktop build in that same checkout.
+        var framework = new DirectoryInfo(AppContext.BaseDirectory);
+        if (framework.Name == "win-x64" && framework.Parent is { } parent) framework = parent;
+        var config = framework.Parent;
+        var bin = config?.Parent;
+        var project = bin?.Parent;
+        var source = project?.Parent;
+        var root = source?.Parent;
+        if (framework.Name != "net10.0" || config?.Name is not ("Debug" or "Release") || bin?.Name != "bin"
+            || project?.Name != "Vesper.NativeHost" || source?.Name != "src" || root is null
+            || !File.Exists(Path.Combine(root.FullName, "VESPER.csproj")))
+            return null;
+        string output = Path.Combine(root.FullName, "bin", config.Name, "net10.0-windows");
+        string app = Path.Combine(output, AppFileName);
+        if (File.Exists(app)) return app;
+        app = Path.Combine(output, "win-x64", AppFileName);
+        return File.Exists(app) ? app : null;
     }
 
     private static string Serialize(BridgeResponse response) => JsonSerializer.Serialize(response, BridgeProtocol.Json);

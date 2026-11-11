@@ -1,54 +1,28 @@
-# Remaining limitations and security notes
+# Media engine limitations (3.0, 2026-11-11)
 
-This is a tested, incremental update to the specified VESPER baseline, **not completion of yt-dlp parity**.
+## YouTube
+- **No player-JavaScript execution.** Formats needing signature deciphering or the `n` throttling transform are omitted and counted in notes. Consequence: "made for kids" videos (not served to the visionOS client) and any future case where JS-less clients stop working will fail with a precise `BrowserContextRequired` diagnostic. Smallest practical fix (needs approval, not added): an optional pure-managed JS evaluator such as Jint (BSD-2, ~1 MB) behind the existing client-profile seam.
+- **No proof-of-origin tokens** are generated or imitated. iOS/Android clients' URLs are cut off after ~1 MiB without them; the byte probe detects this and they are never offered.
+- **Bot gates** ("Sign in to confirm you're not a bot") from flagged networks (datacenter IPs) are reported, not bypassed. The visionOS strategy worked from this sandbox only with watch-page visitor data.
+- **Live streams** are detected and refused (completed recordings work). **Mix/radio** enumeration needs the InnerTube `next` endpoint (not implemented); the current video still resolves.
+- **DRC audio variants** are collapsed with their regular twin by the shared deduplicator when metadata is identical.
+- **Subtitles/automatic captions** are listed (VTT URLs) but caption *download* was not live-validated; some caption URLs may require tokens. Subtitles are not muxed into outputs.
+- **8K** availability is parsed generically but no 8K item was live-tested. HDR formats are detected; an HDR download was not independently validated.
+- Server-ABR-only and OTF (segmented) formats are unsupported and reported.
 
-## Deliberately unavailable media operations
+## Merging / containers
+- Remux only. Supported outputs: MP4 (H.264/HEVC/AV1 + AAC/MP3), WebM (VP8/VP9/AV1 + Opus/Vorbis), MKV (any of these). Anything else is refused before download (`MergeCapability`) and re-checked after download (no publication on mismatch).
+- Merge jobs take plain HTTP tracks of exactly known size. Separate HLS/DASH segment-list tracks are not merged yet (single-representation HLS/DASH downloads keep working as before).
+- One video track + up to three audio tracks per plan; the bridge currently selects one audio track.
+- Matroska output timestamps use 1 ms precision; MP4→MKV drops MP4 edit lists for timing shifts other than the initial offset (AAC priming ≈ 20 ms not compensated in MKV).
+- HDR colour metadata is preserved verbatim for MP4→MP4 and WebM→WebM/MKV; MP4→MKV relies on in-bitstream colour information.
+- Temporary disk need ≈ 2× output size during merge (tracks + merged file until publication).
+- The `.tracks` sidecar can leak if the process dies after publication but before sidecar deletion (harmless; not yet garbage-collected).
 
-- **No general audio/video muxer was implemented.** Source-muxed fMP4 is validated and retained; two independent streams are not joined.
-  Correct muxing requires reconciled movie/track IDs and defaults, sample-description indices, moof/trun offsets, timeline/timescale and edit-list handling,
-  and correct audio/video presentation. Concatenating independently initialized files is not a safe substitute. No FFmpeg is bundled or invoked by VESPER.
-- Clear fMP4 subset only: one audio track, one video track, or a source-provided pair; moof-relative offsets, explicit trun offsets and contiguous tfdt timelines.
-  Absolute offsets, edit lists in fragmented initialization, track changes, unsupported sample entries and encrypted fragments stop with an explanation.
-- DASH is single-period VOD. Multi-period, WebM fragment assembly and unsupported initialization/container layouts remain unavailable.
-  SegmentBase index expansion is not added. Unsupported source representations may be discovered by the library but are not selectable in the native handoff.
-- HLS supports completed VOD TS/fMP4, relative URLs, initialization maps, exact byte ranges and identity AES-128 CBC.
-  Discontinuities, gaps, I-frame-only media, session keys, raw packed AAC renditions, changed maps and required remux operations are refused.
-  MPEG-TS support is single-program, clear, recognized audio/video streams with CRC-checked PAT/PMT and PES structure. It is not a full codec decoder.
-- HTTP MP4/WebM checks confirm bounded container layout and declared audio presence, not that every compressed sample decodes.
-  Existing byte coverage, content/range checks and trusted hash verification remain authoritative for ordinary HTTP transfers.
+## Platforms
+- No adapters: SoundCloud, Twitch, X/Twitter, Instagram, Facebook. Existing adapters for TikTok, Reddit, Dailymotion, Bilibili were not live-tested in this pass. Vimeo's live test reported DRM (uninvestigated).
+- The built-in validator parses MP4/WebM/MKV only; AVI/MP3/TS outputs are validated only by the existing per-protocol checks (and independently with ffprobe in live runs).
 
-## Access and websites
-
-- Live YouTube resolution did not succeed in this environment. The player/signature/n/SABR/access-context limitations are real; metadata/artwork is not proof of playback access.
-  The code does not impersonate privileged clients, manufacture verification tokens, bypass account restrictions or execute downloaded player scripts.
-- The extension can provide validated observed candidates. Desktop transfer still refuses credentials, Origin and Accept-Language contexts that the current handoff cannot safely reproduce.
-  Cookie-dependent TikTok and other signed-in workflows are therefore not advertised as completed support.
-- Existing YouTube collection handling remains first-page/snapshot only; no channel crawler or continuation implementation was added.
-  The native selected-item batch is bounded to 200 and resolves up to four selected entries concurrently. No automatic whole-playlist download is introduced.
-- See the compatibility matrix for every verified operation and the sites that remain untested/unsupported.
-
-## Recovery and data
-
-- HTTP source refresh is **explicit and on demand**, from the existing Rescue dialog. Provider, media ID and format ID must match, and existing Rescue byte-identity checks still decide whether append is safe.
-  An identity match without byte proof never authorizes mixing partial files. Older jobs without format identity must use ordinary trusted-identity Rescue.
-- HLS resume requires unchanged resolved manifest identity plus the committed prefix SHA-256. DASH uses a versioned immutable plan fingerprint and committed prefix SHA-256.
-  A prefix is re-read on resume; this is intentional integrity I/O, not spot-check proof. Hashes protect local state consistency; they are not an external content-authenticity guarantee.
-- Signed **fragment-plan re-resolution is not implemented**. Expired fragment URLs stop and preserve data. Changed plans, legacy cursors without identity, mismatched media and incompatible timelines require a separate restart/copy.
-- SQLite migration 3 appends nullable plan/format columns; existing rows/settings/history stay intact. Migration backups and release artifacts are no-overwrite.
-  Downgrading to an older engine is not supported on a newer schema; restore an appropriate backup rather than editing the schema number.
-- On Windows, source URLs, previous URLs, referrer, original page, thumbnail URL, plans and cursors are DPAPI-protected for the current Windows user.
-  Legacy plaintext remains readable, and old backups may still contain it. This is not retroactive secure deletion of old database pages/backups.
-  A DPAPI database copied to another Windows account/machine may not decrypt; restore using the original account/key backup. Decryption failure does not trigger database quarantine/replacement.
-- Headless **non-Windows developer tooling has no DPAPI and stores plaintext**. Do not use it with sensitive signed-in sources.
-  Cookies, authorization headers and AES key material are not added to persisted media plans. AES keys are bounded in memory and cleared after use.
-
-## Performance and validation boundaries
-
-- HLS still buffers one bounded segment (64 MiB maximum; CBC decryption can require an additional buffer). DASH buffers one bounded object; initialization is capped at 8 MiB.
-  Streaming decryption, pipelined parallel fragment fetch and universal low-allocation processing are not claimed.
-- Short cache lifetime, connection reuse, bounded HTTP body concurrency and four-way selected-batch discovery are implemented. General cross-caller in-flight HTTP deduplication is not added.
-- Browser candidates and ordinary metadata have different cache/security contexts. Successful metadata caching has a signed-URL expiry margin and excludes credential-bearing nested results.
-- Full Windows UI execution, live extension/native messaging registration and Windows DPAPI integration could not run on Linux. Two DPAPI tests are explicitly skipped here and run automatically on Windows.
-- PowerShell release/packaging scripts and the added Windows CI workflow were not executed in this Linux sandbox. `Package-Source.ps1` uses PowerShell 7/.NET APIs.
-- No comparable current yt-dlp executable benchmark was run. There is no basis for claiming VESPER is faster than yt-dlp.
-- Peak working-set measurements are process-lifetime peaks, not isolated per-resolve memory peaks. Thumbnail timings measure bytes available, not WinForms pixels rendered.
+## Verification gaps
+- **Windows not verified**: only a Linux cross-compile of the WinForms project; the 2 DPAPI tests are skipped on Linux. No packaged build was produced.
+- Performance numbers come from one sandbox network with 1–3 runs per case; memory comparisons use peak RSS of the largest process.

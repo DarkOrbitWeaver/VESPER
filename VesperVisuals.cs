@@ -4,10 +4,44 @@ using System.Drawing.Drawing2D;
 namespace VESPER;
 
 // All icons are drawn at the requested size. Font glyphs were not reliable at Windows text scaling.
-public enum VesperIcon { None, Plus, Gear, Search, More, Audio, Video, Disc, Archive, Book, File, Check, Warning, Info, Link, Pause, Folder, Download, Queue, Clipboard, Close, ChevronDown, Play, Pencil, Trash, Gauge, Refresh, Clock }
+public enum VesperIcon
+{
+    None, Plus, Gear, Search, More, Audio, Video, Disc, Archive, Book, File, Check, Warning, Info, Link, Pause,
+    Folder, Download, Queue, Clipboard, Close, ChevronDown, Play, Pencil, Trash, Gauge, Refresh, Clock, RemoveList,
+    Storage, Quality, Provider, Crown, Leaf, Layers, Sort, Document, Activity, Shield
+}
 
 internal static class VesperDrawing
 {
+    internal const TextFormatFlags PaintTextFlags = TextFormatFlags.PreserveGraphicsClipping |
+        TextFormatFlags.PreserveGraphicsTranslateTransform;
+
+    internal static void FocusOutline(Graphics graphics, Rectangle bounds, Color ink)
+    {
+        if (bounds.Width < 2 || bounds.Height < 2) return;
+        using var pen = new Pen(ink) { DashStyle = DashStyle.Dot };
+        graphics.DrawRectangle(pen, bounds);
+    }
+
+    internal static Color Mix(Color from, Color to, float amount) => Color.FromArgb(
+        (int)Math.Round(from.R + (to.R - from.R) * amount),
+        (int)Math.Round(from.G + (to.G - from.G) * amount),
+        (int)Math.Round(from.B + (to.B - from.B) * amount));
+
+    internal static Color Ink(VesperIcon icon, VesperPalette palette)
+    {
+        if (palette.HighContrast) return palette.Text;
+        return icon switch
+        {
+            VesperIcon.Trash or VesperIcon.Warning => palette.Red,
+            VesperIcon.Crown or VesperIcon.Archive or VesperIcon.Pause or VesperIcon.Clock or VesperIcon.Folder => palette.Amber,
+            VesperIcon.Link or VesperIcon.Quality or VesperIcon.Provider or VesperIcon.Document or VesperIcon.Info => palette.Link,
+            VesperIcon.Audio => palette.IsDark ? Color.FromArgb(200, 175, 222) : Color.FromArgb(117, 77, 141),
+            VesperIcon.None or VesperIcon.Close or VesperIcon.File or VesperIcon.More => palette.Muted,
+            _ => palette.MutedGreen
+        };
+    }
+
     public static GraphicsPath Rounded(Rectangle r, int radius)
     {
         var p = new GraphicsPath();
@@ -116,6 +150,47 @@ internal static class VesperDrawing
                     g.DrawLine(pen, 4, 7, 20, 7); g.DrawLine(pen, 9, 4, 15, 4);
                     g.DrawLines(pen, [new PointF(6, 8), new PointF(8, 21), new PointF(16, 21), new PointF(18, 8)]);
                     g.DrawLine(pen, 10, 11, 10, 18); g.DrawLine(pen, 14, 11, 14, 18); break;
+                case VesperIcon.RemoveList:
+                    g.DrawLine(pen, 4, 6, 17, 6); g.DrawLine(pen, 4, 12, 14, 12); g.DrawLine(pen, 4, 18, 12, 18);
+                    g.DrawLine(pen, 16, 17, 22, 17); break;
+                case VesperIcon.Storage:
+                    g.DrawEllipse(pen, 4, 3, 16, 6); g.DrawLine(pen, 4, 6, 4, 18); g.DrawLine(pen, 20, 6, 20, 18);
+                    g.DrawArc(pen, 4, 9, 16, 6, 0, 180); g.DrawArc(pen, 4, 15, 16, 6, 0, 180); break;
+                case VesperIcon.Quality:
+                    g.DrawRectangle(pen, 3, 4, 18, 13); g.DrawLine(pen, 8, 21, 16, 21); g.DrawLine(pen, 12, 17, 12, 21); break;
+                case VesperIcon.Provider:
+                    g.DrawEllipse(pen, 3, 3, 18, 18); g.DrawEllipse(pen, 8, 3, 8, 18); g.DrawLine(pen, 4, 12, 20, 12); break;
+                case VesperIcon.Crown:
+                    g.DrawPolygon(pen, [new Point(3, 8), new Point(8, 12), new Point(12, 5), new Point(16, 12),
+                        new Point(21, 8), new Point(18, 18), new Point(6, 18)]);
+                    g.DrawLine(pen, 6, 21, 18, 21); break;
+                case VesperIcon.Leaf:
+                    using (var leaf = new GraphicsPath())
+                    {
+                        leaf.AddBezier(5, 18, 0, 8, 10, 4, 21, 3);
+                        leaf.AddBezier(21, 3, 20, 15, 13, 22, 5, 18);
+                        g.DrawPath(pen, leaf);
+                    }
+                    g.DrawLine(pen, 3, 21, 14, 10); break;
+                case VesperIcon.Layers:
+                    g.DrawPolygon(pen, [new Point(2, 8), new Point(12, 3), new Point(22, 8), new Point(12, 13)]);
+                    g.DrawLines(pen, [new Point(2, 12), new Point(12, 17), new Point(22, 12)]);
+                    g.DrawLines(pen, [new Point(2, 16), new Point(12, 21), new Point(22, 16)]); break;
+                case VesperIcon.Sort:
+                    g.DrawLine(pen, 7, 20, 7, 4); g.DrawLines(pen, [new Point(3, 8), new Point(7, 4), new Point(11, 8)]);
+                    g.DrawLine(pen, 17, 4, 17, 20); g.DrawLines(pen, [new Point(13, 16), new Point(17, 20), new Point(21, 16)]); break;
+                case VesperIcon.Document:
+                    g.DrawLines(pen, [new Point(5, 3), new Point(14, 3), new Point(19, 8), new Point(19, 21),
+                        new Point(5, 21), new Point(5, 3)]);
+                    g.DrawLines(pen, [new Point(14, 3), new Point(14, 8), new Point(19, 8)]);
+                    g.DrawLine(pen, 9, 12, 15, 12); g.DrawLine(pen, 9, 16, 15, 16); break;
+                case VesperIcon.Activity:
+                    g.DrawLines(pen, [new Point(2, 12), new Point(7, 12), new Point(10, 5), new Point(14, 20),
+                        new Point(17, 12), new Point(22, 12)]); break;
+                case VesperIcon.Shield:
+                    g.DrawLines(pen, [new Point(12, 3), new Point(20, 6), new Point(19, 15), new Point(12, 21),
+                        new Point(5, 15), new Point(4, 6), new Point(12, 3)]);
+                    g.DrawLines(pen, [new Point(8, 12), new Point(11, 15), new Point(16, 9)]); break;
                 case VesperIcon.Gauge:
                     g.DrawArc(pen, 3, 4, 18, 18, 195, 150);
                     g.DrawLine(pen, 12, 15, 18, 9); g.FillEllipse(brush, 10, 13, 4, 4); break;
@@ -132,7 +207,7 @@ internal static class VesperDrawing
     }
 }
 
-// Native button with only the five-pixel rounding and line icons used in the HTML reference.
+// Keep native button input and accessibility. The face is painted on the actual parent surface.
 public sealed class VesperButton : Button
 {
     private bool _hovered;
@@ -140,6 +215,7 @@ public sealed class VesperButton : Button
     private VesperPalette _palette = VesperPalette.Light;
 
     [DefaultValue(false)] public bool Primary { get; set; }
+    [DefaultValue(false)] internal bool PreviewPressed { get; set; }
     [DefaultValue(false)] public bool NavigationActive { get; set; }
     [DefaultValue(false)] public bool NavigationItem { get; set; }
     [DefaultValue(false)] public bool Quiet { get; set; }
@@ -147,11 +223,12 @@ public sealed class VesperButton : Button
     [DefaultValue(VesperIcon.None)] public VesperIcon Symbol { get; set; }
     public VesperButton()
     {
-        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
         Cursor = Cursors.Hand;
         UseVisualStyleBackColor = false;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+            ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         Font = new Font("Segoe UI", 9F);
         Height = 33;
     }
@@ -161,85 +238,119 @@ public sealed class VesperButton : Button
     protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) _pressed = true; Invalidate(); base.OnMouseDown(e); }
     protected override void OnMouseUp(MouseEventArgs e) { _pressed = false; Invalidate(); base.OnMouseUp(e); }
     protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { _pressed = false; base.OnLostFocus(e); Invalidate(); }
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Space) { _pressed = true; Invalidate(); }
+        base.OnKeyDown(e);
+    }
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Space) { _pressed = false; Invalidate(); }
+        base.OnKeyUp(e);
+    }
     protected override void OnPaint(PaintEventArgs e)
     {
+        VesperPanel.PaintBackdrop(this, e);
         var g = e.Graphics;
-        g.Clear(Parent?.BackColor ?? _palette.Surface);
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        bool dark = _palette.Surface.R < 100;
-        Color fill;
-        Color edge;
-        Color ink;
+        bool pressed = (_pressed || PreviewPressed) && Enabled;
+        bool active = (_hovered || pressed) && Enabled;
+        bool material = _palette.Botanical;
+        Color fill = _palette.Surface;
+        Color edge = _palette.Border;
+        Color ink = Enabled ? _palette.Text : _palette.Muted;
         if (Quiet)
         {
-            fill = _hovered && Enabled ? _palette.Secondary : (Parent?.BackColor ?? _palette.Surface);
-            edge = fill;
-            ink = Enabled ? _palette.Muted : _palette.Muted;
+            fill = active ? _palette.Secondary : Color.Transparent;
+            edge = Color.Transparent;
+            if (Enabled) ink = Symbol == VesperIcon.Link ? _palette.Link : _palette.HighContrast ? _palette.Text : _palette.Muted;
         }
         else if (NavigationItem)
         {
-            fill = NavigationActive ? _palette.Surface : _palette.Secondary;
-            if (_hovered && Enabled && !NavigationActive) fill = _palette.Back;
-            edge = NavigationActive ? _palette.Border : fill;
-            ink = NavigationActive ? _palette.Green : _palette.Text;
+            fill = NavigationActive ? _palette.Selection : active ? _palette.Back : Color.Transparent;
+            edge = NavigationActive ? _palette.Border : Color.Transparent;
+            if (NavigationActive && _palette.HighContrast) ink = SystemColors.HighlightText;
         }
         else if (Primary)
         {
-            fill = Enabled ? (_hovered ? _palette.GreenHover : _palette.Green)
-                : (dark ? Color.FromArgb(54, 74, 60) : Color.FromArgb(222, 231, 219));
-            edge = fill;
-            ink = Enabled ? Color.White : (dark ? Color.FromArgb(190, 207, 189) : Color.FromArgb(95, 117, 98));
+            fill = Enabled ? (active ? _palette.GreenHover : _palette.Green) : _palette.Secondary;
+            edge = Enabled && !_palette.HighContrast ? Color.Transparent : _palette.Border;
+            ink = Enabled ? _palette.ActionInk : _palette.Muted;
         }
         else
         {
-            fill = _hovered && Enabled ? _palette.Secondary : _palette.Surface;
-            edge = _palette.Border;
-            ink = Enabled ? _palette.Text : _palette.Muted;
+            fill = active ? _palette.Secondary : _palette.Surface;
         }
-        if (_pressed && Enabled) fill = Primary ? _palette.GreenHover : _palette.Secondary;
-
-        using (var shape = VesperDrawing.Rounded(new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3)), 5))
+        var face = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
+        if (fill.A > 0)
         {
-            using var brush = new SolidBrush(fill);
-            g.FillPath(brush, shape);
-            if (!Quiet && !Primary && (edge != fill || NavigationActive))
+            int radius = UiKit.Scale(this, 5);
+            using var shape = VesperDrawing.Rounded(face, radius);
+            if (Primary && material && Enabled && !pressed)
             {
-                using var pen = new Pen(edge, 1f);
+                using var brush = new LinearGradientBrush(face, VesperDrawing.Mix(fill, Color.White, 0.075f),
+                    fill, LinearGradientMode.Vertical);
+                g.FillPath(brush, shape);
+            }
+            else
+            {
+                using var brush = new SolidBrush(fill);
+                g.FillPath(brush, shape);
+            }
+            if (edge.A > 0)
+            {
+                using var pen = new Pen(edge);
                 g.DrawPath(pen, shape);
+            }
+            if (Enabled && !pressed && !Quiet && !NavigationItem && !_palette.HighContrast && (!Primary || material))
+            {
+                int x = face.Left + radius + 1;
+                int y = face.Top + UiKit.Scale(this, 2);
+                int alpha = Primary ? 45 : _palette.IsDark ? 25 : 100;
+                if (face.Right - radius > x)
+                {
+                    using var highlight = new Pen(Color.FromArgb(alpha, Color.White));
+                    g.DrawLine(highlight, x, y, face.Right - radius, y);
+                }
             }
         }
         if (NavigationItem && NavigationActive)
         {
-            using var accent = new SolidBrush(_palette.Green);
+            using var accent = new SolidBrush(_palette.HighContrast ? SystemColors.HighlightText : _palette.MutedGreen);
             g.FillRectangle(accent, 2, 8, 3, Math.Max(1, Height - 16));
         }
 
-        int iconSize = Math.Min(19, Height - 12);
+        Color iconInk = Enabled && !Primary && !_palette.HighContrast ? VesperDrawing.Ink(Symbol, _palette) : ink;
+        int iconSize = Math.Min(UiKit.Scale(this, 18), Height - UiKit.Scale(this, 10));
         if (string.IsNullOrEmpty(Text) && Symbol != VesperIcon.None)
         {
-            VesperDrawing.Icon(g, Symbol, new Rectangle((Width - iconSize) / 2, (Height - iconSize) / 2, iconSize, iconSize), ink);
+            VesperDrawing.Icon(g, Symbol, new Rectangle((Width - iconSize) / 2, (Height - iconSize) / 2, iconSize, iconSize), iconInk);
         }
         else
         {
             var measure = TextRenderer.MeasureText(g, Text, Font,
                 new Size(2000, Height), TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-            int gap = Symbol == VesperIcon.None ? 0 : 7;
+            int gap = Symbol == VesperIcon.None ? 0 : UiKit.Scale(this, 7);
             int groupWidth = measure.Width + (Symbol == VesperIcon.None ? 0 : iconSize + gap);
-            int left = NavigationItem || TextAlign == ContentAlignment.MiddleLeft ? 17 : Math.Max(5, (Width - groupWidth) / 2);
+            int left = NavigationItem || TextAlign == ContentAlignment.MiddleLeft ? UiKit.Scale(this, 13) : Math.Max(5, (Width - groupWidth) / 2);
             if (Symbol != VesperIcon.None)
             {
-                VesperDrawing.Icon(g, Symbol, new Rectangle(left, (Height - iconSize) / 2, iconSize, iconSize), ink);
+                VesperDrawing.Icon(g, Symbol, new Rectangle(left, (Height - iconSize) / 2, iconSize, iconSize), iconInk);
                 left += iconSize + gap;
             }
             TextRenderer.DrawText(g, Text, Font,
-                new Rectangle(left, 0, Math.Max(1, Width - left - (TrailingChevron ? 27 : 5)), Height), ink,
-                TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                new Rectangle(left, 0, Math.Max(1, Width - left - UiKit.Scale(this, TrailingChevron ? 27 : 5)), Height), ink,
+                VesperDrawing.PaintTextFlags | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter |
+                TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
         }
         if (TrailingChevron)
-            VesperDrawing.Icon(g, VesperIcon.ChevronDown, new Rectangle(Width - 25, (Height - 16) / 2, 16, 16), ink);
+            VesperDrawing.Icon(g, VesperIcon.ChevronDown, new Rectangle(Width - UiKit.Scale(this, 25),
+                (Height - UiKit.Scale(this, 16)) / 2, UiKit.Scale(this, 16), UiKit.Scale(this, 16)), ink);
         if (Focused && ShowFocusCues)
-            ControlPaint.DrawFocusRectangle(g, new Rectangle(5, 5, Math.Max(1, Width - 11), Math.Max(1, Height - 11)), ink, fill);
+            VesperDrawing.FocusOutline(g, Rectangle.Inflate(face, -4, -4), ink);
     }
 
 }
@@ -253,6 +364,7 @@ public sealed class VesperChoice : Control
     private int _index = -1;
     private VesperPalette _palette = VesperPalette.Light;
     public event EventHandler? SelectedIndexChanged;
+    [DefaultValue(VesperIcon.None)] public VesperIcon Symbol { get; set; }
 
     [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int SelectedIndex
@@ -275,7 +387,7 @@ public sealed class VesperChoice : Control
     {
         _items = values;
         _index = values.Length > 0 ? 0 : -1;
-        _menu.Items.Clear();
+        foreach (ToolStripItem old in _menu.Items.Cast<ToolStripItem>().ToArray()) old.Dispose();
         for (int i = 0; i < _items.Length; i++)
         {
             int index = i;
@@ -300,7 +412,8 @@ public sealed class VesperChoice : Control
     public VesperChoice()
     {
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
-            ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable, true);
+            ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable |
+            ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         Height = 32;
         Width = 145;
         Font = new Font("Segoe UI", 9F);
@@ -349,6 +462,12 @@ public sealed class VesperChoice : Control
 
     protected override void OnClick(EventArgs e) { base.OnClick(e); ShowMenu(); }
 
+    protected override bool IsInputKey(Keys keyData) => (keyData & Keys.KeyCode) is Keys.Up or Keys.Down
+        || base.IsInputKey(keyData);
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
+
     protected override void OnKeyDown(KeyEventArgs e)
     {
         if (e.KeyCode is Keys.Enter or Keys.Space or Keys.F4)
@@ -379,19 +498,30 @@ public sealed class VesperChoice : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent?.BackColor ?? _palette.Surface);
+        VesperPanel.PaintBackdrop(this, e);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using var path = VesperDrawing.Rounded(new Rectangle(1, 1,
-            Math.Max(1, Width - 3), Math.Max(1, Height - 3)), 5);
-        using (var bg = new SolidBrush(_palette.Surface)) e.Graphics.FillPath(bg, path);
+        var face = new Rectangle(1, 1, Math.Max(1, Width - 3), Math.Max(1, Height - 3));
+        using var path = VesperDrawing.Rounded(face, UiKit.Scale(this, 5));
+        Color fill = Enabled ? _palette.Surface : _palette.Secondary;
+        using (var bg = new SolidBrush(fill)) e.Graphics.FillPath(bg, path);
         using (var pen = new Pen(Focused ? _palette.MutedGreen : _palette.Border))
             e.Graphics.DrawPath(pen, path);
+        int x = UiKit.Scale(this, 11);
+        int iconSize = UiKit.Scale(this, 16);
+        if (Symbol != VesperIcon.None)
+        {
+            VesperDrawing.Icon(e.Graphics, Symbol, new Rectangle(x, (Height - iconSize) / 2, iconSize, iconSize),
+                Enabled ? VesperDrawing.Ink(Symbol, _palette) : _palette.Muted);
+            x += iconSize + UiKit.Scale(this, 7);
+        }
         TextRenderer.DrawText(e.Graphics, SelectedText, Font,
-            new Rectangle(11, 0, Math.Max(1, Width - 36), Height), _palette.Text,
-            TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter |
+            new Rectangle(x, 0, Math.Max(1, Width - x - UiKit.Scale(this, 27)), Height), Enabled ? _palette.Text : _palette.Muted,
+            VesperDrawing.PaintTextFlags | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter |
             TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
         VesperDrawing.Icon(e.Graphics, VesperIcon.ChevronDown,
-            new Rectangle(Width - 25, (Height - 15) / 2, 15, 15), _palette.Muted);
+            new Rectangle(Width - UiKit.Scale(this, 25), (Height - iconSize) / 2, iconSize, iconSize), _palette.Muted);
+        if (Focused && ShowFocusCues)
+            VesperDrawing.FocusOutline(e.Graphics, Rectangle.Inflate(face, -4, -4), _palette.Text);
     }
 
     protected override void Dispose(bool disposing)

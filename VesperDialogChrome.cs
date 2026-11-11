@@ -24,6 +24,7 @@ internal class VesperPopupForm : Form
 internal static class VesperDialogChrome
 {
     public const int HeaderHeight = 43; // logical pixels at 96 DPI
+    public static int VerticalInset(Form form) => UiKit.Scale(form, HeaderHeight) + 2 * Math.Max(1, UiKit.Scale(form, 1));
     private const int WmNcLButtonDown = 0xA1;
     private static readonly IntPtr HtCaption = new(2);
 
@@ -40,9 +41,7 @@ internal static class VesperDialogChrome
         form.ShowInTaskbar = false;
         form.StartPosition = FormStartPosition.CenterParent;
 
-        bool dark = palette.Surface.GetBrightness() < 0.5f;
-        Color edge = SystemInformation.HighContrast ? SystemColors.WindowFrame
-            : dark ? Color.FromArgb(83, 102, 87) : Color.FromArgb(177, 189, 177);
+        Color edge = palette.HighContrast ? SystemColors.WindowFrame : palette.Border;
         form.BackColor = edge; // A real perimeter remains visible even when child panels cover the form.
 
         // Capture the original layout before moving controls to a different parent.
@@ -53,7 +52,9 @@ internal static class VesperDialogChrome
 
         var shell = new VesperPanel { BackColor = palette.Surface, TabStop = false };
         var content = new VesperPanel { BackColor = palette.Surface, TabStop = false };
-        var header = new VesperPanel { BackColor = palette.Secondary, TabStop = false };
+        var header = new VesperPanel { BackColor = palette.Botanical ? palette.Back : palette.Secondary, TabStop = false };
+        var art = BotanicalArt.Acquire(palette);
+        if (art is not null) form.Disposed += (_, _) => art.Dispose();
 
         foreach (var (control, _) in originals)
         {
@@ -64,12 +65,11 @@ internal static class VesperDialogChrome
             content.Controls.Add(control);
         }
 
-        var caption = new Label
+        var caption = new VesperSurfaceLabel
         {
             Text = title,
             Font = new Font("Segoe UI", 9F, FontStyle.Bold),
             ForeColor = palette.Text,
-            BackColor = Color.Transparent,
             TextAlign = ContentAlignment.MiddleLeft,
             AutoSize = false
         };
@@ -86,12 +86,22 @@ internal static class VesperDialogChrome
             form.Close();
         };
         header.Controls.AddRange([caption, close]);
-        header.Paint += (_, e) =>
+        header.Decoration = (graphics, clip) =>
         {
-            int size = Math.Max(14, (int)Math.Round(19d * form.DeviceDpi / 96));
-            VesperDrawing.Icon(e.Graphics, icon, new Rectangle(15, (header.Height - size) / 2, size, size), palette.Green);
-            using var divider = new Pen(palette.Border);
-            e.Graphics.DrawLine(divider, 0, header.Height - 1, header.Width, header.Height - 1);
+            if (art is not null)
+            {
+                int left = caption.Right + UiKit.Scale(form, 12);
+                int right = close.Left - UiKit.Scale(form, 12);
+                int width = Math.Clamp(right - left, 0, UiKit.Scale(form, 190));
+                int inset = UiKit.Scale(form, 4);
+                art.PaintHeader(graphics, header.ClientRectangle, clip,
+                    new Rectangle(right - width, inset, width, Math.Max(0, header.Height - 2 * inset)), dialog: true);
+            }
+            int size = UiKit.Scale(form, 18);
+            VesperDrawing.Icon(graphics, icon, new Rectangle(UiKit.Scale(form, 15), (header.Height - size) / 2, size, size),
+                VesperDrawing.Ink(icon, palette));
+            using var divider = new Pen(palette.Divider);
+            graphics.DrawLine(divider, 0, header.Height - 1, header.Width, header.Height - 1);
         };
 
         shell.Controls.AddRange([content, header]);
@@ -154,10 +164,14 @@ internal static class VesperDialogChrome
             header.SetBounds(0, 0, shell.ClientSize.Width, headerHeight);
             content.SetBounds(0, headerHeight, shell.ClientSize.Width,
                 Math.Max(1, shell.ClientSize.Height - headerHeight));
-            caption.SetBounds(42, 0, Math.Max(50, header.Width - 105), header.Height);
             int buttonSize = Math.Max(28, (int)Math.Round(30d * form.DeviceDpi / 96));
-            close.SetBounds(Math.Max(0, header.Width - buttonSize - 18),
+            close.SetBounds(Math.Max(0, header.Width - buttonSize - UiKit.Scale(form, 12)),
                 (header.Height - buttonSize) / 2, buttonSize, buttonSize);
+            int captionX = UiKit.Scale(form, 43);
+            int captionWidth = Math.Min(close.Left - captionX - UiKit.Scale(form, 12),
+                TextRenderer.MeasureText(title, caption.Font).Width + UiKit.Scale(form, 8));
+            caption.SetBounds(captionX, 0, Math.Max(1, captionWidth), header.Height);
+            header.Invalidate(true);
             LayoutContent();
         }
 

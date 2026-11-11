@@ -10,11 +10,19 @@ namespace VESPER
         [STAThread]
         static void Main(string[] args)
         {
-            // One instance per Windows user: a second launch only asks the first one to show itself.
+            if (args.Contains("--ui-preview", StringComparer.OrdinalIgnoreCase))
+            {
+                ApplicationConfiguration.Initialize();
+                BotanicalPreview.Run(args);
+                return;
+            }
+
+            bool background = args.Contains("--background", StringComparer.OrdinalIgnoreCase);
+            // Background launches can race while Chrome sends several requests.
             using var mutex = new Mutex(true, @"Local\VESPER.SingleInstance", out bool firstInstance);
             if (!firstInstance)
             {
-                SignalRunningInstance();
+                if (!background) SignalRunningInstance();
                 return;
             }
 
@@ -23,9 +31,8 @@ namespace VESPER
             if (SettingsStore.LoadWarning is { } warning)
                 MessageBox.Show(warning, "VESPER settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
 
-            // In an installed release the native helper is registered automatically.
-            // Developer builds don't overwrite a user's installed browser registration.
-            if (NativeHostSetup.HostPresent && NativeHostSetup.IsInstalledApp && !NativeHostSetup.IsRegistered)
+            if (NativeHostSetup.HostPresent && (NativeHostSetup.IsInstalledApp || NativeHostSetup.HasDevelopmentRegistration)
+                && !NativeHostSetup.IsRegistered)
                 _ = NativeHostSetup.Register(); // Troubleshooting > Repair helper is available if registration fails.
 
             DownloadEngine engine;
@@ -53,7 +60,6 @@ namespace VESPER
                     "VESPER recovered", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
-            bool background = args.Contains("--background", StringComparer.OrdinalIgnoreCase);
             var form = new Form1(preferences, engine, startHidden: background);
 
             // Event-driven (no polling): a second launch signals this wait handle.

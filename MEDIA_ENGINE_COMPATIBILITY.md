@@ -1,32 +1,42 @@
-# Media compatibility — measured scope, not hostname recognition
+# Live compatibility matrix — tested 2026-11-11
 
-Baseline: `b0c5ac14877dc729280b5eb210123f23da6ae067`. Working branch: `work/media-discovery-reliability`.
-Checks performed in the Linux sandbox on 2026-11-11. Windows execution remains unverified.
+Runner: `tools/Vesper.LiveCheck` (same `MediaTransferBridge` + real `DownloadEngine` as the app) over `tests/live/corpus.tsv`.
+Independent validation: ffprobe/ffmpeg 7.0.2 static (development tool, not bundled): full decode with `-xerror` (files ≤ 400 MB) or first 90 s + last 60 s decode plus container duration (larger files). Raw evidence: `reports/live/2026-11-11/`.
+"VESPER validation" = built-in demux of the published file (track kinds, codecs, sample counts, durations). It understands MP4/WebM/MKV only.
 
-**Verified** means only the stated operation passed. **Partial** means implemented paths/fixture coverage with important gaps.
-**Unsupported** means deliberately unavailable. **Untested** is not a claim of compatibility.
+| Platform | Scenario | Discovery | Format selection | Download | Audio present | Output validity (independent) | Tested | Failure reason / notes | Limitations |
+|---|---|---|---|---|---|---|---|---|---|
+| YouTube | Standard video (`jNQXAC9IVRw`) balanced | pass | pass (395+140) | pass | verified | full decode ok; AV1 320×240 + AAC MP4 | 2026-11-11 | — | — |
+| YouTube | `youtu.be` link, audio only | pass | pass (140) | pass | verified | full decode ok; AAC M4A | 2026-11-11 | — | — |
+| YouTube | YouTube Music URL, audio only | pass | pass (140) | pass | verified | full decode ok; AAC M4A | 2026-11-11 | — | Music-only (non-video) catalogue items not tested |
+| YouTube | `youtube-nocookie.com/embed` smallest | pass | pass (395+140) | pass | verified | full decode ok | 2026-11-11 | — | Embeds discovered inside third-party pages not tested |
+| YouTube | 1080p60 H.264+AAC (Big Buck Bunny) | pass | pass (299+140) | pass (267.8 MB, 8 s) | verified | full decode ok; h264 1920×1080@60 + aac, 634.6 s | 2026-11-11 | — | — |
+| YouTube | 2160p60 4K (Big Buck Bunny) | pass | pass (315 VP9 + 140) | pass (1.37 GB, 22.5 s) | verified | head+tail decode ok; vp9 3840×2160 + aac MKV | 2026-11-11 | — | 8K not tested (no verified 8K item in corpus) |
+| YouTube | HDR + 4K discovery (`LXb3EKWsInQ`) | pass | n/a | n/a | n/a | n/a | 2026-11-11 | HDR formats detected | HDR download not independently validated |
+| YouTube | Multi-language audio discovery (`0e3GPea1Tyg`) | pass | n/a | n/a | n/a | n/a | 2026-11-11 | multiple audio tracks listed | — |
+| YouTube | Non-default language (es) audio | pass | pass (140-es.3) | pass | verified | full decode ok; AAC M4A, 1541 s | 2026-11-11 | — | — |
+| YouTube | Shorts `k5Z7sFwFF7Q` | pass | pass (788+140) | pass | verified | full decode ok; AV1 608×1080 | 2026-11-11 | — | — |
+| YouTube | Shorts `-62C9R_41Sc` | pass | pass (788+140) | pass | verified | full decode ok | 2026-11-11 | — | — |
+| YouTube | Shorts `myZ9kn9MIWQ` | pass | pass (788+251) | pass | verified | full decode ok; AV1+Opus WebM | 2026-11-11 | — | — |
+| YouTube | Completed livestream (`MRg4uIpJ3xE`, 96 min) | pass | pass (135+140) | pass (215.7 MB) | verified | full decode ok; h264 854×480 | 2026-11-11 | — | — |
+| YouTube | Item harvested as "stream" (`M3HKLzjvKPc`) | fail (correct) | n/a | n/a | n/a | n/a | 2026-11-11 | currently **live**; reported `LiveStreamNotSupported` | Live capture unsupported; excluded from the success denominator (not a completed recording) |
+| YouTube | Playlist with continuation (NASA uploads) | pass | n/a | n/a | n/a | n/a | 2026-11-11 | 200 entries in 2 requests (continuation followed), `IsComplete=false` because the 200-item bound was reached | First run failed (2026 `lockupViewModel` markup); fixed and re-run the same day |
+| YouTube | Mix / radio | **fail** | n/a | n/a | n/a | n/a | 2026-11-11 | watch pages no longer embed the Mix panel; now reported as `SourceChanged` with that reason | Needs InnerTube `next` endpoint (not implemented) |
+| PeerTube | framatube "What is PeerTube?" | pass | pass (HLS 480p) | pass (50 s) | verified | full decode ok; h264 + aac | 2026-11-11 | — | HLS fetch slow (serial segments) |
+| Bandcamp | yt-dlp public test track | pass | pass (mp3-128) | pass | verified (ffprobe) | full decode ok; mp3 | 2026-11-11 | VESPER validator does not parse MP3 | — |
+| Internet Archive | `BigBuckBunny_124` smallest | pass | pass (AVI) | pass (332 MB) | verified (ffprobe) | full decode ok; mpeg4 + audio | 2026-11-11 | VESPER validator does not parse AVI | — |
+| Podcast RSS | NPR feed | pass | n/a | n/a | n/a | n/a | 2026-11-11 | 200 enclosures listed (bounded) | — |
+| Vimeo | `76979871` | **fail** | n/a | n/a | n/a | n/a | 2026-11-11 | `DrmProtected: HLS playlist uses a DRM key format` | Not yet investigated whether a clear rendition exists |
+| SoundCloud | public track | fail | n/a | n/a | n/a | n/a | 2026-11-11 | no adapter; generic scan finds no media | Unsupported |
+| Twitch | VOD URL | invalid test | — | — | — | — | 2026-11-11 | **corpus placeholder ID** (made up) — not a valid test; no Twitch adapter exists | Replace with a real public clip/VOD |
+| X | post URL | invalid test | — | — | — | — | 2026-11-11 | **corpus placeholder ID** (HTTP 404) — not a valid test; no X adapter exists | Replace with a real public post |
+| TikTok, Instagram, Facebook, Reddit, Dailymotion, Bilibili | — | not tested live | — | — | — | — | — | adapters exist only for TikTok/Reddit/Dailymotion/Bilibili (fixture-tested); Instagram/Facebook have none | Milestone C |
 
-| Source / workflow | Classification | Actual evidence and boundaries |
-|---|---|---|
-| Mux public Big Buck Bunny HLS | **Verified: discovery + complete transfer** | `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`: five source qualities. Low-bandwidth media playlist fully transferred through VESPER: 22,418,060 bytes; independent current FFmpeg probe and full decode succeeded, H.264 + AAC, 634.633333 s. Not every quality was downloaded. |
-| Akamai public Big Buck Bunny DASH | **Verified: discovery + audio transfer** | `https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd`: nine deduplicated representations. One selectable complete audio representation. 5,278,733-byte AAC/M4A output independently probed and fully decoded, 634.354750 s. Separate video/audio pairing is **not** implemented. |
-| Internet Archive / LibriVox public-domain collection | **Verified: enumeration + explicit queue** | `https://archive.org/details/adventures_holmes`: 12 chapters; two explicitly selected items durably queued, no bodies automatically downloaded. Title and thumbnail retrieval measured independently. Full chapter downloads were not run. |
-| Ordinary HTTP files | **Verified in regression fixtures** | Existing range, identity, retry, rescue, cancellation, hash, file-safety and crash tests retained. Not a universal live-host claim. |
-| Clear source-muxed fragmented MP4 | **Verified in fixtures** | Synthetic H.264/AAC initialization + three fragments, exact-byte assembly, timeline/offset checks, crash/expiration recovery, independent decode. No combining of separate tracks. |
-| HLS AES-128 CBC with accessible identity key | **Verified in local regression fixtures** | Existing AES transfer tests retained and now use actual synthetic TS media. Encrypted initialization logic implemented with explicit-IV requirement; that specific path is not independently live-tested. SAMPLE-AES/DRM/session keys remain unavailable. |
-| Direct MP4 / M4A / WebM media handoff | **Verified track-presence fixture checks; partial container validation** | MP4/WebM audio presence checked before publishing media handoffs. Video-only MP4/WebM is refused rather than silently accepted as an audio/video result. This is not full codec decoding. |
-| YouTube videos / Shorts | **Partial implementation; live resolution failed here** | Embedded plain playback URLs, HLS/DASH fallback, source identity and typed errors tested with synthetic fixtures. Three actual `https://www.youtube.com/watch?v=aqz-KE-bpKQ` .NET discoveries returned `BrowserContextRequired`; no live YouTube download succeeded. A separate curl request returned HTTP 403. No signature/n challenge solving, SABR implementation, token generation or anti-bot evasion. |
-| YouTube playlists / Mix | **Partial / live untested** | Existing first-page playlist and bounded dynamic Mix snapshot tests pass. No continuation API or large/channel enumeration added. Browser candidates can avoid a redundant watch-page request; that handoff path is fixture-tested, not live-browser verified. |
-| TikTok | **Partial / live untested** | Existing rehydration formats/cookie-scoping tests preserved; early metadata added. The desktop still refuses transfer contexts it cannot safely retain/apply. No live TikTok success claimed. |
-| Vimeo | **Partial; tested URL produced no usable result** | `https://vimeo.com/76979871` returned `DrmProtected` from the resolver after three requests. This records resolver behavior, not an independent determination about the source's actual protection. No successful transfer verified. |
-| Dailymotion, Reddit, Bilibili, PeerTube | **Partial / live untested** | Existing independent adapters and regression fixtures preserved. Separate-track media still needs an unavailable muxer. No claim that all current live response shapes work. |
-| Internet Archive single files, Bandcamp | **Partial / additional live transfers untested** | Existing adapters preserved; Archive derivative grouping improved using the source's `original` field. Collection operations verified above, not blanket download compatibility. |
-| Generic HTML5 / embeds / RSS | **Partial** | Existing parser, embed, feed and security tests pass. Public HLS/DASH paths verified above. Arbitrary player JavaScript is not executed. |
-| Instagram, Facebook, X/Twitter, Twitch, SoundCloud | **Unsupported dedicated extraction / generic paths untested** | No empty or hostname-only adapters were added. Generic exposed clear media might work, but there is no live evidence here. |
-| DRM, live streams, multi-period DASH, changing init maps, discontinuity remux, general A/V mux | **Unsupported** | Kept unavailable rather than concatenating incompatible bytes or advertising unsupported qualities. |
+## Success rate on the defined supported set
 
-## Reproduce the actual checks
+Supported set = YouTube VOD/Shorts/audio/discovery/collections, PeerTube, Bandcamp, Internet Archive, podcast RSS, Vimeo (20 items; the live-now stream and the two placeholder URLs are excluded with reasons above).
+**18 / 20 passed = 90 %** (target 95 % not reached). Failing: YouTube Mix, Vimeo.
 
-Use the .NET 10 developer tool in `src/Vesper.MediaResolver.Benchmarks`. Commands and cold/warm methodology are in `reports/BENCHMARKS.md`.
-Raw JSONL, successful independent probes, and decoder logs are included under `reports/benchmarks`.
-Full external media, downloaded binaries, credentials and temporary test databases are not included in this source delivery.
+## yt-dlp reference
+
+yt-dlp 2026.10.26 (no JS runtime → its JS-less `visionos` client, the same client VESPER uses) downloaded the same YouTube formats successfully in every valid comparison run; no case was found where yt-dlp succeeded and VESPER failed on the compared items. yt-dlp **with** a JS runtime can reach clients VESPER cannot (e.g. "made for kids" videos); that gap is documented in `MEDIA_ENGINE_LIMITATIONS.md`.

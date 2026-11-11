@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VESPER — Chrome downloads</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body class="transfers">
+  <header><img src="icons/vesper-48.png" width="28" height="28" alt=""><h1>Chrome downloads</h1></header>
+  <main>
+    <p class="hint">VESPER starts a new copy. Chrome pauses and keeps its progress once VESPER receives data.</p>
+    <ul id="active"></ul>
+    <section id="unconfirmed" hidden><h2>Unconfirmed handoffs</h2><ul id="pending"></ul></section>
+    <p id="result" class="result" role="status"></p>
+  </main>
+  <script src="theme.js"></script>
+  <script src="transfers.js"></script>
+</body>
+</html>

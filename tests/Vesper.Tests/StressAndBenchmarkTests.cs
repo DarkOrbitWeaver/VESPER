@@ -4,6 +4,11 @@ using Xunit.Abstractions;
 
 namespace Vesper.Tests;
 
+// The handle-count check measures the whole test process.
+[CollectionDefinition("Process handle checks", DisableParallelization = true)]
+public sealed class ProcessHandleChecks { }
+
+[Collection("Process handle checks")]
 public class StressTests
 {
     // Open file handles: HandleCount on Windows, /proc/self/fd on Linux (where HandleCount is not supported).

@@ -349,6 +349,26 @@ public class BridgeProtocolTests
         Assert.NotEmpty(error);
     }
 
+    [Theory]
+    [InlineData("queue", 2, true)]
+    [InlineData("download", 63, true)]
+    [InlineData("ask", 2, false)]
+    [InlineData("queue", 64, false)]
+    public void Browser_media_selection_accepts_only_a_session_and_valid_choice(string mode, int index, bool valid)
+    {
+        const string session = "edc1604be3d34136a798fca8addbcbcd";
+        string request = Msg($$"""
+            "type":"media-select","mode":"{{mode}}","mediaSession":"{{session}}","formatChoice":{{index}},
+            "url":"https://example.com/unrelated"
+            """);
+        Assert.Equal(valid, BridgeProtocol.TryParse(request, out BridgeRequest parsed, out _));
+        if (!valid) return;
+        Assert.Equal(Guid.ParseExact(session, "N"), parsed.MediaSession);
+        Assert.Equal(index, parsed.FormatChoice);
+        Assert.Null(parsed.Url);
+        Assert.Empty(parsed.Items);
+    }
+
     [Fact]
     public void The_browser_cannot_choose_a_destination_or_a_program()
     {

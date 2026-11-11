@@ -1,0 +1,14 @@
+vesper	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run1	788+140US.4	rc=0 wall_s=2.05 peak_rss_mib=105.2	pass 5336817
+yt-dlp	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run1	788+140US.4	rc=1 wall_s=3.36 peak_rss_mib=76.9	
+vesper	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run2	788+140US.4	rc=0 wall_s=5.46 peak_rss_mib=110.0	pass 5336817
+yt-dlp	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run2	788+140US.4	rc=1 wall_s=3.64 peak_rss_mib=76.7	
+vesper	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run3	788+140US.4	rc=0 wall_s=2.44 peak_rss_mib=106.4	pass 5336817
+yt-dlp	balanced	https://www.youtube.com/shorts/k5Z7sFwFF7Q	run3	788+140US.4	rc=1 wall_s=3.37 peak_rss_mib=76.8	
+vesper	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run1	788+140US.4	rc=0 wall_s=5.10 peak_rss_mib=109.4	pass 4109793
+yt-dlp	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run1	788+140US.4	rc=1 wall_s=3.16 peak_rss_mib=76.7	
+vesper	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run2	788+140US.4	rc=0 wall_s=4.89 peak_rss_mib=109.0	pass 4109793
+yt-dlp	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run2	788+140US.4	rc=1 wall_s=3.44 peak_rss_mib=76.6	
+vesper	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run3	788+140US.4	rc=0 wall_s=1.94 peak_rss_mib=101.6	pass 4109793
+yt-dlp	balanced	https://www.youtube.com/shorts/-62C9R_41Sc	run3	788+140US.4	rc=1 wall_s=3.31 peak_rss_mib=74.0	
+vesper	h1080	https://www.youtube.com/watch?v=aqz-KE-bpKQ	run1	299+140	rc=0 wall_s=5.91 peak_rss_mib=124.4	pass 267814246
+yt-dlp	h1080	https://www.youtube.com/watch?v=aqz-KE-bpKQ	run1	299+140	rc=0 wall_s=13.64 peak_rss_mib=62.2	268281284

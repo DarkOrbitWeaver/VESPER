@@ -20,6 +20,9 @@ public sealed class ResolverOptions
 
     public int MaxCollectionItems { get; init; } = 500;
     public int MaxCollectionPages { get; init; } = 20;
+
+    /// <summary>YouTube InnerTube client profiles to try, in order (see YouTubeClients). Repairs need no code change.</summary>
+    public IReadOnlyList<string> YouTubeClients { get; init; } = ["visionos"];
     public int MaxSegmentsPerRepresentation { get; init; } = 50_000;
     public int MaxCandidatesPerPage { get; init; } = 24;
     public int MaxManifestsPerPage { get; init; } = 3;

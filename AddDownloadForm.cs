@@ -50,7 +50,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         BackColor = _colors.Surface;
         ForeColor = _colors.Text;
 
-        var title = TextLabel("Add download", 16, true);
+        var title = TextLabel("Add download", 17, true);
         title.SetBounds(23, 18, 440, 34);
         var description = TextLabel("Paste one or more HTTP or HTTPS links, one per line.", 8.5F, muted: true);
         description.SetBounds(23, 52, 455, 23);
@@ -61,8 +61,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
             Text = "Multiple links", AutoSize = false,
             TextAlign = ContentAlignment.MiddleRight,
             Location = new Point(352, 84), Size = new Size(133, 22),
-            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
-            BackColor = _colors.Surface, Font = new Font("Segoe UI", 8F)
+            LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
+            Font = new Font("Segoe UI", 8F)
         };
         _multipleLinks.Click += (_, _) => SetMultipleLinks(!_multiLine);
 
@@ -111,16 +111,16 @@ internal sealed class AddDownloadForm : VesperPopupForm
 
         _hint = TextLabel("Enter a link to continue", 8, muted: true);
         _hint.SetBounds(23, 157, 462, 22);
-        _detected = new Panel { BackColor = _colors.Secondary, Size = new Size(462, 55), Visible = false };
+        _detected = new VesperPanel { BackColor = _colors.Surface, Size = new Size(462, 47), Visible = false };
         _detectedTitle = TextLabel("", 9, true);
         _detectedNote = TextLabel("", 8, muted: true);
-        _detectedTitle.SetBounds(12, 7, 308, 20);
-        _detectedNote.SetBounds(12, 29, 437, 19);
+        _detectedTitle.SetBounds(23, 1, 308, 20);
+        _detectedNote.SetBounds(23, 22, 437, 19);
         _discoverLink = new LinkLabel
         {
             Text = "Find media", TextAlign = ContentAlignment.MiddleRight,
-            BackColor = Color.Transparent, LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
-            Location = new Point(340, 6), Size = new Size(108, 21), Visible = false,
+            LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
+            Location = new Point(340, 0), Size = new Size(121, 21), Visible = false,
             Font = new Font("Segoe UI", 8.5F)
         };
         _discoverLink.Click += (_, _) => DiscoverVideo(allowGeneric: true);
@@ -161,7 +161,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         var reset = new LinkLabel
         {
             Text = "Use default folder", AutoSize = true, Location = new Point(0, 60),
-            BackColor = _colors.Surface, LinkColor = _colors.Green, ActiveLinkColor = _colors.Green,
+            LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
             Font = new Font("Segoe UI", 8F)
         };
         reset.Click += (_, _) => _destinationInput.Text = _prefs.DefaultFolder;
@@ -170,7 +170,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
         _footer.Paint += (_, e) =>
         {
-            using var separator = new Pen(_colors.Border);
+            using var separator = new Pen(_colors.Divider);
             e.Graphics.DrawLine(separator, 0, 0, _footer.Width, 0);
         };
         var cancel = MakeButton("Cancel", 85);
@@ -184,14 +184,23 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _openPage.AccessibleName = "Discover available media formats";
         _openPage.Visible = false;
         _openPage.Click += (_, _) => DiscoverVideo();
-        _footer.Controls.AddRange([cancel, _queue, _download, _openPage]);
-        _footer.Resize += (_, _) =>
+        _detected.Paint += (_, e) =>
         {
-            cancel.SetBounds(23, 14, 85, 34);
-            _download.SetBounds(_footer.Width - 23 - 122, 14, 122, 34);
-            _queue.SetBounds(_download.Left - 8 - 91, 14, 91, 34);
-            _openPage.SetBounds(_footer.Width - 23 - 154, 14, 154, 34);
+            int size = UiKit.Scale(this, 16);
+            VesperIcon icon = _detectedTitle.ForeColor == _colors.Red ? VesperIcon.Warning
+                : _openPage.Visible ? VesperIcon.Video : VesperIcon.Info;
+            VesperDrawing.Icon(e.Graphics, icon, new Rectangle(0, UiKit.Scale(this, 4), size, size),
+                VesperDrawing.Ink(icon, _colors));
         };
+        _footer.Controls.AddRange([cancel, _queue, _download, _openPage]);
+        void LayoutFooter()
+        {
+            cancel.SetBounds(S(23), S(14), S(85), S(34));
+            _download.SetBounds(_footer.Width - S(23 + 122), S(14), S(122), S(34));
+            _queue.SetBounds(_download.Left - S(8 + 91), S(14), S(91), S(34));
+            _openPage.SetBounds(_footer.Width - S(23 + 154), S(14), S(154), S(34));
+        }
+        _footer.Resize += (_, _) => LayoutFooter();
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
         body.Controls.AddRange([title, description, fieldLabel, _multipleLinks, _urlFrame, _hint,
@@ -211,8 +220,11 @@ internal sealed class AddDownloadForm : VesperPopupForm
                     Vesper.Engine.UrlPolicy.TryParse(candidate, out _, out _)))
                     SetLinkText(clipboard);
             }
+            LayoutContent();
+            LayoutFooter();
             _url.Focus();
         };
+        DpiChanged += (_, _) => BeginInvoke(() => { if (!IsDisposed) { LayoutContent(); LayoutFooter(); } });
         if (!string.IsNullOrWhiteSpace(initialUrl)) SetLinkText(initialUrl.Trim());
         UpdateDestinationText();
         InspectUrl();
@@ -220,9 +232,10 @@ internal sealed class AddDownloadForm : VesperPopupForm
 
     private Label TextLabel(string text, float size, bool bold = false, bool muted = false) => new()
     {
-        Text = text, AutoSize = false, BackColor = Color.Transparent,
+        Text = text, AutoSize = false,
         ForeColor = muted ? _colors.Muted : _colors.Text,
-        Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
+        Font = bold && size >= 16 ? UiKit.Heading(_colors, size)
+            : new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
         TextAlign = ContentAlignment.MiddleLeft
     };
 
@@ -298,10 +311,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
         _queue.Visible = _download.Visible = !hasMedia;
         _openPage.Visible = mediaRoute;
         _discoverLink.Visible = !hasMedia && links.Length == 1 && valid;
+        _hint.Visible = links.Length == 0;
         _detected.Visible = links.Length > 0;
-        _detected.BackColor = invalid
-            ? (_colors.Surface.R == 255 ? Color.FromArgb(253, 246, 243) : Color.FromArgb(54, 37, 35))
-            : _colors.Secondary;
         _detectedTitle.ForeColor = invalid ? _colors.Red : _colors.Text;
 
         if (links.Length == 0)
@@ -312,31 +323,29 @@ internal sealed class AddDownloadForm : VesperPopupForm
         {
             int mediaCount = links.Count(IsMediaLink);
             int fileCount = links.Length - mediaCount;
-            _hint.Text = "Media discovery is needed";
             _detectedTitle.Text = fileCount == 0
-                ? mediaCount == 1 ? "Media page or stream" : $"{mediaCount} media sources"
+                ? mediaCount == 1 ? "Media link" : $"{mediaCount} media sources"
                 : $"{mediaCount} media + {fileCount} direct file links";
-            _detectedNote.Text = "Choose media quality once; direct file links are added alongside it.";
+            _detectedNote.Text = fileCount == 0 ? "Find media to see available formats."
+                : "Direct file links are added alongside your media selection.";
             _openPage.Text = "Find media";
         }
         else if (!valid)
         {
-            _hint.Text = "Check the address above";
             _detectedTitle.Text = "This link cannot be added as a file";
             _detectedNote.Text = "Try a file URL, HLS playlist, or a supported video page.";
         }
         else if (links.Length > 1)
         {
-            _hint.Text = "Links ready for checking";
             _detectedTitle.Text = $"{links.Length} file addresses";
             _detectedNote.Text = "VESPER will check each file when its download begins.";
         }
         else
         {
-            _hint.Text = "Address format looks OK";
             _detectedTitle.Text = "File link to check";
-            _detectedNote.Text = "VESPER checks the file when downloading. A webpage is not a file.";
+            _detectedNote.Text = "VESPER checks the file when the download starts.";
         }
+        _detected.Invalidate();
         LayoutContent();
     }
 
@@ -353,6 +362,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
         (Vesper.Engine.MediaPageLinks.TryGetSite(url, out _) ||
          url.AbsolutePath.EndsWith(".mpd", StringComparison.OrdinalIgnoreCase));
 
+    private int S(int px) => IsHandleCreated ? UiKit.Scale(this, px) : px;
+
     private void LayoutContent()
     {
         if (_layingOut) return;
@@ -360,16 +371,17 @@ internal sealed class AddDownloadForm : VesperPopupForm
         try
         {
             int extra = _multiLine ? 56 : 0;
-            _urlFrame.SetBounds(23, 107, 462, 43 + extra);
-            _url.SetBounds(12, 12, 400, 22 + extra);
-            _hint.SetBounds(23, 157 + extra, 462, 22);
-            _detected.SetBounds(23, 181 + extra, 462, 55);
-            int destinationY = (_detected.Visible ? 248 : 192) + extra;
-            _destinationButton.SetBounds(23, destinationY, 462, 34);
+            _urlFrame.SetBounds(S(23), S(107), S(462), S(43 + extra));
+            _url.SetBounds(S(12), S(12), S(400), S(22 + extra));
+            _hint.SetBounds(S(23), S(157 + extra), S(462), S(22));
+            _detected.SetBounds(S(23), S(156 + extra), S(462), S(47));
+            int destinationY = (_url.TextLength > 0 && SplitLinks().Length > 0 ? 214 : 192) + extra;
+            _destinationButton.SetBounds(S(23), S(destinationY), S(462), S(34));
             _destinationPanel.Visible = _folderExpanded;
-            _destinationPanel.Location = new Point(23, destinationY + 43);
+            _destinationPanel.Location = new Point(S(23), S(destinationY + 43));
             int contentBottom = destinationY + 34 + (_folderExpanded ? 92 : 0);
-            ClientSize = new Size(508, contentBottom + 18 + _footer.Height + VesperDialogChrome.HeaderHeight);
+            int chrome = IsHandleCreated ? VesperDialogChrome.VerticalInset(this) : VesperDialogChrome.HeaderHeight + 2;
+            ClientSize = new Size(S(508), S(contentBottom + 18) + _footer.Height + chrome);
         }
         finally { _layingOut = false; }
     }

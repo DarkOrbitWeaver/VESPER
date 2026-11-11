@@ -19,12 +19,12 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["theme.js", "content.js"],
       "run_at": "document_idle",
       "all_frames": true
     }
   ],
   "web_accessible_resources": [
-    { "resources": ["icons/moth-64.png"], "matches": ["http://*/*", "https://*/*"] }
+    { "resources": ["icons/butterfly-perched.png", "icons/butterfly-front.png"], "matches": ["http://*/*", "https://*/*"] }
   ]
 }

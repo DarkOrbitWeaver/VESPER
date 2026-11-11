@@ -15,6 +15,7 @@ internal sealed class QuickDownloadForm : VesperPopupForm
     private readonly VesperPalette _colors;
     private readonly TextBox _folder;
     private readonly Label _warning;
+    private readonly Panel _footer;
     private readonly long? _sizeBytes;
 
     public Outcome Result { get; private set; } = Outcome.Cancel;
@@ -28,7 +29,7 @@ internal sealed class QuickDownloadForm : VesperPopupForm
         Text = "Quick download — VESPER";
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(508, 218 + VesperDialogChrome.HeaderHeight);
+        ClientSize = new Size(508, 235 + VesperDialogChrome.HeaderHeight + 2);
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = true;
         TopMost = true;
@@ -52,7 +53,7 @@ internal sealed class QuickDownloadForm : VesperPopupForm
         _folder.TextChanged += (_, _) => CheckSpace();
         frame.Controls.Add(_folder);
 
-        var browse = new VesperButton { Text = "Browse…", Width = 102, Height = 36 };
+        var browse = new VesperButton { Text = "Browse…", Width = 102, Height = 36, Symbol = VesperIcon.Folder };
         browse.ApplyPalette(_colors);
         browse.SetBounds(383, 119, 102, 36);
         browse.Click += (_, _) =>
@@ -66,59 +67,81 @@ internal sealed class QuickDownloadForm : VesperPopupForm
         _warning.SetBounds(23, 160, 462, 38);
         _warning.AutoEllipsis = false;
 
-        var footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
-        footer.Paint += (_, e) => { using var pen = new Pen(_colors.Border); e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0); };
+        _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
+        _footer.Paint += (_, e) => { using var pen = new Pen(_colors.Divider); e.Graphics.DrawLine(pen, 0, 0, _footer.Width, 0); };
         var cancel = new VesperButton { Text = "Cancel", Width = 85, Height = 34, DialogResult = DialogResult.Cancel };
         var queue = new VesperButton { Text = "Queue", Width = 91, Height = 34, Symbol = VesperIcon.Queue };
         var download = new VesperButton { Text = "Download", Width = 122, Height = 34, Primary = true, Symbol = VesperIcon.Download };
         foreach (VesperButton b in new[] { cancel, queue, download }) b.ApplyPalette(_colors);
         queue.Click += (_, _) => Accept(Outcome.Queue);
         download.Click += (_, _) => Accept(Outcome.Download);
-        footer.Controls.AddRange([cancel, queue, download]);
-        footer.Resize += (_, _) =>
+        _footer.Controls.AddRange([cancel, queue, download]);
+        void LayoutFooter()
         {
-            cancel.SetBounds(23, 14, 85, 34);
-            download.SetBounds(footer.Width - 23 - 122, 14, 122, 34);
-            queue.SetBounds(download.Left - 8 - 91, 14, 91, 34);
-        };
+            int S(int px) => IsHandleCreated ? UiKit.Scale(this, px) : px;
+            cancel.SetBounds(S(23), S(14), S(85), S(34));
+            download.SetBounds(_footer.Width - S(23 + 122), S(14), S(122), S(34));
+            queue.SetBounds(download.Left - S(8 + 91), S(14), S(91), S(34));
+        }
+        _footer.Resize += (_, _) => LayoutFooter();
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
         body.Controls.AddRange([name, detail, saveLabel, frame, browse, _warning]);
         Controls.Add(body);
-        Controls.Add(footer);
+        Controls.Add(_footer);
         VesperDialogChrome.Attach(this, "VESPER  /  Quick download", _colors, VesperIcon.Download);
         CancelButton = cancel;
         AcceptButton = download;
         TopMost = true;
+        Shown += (_, _) => { FitWarning(); LayoutFooter(); };
+        DpiChanged += (_, _) => BeginInvoke(() => { if (!IsDisposed) { FitWarning(); LayoutFooter(); } });
         CheckSpace();
     }
 
     private Label Label_(string text, float size, bool bold = false, bool muted = false) => new()
     {
-        Text = text, AutoSize = false, BackColor = Color.Transparent, ForeColor = muted ? _colors.Muted : _colors.Text,
+        Text = text, AutoSize = false, ForeColor = muted ? _colors.Muted : _colors.Text,
         Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular), TextAlign = ContentAlignment.MiddleLeft
     };
 
     /// <summary>Warns before the download starts; the engine still enforces it when the transfer begins.</summary>
     private void CheckSpace()
     {
-        _warning.Text = "";
-        if (_sizeBytes is not long size || !Path.IsPathFullyQualified(_folder.Text)) return;
-        try
+        string message = "";
+        if (_sizeBytes is long size && Path.IsPathFullyQualified(_folder.Text))
         {
-            string root = Path.GetPathRoot(Path.GetFullPath(_folder.Text)) ?? "";
-            long free = new DriveInfo(root).AvailableFreeSpace;
-            if (free < size) _warning.Text = $"Not enough free space on {root}: {Formatting.Bytes(size)} needed, {Formatting.Bytes(free)} available.";
+            try
+            {
+                string root = Path.GetPathRoot(Path.GetFullPath(_folder.Text)) ?? "";
+                long free = new DriveInfo(root).AvailableFreeSpace;
+                if (free < size) message = $"Not enough free space on {root}: {Formatting.Bytes(size)} needed, {Formatting.Bytes(free)} available.";
+            }
+            catch (ArgumentException) { /* unusual path: nothing to check */ }
+            catch (IOException) { /* drive not ready */ }
         }
-        catch (ArgumentException) { /* unusual path: nothing to check */ }
-        catch (IOException) { /* drive not ready */ }
+        SetWarning(message);
+    }
+
+    private void SetWarning(string text)
+    {
+        _warning.Text = text;
+        _warning.Visible = text.Length > 0;
+        FitWarning();
+    }
+
+    private void FitWarning()
+    {
+        int body = _warning.Text.Length == 0 ? 173 : 210;
+        int height = (IsHandleCreated ? UiKit.Scale(this, body) + VesperDialogChrome.VerticalInset(this)
+            : body + VesperDialogChrome.HeaderHeight + 2) + _footer.Height;
+        if (ClientSize.Height != height) ClientSize = new Size(ClientSize.Width, height);
     }
 
     private void Accept(Outcome outcome)
     {
         if (!PathSafety.TryResolveFolder(_folder.Text, create: false, out _, out string problem) && !problem.Contains("does not exist"))
         {
-            _warning.Text = problem;
+            SetWarning(problem);
             return;
         }
         Result = outcome;

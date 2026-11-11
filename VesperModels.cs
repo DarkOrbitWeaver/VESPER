@@ -8,7 +8,7 @@ internal enum JobStatus
     Downloading, Paused, Queued, Completed, Missing, NeedsLink, Waiting, Verifying, Suspect,
     Resolving, WaitingRetry, NeedsAttention, Processing, Failed, Cancelled
 }
-internal enum Density { ExtraCompact, Compact, Comfortable }
+internal enum Density { ExtraCompact, Compact, Comfortable, Gallery }
 internal enum ThemeChoice { System, Light, Dark }
 internal enum MotionChoice { Off, Subtle, Botanical }
 internal enum BrowserAction { Ask, Download, Queue }
@@ -41,7 +41,7 @@ internal sealed class DownloadItem
         string extension = Path.GetExtension(s.FileName).TrimStart('.').ToUpperInvariant();
         return new DownloadItem
         {
-            Id = s.Id, Snapshot = s, Name = s.FileName, Extension = extension, FileType = TypeOf(extension),
+            Id = s.Id, Snapshot = s, Name = s.FileName, Extension = extension, FileType = TypeOf(extension, s.MediaQuality, s.ContentType),
             Size = s.TotalBytes is long total ? Formatting.Bytes(total)
                 : s.State == JobState.Completed ? Formatting.Bytes(s.CommittedBytes) : "Unknown",
             SizeBytes = s.TotalBytes ?? s.CommittedBytes,
@@ -88,15 +88,24 @@ internal sealed class DownloadItem
         _ => ""
     };
 
-    private static string TypeOf(string extension) => extension switch
+    private static string TypeOf(string extension, string? quality, string? contentType)
     {
-        "MP3" or "WAV" or "FLAC" or "M4A" or "OGG" or "AAC" or "WEBA" => "Audio",
-        "MP4" or "MKV" or "WEBM" or "AVI" or "MOV" or "TS" or "M4V" => "Video",
-        "ZIP" or "RAR" or "7Z" or "GZ" or "TAR" or "XZ" => "Archive",
-        "ISO" or "IMG" => "Disc image",
-        "EPUB" => "eBook",
-        _ => "File"
-    };
+        if (quality?.StartsWith("audio", StringComparison.OrdinalIgnoreCase) == true) return "Audio";
+        if (contentType?.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) == true) return "Audio";
+        if (contentType?.StartsWith("video/", StringComparison.OrdinalIgnoreCase) == true) return "Video";
+        if (extension is "WEBM" or "MKV" or "MP4")
+            return quality is not null && System.Text.RegularExpressions.Regex.IsMatch(quality, @"\b\d{3,4}p\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "Video" : "Media";
+        return extension switch
+        {
+            "MP3" or "WAV" or "FLAC" or "M4A" or "OGG" or "AAC" or "WEBA" => "Audio",
+            "AVI" or "MOV" or "TS" or "M4V" => "Video",
+            "ZIP" or "RAR" or "7Z" or "GZ" or "TAR" or "XZ" => "Archive",
+            "ISO" or "IMG" => "Disc image",
+            "EPUB" => "eBook",
+            "PDF" or "DOC" or "DOCX" or "ODT" or "RTF" or "TXT" => "Document",
+            _ => "File"
+        };
+    }
 
     /// <summary>Shown only inside the Visual Studio designer so the list is not empty there.</summary>
     public static List<DownloadItem> DesignerSamples() =>
@@ -141,6 +150,17 @@ internal sealed class VesperPreferences
 
 internal readonly record struct VesperPalette(Color Back, Color Surface, Color Secondary, Color Border, Color Text, Color Muted, Color Green, Color GreenHover, Color MutedGreen, Color Amber, Color Red)
 {
+    public bool Botanical { get; init; }
+    public bool HighContrast { get; init; }
+    public bool IsDark => Surface.GetBrightness() < 0.5f;
+    public Color Link => HighContrast ? SystemColors.HotTrack
+        : IsDark ? Color.FromArgb(153, 194, 221) : Color.FromArgb(43, 91, 130);
+    public Color ActionInk => HighContrast ? SystemColors.HighlightText
+        : Green.GetBrightness() >= 0.55f ? Color.FromArgb(25, 39, 27) : Color.FromArgb(255, 251, 240);
+    public Color Divider => Botanical ? VesperDrawing.Mix(Surface, Border, 0.45f) : Border;
+    public Color Selection => HighContrast ? SystemColors.Highlight
+        : Botanical ? VesperDrawing.Mix(Surface, MutedGreen, IsDark ? 0.17f : 0.16f) : Secondary;
+
     public static VesperPalette Light => new(
         ColorTranslator.FromHtml("#F8F9F6"), Color.White, ColorTranslator.FromHtml("#F2F4EF"),
         ColorTranslator.FromHtml("#D9DED6"), ColorTranslator.FromHtml("#313934"),
@@ -154,6 +174,18 @@ internal readonly record struct VesperPalette(Color Back, Color Surface, Color S
         ColorTranslator.FromHtml("#84B68A"), ColorTranslator.FromHtml("#A5CFA8"),
         ColorTranslator.FromHtml("#75887A"), ColorTranslator.FromHtml("#DBAE61"),
         ColorTranslator.FromHtml("#DC847B"));
+
+    public static VesperPalette BotanicalLight { get; } = new(
+        C("#FAF6ED"), C("#FCF8F0"), C("#F0EDE1"), C("#CDC5B3"), C("#262E22"),
+        C("#646557"), C("#3C5736"), C("#2F482B"), C("#62784C"), C("#8B5C17"), C("#A53C34"))
+        { Botanical = true };
+
+    public static VesperPalette BotanicalDark { get; } = new(
+        C("#1D251E"), C("#222A23"), C("#29332A"), C("#4E5D4B"), C("#F3EDDF"),
+        C("#B9C4B3"), C("#416244"), C("#365539"), C("#A7BE91"), C("#E4B96E"), C("#F2A299"))
+        { Botanical = true };
+
+    private static Color C(string hex) => ColorTranslator.FromHtml(hex);
 }
 
 internal static class UiKit
@@ -197,11 +229,20 @@ internal static class UiKit
         }
         catch { return false; }
     }
-    public static VesperPalette Palette(VesperPreferences p) => SystemInformation.HighContrast
-        ? new VesperPalette(SystemColors.Window,SystemColors.Window,SystemColors.Control,SystemColors.WindowFrame,
-            SystemColors.WindowText,SystemColors.GrayText,SystemColors.Highlight,SystemColors.HotTrack,
-            SystemColors.GrayText,SystemColors.Highlight,SystemColors.HotTrack)
-        : IsDark(p) ? VesperPalette.Dark : VesperPalette.Light;
+    public static VesperPalette Palette(VesperPreferences p)
+    {
+        if (SystemInformation.HighContrast)
+            return new VesperPalette(SystemColors.Window, SystemColors.Window, SystemColors.Control, SystemColors.WindowFrame,
+                SystemColors.WindowText, SystemColors.GrayText, SystemColors.Highlight, SystemColors.Highlight,
+                SystemColors.GrayText, SystemColors.WindowText, SystemColors.WindowText) { HighContrast = true };
+        bool dark = IsDark(p);
+        if (p.Botanical) return dark ? VesperPalette.BotanicalDark : VesperPalette.BotanicalLight;
+        return dark ? VesperPalette.Dark : VesperPalette.Light;
+    }
+
+    public static Font Heading(VesperPalette palette, float size) => palette.Botanical
+        ? new Font("Georgia", size)
+        : new Font("Segoe UI", size, FontStyle.Bold);
     public static Image? LoadImage(string name)
     {
         string path = Asset(name);
