@@ -58,7 +58,8 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
             }
             else
             {
-                var resp = (await _svc.Http.GetStringAsync(pageUrl, request.AuthContext, ct, accept: PageAccept).ConfigureAwait(false)).EnsureSuccess();
+                var resp = (request.PageResponse ?? await _svc.Http.GetStringAsync(pageUrl, request.AuthContext, ct, accept: PageAccept).ConfigureAwait(false)).EnsureSuccess();
+                request.PageResponse = resp;
                 pageUrl = resp.FinalUrl;
 
                 if (!resp.IsText)
@@ -79,6 +80,7 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
                 {
                     meta = PageScanner.Scan(resp.Content, resp.FinalUrl, _svc.Options.MaxCandidatesPerPage);
                     candidates.AddRange(meta.Candidates);
+                    request.Publish(new DiscoveryProgress(meta.Title, meta.Thumbnail));
                 }
             }
         }

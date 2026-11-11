@@ -1,0 +1,12 @@
+  Determining projects to restore...
+  Restored /app/VESPER/src/Vesper.MediaResolver/Vesper.MediaResolver.csproj (in 112 ms).
+  Restored /app/VESPER/tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj (in 300 ms).
+  Vesper.MediaResolver -> /app/VESPER/src/Vesper.MediaResolver/bin/Release/net10.0/Vesper.MediaResolver.dll
+  Vesper.MediaResolver.Tests -> /app/VESPER/tests/Vesper.MediaResolver.Tests/bin/Release/net10.0/Vesper.MediaResolver.Tests.dll
+Test run for /app/VESPER/tests/Vesper.MediaResolver.Tests/bin/Release/net10.0/Vesper.MediaResolver.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+WARNING: Overwriting results file: /tmp/vesper-final-results/resolver.trx
+Results File: /tmp/vesper-final-results/resolver.trx
+
+Passed!  - Failed:     0, Passed:   314, Skipped:     0, Total:   314, Duration: 832 ms - Vesper.MediaResolver.Tests.dll (net10.0)
+VSTEST_ARTIFACTS_DIRECTORY environment variable was not found, falling back to a user-private temporary directory. This is most likely caused by an outdated Microsoft.NET.Test.Sdk package reference in the test project.

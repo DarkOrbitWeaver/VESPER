@@ -1,4 +1,6 @@
 using Vesper.Engine;
+using Vesper.MediaResolver.Core;
+using Vesper.MediaResolver.Models;
 
 namespace VESPER;
 
@@ -23,6 +25,8 @@ internal sealed class RescueForm : VesperPopupForm
     private readonly Label _shaLabel;
     private readonly VesperInputFrame _shaFrame;
     private readonly VesperButton _pieceButton;
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly LinkLabel _refreshSource;
     private bool _advancedVisible;
     private string? _pieceJson;
 
@@ -64,6 +68,16 @@ internal sealed class RescueForm : VesperPopupForm
             BackColor = _colors.Surface, Font = new Font("Segoe UI", 8.5F)
         };
         _advanced.LinkClicked += (_, _) => ToggleAdvanced();
+        _refreshSource = new LinkLabel
+        {
+            Text = "Refresh original media link", AutoSize = true, Location = new Point(322, 163),
+            LinkColor = _colors.Green, ActiveLinkColor = _colors.Green, BackColor = _colors.Surface,
+            Font = new Font("Segoe UI", 8.5F), Visible = job.Kind == JobKind.Http
+                && job.OriginalPageUrl is not null && job.MediaId is not null && job.MediaFormatId is not null
+        };
+        _refreshSource.LinkClicked += async (_, _) => await RefreshSourceAsync();
+        FormClosing += (_, _) => _lifetime.Cancel();
+        FormClosed += (_, _) => _lifetime.Dispose();
         _shaLabel = Text_("Publisher-provided SHA-256", 9, bold: true);
         _shaLabel.SetBounds(23, 194, 474, 20);
         (_shaFrame, _sha) = InputBox(23, 216, 474);
@@ -101,7 +115,7 @@ internal sealed class RescueForm : VesperPopupForm
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
         body.Controls.AddRange([name, status, linkLabel, urlFrame, _advanced, _shaLabel, _shaFrame,
-            _pieceButton, _pieceLabel, _result]);
+            _pieceButton, _pieceLabel, _result, _refreshSource]);
         Controls.Add(body);
         Controls.Add(footer);
         VesperDialogChrome.Attach(this, "VESPER  /  Replace link", _colors, VesperIcon.Link);
@@ -171,7 +185,7 @@ internal sealed class RescueForm : VesperPopupForm
         Show("Checking the new link…", error: false);
         try
         {
-            RescueResult result = await _engine.ReplaceLinkAsync(_job.Id, link, new RescueInput(_sha.Text.Trim(), _pieceJson));
+            RescueResult result = await _engine.ReplaceLinkAsync(_job.Id, link, new RescueInput(_sha.Text.Trim(), _pieceJson), _lifetime.Token);
             if (result.Accepted)
             {
                 string message = result.RetainedBytes == 0
@@ -196,7 +210,38 @@ internal sealed class RescueForm : VesperPopupForm
         {
             Show("Something went wrong while checking the link: " + ex.Message + "\nYour saved data was not changed.", error: true);
         }
-        finally { SetBusy(false); }
+        finally { if (!IsDisposed) SetBusy(false); }
+    }
+
+    private async Task RefreshSourceAsync()
+    {
+        if (!Uri.TryCreate(_job.OriginalPageUrl, UriKind.Absolute, out var page)) return;
+        CancellationToken token = _lifetime.Token;
+        SetBusy(true);
+        Show("Resolving the original page and checking the selected format…", error: false);
+        try
+        {
+            using var resolver = new DefaultMediaResolver();
+            var discovery = await Task.Run(() => resolver.ResolveAsync(new MediaDiscoveryRequest
+            { Url = page, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token), token);
+            if (IsDisposed || token.IsCancellationRequested) return;
+            if (discovery.Item is not { } item)
+            { Show(discovery.Error?.UserMessage ?? "The original page could not be resolved. Saved data was kept.", true); return; }
+            var format = item.Representations.FirstOrDefault(r => r.Id == _job.MediaFormatId);
+            if (format is null || format.Protocol != StreamProtocol.Http || format.Context.HasCredentials
+                || format.Context.Origin is not null || format.Context.AcceptLanguage is not null)
+            { Show("The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.", true); return; }
+            if (item.MediaId is null)
+            { Show("The source does not expose a verifiable media identity. Saved data was kept.", true); return; }
+            var result = await _engine.RefreshMediaSourceAsync(_job.Id, new ResolvedMediaSource(item.Provider,
+                item.MediaId, format.Id, format.Url.AbsoluteUri, format.ExpiresAt), token);
+            if (IsDisposed || token.IsCancellationRequested) return;
+            Show(result.Message, !result.Accepted);
+            if (result.Accepted) { _replace.Visible = false; _refreshSource.Visible = false; _cancel.Text = "Done"; }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception) { if (!IsDisposed) Show("Source refresh failed. No replacement was accepted; saved data was kept.", true); }
+        finally { if (!IsDisposed) SetBusy(false); }
     }
 
     private void StartSeparateCopy()
@@ -209,7 +254,7 @@ internal sealed class RescueForm : VesperPopupForm
 
     private void SetBusy(bool busy)
     {
-        _replace.Enabled = !busy;
+        _replace.Enabled = _refreshSource.Enabled = !busy;
         _url.Enabled = _sha.Enabled = _pieceButton.Enabled = _advanced.Enabled = !busy;
         UseWaitCursor = busy;
     }

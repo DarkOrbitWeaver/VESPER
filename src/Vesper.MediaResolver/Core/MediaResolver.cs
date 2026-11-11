@@ -68,13 +68,41 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         ArgumentNullException.ThrowIfNull(request);
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
+        // Per-call scratch state must not survive request reuse or race another caller using the same request object.
+        request = new MediaDiscoveryRequest { Url = request.Url, Browser = request.Browser, Options = request.Options, Progress = request.Progress };
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(_options.DiscoveryTimeout);
+        var trace = new DiscoveryTrace { Parent = DiscoveryTrace.Current.Value };
+        DiscoveryTrace.Current.Value = trace;
+        MediaDiscoveryResult result;
         try
         {
-            return await ResolveCoreAsync(request, cancellationToken).ConfigureAwait(false);
+            result = await ResolveGuardedAsync(request, deadline.Token, cancellationToken).ConfigureAwait(false);
+            if (result.Item is { } item)
+                request.Publish(new DiscoveryProgress(item.Title, item.Thumbnail, item.Representations.Count));
+            else if (result.Collection is { } collection)
+                request.Publish(new DiscoveryProgress(collection.Title, collection.Entries.FirstOrDefault()?.Thumbnail));
+        }
+        finally { DiscoveryTrace.Current.Value = trace.Parent; }
+        try { _options.Measurement?.Invoke(trace.Finish(result)); }
+        catch (Exception) { /* Diagnostics are optional and must not affect downloading. */ }
+        return result;
+    }
+
+    private async Task<MediaDiscoveryResult> ResolveGuardedAsync(MediaDiscoveryRequest request,
+        CancellationToken deadlineToken, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await ResolveCoreAsync(request, deadlineToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
+        }
+        catch (OperationCanceledException)
+        {
+            return MediaDiscoveryResult.Failure(MediaErrors.Network("The whole discovery deadline was exceeded."));
         }
         catch (MediaResolverException ex)
         {
@@ -82,7 +110,7 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         }
         catch (HttpRequestException ex)
         {
-            return MediaDiscoveryResult.Failure(MediaErrors.Network($"{ex.GetType().Name}: {ex.Message}"));
+            return MediaDiscoveryResult.Failure(MediaErrors.Network(ex.GetType().Name));
         }
         catch (Exception ex) when (ex is JsonException or XmlException or FormatException or InvalidOperationException or ArgumentException)
         {
@@ -102,9 +130,21 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         if (request.Browser is { } message)
             request.ValidatedBrowser = BrowserMessageValidator.Validate(message, svc.Now, _options);
 
-        string cacheKey = $"{request.Url.AbsoluteUri}|{request.Options.CollectionIntent}|{request.Options.PageToken}|{request.Options.IncludeSubtitles}";
+        string cacheKey = $"{request.Url.AbsoluteUri}|{request.Options.CollectionIntent}|{request.Options.PageToken}|{request.Options.IncludeSubtitles}|{request.Options.MaxCollectionItems}|{request.Options.ResolveEmbeds}|{request.Options.EmbedDepth}";
         bool cacheable = _cache is not null && request.Browser is null;
-        if (cacheable && _cache!.TryGet(cacheKey, svc.Now, out var hit)) return hit;
+        if (cacheable && _cache!.TryGet(cacheKey, svc.Now, out var hit))
+        {
+            if (DiscoveryTrace.Current.Value is { } trace) trace.CacheHit = true;
+            return hit;
+        }
+
+        // Browser candidates are already observed playback: do not refetch an inaccessible watch page first.
+        MediaDiscoveryResult? browserResult = null;
+        if (request.ValidatedBrowser is { Candidates.Count: > 0 })
+        {
+            browserResult = await GetAdapter(GenericAdapter.Descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
+            if (browserResult.IsSuccess) return ResultFinalizer.Finalize(browserResult, _options, svc.Now);
+        }
 
         MediaDiscoveryResult? result = null;
         foreach (var d in _descriptors)
@@ -118,7 +158,7 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
 
         if (result is null || (!result.IsSuccess && ShouldTryGeneric(result, request)))
         {
-            var generic = await GetAdapter(GenericAdapter.Descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
+            var generic = browserResult ?? await GetAdapter(GenericAdapter.Descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
             // Keep a specific adapter's precise error when the generic scan finds nothing either.
             if (result is null || generic.IsSuccess) result = generic;
         }

@@ -19,7 +19,7 @@ public enum JobState
 }
 
 public enum JobPriority { Low = -1, Normal = 0, High = 1 }
-public enum JobKind { Http = 0, Hls = 1 }
+public enum JobKind { Http = 0, Hls = 1, Dash = 2 }
 
 /// <summary>How strongly the remote representation can be identified across requests.</summary>
 public enum IdentityLevel
@@ -100,6 +100,7 @@ public sealed class DownloadJob
     public string? MediaProvider { get; set; }
     public string? MediaId { get; set; }
     public string? MediaQuality { get; set; }
+    public string? MediaFormatId { get; set; }
     public string? MediaThumbnailUrl { get; set; }
     public DateTimeOffset? MediaExpiresAt { get; set; }
 
@@ -115,6 +116,9 @@ public sealed class DownloadJob
 
     /// <summary>HLS cursor etc. Committed in the same transaction as the extents.</summary>
     public string? MediaState { get; set; }
+
+    /// <summary>Versioned immutable fragment plan. No cookies, keys or authorization headers.</summary>
+    public string? MediaPlanJson { get; set; }
 
     /// <summary>Incremented by every durable checkpoint; also written to the recovery manifest.</summary>
     public long Generation { get; set; }

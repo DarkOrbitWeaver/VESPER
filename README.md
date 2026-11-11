@@ -18,3 +18,11 @@ Changes from U1:
 **Important verification limit:** Prepared in a Linux environment without .NET SDK or the Windows WinForms design host. Static checks passed, but this ZIP has **not** been compiled or visually exercised in Windows. Please build and open **View Designer**; a designer exception or compiler error screenshot is the most useful next input if the environment exposes an issue.
 
 See `DOCUMENTATION/U2_DESIGNER_AND_VISUAL_CHECKLIST.md` and `DOCUMENTATION/U2_STATIC_QA_RESULTS.txt`.
+
+
+## Media-engine reliability update
+
+This working branch updates the existing WinForms/engine solution, not a replacement application.
+See [implementation and executed checks](MEDIA_ENGINE_REPORT.md), [verified compatibility](MEDIA_ENGINE_COMPATIBILITY.md),
+[remaining limitations](MEDIA_ENGINE_LIMITATIONS.md), and [raw benchmark methodology/results](reports/BENCHMARKS.md).
+The update deliberately does not claim yt-dlp parity, live YouTube success, or a general separate-track muxer.

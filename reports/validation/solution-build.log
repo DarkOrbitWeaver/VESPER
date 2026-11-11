@@ -1,0 +1,18 @@
+  Determining projects to restore...
+  Restored /app/VESPER/src/Vesper.MediaResolver/Vesper.MediaResolver.csproj (in 276 ms).
+  Restored /app/VESPER/tests/Vesper.Tests/Vesper.Tests.csproj (in 341 ms).
+  Restored /app/VESPER/src/Vesper.Engine/Vesper.Engine.csproj (in 338 ms).
+  Restored /app/VESPER/tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj (in 321 ms).
+  2 of 6 projects are up-to-date for restore.
+  Vesper.MediaResolver -> /app/VESPER/src/Vesper.MediaResolver/bin/Release/net10.0/Vesper.MediaResolver.dll
+  Vesper.MediaResolver.Tests -> /app/VESPER/tests/Vesper.MediaResolver.Tests/bin/Release/net10.0/Vesper.MediaResolver.Tests.dll
+  Vesper.Engine -> /app/VESPER/src/Vesper.Engine/bin/Release/net10.0/Vesper.Engine.dll
+  Vesper.NativeHost -> /app/VESPER/src/Vesper.NativeHost/bin/Release/net10.0/vesper-host.dll
+  Vesper.Tests -> /app/VESPER/tests/Vesper.Tests/bin/Release/net10.0/Vesper.Tests.dll
+  VESPER -> /app/VESPER/bin/Release/net10.0-windows/VESPER.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:03.60

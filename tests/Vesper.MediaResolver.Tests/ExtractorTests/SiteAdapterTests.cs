@@ -58,7 +58,7 @@ public class SiteAdapterTests
             .AddFile("https://player.vimeo.com/video/76979871/config?h=abcdef1234", "vimeo_config.json");
         var res = await Resolve(h, "https://vimeo.com/76979871/abcdef1234");
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
-        Assert.Equal(1, h.Count("config?h=abcdef1234"));
+        Assert.Single(h.Requests, r => r.Url.AbsoluteUri.Contains("config?h=abcdef1234", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -225,7 +225,7 @@ public class SiteAdapterTests
         var res = await Resolve(h, "https://other.example.com/w/abcdef123456");
         Assert.False(res.IsSuccess);
         Assert.NotEqual("peertube", res.Item?.Provider);
-        Assert.Equal(1, h.Count("/api/v1/videos/"));            // probed once, then deferred to the generic adapter
+        Assert.Single(h.Requests, r => r.Url.AbsoluteUri.Contains("/api/v1/videos/", StringComparison.Ordinal));            // probed once, then deferred to the generic adapter
     }
 
     [Fact]

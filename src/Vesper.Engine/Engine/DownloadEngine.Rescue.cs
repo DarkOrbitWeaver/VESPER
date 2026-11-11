@@ -85,6 +85,8 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out job)) return Rejected("That entry no longer exists.");
             if (job.State == JobState.Completed) return Rejected("This download is already complete.");
+            if (job.Kind != JobKind.Http)
+                return Rejected("A streaming manifest is not a replacement file URL. Resolve the source into a new plan; the existing fragments remain untouched.");
             if (_sessions.TryGetValue(id, out JobSession? running)) { running.Intent = StopIntent.Pause; running.Cts.Cancel(); stopping = running.RunTask; }
         }
         if (stopping is not null) await Task.WhenAny(stopping, Task.Delay(TimeSpan.FromSeconds(15), ct)).ConfigureAwait(false);

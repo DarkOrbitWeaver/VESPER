@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using static VESPER.MediaTransferBridge;
 using Vesper.Engine;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
@@ -6,12 +7,6 @@ using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Playlists;
 
 namespace VESPER;
-
-/// <summary>Single-stream transfer handoff, including durable non-secret source provenance.</summary>
-internal sealed record MediaDownloadChoice(
-    string Url, string FileName, JobKind Kind, string? Referer, string? UserAgent,
-    string? OriginalPageUrl = null, string? Provider = null, string? MediaId = null,
-    string? Quality = null, string? ThumbnailUrl = null, DateTimeOffset? ExpiresAt = null);
 
 /// <summary>
 /// Event-driven media discovery. Uses the same WinForms visual language as other VESPER popups.
@@ -55,6 +50,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private ViewState _state = ViewState.Inspecting;
     private bool _busy;
     private bool _truncated;
+    private bool _hasMetadata;
+    private CancellationTokenSource? _attempt;
+    private CancellationTokenSource? _posterLoad;
+    private Uri? _posterUrl;
+    private readonly Dictionary<Uri, byte[]> _posterCache = new();
 
     public IReadOnlyList<MediaDownloadChoice> Selections { get; private set; } = [];
     public bool QueueOnly { get; private set; }
@@ -92,7 +92,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         {
             using var pen = new Pen(_colors.Border);
             e.Graphics.DrawRectangle(pen, 0, 0, _posterFrame.Width - 1, _posterFrame.Height - 1);
-            if (_poster.Image is null)
+            if (_poster?.Image is null)
                 VesperDrawing.Icon(e.Graphics, VesperIcon.Video,
                     new Rectangle((_posterFrame.Width - 27) / 2, (_posterFrame.Height - 27) / 2, 27, 27), _colors.MutedGreen);
         };
@@ -158,12 +158,14 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         AcceptButton = _download;
         Render(ViewState.Inspecting);
         Shown += async (_, _) => await DiscoverAsync();
-        FormClosing += (_, _) => _lifetime.Cancel();
+        FormClosing += (_, _) => { _lifetime.Cancel(); _attempt?.Cancel(); _posterLoad?.Cancel(); };
         FormClosed += (_, _) =>
         {
             _poster.Image?.Dispose();
             _resolver.Dispose();
             _thumbnails.Dispose();
+            _attempt?.Dispose();
+            _posterLoad?.Dispose();
             _lifetime.Dispose();
         };
     }
@@ -262,18 +264,33 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             return;
         }
 
+        _attempt?.Cancel();
+        _attempt?.Dispose();
+        _attempt = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        CancellationToken attempt = _attempt.Token;
         SetBusy(true, "Checking available media…");
+        _hasMetadata = false;
         _item = null;
         _collection = null;
         _playableFormats.Clear();
         _title.Text = "Checking link…";
         _notice.Text = "";
         Render(ViewState.Inspecting);
+        TryKnownYouTubeThumbnail(); // independent artwork request; never a claim of stream availability
+        var updates = new Progress<DiscoveryProgress>(update =>
+        {
+            if (attempt.IsCancellationRequested || IsDisposed) return;
+            if (!string.IsNullOrWhiteSpace(update.Title))
+            { _title.Text = update.Title; _hasMetadata = true; }
+            if (update.Thumbnail is not null) _ = LoadThumbnailAsync(update.Thumbnail);
+            if (update.RepresentationCount > 0 && _state == ViewState.Inspecting)
+                _status.Text = $"{update.RepresentationCount} source representations found; checking transfer compatibility…";
+        });
         try
         {
-            MediaDiscoveryResult result = await _resolver.ResolveAsync(new MediaDiscoveryRequest
-            { Url = _url, Browser = _browserContext,
-                Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, _lifetime.Token);
+            MediaDiscoveryResult result = await Task.Run(() => _resolver.ResolveAsync(new MediaDiscoveryRequest
+            { Url = _url, Browser = _browserContext, Progress = updates,
+                Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, attempt), attempt);
             if (_lifetime.IsCancellationRequested || IsDisposed) return;
             if (result.Item is { } item)
             {
@@ -292,7 +309,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                     ? "The browser butterfly may find a stream if it is available in the player."
                     : "This page may not expose a downloadable or supported stream.";
                 ShowUnavailable(message, hint);
-                TryKnownYouTubeThumbnail();
+
             }
         }
         catch (OperationCanceledException) { }
@@ -308,9 +325,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         _status.Text = reason;
         _notice.Text = hint;
-        if (_item is null)
+        if (_item is null && !_hasMetadata)
         {
-            _title.Text = "No compatible media found";
+            _title.Text = "Playback discovery unavailable";
             _source.Text = _url.Host;
         }
         Render(ViewState.Unavailable);
@@ -321,7 +338,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         // Public poster fallback only, not a guessed playable stream.
         string host = _url.Host.ToLowerInvariant();
         if (host is not ("youtube.com" or "www.youtube.com" or "m.youtube.com" or "youtu.be")) return;
-        string? id = host == "youtu.be" ? _url.AbsolutePath.Trim('/')
+        string[] parts = _url.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        string? id = host == "youtu.be" ? parts.FirstOrDefault()
+            : parts.Length >= 2 && parts[0] is "shorts" or "embed" or "live" ? parts[1]
             : _url.Query.TrimStart('?').Split('&')
                 .FirstOrDefault(x => x.StartsWith("v=", StringComparison.OrdinalIgnoreCase))?.Substring(2);
         if (id is { Length: 11 } && id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
@@ -330,16 +349,34 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private async Task LoadThumbnailAsync(Uri? url)
     {
-        if (url is null || url.Scheme != Uri.UriSchemeHttps) return;
+        if (url is null || url.Scheme != Uri.UriSchemeHttps || IsDisposed || _lifetime.IsCancellationRequested) return;
+        if (_posterUrl == url) return;
+        _posterLoad?.Cancel();
+        _posterLoad?.Dispose();
+        _posterLoad = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        CancellationToken token = _posterLoad.Token;
+        _posterUrl = url;
         try
         {
-            byte[]? imageBytes = await _thumbnails.GetThumbnailAsync(url, _lifetime.Token);
-            if (imageBytes is null || _lifetime.IsCancellationRequested || IsDisposed) return;
-            using var ms = new MemoryStream(imageBytes, writable: false);
-            using var decoded = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
-            if (decoded.Width > 4096 || decoded.Height > 4096 || (long)decoded.Width * decoded.Height > 4_000_000) return;
-            var image = new Bitmap(decoded);
-            if (_lifetime.IsCancellationRequested || IsDisposed) { image.Dispose(); return; }
+            if (!_posterCache.TryGetValue(url, out byte[]? imageBytes))
+            {
+                imageBytes = await _thumbnails.GetThumbnailAsync(url, token);
+                if (imageBytes is null) { if (_posterUrl == url) _posterUrl = null; return; }
+                if (token.IsCancellationRequested || IsDisposed) return;
+                if (_posterCache.Count >= 8) _posterCache.Remove(_posterCache.Keys.First());
+                _posterCache[url] = imageBytes;
+            }
+            byte[] bytes = imageBytes;
+            Bitmap? image = await Task.Run(() =>
+            {
+                token.ThrowIfCancellationRequested();
+                using var ms = new MemoryStream(bytes, writable: false);
+                using var decoded = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: true);
+                if (decoded.Width > 4096 || decoded.Height > 4096 || (long)decoded.Width * decoded.Height > 4_000_000) return null;
+                return new Bitmap(decoded);
+            }, token);
+            if (image is null) return;
+            if (token.IsCancellationRequested || IsDisposed) { image.Dispose(); return; }
             _poster.Image?.Dispose();
             _poster.Image = image;
             _poster.Visible = true;
@@ -348,20 +385,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         catch (Exception ex) when (ex is IOException or ArgumentException or OutOfMemoryException
             or System.Net.Http.HttpRequestException or Vesper.MediaResolver.Models.MediaResolverException
             or OperationCanceledException or ObjectDisposedException or System.Runtime.InteropServices.ExternalException)
-        { /* Poster is optional, placeholder remains. No secrets or raw URLs in UI. */ }
+        { if (_posterUrl == url) _posterUrl = null; /* optional artwork; placeholder remains */ }
     }
-
-    private static MediaItem PlayableOnly(MediaItem item) => item with
-    {
-        Representations = item.Representations.Where(r => !r.IsLive
-            && (r.Content is StreamContent.VideoAndAudio or StreamContent.AudioOnly)
-            && (r.Protocol is StreamProtocol.Http or StreamProtocol.Hls)
-            && !r.Context.HasCredentials
-            && r.Context.Origin is null
-            && r.Context.AcceptLanguage is null
-            && (r.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio | ProcessingRequirement.DashSegmentAssembly)) == 0)
-            .ToArray()
-    };
 
     private void UpdatePlayableFormats(MediaItem item)
     {
@@ -374,15 +399,16 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         if (_playableFormats.Count == 0)
         {
             ShowUnavailable(item.Representations.Count > 0
-                ? "Media was found, but the available formats need DASH or separate audio/video combining."
+                ? "Media was found, but none of its formats have an implemented complete transfer path."
                 : "This page did not provide a playable download stream.",
-                "VESPER won't create a silent or broken file. You can view the original or try the butterfly.");
+                "Separate-track muxing, unsupported containers and credential-dependent transfers are unavailable; no silent file will be queued.");
             return;
         }
 
         string[] options = _playableFormats.Select(r =>
         {
             var parts = new List<string> { r.Content == StreamContent.AudioOnly ? "Audio" : r.Height is { } h ? $"{h}p" : "Video" };
+            if (r.AudioUnverified) parts.Add("audio not confirmed");
             if (r.FrameRate is > 30.5) parts.Add($"{Math.Round(r.FrameRate.Value)} fps");
             if (r.VideoCodec is { Length: > 0 } codec) parts.Add(codec.ToUpperInvariant());
             if (r.Container is { Length: > 0 } container) parts.Add(container.ToUpperInvariant());
@@ -417,7 +443,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         FormatPreferences prefs = CurrentPreferences();
         var result = Prepare(_item, prefs, SelectedExactRepresentation());
         if (result.Choice is { } choice)
-            _notice.Text = $"Selected: {choice.Quality ?? "Available source"}. Only compatible complete streams are offered.";
+            _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
+                ? $"Selected: {choice.Quality ?? "Available source"}. Audio is unconfirmed and will be checked before publication."
+                : $"Selected: {choice.Quality ?? "Available source"}. Only implemented transfer paths are offered.";
         else
             _notice.Text = result.Error ?? "This preference isn't available for the source.";
         SetButtonsEnabled(result.Choice is not null);
@@ -435,43 +463,6 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         3 => FormatPreferences.AudioOnly with { AllowMuxing = false },
         _ => FormatPreferences.BestQuality with { AllowMuxing = false }
     };
-
-    private static (MediaDownloadChoice? Choice, string? Error) Prepare(MediaItem item, FormatPreferences prefs,
-        MediaRepresentation? exact = null)
-    {
-        var selection = exact is not null
-            ? new FormatSelection
-            {
-                Video = exact.Content == StreamContent.AudioOnly ? null : exact,
-                Audio = exact.Content == StreamContent.AudioOnly ? exact : null,
-                Requirements = exact.Requirements,
-                OutputContainer = exact.Container,
-                EstimatedSize = exact.FileSize,
-                Summary = exact.Content == StreamContent.AudioOnly ? "Audio only" : $"{exact.Height?.ToString() ?? "Source"}p · {exact.Container ?? "stream"}"
-            }
-            : FormatSelector.Select(PlayableOnly(item), prefs).Selection;
-        if (selection is null) return (null, "No compatible format satisfies this preference.");
-        PlanResult planResult = DownloadPlanBuilder.Build(item, selection);
-        if (planResult.Plan is not { } plan)
-            return (null, planResult.Error?.UserMessage ?? "This format isn't ready to download.");
-        if (plan.RequiresExternalHelper || plan.Steps.Count != 1 ||
-            (plan.Requirements & (ProcessingRequirement.DashSegmentAssembly | ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) != 0)
-            return (null, "This format requires audio/video processing that VESPER doesn't support yet.");
-        TransferStep step = plan.Steps[0];
-        if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls) || step.Context.HasCredentials
-            || step.Context.Origin is not null || step.Context.AcceptLanguage is not null)
-            return (null, "This source needs an unsupported transfer method or request context.");
-        if (step.Protocol == StreamProtocol.Hls && step.Segments is not null &&
-            !step.Url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
-            return (null, "This HLS stream needs a segment download path that isn't supported.");
-        string name = step.Protocol == StreamProtocol.Hls
-            ? Path.GetFileNameWithoutExtension(plan.SuggestedFileName) : plan.SuggestedFileName;
-        return (new MediaDownloadChoice(step.Url.AbsoluteUri, name,
-            step.Protocol == StreamProtocol.Hls ? JobKind.Hls : JobKind.Http,
-            step.Context.Referer, step.Context.UserAgent,
-            item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
-            item.Thumbnail?.AbsoluteUri, plan.ExpiresAt), null);
-    }
 
     private async Task LoadCollectionAsync()
     {
@@ -543,22 +534,30 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             {
                 int[] selected = _entries.CheckedIndices.Cast<int>().ToArray();
                 if (selected.Length == 0) { _status.Text = "Select at least one item."; return; }
-                for (int i = 0; i < selected.Length; i++)
+                var preparedItems = new (MediaDownloadChoice? Choice, string? Error)[selected.Length];
+                int completed = 0;
+                var progress = new Progress<int>(count =>
+                { if (!IsDisposed) _status.Text = $"Checked {count} of {selected.Length} selected media…"; });
+                await Task.Run(() => Parallel.ForEachAsync(Enumerable.Range(0, selected.Length),
+                    new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = _lifetime.Token }, async (i, token) =>
                 {
-                    _lifetime.Token.ThrowIfCancellationRequested();
                     CollectionEntry entry = collection[selected[i]];
-                    _status.Text = $"Checking {i + 1} of {selected.Length} selected media…";
-                    MediaDiscoveryResult result = entry.Resolved is { } ready
-                        ? MediaDiscoveryResult.FromItem(ready)
-                        : await _resolver.ResolveAsync(new MediaDiscoveryRequest
-                        { Url = entry.Url, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, _lifetime.Token);
-                    if (result.Item is { } item)
+                    try
                     {
-                        var prepared = Prepare(item, prefs);
-                        if (prepared.Choice is { } c) jobs.Add(c);
-                        else errors.Add($"{Limit(entry.Title ?? entry.MediaId, 35)}: {prepared.Error}");
+                        MediaDiscoveryResult result = entry.Resolved is { } ready ? MediaDiscoveryResult.FromItem(ready)
+                            : await _resolver.ResolveAsync(new MediaDiscoveryRequest
+                            { Url = entry.Url, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token);
+                        preparedItems[i] = result.Item is { } item ? Prepare(item, prefs)
+                            : (null, result.Error?.UserMessage ?? "Unavailable");
                     }
-                    else errors.Add($"{Limit(entry.Title ?? entry.MediaId, 35)}: {result.Error?.UserMessage ?? "Unavailable"}");
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception) { preparedItems[i] = (null, "This item could not be prepared."); }
+                    ((IProgress<int>)progress).Report(Interlocked.Increment(ref completed));
+                }), _lifetime.Token);
+                for (int i = 0; i < preparedItems.Length; i++)
+                {
+                    if (preparedItems[i].Choice is { } choice) jobs.Add(choice);
+                    else errors.Add($"{Limit(collection[selected[i]].Title ?? collection[selected[i]].MediaId, 35)}: {preparedItems[i].Error}");
                 }
             }
             if (IsDisposed || _lifetime.IsCancellationRequested) return;

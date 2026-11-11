@@ -107,7 +107,7 @@ public static class DashParser
                 if (!dynamic)
                 {
                     bool fmp4 = mime?.Contains("mp4", StringComparison.OrdinalIgnoreCase) == true;
-                    var tmpl = DashTemplate.Merge(Kid(aset, "SegmentTemplate"), Kid(rep, "SegmentTemplate"));
+                    var tmpl = DashTemplate.Merge(Kid(mpd, "SegmentTemplate"), Kid(period, "SegmentTemplate"), Kid(aset, "SegmentTemplate"), Kid(rep, "SegmentTemplate"));
                     var list = Kid(rep, "SegmentList") ?? Kid(aset, "SegmentList");
                     if (tmpl is not null)
                         plan = tmpl.Expand(repId, bandwidth, repBase, periodSeconds, maxSegments, fmp4);

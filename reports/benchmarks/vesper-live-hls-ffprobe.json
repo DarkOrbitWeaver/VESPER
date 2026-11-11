@@ -1,0 +1,20 @@
+{
+    "streams": [
+        {
+            "index": 0,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "duration": "633.765433"
+        },
+        {
+            "index": 1,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "duration": "634.633333"
+        }
+    ],
+    "format": {
+        "duration": "634.633333",
+        "size": "22418060"
+    }
+}

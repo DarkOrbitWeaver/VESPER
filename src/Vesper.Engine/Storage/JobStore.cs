@@ -39,6 +39,10 @@ public sealed class JobStore : IDisposable
         ALTER TABLE jobs ADD COLUMN media_quality TEXT;
         ALTER TABLE jobs ADD COLUMN media_thumbnail_url TEXT;
         ALTER TABLE jobs ADD COLUMN media_expires_at TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN media_plan_json TEXT;
+        ALTER TABLE jobs ADD COLUMN media_format_id TEXT;
         """
     ];
 
@@ -125,7 +129,9 @@ public sealed class JobStore : IDisposable
     private void BackupBeforeMigration(int version)
     {
         Execute("PRAGMA wal_checkpoint(TRUNCATE);");
-        File.Copy(_path, $"{_path}.bak-v{version}", overwrite: true);
+        string backup = $"{_path}.bak-v{version}";
+        if (File.Exists(backup)) backup += "-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N")[..8];
+        File.Copy(_path, backup, overwrite: false);
     }
 
     // ---- jobs -------------------------------------------------------------------------------------------------
@@ -137,7 +143,7 @@ public sealed class JobStore : IDisposable
         "speed_limit", "created_utc", "updated_utc", "completed_utc", "retry_count", "next_retry_utc", "etag", "last_modified",
         "accepts_ranges", "identity_level", "content_type", "category", "referer", "user_agent", "expected_sha256", "piece_map",
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
-        "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at"
+        "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id"
     ];
 
     private static readonly string UpsertSql =
@@ -196,8 +202,8 @@ public sealed class JobStore : IDisposable
     {
         yield return ("id", j.Id.ToString("D"));
         yield return ("kind", (int)j.Kind);
-        yield return ("source_url", j.SourceUrl);
-        yield return ("previous_urls", j.PreviousUrls);
+        yield return ("source_url", ProtectedMediaState.Protect(j.SourceUrl));
+        yield return ("previous_urls", ProtectedMediaState.Protect(j.PreviousUrls));
         yield return ("file_name", j.FileName);
         yield return ("name_locked", j.NameLocked ? 1 : 0);
         yield return ("destination", j.DestinationFolder);
@@ -224,7 +230,7 @@ public sealed class JobStore : IDisposable
         yield return ("identity_level", (int)j.Identity);
         yield return ("content_type", j.ContentType);
         yield return ("category", j.Category);
-        yield return ("referer", j.Referer);
+        yield return ("referer", ProtectedMediaState.Protect(j.Referer));
         yield return ("user_agent", j.UserAgent);
         yield return ("expected_sha256", j.ExpectedSha256);
         yield return ("piece_map", j.PieceMapJson);
@@ -233,13 +239,15 @@ public sealed class JobStore : IDisposable
         yield return ("sha256_verified", j.Sha256Verified ? 1 : 0);
         yield return ("unverified_resume", j.UnverifiedResumeApproved ? 1 : 0);
         yield return ("non_resumable", j.NonResumable ? 1 : 0);
-        yield return ("media_state", j.MediaState);
+        yield return ("media_state", ProtectedMediaState.Protect(j.MediaState));
+        yield return ("media_plan_json", ProtectedMediaState.Protect(j.MediaPlanJson));
+        yield return ("media_format_id", j.MediaFormatId);
         yield return ("generation", j.Generation);
-        yield return ("original_page_url", j.OriginalPageUrl);
+        yield return ("original_page_url", ProtectedMediaState.Protect(j.OriginalPageUrl));
         yield return ("media_provider", j.MediaProvider);
         yield return ("media_id", j.MediaId);
         yield return ("media_quality", j.MediaQuality);
-        yield return ("media_thumbnail_url", j.MediaThumbnailUrl);
+        yield return ("media_thumbnail_url", ProtectedMediaState.Protect(j.MediaThumbnailUrl));
         yield return ("media_expires_at", j.MediaExpiresAt?.ToString("O", CultureInfo.InvariantCulture));
     }
 
@@ -256,8 +264,8 @@ public sealed class JobStore : IDisposable
         {
             Id = Guid.Parse(Str("id")),
             Kind = (JobKind)Int("kind"),
-            SourceUrl = Str("source_url"),
-            PreviousUrls = Str("previous_urls"),
+            SourceUrl = ProtectedMediaState.Unprotect(Str("source_url")) ?? "",
+            PreviousUrls = ProtectedMediaState.Unprotect(Str("previous_urls")) ?? "",
             FileName = Str("file_name"),
             NameLocked = Int("name_locked") != 0,
             DestinationFolder = Str("destination"),
@@ -283,7 +291,7 @@ public sealed class JobStore : IDisposable
             Identity = (IdentityLevel)Int("identity_level"),
             ContentType = NStr("content_type"),
             Category = Str("category"),
-            Referer = NStr("referer"),
+            Referer = ProtectedMediaState.Unprotect(NStr("referer")),
             UserAgent = NStr("user_agent"),
             ExpectedSha256 = NStr("expected_sha256"),
             PieceMapJson = NStr("piece_map"),
@@ -292,13 +300,15 @@ public sealed class JobStore : IDisposable
             Sha256Verified = Int("sha256_verified") != 0,
             UnverifiedResumeApproved = Int("unverified_resume") != 0,
             NonResumable = Int("non_resumable") != 0,
-            MediaState = NStr("media_state"),
+            MediaState = ProtectedMediaState.Unprotect(NStr("media_state")),
+            MediaPlanJson = ProtectedMediaState.Unprotect(NStr("media_plan_json")),
+            MediaFormatId = NStr("media_format_id"),
             Generation = Int("generation"),
-            OriginalPageUrl = NStr("original_page_url"),
+            OriginalPageUrl = ProtectedMediaState.Unprotect(NStr("original_page_url")),
             MediaProvider = NStr("media_provider"),
             MediaId = NStr("media_id"),
             MediaQuality = NStr("media_quality"),
-            MediaThumbnailUrl = NStr("media_thumbnail_url"),
+            MediaThumbnailUrl = ProtectedMediaState.Unprotect(NStr("media_thumbnail_url")),
             MediaExpiresAt = NStr("media_expires_at") is { } expiry ? DateTimeOffset.Parse(expiry, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind) : null
         };
     }

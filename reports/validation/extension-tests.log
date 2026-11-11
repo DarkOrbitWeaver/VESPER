@@ -1,0 +1,46 @@
+TAP version 13
+# Subtest: offers Best / Balanced / Smaller / Audio only, de-duplicates qualities and never invents sizes
+ok 1 - offers Best / Balanced / Smaller / Audio only, de-duplicates qualities and never invents sizes
+  ---
+  duration_ms: 4.382396
+  type: 'test'
+  ...
+# Subtest: size estimates are marked approximate and only appear with a real duration
+ok 2 - size estimates are marked approximate and only appear with a real duration
+  ---
+  duration_ms: 1.164098
+  type: 'test'
+  ...
+# Subtest: audio-only is not offered when the stream has none
+ok 3 - audio-only is not offered when the stream has none
+  ---
+  duration_ms: 0.925185
+  type: 'test'
+  ...
+# Subtest: a direct file gets exactly one honest choice with its real type and size
+ok 4 - a direct file gets exactly one honest choice with its real type and size
+  ---
+  duration_ms: 1.033724
+  type: 'test'
+  ...
+# Subtest: unsupported sources and a missing connection are reported, not hidden
+ok 5 - unsupported sources and a missing connection are reported, not hidden
+  ---
+  duration_ms: 2.499787
+  type: 'test'
+  ...
+# Subtest: requests carry the protocol version and a valid id
+ok 6 - requests carry the protocol version and a valid id
+  ---
+  duration_ms: 0.912975
+  type: 'test'
+  ...
+1..6
+# tests 6
+# suites 0
+# pass 6
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 65.274741

@@ -14,7 +14,7 @@ internal static class RecoveryManifest
     public const string Extension = ".vmeta";
 
     private sealed record Body(int V, Guid JobId, long Generation, string Url, string FileName, long? Total,
-        string Extents, string? ETag, string? LastModified, int Identity, string Destination);
+        string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0);
 
     private sealed record Envelope(string Check, string Body);
 
@@ -24,7 +24,7 @@ internal static class RecoveryManifest
     {
         if (job.PartialPath.Length == 0) return;
         var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
-            job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder);
+            job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder, (int)job.Kind);
         string bodyJson = JsonSerializer.Serialize(body);
         string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
 
@@ -60,10 +60,11 @@ internal static class RecoveryManifest
 
             job = new DownloadJob
             {
-                Id = body.JobId, Kind = JobKind.Http, SourceUrl = body.Url, FileName = body.FileName, NameLocked = true,
+                Id = body.JobId, Kind = Enum.IsDefined((JobKind)body.Kind) ? (JobKind)body.Kind : JobKind.Http, SourceUrl = body.Url, FileName = body.FileName, NameLocked = true,
                 DestinationFolder = body.Destination, PartialPath = partial, TotalBytes = body.Total, Extents = extents,
-                State = JobState.NeedsLink, Reason = "restored",
-                Message = "Restored from a recovery file. Provide the download link again to continue.",
+                State = body.Kind == 0 ? JobState.NeedsLink : JobState.NeedsAttention, Reason = "restored",
+                Message = body.Kind == 0 ? "Restored from a recovery file. Provide the download link again to continue."
+                    : "Streaming partial restored without a private transfer plan. Resolve a new copy; saved fragments were kept and must not be treated as an ordinary HTTP file.",
                 ETag = body.ETag, Identity = (IdentityLevel)body.Identity, AcceptsRanges = true, Generation = body.Generation,
                 LastModified = DateTimeOffset.TryParse(body.LastModified, out DateTimeOffset lm) ? lm : null
             };

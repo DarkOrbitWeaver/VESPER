@@ -40,6 +40,7 @@ internal sealed class TikTokAdapter : AdapterBase
     {
         var page = await GetPageAsync(request.Url, request.AuthContext, ct).ConfigureAwait(false);
 
+        request.PageResponse = page;
         string? raw = null;
         foreach (var tag in HtmlScanner.Scan(page.Content))
         {
@@ -74,6 +75,7 @@ internal sealed class TikTokAdapter : AdapterBase
         };
 
         var video = s.P("video");
+        request.Publish(new DiscoveryProgress(s.P("desc").Str(), U(video.P("cover").Str())));
         var reps = new List<MediaRepresentation>();
         int i = 0;
         foreach (var b in video.P("bitrateInfo").Items())

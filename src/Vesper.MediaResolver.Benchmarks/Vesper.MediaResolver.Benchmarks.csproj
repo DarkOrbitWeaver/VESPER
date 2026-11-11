@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <VesperSourceRoot Condition="'$(VesperSourceRoot)' == ''">../..</VesperSourceRoot>
+    <DefineConstants Condition="'$(Baseline)' == 'true'">$(DefineConstants);BASELINE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(VesperSourceRoot)/src/Vesper.MediaResolver/Vesper.MediaResolver.csproj" />
+    <ProjectReference Include="$(VesperSourceRoot)/src/Vesper.Engine/Vesper.Engine.csproj" />
+    <None Include="../../tests/Vesper.MediaResolver.Tests/Fixtures/youtube_watch.html" Link="Fixtures/youtube_watch.html" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(Baseline)' != 'true'">
+    <Compile Include="../../MediaTransferBridge.cs" Link="MediaTransferBridge.cs" />
+  </ItemGroup>
+</Project>

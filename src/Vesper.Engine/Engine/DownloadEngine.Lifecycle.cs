@@ -25,6 +25,20 @@ public sealed partial class DownloadEngine
         UpdateJob(job, j => { j.TotalBytes = total; j.State = JobState.Finalizing; j.Message = ""; });
         Failpoint("finalize.afterFlush");
 
+        if (job.Kind == JobKind.Http && job.MediaProvider is not null)
+        {
+            string extension = Path.GetExtension(job.FileName).ToLowerInvariant();
+            string type = job.ContentType?.ToLowerInvariant() ?? "";
+            string? format = extension == ".webm" || type.Contains("webm") ? "webm"
+                : extension is ".mp4" or ".m4a" or ".m4v" or ".mov" || type.Contains("mp4") ? "mp4" : null;
+            if (format is not null)
+            {
+                try { MediaTrackProbe.RequireAudio(file, format, ct); }
+                catch (MediaContainerException ex)
+                { return RunOutcome.NeedsAttention("media-validation", ex.Message + " Saved data was kept."); }
+            }
+        }
+
         if (job.ExpectedSha256 is { } expected)
         {
             SetPhase(job, JobState.Verifying);
@@ -39,6 +53,7 @@ public sealed partial class DownloadEngine
             UpdateJob(job, j => { j.Sha256Verified = true; j.State = JobState.Finalizing; });
         }
 
+        ct.ThrowIfCancellationRequested();
         session.CloseFile();                                  // release the handle before renaming
         return Publish(job);
     }

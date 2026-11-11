@@ -11,6 +11,7 @@ public sealed class JobSnapshot
     public string? MediaProvider { get; init; }
     public string? MediaId { get; init; }
     public string? MediaQuality { get; init; }
+    public string? MediaFormatId { get; init; }
     public string? MediaThumbnailUrl { get; init; }
     public DateTimeOffset? MediaExpiresAt { get; init; }
     public string Destination { get; init; } = "";

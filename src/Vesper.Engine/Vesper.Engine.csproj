@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Vesper.Tests" />
+    <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />
   </ItemGroup>
 
 </Project>

@@ -575,7 +575,7 @@ public partial class Form1 : Form
                 Kind: media.Kind, OriginalPageUrl: media.OriginalPageUrl,
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
-                MediaExpiresAt: media.ExpiresAt));
+                MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId));
             if (!result.Ok) problems.Add($"{UrlPolicy.Redact(media.Url)}\n   {result.Message}");
         }
         foreach (string url in dialog.DownloadUrls)

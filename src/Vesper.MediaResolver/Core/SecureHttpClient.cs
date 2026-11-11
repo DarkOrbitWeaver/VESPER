@@ -138,6 +138,9 @@ public sealed class SecureHttpClient : IDisposable
     /// </summary>
     public async Task<byte[]?> GetThumbnailAsync(Uri url, CancellationToken ct, int maxBytes = 768 * 1024)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(_o.RequestTimeout);
+        ct = timeout.Token;
         using var response = await SendAsync(HttpMethod.Get, url, null, ct, req =>
             req.Headers.TryAddWithoutValidation("Accept", "image/jpeg,image/png,image/gif")).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) return null;
@@ -195,6 +198,7 @@ public sealed class SecureHttpClient : IDisposable
         var visited = new HashSet<string>(StringComparer.Ordinal);
 
         await _gate.WaitAsync(ct).ConfigureAwait(false);
+        bool leased = false;
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -206,7 +210,7 @@ public sealed class SecureHttpClient : IDisposable
                 if (!visited.Add(url.AbsoluteUri))
                     throw new MediaResolverException(MediaErrors.Network("Redirect loop detected", retry: false));
 
-                var req = new HttpRequestMessage(method, url);
+                using var req = new HttpRequestMessage(method, url);
                 req.Headers.TryAddWithoutValidation("User-Agent", ctx.UserAgent ?? _o.UserAgent);
                 foreach (var kv in ctx.HeadersFor(url))
                 {
@@ -216,6 +220,7 @@ public sealed class SecureHttpClient : IDisposable
                 configure?.Invoke(req);
 
                 Interlocked.Increment(ref _requests);
+                DiscoveryTrace.Current.Value?.RequestStarted();
                 _o.Diagnostics?.Invoke($"{method} {UrlRedactor.Redact(url)}");
 
                 HttpResponseMessage resp;
@@ -231,7 +236,7 @@ public sealed class SecureHttpClient : IDisposable
                 {
                     for (Exception? inner = ex; inner is not null; inner = inner.InnerException)
                         if (inner is MediaResolverException mre) throw mre;
-                    throw new MediaResolverException(MediaErrors.Network($"{ex.GetType().Name} contacting {UrlRedactor.Redact(url)}: {ex.Message}"));
+                    throw new MediaResolverException(MediaErrors.Network($"{ex.GetType().Name} contacting {UrlRedactor.Redact(url)}"));
                 }
 
                 var status = resp.StatusCode;
@@ -248,12 +253,14 @@ public sealed class SecureHttpClient : IDisposable
                     url = next; // the next loop iteration re-validates it and re-filters credentials for the new host
                     continue;
                 }
+                resp.Content = new LeasedContent(resp.Content, _gate);
+                leased = true;
                 return resp;
             }
         }
         finally
         {
-            _gate.Release();
+            if (!leased) _gate.Release();
         }
     }
 
@@ -286,7 +293,7 @@ public sealed class SecureHttpClient : IDisposable
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException)
         {
-            throw new MediaResolverException(MediaErrors.Network($"Body read failed: {ex.Message}"));
+            throw new MediaResolverException(MediaErrors.Network($"Body read failed"));
         }
         finally
         {
@@ -316,9 +323,35 @@ public sealed class SecureHttpClient : IDisposable
         return nv.Contains('=') && nv.Length < 4096 ? nv : "";
     }
 
+    // The response owns its concurrency permit until its body is consumed/disposed, not merely until headers arrive.
+    private sealed class LeasedContent : HttpContent
+    {
+        private readonly HttpContent _inner;
+        private SemaphoreSlim? _lease;
+        internal LeasedContent(HttpContent inner, SemaphoreSlim lease)
+        {
+            _inner = inner;
+            _lease = lease;
+            foreach (var header in inner.Headers) Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => _inner.CopyToAsync(stream);
+        protected override Task<Stream> CreateContentReadStreamAsync() => _inner.ReadAsStreamAsync();
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken ct) => _inner.ReadAsStreamAsync(ct);
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _inner.Headers.ContentLength ?? 0;
+            return _inner.Headers.ContentLength is not null;
+        }
+        protected override void Dispose(bool disposing)
+        {
+            try { if (disposing) _inner.Dispose(); }
+            finally { Interlocked.Exchange(ref _lease, null)?.Release(); base.Dispose(disposing); }
+        }
+    }
+
     public void Dispose()
     {
         _client.Dispose();
-        _gate.Dispose();
+        // Do not dispose the managed semaphore: a closing response may still return its lease.
     }
 }

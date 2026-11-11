@@ -4,7 +4,7 @@ namespace Vesper.Engine;
 
 public sealed record HlsVariant(string Uri, long Bandwidth, int Width, int Height, string? Codecs, bool NeedsSeparateAudio, bool AudioOnly);
 public sealed record HlsKey(string? Uri, byte[]? Iv);
-public sealed record HlsMap(string Uri, long? Length, long? Offset);
+public sealed record HlsMap(string Uri, long? Length, long? Offset, HlsKey? Key = null);
 public sealed record HlsSegment(string Uri, double Duration, long? RangeLength, long? RangeOffset, HlsKey? Key, HlsMap? Map, long Sequence);
 
 public sealed class HlsMedia
@@ -28,8 +28,10 @@ public static class HlsParser
     public static IReadOnlyList<HlsVariant> ParseMaster(string text, Uri baseUri)
     {
         var variants = new List<HlsVariant>();
-        bool hasAudioRendition = text.Split('\n').Any(l => l.StartsWith("#EXT-X-MEDIA:", StringComparison.Ordinal)
-            && Attributes(l).GetValueOrDefault("TYPE", "").Equals("AUDIO", StringComparison.OrdinalIgnoreCase) && Attributes(l).ContainsKey("URI"));
+        var externalAudioGroups = text.Split('\n').Select(l => l.Trim())
+            .Where(l => l.StartsWith("#EXT-X-MEDIA:", StringComparison.Ordinal)).Select(Attributes)
+            .Where(a => a.GetValueOrDefault("TYPE") == "AUDIO" && a.ContainsKey("URI"))
+            .Select(a => a.GetValueOrDefault("GROUP-ID", "")).ToHashSet(StringComparer.Ordinal);
 
         string[] lines = text.Replace("\r", "").Split('\n');
         for (int i = 0; i < lines.Length - 1; i++)
@@ -48,7 +50,8 @@ public static class HlsParser
                 && !codecs.Contains("hvc", StringComparison.OrdinalIgnoreCase) && !codecs.Contains("hev", StringComparison.OrdinalIgnoreCase)
                 && !codecs.Contains("vp0", StringComparison.OrdinalIgnoreCase) && !codecs.Contains("av01", StringComparison.OrdinalIgnoreCase);
             // A variant that points at an audio group carries picture only; joining needs a muxer VESPER does not ship.
-            bool separateAudio = a.ContainsKey("AUDIO") && hasAudioRendition && !audioOnly;
+            bool separateAudio = a.TryGetValue("AUDIO", out var group) && externalAudioGroups.Contains(group) && !audioOnly;
+            if (variants.Count >= 1000) break;
             variants.Add(new HlsVariant(new Uri(baseUri, uri).AbsoluteUri, bandwidth, width, height, codecs, separateAudio, audioOnly));
         }
         return variants;
@@ -61,7 +64,9 @@ public static class HlsParser
         HlsMap? map = null;
         long sequence = 0;
         double duration = 0;
-        long? rangeLength = null, rangeOffset = null, nextOffset = 0;
+        long? rangeLength = null, rangeOffset = null, nextOffset = null;
+        string? previousResource = null;
+        bool implicitRange = false;
 
         foreach (string raw in text.Replace("\r", "").Split('\n'))
         {
@@ -71,14 +76,20 @@ public static class HlsParser
             if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:", StringComparison.Ordinal))
                 long.TryParse(line["#EXT-X-MEDIA-SEQUENCE:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out sequence);
             else if (line.StartsWith("#EXT-X-ENDLIST", StringComparison.Ordinal)) media.IsVod = true;
-            else if (line.StartsWith("#EXT-X-PLAYLIST-TYPE:VOD", StringComparison.Ordinal)) media.IsVod = true;
+            else if (line is "#EXT-X-DISCONTINUITY" or "#EXT-X-GAP" or "#EXT-X-I-FRAMES-ONLY")
+                media.Unsupported = "Discontinuous, missing or I-frame-only media requires processing that is not supported.";
             else if (line.StartsWith("#EXTINF:", StringComparison.Ordinal))
                 double.TryParse(line["#EXTINF:".Length..].Split(',')[0], NumberStyles.Float, CultureInfo.InvariantCulture, out duration);
             else if (line.StartsWith("#EXT-X-BYTERANGE:", StringComparison.Ordinal))
             {
                 string[] parts = line["#EXT-X-BYTERANGE:".Length..].Split('@');
-                if (long.TryParse(parts[0], out long len)) rangeLength = len;
-                rangeOffset = parts.Length > 1 && long.TryParse(parts[1], out long off) ? off : nextOffset;
+                if (parts.Length > 2 || !long.TryParse(parts[0], out long len) || len <= 0)
+                    media.Unsupported = "The playlist contains an invalid byte-range length.";
+                else rangeLength = len;
+                implicitRange = parts.Length == 1;
+                if (implicitRange) rangeOffset = nextOffset;
+                else if (long.TryParse(parts[1], out long off) && off >= 0) rangeOffset = off;
+                else media.Unsupported = "The playlist contains an invalid byte-range offset.";
             }
             else if (line.StartsWith("#EXT-X-KEY:", StringComparison.Ordinal))
             {
@@ -87,22 +98,43 @@ public static class HlsParser
                 string format = a.GetValueOrDefault("KEYFORMAT", "identity");
                 if (method == "NONE") key = null;
                 else if (method == "AES-128" && format == "identity")
-                    key = new HlsKey(a.GetValueOrDefault("URI") is { } k ? new Uri(baseUri, k).AbsoluteUri : null, ParseIv(a.GetValueOrDefault("IV")));
+                {
+                    byte[]? iv = ParseIv(a.GetValueOrDefault("IV"));
+                    if (a.ContainsKey("IV") && iv is null) media.Unsupported = "The AES-128 IV is invalid.";
+                    key = new HlsKey(a.GetValueOrDefault("URI") is { } k ? new Uri(baseUri, k).AbsoluteUri : null, iv);
+                }
                 else media.Unsupported = $"The stream uses protection that VESPER does not support ({method}/{format}).";
             }
             else if (line.StartsWith("#EXT-X-MAP:", StringComparison.Ordinal))
             {
                 Dictionary<string, string> a = Attributes(line);
                 long? length = null, offset = null;
-                if (a.GetValueOrDefault("BYTERANGE")?.Split('@') is { Length: > 0 } br && long.TryParse(br[0], out long l))
-                { length = l; offset = br.Length > 1 && long.TryParse(br[1], out long o) ? o : 0; }
-                map = new HlsMap(new Uri(baseUri, a["URI"]).AbsoluteUri, length, offset);
+                if (a.GetValueOrDefault("BYTERANGE")?.Split('@') is { } br)
+                {
+                    if (br.Length != 2 || !long.TryParse(br[0], out long l) || l <= 0 || !long.TryParse(br[1], out long o) || o < 0 || o > long.MaxValue - l)
+                        media.Unsupported = "An initialization byte range needs a valid explicit offset.";
+                    else { length = l; offset = o; }
+                }
+                if (!a.TryGetValue("URI", out string? mapUrl)) media.Unsupported = "Initialization has no URI.";
+                else map = new HlsMap(new Uri(baseUri, mapUrl).AbsoluteUri, length, offset, key);
+                if (key is { Iv: null }) media.Unsupported = "Encrypted initialization requires an explicit AES IV.";
             }
             else if (!line.StartsWith('#'))
             {
-                media.Segments.Add(new HlsSegment(new Uri(baseUri, line).AbsoluteUri, duration, rangeLength, rangeOffset, key, map, sequence++));
-                if (rangeLength is long rl && rangeOffset is long ro) nextOffset = ro + rl;
-                rangeLength = rangeOffset = null;
+                string resource = new Uri(baseUri, line).AbsoluteUri;
+                if (media.Segments.Count >= 50_000) { media.Unsupported = "The playlist exceeds the segment limit."; break; }
+                if (duration <= 0 || !double.IsFinite(duration)) media.Unsupported = "A segment has no valid finite duration.";
+                if (implicitRange && (previousResource != resource || nextOffset is null))
+                    media.Unsupported = "An implicit byte range must follow a range of the same resource.";
+                if (rangeLength is long rl && rangeOffset is long ro)
+                {
+                    if (ro > long.MaxValue - rl) media.Unsupported = "A byte range overflows.";
+                    else nextOffset = ro + rl;
+                }
+                else nextOffset = null;
+                media.Segments.Add(new HlsSegment(resource, duration, rangeLength, rangeOffset, key, map, sequence++));
+                previousResource = resource;
+                rangeLength = rangeOffset = null; implicitRange = false;
                 duration = 0;
             }
         }

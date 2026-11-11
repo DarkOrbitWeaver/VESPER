@@ -1,0 +1,10 @@
+  Determining projects to restore...
+  Restored /app/VESPER/tests/Vesper.Tests/Vesper.Tests.csproj (in 1.37 sec).
+  Restored /app/VESPER/src/Vesper.Engine/Vesper.Engine.csproj (in 1.37 sec).
+  Vesper.Engine -> /app/VESPER/src/Vesper.Engine/bin/Debug/net10.0/Vesper.Engine.dll
+  Vesper.Tests -> /app/VESPER/tests/Vesper.Tests/bin/Debug/net10.0/Vesper.Tests.dll
+Test run for /app/VESPER/tests/Vesper.Tests/bin/Debug/net10.0/Vesper.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:   161, Skipped:     0, Total:   161, Duration: 23 s - Vesper.Tests.dll (net10.0)
+VSTEST_ARTIFACTS_DIRECTORY environment variable was not found, falling back to a user-private temporary directory. This is most likely caused by an outdated Microsoft.NET.Test.Sdk package reference in the test project.

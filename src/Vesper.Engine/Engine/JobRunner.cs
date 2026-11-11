@@ -27,9 +27,13 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         CancellationToken ct = session.Cts.Token;
         try
         {
-            return Job.Kind == JobKind.Hls
-                ? await new HlsTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false)
-                : await TransferAsync(ct).ConfigureAwait(false);
+            return Job.Kind switch
+            {
+                JobKind.Hls => await new HlsTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
+                JobKind.Dash => await new DashTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
+                JobKind.Http => await TransferAsync(ct).ConfigureAwait(false),
+                _ => RunOutcome.NeedsAttention("unsupported-kind", "This download requires a newer engine. Saved data was kept.")
+            };
         }
         catch (FailpointCrash) { throw; }
         catch (RunnerStop stop) { await SettleAsync(); return stop.Outcome; }
