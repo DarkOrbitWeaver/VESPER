@@ -88,7 +88,7 @@ public sealed class JobStore : IDisposable
             try { store.Initialize(); return store; }
             catch { store.Dispose(); throw; }
         }
-        catch (SqliteException) when (File.Exists(path))
+        catch (SqliteException ex) when (File.Exists(path) && (ex.SqliteErrorCode is 11 or 26))
         {
             string backup = Quarantine(path);
             var fresh = new JobStore(path);

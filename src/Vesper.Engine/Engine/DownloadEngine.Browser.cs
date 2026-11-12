@@ -96,7 +96,7 @@ public sealed partial class DownloadEngine
             job.Extents.Add(new ByteRange(0, file.Length));
             SaveLocked(job, submission);
             _jobs[job.Id] = job;
-            _secrets.Remove(job.Id);
+            _credentials.Remove(job.Id);
             _missing.Remove(job.Id);
             Changed(job);
             Log(job.Id, "chrome-completed", "Chrome completed the download.");

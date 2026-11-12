@@ -204,11 +204,15 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
     // ---- first request -----------------------------------------------------------------------------------------
 
-    private RequestSpec BuildSpec(long? start, long? endInclusive) => new(
-        start, endInclusive,
-        IfRangeEtag: Job.Identity == IdentityLevel.StrongEtag ? Job.ETag : null,
-        IfRangeDate: Job.Identity == IdentityLevel.LastModified ? Job.LastModified : null,
-        Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: engine.SecretsFor(Job.Id));
+    private RequestSpec BuildSpec(long? start, long? endInclusive)
+    {
+        RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+        return new RequestSpec(start, endInclusive,
+            IfRangeEtag: Job.Identity == IdentityLevel.StrongEtag ? Job.ETag : null,
+            IfRangeDate: Job.Identity == IdentityLevel.LastModified ? Job.LastModified : null,
+            Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
+            CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
+    }
 
     private async Task<FirstResult> OpenFirstAsync(long start, CancellationToken ct)
     {

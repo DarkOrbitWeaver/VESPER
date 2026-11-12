@@ -143,7 +143,11 @@ public sealed partial class DownloadEngine
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.
             _jobs[id] = job;
-            if (request.Secrets is { Count: > 0 }) _secrets[id] = new Dictionary<string, string>(request.Secrets);
+            if (request.Secrets is { Count: > 0 })
+            {
+                Uri origin = new UriBuilder(uri) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
+                _credentials[id] = new RequestCredentials(origin, new Dictionary<string, string>(request.Secrets));
+            }
             // "Download" goes to the front of the queue and starts at once if a slot is free; otherwise it waits its turn.
             // Only the explicit "Start now" command may exceed the concurrency limit.
             Changed(job);
@@ -292,7 +296,7 @@ public sealed partial class DownloadEngine
             string? retained = job.State != JobState.Completed && File.Exists(job.PartialPath) ? job.PartialPath : null;
             _store.Delete(id);
             _jobs.Remove(id);
-            _secrets.Remove(id);
+            _credentials.Remove(id);
             _missing.Remove(id);
             _forced.Remove(id);
             Log(id, "removed", "Entry removed from list; no files deleted.");

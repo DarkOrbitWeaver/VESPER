@@ -248,8 +248,12 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         return iv;
     }
 
-    private RequestSpec Spec(long? start, long? end) =>
-        new(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: engine.SecretsFor(Job.Id));
+    private RequestSpec Spec(long? start, long? end)
+    {
+        RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+        return new RequestSpec(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent,
+            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
+    }
 
     private static RunnerStop StatusStop(HttpResponseMessage response)
     {

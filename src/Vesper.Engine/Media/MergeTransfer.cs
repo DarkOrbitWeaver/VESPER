@@ -149,7 +149,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         try
         {
             using var response = await http.SendAsync(uri, new RequestSpec(from, toInclusive, Referer: Job.Referer,
-                UserAgent: Job.UserAgent), ct).ConfigureAwait(false);
+                UserAgent: Job.UserAgent, CredentialOrigin: Job.SourceUrl), ct).ConfigureAwait(false);
             int status = (int)response.StatusCode;
             if (status != 206) throw new RunnerStop(status switch
             {

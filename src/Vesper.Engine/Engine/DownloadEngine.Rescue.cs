@@ -57,7 +57,7 @@ public static class RescueEvaluator
 
         bool sameTime = job.LastModified is not null && probe.LastModified is not null
             && job.LastModified.Value.ToUnixTimeSeconds() == probe.LastModified.Value.ToUnixTimeSeconds();
-        if (job.Identity >= IdentityLevel.LastModified && sameResource && sameTime && (probe.StrongEtag is null || job.Identity != IdentityLevel.StrongEtag))
+        if (job.Identity == IdentityLevel.LastModified && sameResource && sameTime)
             return Accept(RescueMode.R0, "Same address, size and modification time. Saved data will be reused.");
 
         if (trustedSha256 is not null)
@@ -151,7 +151,9 @@ public sealed partial class DownloadEngine
 
     private async Task<ProbeFacts> ProbeAsync(DownloadJob job, Uri uri, long offset, CancellationToken ct)
     {
-        var spec = new RequestSpec(offset, null, Referer: job.Referer, UserAgent: job.UserAgent, Secrets: SecretsFor(job.Id));
+        RequestCredentials? credentials = CredentialsFor(job.Id);
+        var spec = new RequestSpec(offset, null, Referer: job.Referer, UserAgent: job.UserAgent,
+            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? job.SourceUrl);
         using HttpResponseMessage response = await _http.SendAsync(uri, spec, ct).ConfigureAwait(false);
         int status = (int)response.StatusCode;
         RangeCheck check = HttpFacts.CheckRangeResponse(response, offset, null);
