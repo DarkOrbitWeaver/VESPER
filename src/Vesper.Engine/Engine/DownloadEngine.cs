@@ -22,7 +22,7 @@ public sealed partial class DownloadEngine : IDisposable
     private readonly Dictionary<Guid, DownloadJob> _jobs = [];
     private readonly Dictionary<Guid, JobSession> _sessions = [];
     private readonly Dictionary<string, SemaphoreSlim> _hostGates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<Guid, Dictionary<string, string>> _secrets = [];
+    private readonly Dictionary<Guid, RequestCredentials> _credentials = [];
     private readonly HashSet<Guid> _forced = [];
     private readonly HashSet<Guid> _missing = [];
     private readonly ConcurrentQueue<JobSnapshot> _outbox = new();
@@ -44,11 +44,23 @@ public sealed partial class DownloadEngine : IDisposable
     {
         Options = options;
         Directory.CreateDirectory(options.DataDirectory);
-        _store = JobStore.Open(Path.Combine(options.DataDirectory, "vesper.db"));
-        _http = new HttpTransport(options);
-        _retry = new RetryPolicy(options.Retry);
-        GlobalLimiter.SetRate(options.GlobalLimitBytesPerSecond);
-        foreach (DownloadJob job in _store.LoadAll()) _jobs[job.Id] = job;
+        JobStore store = JobStore.Open(Path.Combine(options.DataDirectory, "vesper.db"));
+        HttpTransport? http = null;
+        try
+        {
+            http = new HttpTransport(options);
+            _store = store;
+            _http = http;
+            _retry = new RetryPolicy(options.Retry);
+            GlobalLimiter.SetRate(options.GlobalLimitBytesPerSecond);
+            foreach (DownloadJob job in store.LoadAll()) _jobs[job.Id] = job;
+        }
+        catch
+        {
+            http?.Dispose();
+            store.Dispose();
+            throw;
+        }
         NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
     }
 
@@ -149,9 +161,9 @@ public sealed partial class DownloadEngine : IDisposable
         }
     }
 
-    internal IReadOnlyDictionary<string, string>? SecretsFor(Guid id)
+    internal RequestCredentials? CredentialsFor(Guid id)
     {
-        lock (_lock) return _secrets.GetValueOrDefault(id);
+        lock (_lock) return _credentials.GetValueOrDefault(id);
     }
 
     internal void Log(Guid? jobId, string kind, string detail)

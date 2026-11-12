@@ -14,7 +14,8 @@ public static class FileNames
     {
         "CON", "PRN", "AUX", "NUL",
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"
     };
 
     public static string Sanitize(string? raw, string fallback = "download")
@@ -36,8 +37,9 @@ public static class FileNames
         name = builder.ToString().Trim().TrimEnd('.', ' ');
         if (name.Length == 0 || name.All(c => c == '.' || c == '_')) return fallback;
 
-        string stem = Path.GetFileNameWithoutExtension(name);
-        if (ReservedDeviceNames.Contains(stem)) name = "_" + name;
+        int firstDot = name.IndexOf('.');
+        string firstSegment = firstDot < 0 ? name : name[..firstDot];
+        if (ReservedDeviceNames.Contains(firstSegment.Trim())) name = "_" + name;
 
         if (name.Length > MaxLength)
         {

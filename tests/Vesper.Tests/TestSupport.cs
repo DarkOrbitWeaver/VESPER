@@ -45,8 +45,17 @@ internal sealed class FaultServer : IAsyncDisposable
     public string BaseUrl { get; private set; } = "";
     public int Hits(string path) => _hits.GetValueOrDefault(path);
     public ConcurrentQueue<string> RangeHeaders { get; } = new();
+    public ConcurrentDictionary<string, string> HlsPlaylists { get; } = new();
+    public ConcurrentDictionary<string, byte[]> HlsFiles { get; } = new();
+    public ConcurrentDictionary<string, string> Redirects { get; } = new();
+    public ConcurrentDictionary<string, ConcurrentQueue<ObservedHeaders>> Requests { get; } = new();
     /// <summary>Additional range-capable payloads by path (merge-job tests register synthetic media here).</summary>
     public ConcurrentDictionary<string, byte[]> Extra { get; } = new();
+
+    public sealed record ObservedHeaders(string? Cookie, string? Authorization, string? Referer);
+
+    public IReadOnlyList<ObservedHeaders> RequestsFor(string path) =>
+        Requests.TryGetValue(path, out ConcurrentQueue<ObservedHeaders>? requests) ? requests.ToArray() : [];
 
     public FaultServer(int size = 2 * 1024 * 1024)
     {
@@ -71,8 +80,18 @@ internal sealed class FaultServer : IAsyncDisposable
     {
         string path = ctx.Request.Path.Value ?? "/";
         int hit = _hits.AddOrUpdate(path, 1, (_, n) => n + 1);
+        Requests.GetOrAdd(path, _ => new()).Enqueue(new ObservedHeaders(
+            ctx.Request.Headers["Cookie"].FirstOrDefault(),
+            ctx.Request.Headers["Authorization"].FirstOrDefault(),
+            ctx.Request.Headers["Referer"].FirstOrDefault()));
         if (ctx.Request.Headers.TryGetValue("Range", out var range)) RangeHeaders.Enqueue(path + " " + range);
         HttpResponse res = ctx.Response;
+        if (Redirects.TryGetValue(path, out string? location))
+        {
+            res.StatusCode = 302;
+            res.Headers.Location = location;
+            return;
+        }
         if (path.StartsWith("/hls/")) { await HandleHls(ctx, path); return; }
         if (Extra.TryGetValue(path, out byte[]? extra)) { await Serve(ctx, extra, "\"x\"", Modified); return; }
 
@@ -157,6 +176,18 @@ internal sealed class FaultServer : IAsyncDisposable
         {
             res.ContentType = "application/vnd.apple.mpegurl";
             await res.WriteAsync(body);
+        }
+        if (HlsPlaylists.TryGetValue(path, out string? playlist))
+        {
+            await Text(playlist);
+            return;
+        }
+        if (HlsFiles.TryGetValue(path, out byte[]? media))
+        {
+            res.ContentType = "application/octet-stream";
+            res.ContentLength = media.Length;
+            await res.Body.WriteAsync(media);
+            return;
         }
         string Playlist(string header, bool endList = true)
         {

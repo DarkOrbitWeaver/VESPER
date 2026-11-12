@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
@@ -45,6 +46,13 @@ namespace VESPER
             catch (StoreTooNewException ex)
             {
                 VesperMessageBox.Show(ex.Message + "\n\nInstall the newer VESPER, or restore the backup next to the database.",
+                    "VESPER cannot start", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            catch (CryptographicException ex)
+            {
+                VesperMessageBox.Show("VESPER could not read protected download data. The database was left unchanged. " +
+                    "Open VESPER with the Windows account that created the data, or restore a known-good database backup.\n\n" + ex.Message,
                     "VESPER cannot start", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }

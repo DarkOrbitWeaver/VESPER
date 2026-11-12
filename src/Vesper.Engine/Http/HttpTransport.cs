@@ -5,7 +5,7 @@ using System.Net.Sockets;
 
 namespace Vesper.Engine;
 
-/// <summary>One request's variable parts. Secrets are never persisted and never follow a cross-origin redirect.</summary>
+/// <summary>One request's variable parts. Secrets are never persisted and stay within the consented source origin.</summary>
 public sealed record RequestSpec(
     long? RangeStart = null,
     long? RangeEndInclusive = null,
@@ -13,7 +13,10 @@ public sealed record RequestSpec(
     DateTimeOffset? IfRangeDate = null,
     string? Referer = null,
     string? UserAgent = null,
-    IReadOnlyDictionary<string, string>? Secrets = null);
+    IReadOnlyDictionary<string, string>? Secrets = null,
+    string? CredentialOrigin = null);
+
+internal sealed record RequestCredentials(Uri Origin, IReadOnlyDictionary<string, string> Headers);
 
 public sealed class RedirectException(string message) : Exception(message);
 
@@ -73,6 +76,13 @@ internal sealed class HttpTransport : IDisposable
     {
         var visited = new HashSet<string>(StringComparer.Ordinal);
         Uri current = url;
+        Uri? credentialOrigin = null;
+        if (Uri.TryCreate(spec.CredentialOrigin, UriKind.Absolute, out Uri? parsedOrigin)
+            && parsedOrigin.Scheme is "http" or "https")
+            credentialOrigin = parsedOrigin;
+
+        bool initialRequestWithinCredentialOrigin = credentialOrigin is not null
+            && UrlPolicy.IsSameOrigin(credentialOrigin, url);
 
         for (int hop = 0; hop <= MaxRedirects; hop++)
         {
@@ -96,7 +106,10 @@ internal sealed class HttpTransport : IDisposable
                     throw new BlockedAddressException(current.IdnHost);
             }
 
-            using HttpRequestMessage request = BuildRequest(current, spec, UrlPolicy.IsSameOrigin(url, current));
+            bool sameRequestOrigin = UrlPolicy.IsSameOrigin(url, current);
+            bool sameCredentialOrigin = initialRequestWithinCredentialOrigin
+                && UrlPolicy.IsSameOrigin(credentialOrigin!, current);
+            using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
             HttpResponseMessage response = await SendOnceAsync(request, ct).ConfigureAwait(false);
             if (response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
             {
@@ -139,16 +152,19 @@ internal sealed class HttpTransport : IDisposable
         }
     }
 
-    private static HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameOrigin)
+    private static HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameRequestOrigin, bool sameCredentialOrigin)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
         request.Headers.TryAddWithoutValidation("User-Agent", string.IsNullOrWhiteSpace(spec.UserAgent) ? DefaultUserAgent : spec.UserAgent);
-        // A page URL can carry tokens. Never forward its full path/query to a
-        // different origin after a redirect, even if the original request supplied it.
-        if (sameOrigin && Uri.TryCreate(spec.Referer, UriKind.Absolute, out Uri? referer)
+        // Page URLs can carry tokens. Keep the full referrer on the source origin only.
+        if (sameRequestOrigin && Uri.TryCreate(spec.Referer, UriKind.Absolute, out Uri? referer)
             && referer.Scheme is "http" or "https")
-            request.Headers.Referrer = referer;
+        {
+            request.Headers.Referrer = sameCredentialOrigin && UrlPolicy.IsSameOrigin(referer, url)
+                ? referer
+                : new UriBuilder(referer) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
+        }
 
         if (spec.RangeStart is long start)
             request.Headers.Range = new RangeHeaderValue(start, spec.RangeEndInclusive);
@@ -160,7 +176,7 @@ internal sealed class HttpTransport : IDisposable
                 request.Headers.IfRange = new RangeConditionHeaderValue(date);
         }
 
-        if (sameOrigin && spec.Secrets is not null)
+        if (sameCredentialOrigin && spec.Secrets is not null)
         {
             foreach ((string name, string value) in spec.Secrets)
                 if (name is "Cookie" or "Authorization") request.Headers.TryAddWithoutValidation(name, value);
