@@ -1,8 +1,9 @@
 # Compatibility report
 
-**Last full verification run: never.** Nothing in this repository has been compiled or executed yet, and no live site has been
-contacted. The status below is therefore `NotTested` for every adapter. Fixture tests exist (`Vesper.MediaResolver.Tests/ExtractorTests`) but
-fixtures are synthetic reconstructions (see `Fixtures/FIXTURES.md`); passing them proves parsing logic, **not** live compatibility.
+> Historical standalone-resolver snapshot. Its `NotTested` statuses predate the live runs; see [current release status](../RELEASE.md) and [dated live matrix](../../MEDIA_ENGINE_COMPATIBILITY.md).
+
+**At this snapshot, no full verification run had been recorded.** No live site had been contacted. The statuses below are from that
+standalone package and are not current. Fixture tests prove parsing logic, **not** live compatibility.
 
 A site counts as *supported* only after a recorded run returns verified, actionable media from real authorised media. Record runs as
 `CompatibilityRecord`s and regenerate this table with `CompatibilityReport.ToMarkdown(...)` (the report generator derives everything else

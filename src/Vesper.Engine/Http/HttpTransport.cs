@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using Vesper.Shared;
 
 namespace Vesper.Engine;
 
@@ -35,6 +36,7 @@ internal sealed class HttpTransport : IDisposable
 
     private readonly EngineOptions _options;
     private readonly HttpClient _client;
+    private readonly OriginAwareProxy? _originAwareProxy;
     private readonly bool _validateProxyDns;
 
     public HttpTransport(EngineOptions options)
@@ -51,6 +53,7 @@ internal sealed class HttpTransport : IDisposable
             MaxConnectionsPerServer = Math.Max(options.MaxConnectionsPerHost, 4)
         };
 
+        IWebProxy? proxy = null;
         switch (options.Proxy)
         {
             case ProxyMode.Direct:
@@ -59,11 +62,17 @@ internal sealed class HttpTransport : IDisposable
                 break;
             case ProxyMode.System:
                 handler.UseProxy = true;
+                proxy = HttpClient.DefaultProxy;
                 break;
-            case ProxyMode.Custom when Uri.TryCreate(options.ProxyAddress, UriKind.Absolute, out Uri? proxy):
-                handler.Proxy = new WebProxy(proxy);
+            case ProxyMode.Custom when Uri.TryCreate(options.ProxyAddress, UriKind.Absolute, out Uri? customProxy):
+                proxy = new WebProxy(customProxy);
                 handler.UseProxy = true;
                 break;
+        }
+        if (handler.UseProxy)
+        {
+            _originAwareProxy = new OriginAwareProxy(proxy ?? HttpClient.DefaultProxy);
+            handler.Proxy = _originAwareProxy;
         }
         _validateProxyDns = handler.UseProxy && !options.AllowPrivateNetworks;
 
@@ -94,23 +103,29 @@ internal sealed class HttpTransport : IDisposable
                 deferred.Headers.RetryAfter = new RetryConditionHeaderValue(retryAt);
                 return deferred;
             }
+            IPAddress? proxyAddress = null;
             if (_validateProxyDns)
             {
                 using var dns = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 dns.CancelAfter(_options.ConnectTimeout);
-                IPAddress[] addresses;
-                try { addresses = await Dns.GetHostAddressesAsync(current.IdnHost, dns.Token).ConfigureAwait(false); }
-                catch (SocketException ex) { throw new TransientNetworkException("Could not verify the proxy destination in DNS.", ex); }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TransientNetworkException("DNS verification timed out."); }
-                if (addresses.Length == 0 || addresses.Any(address => !UrlPolicy.IsPublicAddress(address)))
-                    throw new BlockedAddressException(current.IdnHost);
+                try
+                {
+                    proxyAddress = await ResolveProxyDestinationAsync(current, dns.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new TransientNetworkException("DNS verification timed out.");
+                }
             }
 
             bool sameRequestOrigin = UrlPolicy.IsSameOrigin(url, current);
             bool sameCredentialOrigin = initialRequestWithinCredentialOrigin
                 && UrlPolicy.IsSameOrigin(credentialOrigin!, current);
             using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
+            if (proxyAddress is not null)
+                _originAwareProxy!.PinRequest(request, current, proxyAddress);
             HttpResponseMessage response = await SendOnceAsync(request, ct).ConfigureAwait(false);
+            request.RequestUri = current;
             if (response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
             {
                 DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -187,6 +202,25 @@ internal sealed class HttpTransport : IDisposable
     private static bool IsRedirect(HttpStatusCode code) =>
         code is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.SeeOther
             or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
+
+    private async Task<IPAddress> ResolveProxyDestinationAsync(Uri uri, CancellationToken ct)
+    {
+        IPAddress[] addresses;
+        try
+        {
+            addresses = _options.ResolveHost is { } resolveHost
+                ? await resolveHost(uri.IdnHost, ct).ConfigureAwait(false)
+                : await Dns.GetHostAddressesAsync(uri.IdnHost, ct).ConfigureAwait(false);
+        }
+        catch (SocketException ex)
+        {
+            throw new TransientNetworkException("Could not verify the proxy destination in DNS.", ex);
+        }
+        if (addresses.Length == 0 || addresses.Any(address => !UrlPolicy.IsPublicAddress(address)))
+            throw new BlockedAddressException(uri.IdnHost);
+
+        return addresses.FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork) ?? addresses[0];
+    }
 
     /// <summary>
     /// Resolves and connects ourselves so that the address actually used is the address that was checked,

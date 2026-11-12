@@ -1,28 +1,25 @@
-# Media engine limitations (3.0, 2026-11-11)
+# Media engine limits
 
-## YouTube
-- **No player-JavaScript execution.** Formats needing signature deciphering or the `n` throttling transform are omitted and counted in notes. Consequence: "made for kids" videos (not served to the visionOS client) and any future case where JS-less clients stop working will fail with a precise `BrowserContextRequired` diagnostic. Smallest practical fix (needs approval, not added): an optional pure-managed JS evaluator such as Jint (BSD-2, ~1 MB) behind the existing client-profile seam.
-- **No proof-of-origin tokens** are generated or imitated. iOS/Android clients' URLs are cut off after ~1 MiB without them; the byte probe detects this and they are never offered.
-- **Bot gates** ("Sign in to confirm you're not a bot") from flagged networks (datacenter IPs) are reported, not bypassed. The visionOS strategy worked from this sandbox only with watch-page visitor data.
-- **Live streams** are detected and refused (completed recordings work). **Mix/radio** enumeration needs the InnerTube `next` endpoint (not implemented); the current video still resolves.
-- **DRC audio variants** are collapsed with their regular twin by the shared deduplicator when metadata is identical.
-- **Subtitles/automatic captions** are listed (VTT URLs) but caption *download* was not live-validated; some caption URLs may require tokens. Subtitles are not muxed into outputs.
-- **8K** availability is parsed generically but no 8K item was live-tested. HDR formats are detected; an HDR download was not independently validated.
-- Server-ABR-only and OTF (segmented) formats are unsupported and reported.
+Current scope on `main`, 2026-11-12. Live-site results in [the compatibility matrix](MEDIA_ENGINE_COMPATIBILITY.md) are from 2026-11-11 and may change as providers change their sites.
 
-## Merging / containers
-- Remux only. Supported outputs: MP4 (H.264/HEVC/AV1 + AAC/MP3), WebM (VP8/VP9/AV1 + Opus/Vorbis), MKV (any of these). Anything else is refused before download (`MergeCapability`) and re-checked after download (no publication on mismatch).
-- Merge jobs take plain HTTP tracks of exactly known size. Separate HLS/DASH segment-list tracks are not merged yet (single-representation HLS/DASH downloads keep working as before).
-- One video track + up to three audio tracks per plan; the bridge currently selects one audio track.
-- Matroska output timestamps use 1 ms precision; MP4→MKV drops MP4 edit lists for timing shifts other than the initial offset (AAC priming ≈ 20 ms not compensated in MKV).
-- HDR colour metadata is preserved verbatim for MP4→MP4 and WebM→WebM/MKV; MP4→MKV relies on in-bitstream colour information.
-- Temporary disk need ≈ 2× output size during merge (tracks + merged file until publication).
-- The `.tracks` sidecar can leak if the process dies after publication but before sidecar deletion (harmless; not yet garbage-collected).
+## Transfer and media processing
 
-## Platforms
-- No adapters: SoundCloud, Twitch, X/Twitter, Instagram, Facebook. Existing adapters for TikTok, Reddit, Dailymotion, Bilibili were not live-tested in this pass. Vimeo's live test reported DRM (uninvestigated).
-- The built-in validator parses MP4/WebM/MKV only; AVI/MP3/TS outputs are validated only by the existing per-protocol checks (and independently with ffprobe in live runs).
+- The engine downloads direct HTTP and HTTPS files and supports single-representation HLS and DASH segment plans. It refuses live capture and DRM-protected manifests.
+- The in-process C# remuxer joins compatible, clear HTTP video and audio tracks into MP4, WebM, or MKV without re-encoding. It validates the output before publication. Separate HLS audio renditions and separate DASH segment-list tracks are not merged.
+- VESPER does not bundle or invoke ffmpeg, yt-dlp, or Python. A narrow Windows Media Foundation conversion path uses codecs available on Windows; it is not a general-purpose transcoder.
+- Subtitle and caption metadata may be listed, but subtitle downloads and muxing into media outputs are not supported.
 
-## Verification gaps
-- **Windows not verified**: only a Linux cross-compile of the WinForms project; the 2 DPAPI tests are skipped on Linux. No packaged build was produced.
-- Performance numbers come from one sandbox network with 1–3 runs per case; memory comparisons use peak RSS of the largest process.
+## Site discovery
+
+- YouTube formats that require player JavaScript signature or `n` challenge execution are omitted. VESPER does not manufacture proof-of-origin tokens or bypass DRM, sign-in, age, or bot checks. Browser-assisted discovery can contribute page evidence, but it does not execute those challenges.
+- Live streams are detected and refused. A completed recording can be downloaded when its provider exposes a supported completed-file representation.
+- Provider support is implementation-specific and can change without notice. The 2026-11-11 live matrix recorded 18 of 20 cases in its defined supported set; YouTube Mix and one Vimeo sample were not resolved successfully.
+- The generic remuxer requires clear, structurally supported inputs and known sizes for each track. It does not repair damaged or mismatched tracks, and it does not transcode unsupported codecs into a supported container.
+
+## Browser and recovery boundaries
+
+- The extension can keep Chrome-owned transfers when Chrome's network connection is required. Native helper registration does not enable the extension; Chrome approval remains a separate action.
+- The extension's optional cookie permission defaults off. If the user enables **Use site sign-in**, credentials remain scoped to the consented source origin.
+- A recovered media merge must retain the same provider identity, track roles, format IDs, sizes, and codecs. If the refreshed source cannot prove that identity, VESPER keeps the partial data and asks for a new link or user action.
+
+For current build status, automated results, measured performance, and Windows checks still pending, see [release status](DOCUMENTATION/RELEASE.md).

@@ -22,6 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\RecordingProxy.cs" Link="TestSupport\RecordingProxy.cs" />
     <ProjectReference Include="..\..\src\Vesper.Engine\Vesper.Engine.csproj" />
     <ProjectReference Include="..\..\src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />
     <Compile Include="..\..\MediaTransferBridge.cs" Link="MediaTransferBridge.cs" />

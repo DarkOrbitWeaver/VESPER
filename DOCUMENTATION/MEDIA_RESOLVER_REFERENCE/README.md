@@ -1,10 +1,11 @@
 # Vesper.MediaResolver
 
+> Historical README from the early standalone resolver package. The resolver is now integrated into the main VESPER solution and has been built and tested. Its old workspace layout and "never compiled" status below are not current; see [current release status](../RELEASE.md) and [current media limits](../../MEDIA_ENGINE_LIMITATIONS.md).
+
 Native C# / .NET 10 media-discovery library for the VESPER download manager. It **finds** media (items, playlists, formats,
 subtitles, download plans). It does **not** download anything: the VESPER engine does that.
 
-> **Status: source complete, never compiled, never run.** This code was written without a .NET SDK. The first thing to do is
-> `dotnet build` and `dotnet test`; expect a handful of compile errors and a few failing tests to fix. See `CHECKPOINT.md`.
+The reference package's compatibility and continuation notes remain useful for the original standalone resolver boundary, but they do not describe the current integrated application.
 
 ## Layout
 

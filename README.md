@@ -1,28 +1,35 @@
-# VESPER — stable v8.3 WinForms UI correction (U2)
+# VESPER
 
-**Open:** `VESPER/VESPER.slnx` in Visual Studio on Windows 11 with the .NET 10 desktop workload.
+VESPER is a native Windows download manager built with C#/.NET 10 and WinForms, with a Manifest V3 Chrome companion. It manages direct HTTP and HTTPS downloads, supported media formats, durable history, and browser handoff. The engine runs in-process and does not bundle or invoke yt-dlp or Python.
 
-**To preview/edit the main form in Visual Studio:** in Solution Explorer, expand `Form1.cs` and choose **View Designer** (Shift+F7). The masthead, buttons, search/filter/sort toolbar, list, and footer now come from `Form1.Designer.cs` instead of an empty designer form. The sample rows are provided by `DownloadGrid` and in-memory demo records at construction time. This is actual WinForms UI, not HTML.
+## What it does
 
-U2 is focused on **design/layout only**. The real download engine, file opening, rescue, deletion, persistence and transfer capabilities are deliberately absent.
+- Queue, pause, resume, retry, and recover downloads after restart. VESPER validates partial data and publishes completed files without overwriting an existing file.
+- Discover supported media and select available formats. VESPER can natively remux compatible separate HTTP video and audio tracks without re-encoding. M4A and original audio choices remain available.
+- Send direct links and supported player hints from Chrome. Depending on the connection, downloads can use VESPER's native route or keep Chrome's transfer and connection.
+- Install per-user with First Flight. Setup verifies its payload and supports repair, upgrade rollback, and uninstall. The browser extension is enabled separately in Chrome.
 
-Changes from U1:
-- Main controls are designer-backed. Runtime wiring remains in `Form1.cs`.
-- Stable v8.3 spacing, labeled Show/Sort controls, native search surround, restrained colors and proportioned list columns.
-- Faint stable header foliage; stronger v9 decoration remains **opt-in** in Settings.
-- Settings Appearance note text moves *below* the motion chooser; long descriptions wrap and no longer require a horizontal scrollbar at supported window widths.
-- Settings footer simplified, with Save settings / Cancel and no oversized demo text.
-- Asset lookup supports the compiled app and Visual Studio designer's alternate working directory.
-- All sample-data operations remain separate from actual disk/network operations.
+The interface keeps its compact botanical design and light and dark themes.
 
-**Important verification limit:** Prepared in a Linux environment without .NET SDK or the Windows WinForms design host. Static checks passed, but this ZIP has **not** been compiled or visually exercised in Windows. Please build and open **View Designer**; a designer exception or compiler error screenshot is the most useful next input if the environment exposes an issue.
+## Browser permissions
 
-See `DOCUMENTATION/U2_DESIGNER_AND_VISUAL_CHECKLIST.md` and `DOCUMENTATION/U2_STATIC_QA_RESULTS.txt`.
+The extension matches HTTP and HTTPS pages in all frames so it can detect direct media links and sources inside embedded players on arbitrary sites. Background request listeners filter to relevant media and resource request types. Cookie access is optional and no cookie is read unless **Use site sign-in** is enabled in the extension settings.
 
+VESPER has no telemetry or account service. Network requests are made for links and media discovery that the user submits.
 
-## Media-engine reliability update
+## Build and test
 
-This working branch updates the existing WinForms/engine solution, not a replacement application.
-See [implementation and executed checks](MEDIA_ENGINE_REPORT.md), [verified compatibility](MEDIA_ENGINE_COMPATIBILITY.md),
-[remaining limitations](MEDIA_ENGINE_LIMITATIONS.md), and [raw benchmark methodology/results](reports/BENCHMARKS.md).
-The update deliberately does not claim yt-dlp parity, live YouTube success, or a general separate-track muxer.
+Use Windows 11 x64 with the .NET 10 SDK and Node.js for the extension tests.
+
+```powershell
+.\scripts\Run-Tests.ps1
+.\scripts\Build-Release.ps1 -Version 1.0.0
+```
+
+The build creates a self-contained setup executable and a portable ZIP. Add `-PortableOnly` to build only the ZIP; add `-SelfContained` to include the .NET runtime in that ZIP. Release executables are unsigned.
+
+## Limits and verification
+
+VESPER does not bypass DRM, sign-in gates, or site JavaScript challenges, and it does not transcode media. Its native remuxer accepts only compatible, validated tracks; live capture and separate HLS audio renditions are not supported. Site compatibility depends on the current site implementation.
+
+See [release status and verification](DOCUMENTATION/RELEASE.md) and [current media limits](MEDIA_ENGINE_LIMITATIONS.md). Clean-machine installation, mixed-DPI interaction, live VPN/site coverage, and matched comparisons with IDM, FDM, and yt-dlp still need manual runs.

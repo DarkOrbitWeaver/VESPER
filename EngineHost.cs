@@ -7,8 +7,16 @@ namespace VESPER;
 /// <summary>Maps the user's preferences to engine options and applies later changes without disturbing running jobs.</summary>
 internal static class EngineHost
 {
-    public static string DataDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VESPER");
+    public static string DataDirectory
+    {
+        get
+        {
+            string? testDirectory = Environment.GetEnvironmentVariable("VESPER_TEST_DATA_DIRECTORY");
+            return string.IsNullOrWhiteSpace(testDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VESPER")
+                : Path.GetFullPath(testDirectory);
+        }
+    }
 
     private static EngineOptions? _activeNetwork;
 

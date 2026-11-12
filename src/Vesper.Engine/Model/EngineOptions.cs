@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace Vesper.Engine;
 
 public enum ProxyMode { Direct, System, Custom }
@@ -52,6 +54,7 @@ public sealed class EngineOptions
     public bool AllowPrivateNetworks { get; init; }
     public ProxyMode Proxy { get; init; } = ProxyMode.Direct;
     public string? ProxyAddress { get; init; }
+    internal Func<string, CancellationToken, Task<IPAddress[]>>? ResolveHost { get; init; }
     public OriginCooldown Cooldown { get; } = new();
 
     public RetryOptions Retry { get; init; } = new();

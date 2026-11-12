@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace Vesper.MediaResolver.Core;
 
 /// <summary>All limits are enforced; none are advisory. Defaults are deliberately conservative.</summary>
@@ -35,6 +37,7 @@ public sealed class ResolverOptions
     /// </summary>
     public bool UseSystemProxy { get; init; }
     public Uri? ProxyAddress { get; init; }
+    internal Func<string, CancellationToken, Task<IPAddress[]>>? ResolveHost { get; init; }
 
     public Func<Uri, DateTimeOffset?>? OriginRetryAt { get; init; }
     public Action<Uri, DateTimeOffset>? OriginThrottled { get; init; }

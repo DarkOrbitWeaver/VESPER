@@ -491,6 +491,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
                 IsDefaultAudio = f.P("audioTrack").P("audioIsDefault").Bool() == true || (trackId is null && isAudio && !drc),
                 IsAudioDescription = trackName?.Contains("descriptive", StringComparison.OrdinalIgnoreCase) == true
                     || trackName?.Contains("description", StringComparison.OrdinalIgnoreCase) == true,
+                IsDrc = drc,
                 FileSize = size,
                 ExpiresAt = ExpiryParser.FromUrl(url),
                 ContentIdentity = identity,

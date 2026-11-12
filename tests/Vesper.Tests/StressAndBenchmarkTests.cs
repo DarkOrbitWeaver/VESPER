@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using Vesper.Engine;
 using Xunit.Abstractions;
 
@@ -86,8 +87,17 @@ public class BenchmarkTests(ITestOutputHelper output)
             watch.Stop();
 
             Assert.Equal(size, new FileInfo(done.FinalPath!).Length);
-            output.WriteLine(FormattableString.Invariant($"connections<={connections}: {size / 1048576.0 / watch.Elapsed.TotalSeconds:F2} MB/s over {watch.Elapsed.TotalSeconds:F3} s; ") +
-                $"working set grew by {(peakMemory - memoryBefore) / 1048576.0:F0} MB for a {size / 1048576} MB file; GC heap {GC.GetTotalMemory(false) / 1048576.0:F0} MB");
+            Assert.Equal(Payloads.Sha256(server.V1), Payloads.Sha256(await File.ReadAllBytesAsync(done.FinalPath!)));
+            var sample = new
+            {
+                connections,
+                sizeBytes = size,
+                elapsedMs = watch.Elapsed.TotalMilliseconds,
+                mibPerSecond = size / 1048576.0 / watch.Elapsed.TotalSeconds,
+                workingSetGrowthMiB = (peakMemory - memoryBefore) / 1048576.0
+            };
+            string json = JsonSerializer.Serialize(sample);
+            output.WriteLine(json);
         }
     }
 }

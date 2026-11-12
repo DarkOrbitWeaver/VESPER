@@ -1,18 +1,18 @@
 <#
 .SYNOPSIS  Builds, tests and packages VESPER for Windows 11 x64.
 .EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0
-.EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0 -Setup
-.NOTES     Output: release\VESPER-<version>\ and release\VESPER-<version>.zip (+ SHA256SUMS.txt).
+.EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0 -PortableOnly
+.NOTES     Output: release\setup-<version>\VESPER-Setup.exe and release\VESPER-<version>.zip.
            The executables are NOT code-signed. Windows SmartScreen may warn on first run.
-           Default is framework-dependent (needs the .NET 10 Desktop Runtime, small download).
-           Use -SelfContained to bundle the runtime instead (much larger, no prerequisite).
+           The setup is self-contained. The ZIP is a portable app payload; use -SelfContained to bundle
+           the .NET runtime in that payload as well.
 #>
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
     [string]$Version = "1.0.0",
     [switch]$SkipTests,
     [switch]$SelfContained,
-    [switch]$Setup,
+    [switch]$PortableOnly,
     [ValidatePattern('^10\.0\.[0-9]+$')][string]$RuntimeVersion
 )
 $ErrorActionPreference = 'Stop'
@@ -29,6 +29,7 @@ if (-not $SkipTests) {
     Run "Engine, bridge and storage tests" { dotnet test tests/Vesper.Tests -c Release --nologo }
     Run "Media resolver tests" { dotnet test tests/Vesper.MediaResolver.Tests -c Release --nologo }
     Run "Setup and recovery tests" { dotnet test tests/Vesper.Setup.Tests -c Release --nologo }
+    Run "Desktop persistence tests" { dotnet test tests/Vesper.Windows.Tests -c Release --nologo }
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $extensionTests = @(Get-ChildItem (Join-Path $root 'tests/extension') -Filter '*.test.mjs' -File | ForEach-Object FullName)
         if ($extensionTests.Count -eq 0) { throw 'No extension regression tests were found.' }
@@ -39,17 +40,17 @@ if (-not $SkipTests) {
 $out = Join-Path $root "release\VESPER-$Version"
 if ((Test-Path $out) -or (Test-Path "$out.zip")) { throw "Release output already exists: $out. Archive it or choose another version; nothing was overwritten." }
 $setupOut = Join-Path $root "release\setup-$Version"
-if ($Setup -and (Test-Path -LiteralPath $setupOut)) { throw "Setup output already exists: $setupOut." }
-$sc = if ($SelfContained -or $Setup) { "--self-contained" } else { "--no-self-contained" }
+if (-not $PortableOnly -and (Test-Path -LiteralPath $setupOut)) { throw "Setup output already exists: $setupOut." }
+$sc = if ($SelfContained -or -not $PortableOnly) { "--self-contained" } else { "--no-self-contained" }
 $runtimeArgs = @()
 if ($RuntimeVersion) { $runtimeArgs += "-p:RuntimeFrameworkVersion=$RuntimeVersion" }
 
 Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
 Run "Publish native-messaging host" { dotnet publish src/Vesper.NativeHost/Vesper.NativeHost.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
 
-Write-Host "==> Extension and scripts" -ForegroundColor Green
+Write-Host "==> Extension" -ForegroundColor Green
 Copy-Item (Join-Path $root "extension") (Join-Path $out "extension") -Recurse -Force
-if ($Setup) {
+if (-not $PortableOnly) {
     Write-Host "==> Build offline First Flight setup"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $package = Join-Path $root ("release\.setup-" + [guid]::NewGuid().ToString('N'))
@@ -86,7 +87,6 @@ if ($Setup) {
         Remove-Item -LiteralPath $package
     }
 }
-Copy-Item (Join-Path $root "scripts\Install.ps1"), (Join-Path $root "scripts\Uninstall.ps1") $out
 Copy-Item (Join-Path $root "DOCUMENTATION\RELEASE.md") (Join-Path $out "RELEASE.md")
 
 $zip = "$out.zip"
@@ -95,5 +95,5 @@ Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" } | Set-Content (Join-Path $out "SHA256SUMS.txt")
 Compress-Archive -Path "$out\*" -DestinationPath $zip
 Write-Host "Done: $zip" -ForegroundColor Green
-if ($Setup) { Write-Host "The offline setup is unsigned." }
-else { Write-Host "Not code-signed. Run Install.ps1 from the unpacked folder for a per-user install (no administrator rights)." }
+if (-not $PortableOnly) { Write-Host "First Flight setup is unsigned: $(Join-Path $setupOut 'VESPER-Setup.exe')" }
+else { Write-Host "Portable ZIP only. It does not register VESPER's browser helper." }

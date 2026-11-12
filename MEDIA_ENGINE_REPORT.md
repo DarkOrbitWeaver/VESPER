@@ -3,6 +3,8 @@
 Branch: `media-engine-3.0` (based on verified `main` @ `fbf40a9c7ac23f975870e486a5bff903558ddc85`). Date of all live evidence: **2026-11-11**.
 Environment: Linux x86_64 sandbox, .NET SDK 10.0.404. **Windows was not available**: the WinForms app was only cross-compiled on Linux (`-p:EnableWindowsTargeting=true`), which is *not* Windows verification.
 
+This report records the 3.0 branch snapshot. Later `main` revisions added native engine integration, First Flight setup, and Windows verification; see [current release status](DOCUMENTATION/RELEASE.md) and [current media limits](MEDIA_ENGINE_LIMITATIONS.md) before using the status below as current guidance.
+
 ## 1. Root cause of "title and thumbnail but no stream" (YouTube)
 
 Measured live from this network on 2026-11-11:

@@ -1,7 +1,8 @@
 # Continuation checkpoint
 
-State: the repository is coherent and complete as source (library, tests, fixtures, benchmarks, examples, docs). Nothing has been
-compiled or run. The next developer should proceed in this order.
+> Historical checkpoint for the standalone resolver package before its first build. It is retained as provenance, not as current build guidance. See [current release status](../RELEASE.md).
+
+The original package was coherent as source, but had not yet been compiled or run. The checklist below records that first-build handoff.
 
 ## 1. Make it build
 ```

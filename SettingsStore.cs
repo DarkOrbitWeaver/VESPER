@@ -12,15 +12,20 @@ internal static class SettingsStore
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true, Converters = { new JsonStringEnumConverter() } };
 
     private static string Directory_ => EngineHost.DataDirectory;
-    private static string FilePath => Path.Combine(Directory_, "settings.json");
-    private static string LegacyPath => Path.Combine(Directory_, "ui-preview-settings.json");
 
     /// <summary>Set when the previous settings file could not be read; shown to the user once at startup.</summary>
     public static string? LoadWarning { get; private set; }
 
     public static VesperPreferences Load()
     {
-        string path = File.Exists(FilePath) ? FilePath : LegacyPath;
+        return Load(Directory_);
+    }
+
+    internal static VesperPreferences Load(string directory)
+    {
+        string settingsPath = Path.Combine(directory, "settings.json");
+        string legacyPath = Path.Combine(directory, "ui-preview-settings.json");
+        string path = File.Exists(settingsPath) ? settingsPath : legacyPath;
         if (!File.Exists(path)) return new VesperPreferences();
         try
         {
@@ -30,8 +35,8 @@ internal static class SettingsStore
         {
             try
             {
-                string bad = path + ".bad";
-                File.Move(path, bad, overwrite: true);
+                string bad = NextBackupPath(path);
+                File.Move(path, bad);
                 LoadWarning = $"VESPER could not read its settings file ({ex.Message}). It was kept as {Path.GetFileName(bad)} and defaults are in use.";
             }
             catch (IOException) { LoadWarning = "VESPER could not read its settings file and is using defaults."; }
@@ -41,18 +46,34 @@ internal static class SettingsStore
 
     /// <summary>Returns an error message, or null on success. A failed save never loses the previous file.</summary>
     public static string? Save(VesperPreferences preferences)
+        => Save(preferences, Directory_);
+
+    internal static string? Save(VesperPreferences preferences, string directory)
     {
+        string path = Path.Combine(directory, "settings.json");
+        string temp = path + ".tmp";
         try
         {
-            Directory.CreateDirectory(Directory_);
-            string temp = FilePath + ".tmp";
-            File.WriteAllText(temp, JsonSerializer.Serialize(preferences, Options));
-            File.Move(temp, FilePath, overwrite: true);
+            Directory.CreateDirectory(directory);
+            using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, preferences, Options);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
             return null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return ex.Message;
         }
+    }
+
+    private static string NextBackupPath(string path)
+    {
+        string backup = path + ".bad";
+        for (int suffix = 1; File.Exists(backup); suffix++)
+            backup = path + ".bad." + suffix;
+        return backup;
     }
 }
