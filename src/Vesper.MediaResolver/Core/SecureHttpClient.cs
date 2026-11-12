@@ -39,6 +39,7 @@ public sealed class SecureHttpClient : IDisposable
     private readonly ResolverOptions _o;
     private readonly HttpClient _client;
     private readonly SemaphoreSlim _gate;
+    private readonly bool _validateProxyDns;
     private int _requests;
 
     public int RequestCount => Volatile.Read(ref _requests);
@@ -46,6 +47,7 @@ public sealed class SecureHttpClient : IDisposable
     public SecureHttpClient(ResolverOptions options, HttpMessageHandler? handlerOverride = null)
     {
         _o = options;
+        _validateProxyDns = handlerOverride is null && (options.UseSystemProxy || options.ProxyAddress is not null) && !options.AllowPrivateNetworks;
         _gate = new SemaphoreSlim(Math.Max(1, options.MaxConcurrentRequests));
         _client = new HttpClient(handlerOverride ?? CreateHandler(options), disposeHandler: true)
         {
@@ -64,9 +66,10 @@ public sealed class SecureHttpClient : IDisposable
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(20),
             MaxConnectionsPerServer = 8,
             ConnectTimeout = TimeSpan.FromSeconds(10),
-            UseProxy = o.UseSystemProxy
+            UseProxy = o.UseSystemProxy || o.ProxyAddress is not null,
+            Proxy = o.ProxyAddress is { } proxy ? new WebProxy(proxy) : null
         };
-        if (!o.UseSystemProxy && !o.AllowPrivateNetworks)
+        if (!h.UseProxy && !o.AllowPrivateNetworks)
             h.ConnectCallback = ConnectFilteredAsync;
         return h;
     }
@@ -241,6 +244,10 @@ public sealed class SecureHttpClient : IDisposable
                 UrlValidator.EnsureAllowed(url, _o);
                 if (!visited.Add(url.AbsoluteUri))
                     throw new MediaResolverException(MediaErrors.Network("Redirect loop detected", retry: false));
+                if (_o.OriginRetryAt?.Invoke(url) is { } deferred && deferred > _o.TimeProvider.GetUtcNow())
+                    throw new MediaResolverException(MediaErrors.RateLimited("This origin is cooling down") with { RetryAt = deferred });
+                if (_validateProxyDns)
+                    await ValidateProxyDestinationAsync(url, cts.Token).ConfigureAwait(false);
 
                 using var req = new HttpRequestMessage(method, url);
                 req.Headers.TryAddWithoutValidation("User-Agent", ctx.UserAgent ?? _o.UserAgent);
@@ -272,6 +279,17 @@ public sealed class SecureHttpClient : IDisposable
                 }
 
                 var status = resp.StatusCode;
+                if (status == HttpStatusCode.TooManyRequests || status == HttpStatusCode.ServiceUnavailable && resp.Headers.RetryAfter is not null)
+                {
+                    DateTimeOffset now = _o.TimeProvider.GetUtcNow();
+                    TimeSpan delay = resp.Headers.RetryAfter?.Delta ?? (resp.Headers.RetryAfter?.Date - now) ?? TimeSpan.FromSeconds(30);
+                    DateTimeOffset until = now.AddTicks(Math.Clamp(delay.Ticks, 0, TimeSpan.TicksPerHour));
+                    _o.OriginThrottled?.Invoke(url, until);
+                    string origin = url.GetLeftPart(UriPartial.Authority);
+                    _o.Diagnostics?.Invoke($"HTTP {(int)status} from {origin}. Retry at {until:O}.");
+                    resp.Dispose();
+                    throw new MediaResolverException(MediaErrors.RateLimited($"HTTP {(int)status} from {origin}") with { RetryAt = until });
+                }
                 if (status is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.SeeOther
                     or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect
                     && resp.Headers.Location is { } location)
@@ -293,6 +311,20 @@ public sealed class SecureHttpClient : IDisposable
         finally
         {
             if (!leased) _gate.Release();
+        }
+    }
+
+    private static async Task ValidateProxyDestinationAsync(Uri uri, CancellationToken ct)
+    {
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(uri.IdnHost, ct).ConfigureAwait(false);
+            if (addresses.Length == 0 || addresses.Any(address => !IpAddressClassifier.IsPublic(address)))
+                throw new MediaResolverException(MediaErrors.Blocked("The proxy destination must resolve to public addresses."));
+        }
+        catch (SocketException)
+        {
+            throw new MediaResolverException(MediaErrors.Network("Could not verify the proxy destination in DNS."));
         }
     }
 

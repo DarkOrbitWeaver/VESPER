@@ -15,11 +15,13 @@ public enum JobState
     Completed = 10,
     Failed = 11,
     Suspect = 12,
-    Cancelled = 13
+    Cancelled = 13,
+    Converting = 14
 }
 
 public enum JobPriority { Low = -1, Normal = 0, High = 1 }
-public enum JobKind { Http = 0, Hls = 1, Dash = 2, Merge = 3 }
+public enum JobKind { Http = 0, Hls = 1, Dash = 2, Merge = 3, BrowserFile = 4 }
+public enum MediaOutput { Original = 0, Mp4 = 1, M4a = 2 }
 
 /// <summary>How strongly the remote representation can be identified across requests.</summary>
 public enum IdentityLevel
@@ -38,7 +40,7 @@ public static class JobStates
 {
     /// <summary>States in which a runner may exist or is about to exist.</summary>
     public static bool IsActive(JobState s) => s is JobState.Resolving or JobState.Downloading
-        or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Verifying or JobState.Finalizing;
+        or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Verifying or JobState.Finalizing or JobState.Converting;
 
     /// <summary>States from which nothing happens until the user acts.</summary>
     public static bool NeedsUser(JobState s) => s is JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention
@@ -65,6 +67,8 @@ public sealed class DownloadJob
     public string? FinalPath { get; set; }
     /// <summary>Recorded before publishing so a crash during rename can be reconciled.</summary>
     public string? PendingFinalPath { get; set; }
+    public long? PendingConversionBytes { get; set; }
+    public string? PendingConversionDigest { get; set; }
 
     public long? TotalBytes { get; set; }
     public ExtentSet Extents { get; set; } = new();
@@ -103,6 +107,8 @@ public sealed class DownloadJob
     public string? MediaFormatId { get; set; }
     public string? MediaThumbnailUrl { get; set; }
     public DateTimeOffset? MediaExpiresAt { get; set; }
+    public MediaOutput Output { get; set; }
+    public BrowserTransferProof? BrowserProof { get; set; }
 
     // Integrity and Rescue.
     public string? ExpectedSha256 { get; set; }

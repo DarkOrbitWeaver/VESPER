@@ -4,34 +4,90 @@
   if (window.__vesperContent) return;          // never inject twice
   window.__vesperContent = true;
 
+  const lifetime = new AbortController();
+  const { signal } = lifetime;
   const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_RADIUS = 100;
   let video = null;            // the player the butterfly is attached to
   let host = null, root = null, button = null, panel = null, receipt = null;
   let frame = 0, listening = false, pointer = null, panelRequest = 0, unwatchTheme = null;
-  let perch = null, receiptTimer = 0, panelMotion = null, settleMotion = null;
+  let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, panelMotion = null;
+  const pageAddress = () => location.href.split('#', 1)[0];
+  let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+  let motionMode = 'system', unwatchMotion = null;
+  const still = () => motionMode === 'still' || (motionMode === 'system' && reducedMotion.matches);
   const protectedVideos = new WeakSet();
+  const playback = new WeakMap();
+  let generation = 0;
   const observed = new Set();
+  const intersecting = new WeakMap();
   const resize = new ResizeObserver(schedule);
   const visibility = new IntersectionObserver((entries) => {
+    if (!alive()) return;
     for (const entry of entries) {
       if (!entry.target.isConnected) {
         visibility.unobserve(entry.target);
         observed.delete(entry.target);
-      }
+      } else intersecting.set(entry.target, entry.isIntersecting);
     }
     selectPlayer();
   }, { threshold: [0, 0.1, 0.25, 0.5, 0.75, 1] });
 
-  const send = (message) => new Promise((resolve) => {
-    try { chrome.runtime.sendMessage(message, (reply) => resolve(chrome.runtime.lastError ? { ok: false, code: 'extension-error' } : reply)); }
-    catch { resolve({ ok: false, code: 'extension-error' }); }   // extension reloaded: this script is orphaned
-  });
+  function retire() {
+    if (signal.aborted) return;
+    lifetime.abort();
+    visibility.disconnect();
+    observed.clear();
+    unwatchMotion?.();
+    detach();
+    delete window.__vesperContent;
+  }
+
+  function alive() {
+    if (signal.aborted) return false;
+    if (VesperTheme.available()) return true;
+    // Reloading the extension can leave page listeners behind until the tab reloads.
+    retire();
+    return false;
+  }
+
+  async function send(message) {
+    if (!alive()) return null;
+    try { return await chrome.runtime.sendMessage(message); }
+    catch (error) {
+      if (VesperTheme.contextGone(error)) { retire(); return null; }
+      return { ok: false, code: 'extension-error' };
+    }
+  }
+
+  function syncPage() {
+    if (!alive()) return;
+    const current = pageAddress();
+    if (current === pageUrl) return;
+    const changed = VesperPlayerSource.identity(current) !== VesperPlayerSource.identity(pageUrl);
+    pageUrl = current;
+    if (!changed) return;
+    mediaChangedAt = Date.now();
+    if (panelMedia || receiptTimer) closePanel();
+  }
+  window.navigation?.addEventListener('currententrychange', syncPage, { signal });
+
+  function playerSource(player) {
+    return player.currentSrc || player.src || '';
+  }
+
+  function isCurrentRequest(request) {
+    if (!alive() || request !== panelRequest || !panelMedia) return false;
+    if (panelMedia.identity === VesperPlayerSource.identity(pageAddress()) && panelMedia.player === video &&
+        video?.isConnected && panelMedia.src === playerSource(video)) return true;
+    closePanel();
+    return false;
+  }
 
   // ------------------------------------------------------------ noticing media
 
   function visiblePlayer(el) {
-    if (!el?.isConnected) return null;
+    if (!el?.isConnected || intersecting.get(el) === false) return null;
     const r = el.getBoundingClientRect();
     const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
@@ -41,13 +97,14 @@
   }
 
   function selectPlayer() {
+    if (!alive()) return;
     const fullscreen = document.fullscreenElement;
     let best = null, bestArea = 0;
     for (const el of observed) {
       if (fullscreen && !fullscreen.contains(el)) continue;
       const r = visiblePlayer(el);
       if (!r) continue;
-      const area = (r.right - r.left) * (r.bottom - r.top);
+      const area = (r.right - r.left) * (r.bottom - r.top) * (el.paused ? 1 : 1.15);
       if (area > bestArea) { best = el; bestArea = area; }
     }
     if (best) attach(best);
@@ -56,29 +113,38 @@
   }
 
   function consider(el) {
-    if (!(el instanceof HTMLMediaElement)) return;
+    if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
-    const drm = !!el.mediaKeys || protectedVideos.has(el);
     if (el instanceof HTMLVideoElement && !observed.has(el) &&
         (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]'))) {
       observed.add(el);
       visibility.observe(el);
     }
-    const title = document.querySelector('meta[property="og:title"]')?.content || document.title || '';
-    const poster = el.poster || document.querySelector('meta[property="og:image"]')?.content || '';
-    const duration = Number.isFinite(el.duration) ? el.duration : null;
-    void send({ type: 'media-element', src: drm || !/^https?:\/\//i.test(src) ? '' : src, title, poster, duration,
-      unsupported: drm ? 'drm' : null });
+    if (el.readyState >= 1 && playback.get(el)?.src !== src)
+      playback.set(el, { src, page: pageAddress(), generation: ++generation });
   }
 
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
-  for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => consider(e.target), { capture: true, passive: true });
+  for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
+    consider(e.target);
+    if (type === 'playing' && observed.has(e.target)) selectPlayer();
+  }, { capture: true, passive: true, signal });
+  for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
+    if (!alive()) return;
+    if (type === 'emptied') {
+      protectedVideos.delete(e.target);
+      playback.delete(e.target);
+    }
+    if (e.target !== video) return;
+    if (type === 'emptied') mediaChangedAt = Date.now();
+    if (panelMedia || receiptTimer) closePanel();
+  }, { capture: true, passive: true, signal });
   document.addEventListener('encrypted', (e) => {
-    if (!(e.target instanceof HTMLMediaElement)) return;
+    if (!alive() || !(e.target instanceof HTMLMediaElement)) return;
     protectedVideos.add(e.target);
     if (e.target === video) closePanel();
     consider(e.target);
-  }, { capture: true, passive: true });
+  }, { capture: true, passive: true, signal });
 
   // ------------------------------------------------------------ the butterfly
 
@@ -90,7 +156,7 @@
     return el;
   }
 
-  function build() {
+  function build(atlasUrl) {
     host = document.createElement('div');
     host.dataset.vesperPlayer = '';
     host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;top:0;left:0;width:0;height:0;';
@@ -99,16 +165,15 @@
     style.textContent = VesperTheme.css + `
         :host{all:initial}
         *{box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
-        .fly{position:fixed;width:${FLY_SIZE}px;height:${FLY_SIZE}px;border-radius:6px;border:0;background:none;display:flex;
+        .fly{position:fixed;left:0;top:0;width:${FLY_SIZE}px;height:${FLY_SIZE}px;border-radius:6px;border:0;background:none;display:flex;
           align-items:center;justify-content:center;cursor:pointer;padding:0;opacity:0;pointer-events:none;
-          transform:translate(4px,-6px) scale(.95);transition:opacity .18s ease,transform .18s ease-out}
-        .fly[hidden]{display:none}.fly.show,.fly:focus-visible{opacity:1;transform:none;pointer-events:auto}
+          transition:opacity .18s ease;touch-action:manipulation}
+        .fly[hidden]{display:none}.fly.show,.fly:focus-visible{opacity:1;pointer-events:auto}
         .fly:focus-visible{outline:2px solid #a5cfa8;outline-offset:1px}
-        .fly img{width:40px;height:40px;object-fit:contain;pointer-events:none;filter:drop-shadow(0 1px 2px #0008);
-          transform-origin:50% 85%;transition:transform .18s ease-out}
-        .fly:hover img{transform:translateY(-3px) rotate(-6deg) scale(1.08)}
-        .fly.clicked img{animation:perch-tap .24s ease-out}
-        @keyframes perch-tap{35%{transform:translateY(-4px) scale(.87,1.07)}70%{transform:translateY(-1px) scale(1.09,.98)}}
+        .fly canvas{width:100%;height:100%;pointer-events:none;filter:drop-shadow(0 1px 2px #0008)}
+        .fly-fallback{display:grid;place-items:center;width:29px;height:29px;border-radius:7px;
+          background:var(--green);color:#fffbee;font-size:19px;pointer-events:none}
+        .fly.companion-ready .fly-fallback{display:none}
         .panel{position:fixed;width:316px;max-width:calc(100vw - 16px);max-height:min(630px,calc(100vh - 16px));
           background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;display:none;
           box-shadow:0 7px 22px #0003;overflow:auto;font-size:13px;transform-origin:top right}
@@ -118,14 +183,17 @@
           background:var(--surface);color:var(--sage);box-shadow:0 3px 10px #0003;font-size:12px;line-height:1.4;
           pointer-events:none;opacity:0;transform:translateX(4px);transition:opacity .16s ease,transform .16s ease-out}
         .receipt.show{opacity:1;transform:none}
-        @media(prefers-reduced-motion:reduce){
-          .fly,.fly img,.panel.show,.receipt{animation:none;transition:none}
-          .fly,.fly:hover img,.receipt{transform:none}
-        }
+        :host([data-vesper-still]) :is(.fly,.panel.show,.receipt){animation:none;transition:none}
+        :host([data-vesper-still]) .receipt{transform:none}
         .head{display:flex;gap:10px;padding:13px 12px;border-bottom:1px solid var(--border);align-items:center;background:var(--paper)}
         .thumb{width:64px;height:41px;border-radius:6px;background:var(--wash) center/cover;flex:none}
         .t{font:600 14px/1.25 Georgia,serif;max-height:36px;overflow:hidden}.d{font-size:11px;color:var(--muted);margin-top:3px}
         .x{margin-left:auto;border:0;background:none;font-size:18px;color:var(--muted);cursor:pointer;align-self:flex-start;padding:0 2px}
+        .output{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
+        .output[hidden]{display:none}
+        .output select{border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
+          color-scheme:inherit;padding:4px 6px;font:inherit;cursor:pointer}
+        .output select:focus-visible{outline:2px solid var(--sage);outline-offset:2px}
         .list{padding:7px 8px}.opt{display:flex;gap:8px;align-items:center;width:100%;min-height:43px;border:1px solid transparent;
           background:none;text-align:left;padding:7px 8px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--text)}
         .opt:hover,.opt[aria-checked=true]{background:var(--wash)}
@@ -145,10 +213,11 @@
     button.title = 'Find media with VESPER';
     button.setAttribute('aria-label', button.title);
     button.setAttribute('aria-expanded', 'false');
-    const butterfly = element('img');
-    butterfly.alt = '';
-    butterfly.src = chrome.runtime.getURL('icons/butterfly-front.png');
-    button.append(butterfly);
+    const fallback = element('span', 'fly-fallback', '↓');
+    fallback.setAttribute('aria-hidden', 'true');
+    button.append(fallback);
+    companion = VesperCompanion.create(button, atlasUrl, still());
+    host.toggleAttribute('data-vesper-still', still());
     panel = element('div', 'panel');
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-label', 'VESPER download options');
@@ -157,17 +226,17 @@
     root.append(style, button, panel, receipt);
     button.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (!reducedMotion.matches) button.classList.add('clicked');
       void togglePanel();
-    });
-    butterfly.addEventListener('animationend', () => button?.classList.remove('clicked'));
+    }, { signal });
+    button.addEventListener('focus', updateFlyVisibility, { signal });
+    button.addEventListener('blur', updateFlyVisibility, { signal });
     root.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && panel.classList.contains('show')) {
         e.stopPropagation();
         closePanel();
         button.focus();
       }
-    });
+    }, { signal });
     unwatchTheme = VesperTheme.watch(host);
     mount();
   }
@@ -177,27 +246,36 @@
     // A video element in native fullscreen can't render the overlay as a child.
     const parent = fullscreen && !(fullscreen instanceof HTMLVideoElement) ? fullscreen : document.documentElement;
     if (host.parentElement !== parent) parent.appendChild(host);
-    button.querySelector('img').src = chrome.runtime.getURL(fullscreen ? 'icons/butterfly-perched.png' : 'icons/butterfly-front.png');
   }
   document.addEventListener('fullscreenchange', () => {
+    if (!alive()) return;
     pointer = null;
     if (host) mount();
     selectPlayer();
-  }, { passive: true });
+  }, { passive: true, signal });
+  document.addEventListener('visibilitychange', () => { if (alive()) updateFlyVisibility(); }, { signal });
+  document.addEventListener('keydown', e => {
+    if (!alive() || !e.altKey || !e.shiftKey || e.key.toLowerCase() !== 'v' || !perch || button?.hidden) return;
+    e.preventDefault();
+    button?.focus({ preventScroll: true });
+  }, { signal });
 
   function attach(el) {
     if (video === el && host) { place(); return; }
     closePanel();
     resize.disconnect();
     video = el;
-    if (!host) build();
+    if (!host) {
+      try { build(chrome.runtime.getURL('icons/vesper-companion-atlas.png')); }
+      catch (error) { if (!VesperTheme.contextGone(error)) throw error; retire(); return; }
+    }
     resize.observe(el);
     if (!listening) {
       listening = true;
-      document.addEventListener('pointermove', onPointer, { passive: true, capture: true });
-      document.addEventListener('pointerleave', clearPointer, { passive: true });
-      window.addEventListener('scroll', schedule, { passive: true, capture: true });
-      window.addEventListener('resize', schedule, { passive: true });
+      document.addEventListener('pointermove', onPointer, { passive: true, capture: true, signal });
+      document.addEventListener('pointerleave', clearPointer, { passive: true, signal });
+      window.addEventListener('scroll', schedule, { passive: true, capture: true, signal });
+      window.addEventListener('resize', schedule, { passive: true, signal });
     }
     place();
   }
@@ -215,22 +293,25 @@
     cancelAnimationFrame(frame);
     frame = 0;
     perch = null;
+    companion?.dispose();
+    companion = null;
     host?.remove(); host = root = button = panel = receipt = null; video = null;
   }
 
   function place() {
+    if (!alive()) return;
     if (!video || !video.isConnected) return detach();
     const fullscreen = document.fullscreenElement;
     const r = visiblePlayer(video);
-    button.hidden = !r || !!fullscreen && (fullscreen instanceof HTMLVideoElement || !fullscreen.contains(video));
+    button.hidden = !r || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
     if (button.hidden) { perch = null; closePanel(); return; }
-    const x = r.right - FLY_SIZE - 10;
-    const y = fullscreen ? r.top + 10 : perchTop(r, x);
-    button.style.left = `${x}px`; button.style.top = `${y}px`;
-    perch = { x, y };
+    perch = playerPerch(r, Boolean(fullscreen));
+    const { x, y, faceLeft } = perch;
+    companion.setPerch(x, y, faceLeft, Boolean(fullscreen));
     updateFlyVisibility();
     if (panel.classList.contains('show')) {
-      panel.style.left = `${Math.max(8, x + FLY_SIZE - panel.offsetWidth)}px`;
+      const left = faceLeft ? x + FLY_SIZE - panel.offsetWidth : x;
+      panel.style.left = `${Math.max(8, Math.min(left, innerWidth - panel.offsetWidth - 8))}px`;
       panel.style.top = `${Math.max(8, Math.min(y + FLY_SIZE + 5, innerHeight - panel.offsetHeight - 8))}px`;
     }
     if (receiptTimer) {
@@ -241,41 +322,41 @@
     }
   }
 
-  function perchTop(rect, x) {
-    // When the player has its own strip above the picture, sit in that space.
-    // Otherwise try the picture's upper edge, clear of links and player controls.
-    function clear(y) {
-      return y >= 4 && ![6, FLY_SIZE - 6].some(offset => document.elementsFromPoint(x + offset, y + 12)
+  function playerPerch(rect, fullscreen) {
+    const corners = [{ x: rect.right - FLY_SIZE - 10, faceLeft: true }, { x: rect.left + 10, faceLeft: false }];
+    const border = Math.abs(video.getBoundingClientRect().top - rect.top) < 2;
+    const clear = (x, y) => y >= 4 && ![8, FLY_SIZE / 2, FLY_SIZE - 8].some(offset =>
+      document.elementsFromPoint(x + offset, y + FLY_SIZE / 2)
         .some(el => el !== host && el.closest('button, a[href], input, [role="button"]')));
+    const positions = fullscreen || !border ? [rect.top + 8] : [rect.top - VesperCompanion.footY, rect.top + 8];
+    for (const y of positions) {
+      const corner = corners.find(({ x }) => clear(x, y));
+      if (corner) return { ...corner, y };
     }
-    let parent = video.parentElement;
-    for (let depth = 0; parent && depth < 4; depth++, parent = parent.parentElement) {
-      const box = parent.getBoundingClientRect();
-      const strip = rect.top - box.top;
-      if (strip >= 14 && strip <= 76 && box.right >= rect.right - 8 && Math.abs(box.left - rect.left) <= 24) {
-        const y = rect.top - Math.round(FLY_SIZE * 0.76);
-        if (clear(y)) return y;
-      }
-    }
-    const edge = rect.top - Math.round(FLY_SIZE * 0.70);
-    return clear(edge) ? edge : rect.top + 8;
+    return { ...corners[0], y: rect.top + 8 };
   }
 
-  function schedule() { if (!frame) frame = requestAnimationFrame(() => { frame = 0; place(); }); }
+  function schedule() { if (alive() && !frame) frame = requestAnimationFrame(() => { frame = 0; place(); }); }
 
   function updateFlyVisibility() {
-    if (!perch || !button) return;
+    if (!button || !companion) return;
+    if (!perch || button.hidden) { companion.setVisible(false); return; }
     const radius = FULLSCREEN_RADIUS + (button.classList.contains('show') ? 14 : 0);
     const nearby = pointer && Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) <= radius;
-    button.classList.toggle('show', !document.fullscreenElement || panel.classList.contains('show') || !!receiptTimer || !!nearby);
+    const show = !document.fullscreenElement || panel.classList.contains('show') || !!receiptTimer || !!nearby || button.matches(':focus-visible');
+    button.classList.toggle('show', show);
+    companion.setVisible(show && !document.hidden);
   }
 
   function onPointer(e) {
-    if (!document.fullscreenElement) return;
-    pointer = { x: e.clientX, y: e.clientY };
-    updateFlyVisibility();
+    if (!alive()) return;
+    if (document.fullscreenElement) {
+      pointer = { x: e.clientX, y: e.clientY };
+      updateFlyVisibility();
+    }
+    companion?.pointerMove(e.clientX, e.clientY);
   }
-  function clearPointer() { pointer = null; updateFlyVisibility(); }
+  function clearPointer() { pointer = null; companion?.pointerMove(-Infinity, -Infinity); updateFlyVisibility(); }
 
   // ------------------------------------------------------------ the quality picker
 
@@ -286,11 +367,13 @@
     receipt?.classList.remove('show');
   }
 
-  function closePanel() {
+  function closePanel(acknowledged = false) {
     panelRequest++;
+    panelMedia = null;
     panelMotion?.cancel();
-    settleMotion?.cancel();
-    panelMotion = settleMotion = null;
+    panelMotion = null;
+    clearTimeout(retryTimer);
+    retryTimer = 0;
     dismissReceipt();
     if (receipt) receipt.textContent = '';
     if (panel) {
@@ -298,41 +381,69 @@
       panel.inert = false;
     }
     button?.setAttribute('aria-expanded', 'false');
+    companion?.setPickerOpen(false, acknowledged);
     updateFlyVisibility();
   }
 
   async function togglePanel() {
+    if (!alive()) return;
+    syncPage();
     if (panel.classList.contains('show')) return closePanel();
     await loadFormats();
   }
 
   async function loadFormats() {
+    syncPage();
+    if (!video?.isConnected || !panel) return;
     dismissReceipt();
     receipt.textContent = '';
-    settleMotion?.cancel();
-    settleMotion = null;
     const request = ++panelRequest;
+    const src = playerSource(video);
+    const identity = VesperPlayerSource.identity(pageUrl);
+    const binding = playback.get(video);
+    const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
+    panelMedia = { identity, player: video, src };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
-    const title = document.querySelector('meta[property="og:title"]')?.content || document.title || 'This video';
-    const poster = video.poster || document.querySelector('meta[property="og:image"]')?.content || '';
-    const seconds = Number.isFinite(video.duration) ? video.duration : null;
+    companion.setPickerOpen(true);
+    updateFlyVisibility();
+    const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
+    const poster = current ? video.poster || document.querySelector('meta[property="og:image"]')?.content || '' : '';
+    const duration = current && Number.isFinite(video.duration) ? video.duration : null;
     if (video.mediaKeys || protectedVideos.has(video))
-      return renderShell(title, poster, seconds, element('div', 'msg bad', 'This video is protected by DRM.'));
+      return renderShell(title, poster, duration, element('div', 'msg bad', 'This video is protected by DRM.'));
 
     const loading = element('div', 'msg', 'Loading formats…');
     loading.setAttribute('role', 'status');
-    renderShell(title, poster, seconds, loading);
-    const result = await send({ type: 'media-options', playerUrl: video.currentSrc || video.src || '', title });
-    if (request !== panelRequest) return;
+    renderShell(title, poster, duration, loading);
+    if (!isCurrentRequest(request)) return;
+    const result = await send({ type: 'media-options', pageUrl, mediaChangedAt, title,
+      playerPageUrl: current ? binding.page : '', playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
+    if (!isCurrentRequest(request)) return;
     if (!result?.ok || !result.data?.choices?.length) {
       const message = errorMessage(result);
-      if (result?.code !== 'protected') appendRetry(message, loadFormats);
-      return renderShell(title, poster, seconds, message);
+      if (!['protected', 'blocked', 'chrome-format'].includes(result?.code)) appendRetry(message, loadFormats, result?.data?.retryAt);
+      return renderShell(title, poster, duration, message);
     }
     const formats = result.data;
     choice = formats.choices[0];
-    renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? seconds, formats);
+    renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? duration, formats);
+  }
+
+  function declaredManifest(identity) {
+    for (const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 6)) {
+      if (script.textContent.length > 64 * 1024) continue;
+      try {
+        const json = JSON.parse(script.textContent);
+        const entries = Array.isArray(json) ? json : Array.isArray(json?.['@graph']) ? json['@graph'] : [json];
+        for (const entry of entries.slice(0, 12)) {
+          if (entry?.['@type'] !== 'VideoObject' || ![entry.url, entry['@id'], entry.embedUrl].some(url => VesperPlayerSource.identity(url) === identity)) continue;
+          const url = VesperPlayerSource.http(entry.contentUrl);
+          if (url) return url.href;
+        }
+      } catch { /* This page did not expose usable video metadata. */ }
+    }
   }
 
   function renderShell(title, poster, seconds, ...body) {
@@ -344,19 +455,41 @@
     labels.append(element('div', 't', title), element('div', 'd', clock));
     const close = element('button', 'x', '×');
     close.setAttribute('aria-label', 'Close');
-    close.onclick = closePanel;
+    close.onclick = () => { closePanel(); button.focus({ preventScroll: true }); };
     head.append(thumb, labels, close);
     panel.replaceChildren(head, ...body);
     place();
     return close;
   }
 
-  function renderChoices(title, poster, seconds, formats, expanded = false) {
-    const all = expanded ? [...formats.choices, ...formats.more] : formats.choices;
+  function renderChoices(title, poster, seconds, formats, expanded = false, useOriginal = false, useM4a = true) {
+    const request = panelRequest;
+    const originalPresets = useOriginal ? formats.originalChoices : formats.choices;
+    const presets = useM4a && formats.audioM4a
+      ? originalPresets.map(c => c.label === 'Audio only' ? formats.audioM4a : c)
+      : originalPresets;
+    const moreFormats = formats.more || [];
+    const all = expanded ? [...presets, ...moreFormats] : presets;
+    const output = element('label', 'output', 'Output');
+    const mode = element('select');
+    output.append(mode);
     const list = element('div', 'list');
     list.setAttribute('role', 'radiogroup');
     list.setAttribute('aria-label', 'Download format');
     const rows = [];
+    function updateOutput(index) {
+      const isPreset = index < presets.length;
+      const audio = isPreset && choice.label === 'Audio only';
+      output.hidden = !isPreset || !(audio ? formats.audioM4a : formats.originalChoices?.length);
+      if (output.hidden) return;
+      const kind = audio ? 'audio' : 'video';
+      if (mode.dataset.kind !== kind) {
+        const labels = audio ? ['M4A (AAC)', 'Original audio'] : ['Compatible', 'Original'];
+        mode.replaceChildren(...labels.map(name => element('option', '', name)));
+        mode.dataset.kind = kind;
+      }
+      mode.selectedIndex = (audio ? !useM4a : useOriginal) ? 1 : 0;
+    }
     function select(index, focus) {
       choice = all[index];
       for (const [i, option] of rows.entries()) {
@@ -364,6 +497,7 @@
         option.querySelector('.tick').textContent = i === index ? '✓' : '';
         option.tabIndex = i === index ? 0 : -1;
       }
+      updateOutput(index);
       if (focus) rows[index].focus();
     }
     for (const c of all) {
@@ -379,10 +513,12 @@
       if (c.container) option.append(element('span', 'kind', c.container));
       option.append(element('span', 'tick'));
       const index = rows.length;
-      option.onclick = () => select(index, false);
+      option.onclick = () => {
+        if (option.isConnected && isCurrentRequest(request)) select(index, false);
+      };
       option.onkeydown = e => {
         const offset = { ArrowUp: -1, ArrowLeft: -1, ArrowDown: 1, ArrowRight: 1 }[e.key];
-        if (!offset) return;
+        if (!offset || !option.isConnected || !isCurrentRequest(request)) return;
         e.preventDefault();
         e.stopPropagation();
         select((index + offset + all.length) % all.length, true);
@@ -391,41 +527,60 @@
       list.append(option);
     }
     select(Math.max(0, all.indexOf(choice)), false);
-    const body = [list];
-    if (!expanded && formats.more.length) {
+    mode.onchange = () => {
+      if (!mode.isConnected || output.hidden || !isCurrentRequest(request)) return;
+      let original = useOriginal, m4a = useM4a;
+      if (mode.dataset.kind === 'audio') {
+        m4a = mode.selectedIndex === 0;
+        choice = m4a ? formats.audioM4a : originalPresets.find(c => c.label === 'Audio only');
+      } else {
+        original = mode.selectedIndex === 1;
+        const next = original ? formats.originalChoices : formats.choices;
+        choice = next.find(c => c.label === choice.label) || next[0];
+      }
+      renderChoices(title, poster, seconds, formats, expanded, original, m4a);
+      panel.querySelector('.output select')?.focus({ preventScroll: true });
+    };
+    const body = [output, list];
+    if (!expanded && moreFormats.length) {
       const more = element('button', 'vesper-button more', 'More formats ▾');
       more.onclick = () => {
-        renderChoices(title, poster, seconds, formats, true);
-        panel.querySelectorAll('.opt')[formats.choices.length]?.focus();
+        if (!isCurrentRequest(request)) return;
+        renderChoices(title, poster, seconds, formats, true, useOriginal, useM4a);
+        panel.querySelectorAll('.opt')[presets.length]?.focus();
       };
       body.push(more);
     }
     const footer = element('div', 'foot');
-    for (const mode of ['queue', 'download']) {
-      const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', mode === 'download' ? 'Download' : 'Queue');
-      action.onclick = () => deliver(title, poster, seconds, formats.mediaSession, choice.index, mode);
+    for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
+      const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
+      const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
+      action.onclick = () => {
+        if (action.isConnected) void deliver(title, poster, seconds, formats, choice.index, mode, request);
+      };
       footer.append(action);
     }
     renderShell(title, poster, seconds, ...body, footer);
   }
 
-  async function deliver(title, poster, seconds, mediaSession, formatChoice, mode) {
-    const request = panelRequest;
-    const sending = element('div', 'msg', 'Sending to VESPER…');
+  async function deliver(title, poster, seconds, formats, formatChoice, mode, request) {
+    if (!isCurrentRequest(request)) return;
+    const sending = element('div', 'msg', formats.browserChoice ? 'Starting in Chrome…' : 'Sending to VESPER…');
     sending.setAttribute('role', 'status');
     const hadFocus = panel.contains(root.activeElement);
     const close = renderShell(title, poster, seconds, sending);
     if (hadFocus) close.focus({ preventScroll: true });
-    const reply = await send({ type: 'media-select', mediaSession, formatChoice, mode });
-    if (request !== panelRequest) return;
+    const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice, pageUrl }
+      : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode });
+    if (!isCurrentRequest(request)) return;
     if (reply?.ok) {
       const status = reply.results?.[0]?.status;
-      return confirmSend(status === 'queued' ? 'Queued in VESPER' :
+      return confirmSend(formats.browserChoice ? 'Downloading in Chrome' : status === 'queued' ? 'Queued in VESPER' :
         status === 'already-submitted' ? 'Already in VESPER' : 'Sent to VESPER', request);
     }
     const error = errorMessage(reply);
     appendRetry(error, reply?.code === 'expired-selection' ? loadFormats
-      : () => deliver(title, poster, seconds, mediaSession, formatChoice, mode));
+      : () => deliver(title, poster, seconds, formats, formatChoice, mode, request));
     const hasFocus = panel.contains(root.activeElement);
     renderShell(title, poster, seconds, error);
     if (hasFocus) error.querySelector('button')?.focus({ preventScroll: true });
@@ -434,30 +589,30 @@
   async function confirmSend(message, request) {
     if (panel.contains(root.activeElement)) button.focus({ preventScroll: true });
     panel.inert = true;
-    if (!reducedMotion.matches) {
+    if (!still()) {
       panelMotion = panel.animate([{ opacity: 1, transform: 'none' },
         { opacity: 0, transform: 'translate(5px,-7px) scale(.96)' }], { duration: 145, easing: 'ease-in', fill: 'forwards' });
       await panelMotion.finished.catch(() => {});
     }
-    if (request !== panelRequest) return;
-    closePanel();
+    if (!isCurrentRequest(request)) return;
+    closePanel(true);
     receipt.textContent = message;
     receipt.classList.add('show');
     receiptTimer = setTimeout(() => { dismissReceipt(); updateFlyVisibility(); }, 1750);
-    if (!reducedMotion.matches) {
-      settleMotion = button.firstElementChild.animate([
-        { transform: 'none' },
-        { transform: 'translate(-3px,-6px) rotate(-8deg) scaleX(.90)', offset: .42 },
-        { transform: 'translate(1px,-2px) rotate(3deg)', offset: .76 },
-        { transform: 'none' }
-      ], { duration: 340, easing: 'ease-out' });
-    }
     place();
   }
 
-  function appendRetry(message, action) {
+  function appendRetry(message, action, when) {
     const retry = element('button', 'link', 'Try again');
     retry.onclick = action;
+    const retryAt = Date.parse(when);
+    if (retryAt > Date.now()) {
+      const time = new Date(retryAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      message.append(` Try again after ${time}.`);
+      retry.hidden = true;
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => { retry.hidden = false; }, retryAt - Date.now());
+    }
     message.append(' ', retry);
   }
 
@@ -474,6 +629,22 @@
     return element('div', 'msg bad', text);
   }
 
-  document.addEventListener('pointerdown', (e) => { if (panel?.classList.contains('show') && !e.composedPath().includes(host)) closePanel(); }, { capture: true, passive: true });
+  function applyMotion() {
+    if (!alive()) return;
+    host?.toggleAttribute('data-vesper-still', still());
+    companion?.setStill(still());
+    if (still()) panelMotion?.cancel();
+  }
+
+  document.addEventListener('pointerdown', (e) => {
+    if (alive() && panel?.classList.contains('show') && !e.composedPath().includes(host)) closePanel();
+  }, { capture: true, passive: true, signal });
+  window.addEventListener('pagehide', e => { if (e.persisted) companion?.setVisible(false); else retire(); }, { signal });
+  window.addEventListener('pageshow', selectPlayer, { signal });
+  reducedMotion.addEventListener('change', applyMotion, { signal });
+  unwatchMotion = VesperTheme.watchPreference('motion', 'system', value => {
+    motionMode = ['animate', 'still'].includes(value) ? value : 'system';
+    applyMotion();
+  });
   document.querySelectorAll('video').forEach(consider);
 })();

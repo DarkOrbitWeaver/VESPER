@@ -65,6 +65,42 @@ public static class PathSafety
         }
     }
 
+    internal static bool TryGetBrowserDownload(BrowserCompletedFile file, string defaultFolder, string? browserFolder, out string path)
+    {
+        path = "";
+        string value = file.Path;
+        if (file.Length < 0 || value.Length is < 1 or > 4096 || value.Any(char.IsControl)
+            || !Path.IsPathFullyQualified(value) || value.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains("..")
+            || (OperatingSystem.IsWindows() && (value.Length < 3 || !char.IsAsciiLetter(value[0])
+                || value[1] != ':' || value[2] is not ('\\' or '/') || value.AsSpan(2).Contains(':'))))
+            return false;
+        try
+        {
+            string full = Path.GetFullPath(value);
+            foreach (string? folder in new[] { defaultFolder, browserFolder })
+            {
+                if (folder is null || !Path.IsPathFullyQualified(folder) || !IsInside(folder, full)) continue;
+                string root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+                string? parent = Path.GetDirectoryName(full);
+                while (parent is not null)
+                {
+                    if (Inspect(parent) is not { Exists: true, IsDirectory: true, IsReparsePoint: false, IsCloudPlaceholder: false }) break;
+                    if (string.Equals(parent, root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        FileCheck check = Inspect(full);
+                        if (check is { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false }
+                            && check.Length == file.Length && !full.EndsWith(".crdownload", StringComparison.OrdinalIgnoreCase))
+                        { path = full; return true; }
+                        break;
+                    }
+                    parent = Path.GetDirectoryName(parent);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException) { }
+        return false;
+    }
+
     /// <summary>User-readable form: the profile path is shown as %USERPROFILE%. Never used for filesystem work.</summary>
     public static string ForDisplay(string path)
     {

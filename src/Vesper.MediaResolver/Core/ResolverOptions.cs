@@ -31,10 +31,13 @@ public sealed class ResolverOptions
     public bool AllowPrivateNetworks { get; init; }
 
     /// <summary>
-    /// When true the system proxy is used and DNS/IP filtering at connect time is delegated to the proxy
-    /// (only literal-host checks remain). Default false.
+    /// When true the system proxy is used. Requests still pass URL and local DNS checks before reaching the proxy.
     /// </summary>
     public bool UseSystemProxy { get; init; }
+    public Uri? ProxyAddress { get; init; }
+
+    public Func<Uri, DateTimeOffset?>? OriginRetryAt { get; init; }
+    public Action<Uri, DateTimeOffset>? OriginThrottled { get; init; }
 
     public string UserAgent { get; init; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VesperMediaResolver/0.1";
 

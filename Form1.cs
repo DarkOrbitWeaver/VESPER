@@ -5,7 +5,10 @@ namespace VESPER;
 
 public partial class Form1 : Form
 {
+    internal VesperPalette CurrentPalette => _colors;
     private readonly Dictionary<Guid, DownloadItem> _items = [];
+    private readonly Dictionary<string, DownloadItem> _browserItems = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _recentBrowserCompletions = new(StringComparer.Ordinal);
     private readonly VesperPreferences _prefs;
     private readonly DownloadEngine? _engine;
     private readonly DownloadActions? _actions;
@@ -24,7 +27,10 @@ public partial class Form1 : Form
     private bool _inboxQueued;
 
     private NotifyIcon? _tray;
+    private VesperNotice? _notice;
+    private Rectangle _noticeWorkArea;
     private BridgeServer? _bridge;
+    private BrowserBridgeHandler? _browserHandler;
     private DownloadItem? _menuTarget;
     private VesperPalette _colors = VesperPalette.Light;
 
@@ -33,7 +39,6 @@ public partial class Form1 : Form
     private bool _allowVisible;
     private bool _exiting;
     private string? _lastClipboard;
-    private string? _clipboardCandidate;
     private DateTime _lastAvailabilityCheck = DateTime.MinValue;
 
     /// <summary>Visual Studio designer entry point. Never starts an engine.</summary>
@@ -44,6 +49,7 @@ public partial class Form1 : Form
         _prefs = preferences;
         Disposed += (_, _) =>
         {
+            _browserHandler?.CloseBrowserActivity();
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _botanicalArt?.Dispose();
             _rowMenu.Dispose();
@@ -53,6 +59,15 @@ public partial class Form1 : Form
         _startHidden = startHidden;
         _allowVisible = !startHidden;
         InitializeComponent();
+        Move += (_, _) => RememberNoticeMonitor();
+        FormWindowState previousState = WindowState;
+        Resize += (_, _) =>
+        {
+            RememberNoticeMonitor();
+            if (previousState != WindowState) _browserHandler?.WakeBrowserActivity();
+            previousState = WindowState;
+        };
+        VisibleChanged += (_, _) => { RememberNoticeMonitor(); _browserHandler?.WakeBrowserActivity(); };
         HandleCreated += (_, _) => VesperWindowChrome.Apply(this, _colors);
 
         VesperWindowChrome.Brand(this);
@@ -86,15 +101,15 @@ public partial class Form1 : Form
         engine.ActivityChanged += active => PostToUi(() => EngineHost.HoldAwake(active && _prefs.PreventSleep));
 
         BuildTray();
-        var handler = new BrowserBridgeHandler(this, engine, () => _prefs);
+        _browserHandler = new BrowserBridgeHandler(this, engine, () => _prefs);
         try
         {
-            _bridge = new BridgeServer(BridgePipe.NameForCurrentUser(), handler.HandleAsync);
+            _bridge = new BridgeServer(BridgePipe.NameForCurrentUser(), _browserHandler.HandleAsync);
             _bridge.Start();
         }
         catch (IOException ex)
         {
-            MessageBox.Show(this, "The browser connection could not be started: " + ex.Message + "\n\nDownloads from the VESPER window still work.",
+            VesperMessageBox.Show(this, "The browser connection could not be started: " + ex.Message + "\n\nDownloads from the VESPER window still work.",
                 "Browser integration", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
@@ -107,6 +122,70 @@ public partial class Form1 : Form
         if (IsDisposed || !IsHandleCreated) return;
         try { BeginInvoke(action); }
         catch (InvalidOperationException) { /* the window is closing */ }
+    }
+
+    internal async Task<bool> ApplyBrowserActivityAsync(BrowserActivity activity, CancellationToken ct)
+    {
+        if (IsDisposed || !IsHandleCreated) return false;
+        var applied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        PostToUi(() =>
+        {
+            var current = activity.Files.Select(file => file.Id).ToHashSet(StringComparer.Ordinal);
+            bool structure = RemoveBrowserRows(item => item.BrowserProfile == activity.Profile && !current.Contains(item.BrowserFile!.Id));
+            var changed = new List<Guid>();
+            foreach (BrowserActiveFile file in activity.Files)
+            {
+                if (_recentBrowserCompletions.Contains(file.Id)) continue;
+                if (!_browserItems.TryGetValue(file.Id, out var row))
+                {
+                    row = new DownloadItem { Id = Guid.NewGuid() };
+                    _items.Add(row.Id, row);
+                    _browserItems.Add(file.Id, row);
+                    structure = true;
+                }
+                else if (row.BrowserFile == file) continue;
+                var previous = row.BrowserFile;
+                row.UpdateFromBrowser(activity.Profile, file);
+                structure |= previous is null || previous.Name != file.Name || previous.Paused != file.Paused
+                    || previous.CanResume != file.CanResume || _sort.SelectedText == "Size" && previous.Length != file.Length;
+                changed.Add(row.Id);
+            }
+            if (structure) RefreshList();
+            else if (Visible && changed.Count > 0) _grid.RefreshRows(changed, static id => id);
+            applied.TrySetResult(Visible && WindowState != FormWindowState.Minimized);
+        });
+        try { return await applied.Task.WaitAsync(TimeSpan.FromSeconds(3), ct); }
+        catch (TimeoutException) { return false; }
+    }
+
+    internal void ClearBrowserActivity(string profile) => PostToUi(() =>
+    {
+        if (RemoveBrowserRows(item => item.BrowserProfile == profile)) RefreshList();
+    });
+
+    internal void FinishBrowserActivity(string id) => PostToUi(() =>
+    {
+        if (_recentBrowserCompletions.Count >= 256) _recentBrowserCompletions.Remove(_recentBrowserCompletions.First());
+        _recentBrowserCompletions.Add(id);
+        if (RemoveBrowserRows(item => item.BrowserFile!.Id == id)) RefreshList();
+    });
+
+    private bool RemoveBrowserRows(Func<DownloadItem, bool> predicate)
+    {
+        var removed = _browserItems.Values.Where(predicate).ToArray();
+        foreach (var row in removed)
+        {
+            _browserItems.Remove(row.BrowserFile!.Id);
+            _items.Remove(row.Id);
+        }
+        if (removed.Length > 0) _grid.PruneChecks(_items.Keys);
+        return removed.Length > 0;
+    }
+
+    private void ControlBrowserDownload(DownloadItem row, string action)
+    {
+        if (row.BrowserFile is { } file && row.BrowserProfile is { } profile)
+            _browserHandler?.SendBrowserCommand(profile, file.Id, action);
     }
 
     private void Enqueue(JobSnapshot snapshot)
@@ -144,28 +223,52 @@ public partial class Form1 : Form
             }
             else
             {
-                _items[snapshot.Id] = DownloadItem.From(snapshot);
+                var added = DownloadItem.From(snapshot);
+                _items[snapshot.Id] = added;
+                if (added.Status == JobStatus.Completed) Announce(JobStatus.Queued, added);
                 structural = true;
             }
         }
         if (structural) RefreshList();
-        else { _grid.RefreshRows(batch); UpdateFooter(); }
+        else { _grid.RefreshRows(batch, static row => row.Id); UpdateFooter(); }
     }
 
     /// <summary>Tray notifications only for real transitions the user would want to know about.</summary>
     private void Announce(JobStatus before, DownloadItem item)
     {
-        if (!_prefs.NotifyOnFinish || _tray is null || before == item.Status) return;
-        bool wasActive = before is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing or JobStatus.Verifying
+        if (!_prefs.NotifyOnFinish || _tray is null || before == item.Status || item.Snapshot?.Kind == JobKind.BrowserFile) return;
+        if (item.Status == JobStatus.Completed && before != JobStatus.Missing)
+        {
+            _notice ??= new VesperNotice();
+            if (_notice.PresentCompletion(item.Name, _colors, NoticeArea, ShowFromTray) && _prefs.PlayCompletionSound)
+                VesperSounds.PlayCompletion();
+            return;
+        }
+        bool wasActive = before is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing or JobStatus.Verifying or JobStatus.Converting
             or JobStatus.Waiting or JobStatus.WaitingRetry;
         if (!wasActive) return;
         switch (item.Status)
         {
-            case JobStatus.Completed: _tray.ShowBalloonTip(4000, "Download complete", item.Name, ToolTipIcon.Info); break;
-            case JobStatus.NeedsLink: _tray.ShowBalloonTip(5000, "Link expired", item.Name + " needs a new link. Saved data is kept.", ToolTipIcon.Warning); break;
+            case JobStatus.NeedsLink:
+                PresentNotice("Link expired", item.Name, VesperIcon.Clock, ShowFromTray);
+                break;
             case JobStatus.NeedsAttention: case JobStatus.Failed: case JobStatus.Suspect:
-                _tray.ShowBalloonTip(5000, "Download needs attention", item.Name, ToolTipIcon.Warning); break;
+                PresentNotice("Download needs attention", item.Name, VesperIcon.Warning, ShowFromTray);
+                break;
         }
+    }
+
+    private Rectangle NoticeArea => _noticeWorkArea.IsEmpty ? Screen.FromPoint(Cursor.Position).WorkingArea : _noticeWorkArea;
+
+    private void PresentNotice(string title, string detail, VesperIcon symbol, Action activate)
+    {
+        _notice ??= new VesperNotice();
+        _notice.Present(title, detail, symbol, _colors, NoticeArea, activate);
+    }
+
+    private void RememberNoticeMonitor()
+    {
+        if (Visible && WindowState != FormWindowState.Minimized) _noticeWorkArea = Screen.FromControl(this).WorkingArea;
     }
 
     // ---- window, tray and lifecycle -------------------------------------------------------------------------------
@@ -189,11 +292,6 @@ public partial class Form1 : Form
         _tray = new NotifyIcon { Icon = Icon, Text = "VESPER", Visible = true, ContextMenuStrip = menu };
         ApplyTrayAppearance();
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowFromTray(); };
-        _tray.BalloonTipClicked += (_, _) =>
-        {
-            if (_clipboardCandidate is { } link) { _clipboardCandidate = null; ShowFromTray(); AddDownload(link); }
-            else ShowFromTray();
-        };
     }
 
     private void ApplyTrayAppearance()
@@ -235,7 +333,7 @@ public partial class Form1 : Form
     {
         if (HasActiveDownloads())
         {
-            var choice = MessageBox.Show(this,
+            var choice = VesperMessageBox.Show(this,
                 "Downloads are still running.\n\nExit now? Running downloads will be paused safely and resume next time VESPER starts.",
                 "Exit VESPER", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
             if (choice != DialogResult.Yes) return;
@@ -249,6 +347,8 @@ public partial class Form1 : Form
     {
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _bridge?.Dispose();
+        _notice?.Dispose();
+        VesperSounds.Stop();
         _tray?.ContextMenuStrip?.Dispose();
         _tray?.Dispose();
         EngineHost.HoldAwake(false);
@@ -293,8 +393,9 @@ public partial class Form1 : Form
             _lastClipboard = text;
             string ext = Path.GetExtension(uri.AbsolutePath).ToLowerInvariant();
             if (ext is not (".zip" or ".rar" or ".7z" or ".iso" or ".exe" or ".msi" or ".mp4" or ".mkv" or ".webm" or ".mp3" or ".flac" or ".pdf" or ".m3u8" or ".epub")) return;
-            _clipboardCandidate = text;
-            _tray?.ShowBalloonTip(5000, "Link copied", "Click to download " + FileNames.FromUrl(uri) + " with VESPER.", ToolTipIcon.Info);
+            if (_tray is not null)
+                PresentNotice("Link copied", "Add " + FileNames.FromUrl(uri) + " to VESPER", VesperIcon.Clipboard,
+                    () => { ShowFromTray(); AddDownload(text); });
         }
         catch (System.Runtime.InteropServices.ExternalException) { /* another program holds the clipboard; try again next time */ }
     }
@@ -352,8 +453,18 @@ public partial class Form1 : Form
         _search.TextChanged += (_, _) => RefreshList();
         _filter.SelectedIndexChanged += (_, _) => RefreshList();
         _sort.SelectedIndexChanged += (_, _) => RefreshList();
-        _pause.Click += (_, _) => { foreach (var s in CheckedSnapshots()) _engine?.Pause(s.Id); };
-        _resume.Click += (_, _) => { foreach (var s in CheckedSnapshots()) _engine?.Resume(s.Id); };
+        _pause.Click += (_, _) =>
+        {
+            foreach (var row in _grid.CheckedItems)
+                if (row.BrowserFile is { Paused: false }) ControlBrowserDownload(row, "pause");
+                else if (row.Snapshot is { } s) _engine?.Pause(s.Id);
+        };
+        _resume.Click += (_, _) =>
+        {
+            foreach (var row in _grid.CheckedItems)
+                if (row.BrowserFile is { Paused: true, CanResume: true }) ControlBrowserDownload(row, "resume");
+                else if (row.Snapshot is { } s) _engine?.Resume(s.Id);
+        };
         _remove.Click += (_, _) => _actions?.Remove(CheckedSnapshots());
         _clear.Click += (_, _) => _grid.ClearChecks();
 
@@ -463,6 +574,8 @@ public partial class Form1 : Form
     private void ApplyAppearance()
     {
         _colors = UiKit.Palette(_prefs);
+        VesperWindowChrome.ApplyNativeColors(_colors);
+        _notice?.ApplyPalette(_colors);
         if (_colors.Botanical) _botanicalArt ??= BotanicalArt.Acquire(_colors);
         else
         {
@@ -531,7 +644,7 @@ public partial class Form1 : Form
 
         records = _filter.SelectedText switch
         {
-            "Downloading" => records.Where(r => r.Status is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing),
+            "Downloading" => records.Where(r => r.Status is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing or JobStatus.Converting),
             "Paused" => records.Where(r => r.Status == JobStatus.Paused),
             "Queued" => records.Where(r => r.Status is JobStatus.Queued or JobStatus.Waiting or JobStatus.WaitingRetry),
             "Completed" => records.Where(r => r.Status is JobStatus.Completed or JobStatus.Missing),
@@ -582,8 +695,9 @@ public partial class Form1 : Form
         _selectedLabel.Text = $"{count} selected";
         var selected = _grid.CheckedItems;
         _pause.Enabled = selected.Any(r => r.Status is JobStatus.Downloading or JobStatus.Queued or JobStatus.Resolving or JobStatus.WaitingRetry or JobStatus.Waiting);
-        _resume.Enabled = selected.Any(r => r.Status is JobStatus.Paused or JobStatus.Failed or JobStatus.NeedsAttention);
-        _remove.Enabled = count > 0;
+        _resume.Enabled = selected.Any(r => r.BrowserFile is { Paused: true, CanResume: true }
+            || r.BrowserFile is null && r.Status is JobStatus.Paused or JobStatus.Failed or JobStatus.NeedsAttention);
+        _remove.Enabled = selected.Any(r => r.Snapshot is not null) || _engine is null && count > 0;
         LayoutSelectionToolbar();
     }
 
@@ -613,7 +727,7 @@ public partial class Form1 : Form
                 Kind: media.Kind, OriginalPageUrl: media.OriginalPageUrl,
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
-                MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId));
+                MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId, Output: media.Output));
             if (!result.Ok) problems.Add($"{UrlPolicy.Redact(media.Url)}\n   {result.Message}");
         }
         foreach (string url in dialog.DownloadUrls)
@@ -623,7 +737,7 @@ public partial class Form1 : Form
             if (!result.Ok) problems.Add($"{UrlPolicy.Redact(url)}\n   {result.Message}");
         }
         if (problems.Count > 0)
-            MessageBox.Show(this, "Some links were not added:\n\n" + string.Join("\n\n", problems), "Add download", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(this, "Some links were not added:\n\n" + string.Join("\n\n", problems), "Add download", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void OpenSettings()
@@ -639,12 +753,12 @@ public partial class Form1 : Form
 
         BuildRateOptions();
         if (SettingsStore.Save(_prefs) is { } saveError)
-            MessageBox.Show(this, "Settings could not be saved and will be lost when VESPER closes:\n" + saveError, "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            VesperMessageBox.Show(this, "Settings could not be saved and will be lost when VESPER closes:\n" + saveError, "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         EngineHost.Apply(_engine, _prefs);        // running downloads keep running; limits and queue rules update
         ApplyAppearance();
         RefreshList();
         if (restartNeeded)
-            MessageBox.Show(this, "Network access and proxy changes apply the next time VESPER starts.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(this, "Network access and proxy changes apply the next time VESPER starts.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private static void CopyPreferences(VesperPreferences from, VesperPreferences to)
@@ -654,6 +768,7 @@ public partial class Form1 : Form
         to.ConcurrentTransfers = from.ConcurrentTransfers; to.GlobalRateLimitKbs = from.GlobalRateLimitKbs;
         to.PerTransferRateLimitKbs = from.PerTransferRateLimitKbs; to.BandwidthPresetsKbs = [.. from.BandwidthPresetsKbs];
         to.MaxConnectionsPerJob = from.MaxConnectionsPerJob; to.NotifyOnFinish = from.NotifyOnFinish; to.WatchClipboard = from.WatchClipboard;
+        to.PlayCompletionSound = from.PlayCompletionSound;
         to.PreventSleep = from.PreventSleep; to.CloseToTray = from.CloseToTray; to.AllowPrivateNetworks = from.AllowPrivateNetworks;
         to.ProxyMode = from.ProxyMode; to.ProxyAddress = from.ProxyAddress; to.ScheduleEnabled = from.ScheduleEnabled;
         to.ScheduleStart = from.ScheduleStart; to.ScheduleEnd = from.ScheduleEnd; to.BrowserAction = from.BrowserAction;
@@ -668,7 +783,14 @@ public partial class Form1 : Form
             var command = new ToolStripMenuItem(text);
             command.Click += (_, _) =>
             {
-                if (_menuTarget?.Snapshot is { } snapshot) action(snapshot);
+                if (_menuTarget is not { } target) return;
+                if (target.BrowserFile is not null)
+                {
+                    if (text == "Pause") ControlBrowserDownload(target, "pause");
+                    else if (text == "Resume") ControlBrowserDownload(target, "resume");
+                    else if (text == "Cancel download") ControlBrowserDownload(target, "cancel");
+                }
+                else if (target.Snapshot is { } snapshot) action(snapshot);
             };
             _menuCommands.Add(text, command);
             _menuSymbols.Add(command, icon);
@@ -681,6 +803,7 @@ public partial class Form1 : Form
         Add("Locate file…", VesperIcon.Folder, s => _actions?.Locate(s));
         Add("Pause", VesperIcon.Pause, s => _engine?.Pause(s.Id));
         Add("Resume", VesperIcon.Play, s => _engine?.Resume(s.Id));
+        Add("Cancel download", VesperIcon.Close, _ => { });
         Add("Start now", VesperIcon.Play, s => _engine?.StartNow(s.Id));
         Add("Replace link…", VesperIcon.Link, s => _actions?.ReplaceLink(s));
         Add("Resume anyway…", VesperIcon.Play, s => _actions?.ApproveUnverified(s));
@@ -757,6 +880,14 @@ public partial class Form1 : Form
     /// <summary>Only toggles items whose availability actually changed; toggling all of them forced repeated menu layout.</summary>
     private void ConfigureRowMenu(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        if (_menuTarget?.BrowserFile is { } browser)
+        {
+            foreach (var (name, command) in _menuCommands)
+                command.Available = name == "Cancel download" || name == "Pause" && !browser.Paused
+                    || name == "Resume" && browser.Paused && browser.CanResume;
+            _bandwidthMenu.Available = _priorityMenu.Available = false;
+            return;
+        }
         if (_menuTarget?.Snapshot is not { } s) { e.Cancel = true; return; }
 
         bool fileAvailable = s.State == JobState.Completed && !s.FileMissing;
@@ -765,8 +896,10 @@ public partial class Form1 : Form
         {
             bool available = name switch
             {
-                "Details" or "Copy source URL" or "Rename entry…" or "Remove from list…" => true,
-                "Open file" or "Open containing folder" or "Verify integrity…" or "Delete downloaded file…" =>
+                "Details" or "Rename entry…" or "Remove from list…" => true,
+                "Copy source URL" => s.Kind != JobKind.BrowserFile,
+                "Delete downloaded file…" => fileAvailable && s.Kind != JobKind.BrowserFile,
+                "Open file" or "Open containing folder" or "Verify integrity…" =>
                     fileAvailable || (name == "Open containing folder" && s.State == JobState.Suspect),
                 "Locate file…" => s.State == JobState.Completed && s.FileMissing,
                 "Pause" => s.State is JobState.Resolving or JobState.Downloading or JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry,
@@ -780,7 +913,7 @@ public partial class Form1 : Form
             if (command.Available != available) command.Available = available;
         }
 
-        bool tunable = unfinished && s.State is not (JobState.Suspect or JobState.Finalizing or JobState.Verifying);
+        bool tunable = unfinished && s.State is not (JobState.Suspect or JobState.Finalizing or JobState.Verifying or JobState.Converting);
         if (_bandwidthMenu.Available != tunable) _bandwidthMenu.Available = tunable;
         if (_priorityMenu.Available != tunable) _priorityMenu.Available = tunable;
 

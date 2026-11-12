@@ -19,11 +19,24 @@
         <option value="dark">Dark</option>
       </select>
     </label>
+    <label class="setting"><span>Butterfly motion</span>
+      <select id="motion">
+        <option value="system">System</option>
+        <option value="animate">Animate</option>
+        <option value="still">Still</option>
+      </select>
+    </label>
     <label class="setting"><span>When Chrome sends a file</span>
       <select id="handoff">
         <option value="download">Download now</option>
         <option value="queue">Queue</option>
         <option value="default">Follow VESPER</option>
+      </select>
+    </label>
+    <label class="setting"><span>Download connection</span>
+      <select id="route">
+        <option value="auto">Automatic</option>
+        <option value="chrome">Keep Chrome’s connection</option>
       </select>
     </label>
     <label class="check"><input type="checkbox" id="intercept"><span>Capture downloads automatically</span></label>

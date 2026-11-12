@@ -118,7 +118,8 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             if (status is not (200 or 206)) throw new RunnerStop(status switch
             {
                 401 or 403 or 404 or 410 => RunOutcome.NeedsLink("expired", "The DASH address expired or is unavailable. Saved fragments were kept; do not replace them with another representation."),
-                408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The fragment server answered HTTP {status}."),
+                408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The fragment server answered HTTP {status}.",
+                    HttpFacts.RetryAfter(response, DateTimeOffset.UtcNow)),
                 _ => RunOutcome.NeedsAttention("http-status", $"The fragment server answered HTTP {status}.")
             });
             if (!HttpFacts.IsIdentityEncoded(response) || HttpFacts.IsHtml(response))

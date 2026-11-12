@@ -156,7 +156,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                 200 => Stop("The media server ignored the byte-range request."),
                 401 or 403 or 404 or 410 => RunOutcome.NeedsLink("expired", "The media address expired or was refused. Saved track data was kept; refresh the source to continue."),
                 416 => Stop("The media server reports a different size than planned."),
-                408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The media server answered HTTP {status}."),
+                408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The media server answered HTTP {status}.",
+                    HttpFacts.RetryAfter(response, DateTimeOffset.UtcNow)),
                 _ => RunOutcome.NeedsAttention("http-status", $"The media server answered HTTP {status}.")
             });
             if (!HttpFacts.IsIdentityEncoded(response) || HttpFacts.IsHtml(response))
@@ -201,7 +202,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
     private async Task<RunOutcome> MergeAsync(MediaMergePlan plan, string fingerprint, CancellationToken ct)
     {
-        engine.UpdateJob(Job, j => { j.State = JobState.Verifying; j.Message = plan.Tracks.Count > 1 ? "Merging video and audio" : "Checking media"; });
+        engine.UpdateJob(Job, j => { j.State = JobState.Verifying; j.Reason = "prepare-media"; j.Message = "Preparing file"; });
         string mergingPath = MergingPath(Job);
         long length;
         string sha;

@@ -9,15 +9,9 @@ namespace VESPER;
 /// </summary>
 internal static class NativeHostSetup
 {
-    public const string HostName = "com.vesper.downloader";
-    public const string ExtensionId = "aidnpdcnkhgojimnkcgieebdjdicfemi";
-
-    private static readonly string[] BrowserKeys =
-    [
-        @"Software\Google\Chrome\NativeMessagingHosts\" + HostName,
-        @"Software\Microsoft\Edge\NativeMessagingHosts\" + HostName,
-        @"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\" + HostName
-    ];
+    public const string HostName = NativeHostRegistration.HostName;
+    public const string ExtensionId = NativeHostRegistration.ExtensionId;
+    private static string[] BrowserKeys => NativeHostRegistration.BrowserKeys;
 
     private static string? ProjectFolder
     {
@@ -65,7 +59,7 @@ internal static class NativeHostSetup
         .Equals(Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Programs", "VESPER")), StringComparison.OrdinalIgnoreCase);
 
-    public static string ManifestPath => Path.Combine(EngineHost.DataDirectory, "native-host", HostName + ".json");
+    public static string ManifestPath => NativeHostRegistration.ManifestPath(EngineHost.DataDirectory);
     public static bool HostPresent => File.Exists(HostExecutable);
     public static bool ExtensionPresent => File.Exists(Path.Combine(ExtensionFolder, "manifest.json"));
 
@@ -113,15 +107,7 @@ internal static class NativeHostSetup
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(ManifestPath)!);
-            var manifest = new
-            {
-                name = HostName,
-                description = "VESPER download manager",
-                path = HostExecutable,
-                type = "stdio",
-                allowed_origins = new[] { $"chrome-extension://{ExtensionId}/" }
-            };
-            File.WriteAllText(ManifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(ManifestPath, NativeHostRegistration.Manifest(HostExecutable));
             foreach (string subKey in BrowserKeys)
             {
                 using RegistryKey key = Registry.CurrentUser.CreateSubKey(subKey);

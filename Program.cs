@@ -28,8 +28,10 @@ namespace VESPER
 
             ApplicationConfiguration.Initialize();
             VesperPreferences preferences = SettingsStore.Load();
+            VesperMessageBox.StartupPalette = UiKit.Palette(preferences);
+            VesperWindowChrome.ApplyNativeColors(VesperMessageBox.StartupPalette);
             if (SettingsStore.LoadWarning is { } warning)
-                MessageBox.Show(warning, "VESPER settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                VesperMessageBox.Show(warning, "VESPER settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
 
             if (NativeHostSetup.HostPresent && (NativeHostSetup.IsInstalledApp || NativeHostSetup.HasDevelopmentRegistration)
                 && !NativeHostSetup.IsRegistered)
@@ -42,20 +44,20 @@ namespace VESPER
             }
             catch (StoreTooNewException ex)
             {
-                MessageBox.Show(ex.Message + "\n\nInstall the newer VESPER, or restore the backup next to the database.",
+                VesperMessageBox.Show(ex.Message + "\n\nInstall the newer VESPER, or restore the backup next to the database.",
                     "VESPER cannot start", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
             catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
             {
-                MessageBox.Show("VESPER could not open its download database:\n" + ex.Message, "VESPER cannot start",
+                VesperMessageBox.Show("VESPER could not open its download database:\n" + ex.Message, "VESPER cannot start",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
             if (engine.RecoveredFromCorruptDatabase)
             {
-                MessageBox.Show("The download database was damaged. It was kept as " + Path.GetFileName(engine.CorruptDatabaseBackup) +
+                VesperMessageBox.Show("The download database was damaged. It was kept as " + Path.GetFileName(engine.CorruptDatabaseBackup) +
                     " and a new one was created. Partial downloads that have recovery files appear as \"Needs a new link\".",
                     "VESPER recovered", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }

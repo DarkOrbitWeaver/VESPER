@@ -155,7 +155,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     {
         if (!UrlPolicy.TryParse(url, out Uri uri, out string error)) throw new RunnerStop(RunOutcome.NeedsLink("bad-url", error));
         using HttpResponseMessage response = await http.SendAsync(uri, Spec(null, null), ct).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode) throw StatusStop((int)response.StatusCode);
+        if (!response.IsSuccessStatusCode) throw StatusStop(response);
         byte[] body = await ReadBoundedAsync(response, MaxPlaylistBytes, ct).ConfigureAwait(false);
         return (System.Text.Encoding.UTF8.GetString(body), response.RequestMessage?.RequestUri ?? uri);
     }
@@ -169,7 +169,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         long? end = offset is long start && length is long size ? start + size - 1 : null;
         using HttpResponseMessage response = await http.SendAsync(uri, Spec(offset, end), ct).ConfigureAwait(false);
         int code = (int)response.StatusCode;
-        if (code is not (200 or 206)) throw StatusStop(code);
+        if (code is not (200 or 206)) throw StatusStop(response);
         if (offset is long requestedStart)
         {
             RangeCheck check = HttpFacts.CheckRangeResponse(response, requestedStart, end);
@@ -224,7 +224,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         {
             UrlPolicy.TryParse(key.Uri, out Uri keyUri, out _);
             using HttpResponseMessage response = await http.SendAsync(keyUri, Spec(null, null), ct).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode) throw StatusStop((int)response.StatusCode);
+            if (!response.IsSuccessStatusCode) throw StatusStop(response);
             material = await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false);
             if (material.Length != 16) throw new RunnerStop(RunOutcome.NeedsAttention("key", "The stream's key is not a valid AES-128 key."));
             if (cache.Count >= 32)
@@ -251,12 +251,17 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     private RequestSpec Spec(long? start, long? end) =>
         new(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: engine.SecretsFor(Job.Id));
 
-    private static RunnerStop StatusStop(int code) => new(code switch
+    private static RunnerStop StatusStop(HttpResponseMessage response)
     {
-        401 or 403 or 404 or 410 => RunOutcome.NeedsLink("expired", $"The stream address no longer works (HTTP {code}). Saved data was kept."),
-        408 or 429 or 503 or >= 500 => RunOutcome.Retry("server-error", $"The server had a problem (HTTP {code})."),
-        _ => RunOutcome.Failed("http-status", $"The server answered HTTP {code}.")
-    });
+        int code = (int)response.StatusCode;
+        return new RunnerStop(code switch
+        {
+            401 or 403 or 404 or 410 => RunOutcome.NeedsLink("expired", $"The stream address no longer works (HTTP {code}). Saved data was kept."),
+            408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The server had a problem (HTTP {code}).",
+                HttpFacts.RetryAfter(response, DateTimeOffset.UtcNow)),
+            _ => RunOutcome.Failed("http-status", $"The server answered HTTP {code}.")
+        });
+    }
 }
 
 /// <summary>Describes a link for the browser's quality picker. One small request; nothing is saved.</summary>

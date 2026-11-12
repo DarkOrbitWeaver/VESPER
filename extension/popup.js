@@ -4,13 +4,17 @@ VesperTheme.install();
 const $ = id => document.getElementById(id);
 
 async function init() {
-  const prefs = await chrome.storage.sync.get({ theme: 'system', handoff: 'download', intercept: true, useSignIn: true });
+  const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'system', route: 'auto', handoff: 'download', intercept: true, useSignIn: true });
   $('theme').value = prefs.theme;
+  $('motion').value = ['animate', 'still'].includes(prefs.motion) ? prefs.motion : 'system';
   $('handoff').value = prefs.handoff;
+  $('route').value = prefs.route === 'chrome' ? 'chrome' : 'auto';
   $('intercept').checked = prefs.intercept;
 
   $('theme').onchange = () => chrome.storage.sync.set({ theme: $('theme').value });
+  $('motion').onchange = () => chrome.storage.sync.set({ motion: $('motion').value });
   $('handoff').onchange = () => chrome.storage.sync.set({ handoff: $('handoff').value });
+  $('route').onchange = () => chrome.storage.sync.set({ route: $('route').value });
   $('intercept').onchange = () => chrome.storage.sync.set({ intercept: $('intercept').checked });
 
   const signIn = $('signin');

@@ -146,7 +146,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private Panel Page(string key, string subtitle)
     {
-        var page = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Visible = false, BackColor = _colors.Surface };
+        var page = new VesperScrollPanel { Dock = DockStyle.Fill, AutoScroll = true, Visible = false, BackColor = _colors.Surface };
         var heading = Label(key, 16, bold: true);
         heading.SetBounds(25, 22, 390, 33);
         var intro = Label(subtitle, 8.5F, muted: true);
@@ -184,10 +184,10 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private CheckBox Check(string text, int x, int y, bool value, Action<bool> update)
     {
-        var check = new CheckBox
+        var check = new VesperCheckBox(_colors)
         {
             Text = text, Checked = value, Location = new Point(x, y), Size = new Size(480, 25),
-            AutoSize = false, FlatStyle = FlatStyle.Flat,
+            AutoSize = false,
             ForeColor = _colors.Text, BackColor = _colors.Surface
         };
         check.CheckedChanged += (_, _) => update(check.Checked);
@@ -242,12 +242,20 @@ internal sealed class SettingsForm : VesperPopupForm
         missingNote.SetBounds(45, 353, 470, 37);
         var separator3 = Divider(398);
         var notify = Check("Show a notification when a download finishes", 25, 410, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);
-        var clipboard = Check("Offer to download links I copy", 25, 438, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
-        var tray = Check("Keep VESPER in the tray when I close the window", 25, 466, _draft.CloseToTray, v => _draft.CloseToTray = v);
+        var sound = Check("Play completion sound", 25, 438, _draft.PlayCompletionSound, v =>
+        {
+            _draft.PlayCompletionSound = v;
+            if (!v) VesperSounds.Stop();
+        });
+        var previewSound = Button("Preview sound", 140, symbol: VesperIcon.Audio);
+        previewSound.SetBounds(257, 437, 140, 29);
+        previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
+        var clipboard = Check("Offer to download links I copy", 25, 475, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
+        var tray = Check("Keep VESPER in the tray when I close the window", 25, 503, _draft.CloseToTray, v => _draft.CloseToTray = v);
         var collisions = Label("Existing files are never overwritten: a number is added to the new file's name instead.", 8, muted: true);
-        collisions.SetBounds(25, 496, 490, 20);
+        collisions.SetBounds(25, 533, 490, 23);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
-            separator2, missing, missingNote, separator3, notify, clipboard, tray, collisions]);
+            separator2, missing, missingNote, separator3, notify, sound, previewSound, clipboard, tray, collisions]);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
@@ -493,7 +501,7 @@ internal sealed class SettingsForm : VesperPopupForm
         {
             try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", $"\"{NativeHostSetup.ExtensionFolder}\"") { UseShellExecute = false }); }
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-            { MessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            { VesperMessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         };
         var repair = Button("Repair helper", 131, symbol: VesperIcon.Refresh);
         repair.SetBounds(213, 448, 131, 34);
@@ -501,7 +509,7 @@ internal sealed class SettingsForm : VesperPopupForm
         repair.Click += (_, _) =>
         {
             string? error = NativeHostSetup.Register();
-            if (error is not null) MessageBox.Show(this, error, "Repair browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            if (error is not null) VesperMessageBox.Show(this, error, "Repair browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             Refresh();
         };
         var developerTip = Label("For unpacked Chrome builds: chrome://extensions → Developer mode → Load unpacked.", 8, muted: true);
@@ -570,7 +578,7 @@ internal sealed class SettingsForm : VesperPopupForm
             {
                 ShowPage("Transfers");
                 _globalInput.Focus();
-                MessageBox.Show(this, "Enter a global speed limit between 1 and 10,000,000 KB/s.", "Invalid limit",
+                VesperMessageBox.Show(this, "Enter a global speed limit between 1 and 10,000,000 KB/s.", "Invalid limit",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
@@ -595,14 +603,14 @@ internal sealed class SettingsForm : VesperPopupForm
         if (string.IsNullOrWhiteSpace(_draft.DefaultFolder) || !Path.IsPathFullyQualified(_draft.DefaultFolder))
         {
             ShowPage("Downloads");
-            MessageBox.Show(this, "Choose a valid absolute default folder path.", "Invalid folder",
+            VesperMessageBox.Show(this, "Choose a valid absolute default folder path.", "Invalid folder",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         if (_draft.ScheduleEnabled && (!TimeOnly.TryParse(_scheduleStart.Text, out _) || !TimeOnly.TryParse(_scheduleEnd.Text, out _)))
         {
             ShowPage("Network");
-            MessageBox.Show(this, "Enter the download hours as 24-hour times, for example 01:00 and 07:00.", "Invalid hours", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(this, "Enter the download hours as 24-hour times, for example 01:00 and 07:00.", "Invalid hours", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         _draft.ScheduleStart = _scheduleStart.Text.Trim();
@@ -610,7 +618,7 @@ internal sealed class SettingsForm : VesperPopupForm
         if (_draft.ProxyMode == "Custom" && !Vesper.Engine.UrlPolicy.TryParse(_proxyAddress.Text, out _, out string proxyProblem))
         {
             ShowPage("Network");
-            MessageBox.Show(this, "Enter the proxy as a full address such as http://proxy.example:8080.\n" + proxyProblem, "Invalid proxy", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(this, "Enter the proxy as a full address such as http://proxy.example:8080.\n" + proxyProblem, "Invalid proxy", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         _draft.ProxyAddress = _proxyAddress.Text.Trim();
@@ -623,7 +631,7 @@ internal sealed class SettingsForm : VesperPopupForm
     {
         ShowPage("Transfers");
         row.Value.Focus();
-        MessageBox.Show(this, "Enter positive, unique bandwidth presets (up to 10,000,000 KB/s each).",
+        VesperMessageBox.Show(this, "Enter positive, unique bandwidth presets (up to 10,000,000 KB/s each).",
             "Invalid preset", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 

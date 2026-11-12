@@ -325,6 +325,30 @@ public class BridgeProtocolTests
         Assert.False(BridgeProtocol.TryParse(Msg($"\"type\":\"submit\",\"items\":[{{\"url\":\"{url}\"}}]"), out _, out _));
 
     [Fact]
+    public void Browser_handoff_parses_the_response_proof_and_always_waits_for_confirmation()
+    {
+        string request = Msg("""
+            "type":"browser-submit","mode":"download","items":[{"url":"https://example.com/archive"}],
+            "browserProof":{"length":200,"etag":"\"p1\"","contentType":"application/zip","awaitingConfirmation":false}
+            """);
+        Assert.True(BridgeProtocol.TryParse(request, out BridgeRequest parsed, out string error), error);
+        Assert.True(parsed.ConfirmTransfer);
+        Assert.Equal(new BrowserTransferProof(200, "\"p1\"", "application/zip"), parsed.BrowserProof);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"length\":-1}")]
+    [InlineData("{\"etag\":\"W/\\\"p1\\\"\"}")]
+    public void Browser_handoff_rejects_an_invalid_response_proof(string proof)
+    {
+        string request = Msg($$"""
+            "type":"browser-submit","items":[{"url":"https://example.com/archive"}],"browserProof":{{proof}}
+            """);
+        Assert.False(BridgeProtocol.TryParse(request, out _, out _));
+    }
+
+    [Fact]
     public void Browser_media_picker_accepts_bounded_hints_without_paths_or_credentials()
     {
         string request = Msg("\"type\":\"media-picker\",\"url\":\"https://video.example.com/watch/123\"," +

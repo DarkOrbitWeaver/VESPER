@@ -17,10 +17,12 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     private VesperPalette Colors => UiKit.Palette(preferences());
 
     private void Info(string text, string title = "VESPER", MessageBoxIcon icon = MessageBoxIcon.Information) =>
-        MessageBox.Show(owner, text, title, MessageBoxButtons.OK, icon);
+        VesperMessageBox.Show(owner, text, title, MessageBoxButtons.OK, icon);
 
-    private bool Confirm(string text, string title, MessageBoxIcon icon = MessageBoxIcon.Question) =>
-        MessageBox.Show(owner, text, title, MessageBoxButtons.YesNo, icon, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+    private bool Confirm(string text, string title, MessageBoxIcon icon = MessageBoxIcon.Question,
+        string? action = null, VesperIcon? symbol = null) =>
+        VesperMessageBox.Show(owner, text, title, MessageBoxButtons.YesNo, icon, MessageBoxDefaultButton.Button2,
+            action, symbol) == DialogResult.Yes;
 
     // ---- opening --------------------------------------------------------------------------------------------------
 
@@ -99,9 +101,10 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     {
         if (items.Count == 0) return;
         int partial = items.Count(i => i.State != JobState.Completed && i.CommittedBytes > 0);
-        string text = $"Remove {items.Count} {(items.Count == 1 ? "entry" : "entries")} from the list?\n\nFiles on disk are NOT deleted."
+        string text = (items.Count == 1 ? "Remove this download from the list?" : $"Remove {items.Count} downloads from the list?")
+            + "\n\nYour files stay in their folders."
             + (partial > 0 ? $"\nPartially downloaded data ({partial}) stays in the destination folder." : "");
-        if (!Confirm(text, "Remove from list")) return;
+        if (!Confirm(text, "Remove from list", action: "Remove", symbol: VesperIcon.RemoveList)) return;
 
         var blocked = new List<string>();
         foreach (JobSnapshot item in items)
@@ -114,7 +117,8 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
 
     public void DeleteFile(JobSnapshot s)
     {
-        if (!Confirm($"Move this file to the Recycle Bin?\n\n{s.FinalPath}\n\nThe entry stays in the list as \"file missing\".", "Delete downloaded file", MessageBoxIcon.Warning)) return;
+        if (!Confirm($"Move this file to the Recycle Bin?\n\n{s.FinalPath}\n\nVESPER marks the entry as File missing.",
+                "Delete downloaded file", MessageBoxIcon.Warning, "Move to Recycle Bin", VesperIcon.Trash)) return;
         DeleteResult result = engine.DeleteDownloadedFile(s.Id, EngineHost.RecycleFile);
         Info(result.Deleted ? $"Moved to the Recycle Bin:\n{result.Path}" : result.Message, "Delete downloaded file",
             result.Deleted ? MessageBoxIcon.Information : MessageBoxIcon.Warning);

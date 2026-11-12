@@ -23,6 +23,18 @@ internal static class VesperDrawing
         graphics.DrawRectangle(pen, bounds);
     }
 
+    internal static void CheckBox(Graphics graphics, Rectangle bounds, VesperPalette palette, bool isChecked, bool enabled)
+    {
+        Color fill = isChecked && enabled ? palette.Green : enabled ? palette.Surface : palette.Secondary;
+        using var face = Rounded(Rectangle.Inflate(bounds, -1, -1), Math.Max(1, bounds.Height / 4));
+        using var brush = new SolidBrush(fill);
+        using var border = new Pen(enabled ? palette.MutedGreen : palette.Border);
+        graphics.FillPath(brush, face);
+        graphics.DrawPath(border, face);
+        if (isChecked)
+            Icon(graphics, VesperIcon.Check, Rectangle.Inflate(bounds, -1, -1), enabled ? palette.ActionInk : palette.Muted);
+    }
+
     internal static Color Mix(Color from, Color to, float amount) => Color.FromArgb(
         (int)Math.Round(from.R + (to.R - from.R) * amount),
         (int)Math.Round(from.G + (to.G - from.G) * amount),

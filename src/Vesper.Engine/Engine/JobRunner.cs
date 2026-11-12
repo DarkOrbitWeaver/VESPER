@@ -44,6 +44,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             return session.Intent switch
             {
                 StopIntent.Pause => new RunOutcome(JobState.Paused, "", ""),
+                StopIntent.BrowserFallback => DownloadEngine.BrowserFallbackOutcome,
                 StopIntent.Window => new RunOutcome(JobState.Queued, "schedule", "Waiting for the scheduled download window."),
                 _ => new RunOutcome(JobState.Queued, "shutdown", "Will resume when VESPER starts.")
             };
@@ -109,8 +110,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             FirstResult first = await OpenFirstAsync(start, ct).ConfigureAwait(false);
             try
             {
+                CheckBrowserResponse(first);
                 CaptureMetadata(first);
                 if (first.Total is long total) { EnsureSpace(file, total); file.EnsureLength(total); }
+                await WaitForBrowserApprovalAsync(ct).ConfigureAwait(false);
 
                 if (first.Ranged) await RunRangedAsync(first, ct).ConfigureAwait(false);
                 else await RunLinearAsync(first, file, ct).ConfigureAwait(false);
@@ -135,6 +138,38 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     {
         await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
         return await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
+    }
+
+    private void CheckBrowserResponse(FirstResult first)
+    {
+        if (Job.BrowserProof is not { } proof) return;
+        HttpResponseMessage response = first.Response;
+        if (first.Decoded
+            || proof.Length is long length && first.Total != length
+            || proof.ETag is { } etag && HttpFacts.StrongEtag(response) != etag
+            || proof.ContentType is { } mime && !string.Equals(HttpFacts.ContentType(response), mime, StringComparison.OrdinalIgnoreCase)
+            || response.RequestMessage?.RequestUri is { } final && UrlPolicy.Normalize(final) != UrlPolicy.Normalize(_url))
+            throw Stop(DownloadEngine.BrowserFallbackOutcome);
+    }
+
+    private async Task WaitForBrowserApprovalAsync(CancellationToken ct)
+    {
+        if (session.BrowserApproval is not { } approval || approval.Task.IsCompletedSuccessfully) return;
+        engine.UpdateJob(Job, j =>
+        {
+            if (j.BrowserProof is { AwaitingConfirmation: true })
+            {
+                j.Reason = "browser-ready";
+                j.Message = "Waiting for Chrome to hand over this download.";
+            }
+        });
+        try
+        {
+            await approval.Task.WaitAsync(TimeSpan.FromSeconds(20), ct).ConfigureAwait(false);
+            return;
+        }
+        catch (TimeoutException) { }
+        throw Stop(DownloadEngine.BrowserFallbackOutcome);
     }
 
     private void ReconcileWithFile(PartialFile file)
@@ -317,6 +352,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         foreach (ByteRange gap in Job.Extents.Gaps(total)) AddSegments(board, gap, pieceMode);
 
         var advisor = new ConnectionAdvisor(segmented ? _o.MaxConnectionsPerJob : 1);
+        if (segmented && first.Response.RequestMessage?.RequestUri is { } origin && _o.Cooldown.WasRecentlyThrottled(origin))
+            advisor.OnThrottled(_o.MaxConnectionsPerJob);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var workers = new List<Task>();
         HttpResponseMessage? firstResponse = first.Response;

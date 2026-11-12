@@ -38,6 +38,7 @@ public sealed record MediaError(
     bool IsPermanent)
 {
     public string? EntryId { get; init; }
+    public DateTimeOffset? RetryAt { get; init; }
 
     public override string ToString() => $"{Code}: {UserMessage}";
 }

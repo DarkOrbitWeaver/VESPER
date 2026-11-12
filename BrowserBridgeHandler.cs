@@ -4,8 +4,8 @@ using Vesper.MediaResolver.Models;
 namespace VESPER;
 
 /// <summary>
-/// Turns validated browser requests into engine calls. The browser only ever supplies links and optional hints;
-/// where a file is saved is decided here (settings or the Quick Download window), never by the request.
+/// Turns validated browser requests into engine calls. VESPER chooses new download destinations.
+/// A file already saved by Chrome can be listed at its verified existing location.
 /// "Success" is reported only after the engine has actually accepted the job.
 /// </summary>
 internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, Func<VesperPreferences> preferences)
@@ -31,7 +31,20 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 return SelectBrowserMedia(request);
 
             case "submit":
+            case "browser-submit":
                 return await SubmitAsync(request, ct);
+
+            case "browser-transfer":
+                return await BrowserTransferAsync(request, ct);
+
+            case "browser-completed":
+                AddResult saved = engine.RegisterBrowserDownload(request.Id, request.CompletedFile!, request.TransferId);
+                if (saved.Ok) owner.FinishBrowserActivity(request.Id);
+                return saved.Ok ? BridgeResponse.Success(request.Id, saved.Message, data: new { jobId = saved.JobId })
+                    : BridgeResponse.Fail(request.Id, saved.Status == AddStatus.Busy ? "busy" : "invalid-file", saved.Message);
+
+            case "browser-activity":
+                return await WatchBrowserActivityAsync(request, ct);
 
             default:
                 return BridgeResponse.Fail(request.Id, "invalid", "Unknown request.");
@@ -92,6 +105,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
     {
         // "ask" from the browser means "apply VESPER's own handoff setting"; download/queue are explicit overrides.
         string mode = request.Mode == "ask" ? preferences().BrowserAction.ToString().ToLowerInvariant() : request.Mode;
+        if (request.Type == "browser-submit" && mode == "ask") mode = "download";
 
         bool startNow = mode == "download";
         string? folder = null;
@@ -118,7 +132,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             AddResult added = engine.Add(new AddRequest(item.Url, folder, item.FileName, startNow, item.Referer, item.UserAgent,
                 RequestId: $"{request.Id}:{i}", ExpectedSha256: item.Sha256,
-                Kind: item.Kind == "hls" ? JobKind.Hls : JobKind.Http, Secrets: secrets));
+                Kind: item.Kind == "hls" ? JobKind.Hls : JobKind.Http, Secrets: secrets, BrowserProof: request.BrowserProof));
 
             string status = added.Status switch
             {
@@ -129,7 +143,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 _ => "invalid"
             };
             bool? transferReady = request.ConfirmTransfer && added.Ok
-                ? await ConfirmTransferAsync(added.JobId, startNow, ct) : null;
+                ? await ConfirmTransferAsync(added.JobId, startNow, request.BrowserProof is not null, ct) : null;
             results.Add(new BridgeResult(UrlPolicy.Redact(item.Url), status,
                 added.Ok || added.Status == AddStatus.Duplicate ? added.JobId.ToString("D") : null, added.Message, transferReady));
         }
@@ -140,14 +154,15 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
     }
 
-    private async Task<bool> ConfirmTransferAsync(Guid id, bool startNow, CancellationToken ct)
+    private async Task<bool> ConfirmTransferAsync(Guid id, bool startNow, bool staged, CancellationToken ct)
     {
         var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         void Inspect(JobSnapshot snapshot)
         {
             if (snapshot.Id != id) return;
             if (snapshot.State == JobState.Completed && !snapshot.FileMissing ||
-                snapshot.ProgressBytes > 0 && snapshot.State is (JobState.Downloading or JobState.Verifying or JobState.Finalizing))
+                (staged ? snapshot.Reason == "browser-ready" && snapshot.State == JobState.Downloading
+                    : snapshot.ProgressBytes > 0 && snapshot.State is (JobState.Downloading or JobState.Verifying or JobState.Finalizing or JobState.Converting)))
                 ready.TrySetResult(true);
             else if (snapshot.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed
                 or JobState.Cancelled or JobState.Suspect or JobState.Paused or JobState.Completed)
@@ -176,6 +191,54 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             engine.Progress -= InspectProgress;
         }
     }
+
+    private async Task<BridgeResponse> BrowserTransferAsync(BridgeRequest request, CancellationToken ct)
+    {
+        string id = request.TransferId!;
+        if (request.Operation == "accept" && !engine.AcceptBrowserTransfer(id))
+            return BridgeResponse.Fail(request.Id, "unavailable", "VESPER could not take over this download.");
+        if (request.Operation == "abandon") engine.AbandonBrowserTransfer(id);
+
+        string State()
+        {
+            JobSnapshot? snapshot = engine.BrowserTransferSnapshot(id);
+            string current = BrowserTransferState(snapshot);
+            if (current != "complete") return current;
+            if (snapshot is not { FinalPath: { } path, TotalBytes: long expected }) return "failed";
+            FileCheck file = PathSafety.Inspect(path);
+            return file is { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false }
+                && file.Length == expected ? "complete" : "failed";
+        }
+        string state = State();
+        if (request.Operation == "watch" && state == "active")
+        {
+            var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Guid? jobId = engine.BrowserTransferSnapshot(id)?.Id;
+            void Changed(JobSnapshot snapshot)
+            {
+                if (snapshot.Id == jobId && BrowserTransferState(snapshot) != "active") terminal.TrySetResult();
+            }
+            void Removed(Guid removed) { if (removed == jobId) terminal.TrySetResult(); }
+            engine.JobChanged += Changed;
+            engine.JobRemoved += Removed;
+            try
+            {
+                if (State() == "active") await terminal.Task.WaitAsync(TimeSpan.FromSeconds(25), ct);
+            }
+            catch (TimeoutException) { }
+            finally { engine.JobChanged -= Changed; engine.JobRemoved -= Removed; }
+            state = State();
+        }
+        return BridgeResponse.Success(request.Id, data: new { state });
+    }
+
+    private static string BrowserTransferState(JobSnapshot? snapshot) => snapshot switch
+    {
+        { State: JobState.Completed, FileMissing: false } => "complete",
+        null or { State: JobState.Failed or JobState.Suspect or JobState.Cancelled or JobState.NeedsLink or JobState.NeedsAttention
+            or JobState.Completed } => "failed",
+        _ => "active"
+    };
 
     /// <summary>Shows the compact Quick Download window on the UI thread and waits for the user's choice.</summary>
     private async Task<(QuickDownloadForm.Outcome, string)> AskUserAsync(BridgeRequest request, CancellationToken ct)

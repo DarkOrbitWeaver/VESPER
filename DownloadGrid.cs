@@ -49,16 +49,16 @@ public sealed class DownloadGrid : ScrollableControl
     private readonly Font _emptyFont = new("Georgia", 19F, FontStyle.Italic);
 
     /// <summary>Repaints rows after an in-place change (progress tick). Only visible rows are drawn.</summary>
-    internal void RefreshRows(IReadOnlyList<JobSnapshot> changes)
+    internal void RefreshRows<T>(IReadOnlyList<T> changes, Func<T, Guid> idOf)
     {
         int first = Math.Clamp(-AutoScrollPosition.Y / Math.Max(1, _rowHeight), 0, _items.Count);
         int last = Math.Min(_items.Count, first + Math.Max(0, (ClientSize.Height - _headerHeight) / Math.Max(1, _rowHeight) + 2));
         for (int index = first; index < last; index++)
         {
             Guid id = _items[index].Id;
-            foreach (JobSnapshot snapshot in changes)
+            foreach (T change in changes)
             {
-                if (snapshot.Id != id) continue;
+                if (idOf(change) != id) continue;
                 var row = Rectangle.Intersect(RowRectangle(index), BodyBounds);
                 if (!row.IsEmpty) Invalidate(row);
                 break;
@@ -79,6 +79,15 @@ public sealed class DownloadGrid : ScrollableControl
         if (LicenseManager.UsageMode == LicenseUsageMode.Designtime)
             _items = DownloadItem.DesignerSamples(); // Visual Studio designer preview only.
         ApplyAppearance(VesperPalette.Light, Density.Compact);
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            SetStyle(ControlStyles.ApplyThemingImplicitly, true);
+            return base.CreateParams;
+        }
     }
 
     internal IReadOnlyList<DownloadItem> VisibleItems => _items;
@@ -142,6 +151,10 @@ public sealed class DownloadGrid : ScrollableControl
 
     internal void ApplyAppearance(VesperPalette palette, Density density)
     {
+        // WinForms applies the native scrollbar theme when the handle is created.
+        bool darkScrollbarChanged = IsHandleCreated && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)
+            && (palette.IsDark && !palette.HighContrast) != (_palette.IsDark && !_palette.HighContrast);
+        int scrollOffset = darkScrollbarChanged ? -AutoScrollPosition.Y : 0;
         _palette = palette;
         _density = density;
         BackColor = palette.Surface;
@@ -155,6 +168,11 @@ public sealed class DownloadGrid : ScrollableControl
             _ => 46
         });
         UpdateScrollArea();
+        if (darkScrollbarChanged)
+        {
+            RecreateHandle();
+            AutoScrollPosition = new Point(0, scrollOffset);
+        }
         Invalidate();
         LoadVisiblePosters();
     }
@@ -481,21 +499,22 @@ public sealed class DownloadGrid : ScrollableControl
     {
         var (label, icon, color) = item.Status switch
         {
-            JobStatus.Downloading => ("Downloading", VesperIcon.Download, _palette.MutedGreen),
-            JobStatus.Paused => ("Paused", VesperIcon.Pause, _palette.Amber),
+            JobStatus.Downloading => (item.BrowserFile is null ? "Downloading" : "In Chrome", VesperIcon.Download, _palette.MutedGreen),
+            JobStatus.Paused => ("Paused", VesperIcon.Pause, _palette.ProgressAmber),
             JobStatus.Queued => ("Queued", VesperIcon.Layers, _palette.Muted),
             JobStatus.Completed => ("Completed", VesperIcon.Check, _palette.MutedGreen),
-            JobStatus.Missing => ("File missing", VesperIcon.Warning, _palette.Amber),
-            JobStatus.NeedsLink => ("Needs link", VesperIcon.Warning, _palette.Red),
+            JobStatus.Missing => ("File missing", VesperIcon.Warning, _palette.ProgressAmber),
+            JobStatus.NeedsLink => ("Needs link", VesperIcon.Warning, _palette.ProgressAmber),
             JobStatus.Waiting => ("Waiting for network", VesperIcon.Info, _palette.Muted),
-            JobStatus.Verifying => ("Verifying", VesperIcon.Shield, _palette.MutedGreen),
+            JobStatus.Verifying => ("Checking", VesperIcon.Shield, _palette.MutedGreen),
             JobStatus.Resolving => ("Resolving", VesperIcon.Info, _palette.Muted),
-            JobStatus.WaitingRetry => ("Waiting to retry", VesperIcon.Clock, _palette.Amber),
-            JobStatus.NeedsAttention => ("Needs attention", VesperIcon.Warning, _palette.Red),
-            JobStatus.Processing => ("Finishing", VesperIcon.Info, _palette.MutedGreen),
-            JobStatus.Failed => ("Failed", VesperIcon.Warning, _palette.Red),
+            JobStatus.WaitingRetry => ("Waiting to retry", VesperIcon.Clock, _palette.ProgressAmber),
+            JobStatus.NeedsAttention => ("Needs attention", VesperIcon.Warning, _palette.ProgressAmber),
+            JobStatus.Processing => ("Preparing file", VesperIcon.Info, _palette.MutedGreen),
+            JobStatus.Converting => ("Converting", VesperIcon.Refresh, _palette.MutedGreen),
+            JobStatus.Failed => ("Failed", VesperIcon.Warning, _palette.ProgressRed),
             JobStatus.Cancelled => ("Cancelled", VesperIcon.Info, _palette.Muted),
-            _ => ("Suspect integrity", VesperIcon.Warning, _palette.Red)
+            _ => ("Suspect integrity", VesperIcon.Warning, _palette.ProgressRed)
         };
         if (_palette.HighContrast) color = _palette.Text;
         bool progress = item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink
@@ -524,10 +543,20 @@ public sealed class DownloadGrid : ScrollableControl
         int barHeight = UiKit.Scale(this, _density == Density.ExtraCompact ? 2 : 4);
         int barTop = statusY + statusHeight + (_density == Density.ExtraCompact ? 0 : UiKit.Scale(this, 1));
         var bar = new Rectangle(rect.Left + pad, barTop, Math.Max(1, rect.Width - pad * 2), barHeight);
-        using (var track = new SolidBrush(_palette.Border)) g.FillRectangle(track, bar);
-        using (var fill = new SolidBrush(item.Status == JobStatus.Paused ? _palette.Amber
-            : item.Status is JobStatus.NeedsLink or JobStatus.NeedsAttention or JobStatus.Failed ? _palette.MutedGreen : _palette.Green))
-            g.FillRectangle(fill, bar.X, bar.Y, (int)(bar.Width * percent / 100d), bar.Height);
+        using (var track = new SolidBrush(_palette.ProgressTrack)) g.FillRectangle(track, bar);
+        Color ink = item.Status switch
+        {
+            JobStatus.Downloading => _palette.ProgressGreen,
+            JobStatus.Failed => _palette.ProgressRed,
+            _ => _palette.ProgressAmber
+        };
+        int fillWidth = bar.Width * percent / 100;
+        using (var fill = new SolidBrush(ink)) g.FillRectangle(fill, bar.X, bar.Y, fillWidth, bar.Height);
+        if (item.Status == JobStatus.Downloading && _palette.IsDark && !_palette.HighContrast && fillWidth > 0 && bar.Height > 1)
+        {
+            using var edge = new SolidBrush(VesperDrawing.Mix(ink, Color.White, 0.26f));
+            g.FillRectangle(edge, bar.X, bar.Y, fillWidth, 1);
+        }
     }
 
     private void PaintTransfer(Graphics g, DownloadItem item, Rectangle rect, int pad)

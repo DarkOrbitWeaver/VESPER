@@ -17,7 +17,7 @@ function row(list, name, label, message) {
       const reply = await chrome.runtime.sendMessage(message);
       if (reply?.ok) {
         action.textContent = 'Sent';
-        $('result').textContent = reply.chromePaused ? 'Chrome’s copy is paused.' : 'Sent to VESPER.';
+        $('result').textContent = 'Downloading with VESPER.';
         return;
       }
       $('result').textContent = reply?.message || 'VESPER could not accept this file.';
