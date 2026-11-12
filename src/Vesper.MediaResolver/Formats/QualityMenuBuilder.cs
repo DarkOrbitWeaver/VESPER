@@ -46,7 +46,11 @@ public static class QualityMenuBuilder
         TryAdd(QualityOptionKind.Smallest, QualityMode.Smallest, "Smallest suitable");
 
         // Audio-only is a different kind of output, so it is exempt from the visual-duplicate check.
-        var audio = FormatSelector.Select(item, baseline with { Mode = QualityMode.AudioOnly });
+        var audio = FormatSelector.Select(item, baseline with
+        {
+            Mode = QualityMode.AudioOnly,
+            AudioCodecs = baseline.AudioCodecs.Count > 0 ? baseline.AudioCodecs : FormatPreferences.AudioOnly.AudioCodecs
+        });
         if (audio.Selection is { } a && !a.IsFallback)
             options.Add(new QualityOption(QualityOptionKind.AudioOnly, $"Audio only ({a.Summary})", a.Summary, a));
 

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using Vesper.Engine;
+using Vesper.MediaResolver.Core;
 
 namespace VESPER;
 
@@ -9,19 +10,57 @@ internal static class EngineHost
     public static string DataDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VESPER");
 
-    public static DownloadEngine Start(VesperPreferences p) => DownloadEngine.Start(Build(p));
+    private static EngineOptions? _activeNetwork;
+
+    public static DownloadEngine Start(VesperPreferences p)
+    {
+        var engine = DownloadEngine.Start(Build(p));
+        Volatile.Write(ref _activeNetwork, engine.Options);
+        return engine;
+    }
+
+    // Proxy changes take effect on restart for both discovery and the transfer engine.
+    internal static ResolverOptions MediaNetwork(int maxConcurrent = 4, EngineOptions? options = null)
+    {
+        options ??= Volatile.Read(ref _activeNetwork);
+        Uri? proxy = options?.Proxy == ProxyMode.Custom && Uri.TryCreate(options.ProxyAddress, UriKind.Absolute, out Uri? address)
+            ? address : null;
+        var cooldown = options?.Cooldown;
+        return new ResolverOptions
+        {
+            UseSystemProxy = options?.Proxy == ProxyMode.System,
+            ProxyAddress = proxy,
+            MaxConcurrentRequests = maxConcurrent,
+            OriginRetryAt = cooldown is null ? null : cooldown.RetryAt,
+            OriginThrottled = cooldown is null ? null : cooldown.Remember,
+            Diagnostics = options is null ? null : message => System.Diagnostics.Trace.WriteLine(message, $"Media discovery ({options.Proxy})")
+        };
+    }
 
     private static EngineOptions Build(VesperPreferences p)
     {
         var options = new EngineOptions
         {
             DataDirectory = DataDirectory,
+            BrowserDownloadsFolder = WindowsDownloadsFolder(),
             AllowPrivateNetworks = p.AllowPrivateNetworks,
             Proxy = Enum.TryParse(p.ProxyMode, out ProxyMode mode) ? mode : ProxyMode.Direct,
             ProxyAddress = string.IsNullOrWhiteSpace(p.ProxyAddress) ? null : p.ProxyAddress
         };
         ApplyLive(options, p);
         return options;
+    }
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern int SHGetKnownFolderPath(in Guid folder, uint flags, IntPtr token, out IntPtr path);
+
+    private static string? WindowsDownloadsFolder()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        Guid downloads = new("374de290-123f-4565-9164-39c4925e467b");
+        int result = SHGetKnownFolderPath(downloads, 0, IntPtr.Zero, out IntPtr path);
+        try { return result == 0 ? Marshal.PtrToStringUni(path) : null; }
+        finally { Marshal.FreeCoTaskMem(path); }
     }
 
     /// <summary>Settings that can change while jobs run.</summary>

@@ -74,7 +74,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     private async Task LoadPosterAsync()
     {
         if (!MediaPoster.TryUri(_job.MediaThumbnailUrl, out var uri)) return;
-        using var http = new Vesper.MediaResolver.Core.SecureHttpClient(new Vesper.MediaResolver.Core.ResolverOptions());
+        using var http = new Vesper.MediaResolver.Core.SecureHttpClient(EngineHost.MediaNetwork(maxConcurrent: 1));
         Bitmap? poster = await MediaPoster.LoadAsync(http, uri, 300, 170, _posterLifetime.Token);
         if (poster is null) return;
         if (IsDisposed || _posterLifetime.IsCancellationRequested) { poster.Dispose(); return; }
@@ -201,11 +201,16 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
             if (_job.Fraction is double fraction && _job.ProgressBytes > 0 && _job.State != JobState.Completed)
             {
                 _progressWidth = contentWidth;
-                var track = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 4), BackColor = _colors.Border };
+                var track = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 4), BackColor = _colors.ProgressTrack };
                 _progressFill = new Panel
                 {
                     Location = Point.Empty, Size = new Size((int)(contentWidth * fraction), 4),
-                    BackColor = _job.State is JobState.Downloading ? _colors.Green : _job.State == JobState.Paused ? _colors.Amber : _colors.MutedGreen
+                    BackColor = _job.State switch
+                    {
+                        JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.WaitingForRetry => _colors.ProgressAmber,
+                        JobState.Failed or JobState.Suspect => _colors.ProgressRed,
+                        _ => _colors.ProgressGreen
+                    }
                 };
                 track.Controls.Add(_progressFill);
                 _content.Controls.Add(track);
@@ -230,7 +235,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
                 VesperIcon glyph = key switch
                 {
                     "Progress" => VesperIcon.Download, "Transfer" or "Bandwidth" => VesperIcon.Gauge, "Time left" => VesperIcon.Clock,
-                    "Source" or "Original page" => VesperIcon.Link, "Save to" or "Last known path" or "Partial file" => VesperIcon.Folder,
+                    "Source" or "Original page" or "Website" => VesperIcon.Link, "Save to" or "Last known path" or "Partial file" => VesperIcon.Folder,
                     "Integrity" or "Recovery" => VesperIcon.Shield, "Size" => VesperIcon.Storage,
                     "Quality" => VesperIcon.Quality,
                     "Source link expires" => VesperIcon.Clock, _ => VesperIcon.File
@@ -240,10 +245,11 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
                 _content.Controls.Add(fieldIcon);
                 _content.Controls.Add(Text_(key, margin + 23, y, valueX - margin - 31, 28, 8.5F, muted: true));
                 Label field = Text_(value, valueX, y, bodyWidth - valueX - margin, 28, 8.8F);
-                if (key == "Original page" && Uri.TryCreate(_job.OriginalPageUrl, UriKind.Absolute, out var uri)
+                if (key is "Original page" or "Website" && Uri.TryCreate(_job.OriginalPageUrl, UriKind.Absolute, out var uri)
                     && uri.Scheme is "http" or "https")
                 {
-                    var link = new LinkLabel { Text = _job.MediaProvider is { Length: > 0 } provider ? $"{provider} · {uri.Host}" : uri.Host, AccessibleName = $"Open original page on {uri.Host}",
+                    var link = new LinkLabel { Text = _job.MediaProvider is { Length: > 0 } provider ? $"{provider} · {uri.Host}" : uri.Host,
+                        AccessibleName = key == "Website" ? $"Open {uri.Host}" : $"Open original page on {uri.Host}",
                         Bounds = field.Bounds, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true,
                         LinkColor = _colors.Link,
                         ActiveLinkColor = _colors.Text, VisitedLinkColor = _colors.Link, LinkBehavior = LinkBehavior.AlwaysUnderline };
@@ -307,8 +313,10 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
             JobState.WaitingForRetry => ("Waiting to retry", VesperIcon.Clock, _colors.Amber),
             JobState.NeedsLink => ("Needs a new link", VesperIcon.Warning, _colors.Red),
             JobState.NeedsAttention => ("Needs attention", VesperIcon.Warning, _colors.Red),
-            JobState.Verifying => ("Verifying checksum", VesperIcon.Shield, _colors.MutedGreen),
-            JobState.Finalizing => ("Finishing", VesperIcon.Check, _colors.MutedGreen),
+            JobState.Verifying when _job.Reason == "prepare-media" => ("Preparing file", VesperIcon.Info, _colors.MutedGreen),
+            JobState.Verifying => ("Checking", VesperIcon.Shield, _colors.MutedGreen),
+            JobState.Finalizing => ("Preparing file", VesperIcon.Check, _colors.MutedGreen),
+            JobState.Converting => ("Converting", VesperIcon.Refresh, _colors.MutedGreen),
             JobState.Suspect => ("Suspect integrity", VesperIcon.Warning, _colors.Red),
             JobState.Failed => ("Failed", VesperIcon.Warning, _colors.Red),
             _ => ("Cancelled", VesperIcon.Info, _colors.Muted)
@@ -318,10 +326,12 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     private string Explanation() => _job.State switch
     {
         JobState.Completed when _job.FileMissing => "The saved file is no longer at its recorded location. The download itself did not fail.",
+        JobState.Completed when _job.Kind == JobKind.BrowserFile => "Chrome saved this file.",
         JobState.NeedsLink => $"The link no longer works. {(_job.CommittedBytes > 0 ? $"{Formatting.Bytes(_job.CommittedBytes)} is saved. " : "")}" +
             "VESPER checks that a replacement serves the same file before reusing any saved data.",
         JobState.Paused when _job.CommittedBytes > 0 => $"{Formatting.Bytes(_job.CommittedBytes)} is saved safely and will be reused.",
-        JobState.Completed or JobState.Downloading or JobState.Queued or JobState.Resolving => _job.State == JobState.Downloading ? _job.Message : "",
+        JobState.Completed when _job.Reason == "saved-original" => _job.Message,
+        JobState.Completed or JobState.Queued or JobState.Resolving => "",
         _ => _job.Message
     };
 
@@ -348,7 +358,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         if (unfinished && _job.CommittedBytes > 0) yield return ("Partial file", PathSafety.ForDisplay(_job.PartialPath));
         if (_job.OriginalPageUrl is { Length: > 0 } original)
         {
-            yield return ("Original page", UrlPolicy.Redact(original));
+            yield return (_job.Kind == JobKind.BrowserFile ? "Website" : "Original page", UrlPolicy.Redact(original));
             if (_job.MediaQuality is { Length: > 0 } quality) yield return ("Quality", MediaTransferBridge.DisplayQuality(quality));
             if (_showDiagnostics && _job.MediaExpiresAt is { } expiry) yield return ("Source link expires", expiry.ToLocalTime().ToString("g"));
         }
@@ -372,7 +382,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     {
         try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true }); }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-        { MessageBox.Show(this, ex.Message, "Open source", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        { VesperMessageBox.Show(this, ex.Message, "Open source", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
     }
 
     private IEnumerable<(string Text, bool Primary, Action Action)> Actions()
@@ -385,7 +395,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
                 yield return ("Open", true, () => _actions.Open(j));
                 yield return ("Show in folder", false, () => _actions.ShowFolder(j));
                 break;
-            case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry:
+            case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Converting:
                 yield return ("Pause", false, () => _engine.Pause(j.Id));
                 break;
             case JobState.Paused: yield return ("Resume", true, () => _engine.Resume(j.Id)); break;

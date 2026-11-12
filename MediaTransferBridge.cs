@@ -4,12 +4,29 @@ using Vesper.MediaResolver.Models;
 
 namespace VESPER;
 
+internal enum MediaOutputPreference { Original, CompatibleVideo, M4a }
+
 /// <summary>Single-stream transfer handoff, including durable non-secret source provenance.</summary>
 internal sealed record MediaDownloadChoice(
     string Url, string FileName, JobKind Kind, string? Referer, string? UserAgent,
     string? OriginalPageUrl = null, string? Provider = null, string? MediaId = null,
     string? Quality = null, string? ThumbnailUrl = null, DateTimeOffset? ExpiresAt = null,
-    string? MediaPlanJson = null, string? FormatId = null);
+    string? MediaPlanJson = null, string? FormatId = null, MediaOutput Output = MediaOutput.Original,
+    string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null)
+{
+    public string DisplayContainer => Output switch
+    {
+        MediaOutput.Mp4 => "MP4",
+        MediaOutput.M4a => "M4A",
+        _ => Kind == JobKind.Hls ? "HLS" : Path.GetExtension(FileName).TrimStart('.').ToUpperInvariant()
+    };
+    public string DisplayDetail => Output switch
+    {
+        MediaOutput.M4a => $"AAC · Converts from {ConvertedAudioCodec}",
+        MediaOutput.Mp4 => $"{ConvertedVideoQuality}H.264 + AAC · Converts if supported",
+        _ => MediaTransferBridge.DisplayQuality(Quality ?? "Available source")
+    };
+}
 
 /// <summary>
 /// One source of truth for the desktop, native browser picker and developer transfer checks. A representation is only
@@ -18,6 +35,8 @@ internal sealed record MediaDownloadChoice(
 /// </summary>
 internal static class MediaTransferBridge
 {
+    private const int HighQualitySourceAacKbps = 192;
+
     internal static string DisplayQuality(string quality) => quality
         .Replace("+ separate audio (merge required)", "+ audio", StringComparison.OrdinalIgnoreCase)
         .Replace(" (merged by VESPER)", "", StringComparison.OrdinalIgnoreCase);
@@ -44,10 +63,82 @@ internal static class MediaTransferBridge
     }
 
     internal static (MediaDownloadChoice? Choice, string? Error) Prepare(MediaItem item, FormatPreferences prefs,
-        MediaRepresentation? exact = null)
+        MediaRepresentation? exact = null, MediaOutputPreference output = MediaOutputPreference.Original)
+    {
+        if (exact is not null || output == MediaOutputPreference.Original)
+            return PrepareSource(item, prefs, exact, out _);
+        bool audioOnly = prefs.Mode == QualityMode.AudioOnly || item.Representations.All(r => !r.HasVideo);
+        if (output == MediaOutputPreference.M4a && audioOnly)
+            return PrepareM4a(item, prefs);
+        if (audioOnly || output != MediaOutputPreference.CompatibleVideo)
+            return PrepareSource(item, prefs, exact: null, out _);
+
+        MediaItem native = item with
+        {
+            Representations = item.Representations.Where(r =>
+                r.Protocol != StreamProtocol.Hls && r.Container is "mp4" or "m4a" && !r.AudioUnverified
+                && (r.Content == StreamContent.AudioOnly ? r.AudioCodec == "aac"
+                    : r.VideoCodec == "h264" && (!r.HasAudio || r.AudioCodec == "aac"))).ToArray()
+        };
+        FormatPreferences nativePrefs = prefs with { Container = "mp4", ContainerStrict = true };
+        if (PrepareSource(native, nativePrefs, exact: null, out FormatSelection? nativeSelection).Choice is { } compatible
+            && nativeSelection is { HasVideo: true })
+            return (compatible, null);
+
+        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source);
+        if (original.Choice is { } choice && CanConvert(choice)
+            && source is { HasAudio: true, Video: { VideoCodec: not null, Hdr: HdrKind.Sdr, Height: null or <= 2304, Width: null or <= 4096 } video }
+            && (source.Audio ?? video).AudioCodec is not null)
+        {
+            string? videoQuality = video.Height is int height
+                ? video.FrameRate is > 30.5 ? $"{height}p {Math.Round(video.FrameRate.Value)} fps · " : $"{height}p · "
+                : null;
+            return (choice with { Output = MediaOutput.Mp4, ConvertedVideoQuality = videoQuality }, null);
+        }
+        return original;
+    }
+
+    private static (MediaDownloadChoice? Choice, string? Error) PrepareM4a(MediaItem item, FormatPreferences prefs)
+    {
+        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source);
+        if (original.Choice is not { } choice || source?.Audio is not { } audio) return original;
+
+        if (IsNativeAac(audio))
+            return (choice with { FileName = Path.ChangeExtension(choice.FileName, ".m4a") }, null);
+
+        string? codec = audio.AudioCodec;
+        bool canEncode = codec is not null && CanConvert(choice)
+            && audio.AudioChannels is null or 1 or 2 && audio.AudioSampleRate is null or 44100 or 48000;
+
+        // Keep high-bitrate AAC at its source quality, or use available native AAC if encoding is unavailable.
+        MediaRepresentation[] nativeAac = item.Representations.Where(candidate => IsNativeAac(candidate)
+            && (!canEncode || candidate.BitrateKbps >= HighQualitySourceAacKbps)
+            && (candidate.AudioChannels ?? 2) == (audio.AudioChannels ?? 2)
+            && candidate.IsDefaultAudio == audio.IsDefaultAudio && candidate.IsAudioDescription == audio.IsAudioDescription
+            && candidate.AudioTrackId == audio.AudioTrackId
+            && string.Equals(candidate.AudioLanguage, audio.AudioLanguage, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (nativeAac.Length > 0 && PrepareSource(item with { Representations = nativeAac }, prefs,
+                exact: null, out _).Choice is { } sourceAac)
+            return (sourceAac with { FileName = Path.ChangeExtension(sourceAac.FileName, ".m4a") }, null);
+
+        if (canEncode && codec is not null)
+            return (choice with { Output = MediaOutput.M4a, ConvertedAudioCodec = codec.ToUpperInvariant() }, null);
+
+        return original;
+    }
+
+    private static bool IsNativeAac(MediaRepresentation stream) =>
+        stream is { Content: StreamContent.AudioOnly, AudioCodec: "aac", Container: "mp4" or "m4a", AudioUnverified: false }
+        && stream.Protocol != StreamProtocol.Hls;
+
+    private static bool CanConvert(MediaDownloadChoice choice) => OperatingSystem.IsWindows()
+        && choice.Kind is JobKind.Http or JobKind.Merge
+        && Path.GetExtension(choice.FileName).ToLowerInvariant() is ".webm" or ".mkv" or ".mp4" or ".m4a";
+
+    private static (MediaDownloadChoice? Choice, string? Error) PrepareSource(MediaItem item, FormatPreferences prefs,
+        MediaRepresentation? exact, out FormatSelection? selection)
     {
         prefs = prefs with { NativeMergeOnly = true };
-        FormatSelection? selection;
         if (exact is not null && exact.Content == StreamContent.VideoOnly)
         {
             // An exact video-only choice is paired with the preferred audio the native remuxer can merge with it.
@@ -65,7 +156,9 @@ internal static class MediaTransferBridge
                 Requirements = exact.Requirements,
                 OutputContainer = exact.Container,
                 EstimatedSize = exact.FileSize,
-                Summary = exact.Content == StreamContent.AudioOnly ? "Audio only" : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}"
+                Summary = exact.Content == StreamContent.AudioOnly
+                    ? $"audio {exact.AudioCodec ?? exact.Container ?? ""} {(exact.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
+                    : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}"
             };
         }
         else selection = FormatSelector.Select(PlayableOnly(item), prefs).Selection;

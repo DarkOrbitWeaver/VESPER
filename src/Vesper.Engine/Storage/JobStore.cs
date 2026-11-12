@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
 namespace Vesper.Engine;
@@ -43,6 +44,14 @@ public sealed class JobStore : IDisposable
         """
         ALTER TABLE jobs ADD COLUMN media_plan_json TEXT;
         ALTER TABLE jobs ADD COLUMN media_format_id TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN media_output INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE jobs ADD COLUMN pending_conversion_bytes INTEGER;
+        ALTER TABLE jobs ADD COLUMN pending_conversion_digest TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN browser_proof TEXT;
         """
     ];
 
@@ -143,7 +152,8 @@ public sealed class JobStore : IDisposable
         "speed_limit", "created_utc", "updated_utc", "completed_utc", "retry_count", "next_retry_utc", "etag", "last_modified",
         "accepts_ranges", "identity_level", "content_type", "category", "referer", "user_agent", "expected_sha256", "piece_map",
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
-        "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id"
+        "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
+        "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof"
     ];
 
     private static readonly string UpsertSql =
@@ -242,6 +252,10 @@ public sealed class JobStore : IDisposable
         yield return ("media_state", ProtectedMediaState.Protect(j.MediaState));
         yield return ("media_plan_json", ProtectedMediaState.Protect(j.MediaPlanJson));
         yield return ("media_format_id", j.MediaFormatId);
+        yield return ("media_output", (int)j.Output);
+        yield return ("pending_conversion_bytes", j.PendingConversionBytes);
+        yield return ("pending_conversion_digest", j.PendingConversionDigest);
+        yield return ("browser_proof", j.BrowserProof is null ? null : JsonSerializer.Serialize(j.BrowserProof));
         yield return ("generation", j.Generation);
         yield return ("original_page_url", ProtectedMediaState.Protect(j.OriginalPageUrl));
         yield return ("media_provider", j.MediaProvider);
@@ -272,6 +286,9 @@ public sealed class JobStore : IDisposable
             PartialPath = Str("partial_path"),
             FinalPath = NStr("final_path"),
             PendingFinalPath = NStr("pending_final_path"),
+            PendingConversionBytes = NInt("pending_conversion_bytes"),
+            PendingConversionDigest = NStr("pending_conversion_digest"),
+            BrowserProof = NStr("browser_proof") is { } proof ? JsonSerializer.Deserialize<BrowserTransferProof>(proof) : null,
             TotalBytes = NInt("total_bytes"),
             Extents = extents,
             State = (JobState)Int("state"),
@@ -303,6 +320,7 @@ public sealed class JobStore : IDisposable
             MediaState = ProtectedMediaState.Unprotect(NStr("media_state")),
             MediaPlanJson = ProtectedMediaState.Unprotect(NStr("media_plan_json")),
             MediaFormatId = NStr("media_format_id"),
+            Output = (MediaOutput)Int("media_output"),
             Generation = Int("generation"),
             OriginalPageUrl = ProtectedMediaState.Unprotect(NStr("original_page_url")),
             MediaProvider = NStr("media_provider"),

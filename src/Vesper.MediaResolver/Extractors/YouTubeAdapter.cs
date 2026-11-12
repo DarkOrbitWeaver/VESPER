@@ -226,12 +226,6 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             attempt.Summary = $"request failed ({ex.Error.Code})";
             return attempt;
         }
-        if (resp.StatusCode == 429)
-        {
-            attempt.Error = MediaErrors.RateLimited($"player API ({profile.Key}) answered HTTP 429");
-            attempt.Summary = "rate limited (HTTP 429)";
-            return attempt;
-        }
         if (!resp.IsSuccess || JsonExt.TryParse(resp.Content) is not { } doc)
         {
             // An API failure says nothing about the video itself: keep it low-priority (page evidence wins).

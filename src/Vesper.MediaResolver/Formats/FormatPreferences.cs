@@ -69,7 +69,7 @@ public sealed record FormatPreferences
     public static FormatPreferences BestQuality => new() { Mode = QualityMode.Best };
     public static FormatPreferences BalancedQuality => new() { Mode = QualityMode.Balanced };
     public static FormatPreferences SmallestSuitable => new() { Mode = QualityMode.Smallest };
-    public static FormatPreferences AudioOnly => new() { Mode = QualityMode.AudioOnly };
+    public static FormatPreferences AudioOnly => new() { Mode = QualityMode.AudioOnly, AudioCodecs = ["opus"] };
     public static FormatPreferences Height(int height, FallbackPolicy fallback = FallbackPolicy.NearestLowerThenHigher) =>
         new() { Mode = QualityMode.Custom, TargetHeight = height, Fallback = fallback };
 }

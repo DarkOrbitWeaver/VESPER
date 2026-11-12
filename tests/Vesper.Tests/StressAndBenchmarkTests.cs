@@ -86,7 +86,7 @@ public class BenchmarkTests(ITestOutputHelper output)
             watch.Stop();
 
             Assert.Equal(size, new FileInfo(done.FinalPath!).Length);
-            output.WriteLine($"connections<={connections}: {size / 1048576.0 / watch.Elapsed.TotalSeconds:F0} MB/s over {watch.Elapsed.TotalSeconds:F1} s; " +
+            output.WriteLine(FormattableString.Invariant($"connections<={connections}: {size / 1048576.0 / watch.Elapsed.TotalSeconds:F2} MB/s over {watch.Elapsed.TotalSeconds:F3} s; ") +
                 $"working set grew by {(peakMemory - memoryBefore) / 1048576.0:F0} MB for a {size / 1048576} MB file; GC heap {GC.GetTotalMemory(false) / 1048576.0:F0} MB");
         }
     }

@@ -13,6 +13,7 @@ public sealed partial class DownloadEngine
     internal async Task<RunOutcome> FinalizeAsync(JobSession session, CancellationToken ct)
     {
         DownloadJob job = session.Job;
+        if (session.BrowserApproval is { Task.IsCompletedSuccessfully: false }) return BrowserFallbackOutcome;
         PartialFile file = session.OpenFile();
         long total = job.TotalBytes ?? job.Extents.End;
 
@@ -22,7 +23,7 @@ public sealed partial class DownloadEngine
 
         if (file.Length != total) file.Truncate(total);     // stale tail from an older, longer file never ships
         file.Flush();
-        UpdateJob(job, j => { j.TotalBytes = total; j.State = JobState.Finalizing; j.Message = ""; });
+        UpdateJob(job, j => { j.TotalBytes = total; j.State = JobState.Finalizing; j.Message = ""; ClearPendingPublication(j); });
         Failpoint("finalize.afterFlush");
 
         if (job.Kind == JobKind.Http && job.MediaProvider is not null)
@@ -55,7 +56,14 @@ public sealed partial class DownloadEngine
 
         ct.ThrowIfCancellationRequested();
         session.CloseFile();                                  // release the handle before renaming
-        return Publish(job);
+        ConvertedFile? converted = job.Output == MediaOutput.Original
+            ? null : await ConvertMediaAsync(job, ct).ConfigureAwait(false);
+        if (ct.IsCancellationRequested && converted is not null) DeleteTemporaryFile(job, ConversionPath(job));
+        ct.ThrowIfCancellationRequested();
+        RunOutcome outcome = Publish(job, converted);
+        if (converted is not null && outcome.State != JobState.Completed)
+            DeleteTemporaryFile(job, ConversionPath(job));
+        return outcome;
     }
 
     private static string HashFile(PartialFile file, long length, CancellationToken ct)
@@ -78,21 +86,29 @@ public sealed partial class DownloadEngine
     /// Publishes with "create or fail" semantics: File.Move never overwrites. The chosen name is persisted BEFORE
     /// the rename so a crash between the rename and the database update can be reconciled on restart.
     /// </summary>
-    private RunOutcome Publish(DownloadJob job)
+    private RunOutcome Publish(DownloadJob job, ConvertedFile? converted)
     {
         if (!PathSafety.TryResolveFolder(job.DestinationFolder, create: true, out _, out string problem))
             return RunOutcome.NeedsAttention("destination", problem + " The finished file is waiting at " + PathSafety.ForDisplay(job.PartialPath));
 
-        WriteMarkOfTheWeb(job);
+        string source = converted is null ? job.PartialPath : ConversionPath(job);
+        string fileName = converted is null ? job.FileName : Path.ChangeExtension(job.FileName, OutputExtension(job.Output));
+        WriteMarkOfTheWeb(job, source);
 
         for (int attempt = 0; attempt < 50; attempt++)
         {
-            string target = FileNames.UniquePath(job.DestinationFolder, job.FileName);
-            UpdateJob(job, j => j.PendingFinalPath = target);
+            string target = FileNames.UniquePath(job.DestinationFolder, fileName);
+            UpdateJob(job, j =>
+            {
+                j.State = JobState.Finalizing;
+                j.PendingFinalPath = target;
+                j.PendingConversionBytes = converted?.Bytes;
+                j.PendingConversionDigest = converted?.Digest;
+            });
             Failpoint("finalize.beforeMove");
             try
             {
-                File.Move(job.PartialPath, target, overwrite: false);
+                File.Move(source, target, overwrite: false);
             }
             catch (IOException) when (File.Exists(target))
             {
@@ -104,33 +120,23 @@ public sealed partial class DownloadEngine
             }
 
             Failpoint("finalize.afterMove");
-            UpdateJob(job, j =>
-            {
-                j.FinalPath = target;
-                j.PendingFinalPath = null;
-                j.State = JobState.Completed;
-                j.CompletedUtc = DateTime.UtcNow;
-                j.Reason = "";
-                j.Message = "";
-                j.RetryCount = 0;
-                j.UnverifiedResumeApproved = false;
-            });
-            RecoveryManifest.Delete(job.PartialPath);
+            UpdateJob(job, j => MarkPublished(j, target));
+            FinishPublication(job);
             Log(job.Id, "completed", job.FileName);
-            return RunOutcome.Done();
+            return job.Reason.Length == 0 ? RunOutcome.Done() : new RunOutcome(JobState.Completed, job.Reason, job.Message);
         }
         return RunOutcome.NeedsAttention("name", "No free file name could be found in the destination folder.");
     }
 
     /// <summary>Marks the file as downloaded from the internet so Windows applies SmartScreen/Office protections.</summary>
-    private void WriteMarkOfTheWeb(DownloadJob job)
+    private void WriteMarkOfTheWeb(DownloadJob job, string path)
     {
         if (!OperatingSystem.IsWindows()) return;
         try
         {
             string host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? source) ? source.GetLeftPart(UriPartial.Path) : "";
             string referrer = Uri.TryCreate(job.Referer, UriKind.Absolute, out Uri? r) ? r.GetLeftPart(UriPartial.Path) : "";
-            File.WriteAllText(job.PartialPath + ":Zone.Identifier",
+            File.WriteAllText(path + ":Zone.Identifier",
                 $"[ZoneTransfer]\r\nZoneId=3\r\n{(referrer.Length > 0 ? $"ReferrerUrl={referrer}\r\n" : "")}HostUrl={host}\r\n");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
@@ -153,9 +159,18 @@ public sealed partial class DownloadEngine
 
             foreach (DownloadJob job in _jobs.Values.ToList())
             {
+                if (job.BrowserProof is { AwaitingConfirmation: true } && (job.State == JobState.Queued || JobStates.IsActive(job.State)))
+                {
+                    job.State = JobState.Cancelled;
+                    job.Reason = BrowserFallbackOutcome.Reason;
+                    job.Message = BrowserFallbackOutcome.Message;
+                    SaveLocked(job);
+                    continue;
+                }
                 switch (job.State)
                 {
-                    case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Verifying:
+                    case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry
+                        or JobState.Verifying or JobState.Converting:
                         job.State = JobState.Queued;
                         job.Message = "Resumed after VESPER restarted.";
                         job.NextRetryUtc = null;
@@ -163,6 +178,10 @@ public sealed partial class DownloadEngine
                         break;
                     case JobState.Finalizing:
                         ReconcileFinalizing(job);
+                        break;
+                    case JobState.Completed when job.PendingConversionBytes is not null
+                        && job.FinalPath is { } final && MatchesConversion(job, final):
+                        FinishPublication(job, recovering: true);
                         break;
                 }
             }
@@ -172,20 +191,28 @@ public sealed partial class DownloadEngine
     /// <summary>VESPER died while publishing. Decide, from what is on disk, whether the rename happened.</summary>
     private void ReconcileFinalizing(DownloadJob job)
     {
+        // A converted file is published from a sidecar. The source is still present until the database commit.
+        if (job.PendingConversionBytes is not null && job.PendingFinalPath is { } converted
+            && !File.Exists(ConversionPath(job)) && MatchesConversion(job, converted))
+        {
+            MarkPublished(job, converted);
+            SaveLocked(job);
+            FinishPublication(job, recovering: true);
+            Log(job.Id, "reconciled", "Converted file had been published before the interruption.");
+            return;
+        }
+
         if (File.Exists(job.PartialPath))
         {
             // The rename did not happen; the runner will verify and publish again.
             job.State = JobState.Queued;
             job.Message = "Finishing after restart.";
+            ClearPendingPublication(job);
         }
-        else if (job.PendingFinalPath is { } published && PathSafety.Inspect(published) is { Exists: true } found
+        else if (job.PendingConversionBytes is null && job.PendingFinalPath is { } published && PathSafety.Inspect(published) is { Exists: true } found
             && (job.TotalBytes is null || found.Length == job.TotalBytes))
         {
-            job.FinalPath = published;
-            job.PendingFinalPath = null;
-            job.State = JobState.Completed;
-            job.CompletedUtc ??= DateTime.UtcNow;
-            job.Message = "";
+            MarkPublished(job, published);
             Log(job.Id, "reconciled", "Rename had completed before the interruption.");
         }
         else
@@ -195,6 +222,54 @@ public sealed partial class DownloadEngine
             job.Message = "VESPER was interrupted while finishing this file and cannot find it. Check the destination folder, or use Locate file.";
         }
         SaveLocked(job);
+    }
+
+    private static void MarkPublished(DownloadJob job, string target)
+    {
+        job.FinalPath = target;
+        job.PendingFinalPath = null;
+        job.State = JobState.Completed;
+        job.CompletedUtc ??= DateTime.UtcNow;
+        job.RetryCount = 0;
+        job.UnverifiedResumeApproved = false;
+        job.Reason = "";
+        job.Message = "";
+        if (job.PendingConversionBytes is long bytes)
+        {
+            job.FileName = Path.GetFileName(target);
+            job.TotalBytes = bytes;
+            var extents = new ExtentSet();
+            extents.Add(new ByteRange(0, bytes));
+            job.Extents = extents;
+            job.ContentType = job.Output == MediaOutput.M4a ? "audio/mp4" : "video/mp4";
+            job.MediaQuality = job.Output == MediaOutput.M4a ? "Audio AAC" : "H.264 + AAC";
+            job.Category = FileNames.CategoryFor(job.FileName);
+        }
+        else if (job.Output != MediaOutput.Original)
+        {
+            job.Reason = "saved-original";
+            job.Message = "Saved the original format. Compatible output was unavailable.";
+        }
+    }
+
+    private void FinishPublication(DownloadJob job, bool recovering = false)
+    {
+        RecoveryManifest.Delete(job.PartialPath);
+        if (job.PendingConversionBytes is null || !DeleteTemporaryFile(job, job.PartialPath)) return;
+        if (recovering)
+        {
+            MergeTransfer.DeleteSidecars(job);
+            ClearPendingPublication(job);
+            SaveLocked(job);
+        }
+        else UpdateJob(job, ClearPendingPublication);
+    }
+
+    private static void ClearPendingPublication(DownloadJob job)
+    {
+        job.PendingFinalPath = null;
+        job.PendingConversionBytes = null;
+        job.PendingConversionDigest = null;
     }
 
     /// <summary>After a database loss, partial files with a valid recovery manifest come back as "needs link" entries.</summary>
@@ -291,7 +366,17 @@ public sealed partial class DownloadEngine
     public bool SetExpectedSha256(Guid id, string hex)
     {
         if (!TryNormalizeSha256(hex, out string normalized)) return false;
-        UpdateIfExists(id, j => { j.ExpectedSha256 = normalized; j.Sha256Verified = false; });
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job)) return false;
+            if (job.Output != MediaOutput.Original && job.State is JobState.Converting or JobState.Finalizing or JobState.Verifying)
+                return false;
+            job.ExpectedSha256 = normalized;
+            job.Sha256Verified = false;
+            SaveLocked(job);
+            Changed(job);
+        }
+        FlushOutbox();
         return true;
     }
 }

@@ -29,6 +29,8 @@ public sealed class JobSnapshot
 
     public double SpeedBytesPerSecond { get; init; }
     public TimeSpan? Eta { get; init; }
+    public bool EstimatingEta { get; init; }
+    public bool WaitingForData { get; init; }
     public int Connections { get; init; }
     public JobPriority Priority { get; init; }
     public long SpeedLimitBytes { get; init; }

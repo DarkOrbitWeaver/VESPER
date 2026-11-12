@@ -230,7 +230,7 @@ internal sealed class RescueForm : VesperPopupForm
         Show("Resolving the original page and checking the selected format…", error: false);
         try
         {
-            using var resolver = new DefaultMediaResolver();
+            using var resolver = new DefaultMediaResolver(EngineHost.MediaNetwork(options: _engine.Options));
             var discovery = await Task.Run(() => resolver.ResolveAsync(new MediaDiscoveryRequest
             { Url = page, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token), token);
             if (IsDisposed || token.IsCancellationRequested) return;

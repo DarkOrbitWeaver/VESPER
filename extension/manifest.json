@@ -13,18 +13,18 @@
     "default_icon": { "16": "icons/vesper-16.png", "32": "icons/vesper-32.png" }
   },
   "background": { "service_worker": "background.js" },
-  "permissions": ["nativeMessaging", "contextMenus", "storage", "downloads", "webRequest"],
+  "permissions": ["nativeMessaging", "contextMenus", "storage", "downloads", "webRequest", "alarms"],
   "optional_permissions": ["cookies"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["theme.js", "content.js"],
+      "js": ["theme.js", "player-source.js", "vesper-companion.js", "content.js"],
       "run_at": "document_idle",
       "all_frames": true
     }
   ],
   "web_accessible_resources": [
-    { "resources": ["icons/butterfly-perched.png", "icons/butterfly-front.png"], "matches": ["http://*/*", "https://*/*"] }
+    { "resources": ["icons/vesper-companion-atlas.png"], "matches": ["http://*/*", "https://*/*"] }
   ]
 }

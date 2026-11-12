@@ -68,3 +68,43 @@ public readonly record struct RangeCheck(bool IsValid, string Code, string Messa
     public static RangeCheck Ok(long start, long end, long? total) => new(true, "", "", start, end, total);
     public static RangeCheck Fail(string code, string message) => new(false, code, message, 0, 0, null);
 }
+
+/// <summary>Shared by discovery and transfers using one configured network route.</summary>
+public sealed class OriginCooldown
+{
+    private readonly Dictionary<string, DateTimeOffset> _until = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _lock = new();
+    private long _latestUtcTicks;
+
+    public void Remember(Uri url, DateTimeOffset until)
+    {
+        lock (_lock)
+        {
+            string origin = url.GetLeftPart(UriPartial.Authority);
+            if (_until.TryGetValue(origin, out var existing) && existing >= until) return;
+            if (_until.Count >= 256) _until.Remove(_until.MinBy(entry => entry.Value).Key);
+            _until[origin] = until;
+            if (until.UtcTicks > _latestUtcTicks) Volatile.Write(ref _latestUtcTicks, until.UtcTicks);
+        }
+    }
+
+    public DateTimeOffset? RetryAt(Uri url)
+    {
+        long latest = Volatile.Read(ref _latestUtcTicks);
+        if (latest == 0) return null;
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (latest <= now.UtcTicks) return null;
+        lock (_lock)
+            return _until.TryGetValue(url.GetLeftPart(UriPartial.Authority), out var until) && until > now ? until : null;
+    }
+
+    internal bool WasRecentlyThrottled(Uri url)
+    {
+        long latest = Volatile.Read(ref _latestUtcTicks);
+        if (latest == 0) return false;
+        DateTimeOffset cutoff = DateTimeOffset.UtcNow.AddMinutes(-2);
+        if (latest <= cutoff.UtcTicks) return false;
+        lock (_lock)
+            return _until.TryGetValue(url.GetLeftPart(UriPartial.Authority), out var until) && until > cutoff;
+    }
+}

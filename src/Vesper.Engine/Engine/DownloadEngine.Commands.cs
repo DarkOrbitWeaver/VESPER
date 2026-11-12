@@ -2,7 +2,7 @@ using System.Text;
 
 namespace Vesper.Engine;
 
-public enum AddStatus { Added, Duplicate, Invalid, DestinationUnavailable, AlreadySubmitted }
+public enum AddStatus { Added, Duplicate, Invalid, DestinationUnavailable, AlreadySubmitted, Busy }
 public enum QueueMove { Top, Up, Down, Bottom }
 
 public sealed record AddRequest(
@@ -27,7 +27,9 @@ public sealed record AddRequest(
     string? MediaThumbnailUrl = null,
     DateTimeOffset? MediaExpiresAt = null,
     string? MediaPlanJson = null,
-    string? MediaFormatId = null);
+    string? MediaFormatId = null,
+    MediaOutput Output = MediaOutput.Original,
+    BrowserTransferProof? BrowserProof = null);
 
 public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
 {
@@ -65,7 +67,15 @@ public sealed partial class DownloadEngine
         try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return new AddResult(AddStatus.Invalid, Guid.Empty, ex.Message); }
 
-        if (!Enum.IsDefined(request.Kind)) return new AddResult(AddStatus.Invalid, Guid.Empty, "Unsupported job kind.");
+        if (!Enum.IsDefined(request.Kind) || request.Kind == JobKind.BrowserFile)
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "Unsupported job kind.");
+        if (request.BrowserProof is { } proof && (request.Kind != JobKind.Http || !proof.IsValid
+            || !proof.AwaitingConfirmation || request.Output != MediaOutput.Original || request.RequestId is null))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "Invalid browser handoff.");
+        if (!Enum.IsDefined(request.Output) || request.Output != MediaOutput.Original &&
+            (request.Kind is not (JobKind.Http or JobKind.Merge) || request.MediaProvider is not { Length: > 0 and <= 80 }
+             || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "Compatible output requires a discovered media download without a file checksum.");
         if (request.Kind == JobKind.Dash && (!DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out string planError)
             || request.Secrets is { Count: > 0 }))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan without persisted credentials is required.");
@@ -101,8 +111,10 @@ public sealed partial class DownloadEngine
                 return new AddResult(AddStatus.AlreadySubmitted, accepted, "This request was already accepted.");
 
             string normalized = UrlPolicy.Normalize(uri);
-            DownloadJob? existing = _jobs.Values.FirstOrDefault(j => j.State is not (JobState.Completed or JobState.Cancelled)
+            DownloadJob? existing = _jobs.Values.FirstOrDefault(j => j.Kind != JobKind.BrowserFile
+                && j.State is not (JobState.Completed or JobState.Cancelled)
                 && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
+                && j.Output == request.Output
                 && (request.Kind is not (JobKind.Dash or JobKind.Merge) || j.MediaPlanJson == request.MediaPlanJson));
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
@@ -124,6 +136,8 @@ public sealed partial class DownloadEngine
                 MediaQuality = request.MediaQuality is { Length: <= 180 } ? request.MediaQuality : null,
                 MediaThumbnailUrl = request.MediaThumbnailUrl is { Length: <= 4096 } ? request.MediaThumbnailUrl : null,
                 MediaExpiresAt = request.MediaExpiresAt,
+                Output = request.Output,
+                BrowserProof = request.BrowserProof,
                 MediaPlanJson = request.Kind is JobKind.Dash or JobKind.Merge ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
@@ -173,7 +187,8 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id)) return;
-            if (job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing) return;
+            if (job.BrowserProof is { AwaitingConfirmation: true }
+                || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
             job.State = JobState.Queued;
             job.NextRetryUtc = null;
             job.RetryCount = 0;
@@ -300,6 +315,8 @@ public sealed partial class DownloadEngine
         lock (_lock) _jobs.TryGetValue(id, out job);
         if (job is null || job.State != JobState.Completed || string.IsNullOrEmpty(job.FinalPath))
             return new DeleteResult(false, "There is no completed file to delete for this entry.", null);
+        if (job.Kind == JobKind.BrowserFile)
+            return new DeleteResult(false, "Manage this file from Chrome or File Explorer.", job.FinalPath);
 
         string path = job.FinalPath;
         FileCheck check = PathSafety.Inspect(path);
@@ -333,6 +350,9 @@ public sealed partial class DownloadEngine
             {
                 if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
                 if (!MergeTransfer.DeleteSidecars(job)) throw new IOException("A merge track file could not be deleted.");
+                if (job.Output != MediaOutput.Original
+                    && (!DeleteTemporaryFile(job, ConversionPath(job)) || !DeleteTemporaryFile(job, ConversionAudioPath(job))))
+                    throw new IOException("A temporary conversion file could not be deleted.");
                 RecoveryManifest.Delete(job.PartialPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -346,6 +366,7 @@ public sealed partial class DownloadEngine
             job.TotalBytes = job.PieceMapJson is not null && PieceMap.TryParse(job.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
             (job.ETag, job.LastModified, job.Identity, job.AcceptsRanges, job.NonResumable) = (null, null, IdentityLevel.None, false, false);
             (job.State, job.Reason, job.Message, job.RetryCount, job.MediaState, job.RescueCandidate) = (JobState.Queued, "", "", 0, null, false);
+            ClearPendingPublication(job);
             SaveLocked(job);
             Log(id, "restart", "Partial data discarded at the user's request.");
             Changed(job);

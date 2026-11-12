@@ -27,6 +27,7 @@ internal sealed class JobSession : IDisposable
     private long _sampleBytes;
     private long _sampleTicks = Stopwatch.GetTimestamp();
     private double _speed;
+    internal TransferEstimate Estimate { get; } = new();
 
     public DownloadJob Job { get; }
     public CancellationTokenSource Cts { get; } = new();
@@ -36,6 +37,7 @@ internal sealed class JobSession : IDisposable
     public volatile StopIntent Intent;
     public long CommittedAtStart { get; }
     public Task? RunTask { get; set; }
+    internal TaskCompletionSource? BrowserApproval { get; }
     public string Host { get; }
 
     public JobSession(DownloadEngine engine, DownloadJob job)
@@ -43,6 +45,8 @@ internal sealed class JobSession : IDisposable
         _engine = engine;
         Job = job;
         CommittedAtStart = job.Extents.TotalBytes;
+        if (job.BrowserProof is { AwaitingConfirmation: true })
+            BrowserApproval = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? uri) ? uri.Host.ToLowerInvariant() : "";
         Limiter.SetRate(job.SpeedLimitBytes);
     }
@@ -148,6 +152,14 @@ internal sealed class JobSession : IDisposable
         _speed = _speed == 0 ? instant : _speed * 0.7 + instant * 0.3;
         _sampleBytes = bytes;
         _sampleTicks = now;
+
+        if (Job.State == JobState.Downloading)
+        {
+            long progress;
+            lock (Gate) progress = Job.Extents.TotalBytes + _pending.TotalBytes;
+            Estimate.Sample(now, progress, Job.TotalBytes);
+        }
+        else Estimate.Reset();
     }
 
     public void Dispose()

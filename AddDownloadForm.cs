@@ -8,6 +8,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
     private readonly VesperPalette _colors;
     private readonly VesperInputFrame _urlFrame;
     private readonly TextBox _url;
+    private readonly VesperTextScroll _linkScroll;
     private readonly Label _hint;
     private readonly Panel _detected;
     private readonly Label _detectedTitle;
@@ -103,11 +104,12 @@ internal sealed class AddDownloadForm : VesperPopupForm
             else
             {
                 if (TryReadClipboard(out string clipboard)) SetLinkText(clipboard);
-                else MessageBox.Show(this, "There isn't a usable link on the clipboard.", "Paste link", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else VesperMessageBox.Show(this, "There isn't a usable link on the clipboard.", "Paste link", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             _url.Focus();
         };
-        _urlFrame.Controls.AddRange([_url, _paste]);
+        _linkScroll = new VesperTextScroll(_url, _colors) { Visible = false };
+        _urlFrame.Controls.AddRange([_url, _linkScroll, _paste]);
 
         _hint = TextLabel("Enter a link to continue", 8, muted: true);
         _hint.SetBounds(23, 157, 462, 22);
@@ -278,7 +280,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         if (_multiLine == enabled) return;
         if (!enabled && SplitLines(_url.Text).Length > 1)
         {
-            MessageBox.Show(this, "Remove the extra links before switching back to one line.",
+            VesperMessageBox.Show(this, "Remove the extra links before switching back to one line.",
                 "Multiple links", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -286,7 +288,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
         string previousText = _url.Text;
         _url.Multiline = enabled;
         _url.WordWrap = false;
-        _url.ScrollBars = enabled ? ScrollBars.Vertical : ScrollBars.None;
+        _url.ScrollBars = enabled && _colors.HighContrast ? ScrollBars.Vertical : ScrollBars.None;
+        _linkScroll.Visible = enabled && !_colors.HighContrast;
         _url.Text = previousText;
         _multipleLinks.Text = enabled ? "Single link" : "Multiple links";
         LayoutContent();
@@ -372,7 +375,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
         {
             int extra = _multiLine ? 56 : 0;
             _urlFrame.SetBounds(S(23), S(107), S(462), S(43 + extra));
-            _url.SetBounds(S(12), S(12), S(400), S(22 + extra));
+            _url.SetBounds(S(12), S(12), S(_multiLine && !_colors.HighContrast ? 384 : 400), S(22 + extra));
+            _linkScroll.SetBounds(S(400), S(9), S(13), S(25 + extra));
             _hint.SetBounds(S(23), S(157 + extra), S(462), S(22));
             _detected.SetBounds(S(23), S(156 + extra), S(462), S(47));
             int destinationY = (_url.TextLength > 0 && SplitLinks().Length > 0 ? 214 : 192) + extra;
@@ -400,7 +404,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         if (picker.ShowDialog(this) != DialogResult.OK || picker.Selections.Count == 0)
         {
             string[] ordinary = allowGeneric ? [] : links.Where(IsSupportedUrl).ToArray();
-            if (ordinary.Length == 0 || MessageBox.Show(this,
+            if (ordinary.Length == 0 || VesperMessageBox.Show(this,
                 $"Media discovery was cancelled or found no supported streams. Add the {ordinary.Length} ordinary file link(s) instead?",
                 "Add remaining files", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             MediaJobs = [];
@@ -432,7 +436,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
         {
-            MessageBox.Show(this, "The browser couldn't open this page: " + ex.Message,
+            VesperMessageBox.Show(this, "The browser couldn't open this page: " + ex.Message,
                 "Open video page", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
@@ -448,7 +452,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
         if (!Vesper.Engine.PathSafety.TryResolveFolder(folder, create: false, out string resolved, out string folderProblem)
             && !(folderProblem.Contains("does not exist") && Path.IsPathFullyQualified(folder)))
         {
-            MessageBox.Show(this, folderProblem, "Invalid destination",
+            VesperMessageBox.Show(this, folderProblem, "Invalid destination",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }

@@ -29,15 +29,28 @@ internal sealed partial class BrowserBridgeHandler
 
         using var discovery = CancellationTokenSource.CreateLinkedTokenSource(ct);
         discovery.CancelAfter(TimeSpan.FromSeconds(42)); // Leave time for the browser helper's cold start.
-        using var resolver = new DefaultMediaResolver();
+        using var resolver = new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options));
         MediaDiscoveryResult resolved = await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
             Url = page, Browser = MediaHints(request, page),
             Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly }
         }, discovery.Token);
         if (resolved.Item is not { } item)
-            return BridgeResponse.Fail(request.Id, resolved.Error?.Code == MediaErrorCode.DrmProtected ? "protected" : "unavailable",
-                resolved.Error?.UserMessage ?? "No downloadable media was found.");
+        {
+            var error = resolved.Error;
+            string code = error?.Code switch
+            {
+                MediaErrorCode.DrmProtected => "protected",
+                MediaErrorCode.RateLimited => "rate-limited",
+                MediaErrorCode.LoginRequired or MediaErrorCode.AuthorizationRequired => "sign-in",
+                MediaErrorCode.SourceExpired => "source-expired",
+                MediaErrorCode.BlockedBySecurityPolicy or MediaErrorCode.RegionRestricted => "blocked",
+                MediaErrorCode.NetworkFailure => "network",
+                _ => "unavailable"
+            };
+            var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
+            return error?.RetryAt is { } retryAt ? failure with { Data = new { retryAt } } : failure;
+        }
 
         return CreateBrowserOptions(request.Id, item, discovery.Token);
     }
@@ -47,34 +60,52 @@ internal sealed partial class BrowserBridgeHandler
         var playable = PlayableOnly(item);
         var jobs = new List<MediaDownloadChoice>();
         var presets = new List<BrowserOption>();
+        var originalPresets = new List<BrowserOption>();
         var exact = new List<BrowserOption>();
         long cacheBytes = 0;
         DateTimeOffset now = DateTimeOffset.UtcNow;
+        BrowserOption? OptionFor(MediaDownloadChoice? job, string label)
+        {
+            if (job is null || job.ExpiresAt is { } expires && expires <= now) return null;
+            int index = jobs.IndexOf(job);
+            if (index < 0)
+            {
+                long bytes = 2L * ((job.MediaPlanJson?.Length ?? 0) + job.Url.Length + 1024);
+                if (jobs.Count >= 64 || cacheBytes + bytes > 2 * 1024 * 1024) return null;
+                cacheBytes += bytes;
+                index = jobs.Count;
+                jobs.Add(job);
+            }
+            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer);
+        }
         void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
         {
-            if (job is null || job.ExpiresAt is { } expires && expires <= now) return;
-            long bytes = 2L * ((job.MediaPlanJson?.Length ?? 0) + job.Url.Length + 1024);
-            if (jobs.Count >= 64 || cacheBytes + bytes > 2 * 1024 * 1024) return;
-            cacheBytes += bytes;
-            string? container = job.Kind == JobKind.Hls ? "HLS" : Path.GetExtension(job.FileName).TrimStart('.').ToUpperInvariant();
-            options.Add(new BrowserOption(jobs.Count, label, job.Quality ?? "", container));
-            jobs.Add(job);
+            if (OptionFor(job, label) is { } option && !options.Any(previous => previous.Index == option.Index))
+                options.Add(option);
         }
 
         (string Label, FormatPreferences Preferences)[] quality =
         [
             ("Best quality", FormatPreferences.BestQuality), ("Balanced", FormatPreferences.BalancedQuality),
-            ("Smallest", FormatPreferences.SmallestSuitable), ("Audio only", FormatPreferences.AudioOnly)
+            ("Smallest", FormatPreferences.SmallestSuitable)
         ];
-        foreach (var (label, preference) in quality)
+        if (playable.Representations.Any(r => r.HasVideo))
         {
-            MediaDownloadChoice? job = Prepare(playable, preference).Choice;
-            if (job is not null && !jobs.Any(previous => previous.FormatId == job.FormatId && previous.Url == job.Url))
-                Offer(job, label, presets);
+            foreach (var (label, preference) in quality)
+            {
+                Offer(Prepare(playable, preference, output: MediaOutputPreference.CompatibleVideo).Choice, label, presets);
+                Offer(Prepare(playable, preference).Choice, label, originalPresets);
+            }
         }
+        MediaDownloadChoice? sourceAudio = Prepare(playable, FormatPreferences.AudioOnly).Choice;
+        Offer(sourceAudio, "Audio only", presets);
+        Offer(sourceAudio, "Audio only", originalPresets);
+        MediaDownloadChoice? alternate = Prepare(playable, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice;
+        BrowserOption? audioM4a = alternate != sourceAudio && presets.Any(c => c.Label == "Audio only")
+            ? OptionFor(alternate, "Audio only") : null;
 
         foreach (var format in playable.Representations.OrderByDescending(r => r.Height ?? 0)
-                     .ThenByDescending(r => r.FrameRate ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).Take(60))
+                     .ThenByDescending(r => r.FrameRate ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).Take(56))
         {
             ct.ThrowIfCancellationRequested();
             var parts = new[] { format.Content == StreamContent.AudioOnly ? "Audio" : format.Height is int height ? $"{height}p" : "Video",
@@ -88,8 +119,12 @@ internal sealed partial class BrowserBridgeHandler
         if (jobs.Count == 0) return BridgeResponse.Fail(requestId, "unavailable", "No compatible formats are available for this media.");
         if (presets.Count == 0)
         {
-            presets.Add(exact[0]);
-            exact.RemoveAt(0);
+            if (originalPresets.Count > 0) presets.AddRange(originalPresets);
+            else
+            {
+                presets.Add(exact[0]);
+                exact.RemoveAt(0);
+            }
         }
 
         Guid session = Guid.NewGuid();
@@ -104,7 +139,7 @@ internal sealed partial class BrowserBridgeHandler
         {
             mediaSession = session.ToString("N"), item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
-            choices = presets, more = exact
+            choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, more = exact
         });
     }
 
@@ -133,7 +168,7 @@ internal sealed partial class BrowserBridgeHandler
             Kind: job.Kind, RequestId: requestId, OriginalPageUrl: job.OriginalPageUrl,
             MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
             MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
-            MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId));
+            MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId, Output: job.Output));
         string status = added.Status switch
         {
             AddStatus.Added => queue ? "queued" : "started",

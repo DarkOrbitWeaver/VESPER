@@ -32,6 +32,7 @@ internal sealed class HttpTransport : IDisposable
 
     private readonly EngineOptions _options;
     private readonly HttpClient _client;
+    private readonly bool _validateProxyDns;
 
     public HttpTransport(EngineOptions options)
     {
@@ -61,6 +62,7 @@ internal sealed class HttpTransport : IDisposable
                 handler.UseProxy = true;
                 break;
         }
+        _validateProxyDns = handler.UseProxy && !options.AllowPrivateNetworks;
 
         // HttpClient.Timeout would also cut healthy multi-hour transfers. Stalls are handled per read.
         _client = new HttpClient(handler, disposeHandler: true) { Timeout = Timeout.InfiniteTimeSpan };
@@ -76,9 +78,37 @@ internal sealed class HttpTransport : IDisposable
         {
             if (!visited.Add(current.AbsoluteUri)) throw new RedirectException("The server redirected in a loop.");
             UrlPolicy.EnsureAllowed(current, _options.AllowPrivateNetworks);
+            if (_options.Cooldown.RetryAt(current) is { } retryAt)
+            {
+                var deferred = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+                deferred.Headers.RetryAfter = new RetryConditionHeaderValue(retryAt);
+                return deferred;
+            }
+            if (_validateProxyDns)
+            {
+                using var dns = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                dns.CancelAfter(_options.ConnectTimeout);
+                IPAddress[] addresses;
+                try { addresses = await Dns.GetHostAddressesAsync(current.IdnHost, dns.Token).ConfigureAwait(false); }
+                catch (SocketException ex) { throw new TransientNetworkException("Could not verify the proxy destination in DNS.", ex); }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TransientNetworkException("DNS verification timed out."); }
+                if (addresses.Length == 0 || addresses.Any(address => !UrlPolicy.IsPublicAddress(address)))
+                    throw new BlockedAddressException(current.IdnHost);
+            }
 
             using HttpRequestMessage request = BuildRequest(current, spec, UrlPolicy.IsSameOrigin(url, current));
             HttpResponseMessage response = await SendOnceAsync(request, ct).ConfigureAwait(false);
+            if (response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
+            {
+                DateTimeOffset now = DateTimeOffset.UtcNow;
+                TimeSpan? delay = HttpFacts.RetryAfter(response, now);
+                if (delay is null && response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    delay = TimeSpan.FromSeconds(30);
+                    response.Headers.RetryAfter = new RetryConditionHeaderValue(delay.Value);
+                }
+                if (delay is { } wait) _options.Cooldown.Remember(current, now + wait);
+            }
             if (!IsRedirect(response.StatusCode)) return response;
 
             Uri? location = response.Headers.Location;

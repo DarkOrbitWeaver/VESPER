@@ -257,7 +257,7 @@ public static class FormatSelector
                 OutputContainer = a.Container,
                 EstimatedSize = a.FileSize,
                 EstimatedSizeIsEstimate = a.FileSizeIsEstimate,
-                Summary = $"audio {a.AudioCodec ?? a.Container ?? ""} {(a.BitrateKbps is { } k ? k + "kbps" : "")}".Trim()
+                Summary = $"audio {a.AudioCodec ?? a.Container ?? ""} {(a.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
             });
         }
 
@@ -309,7 +309,9 @@ public static class FormatSelector
                          && !CodecInfo.FitsContainer(CodecInfo.ChooseMuxContainer(video.VideoCodec, a.AudioCodec, p.Container), video.VideoCodec, a.AudioCodec) ? 1 : 0)
             .ThenBy(a => CodecIndex(p.AudioCodecs, a.AudioCodec))
             .ThenBy(a => p.PreferSurround ? -(a.AudioChannels ?? 2) : ((a.AudioChannels ?? 2) == 2 ? 0 : (a.AudioChannels ?? 2) < 2 ? 1 : 2))
+            .ThenBy(a => video is null && a.AudioCodec is "flac" or "alac" ? 0 : 1)
             .ThenByDescending(a => a.BitrateKbps ?? 0)
+            .ThenBy(a => video is null && a.AudioCodec == "opus" ? 0 : 1)
             .ThenBy(a => a.Id, StringComparer.Ordinal)
             .FirstOrDefault();
     }

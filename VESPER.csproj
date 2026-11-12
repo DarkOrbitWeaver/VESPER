@@ -29,7 +29,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="Assets\VESPER-Illustrated.ico;Assets\VESPER-Light.ico;Assets\VESPER-Dark.ico;Assets\VESPER-Illustrated-256.png;Assets\moth-mark-transparent-64.png;Assets\moth-mark-transparent-96.png;Assets\header-branch-light-720x288.png;Assets\header-branch-dark-720x288.png;Assets\Botanical\butterfly.png;Assets\Botanical\empty-hero.png;Assets\Botanical\header.png;Assets\Botanical\sprig.png;Assets\Botanical\hills-left.png;Assets\Botanical\hills.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\VESPER-Illustrated.ico;Assets\Botanical\butterfly.png;Assets\Botanical\empty-hero.png;Assets\Botanical\header.png;Assets\Botanical\sprig.png;Assets\Botanical\hills-left.png;Assets\Botanical\hills.png" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="src\Vesper.Engine\Vesper.Engine.csproj" />
     <ProjectReference Include="src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />
     <ProjectReference Include="src\Vesper.NativeHost\Vesper.NativeHost.csproj" ReferenceOutputAssembly="false" />

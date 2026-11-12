@@ -16,17 +16,40 @@ globalThis.VesperTheme = (() => {
     .vesper-button:disabled{background:var(--wash);border-color:var(--border);color:var(--muted);cursor:default;box-shadow:none}
     :focus-visible{outline:2px solid var(--sage);outline-offset:2px}
   `;
-  function watch(target) {
+  function available() {
+    try { return Boolean(chrome.runtime?.id); }
+    catch { return false; }
+  }
+
+  const contextGone = error => !available() || /extension context invalidated/i.test(error?.message || '');
+
+  function watchPreference(key, fallback, apply) {
     let active = true;
-    const apply = theme => {
-      if (active) target.dataset.vesperTheme = ['light', 'dark'].includes(theme) ? theme : 'system';
-    };
+    let changed = false;
     const listener = (changes, area) => {
-      if (area === 'sync' && changes.theme) apply(changes.theme.newValue);
+      if (!active || area !== 'sync' || !changes[key]) return;
+      changed = true;
+      apply(changes[key].newValue ?? fallback);
     };
-    chrome.storage.sync.get({ theme: 'system' }).then(prefs => apply(prefs.theme)).catch(() => {});
-    chrome.storage.onChanged.addListener(listener);
-    return () => { active = false; chrome.storage.onChanged.removeListener(listener); };
+    try {
+      chrome.storage.onChanged.addListener(listener);
+      chrome.storage.sync.get({ [key]: fallback }).then(prefs => {
+        if (active && !changed) apply(prefs[key]);
+      }).catch(() => {});
+    } catch (error) {
+      if (!contextGone(error)) throw error;
+    }
+    return () => {
+      active = false;
+      try { chrome.storage.onChanged.removeListener(listener); }
+      catch (error) { if (!contextGone(error)) throw error; }
+    };
+  }
+
+  function watch(target) {
+    return watchPreference('theme', 'system', theme => {
+      target.dataset.vesperTheme = ['light', 'dark'].includes(theme) ? theme : 'system';
+    });
   }
   function install() {
     const style = document.createElement('style');
@@ -34,5 +57,5 @@ globalThis.VesperTheme = (() => {
     document.head.append(style);
     watch(document.documentElement);
   }
-  return { css, watch, install };
+  return { css, watch, install, available, contextGone, watchPreference };
 })();

@@ -5,9 +5,8 @@ using Vesper.Engine;
 namespace Vesper.NativeHost;
 
 /// <summary>
-/// Chrome Native Messaging host. Chrome starts it for one message, it relays that message to the running
-/// VESPER over the per-user pipe, writes the answer to stdout and exits. It holds no state and does no
-/// downloading. Everything it forwards has been validated first, and it never writes anything but a reply to stdout.
+/// Chrome Native Messaging host. Relays validated messages over the per-user pipe. Ordinary requests are
+/// one-shot. A live Chrome download can hold a metadata-only port until that download ends.
 /// </summary>
 internal static class Program
 {
@@ -18,25 +17,30 @@ internal static class Program
     {
         using Stream input = Console.OpenStandardInput();
         using Stream output = Console.OpenStandardOutput();
-        using var overall = new CancellationTokenSource(TimeSpan.FromMinutes(6));
         string id = "unknown000";
         try
         {
-            string? json = await BridgeProtocol.ReadFrameAsync(input, overall.Token);
-            if (json is null) return 0;
-
-            string reply;
-            if (!BridgeProtocol.TryParse(json, out BridgeRequest request, out string error))
+            while (true)
             {
-                reply = Serialize(BridgeResponse.Fail(id, "invalid", error));
+                using var overall = new CancellationTokenSource(TimeSpan.FromMinutes(6));
+                string? json = await BridgeProtocol.ReadFrameAsync(input, overall.Token);
+                if (json is null) return 0;
+                string reply;
+                bool persistent = false;
+                if (!BridgeProtocol.TryParse(json, out BridgeRequest request, out string error))
+                {
+                    reply = Serialize(BridgeResponse.Fail(id, "invalid", error));
+                }
+                else
+                {
+                    id = request.Id;
+                    persistent = request.Type == "browser-activity";
+                    reply = await HandleAsync(request, json, overall.Token);
+                }
+                await BridgeProtocol.WriteFrameAsync(output, reply, overall.Token);
+                // connectNative holds a port only for live Chrome downloads. Other commands stay one-shot.
+                if (!persistent) return 0;
             }
-            else
-            {
-                id = request.Id;
-                reply = await HandleAsync(request, json, overall.Token);
-            }
-            await BridgeProtocol.WriteFrameAsync(output, reply, overall.Token);
-            return 0;
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or OperationCanceledException)
         {
@@ -54,7 +58,8 @@ internal static class Program
         if (answer is not null) return answer;
 
         // A browser download or format request can wake the desktop.
-        if (!TryStartApp()) return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
+        if (request is { Type: "browser-activity", Operation: "watch" } || !TryStartApp())
+            return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
 
         DateTime deadline = DateTime.UtcNow + LaunchWait;
         while (DateTime.UtcNow < deadline)

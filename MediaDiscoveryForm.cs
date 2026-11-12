@@ -6,6 +6,7 @@ using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Playlists;
+using QualityMode = Vesper.MediaResolver.Formats.QualityMode;
 
 namespace VESPER;
 
@@ -22,8 +23,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private IReadOnlyList<Uri>? _pastedUrls;
     private BrowserDiscoveryMessage? _browserContext;
     private readonly VesperPalette _colors;
-    private readonly DefaultMediaResolver _resolver = new();
-    private readonly SecureHttpClient _thumbnails = new(new ResolverOptions { MaxConcurrentRequests = 1 });
+    private readonly DefaultMediaResolver _resolver = new(EngineHost.MediaNetwork());
+    private readonly SecureHttpClient _thumbnails = new(EngineHost.MediaNetwork(maxConcurrent: 1));
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Panel _body;
     private readonly Panel _canvas;
@@ -39,6 +40,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly Label _qualityLabel;
     private readonly Label _customLabel;
     private readonly VesperChoice _quality;
+    private readonly VesperChoice _outputChoice;
+    private readonly VesperChoice _audioOutputChoice;
     private readonly VesperChoice _customFormat;
     private readonly CheckedListBox _entries;
     private readonly VesperButton _download;
@@ -58,6 +61,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private bool _busy;
     private bool _truncated;
     private bool _hasMetadata;
+    private bool _canChooseM4a;
     private bool _arranging;
     private int _presetIndex;
     private CancellationTokenSource? _attempt;
@@ -84,7 +88,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
 
-        _body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface, AutoScroll = true, TabIndex = 0 };
+        _body = new VesperScrollPanel { Dock = DockStyle.Fill, BackColor = _colors.Surface, AutoScroll = true, TabIndex = 0 };
         _canvas = new Panel { Dock = DockStyle.Top, BackColor = _colors.Surface };
         _body.Controls.Add(_canvas);
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
@@ -126,11 +130,17 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _quality = new VesperChoice { AccessibleName = "Playlist quality", Symbol = VesperIcon.Quality };
         _quality.ApplyPalette(_colors);
         _quality.SetItems("Best available with audio", "Balanced", "Smallest suitable", "Audio only");
+        _outputChoice = new VesperChoice { AccessibleName = "Output format preference" };
+        _outputChoice.ApplyPalette(_colors);
+        _outputChoice.SetItems("Compatible", "Original");
+        _audioOutputChoice = new VesperChoice { AccessibleName = "Audio output format" };
+        _audioOutputChoice.ApplyPalette(_colors);
+        _audioOutputChoice.SetItems("M4A (AAC)", "Original audio");
         _customLabel = L("Exact available format", 8.5f, muted: true);
         _customFormat = new VesperChoice { AccessibleName = "Exact format", Symbol = VesperIcon.Layers };
         _customFormat.ApplyPalette(_colors);
         _customFormat.SelectedIndexChanged += (_, _) => UpdateChoiceSummary();
-        _canvas.Controls.AddRange([_qualityLabel, _quality, _customLabel, _customFormat]);
+        _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice, _customLabel, _customFormat]);
         _presetOptions = new Panel { BackColor = _colors.Surface, Visible = false, TabIndex = 3 };
         (string Title, VesperIcon Icon)[] presets =
         [
@@ -146,12 +156,22 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         }
         _presets[0].Checked = true;
         _canvas.Controls.Add(_presetOptions);
+        void OutputChanged(object? sender, EventArgs e)
+        {
+            if (_state != ViewState.Ready || _item is null) return;
+            RefreshPresets(_item);
+            UpdateChoiceSummary();
+            FitToContent();
+        }
+        _outputChoice.SelectedIndexChanged += OutputChanged;
+        _audioOutputChoice.SelectedIndexChanged += OutputChanged;
+        _quality.SelectedIndexChanged += (_, _) => { if (_state == ViewState.Collection) UpdateQualityUi(); };
 
         _collectionButton = B("Browse playlist", 152, VesperIcon.Queue);
         _collectionButton.Click += async (_, _) => await LoadCollectionAsync();
         _canvas.Controls.Add(_collectionButton);
 
-        _entries = new CheckedListBox
+        _entries = new VesperCheckedList(_colors)
         {
             CheckOnClick = true, BorderStyle = BorderStyle.None,
             BackColor = _colors.Surface, ForeColor = _colors.Text,
@@ -266,7 +286,10 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             int statusWidth = contentWidth - (playlist ? S(172) : 0);
             Place(_status, margin, 153, statusWidth, _state == ViewState.Unavailable ? 57 : 34);
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
-            Place(_qualityLabel, margin, 185, contentWidth, 22);
+            int outputWidth = Math.Min(S(132), contentWidth / 2);
+            Place(_qualityLabel, margin, 181, contentWidth - outputWidth - S(8), 26);
+            Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
+            Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_quality, margin, 211, contentWidth, 34);
             Place(_entries, margin, 256, contentWidth, 152);
             Place(_presetOptions, margin, 211, contentWidth, 181);
@@ -544,27 +567,43 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             var parts = new List<string> { r.Content == StreamContent.AudioOnly ? "Audio" : r.Height is { } h ? $"{h}p" : "Video" };
             if (r.AudioUnverified) parts.Add("audio not confirmed");
             if (r.FrameRate is > 30.5) parts.Add($"{Math.Round(r.FrameRate.Value)} fps");
-            if (r.VideoCodec is { Length: > 0 } codec) parts.Add(codec.ToUpperInvariant());
+            if ((r.VideoCodec ?? r.AudioCodec) is { Length: > 0 } codec) parts.Add(codec.ToUpperInvariant());
             if (r.Container is { Length: > 0 } container) parts.Add(container.ToUpperInvariant());
             if (r.BitrateKbps is { } bitrate) parts.Add($"{bitrate} kbps");
             return string.Join(" · ", parts);
         }).ToArray();
         _customFormat.SetItems(options);
-        _status.Text = $"{_playableFormats.Count} compatible format{(_playableFormats.Count == 1 ? "" : "s")} available.";
+        MediaDownloadChoice? sourceAudio = Prepare(_item, FormatPreferences.AudioOnly).Choice;
+        _canChooseM4a = Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice is { } m4a
+            && m4a != sourceAudio;
+        _status.Text = $"{_playableFormats.Count} format{(_playableFormats.Count == 1 ? "" : "s")} available.";
+        RefreshPresets(_item);
+        _notice.Text = "";
+        Render(ViewState.Ready);
+    }
+
+    private bool AudioOutputApplies(FormatPreferences prefs) =>
+        prefs.Mode == QualityMode.AudioOnly || _item?.Representations.All(r => !r.HasVideo) == true;
+
+    private MediaOutputPreference OutputPreference(FormatPreferences prefs)
+    {
+        if (AudioOutputApplies(prefs))
+            return _audioOutputChoice.SelectedIndex == 0 && (_state == ViewState.Collection || _canChooseM4a)
+                ? MediaOutputPreference.M4a : MediaOutputPreference.Original;
+        return _outputChoice.SelectedIndex == 0 ? MediaOutputPreference.CompatibleVideo : MediaOutputPreference.Original;
+    }
+
+    private void RefreshPresets(MediaItem item)
+    {
         FormatPreferences[] preferences = [FormatPreferences.BestQuality, FormatPreferences.BalancedQuality,
             FormatPreferences.SmallestSuitable, FormatPreferences.AudioOnly];
         for (int i = 0; i < preferences.Length; i++)
         {
-            var result = Prepare(_item, preferences[i]);
+            var result = Prepare(item, preferences[i], output: OutputPreference(preferences[i]));
             if (result.Choice is { } choice)
-            {
-                string container = choice.Kind == JobKind.Hls ? "" : Path.GetExtension(choice.FileName).TrimStart('.').ToUpperInvariant();
-                _presets[i].SetFormat(choice.Quality ?? "Available source", container, available: true);
-            }
+                _presets[i].SetFormat(choice.DisplayDetail, choice.DisplayContainer, available: true);
             else _presets[i].SetFormat("Unavailable for this source", "", available: false);
         }
-        _notice.Text = "";
-        Render(ViewState.Ready);
     }
 
     internal void SetPreviewState(int preset, bool pressed = false)
@@ -597,6 +636,10 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _customLabel.Visible = _customFormat.Visible = custom;
         _customFormat.Enabled = custom && !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
+        bool outputVisible = _state == ViewState.Collection || _state == ViewState.Ready && !IsExactFormat;
+        bool audio = AudioOutputApplies(CurrentPreferences());
+        _outputChoice.Visible = outputVisible && !audio;
+        _audioOutputChoice.Visible = outputVisible && audio && (_state == ViewState.Collection || _canChooseM4a);
         UpdateChoiceSummary();
     }
 
@@ -604,11 +647,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         if (_state != ViewState.Ready || _item is null || _busy) return;
         FormatPreferences prefs = CurrentPreferences();
-        var result = Prepare(_item, prefs, SelectedExactRepresentation());
+        var result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs));
         if (result.Choice is { } choice)
             _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
                 ? "Audio is unconfirmed and will be checked before publication."
-                : IsExactFormat ? choice.Quality ?? "" : "";
+                : IsExactFormat ? choice.DisplayDetail : "";
         else
             _notice.Text = result.Error ?? "This preference isn't available for the source.";
         _notice.ForeColor = result.Choice is null ? _colors.Red : _colors.Muted;
@@ -688,11 +731,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         try
         {
             var prefs = CurrentPreferences();
+            MediaOutputPreference output = OutputPreference(prefs);
             var jobs = new List<MediaDownloadChoice>();
             var errors = new List<string>();
             if (_collection is null && _item is { } single)
             {
-                var prepared = Prepare(single, prefs, SelectedExactRepresentation());
+                var prepared = Prepare(single, prefs, SelectedExactRepresentation(), output);
                 if (prepared.Choice is { } c) jobs.Add(c);
                 else errors.Add(prepared.Error ?? "The chosen format isn't supported.");
             }
@@ -713,7 +757,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                         MediaDiscoveryResult result = entry.Resolved is { } ready ? MediaDiscoveryResult.FromItem(ready)
                             : await _resolver.ResolveAsync(new MediaDiscoveryRequest
                             { Url = entry.Url, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token);
-                        preparedItems[i] = result.Item is { } item ? Prepare(item, prefs)
+                        preparedItems[i] = result.Item is { } item ? Prepare(item, prefs, output: output)
                             : (null, result.Error?.UserMessage ?? "Unavailable");
                     }
                     catch (OperationCanceledException) { throw; }
@@ -733,13 +777,13 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 _notice.Text = errors.Count > 0 ? Limit(errors[0], 150) : "Try a different quality or source.";
                 return;
             }
-            if (errors.Count > 0 && MessageBox.Show(this,
+            if (errors.Count > 0 && VesperMessageBox.Show(this,
                     $"{jobs.Count} supported item(s); {errors.Count} could not be prepared.\n\n" +
                     string.Join("\n", errors.Take(4)) + "\n\nAdd the supported items?",
                     "Partial media selection", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             // ExpiresAt is retained with each job. Never promise future URL refresh here.
             if (queueOnly && jobs.Any(j => j.ExpiresAt is { } expiry && expiry < DateTimeOffset.UtcNow.AddHours(1)) &&
-                MessageBox.Show(this,
+                VesperMessageBox.Show(this,
                     "One or more media links expire within an hour. Queuing them may cause a 'Needs new link' status later. Queue anyway?",
                     "Temporary media links", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
             if (_sample is not null)
@@ -763,7 +807,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         try { Process.Start(new ProcessStartInfo(_url.AbsoluteUri) { UseShellExecute = true }); }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-        { MessageBox.Show(this, ex.Message, "Open original", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        { VesperMessageBox.Show(this, ex.Message, "Open original", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
     }
 
     private void SetBusy(bool busy, string? message = null)
@@ -774,6 +818,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _collectionButton.Enabled = !_busy;
         _entries.Enabled = !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
+        _outputChoice.Enabled = !_busy;
+        _audioOutputChoice.Enabled = !_busy;
         _presetOptions.Enabled = !_busy;
         _customFormat.Enabled = !_busy && IsExactFormat;
         if (!busy && _state == ViewState.Ready)

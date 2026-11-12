@@ -96,9 +96,8 @@ public sealed partial class DownloadEngine : IDisposable
             progress = job.State == JobState.Completed ? job.TotalBytes ?? committed : committed;
         }
 
-        double speed = session?.SpeedBytesPerSecond ?? 0;
-        TimeSpan? eta = speed > 1024 && job.TotalBytes is long total && job.State == JobState.Downloading
-            ? TimeSpan.FromSeconds(Math.Max(0, total - progress) / speed) : null;
+        bool downloading = job.State == JobState.Downloading;
+        TransferEstimate? estimate = downloading ? session?.Estimate : null;
 
         return new JobSnapshot
         {
@@ -110,7 +109,9 @@ public sealed partial class DownloadEngine : IDisposable
             State = job.State == JobState.Completed && session is not null ? JobState.Finalizing : job.State,
             Reason = job.Reason, Message = job.Message,
             TotalBytes = job.TotalBytes, CommittedBytes = committed, ProgressBytes = progress,
-            SpeedBytesPerSecond = job.State == JobState.Downloading ? speed : 0, Eta = eta, Connections = session?.Connections ?? 0,
+            SpeedBytesPerSecond = downloading && estimate?.WaitingForData != true ? session?.SpeedBytesPerSecond ?? 0 : 0,
+            Eta = estimate?.Remaining, EstimatingEta = estimate?.Estimating == true, WaitingForData = estimate?.WaitingForData == true,
+            Connections = session?.Connections ?? 0,
             Priority = job.Priority, SpeedLimitBytes = job.SpeedLimitBytes, QueueOrder = job.QueueOrder,
             CreatedUtc = job.CreatedUtc, CompletedUtc = job.CompletedUtc, NextRetryUtc = job.NextRetryUtc, RetryCount = job.RetryCount,
             FileMissing = _missing.Contains(job.Id), Identity = job.Identity, AcceptsRanges = job.AcceptsRanges,
@@ -292,6 +293,8 @@ public sealed partial class DownloadEngine : IDisposable
                 _sessions.Remove(job.Id);
                 _forced.Remove(job.Id);
                 bool progressed = job.Extents.TotalBytes > session.CommittedAtStart;
+                if (session.Intent == StopIntent.BrowserFallback && outcome.State != JobState.Completed)
+                    outcome = BrowserFallbackOutcome;
                 ApplyOutcome(job, outcome, progressed);
                 SaveLocked(job);
                 Changed(job);

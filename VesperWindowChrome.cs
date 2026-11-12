@@ -5,6 +5,12 @@ namespace VESPER;
 // Keep the real Windows caption buttons; request its dark treatment when VESPER is dark.
 internal static class VesperWindowChrome
 {
+    public static void ApplyNativeColors(VesperPalette palette)
+    {
+        if (System.ComponentModel.LicenseManager.UsageMode != System.ComponentModel.LicenseUsageMode.Designtime)
+            Application.SetColorMode(palette.IsDark && !palette.HighContrast ? SystemColorMode.Dark : SystemColorMode.Classic);
+    }
+
     public static void Brand(Form window)
     {
         try
@@ -37,5 +43,18 @@ internal static class VesperWindowChrome
         }
         catch (DllNotFoundException) { }
         catch (EntryPointNotFoundException) { }
+    }
+}
+
+// Opt in to the WinForms theme before the native scrollbars are created.
+internal sealed class VesperScrollPanel : Panel
+{
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            SetStyle(ControlStyles.ApplyThemingImplicitly, true);
+            return base.CreateParams;
+        }
     }
 }

@@ -6,6 +6,8 @@ namespace VESPER;
 // Keep native window-manager shadows without rendering a large bitmap or running an animation.
 internal class VesperPopupForm : Form
 {
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    internal VesperPalette? DialogPalette { get; set; }
     public VesperPopupForm() => DoubleBuffered = true;
 
     protected override CreateParams CreateParams
@@ -36,6 +38,7 @@ internal static class VesperDialogChrome
 
     public static Panel Attach(Form form, string title, VesperPalette palette, VesperIcon icon = VesperIcon.Info)
     {
+        if (form is VesperPopupForm popup) popup.DialogPalette = palette;
         form.SuspendLayout();
         form.FormBorderStyle = FormBorderStyle.None;
         form.ShowInTaskbar = false;
@@ -65,10 +68,12 @@ internal static class VesperDialogChrome
             content.Controls.Add(control);
         }
 
+        var captionFont = new Font("Segoe UI", 9F, FontStyle.Bold);
+        form.Disposed += (_, _) => captionFont.Dispose();
         var caption = new VesperSurfaceLabel
         {
             Text = title,
-            Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+            Font = captionFont,
             ForeColor = palette.Text,
             TextAlign = ContentAlignment.MiddleLeft,
             AutoSize = false

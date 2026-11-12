@@ -37,6 +37,7 @@ public sealed class EngineOptions
     public required string DataDirectory { get; init; }
     public string DefaultFolder { get; set; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+    public string? BrowserDownloadsFolder { get; init; }
 
     public int MaxConcurrentJobs { get; set; } = 3;
     public int MaxConnectionsPerJob { get; set; } = 4;
@@ -51,6 +52,7 @@ public sealed class EngineOptions
     public bool AllowPrivateNetworks { get; init; }
     public ProxyMode Proxy { get; init; } = ProxyMode.Direct;
     public string? ProxyAddress { get; init; }
+    public OriginCooldown Cooldown { get; } = new();
 
     public RetryOptions Retry { get; init; } = new();
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(20);
@@ -66,6 +68,8 @@ public sealed class EngineOptions
     public TimeSpan RampInterval { get; init; } = TimeSpan.FromSeconds(3);
     public long FreeSpaceReserve { get; init; } = 64L * 1024 * 1024;
     public TimeSpan ProgressInterval { get; init; } = TimeSpan.FromMilliseconds(200);
+
+    internal Action<string, string, string, MediaOutput, CancellationToken>? ConvertMedia { get; init; }
 
     /// <summary>
     /// Fault injection at durability boundaries. A callback may throw <see cref="FailpointCrash"/>

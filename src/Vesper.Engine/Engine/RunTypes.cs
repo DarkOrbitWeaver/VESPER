@@ -1,6 +1,6 @@
 namespace Vesper.Engine;
 
-internal enum StopIntent { None, Pause, Shutdown, Window }
+internal enum StopIntent { None, Pause, Shutdown, Window, BrowserFallback }
 
 /// <summary>How one run of a job ended. The engine turns it into the next durable state.</summary>
 internal readonly record struct RunOutcome(JobState State, string Reason, string Message, TimeSpan? RetryAfter = null)

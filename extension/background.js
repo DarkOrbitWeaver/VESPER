@@ -1,12 +1,15 @@
 // VESPER service worker. Event-driven only: it wakes for a message, a context-menu click, a download the
-// user opted to hand off, or a narrowly filtered media request. It never polls and holds no native connection.
+// user opted to hand off, a media request, or recovery of an unfinished handoff. It holds no native connection.
 'use strict';
+
+importScripts('player-source.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
 const MAX_SOURCES = 25;
 const DEFAULTS = {
   handoff: 'download',         // default = VESPER decides, download, queue
+  route: 'auto',
   intercept: true,             // enabled by default when the user explicitly installs the extension; can be disabled
   useSignIn: true              // Chrome still requires the user to grant cookie access
 };
@@ -55,25 +58,21 @@ function changePending(change) {
   return write;
 }
 
-async function submit(items, mode, { authorized = false, chromeDownloadId } = {}) {
-  const request = envelope('submit', { mode: mode || 'ask', items, authorized,
-    confirmTransfer: chromeDownloadId !== undefined });
+async function submit(items, mode, { authorized = false } = {}) {
+  const request = envelope('submit', { mode: mode || 'ask', items, authorized });
   await changePending(pending => {
     pending[request.id] = { request: { ...request, authorized: false, items: items.map(stripSecrets) },
-      at: Date.now(), chromeDownloadId };
+      at: Date.now() };
   });
-  return sendSubmission(request, chromeDownloadId);
+  return sendSubmission(request);
 }
 
-async function sendSubmission(request, chromeDownloadId) {
+async function sendSubmission(request) {
   const reply = await nativeRequest(request);
-  let chromePaused = false;
-  if (chromeDownloadId !== undefined && reply.ok && reply.results?.[0]?.transferReady === true)
-    chromePaused = await pauseChromeDownload(chromeDownloadId, request.items[0].url);
   if (reply.ok || reply.code === 'duplicate' || reply.code === 'cancelled') {
     await changePending(pending => { delete pending[request.id]; });
   }
-  return chromeDownloadId === undefined ? reply : { ...reply, chromePaused };
+  return reply;
 }
 
 const stripSecrets = (item) => { const { cookie, authorization, ...safe } = item; return safe; };   // secrets are never stored
@@ -82,8 +81,12 @@ async function retryPending(id) {
   const { pending = {} } = await chrome.storage.local.get('pending');
   const entry = pending[id];
   if (!entry) return { ok: false, code: 'gone', message: 'That request is no longer pending.' };
+  if (entry.chromeDownloadId !== undefined) {
+    await changePending(entries => { delete entries[id]; });
+    return moveChromeDownload(entry.chromeDownloadId, 'download');
+  }
   const enriched = await withSignIn(entry.request.items);
-  return sendSubmission({ ...entry.request, ...enriched }, entry.chromeDownloadId);
+  return sendSubmission({ ...entry.request, ...enriched });
 }
 
 async function updateBadge() {
@@ -115,6 +118,15 @@ async function withSignIn(items) {
 
 const SEGMENT = /\.(ts|m4s|aac|vtt|webvtt|cmfv|cmfa|key)(\?|$)/i;
 const DIRECT = /\.(mp4|webm|m4v|mov|mkv|mp3|m4a|flac|wav|ogg|opus)(\?|$)/i;
+const sourceWrites = new Map();
+const mediaLookups = new Map();
+const browserChoices = new Map();
+
+function inTabOrder(tabId, work) {
+  const write = (sourceWrites.get(tabId) || Promise.resolve()).catch(() => {}).then(work);
+  sourceWrites.set(tabId, write);
+  return write.finally(() => { if (sourceWrites.get(tabId) === write) sourceWrites.delete(tabId); });
+}
 
 async function tabState(tabId) {
   const key = `tab:${tabId}`;
@@ -131,39 +143,121 @@ async function saveTabState(tabId, state) {
   }
 }
 
-function sourceKey(url) {
-  try { const u = new URL(url); return u.origin + u.pathname; } catch { return url; }   // signed query strings change per request
+function mediaPage(message, sender) {
+  try {
+    const frame = new URL(sender.url || sender.tab?.url);
+    if (!['http:', 'https:'].includes(frame.protocol)) return null;
+    const live = message.pageUrl ? new URL(message.pageUrl) : frame;
+    const page = live.protocol === frame.protocol && live.origin === frame.origin ? live : frame;
+    page.hash = '';
+    return page;
+  } catch { return null; }
+}
+
+function isYouTubePage(page) {
+  return /(?:^|\.)(?:youtube\.com|youtube-nocookie\.com|youtu\.be)$/i.test(page.hostname);
 }
 
 async function addSource(tabId, source) {
-  if (tabId < 0 || !/^https?:/i.test(source.url) || SEGMENT.test(source.url)) return;
-  const state = await tabState(tabId);
-  const key = sourceKey(source.url);
-  if (state.sources.some((s) => sourceKey(s.url) === key)) return;
-  state.sources.push({ ...source, seen: Date.now() });
-  await saveTabState(tabId, state);
+  if (tabId < 0 || !source.documentId || !VesperPlayerSource.http(source.url) || SEGMENT.test(source.url)) return;
+  await inTabOrder(tabId, async () => {
+    const state = await tabState(tabId);
+    const seen = source.seen ?? Date.now();
+    const match = s => s.documentId === source.documentId && s.frameId === source.frameId && s.url === source.url;
+    const previous = state.sources.find(match);
+    state.sources = state.sources.filter(s => !match(s) && s.seen >= seen - 10 * 60_000);
+    state.sources.push({ ...previous, ...source, seen });
+    await saveTabState(tabId, state);
+  });
 }
 
 // Narrow listeners: only media requests, plus playlist-looking URLs. The worker sleeps otherwise.
 chrome.webRequest.onResponseStarted.addListener((details) => {
+  if (details.method !== 'GET' || ![200, 206].includes(details.statusCode)) return;
   const header = (name) => details.responseHeaders?.find((h) => h.name.toLowerCase() === name)?.value;
   const type = header('content-type') || '';
   const range = header('content-range');
   const bytes = range ? Number(range.split('/')[1]) : Number(header('content-length')) || null;
   const isPlaylist = /\.(m3u8|mpd)(\?|$)/i.test(details.url) || /mpegurl|dash\+xml/i.test(type);
-  if (!isPlaylist && !(details.type === 'media' || DIRECT.test(details.url))) return;
-  if (!isPlaylist && bytes !== null && bytes < 256 * 1024) return;              // ignore tiny clips and beacons
-  addSource(details.tabId, {
+  if (!isPlaylist && !(details.type === 'media' || DIRECT.test(details.url) || /^(?:audio|video)\//i.test(type))) return;
+  return addSource(details.tabId, {
     url: details.url,
-    kind: /\.mpd(\?|$)/i.test(details.url) ? 'dash' : isPlaylist ? 'hls' : 'direct',
-    mime: type.split(';')[0], bytes
-  });
+    kind: VesperPlayerSource.kind(details.url, type), mime: type.split(';')[0].trim().toLowerCase(), bytes,
+    complete: !isPlaylist && (details.statusCode === 200 || Number.isSafeInteger(bytes) && bytes > 0),
+    documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
+  }).catch(() => {});
 }, { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] }, ['responseHeaders']);
 
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.url) { chrome.storage.session.remove(`tab:${tabId}`); chrome.action.setBadgeText({ tabId, text: '' }); }   // new page, new sources
+  if (change.status === 'loading' && change.url) {
+    void inTabOrder(tabId, async () => {
+      await chrome.storage.session.remove(`tab:${tabId}`);
+      await chrome.action.setBadgeText({ tabId, text: '' });
+    }).catch(() => {});
+  }
 });
-chrome.tabs.onRemoved.addListener((tabId) => chrome.storage.session.remove(`tab:${tabId}`));
+chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, () => chrome.storage.session.remove(`tab:${tabId}`)).catch(() => {}));
+
+async function playerOptions(message, sender) {
+  const page = mediaPage(message, sender);
+  if (!page) return { ok: false, code: 'invalid', message: 'This page cannot be inspected.' };
+  const identity = VesperPlayerSource.identity(page.href);
+  const youTube = isYouTubePage(page);
+  const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
+  const source = binding && VesperPlayerSource.http(message.playerUrl);
+  const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
+  const { route } = await settings();
+  const frame = sender.frameId ?? 0;
+  const tab = sender.tab?.id;
+  const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route].join('|');
+  if (mediaLookups.has(lookupKey)) return mediaLookups.get(lookupKey);
+  const task = (async () => {
+    const state = await tabState(tab);
+    const observed = url => state.sources.find(s => sender.documentId && s.documentId === sender.documentId
+      && (s.frameId ?? 0) === frame && s.url === url.href && s.seen >= Math.max(Date.now() - 10 * 60_000, message.mediaChangedAt || 0));
+    const matching = source ? observed(source) : null;
+    const candidate = url => {
+      const evidence = observed(url);
+      return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
+    };
+    const matchedManifest = manifest && observed(manifest);
+    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null].filter(Boolean).map(candidate);
+    const complete = source && matching?.kind === 'direct' && matching.complete && /^(?:audio|video)\//.test(matching.mime)
+      && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
+    const title = binding || !youTube ? message.title : undefined;
+
+    if (route !== 'chrome') {
+      const reply = await nativeRequest(envelope('media-options', { url: page.href, pageTitle: title,
+        candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
+      if (reply.ok || !complete || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'unavailable', 'timeout'].includes(reply.code)) return reply;
+    }
+    if (!complete) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a complete file for this player.' };
+    const token = crypto.randomUUID();
+    const container = typeName(matching.mime);
+    if (browserChoices.size >= 32) browserChoices.delete(browserChoices.keys().next().value);
+    browserChoices.set(token, { url: source.href, identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
+    return { ok: true, data: { browserChoice: token, title, choices: [{ index: 0,
+      label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
+      detail: 'Saves with Chrome', container }] } };
+  })();
+  mediaLookups.set(lookupKey, task);
+  try { return await task; }
+  finally { mediaLookups.delete(lookupKey); }
+}
+
+async function selectBrowserFile(message, sender) {
+  const choice = browserChoices.get(message.browserChoice);
+  if (!choice || choice.expires <= Date.now() || choice.tab !== sender.tab?.id || choice.frame !== (sender.frameId ?? 0)
+    || !sender.documentId || choice.documentId !== sender.documentId
+    || choice.identity !== VesperPlayerSource.identity(mediaPage(message, sender)?.href))
+    return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
+  choice.started ??= chrome.downloads.download({ url: choice.url, saveAs: false, conflictAction: 'uniquify' });
+  try { await choice.started; return { ok: true }; }
+  catch {
+    choice.started = null;
+    return { ok: false, code: 'chrome-download-failed', message: 'Chrome could not start this download.' };
+  }
+}
 
 // ---------------------------------------------------------------- describing a source: honest quality choices
 
@@ -216,18 +310,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     switch (message.type) {
       case 'media-element': {
-        const tabId = sender.tab?.id ?? -1;
-        const state = await tabState(tabId);
-        state.title = message.title || state.title;
-        state.duration = message.duration || state.duration;
-        state.poster = message.poster || state.poster;
-        if (message.unsupported) state.unsupported = message.unsupported;
-        await saveTabState(tabId, state);
-        if (!message.unsupported && message.src && /^https?:/i.test(message.src)) {
-          const kind = /\.m3u8(?:[?#]|$)/i.test(message.src) ? 'hls'
-            : /\.mpd(?:[?#]|$)/i.test(message.src) ? 'dash' : 'direct';
-          await addSource(tabId, { url: message.src, kind, mime: '', bytes: null });
-        }
+        // Older open tabs may still send these. Only observed responses belong in the network cache.
         return { ok: true };
       }
       case 'tab-state': {
@@ -238,19 +321,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'hello': return nativeRequest(envelope('hello'), 20000);
       case 'chrome-downloads': return listChromeDownloads();
       case 'move-download': return moveChromeDownload(message.downloadId, 'download');
-      case 'media-options': {
-        // Use the actual sender's frame. Prefer its player over unrelated requests in the tab.
-        const page = sender.url || sender.tab?.url;
-        if (!/^https?:\/\//i.test(page || ''))
-          return { ok: false, code: 'invalid', message: 'This page cannot be inspected.' };
-        const player = /^https?:\/\//i.test(message.playerUrl || '') ? message.playerUrl : null;
-        const state = await tabState(sender.tab?.id);
-        const candidates = player
-          ? [{ url: player, kind: /\.m3u8(?:[?#]|$)/i.test(player) ? 'hls'
-            : /\.mpd(?:[?#]|$)/i.test(player) ? 'dash' : 'direct' }]
-          : state.sources.slice(0, 25).map(s => ({ url: s.url, kind: s.kind, mimeType: s.mime || undefined }));
-        return nativeRequest(envelope('media-options', { url: page, pageTitle: message.title, candidates }), 60000);
-      }
+      case 'media-options': return playerOptions(message, sender);
+      case 'browser-media-select': return selectBrowserFile(message, sender);
       case 'media-select': {
         const { mediaSession, formatChoice, mode } = message;
         if (!/^[a-f0-9]{32}$/i.test(mediaSession || '') || !Number.isInteger(formatChoice) || formatChoice < 0 ||
@@ -270,9 +342,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // validates and probes each supplied media hint before it can be selected.
         return nativeRequest(envelope('media-picker', {
           url: pageUrl, pageTitle: message.title || state.title || '',
-          candidates: state.sources.slice(0, 25).map(s => ({
-            url: s.url, kind: s.kind, mimeType: s.mime || undefined
-          }))
+          candidates: []
         }));
       }
       case 'describe': return describe(message.url, message.duration);
@@ -297,9 +367,10 @@ chrome.runtime.onInstalled.addListener(async () => {
   chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
   chrome.contextMenus.create({ id: 'vesper-active-downloads', title: 'Move an active Chrome download…', contexts: ['action'] });
   await updateBadge();
+  await recoverChromeDownloads();
 });
 
-chrome.runtime.onStartup.addListener(updateBadge);
+chrome.runtime.onStartup.addListener(async () => { await updateBadge(); await recoverChromeDownloads(); });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'vesper-active-downloads') {
@@ -309,6 +380,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = info.menuItemId === 'vesper-link' ? info.linkUrl : info.srcUrl;
   if (!url || !/^https?:/i.test(url)) return;      // blob: and data: URLs cannot be fetched by another program
   const prefs = await settings();
+  if (prefs.route === 'chrome') {
+    if (info.menuItemId !== 'vesper-link' && VesperPlayerSource.kind(url) !== 'direct') return;
+    try {
+      await chrome.downloads.download({ url, saveAs: false, conflictAction: 'uniquify' });
+      flash(tab?.id, { ok: true });
+    } catch { flash(tab?.id, { ok: false }); }
+    return;
+  }
   const { items, authorized } = await withSignIn([{ url, referer: tab?.url, userAgent: navigator.userAgent }]);
   const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
   flash(tab?.id, reply);
@@ -321,71 +400,6 @@ function flash(tabId, reply) {
   setTimeout(() => chrome.action.setBadgeText({ tabId, text: '' }), 2500);
 }
 
-// ---------------------------------------------------------------- opt-in takeover of ordinary downloads
+// ---------------------------------------------------------------- Chrome downloads
 
-const browserTransfers = new Map();
-const browserUrl = item => item.finalUrl || item.url;
-const canMove = item => item?.state === 'in_progress' && item.danger === 'safe'
-  && !item.incognito && /^https?:\/\//i.test(browserUrl(item) || '');
-
-function browserName(item) {
-  const name = item.filename?.split(/[\\/]/).pop();
-  if (name && !/\.crdownload$/i.test(name)) return name;
-  try { return new URL(browserUrl(item)).pathname.split('/').pop() || ''; }
-  catch { return ''; }
-}
-
-async function listChromeDownloads() {
-  const downloads = await chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 });
-  return { ok: true, downloads: downloads.filter(canMove).slice(0, 8).map(item => ({
-    id: item.id, name: browserName(item) || 'Download', paused: item.paused
-  })) };
-}
-
-async function pauseChromeDownload(id, url) {
-  try {
-    const [item] = await chrome.downloads.search({ id });
-    if (!canMove(item) || browserUrl(item) !== url) return false;
-    if (!item.paused) await chrome.downloads.pause(id);
-    const [current] = await chrome.downloads.search({ id });
-    return current?.state === 'in_progress' && current.paused;
-  } catch { return false; }
-}
-
-async function moveChromeDownload(id, mode) {
-  if (!Number.isInteger(id)) return { ok: false, code: 'invalid', message: 'Choose a Chrome download.' };
-  if (browserTransfers.has(id)) return browserTransfers.get(id);
-  const move = (async () => {
-    const [item] = await chrome.downloads.search({ id });
-    if (!canMove(item)) return { ok: false, code: 'gone', message: 'This Chrome download is no longer available to move.' };
-    const { pending = {} } = await chrome.storage.local.get('pending');
-    const unconfirmed = Object.entries(pending).find(([, entry]) => entry.chromeDownloadId === id);
-    if (unconfirmed) return retryPending(unconfirmed[0]);
-    const { items, authorized } = await withSignIn([{
-      url: browserUrl(item), fileName: browserName(item) || undefined,
-      referer: item.referrer || undefined, userAgent: navigator.userAgent
-    }]);
-    return submit(items, mode, { authorized, chromeDownloadId: id });
-  })();
-  browserTransfers.set(id, move);
-  try { return await move; }
-  finally { browserTransfers.delete(id); }
-}
-
-async function captureChromeDownload(item) {
-  if (!canMove(item)) return;
-  try {
-    const prefs = await settings();
-    if (!prefs.intercept) return;
-    await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff);
-  } catch { /* Leave the Chrome download alone if handoff is unavailable. */ }
-}
-
-chrome.downloads.onCreated.addListener(captureChromeDownload);
-chrome.downloads.onChanged.addListener(async change => {
-  if (change.danger?.current !== 'safe' || change.danger.previous === 'safe') return;
-  try {
-    const [item] = await chrome.downloads.search({ id: change.id });
-    await captureChromeDownload(item);
-  } catch { /* Chrome still owns this transfer. */ }
-});
+importScripts('browser-downloads.js');

@@ -10,7 +10,9 @@ public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType)
 
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
     IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
-    Guid? MediaSession = null, int? FormatChoice = null);
+    Guid? MediaSession = null, int? FormatChoice = null, BrowserTransferProof? BrowserProof = null,
+    string? TransferId = null, string? Operation = null, BrowserCompletedFile? CompletedFile = null,
+    BrowserActivity? Activity = null);
 
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null);
 
@@ -93,11 +95,12 @@ public static class BridgeProtocol
             { error = "Unsupported protocol version."; return false; }
 
             string id = Str(root, "id") ?? "";
-            if (id.Length is < 8 or > 64 || !id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+            if (!IsRequestId(id))
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "probe" or "submit" or "media-picker" or "media-options" or "media-select"))
+            if (type is not ("hello" or "probe" or "submit" or "media-picker" or "media-options" or "media-select"
+                or "browser-submit" or "browser-transfer" or "browser-completed" or "browser-activity"))
             { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
@@ -108,6 +111,10 @@ public static class BridgeProtocol
             string? probeUrl = null;
             Guid? mediaSession = null;
             int? formatChoice = null;
+            BrowserTransferProof? browserProof = null;
+            BrowserCompletedFile? completedFile = null;
+            BrowserActivity? activity = null;
+            string? transferId = null, operation = null;
             if (type is "probe" or "media-picker" or "media-options")
             {
                 probeUrl = Str(root, "url");
@@ -140,7 +147,7 @@ public static class BridgeProtocol
                 mediaSession = session;
                 formatChoice = index;
             }
-            else if (type == "submit")
+            else if (type is "submit" or "browser-submit")
             {
                 if (!root.TryGetProperty("items", out JsonElement array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() is 0 or > MaxItems)
                 { error = $"Provide between 1 and {MaxItems} items."; return false; }
@@ -151,12 +158,46 @@ public static class BridgeProtocol
                     if (!TryItem(element, authorized, out BridgeItem? item, out error)) return false;
                     items.Add(item!);
                 }
+                if (type == "browser-submit")
+                {
+                    if (items is not [{ Kind: "http" }] || !root.TryGetProperty("browserProof", out JsonElement proof)
+                        || proof.ValueKind != JsonValueKind.Object
+                        || !TryLength(proof, "length", out long? length))
+                    { error = "Invalid browser download proof."; return false; }
+                    browserProof = new BrowserTransferProof(length, Str(proof, "etag"), Str(proof, "contentType"));
+                    if (!browserProof.IsValid)
+                    { error = "Invalid browser download proof."; return false; }
+                }
             }
-            bool confirmTransfer = type == "submit" && items.Count == 1
+            else if (type == "browser-transfer")
+            {
+                transferId = Str(root, "transferId");
+                operation = Str(root, "operation");
+                if (!IsRequestId(transferId) || operation is not ("accept" or "abandon" or "status" or "watch"))
+                { error = "Invalid browser transfer."; return false; }
+            }
+            else if (type == "browser-completed")
+            {
+                string? path = Str(root, "path"), origin = Str(root, "origin");
+                transferId = Str(root, "transferId");
+                if (path is not { Length: > 0 and <= 4096 } || path.Any(char.IsControl)
+                    || !TryLength(root, "length", out long? length) || length is null
+                    || (transferId is not null && !IsRequestId(transferId))
+                    || (origin is not null && (origin.Length > 512 || !UrlPolicy.TryParse(origin, out _, out _))))
+                { error = "Invalid completed browser download."; return false; }
+                completedFile = new BrowserCompletedFile(path, length.Value, origin);
+            }
+            else if (type == "browser-activity")
+            {
+                operation = Str(root, "operation");
+                if (operation is not ("connect" or "watch") || !TryBrowserActivity(root, out activity))
+                { error = "Invalid Chrome download activity."; return false; }
+            }
+            bool confirmTransfer = type == "browser-submit" || type == "submit" && items.Count == 1
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
             string? pageTitle = type is ("media-picker" or "media-options") && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
-                confirmTransfer, mediaSession, formatChoice);
+                confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, completedFile, activity);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
@@ -190,8 +231,46 @@ public static class BridgeProtocol
         return true;
     }
 
+    private static bool TryBrowserActivity(JsonElement root, out BrowserActivity? activity)
+    {
+        activity = null;
+        string? profile = Str(root, "profile");
+        if (profile is not { Length: >= 8 and <= 36 } || profile.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-')
+            || !root.TryGetProperty("files", out var array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() > 32)
+            return false;
+        var files = new List<BrowserActiveFile>();
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in array.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object) return false;
+            string? id = Str(entry, "id"), name = Str(entry, "name");
+            if (!IsRequestId(id) || !id!.StartsWith("c-" + profile + "-", StringComparison.Ordinal) || !ids.Add(id)
+                || name is not { Length: > 0 and <= 255 } || name.Any(char.IsControl) || name.IndexOfAny(['/', '\\', ':']) >= 0
+                || !TryLength(entry, "received", out var received) || received is null
+                || !TryLength(entry, "length", out var length)
+                || !TryLength(entry, "start", out var start) || start is not (>= 946684800000L and <= 253402300799999L)) return false;
+            bool paused = entry.TryGetProperty("paused", out var pause) && pause.ValueKind == JsonValueKind.True;
+            bool canResume = entry.TryGetProperty("canResume", out var resume) && resume.ValueKind == JsonValueKind.True;
+            files.Add(new(id, name, received.Value, length, DateTimeOffset.FromUnixTimeMilliseconds(start.Value).UtcDateTime, paused, canResume));
+        }
+        activity = new(profile, files);
+        return true;
+    }
+
     private static string? Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out JsonElement p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;
+
+    internal static bool IsRequestId(string? id) =>
+        id is { Length: >= 8 and <= 64 } && id.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
+
+    private static bool TryLength(JsonElement element, string name, out long? length)
+    {
+        length = null;
+        if (!element.TryGetProperty(name, out JsonElement value)) return true;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out long bytes) || bytes < 0) return false;
+        length = bytes;
+        return true;
+    }
 
     /// <summary>A header value: bounded, and never containing line breaks (header injection).</summary>
     private static string? Header(JsonElement e, string name, int max)
