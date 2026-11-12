@@ -4,6 +4,7 @@
     <Project Path="src/Vesper.Engine/Vesper.Engine.csproj" />
     <Project Path="src/Vesper.MediaResolver/Vesper.MediaResolver.csproj" />
     <Project Path="src/Vesper.NativeHost/Vesper.NativeHost.csproj" />
+    <Project Path="src/Vesper.Setup/Vesper.Setup.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Vesper.LiveCheck/Vesper.LiveCheck.csproj" />
@@ -11,5 +12,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/Vesper.Tests/Vesper.Tests.csproj" />
     <Project Path="tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj" />
+    <Project Path="tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj" />
   </Folder>
 </Solution>

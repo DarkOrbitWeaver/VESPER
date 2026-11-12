@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>..\..\Assets\VESPER-Illustrated.ico</ApplicationIcon>
+    <AssemblyName>VESPER-Setup</AssemblyName>
+    <RootNamespace>Vesper.Setup</RootNamespace>
+    <Product>VESPER Setup</Product>
+    <Company>DarkOrbitWeaver</Company>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DefineConstants>$(DefineConstants);VESPER_SETUP</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Vesper.Setup.Tests" />
+    <Compile Include="..\..\VesperTheme.cs;..\..\VesperVisuals.cs;..\..\VesperPanel.cs;..\..\VesperMenuTheme.cs;..\..\VesperWindowChrome.cs;..\..\NativeHostRegistration.cs" Link="%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Art\**\*.png" />
+    <EmbeddedResource Include="..\..\extension\icons\vesper-companion-atlas.png" LogicalName="Vesper.Setup.Art.atlas.png" />
+    <EmbeddedResource Include="..\..\Assets\VESPER-Illustrated.ico" LogicalName="Vesper.Setup.App.ico" />
+    <EmbeddedResource Include="$(SetupPayload)" LogicalName="Vesper.Setup.Payload.zip" Condition="'$(SetupPayload)' != ''" />
+    <EmbeddedResource Include="$(SetupManifest)" LogicalName="Vesper.Setup.Payload.json" Condition="'$(SetupManifest)' != ''" />
+  </ItemGroup>
+</Project>
