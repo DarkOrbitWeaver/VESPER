@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\OriginAwareProxy.cs" Link="Http\OriginAwareProxy.cs" />
     <!-- The only third-party dependency: SQLite (MIT) for transactional job state. -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
   </ItemGroup>

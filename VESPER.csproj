@@ -29,6 +29,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="Vesper.Windows.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Content Include="Assets\VESPER-Illustrated.ico;Assets\Botanical\butterfly.png;Assets\Botanical\empty-hero.png;Assets\Botanical\header.png;Assets\Botanical\sprig.png;Assets\Botanical\hills-left.png;Assets\Botanical\hills.png" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="src\Vesper.Engine\Vesper.Engine.csproj" />
     <ProjectReference Include="src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />

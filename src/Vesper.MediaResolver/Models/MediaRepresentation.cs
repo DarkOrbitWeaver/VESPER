@@ -53,6 +53,7 @@ public sealed record MediaRepresentation
     public string? AudioTrackId { get; init; }
     public bool IsDefaultAudio { get; init; }
     public bool IsAudioDescription { get; init; }
+    public bool IsDrc { get; init; }
 
     /// <summary>For HLS video-only variants: the AUDIO group whose renditions pair with this variant.</summary>
     public string? AudioGroupId { get; init; }

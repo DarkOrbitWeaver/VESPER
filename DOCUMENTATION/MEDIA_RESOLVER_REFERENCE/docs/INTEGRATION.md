@@ -1,4 +1,6 @@
-# Integration guide (for the developer wiring this into VESPER)
+# Integration guide (historical resolver boundary)
+
+This guide records the initial resolver integration contract. Its API examples may predate the current main branch; see [current release status](../../RELEASE.md) and [current media limits](../../../MEDIA_ENGINE_LIMITATIONS.md).
 
 ## Ownership boundary
 
@@ -64,8 +66,7 @@ Pass `CollectionIntent.CollectionOnly` (or use `CollectionPager`) to list the co
   Cookie/Authorization are only for `CredentialHosts` (exact or subdomain). Do not log it with `ToString()` surprises: it is redacted, but do not dump fields.
 * `ExpectedSize`: real (`Content-Length`/API) or `null`. Estimates only exist on representation level and are flagged `FileSizeIsEstimate`.
 * `plan.ExpiresAt` / per-rep `ExpiresAt`: signed URLs. If the transfer starts after expiry, call the resolver again; do not retry a dead URL.
-* `plan.Requirements`: `MuxAudioVideo` / `ExtractAudio` mean a **user-installed** muxer (e.g. ffmpeg) is required to finish the file;
-  the library neither bundles nor launches one. `plan.RequiresExternalHelper` is the quick flag. `plan.HasAudio == false` means the source offers no audio for that video.
+* `plan.Requirements`: `MuxAudioVideo` / `ExtractAudio` mark post-transfer work. Standalone resolver consumers must provide it; the integrated VESPER engine handles compatible clear HTTP merges. `plan.RequiresExternalHelper` describes the resolver library boundary, not every app capability. `plan.HasAudio == false` means the source offers no audio for that video.
 * `SuggestedFileName` is sanitised (no separators, reserved names, bidi tricks); still resolve it inside the user's download folder yourself.
 
 ## Errors

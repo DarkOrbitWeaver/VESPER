@@ -107,6 +107,20 @@ public sealed class DownloadGrid : ScrollableControl
         LoadVisiblePosters();
     }
 
+    internal bool Reveal(Guid id)
+    {
+        int index = -1;
+        for (int i = 0; i < _items.Count; i++)
+            if (_items[i].Id == id) { index = i; break; }
+        if (index < 0) return false;
+
+        _focusRow = index;
+        AutoScrollPosition = new Point(0, index * _rowHeight);
+        Focus();
+        Invalidate();
+        return true;
+    }
+
     public void PruneChecks(IEnumerable<Guid> allowed)
     {
         _checked.IntersectWith(allowed);

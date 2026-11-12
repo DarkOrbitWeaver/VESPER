@@ -720,6 +720,15 @@ public partial class Form1 : Form
         // The dialog only passes a folder when it differs from the default, so category subfolders still apply.
         string? folder = string.Equals(dialog.Destination, _prefs.DefaultFolder, StringComparison.OrdinalIgnoreCase) ? null : dialog.Destination;
         var problems = new List<string>();
+        Guid? duplicateToShow = null;
+        void Record(AddResult result, string url)
+        {
+            if (result.Status == AddStatus.Duplicate)
+                duplicateToShow ??= result.JobId;
+            else if (!result.Ok)
+                problems.Add($"{UrlPolicy.Redact(url)}\n   {result.Message}");
+        }
+
         foreach (MediaDownloadChoice media in dialog.MediaJobs)
         {
             AddResult result = _engine.Add(new AddRequest(media.Url, folder, media.FileName,
@@ -728,16 +737,41 @@ public partial class Form1 : Form
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
                 MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId, Output: media.Output));
-            if (!result.Ok) problems.Add($"{UrlPolicy.Redact(media.Url)}\n   {result.Message}");
+            Record(result, media.Url);
         }
         foreach (string url in dialog.DownloadUrls)
         {
             bool hls = Uri.TryCreate(url, UriKind.Absolute, out Uri? uri) && uri.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
             AddResult result = _engine.Add(new AddRequest(url, folder, StartNow: !dialog.QueueOnly, Kind: hls ? JobKind.Hls : JobKind.Http));
-            if (!result.Ok) problems.Add($"{UrlPolicy.Redact(url)}\n   {result.Message}");
+            Record(result, url);
+        }
+        if (duplicateToShow is Guid duplicateId && _engine.Snapshot(duplicateId) is { } existing)
+        {
+            string nextStep = existing.State switch
+            {
+                JobState.Failed => "Use Resume or Start over from its row.",
+                JobState.NeedsLink => "Use Replace link from its row.",
+                JobState.NeedsAttention => "Open Details from its row to see the recovery actions.",
+                JobState.Suspect => "Open Details from its row to inspect the file before choosing Rescue.",
+                _ => "Review or manage it from its row."
+            };
+            DialogResult show = VesperMessageBox.Show(this,
+                $"{existing.FileName} is already in your list. {nextStep}\n\nShow the existing row now?",
+                "Download already exists", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            if (show == DialogResult.Yes) RevealDownload(existing);
         }
         if (problems.Count > 0)
             VesperMessageBox.Show(this, "Some links were not added:\n\n" + string.Join("\n\n", problems), "Add download", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void RevealDownload(JobSnapshot snapshot)
+    {
+        if (_items.TryGetValue(snapshot.Id, out DownloadItem? item)) item.UpdateFrom(snapshot);
+        else _items[snapshot.Id] = item = DownloadItem.From(snapshot);
+        _search.Clear();
+        _filter.SelectedIndex = 0;
+        RefreshList();
+        _grid.Reveal(item.Id);
     }
 
     private void OpenSettings()

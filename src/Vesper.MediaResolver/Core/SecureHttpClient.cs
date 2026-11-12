@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Text;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Security;
+using Vesper.Shared;
 
 namespace Vesper.MediaResolver.Core;
 
@@ -39,6 +40,7 @@ public sealed class SecureHttpClient : IDisposable
     private readonly ResolverOptions _o;
     private readonly HttpClient _client;
     private readonly SemaphoreSlim _gate;
+    private readonly OriginAwareProxy? _originAwareProxy;
     private readonly bool _validateProxyDns;
     private int _requests;
 
@@ -49,14 +51,20 @@ public sealed class SecureHttpClient : IDisposable
         _o = options;
         _validateProxyDns = handlerOverride is null && (options.UseSystemProxy || options.ProxyAddress is not null) && !options.AllowPrivateNetworks;
         _gate = new SemaphoreSlim(Math.Max(1, options.MaxConcurrentRequests));
-        _client = new HttpClient(handlerOverride ?? CreateHandler(options), disposeHandler: true)
+        OriginAwareProxy? originAwareProxy = null;
+        HttpMessageHandler handler = handlerOverride ?? CreateHandler(options, out originAwareProxy);
+        _originAwareProxy = originAwareProxy;
+        _client = new HttpClient(handler, disposeHandler: true)
         {
             Timeout = Timeout.InfiniteTimeSpan // per-request timeouts are applied through linked tokens
         };
     }
 
-    private static SocketsHttpHandler CreateHandler(ResolverOptions o)
+    private static SocketsHttpHandler CreateHandler(ResolverOptions o, out OriginAwareProxy? originAwareProxy)
     {
+        bool useProxy = o.UseSystemProxy || o.ProxyAddress is not null;
+        IWebProxy? proxy = o.ProxyAddress is { } address ? new WebProxy(address) : useProxy ? HttpClient.DefaultProxy : null;
+        originAwareProxy = useProxy ? new OriginAwareProxy(proxy!) : null;
         var h = new SocketsHttpHandler
         {
             AllowAutoRedirect = false,
@@ -66,8 +74,8 @@ public sealed class SecureHttpClient : IDisposable
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(20),
             MaxConnectionsPerServer = 8,
             ConnectTimeout = TimeSpan.FromSeconds(10),
-            UseProxy = o.UseSystemProxy || o.ProxyAddress is not null,
-            Proxy = o.ProxyAddress is { } proxy ? new WebProxy(proxy) : null
+            UseProxy = useProxy,
+            Proxy = originAwareProxy
         };
         if (!h.UseProxy && !o.AllowPrivateNetworks)
             h.ConnectCallback = ConnectFilteredAsync;
@@ -246,8 +254,18 @@ public sealed class SecureHttpClient : IDisposable
                     throw new MediaResolverException(MediaErrors.Network("Redirect loop detected", retry: false));
                 if (_o.OriginRetryAt?.Invoke(url) is { } deferred && deferred > _o.TimeProvider.GetUtcNow())
                     throw new MediaResolverException(MediaErrors.RateLimited("This origin is cooling down") with { RetryAt = deferred });
+                IPAddress? proxyAddress = null;
                 if (_validateProxyDns)
-                    await ValidateProxyDestinationAsync(url, cts.Token).ConfigureAwait(false);
+                {
+                    try
+                    {
+                        proxyAddress = await ValidateProxyDestinationAsync(url, cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        throw new MediaResolverException(MediaErrors.Network("Timed out verifying the proxy destination in DNS"));
+                    }
+                }
 
                 using var req = new HttpRequestMessage(method, url);
                 req.Headers.TryAddWithoutValidation("User-Agent", ctx.UserAgent ?? _o.UserAgent);
@@ -257,6 +275,8 @@ public sealed class SecureHttpClient : IDisposable
                     req.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
                 }
                 configure?.Invoke(req);
+                if (proxyAddress is not null)
+                    _originAwareProxy!.PinRequest(req, url, proxyAddress);
 
                 Interlocked.Increment(ref _requests);
                 DiscoveryTrace.Current.Value?.RequestStarted();
@@ -277,6 +297,7 @@ public sealed class SecureHttpClient : IDisposable
                         if (inner is MediaResolverException mre) throw mre;
                     throw new MediaResolverException(MediaErrors.Network($"{ex.GetType().Name} contacting {UrlRedactor.Redact(url)}"));
                 }
+                if (proxyAddress is not null) req.RequestUri = url;
 
                 var status = resp.StatusCode;
                 if (status == HttpStatusCode.TooManyRequests || status == HttpStatusCode.ServiceUnavailable && resp.Headers.RetryAfter is not null)
@@ -314,18 +335,26 @@ public sealed class SecureHttpClient : IDisposable
         }
     }
 
-    private static async Task ValidateProxyDestinationAsync(Uri uri, CancellationToken ct)
+    private async Task<IPAddress> ValidateProxyDestinationAsync(Uri uri, CancellationToken ct)
     {
+        IPAddress[] addresses;
         try
         {
-            var addresses = await Dns.GetHostAddressesAsync(uri.IdnHost, ct).ConfigureAwait(false);
-            if (addresses.Length == 0 || addresses.Any(address => !IpAddressClassifier.IsPublic(address)))
-                throw new MediaResolverException(MediaErrors.Blocked("The proxy destination must resolve to public addresses."));
+            addresses = IPAddress.TryParse(uri.IdnHost, out IPAddress? literal)
+                ? [literal]
+                : _o.ResolveHost is { } resolveHost
+                    ? await resolveHost(uri.IdnHost, ct).ConfigureAwait(false)
+                    : await Dns.GetHostAddressesAsync(uri.IdnHost, ct).ConfigureAwait(false);
         }
         catch (SocketException)
         {
             throw new MediaResolverException(MediaErrors.Network("Could not verify the proxy destination in DNS."));
         }
+
+        if (addresses.Length == 0 || addresses.Any(address => !IpAddressClassifier.IsPublic(address)))
+            throw new MediaResolverException(MediaErrors.Blocked("The proxy destination must resolve to public addresses."));
+
+        return addresses.FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork) ?? addresses[0];
     }
 
     private async Task<string> ReadLimitedAsync(HttpResponseMessage resp, int maxBytes, CancellationToken ct)

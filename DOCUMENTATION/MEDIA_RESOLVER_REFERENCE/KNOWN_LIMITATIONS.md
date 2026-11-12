@@ -1,14 +1,16 @@
 # Known limitations
 
+> Historical standalone-resolver snapshot. The limits below describe that library contract, not every capability in the integrated Windows app. See [current media limits](../../MEDIA_ENGINE_LIMITATIONS.md).
+
 ## Verification state
-* The code has never been compiled or executed. Expect compile errors and test failures on first build. `CHECKPOINT.md` lists the riskiest spots.
+* At this snapshot, the code had not been compiled or executed. `CHECKPOINT.md` records the original first-build concerns.
 * All benchmark numbers must be produced by the harness on your machine. None are included, and no speed/memory claim vs yt-dlp is made.
 * Site adapters are written from documented/commonly observed response shapes and have not been checked live. They will drift; each reports `SourceChanged` when its expected structure vanishes.
 
 ## By design (not bugs)
 * **No JavaScript execution.** YouTube formats that need signature/`n` solving are omitted and reported; throttled-URL warning is surfaced. Browser-assisted discovery is the supported path for them.
 * **No DRM, no account/anti-bot circumvention.** Widevine/PlayReady/FairPlay/CENC/SAMPLE-AES -> typed failure. Sign-in/bot checks -> `LoginRequired` / `BrowserContextRequired`.
-* **No muxing/transcoding.** The resolver reports `MuxAudioVideo` / `ExtractAudio`; a user-installed tool is required to finish such files.
+* **No muxing/transcoding in the resolver library.** It reports `MuxAudioVideo` / `ExtractAudio`; the integrated VESPER engine handles compatible remux jobs.
 * **Live streams** (`#EXT-X-ENDLIST` missing, DASH `type="dynamic"`, `isLive`) are rejected, not recorded.
 * **Multi-period DASH** is rejected (periods may carry different init segments).
 * Credentials from the browser are never forwarded to hosts outside the page host and its subdomains, so cookie-gated CDNs on other domains need a different mechanism.

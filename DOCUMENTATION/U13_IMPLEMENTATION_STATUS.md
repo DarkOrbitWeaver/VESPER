@@ -1,4 +1,6 @@
-# VESPER U13 — Media UX and browser repair
+# VESPER U13 — Media UX and browser repair (historical notes)
+
+This records the U13 source snapshot from 2026-11-11. Later changes on `main` supersede its current-state and verification statements. See [current release status](RELEASE.md) and [current media limits](../MEDIA_ENGINE_LIMITATIONS.md).
 
 This update modifies **the uploaded VESPER-source-20261111-005352.zip**, not the older U12 archive.
 
@@ -7,19 +9,19 @@ This update modifies **the uploaded VESPER-source-20261111-005352.zip**, not the
 - Added an opt-in, bounded, HTTPS-only thumbnail fetch method through the resolver's existing redirect, IP and timeout safeguards. Only JPEG/PNG/GIF up to 768KB are considered; image dimensions are bounded. Missing artwork shows the normal video glyph.
 - Preserved original webpage, provider, media ID, selected quality, thumbnail reference, and known source expiry through `AddRequest` → durable `DownloadJob` → SQLite migration version 2 → `JobSnapshot` and Download Details. “View original” is a Details action, not a crowded row context menu.
 - Mixed direct files and media pages are accepted in one pasted batch; `.mpd` manifests are routed to media discovery; the batch limit is explicit (200 links) instead of silently truncating to 25. Per-item errors are reported before partial acceptance.
-- Browser Settings no longer exposes normal-use Connect/Disconnect buttons or calls a registry entry a live browser connection. Installed releases register the native helper on startup if repair is needed; `Install.ps1` already registers it as part of installation. Repair is a low-prominence option. Extension approval is still controlled by the browser and user.
+- Browser Settings no longer exposes normal-use Connect/Disconnect buttons or calls a registry entry a live browser connection. First Flight registers the native helper during installation. Repair is a low-prominence option. Extension approval is still controlled by the browser and user.
 - The Chrome extension defaults to handling selected ordinary file types after the user installs/enables it. It can be disabled in the extension. Chrome's own file is canceled only after VESPER confirms acceptance of that file. Friendly error copy now points to repair rather than a removed Connect button.
 - Release and Run-Tests scripts invoke the media resolver test project in addition to engine and browser logic tests.
 - Added a provenance persistence regression test and bridge protocol tests for browser-assisted discovery hints.
 
-## IMPORTANT: Not claimed as complete
+## U13-era limitations
 - YouTube and other frequently changing commercial sites still have *unverified live* extractors. This release cannot promise it downloads the submitted YouTube Mix.
-- The existing transfer engine still does not implement generic DASH/fMP4 assembly or safe video+audio muxing. The picker deliberately refuses to queue an output it cannot finish. No yt-dlp, Python, ffmpeg, external browser or custom DRM bypass was bundled.
+- At this snapshot, the transfer engine did not implement safe video+audio muxing or generic DASH/fMP4 assembly. Later main revisions added native remuxing for compatible clear HTTP tracks; see the current media limits for its boundaries. No yt-dlp, Python, ffmpeg, external browser or custom DRM bypass was bundled.
 - Automatic refresh of expired signed media URLs (including signed URL identity revalidation for partially completed jobs) is **not implemented**. The original page and expiry are stored; the user can see the origin in Details. Do not claim automatic refresh/recovery without identity-proof integration.
 - The extension now exposes **Find formats in VESPER**, which opens the same native resolver/picker as pasted links and passes bounded browser-discovered media hints. The original butterfly quick-quality path still exists as a separate shortcut; full behavioral parity, sign-in scenarios and installed-browser integration need Windows/browser testing.
 - The existing PowerShell release package still expects users to load the unpacked developer extension until a published browser store listing exists.
 
-## Windows verification required
+## Verification gap at the U13 snapshot
 
 Run from the extracted solution root:
 

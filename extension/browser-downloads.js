@@ -3,10 +3,13 @@
 const RECOVERY_ALARM = 'vesper-chrome-downloads';
 const MAX_BROWSER_RECORDS = 128;
 const RESPONSE_LIFETIME = 60_000;
+const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
 const responses = new Map();
 const awaitingResponses = new Map();
 const browserOperations = new Map();
 let recordWrites = Promise.resolve();
+let captureWrites = Promise.resolve();
+let captureRecovery;
 let profileIdPromise;
 let activityPort, openingActivity = false;
 
@@ -20,8 +23,43 @@ const mimeType = value => {
   return mime && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mime) && mime.length <= 100 ? mime : undefined;
 };
 
+const captureStateReady = chrome.storage.session.get(CAPTURE_STATE_KEY).then(({ [CAPTURE_STATE_KEY]: saved }) => {
+  const now = Date.now();
+  for (const [url, response] of Array.isArray(saved?.responses) ? saved.responses : [])
+    if (typeof url === 'string' && /^https?:\/\//i.test(url) && Number.isFinite(response?.seen)
+        && now >= response.seen && now - response.seen <= RESPONSE_LIFETIME && typeof response.replay === 'boolean')
+      responses.set(url, response);
+  for (const [id, waiting] of Array.isArray(saved?.awaiting) ? saved.awaiting : [])
+    if (Number.isSafeInteger(id) && Number.isSafeInteger(waiting?.id) && waiting.id === id
+        && typeof waiting.startTime === 'string' && typeof waiting.url === 'string'
+        && /^https?:\/\//i.test(waiting.url) && Number.isFinite(waiting.seen)
+        && now >= waiting.seen && now - waiting.seen <= RESPONSE_LIFETIME)
+      awaitingResponses.set(id, waiting);
+}).catch(() => {});
+
+function saveCaptureState() {
+  const now = Date.now();
+  for (const [url, response] of responses)
+    if (now < response.seen || now - response.seen > RESPONSE_LIFETIME) responses.delete(url);
+  for (const [id, waiting] of awaitingResponses)
+    if (now < waiting.seen || now - waiting.seen > RESPONSE_LIFETIME) awaitingResponses.delete(id);
+  while (responses.size > MAX_BROWSER_RECORDS) responses.delete(responses.keys().next().value);
+  while (awaitingResponses.size > MAX_BROWSER_RECORDS) awaitingResponses.delete(awaitingResponses.keys().next().value);
+  const state = { responses: [...responses], awaiting: [...awaitingResponses] };
+  const write = captureWrites.then(() => chrome.storage.session.set({ [CAPTURE_STATE_KEY]: state }));
+  captureWrites = write.catch(() => {});
+  return write;
+}
+
+function rememberWaitingResponse(item, url) {
+  awaitingResponses.set(item.id, { id: item.id, startTime: item.startTime, url, seen: Date.now() });
+  while (awaitingResponses.size > MAX_BROWSER_RECORDS) awaitingResponses.delete(awaitingResponses.keys().next().value);
+  return saveCaptureState();
+}
+
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
-function observeDownloadResponse(details) {
+async function observeDownloadResponse(details) {
+  await captureStateReady;
   if (details.statusCode !== 200 && details.statusCode !== 206) return;
   const header = name => details.responseHeaders?.find(h => h.name.toLowerCase() === name)?.value;
   const mime = mimeType(header('content-type'));
@@ -42,20 +80,17 @@ function observeDownloadResponse(details) {
   responses.delete(details.url);
   responses.set(details.url, { seen: Date.now(), replay: details.method === 'GET' && (!encoding || encoding === 'identity') && !conflicts,
     length, etag, contentType: mime });
-  if (responses.size > MAX_BROWSER_RECORDS) responses.delete(responses.keys().next().value);
-
-  const waiting = awaitingResponses.get(details.url);
-  if (waiting) {
-    awaitingResponses.delete(details.url);
-    if (Date.now() - waiting.seen <= RESPONSE_LIFETIME) {
-      void getChromeDownload(waiting.id).then(item => {
-        if (item?.startTime === waiting.startTime && browserUrl(item) === details.url) return captureChromeDownload(item);
-      }).catch(() => {});
-    }
+  const waiting = [...awaitingResponses.values()].filter(entry => entry.url === details.url);
+  for (const entry of waiting) awaitingResponses.delete(entry.id);
+  await saveCaptureState();
+  for (const entry of waiting) {
+    void getChromeDownload(entry.id).then(item => {
+      if (item?.startTime === entry.startTime && browserUrl(item) === details.url) return captureChromeDownload(item);
+    }).catch(() => {});
   }
 }
 
-chrome.webRequest.onHeadersReceived.addListener(observeDownloadResponse,
+chrome.webRequest.onHeadersReceived.addListener(details => { void observeDownloadResponse(details).catch(() => {}); },
   { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame', 'other', 'xmlhttprequest', 'media'] }, ['responseHeaders']);
 
 function recentResponse(url) {
@@ -89,6 +124,22 @@ const sameDownload = (item, record) => !!item && item.startTime === record.start
 const needsRecovery = record => ['parking', 'parked', 'import'].includes(record.stage);
 const getChromeDownload = async id => (await chrome.downloads.search({ id }))[0];
 const readBrowserRecords = async () => (await chrome.storage.local.get('browserDownloads')).browserDownloads || {};
+
+async function recoverUncapturedChromeDownloads() {
+  await captureStateReady;
+  const [items, records] = await Promise.all([
+    chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 }),
+    readBrowserRecords()
+  ]);
+  const recoverable = items.filter(item => canMove(item) && !item.paused && !startedByVesper(item)
+    && !browserOperations.has(item.id) && !sameDownload(item, records[item.id] || {}));
+  await Promise.allSettled(recoverable.map(item => captureChromeDownload(item)));
+}
+
+function recoverChromeCaptures() {
+  captureRecovery ??= recoverUncapturedChromeDownloads().catch(() => {});
+  return captureRecovery;
+}
 
 async function browserRecord(item) {
   const record = (await readBrowserRecords())[item.id];
@@ -234,6 +285,7 @@ async function reconcileChromeDownload(id, record, knownReply) {
 }
 
 async function recoverChromeDownloads() {
+  await recoverChromeCaptures();
   const records = Object.entries(await readBrowserRecords()).filter(([, record]) => needsRecovery(record));
   await Promise.allSettled(records.map(([key, record]) =>
     inBrowserOrder(Number(key), () => reconcileChromeDownload(Number(key), record))));
@@ -348,7 +400,9 @@ async function wakeChromeActivity(startDesktop = true) {
 }
 
 async function captureChromeDownload(item) {
+  await captureStateReady;
   if (item?.state === 'complete') {
+    if (awaitingResponses.delete(item.id)) await saveCaptureState();
     await inBrowserOrder(item.id, async () => {
       const current = await getChromeDownload(item.id);
       if (current?.startTime === item.startTime) await registerChromeDownload(current, await browserRecord(current));
@@ -358,14 +412,11 @@ async function captureChromeDownload(item) {
   if (!canMove(item) || item.paused || startedByVesper(item)) return;
   const url = browserUrl(item);
   if (!downloadProof(item, false)) {
-    if (!recentResponse(url)) {
-      awaitingResponses.delete(url);
-      awaitingResponses.set(url, { id: item.id, startTime: item.startTime, seen: Date.now() });
-      if (awaitingResponses.size > MAX_BROWSER_RECORDS) awaitingResponses.delete(awaitingResponses.keys().next().value);
-    }
+    if (!recentResponse(url)) await rememberWaitingResponse(item, url);
+    else if (awaitingResponses.delete(item.id)) await saveCaptureState();
     return;
   }
-  awaitingResponses.delete(url);
+  if (awaitingResponses.delete(item.id)) await saveCaptureState();
   const prefs = await settings();
   if (prefs.intercept && prefs.route !== 'chrome') await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
 }

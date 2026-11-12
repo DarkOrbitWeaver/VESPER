@@ -8,3 +8,4 @@ release/
 *.bak-v*
 node_modules/
 TestResults/
+*.trx

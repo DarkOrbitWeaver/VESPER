@@ -1,4 +1,6 @@
-# VESPER native media discovery integration (U12)
+# VESPER native media discovery integration (U12 historical snapshot)
+
+This records the U12 state before native merge and the current Windows release work. Its build and limitation statements below are historical. See [current release status](RELEASE.md) and [current media limits](../MEDIA_ENGINE_LIMITATIONS.md).
 
 ## What is integrated
 
@@ -9,7 +11,7 @@
 - Existing extension is optional for the native-paste workflow; it may help for browser-specific pages.
 - Resolver's original test project and fixtures are included in the main solution.
 
-## Important restrictions
+## U12 snapshot restrictions
 
 This is **not** yt-dlp-level verified compatibility. Claude's adapter implementations have not been live-tested or compiled in this environment. Some website adaptations may be incomplete or become obsolete.
 

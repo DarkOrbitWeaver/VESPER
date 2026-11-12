@@ -2,6 +2,8 @@
 
 Linux x64 / .NET SDK 10.0.404 / 2026-11-11. These are actual executed results, not the user's historical baseline.
 
+This is historical validation for the 2026-11-11 Linux worktree, not current Windows verification. Use [current release status](../DOCUMENTATION/RELEASE.md) for later results and outstanding checks.
+
 | Operation | Actual result |
 |---|---|
 | Exact baseline engine tests | 161 passed |
@@ -27,7 +29,7 @@ Commands executed from the repository root:
 - `node --test tests/extension/background.test.mjs`
 - `dotnet build src/Vesper.MediaResolver.Benchmarks -c Release --nologo -v minimal`
 
-Build/test stdout and TRX evidence: `validation/`. Live checks and measurements: `benchmarks/` and `BENCHMARKS.md`.
+Build/test console logs: `validation/`. Live checks and measurements: `benchmarks/` and `BENCHMARKS.md`.
 The test SDK emits a non-failing `VSTEST_ARTIFACTS_DIRECTORY` note; its existing package version was not changed or suppressed.
 
 Not executed: actual WinForms UI/extension/native-host registration, DPAPI round-trip on Windows, PowerShell release/source scripts and the added remote Windows CI workflow.

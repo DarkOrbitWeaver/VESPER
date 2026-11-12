@@ -13,5 +13,6 @@
     <Project Path="tests/Vesper.Tests/Vesper.Tests.csproj" />
     <Project Path="tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj" />
     <Project Path="tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj" />
+    <Project Path="tests/Vesper.Windows.Tests/Vesper.Windows.Tests.csproj" />
   </Folder>
 </Solution>

@@ -90,7 +90,7 @@ public static class DownloadPlanBuilder
                 subs.Add(new TransferStep(TransferRole.Subtitle, s.Url, StreamProtocol.Http, s.Format, selection.Video?.Context ?? MediaRequestContext.Empty, null, null, null, false));
 
         if (!selection.HasAudio) warnings.Add("The selected video has no audio stream.");
-        if (selection.NeedsMuxing) warnings.Add("Video and audio are separate streams and must be merged by an external muxer.");
+        if (selection.NeedsMuxing) warnings.Add("Video and audio are separate streams and require a compatible post-transfer merger.");
 
         string? container = selection.OutputContainer ?? steps[0].Container;
         DateTimeOffset? expiry = selection.Streams.Where(r => r.ExpiresAt is not null).Select(r => r.ExpiresAt!.Value).DefaultIfEmpty().Min();

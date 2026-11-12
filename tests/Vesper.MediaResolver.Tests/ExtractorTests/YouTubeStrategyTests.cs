@@ -52,11 +52,12 @@ public sealed class YouTubeStrategyTests
         Assert.Single(media);                                                // exactly one byte probe
         Assert.True(media[0].Headers.ContainsKey("Range"));
         Assert.DoesNotContain(media, r => r.Headers.ContainsKey("Cookie"));   // the consent cookie never leaves youtube.com
-        // The DRC variant is metadata-identical to the regular AAC track, so the shared deduplicator keeps one of them;
-        // a different language is never collapsed.
-        Assert.Equal(3, item.Representations.Count);
+        // DRC and the regular AAC track are separate choices; a different language is also retained.
+        Assert.Equal(4, item.Representations.Count);
         Assert.Equal(item.Representations.Count, item.Representations.Select(r => r.Id).Distinct().Count());
-        Assert.Single(item.Representations, r => r.Id.StartsWith("yt-140-", StringComparison.Ordinal));
+        Assert.Equal(2, item.Representations.Count(r => r.Id.StartsWith("yt-140-", StringComparison.Ordinal)));
+        Assert.Contains(item.Representations, r => r.IsDrc && r.Id == "yt-140-drc-en.4");
+        Assert.Contains(item.Representations, r => !r.IsDrc && r.Id == "yt-140-en.4");
         Assert.Contains(item.Representations, r => r.Id == "yt-251-es.3" && r.AudioLanguage == "es");
         Assert.Equal(2, item.AudioTracks.Count);
         Assert.Equal("youtube:EK3tCffac5k:137:1712345678901234:4000000", item.Representations.Single(r => r.Id == "yt-137").ContentIdentity);

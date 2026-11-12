@@ -4,7 +4,7 @@ VesperTheme.install();
 const $ = id => document.getElementById(id);
 
 async function init() {
-  const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'system', route: 'auto', handoff: 'download', intercept: true, useSignIn: true });
+  const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'system', route: 'auto', handoff: 'download', intercept: true, useSignIn: false });
   $('theme').value = prefs.theme;
   $('motion').value = ['animate', 'still'].includes(prefs.motion) ? prefs.motion : 'system';
   $('handoff').value = prefs.handoff;
