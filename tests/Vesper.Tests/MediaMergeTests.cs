@@ -590,7 +590,7 @@ public sealed class MediaMergeTests
     [Fact]
     public void WebmAudioMergeEmbedsMusicTagsAndCoverWithoutChangingAudioSamples()
     {
-        var source = new MemoryStream(Fixture("muxed.webm"));
+        var source = new MemoryStream(Fixture("quiet-track.webm"));
         DemuxedTrack audio = Assert.Single(MediaMerger.Demux(source, source.Length, default), track => track.Kind == TrackKind.Audio);
         var metadata = new MediaMergeMetadata
         {
@@ -618,6 +618,63 @@ public sealed class MediaMergeTests
         AssertSamePayloads(audio, source, muxedAudio, output);
 
         string? qaPath = Environment.GetEnvironmentVariable("VESPER_MEDIA_QA_WEBM_MUSIC");
+        if (!string.IsNullOrWhiteSpace(qaPath))
+        {
+            string fullPath = Path.GetFullPath(qaPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            using var qaFile = File.Create(fullPath);
+            output.Position = 0;
+            output.CopyTo(qaFile);
+        }
+    }
+
+    [Fact]
+    public async Task WebmAudioMergeJobPublishesMetadataAndCoverWithoutChangingAudioSamples()
+    {
+        await using var server = new FaultServer();
+        byte[] sourceBytes = Fixture("quiet-track.webm");
+        server.Extra["/m/audio.webm"] = sourceBytes;
+        server.Extra["/m/cover.png"] = TinyPng();
+        await server.StartAsync();
+        using var harness = new Harness();
+        using var source = new MemoryStream(sourceBytes);
+        DemuxedTrack audio = Assert.Single(MediaMerger.Demux(source, source.Length, default), track => track.Kind == TrackKind.Audio);
+        var plan = new MediaMergePlan
+        {
+            Provider = "test", MediaId = "webm-song", OutputContainer = "webm",
+            Tracks = [new MergeTrack("audio", "opus-track", server.Url("/m/audio.webm"), sourceBytes.Length, "webm", "opus", "audio-id")]
+        };
+        var metadata = new MediaMergeMetadata
+        {
+            Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album", AlbumArtist = "Fixture Band",
+            TrackNumber = 2, DiscNumber = 1, ReleaseDate = "2024-03-12"
+        };
+        plan = plan with { Metadata = metadata };
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/m/audio.webm"), FileName: "song.webm",
+            Kind: JobKind.Merge, MediaProvider: "test", MediaId: "webm-song", MediaPlanJson: plan.ToJson(),
+            MediaThumbnailUrl: server.Url("/m/cover.png")));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot? done = await harness.WaitAsync(added.JobId,
+            job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.Equal(JobState.Completed, done!.State);
+        using var output = File.OpenRead(done.FinalPath!);
+        MediaMergeMetadata stored = WebmDemuxer.ReadMetadata(output, output.Length);
+        MediaThumbnail storedCover = Assert.IsType<MediaThumbnail>(WebmDemuxer.ReadThumbnail(output, output.Length));
+        DemuxedTrack muxedAudio = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+
+        Assert.Equal("Song One", stored.Title);
+        Assert.Equal("Fixture Band", stored.Artist);
+        Assert.Equal("Fixture Album", stored.Album);
+        Assert.Equal("Fixture Band", stored.AlbumArtist);
+        Assert.Equal(2, stored.TrackNumber);
+        Assert.Equal(1, stored.DiscNumber);
+        Assert.Equal("2024-03-12", stored.ReleaseDate);
+        Assert.Equal(Payloads.Sha256(TinyPng()), storedCover.Sha256);
+        AssertSamePayloads(audio, source, muxedAudio, output);
+        Assert.Single(harness.Files());
+
+        string? qaPath = Environment.GetEnvironmentVariable("VESPER_MEDIA_QA_WEBM_ENGINE");
         if (!string.IsNullOrWhiteSpace(qaPath))
         {
             string fullPath = Path.GetFullPath(qaPath);

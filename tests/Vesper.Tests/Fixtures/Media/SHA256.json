@@ -70,5 +70,9 @@
   "quiet-track.opus": {
     "bytes": 2270,
     "sha256": "f671361fdcaa3ca9a1136664073f41966645211432bc93bf8a02a8d6643c94ac"
+  },
+  "quiet-track.webm": {
+    "bytes": 777,
+    "sha256": "440833a4ef42336111c83cb2d7bc1ce2af97203afc47d5fddf8cf1dfa42ce044"
   }
 }
