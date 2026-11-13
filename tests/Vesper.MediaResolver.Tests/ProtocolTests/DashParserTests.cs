@@ -61,6 +61,8 @@ public class DashParserTests
         Assert.Equal(new Uri("https://cdn.example.com/vod/v/v1080/seg-4.m4s"), v.Segments.Segments[3].Url);
         Assert.Equal(new Uri("https://cdn.example.com/vod/v/v1080/init.mp4"), v.Segments.InitializationUrl);
         Assert.Equal(20, v.Segments.TotalDurationSeconds, 3);
+        Assert.Equal([0d, 5d, 10d, 15d], v.Segments.Segments.Select(segment => segment.StartSeconds));
+        Assert.False(v.Segments.HasDiscontinuities);
         Assert.Equal(29.97, v.FrameRate!.Value, 2);
     }
 

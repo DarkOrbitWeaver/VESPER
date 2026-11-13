@@ -1,6 +1,7 @@
 using Vesper.Engine;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
+using System.Text.Json;
 
 namespace VESPER;
 
@@ -63,15 +64,20 @@ internal static class MediaTransferBridge
     }
 
     internal static (MediaDownloadChoice? Choice, string? Error) Prepare(MediaItem item, FormatPreferences prefs,
-        MediaRepresentation? exact = null, MediaOutputPreference output = MediaOutputPreference.Original)
+        MediaRepresentation? exact = null, MediaOutputPreference output = MediaOutputPreference.Original,
+        double? clipStartSeconds = null, double? clipEndSeconds = null)
     {
+        if ((clipStartSeconds is null) != (clipEndSeconds is null)
+            || clipStartSeconds is double start && (!double.IsFinite(start) || start < 0)
+            || clipEndSeconds is double end && (!double.IsFinite(end) || end <= (clipStartSeconds ?? 0) || end > 31_536_000))
+            return (null, "Enter a valid start and end time.");
         if (exact is not null || output == MediaOutputPreference.Original)
-            return PrepareSource(item, prefs, exact, out _);
+            return PrepareSource(item, prefs, exact, out _, clipStartSeconds, clipEndSeconds);
         bool audioOnly = prefs.Mode == QualityMode.AudioOnly || item.Representations.All(r => !r.HasVideo);
         if (output == MediaOutputPreference.M4a && audioOnly)
-            return PrepareM4a(item, prefs);
+            return PrepareM4a(item, prefs, clipStartSeconds, clipEndSeconds);
         if (audioOnly || output != MediaOutputPreference.CompatibleVideo)
-            return PrepareSource(item, prefs, exact: null, out _);
+            return PrepareSource(item, prefs, exact: null, out _, clipStartSeconds, clipEndSeconds);
 
         MediaItem native = item with
         {
@@ -81,11 +87,13 @@ internal static class MediaTransferBridge
                     : r.VideoCodec == "h264" && (!r.HasAudio || r.AudioCodec == "aac"))).ToArray()
         };
         FormatPreferences nativePrefs = prefs with { Container = "mp4", ContainerStrict = true };
-        if (PrepareSource(native, nativePrefs, exact: null, out FormatSelection? nativeSelection).Choice is { } compatible
+        if (PrepareSource(native, nativePrefs, exact: null, out FormatSelection? nativeSelection,
+                clipStartSeconds, clipEndSeconds).Choice is { } compatible
             && nativeSelection is { HasVideo: true })
             return (compatible, null);
 
-        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source);
+        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
+            clipStartSeconds, clipEndSeconds);
         if (original.Choice is { } choice && CanConvert(choice)
             && source is { HasAudio: true, Video: { VideoCodec: not null, Hdr: HdrKind.Sdr, Height: null or <= 2304, Width: null or <= 4096 } video }
             && (source.Audio ?? video).AudioCodec is not null)
@@ -98,9 +106,11 @@ internal static class MediaTransferBridge
         return original;
     }
 
-    private static (MediaDownloadChoice? Choice, string? Error) PrepareM4a(MediaItem item, FormatPreferences prefs)
+    private static (MediaDownloadChoice? Choice, string? Error) PrepareM4a(MediaItem item, FormatPreferences prefs,
+        double? clipStartSeconds, double? clipEndSeconds)
     {
-        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source);
+        var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
+            clipStartSeconds, clipEndSeconds);
         if (original.Choice is not { } choice || source?.Audio is not { } audio) return original;
 
         if (IsNativeAac(audio))
@@ -118,7 +128,7 @@ internal static class MediaTransferBridge
             && candidate.AudioTrackId == audio.AudioTrackId
             && string.Equals(candidate.AudioLanguage, audio.AudioLanguage, StringComparison.OrdinalIgnoreCase)).ToArray();
         if (nativeAac.Length > 0 && PrepareSource(item with { Representations = nativeAac }, prefs,
-                exact: null, out _).Choice is { } sourceAac)
+                exact: null, out _, clipStartSeconds, clipEndSeconds).Choice is { } sourceAac)
             return (sourceAac with { FileName = Path.ChangeExtension(sourceAac.FileName, ".m4a") }, null);
 
         if (canEncode && codec is not null)
@@ -136,7 +146,7 @@ internal static class MediaTransferBridge
         && Path.GetExtension(choice.FileName).ToLowerInvariant() is ".webm" or ".mkv" or ".mp4" or ".m4a";
 
     private static (MediaDownloadChoice? Choice, string? Error) PrepareSource(MediaItem item, FormatPreferences prefs,
-        MediaRepresentation? exact, out FormatSelection? selection)
+        MediaRepresentation? exact, out FormatSelection? selection, double? clipStartSeconds = null, double? clipEndSeconds = null)
     {
         prefs = prefs with { NativeMergeOnly = true };
         if (exact is not null && exact.Content == StreamContent.VideoOnly)
@@ -173,13 +183,16 @@ internal static class MediaTransferBridge
             if (selection.Video is not { } video || selection.Audio is not { } audio
                 || MergeCapability.MergeContainer(video, audio, selection.OutputContainer) is not { } container)
                 return (null, "VESPER cannot merge this video/audio combination without transcoding.");
-            return BuildMerge(item, selection, plan, [video, audio], container);
+            return BuildMerge(item, selection, plan, [video, audio], container, clipStartSeconds, clipEndSeconds);
         }
         // Audio with provider byte identity goes through the native job: bounded range requests, container validation,
         // a clean non-fragmented M4A/WebM output and identity-checked continuation after a link refresh.
         if (selection.Video is null && selection.Audio is { ContentIdentity: not null } only
             && MergeCapability.AudioContainer(only) is { } audioContainer)
-            return BuildMerge(item, selection, plan, [only], audioContainer);
+            return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds);
+
+        if (clipStartSeconds is not null)
+            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
 
         if (plan.RequiresExternalHelper || plan.Steps.Count != 1 ||
             (plan.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) != 0)
@@ -202,23 +215,32 @@ internal static class MediaTransferBridge
             {
                 RepresentationId = rep.Id, Provider = item.Provider, MediaId = item.MediaId,
                 Initialization = new DashFragment(init.AbsoluteUri, segments.InitializationRange?.Offset, segments.InitializationRange?.Length),
-                Fragments = segments.Segments.Select(s => new DashFragment(s.Url.AbsoluteUri, s.Range?.Offset, s.Range?.Length)).ToArray(),
+                Fragments = segments.Segments.Select(s => new DashFragment(s.Url.AbsoluteUri, s.Range?.Offset,
+                    s.Range?.Length, s.DurationSeconds, s.StartSeconds)).ToArray(),
+                ClipRange = clipStartSeconds is double start ? new MediaTimeRange(start, clipEndSeconds!.Value) : null,
                 RequireAudio = selection.HasAudio, RequireVideo = selection.Video is not null
             }.ToJson();
         }
         string name = step.Protocol == StreamProtocol.Hls
             ? Path.GetFileNameWithoutExtension(plan.SuggestedFileName) : plan.SuggestedFileName;
+        string? mediaPlan = dashPlan;
+        if (step.Protocol == StreamProtocol.Hls && clipStartSeconds is double clipStart)
+            mediaPlan = JsonSerializer.Serialize(new MediaTimeRange(clipStart, clipEndSeconds!.Value));
         return (new MediaDownloadChoice(step.Url.AbsoluteUri, name,
             step.Protocol == StreamProtocol.Hls ? JobKind.Hls : step.Protocol == StreamProtocol.Dash ? JobKind.Dash : JobKind.Http,
             step.Context.Referer, step.Context.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
-            item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, dashPlan, selection.Streams.Single().Id), null);
+            item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
     private static (MediaDownloadChoice? Choice, string? Error) BuildMerge(MediaItem item, FormatSelection selection,
-        DownloadPlan plan, IReadOnlyList<MediaRepresentation> tracks, string container)
+        DownloadPlan plan, IReadOnlyList<MediaRepresentation> tracks, string container,
+        double? clipStartSeconds, double? clipEndSeconds)
     {
+        if (clipStartSeconds is not null && (tracks.Count != 2
+            || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
+            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
         MediaRequestContext ctx = tracks[0].Context;
         if (tracks.Any(t => t.Context.HasCredentials || t.Context.Origin is not null || t.Context.AcceptLanguage is not null
             || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer))
@@ -246,7 +268,7 @@ internal static class MediaTransferBridge
                     Initialization = new DashFragment(segments.InitializationUrl!.AbsoluteUri,
                         segments.InitializationRange?.Offset, segments.InitializationRange?.Length),
                     Fragments = segments.Segments.Select(segment => new DashFragment(segment.Url.AbsoluteUri,
-                        segment.Range?.Offset, segment.Range?.Length)).ToArray(),
+                        segment.Range?.Offset, segment.Range?.Length, segment.DurationSeconds, segment.StartSeconds)).ToArray(),
                     RequireAudio = role == "audio",
                     RequireVideo = role == "video"
                 };
@@ -264,6 +286,7 @@ internal static class MediaTransferBridge
             OutputContainer = container,
             RequireAudio = tracks.Any(t => t.HasAudio),
             RequireVideo = tracks.Any(t => t.HasVideo),
+            ClipRange = clipStartSeconds is double start ? new MediaTimeRange(start, clipEndSeconds!.Value) : null,
             Tracks = mergeTracks
         };
         string name = Path.ChangeExtension(plan.SuggestedFileName, container);
@@ -271,5 +294,25 @@ internal static class MediaTransferBridge
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
             merge.ToJson(), string.Join("+", tracks.Select(t => t.Id))), null);
+    }
+
+    internal static bool SupportsSegmentClip(MediaDownloadChoice choice)
+    {
+        if (choice.Kind == JobKind.Hls) return true;
+        if (choice.MediaPlanJson is null) return false;
+        try
+        {
+            if (choice.Kind == JobKind.Dash)
+            {
+                DashDownloadPlan? dash = JsonSerializer.Deserialize<DashDownloadPlan>(choice.MediaPlanJson);
+                return dash is { Fragments.Count: > 0 }
+                    && dash.Fragments.All(fragment => fragment.DurationSeconds is > 0 and <= 31_536_000);
+            }
+            if (choice.Kind != JobKind.Merge) return false;
+            MediaMergePlan? plan = JsonSerializer.Deserialize<MediaMergePlan>(choice.MediaPlanJson);
+            return plan is { Version: 2, Tracks.Count: 2 }
+                && plan.Tracks.All(track => track.Source?.Protocol is "hls" or "dash");
+        }
+        catch (JsonException) { return false; }
     }
 }

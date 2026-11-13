@@ -1,4 +1,5 @@
 using Vesper.MediaResolver.Security;
+using System.Text.Json.Serialization;
 
 namespace Vesper.MediaResolver.Models;
 
@@ -8,7 +9,9 @@ public readonly record struct ByteRange(long Offset, long Length)
     public override string ToString() => $"{Offset}-{End}";
 }
 
-public sealed record MediaSegment(Uri Url, double DurationSeconds, ByteRange? Range = null, bool DiscontinuityBefore = false);
+public sealed record MediaSegment(Uri Url, double DurationSeconds, ByteRange? Range = null,
+    bool DiscontinuityBefore = false,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? StartSeconds = null);
 
 /// <summary>Explicit, fully resolved segment list that the transfer engine can fetch in order.</summary>
 public sealed record SegmentPlan

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using System.Globalization;
 using static VESPER.MediaTransferBridge;
 using Vesper.Engine;
 using Vesper.MediaResolver.Core;
@@ -43,6 +44,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperChoice _outputChoice;
     private readonly VesperChoice _audioOutputChoice;
     private readonly VesperChoice _customFormat;
+    private readonly CheckBox _clipCheck;
+    private readonly Label _clipStartLabel;
+    private readonly Label _clipEndLabel;
+    private readonly TextBox _clipStart;
+    private readonly TextBox _clipEnd;
     private readonly CheckedListBox _entries;
     private readonly VesperButton _download;
     private readonly VesperButton _queue;
@@ -139,8 +145,22 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _customLabel = L("Exact available format", 8.5f, muted: true);
         _customFormat = new VesperChoice { AccessibleName = "Exact format", Symbol = VesperIcon.Layers };
         _customFormat.ApplyPalette(_colors);
-        _customFormat.SelectedIndexChanged += (_, _) => UpdateChoiceSummary();
+        _customFormat.SelectedIndexChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
         _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice, _customLabel, _customFormat]);
+        _clipCheck = new CheckBox
+        {
+            Text = "Time range", AccessibleName = "Download a time range", AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft, BackColor = _colors.Surface, ForeColor = _colors.Text,
+            Font = new Font("Segoe UI", 9), Visible = false
+        };
+        _clipStartLabel = L("From", 8.5f, muted: true);
+        _clipEndLabel = L("To", 8.5f, muted: true);
+        _clipStart = ClipTimeBox("Clip start time");
+        _clipEnd = ClipTimeBox("Clip end time");
+        _canvas.Controls.AddRange([_clipCheck, _clipStartLabel, _clipStart, _clipEndLabel, _clipEnd]);
+        _clipCheck.CheckedChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
+        _clipStart.TextChanged += (_, _) => UpdateChoiceSummary();
+        _clipEnd.TextChanged += (_, _) => UpdateChoiceSummary();
         _presetOptions = new Panel { BackColor = _colors.Surface, Visible = false, TabIndex = 3 };
         (string Title, VesperIcon Icon)[] presets =
         [
@@ -297,9 +317,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 _presets[i].SetBounds(0, S(i * 37), contentWidth, S(i < 4 ? 37 : 33));
             Place(_customLabel, margin, 398, contentWidth, 18);
             Place(_customFormat, margin, 419, contentWidth, 34);
+            int clipY = IsExactFormat ? 457 : 402;
+            Place(_clipCheck, margin, clipY, S(126), 29);
+            Place(_clipStartLabel, margin + S(134), clipY, S(40), 29);
+            Place(_clipStart, margin + S(174), clipY + 2, S(86), 25);
+            Place(_clipEndLabel, margin + S(272), clipY, S(26), 29);
+            Place(_clipEnd, margin + S(300), clipY + 2, S(86), 25);
             int noticeY = _state switch
             {
-                ViewState.Ready => IsExactFormat ? 464 : 402,
+                ViewState.Ready => IsExactFormat ? (_clipCheck.Visible ? 495 : 464) : (_clipCheck.Visible ? 440 : 402),
                 ViewState.Collection => 417,
                 ViewState.Unavailable => 213,
                 _ => 191
@@ -325,7 +351,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private int BodyHeight() => _state switch
     {
-        ViewState.Ready => IsExactFormat ? 510 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448,
+        ViewState.Ready => IsExactFormat ? (_clipCheck.Visible ? 541 : 510)
+            : _clipCheck.Visible ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448,
         ViewState.Collection => 464,
         ViewState.Unavailable => 260,
         _ => 214
@@ -366,6 +393,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _viewPage.Visible = !list;
         _notice.Visible = state != ViewState.Inspecting;
         UpdateQualityUi();
+        if (!ready) SetClipControlsVisible(false);
         FitToContent();
         if (!ready) SetButtonsEnabled(list && _entries.CheckedIndices.Count > 0);
     }
@@ -438,6 +466,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private void DisplayItem(MediaItem item)
     {
         _item = item;
+        _clipCheck.Checked = false;
+        _clipStart.Text = "00:00";
+        _clipEnd.Text = item.Duration is { } known ? ClipTimeText(known) : "";
         _title.Text = string.IsNullOrWhiteSpace(item.Title) ? "Media source" : item.Title;
         _source.Text = item.Provider + (item.Duration is { } duration ? $"  ·  {duration:hh\\:mm\\:ss}" : "");
         _ = LoadThumbnailAsync(item.Thumbnail);
@@ -647,16 +678,75 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         if (_state != ViewState.Ready || _item is null || _busy) return;
         FormatPreferences prefs = CurrentPreferences();
-        var result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs));
+        var complete = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs));
+        bool canClip = !_item.IsLive && _item.Duration is { TotalSeconds: > 0 and <= 31_536_000 }
+            && complete.Choice is { } fullChoice && SupportsSegmentClip(fullChoice);
+        SetClipControlsVisible(canClip);
+        if (!canClip && _clipCheck.Checked) _clipCheck.Checked = false;
+
+        var result = _clipCheck.Checked ? PrepareCurrentChoice() : complete;
         if (result.Choice is { } choice)
+        {
             _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
                 ? "Audio is unconfirmed and will be checked before publication."
                 : IsExactFormat ? choice.DisplayDetail : "";
+            if (_clipCheck.Checked)
+                _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
+                    + "Uses complete HLS/DASH segments; the saved format shows the actual boundaries.";
+        }
         else
             _notice.Text = result.Error ?? "This preference isn't available for the source.";
         _notice.ForeColor = result.Choice is null ? _colors.Red : _colors.Muted;
         _notice.Visible = _notice.Text.Length > 0;
         SetButtonsEnabled(result.Choice is not null);
+    }
+
+    private (MediaDownloadChoice? Choice, string? Error) PrepareCurrentChoice()
+    {
+        if (_item is null) return (null, "The selected media is unavailable.");
+        if (!_clipCheck.Checked)
+            return Prepare(_item, CurrentPreferences(), SelectedExactRepresentation(), OutputPreference(CurrentPreferences()));
+        if (!TryGetClipRange(out double start, out double end, out string error)) return (null, error);
+        FormatPreferences prefs = CurrentPreferences();
+        return Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
+    }
+
+    private bool TryGetClipRange(out double start, out double end, out string error)
+    {
+        start = end = 0;
+        error = "Enter start and end times as mm:ss or hh:mm:ss.";
+        if (_item?.Duration is not { } duration
+            || !TryParseClipTime(_clipStart.Text, out TimeSpan from)
+            || !TryParseClipTime(_clipEnd.Text, out TimeSpan to)
+            || from < TimeSpan.Zero || to <= from || to > duration || to.TotalSeconds > 31_536_000)
+            return false;
+        start = from.TotalSeconds;
+        end = to.TotalSeconds;
+        error = "";
+        return true;
+    }
+
+    private static bool TryParseClipTime(string text, out TimeSpan value) => TimeSpan.TryParseExact(text.Trim(),
+        ["m\\:ss", "mm\\:ss", "h\\:mm\\:ss", "hh\\:mm\\:ss", "d\\.hh\\:mm\\:ss"],
+        CultureInfo.InvariantCulture, TimeSpanStyles.None, out value);
+
+    private static string ClipTimeText(TimeSpan value) => value.TotalHours >= 24
+        ? $"{(int)value.TotalDays}.{value:hh\\:mm\\:ss}"
+        : $"{(int)value.TotalHours:00}:{value:mm\\:ss}";
+
+    private TextBox ClipTimeBox(string accessibleName) => new()
+    {
+        AccessibleName = accessibleName, BorderStyle = BorderStyle.FixedSingle,
+        BackColor = _colors.Surface, ForeColor = _colors.Text, Font = new Font("Segoe UI", 9),
+        TextAlign = HorizontalAlignment.Center, Visible = false
+    };
+
+    private void SetClipControlsVisible(bool visible)
+    {
+        _clipCheck.Visible = visible;
+        bool fields = visible && _clipCheck.Checked;
+        _clipStart.Visible = _clipEnd.Visible = _clipStartLabel.Visible = _clipEndLabel.Visible = fields;
+        _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
     }
 
     private MediaRepresentation? SelectedExactRepresentation() =>
@@ -736,7 +826,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             var errors = new List<string>();
             if (_collection is null && _item is { } single)
             {
-                var prepared = Prepare(single, prefs, SelectedExactRepresentation(), output);
+                var prepared = PrepareCurrentChoice();
                 if (prepared.Choice is { } c) jobs.Add(c);
                 else errors.Add(prepared.Error ?? "The chosen format isn't supported.");
             }
@@ -818,6 +908,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _collectionButton.Enabled = !_busy;
         _entries.Enabled = !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
+        _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
         _outputChoice.Enabled = !_busy;
         _audioOutputChoice.Enabled = !_busy;
         _presetOptions.Enabled = !_busy;

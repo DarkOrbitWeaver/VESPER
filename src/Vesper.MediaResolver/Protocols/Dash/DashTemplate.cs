@@ -53,7 +53,8 @@ internal sealed class DashTemplate
         };
     }
 
-    public SegmentPlan Expand(string repId, long bandwidth, Uri baseUrl, double? periodDurationSeconds, int maxSegments, bool fragmentedMp4)
+    public SegmentPlan Expand(string repId, long bandwidth, Uri baseUrl, double? periodDurationSeconds,
+        int maxSegments, bool fragmentedMp4, double periodStartSeconds = 0)
     {
         if (Media is null)
             throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTemplate without a media attribute"));
@@ -65,15 +66,21 @@ internal sealed class DashTemplate
         var segments = new List<MediaSegment>();
         double total = 0;
         long number = StartNumber;
+        bool discontinuities = false;
 
         if (Timeline is not null)
         {
             long time = PresentationTimeOffset;
             bool first = true;
+            long? previousEndTime = null;
             for (int entry = 0; entry < Timeline.Count; entry++)
             {
                 var (t, d, r) = Timeline[entry];
-                if (t is { } tv) time = tv;
+                if (t is { } tv)
+                {
+                    if (previousEndTime is long previous && tv != previous) discontinuities = true;
+                    time = tv;
+                }
                 else if (first) time = PresentationTimeOffset;
                 first = false;
 
@@ -99,13 +106,17 @@ internal sealed class DashTemplate
                         throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
                     var url = ResolveUrl(baseUrl, Substitute(Media, repId, number, bandwidth, time));
                     double dur = (double)d / Timescale;
-                    segments.Add(new MediaSegment(url, dur));
+                    double start = periodStartSeconds + ((double)time - PresentationTimeOffset) / Timescale;
+                    if (!double.IsFinite(start) || start < 0 || !double.IsFinite(dur) || dur <= 0)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid segment presentation time"));
+                    segments.Add(new MediaSegment(url, dur, StartSeconds: start));
                     total += dur;
                     if (time > long.MaxValue - d || number == long.MaxValue)
                         throw new MediaResolverException(MediaErrors.UnsupportedManifest("Timeline arithmetic overflow"));
                     time += d;
                     number++;
                 }
+                previousEndTime = time;
             }
         }
         else if (Duration > 0)
@@ -117,9 +128,13 @@ internal sealed class DashTemplate
             if (count > maxSegments) throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
             for (long i = 0; i < count; i++)
             {
-                long time = PresentationTimeOffset + i * Duration;
+                long time;
+                try { time = checked(PresentationTimeOffset + checked(i * Duration)); }
+                catch (OverflowException) { throw new MediaResolverException(MediaErrors.UnsupportedManifest("Duration template time overflows")); }
                 double dur = Math.Min(segSeconds, periodDurationSeconds.Value - i * segSeconds);
-                segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, StartNumber + i, bandwidth, time)), dur));
+                double start = periodStartSeconds + ((double)time - PresentationTimeOffset) / Timescale;
+                segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, StartNumber + i, bandwidth, time)),
+                    dur, StartSeconds: start));
                 total += dur;
             }
         }
@@ -127,11 +142,12 @@ internal sealed class DashTemplate
         {
             // No timeline and no duration: the template describes exactly one segment.
             segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, StartNumber, bandwidth, PresentationTimeOffset)),
-                periodDurationSeconds ?? 0));
+                periodDurationSeconds ?? 0, StartSeconds: periodStartSeconds));
             total = periodDurationSeconds ?? 0;
         }
 
-        return new SegmentPlan { InitializationUrl = init, Segments = segments, TotalDurationSeconds = total, IsFragmentedMp4 = fragmentedMp4 };
+        return new SegmentPlan { InitializationUrl = init, Segments = segments, TotalDurationSeconds = total,
+            IsFragmentedMp4 = fragmentedMp4, HasDiscontinuities = discontinuities };
     }
 
     /// <summary>Handles $$, $RepresentationID$, $Number$, $Bandwidth$, $Time$ with optional %0Nd width.</summary>

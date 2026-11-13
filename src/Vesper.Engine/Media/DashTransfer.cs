@@ -19,6 +19,23 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             return RunOutcome.NeedsAttention("dash-plan", error);
         if (!PathSafety.TryResolveFolder(Job.DestinationFolder, create: true, out _, out var folderError))
             return RunOutcome.NeedsAttention("destination", folderError + " Saved data was kept.");
+        IReadOnlyList<DashFragment> fragments = plan.Fragments;
+        if (plan.ClipRange is { } clipRange)
+        {
+            double[] durations = [.. plan.Fragments.Select(fragment => fragment.DurationSeconds ?? double.NaN)];
+            double?[] starts = [.. plan.Fragments.Select(fragment => fragment.StartSeconds)];
+            if (!clipRange.TrySelect(durations, starts, out int first, out int count, out double actualStart, out double actualEnd))
+                return RunOutcome.NeedsAttention("clip-range", "The requested DASH time range is outside the available segment timeline.");
+            fragments = plan.Fragments.Skip(first).Take(count).ToArray();
+            string range = MediaTimeRange.Describe(actualStart, actualEnd);
+            engine.UpdateJob(Job, job =>
+            {
+                string quality = job.MediaQuality ?? "DASH";
+                int priorRange = quality.IndexOf(" · Segment-aligned ", StringComparison.Ordinal);
+                if (priorRange >= 0) quality = quality[..priorRange];
+                job.MediaQuality = quality + " · " + range;
+            });
+        }
         string fingerprint = plan.Fingerprint;
         Cursor? cursor = null;
         if (Job.MediaState is not null)
@@ -37,7 +54,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
         {
             if (cursor is not null)
             {
-                if (cursor.Version != 1 || cursor.PlanFingerprint != fingerprint || cursor.Next < 1 || cursor.Next > plan.Fragments.Count
+                if (cursor.Version != 1 || cursor.PlanFingerprint != fingerprint || cursor.Next < 1 || cursor.Next > fragments.Count
                     || cursor.Offset != offset || cursor.InitLength is < 8 or > MaxInitBytes || cursor.InitLength >= offset
                     || cursor.Progress is null) return Stop("The saved plan or representation changed. Restart is required.");
                 // One sequential pass on resume, not random spot checks. No corrupt prefix is trusted.
@@ -62,10 +79,10 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 offset = init.Length;
             }
             session.SetPhase(JobState.Downloading);
-            for (int i = next; i < plan.Fragments.Count; i++)
+            for (int i = next; i < fragments.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                ReadOnlyMemory<byte> fragment = await FetchAsync(plan.Fragments[i], MaxObjectBytes, ct).ConfigureAwait(false);
+                ReadOnlyMemory<byte> fragment = await FetchAsync(fragments[i], MaxObjectBytes, ct).ConfigureAwait(false);
                 mp4.ValidateFragment(fragment.Span);
                 EnsureSpace(fragment.Length);
                 await LimitedWriteAsync(fragment, offset, ct).ConfigureAwait(false);
@@ -76,7 +93,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                     Convert.ToHexString(hash.GetCurrentHash()), mp4.Snapshot());
                 session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
                 await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
-                engine.UpdateJob(Job, j => j.Message = $"Fragment {i + 1} of {plan.Fragments.Count}");
+                engine.UpdateJob(Job, j => j.Message = $"Fragment {i + 1} of {fragments.Count}");
             }
             mp4.Finish(plan.RequireAudio, plan.RequireVideo);
         }

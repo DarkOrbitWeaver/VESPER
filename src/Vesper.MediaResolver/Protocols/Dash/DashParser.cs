@@ -50,6 +50,7 @@ public static class DashParser
         var period = periods[0];
         var mpdBase = ChildBase(manifestUrl, mpd, out bool mpdHasBase);
         var periodBase = ChildBase(mpdBase, period, out bool periodHasBase);
+        double periodStartSeconds = (ParseIsoDuration(period.Attribute("start")?.Value) ?? TimeSpan.Zero).TotalSeconds;
         TimeSpan? periodDuration = ParseIsoDuration(period.Attribute("duration")?.Value) ?? mpdDuration;
         double? periodSeconds = periodDuration?.TotalSeconds;
 
@@ -110,9 +111,9 @@ public static class DashParser
                     var tmpl = DashTemplate.Merge(Kid(mpd, "SegmentTemplate"), Kid(period, "SegmentTemplate"), Kid(aset, "SegmentTemplate"), Kid(rep, "SegmentTemplate"));
                     var list = Kid(rep, "SegmentList") ?? Kid(aset, "SegmentList");
                     if (tmpl is not null)
-                        plan = tmpl.Expand(repId, bandwidth, repBase, periodSeconds, maxSegments, fmp4);
+                        plan = tmpl.Expand(repId, bandwidth, repBase, periodSeconds, maxSegments, fmp4, periodStartSeconds);
                     else if (list is not null)
-                        plan = ExpandList(list, repBase, maxSegments, periodSeconds, fmp4);
+                        plan = ExpandList(list, repBase, maxSegments, periodSeconds, fmp4, periodStartSeconds);
                     else if (hasBase)
                         progressive = repBase;
                     else
@@ -159,7 +160,8 @@ public static class DashParser
         };
     }
 
-    private static SegmentPlan ExpandList(XElement list, Uri baseUrl, int max, double? periodSeconds, bool fmp4)
+    private static SegmentPlan ExpandList(XElement list, Uri baseUrl, int max, double? periodSeconds, bool fmp4,
+        double periodStartSeconds)
     {
         long timescale = long.TryParse(list.Attribute("timescale")?.Value, out var ts) && ts > 0 ? ts : 1;
         double segDuration = long.TryParse(list.Attribute("duration")?.Value, out var d) && d > 0 ? (double)d / timescale : 0;
@@ -181,7 +183,8 @@ public static class DashParser
             if (segs.Count >= max) throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
             string? media = su.Attribute("media")?.Value;
             var url = media is null ? baseUrl : DashTemplate.ResolveUrl(baseUrl, media);
-            segs.Add(new MediaSegment(url, segDuration, ParseRange(su.Attribute("mediaRange")?.Value)));
+            segs.Add(new MediaSegment(url, segDuration, ParseRange(su.Attribute("mediaRange")?.Value),
+                StartSeconds: periodStartSeconds + total));
             total += segDuration;
         }
         if (segs.Count == 0)

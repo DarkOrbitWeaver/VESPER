@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Vesper.Engine;
 
@@ -31,6 +32,8 @@ public sealed record MediaMergePlan
     public required IReadOnlyList<MergeTrack> Tracks { get; init; }
     public bool RequireAudio { get; init; } = true;
     public bool RequireVideo { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public MediaTimeRange? ClipRange { get; init; }
 
     public string ToJson() => JsonSerializer.Serialize(this);
     public long TotalBytes => Tracks.Where(t => t.Source is null).Sum(t => t.Size);
@@ -55,6 +58,7 @@ public sealed record MediaMergePlan
             var sb = new StringBuilder();
             sb.Append(Version).Append('|').Append(Provider).Append('|').Append(MediaId).Append('|').Append(OutputContainer)
               .Append('|').Append(RequireAudio).Append('|').Append(RequireVideo);
+            if (ClipRange is not null) sb.Append("|C:").Append(JsonSerializer.Serialize(ClipRange));
             foreach (var t in Tracks)
             {
                 sb.Append("|T:").Append(t.Role).Append(',').Append(t.FormatId).Append(',').Append(t.Size).Append(',')
@@ -95,6 +99,8 @@ public sealed record MediaMergePlan
                 || value.Tracks is not { Count: >= 1 and <= 4 }
                 || (value.Provider?.Length ?? 0) > 80 || (value.MediaId?.Length ?? 0) > 256) return false;
             bool segmented = value.Tracks.Any(track => track?.Source is not null);
+            if (value.ClipRange is { IsValid: false } || value.ClipRange is not null && !segmented) return false;
+            if (value.ClipRange is not null && value.Tracks.Any(track => track.Source?.Dash?.Fragments.Any(fragment => fragment.DurationSeconds is null) == true)) return false;
             if (segmented != (value.Version == 2) || (segmented && value.Tracks.Any(track => track?.Source is null))) return false;
             int videos = 0, audios = 0;
             foreach (var t in value.Tracks)

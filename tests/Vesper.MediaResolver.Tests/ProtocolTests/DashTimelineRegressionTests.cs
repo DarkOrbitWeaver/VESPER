@@ -43,4 +43,24 @@ public sealed class DashTimelineRegressionTests
         Assert.Equal("/init.mp4", plan.InitializationUrl!.AbsolutePath);
         Assert.Equal(new[] { "/new-1.m4s", "/new-2.m4s" }, plan.Segments.Select(s => s.Url.AbsolutePath));
     }
+
+    [Fact]
+    public void SegmentTimeline_RetainsPresentationTimesAndMarksGaps()
+    {
+        const string xml = """
+            <MPD mediaPresentationDuration="PT14S"><Period start="PT10S" duration="PT4S">
+              <AdaptationSet mimeType="video/mp4" contentType="video">
+                <SegmentTemplate timescale="1000" presentationTimeOffset="5000" initialization="init.mp4" media="s$Time$.m4s">
+                  <SegmentTimeline><S t="5000" d="2000"/><S t="8000" d="2000"/></SegmentTimeline>
+                </SegmentTemplate>
+                <Representation id="v" codecs="avc1.4d401e"/>
+              </AdaptationSet>
+            </Period></MPD>
+            """;
+
+        SegmentPlan plan = Assert.Single(DashParser.Parse(xml, Url).Representations).Segments!;
+
+        Assert.Equal([10d, 13d], plan.Segments.Select(segment => segment.StartSeconds));
+        Assert.True(plan.HasDiscontinuities);
+    }
 }

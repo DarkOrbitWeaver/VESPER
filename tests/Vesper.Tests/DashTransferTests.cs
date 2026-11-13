@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Vesper.Engine;
+using Vesper.MediaResolver.Protocols.Dash;
 
 namespace Vesper.Tests;
 
@@ -14,6 +15,27 @@ public sealed class DashTransferTests
     internal static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
     private static int Tag(byte[] bytes, string tag) => bytes.AsSpan().IndexOf(Encoding.ASCII.GetBytes(tag));
     private static byte[] Expected => [.. Fixture("av-init.mp4"), .. Fixture("av-1.m4s"), .. Fixture("av-2.m4s"), .. Fixture("av-3.m4s")];
+
+    [Fact]
+    public void DashTimeline_StoresPresentationBoundariesAndDetectsGaps()
+    {
+        const string xml = """
+            <MPD mediaPresentationDuration="PT14S"><Period start="PT10S" duration="PT4S">
+              <AdaptationSet mimeType="video/mp4" contentType="video">
+                <SegmentTemplate timescale="1000" presentationTimeOffset="5000" initialization="init.mp4" media="s$Time$.m4s">
+                  <SegmentTimeline><S t="5000" d="2000"/><S t="8000" d="2000"/></SegmentTimeline>
+                </SegmentTemplate>
+                <Representation id="v" codecs="avc1.4d401e"/>
+              </AdaptationSet>
+            </Period></MPD>
+            """;
+
+        var plan = Assert.Single(DashParser.Parse(xml, new Uri("https://cdn.example.com/manifest.mpd"))
+            .Representations).Segments!;
+
+        Assert.Equal([10d, 13d], plan.Segments.Select(segment => segment.StartSeconds));
+        Assert.True(plan.HasDiscontinuities);
+    }
 
     [Fact]
     public void ClearSourceMuxedFragments_HaveBothTracksAndContinuousTimelines()
@@ -137,6 +159,61 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public async Task DashTimeRange_UsesWholeFragmentsAndPreservesTheInitialization()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        DashDownloadPlan plan = server.Plan(ranges: false) with
+        {
+            Fragments = server.Plan(ranges: false).Fragments
+                .Select(fragment => fragment with { DurationSeconds = 1 }).ToArray(),
+            ClipRange = new MediaTimeRange(1.1, 1.8)
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "dash-clip.mp4",
+            Kind: JobKind.Dash, MediaPlanJson: plan.ToJson(), MediaProvider: "fixture", MediaId: "av",
+            MediaFormatId: plan.RepresentationId));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention);
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        byte[] expected = [.. Fixture("av-init.mp4"), .. Fixture("av-2.m4s")];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Equal(0, server.Hits("/av-1.m4s"));
+        Assert.Equal(1, server.Hits("/av-2.m4s"));
+        Assert.Equal(0, server.Hits("/av-3.m4s"));
+        Assert.Contains("Segment-aligned 00:00:01.000–00:00:02.000", done.MediaQuality);
+    }
+
+    [Fact]
+    public async Task DashTimeRange_RefusesToJoinFragmentsAcrossATimelineGap()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        DashDownloadPlan plan = server.Plan(ranges: false) with
+        {
+            Fragments =
+            [
+                new DashFragment(server.Url("/av-1.m4s"), DurationSeconds: 1, StartSeconds: 0),
+                new DashFragment(server.Url("/av-2.m4s"), DurationSeconds: 1, StartSeconds: 2)
+            ],
+            ClipRange = new MediaTimeRange(0.5, 2.5)
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "dash-gap.mp4",
+            Kind: JobKind.Dash, MediaPlanJson: plan.ToJson(), MediaProvider: "fixture", MediaId: "av",
+            MediaFormatId: plan.RepresentationId));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot rejected = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+
+        Assert.Equal("clip-range", rejected.Reason);
+        Assert.Equal(0, rejected.CommittedBytes);
+        Assert.Equal(0, server.Hits("/av-init.mp4"));
+        Assert.Equal(0, server.Hits("/av-1.m4s"));
+        Assert.Equal(0, server.Hits("/av-2.m4s"));
+    }
+
+    [Fact]
     public async Task SegmentedMerge_ResumesSeparateDashRenditionsAndRemuxesThem()
     {
         await using var server = await FixtureServer.StartAsync();
@@ -161,6 +238,24 @@ public sealed class DashTransferTests
         using var output = File.OpenRead(done.FinalPath!);
         Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
+    }
+
+    [Fact]
+    public async Task SegmentedDashMerge_UsesTheSameTimeWindowForBothRenditions()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        using var h = new Harness();
+        MediaMergePlan plan = SegmentedPlan(server) with { ClipRange = new MediaTimeRange(1.1, 1.8) };
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "dash-clip.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention);
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        Assert.Contains("Segment-aligned 00:00:01.000–00:00:02.000", done.MediaQuality);
+        foreach (string path in new[] { "/av-1.m4s", "/av-3.m4s" }) Assert.Equal(0, server.Hits(path));
+        Assert.Equal(2, server.Hits("/av-2.m4s"));
     }
 
     [Fact]
@@ -271,6 +366,8 @@ public sealed class DashTransferTests
         DashDownloadPlan video = server.Plan(ranges: false) with
         {
             RepresentationId = "video-source",
+            Fragments = server.Plan(ranges: false).Fragments
+                .Select(fragment => fragment with { DurationSeconds = 1 }).ToArray(),
             RequireAudio = false,
             RequireVideo = true
         };
@@ -278,7 +375,8 @@ public sealed class DashTransferTests
         {
             RepresentationId = "audio-source",
             Initialization = new DashFragment(server.Url("/av-init.mp4")),
-            Fragments = Enumerable.Range(1, 3).Select(i => new DashFragment(server.Url($"/av-{i}.m4s"))).ToArray(),
+            Fragments = Enumerable.Range(1, 3)
+                .Select(i => new DashFragment(server.Url($"/av-{i}.m4s"), DurationSeconds: 1)).ToArray(),
             RequireAudio = true,
             RequireVideo = false
         };

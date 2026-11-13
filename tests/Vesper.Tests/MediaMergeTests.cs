@@ -14,6 +14,21 @@ namespace Vesper.Tests;
 /// </summary>
 public sealed class MediaMergeTests
 {
+    [Fact]
+    public void MediaTimeRange_RequiresFullContinuousCoverage()
+    {
+        var range = new MediaTimeRange(0.5, 2.5);
+
+        Assert.False(range.TrySelect([1, 1], out _, out _, out _, out _));
+        Assert.False(new MediaTimeRange(1.5, 2.5).TrySelect([1, 1], new double?[] { 0, 2 }, out _, out _, out _, out _));
+        Assert.True(new MediaTimeRange(1.1, 1.8).TrySelect([1, 1, 1],
+            out int first, out int count, out double actualStart, out double actualEnd));
+        Assert.Equal(1, first);
+        Assert.Equal(1, count);
+        Assert.Equal(1, actualStart);
+        Assert.Equal(2, actualEnd);
+    }
+
     private static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
     private static byte[] AacFmp4() => [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
 
@@ -180,6 +195,13 @@ public sealed class MediaMergeTests
         Assert.Collection(plan.Tracks,
             track => Assert.Equal("hls", track.Source?.Protocol),
             track => Assert.Equal("hls", track.Source?.Protocol));
+
+        var clipped = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality,
+            clipStartSeconds: 1.1, clipEndSeconds: 2.2);
+        Assert.Null(clipped.Error);
+        Assert.True(MediaMergePlan.TryParse(clipped.Choice?.MediaPlanJson, false, out MediaMergePlan clippedPlan, out error), error);
+        Assert.Equal(new MediaTimeRange(1.1, 2.2), clippedPlan.ClipRange);
+        Assert.True(MediaTransferBridge.SupportsSegmentClip(clipped.Choice!));
     }
 
     [Fact]
@@ -210,6 +232,16 @@ public sealed class MediaMergeTests
         Assert.Collection(plan.Tracks,
             track => { Assert.Equal("dash", track.Source?.Protocol); Assert.True(track.Source?.Dash?.RequireVideo); },
             track => { Assert.Equal("dash", track.Source?.Protocol); Assert.True(track.Source?.Dash?.RequireAudio); });
+
+        var clipped = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality,
+            clipStartSeconds: 1.1, clipEndSeconds: 2.2);
+        Assert.Null(clipped.Error);
+        Assert.True(MediaMergePlan.TryParse(clipped.Choice?.MediaPlanJson, false, out MediaMergePlan clippedPlan, out error), error);
+        Assert.Equal(new MediaTimeRange(1.1, 2.2), clippedPlan.ClipRange);
+        Assert.All(clippedPlan.Tracks, track => Assert.All(track.Source!.Dash!.Fragments,
+            fragment => Assert.Equal(1d, fragment.DurationSeconds!.Value)));
+        Assert.Equal(new double?[] { 0, 1, 2 }, clippedPlan.Tracks[0].Source!.Dash!.Fragments.Select(fragment => fragment.StartSeconds));
+        Assert.True(MediaTransferBridge.SupportsSegmentClip(clipped.Choice!));
     }
 
     [Fact]
@@ -233,7 +265,8 @@ public sealed class MediaMergeTests
     private static SegmentPlan DashSegments(string id) => new()
     {
         InitializationUrl = new Uri($"https://cdn.example.com/{id}-init.mp4"), IsFragmentedMp4 = true,
-        Segments = [new MediaSegment(new Uri($"https://cdn.example.com/{id}-one.m4s"), 1)]
+        Segments = Enumerable.Range(1, 3).Select(i => new MediaSegment(
+            new Uri($"https://cdn.example.com/{id}-{i}.m4s"), 1, StartSeconds: i - 1)).ToArray()
     };
 
     [Fact]

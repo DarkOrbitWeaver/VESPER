@@ -375,6 +375,50 @@ public class HlsTests
     }
 
     [Fact]
+    public async Task HlsTimeRange_UsesWholeSegmentsAndKeepsTheInitializationSegment()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        const string root = "/hls/clip";
+        string path = root + "/index.m3u8";
+        string[] names = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
+        server.HlsFiles[root + "/init.mp4"] = DashTransferTests.Fixture("av-init.mp4");
+        foreach (string name in names) server.HlsFiles[root + "/" + name] = DashTransferTests.Fixture(name);
+        server.HlsPlaylists[path] = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            + string.Concat(names.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+
+        AddResult added = h.Engine.Add(new AddRequest(server.Url(path), FileName: "clip.mp4", Kind: JobKind.Hls,
+            MediaPlanJson: JsonSerializer.Serialize(new MediaTimeRange(1.1, 1.8))));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention);
+
+        Assert.Equal(JobState.Completed, done.State);
+        byte[] expected = [.. DashTransferTests.Fixture("av-init.mp4"), .. DashTransferTests.Fixture("av-2.m4s")];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Equal(0, server.Hits(root + "/av-1.m4s"));
+        Assert.Equal(1, server.Hits(root + "/av-2.m4s"));
+        Assert.Equal(0, server.Hits(root + "/av-3.m4s"));
+        Assert.Contains("Segment-aligned 00:00:01.000–00:00:02.000", done.MediaQuality);
+    }
+
+    [Fact]
+    public async Task HlsTimeRange_RejectsAWindowOutsideThePlaylist()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        const string path = "/hls/clip-invalid/index.m3u8";
+        server.HlsPlaylists[path] = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\ns0.ts\n#EXT-X-ENDLIST\n";
+        server.HlsFiles["/hls/clip-invalid/s0.ts"] = FaultServer.HlsSegment(0);
+        AddResult added = h.Engine.Add(new AddRequest(server.Url(path), FileName: "clip.ts", Kind: JobKind.Hls,
+            MediaPlanJson: JsonSerializer.Serialize(new MediaTimeRange(2, 3))));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot rejected = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+        Assert.Equal("clip-range", rejected.Reason);
+        Assert.Equal(0, rejected.CommittedBytes);
+        Assert.Equal(0, server.Hits("/hls/clip-invalid/s0.ts"));
+    }
+
+    [Fact]
     public async Task SegmentedMergeJob_MergesSeparateHlsFragmentedRenditions()
     {
         await using var server = new FaultServer(); await server.StartAsync();
@@ -409,6 +453,47 @@ public class HlsTests
         using var output = File.OpenRead(done.FinalPath!);
         Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
+    }
+
+    [Fact]
+    public async Task SegmentedHlsMerge_UsesOneSharedTimeWindowForBothRenditions()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        void AddFmp4Rendition(string root, string init, params string[] fragments)
+        {
+            server.HlsPlaylists[$"{root}/index.m3u8"] = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+                + string.Concat(fragments.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+            server.HlsFiles[$"{root}/init.mp4"] = DashTransferTests.Fixture(init);
+            foreach (string name in fragments) server.HlsFiles[$"{root}/{name}"] = DashTransferTests.Fixture(name);
+        }
+        AddFmp4Rendition("/hls/clip-merge/video", "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s");
+        AddFmp4Rendition("/hls/clip-merge/audio", "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s");
+        string videoUrl = server.Url("/hls/clip-merge/video/index.m3u8");
+        string audioUrl = server.Url("/hls/clip-merge/audio/index.m3u8");
+        var plan = new MediaMergePlan
+        {
+            Version = 2, OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            ClipRange = new MediaTimeRange(1.1, 1.8),
+            Tracks =
+            [
+                new MergeTrack("video", "hls-video", videoUrl, 0, "mp4", "h264", Source: new MergeMediaSource("hls", videoUrl)),
+                new MergeTrack("audio", "hls-audio", audioUrl, 0, "m4a", "aac", Source: new MergeMediaSource("hls", audioUrl))
+            ]
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(videoUrl, FileName: "hls-clip.mp4", Kind: JobKind.Merge,
+            MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention);
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        Assert.Contains("Segment-aligned 00:00:01.000–00:00:02.000", done.MediaQuality);
+        foreach (string root in new[] { "/hls/clip-merge/video", "/hls/clip-merge/audio" })
+        {
+            Assert.Equal(0, server.Hits(root + "/av-1.m4s"));
+            Assert.Equal(1, server.Hits(root + "/av-2.m4s"));
+            Assert.Equal(0, server.Hits(root + "/av-3.m4s"));
+        }
     }
 
     [Fact]
