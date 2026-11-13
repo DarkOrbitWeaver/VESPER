@@ -79,7 +79,7 @@ internal sealed partial class BrowserBridgeHandler
             int index = jobs.IndexOf(job);
             if (index < 0)
             {
-                long bytes = 2L * ((job.MediaPlanJson?.Length ?? 0) + job.Url.Length + 1024);
+                long bytes = 2L * ((job.MediaPlanJson?.Length ?? 0) + (job.MediaMetadataJson?.Length ?? 0) + job.Url.Length + 1024);
                 if (jobs.Count >= 64 || cacheBytes + bytes > 2 * 1024 * 1024) return null;
                 cacheBytes += bytes;
                 index = jobs.Count;
@@ -170,14 +170,15 @@ internal sealed partial class BrowserBridgeHandler
             : BridgeResponse.Fail(request.Id, "rejected", result.Message);
     }
 
-    private BridgeResult QueueMedia(MediaDownloadChoice job, bool queue, string requestId)
+    internal BridgeResult QueueMedia(MediaDownloadChoice job, bool queue, string requestId)
     {
         AddResult added = engine.Add(new AddRequest(job.Url, StartNow: !queue,
             FileName: job.FileName, Referer: job.Referer, UserAgent: job.UserAgent,
             Kind: job.Kind, RequestId: requestId, OriginalPageUrl: job.OriginalPageUrl,
             MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
             MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
-            MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId, Output: job.Output));
+            MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId, Output: job.Output,
+            MediaMetadataJson: job.MediaMetadataJson));
         string status = added.Status switch
         {
             AddStatus.Added => queue ? "queued" : "started",

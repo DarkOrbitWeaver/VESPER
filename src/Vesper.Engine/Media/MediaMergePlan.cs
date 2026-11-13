@@ -145,6 +145,26 @@ public sealed record MediaMergePlan
         catch (Exception ex) when (ex is JsonException or ArgumentException or BlockedAddressException or NotSupportedException) { return false; }
     }
 
+    internal static bool TryParseMetadata(string? json, out MediaMergeMetadata? metadata)
+    {
+        metadata = null;
+        if (json is not { Length: > 0 and <= 16_384 }) return false;
+        try
+        {
+            MediaMergeMetadata? value = JsonSerializer.Deserialize<MediaMergeMetadata>(json,
+                new JsonSerializerOptions { MaxDepth = 8 });
+            if (value is null || !ValidMetadata(value)) return false;
+            metadata = value;
+            return true;
+        }
+        catch (JsonException) { return false; }
+    }
+
+    internal static bool HasMp3TagValues(MediaMergeMetadata metadata) =>
+        metadata.Title is { Length: > 0 } || metadata.Artist is { Length: > 0 } || metadata.Album is { Length: > 0 }
+        || metadata.AlbumArtist is { Length: > 0 } || metadata.TrackNumber is not null || metadata.DiscNumber is not null
+        || metadata.ReleaseDate is { Length: > 0 };
+
     private static bool ValidSource(MergeTrack track, MergeMediaSource source, bool allowPrivate)
     {
         if (source.Protocol == "hls")
@@ -163,7 +183,7 @@ public sealed record MediaMergePlan
         return DashDownloadPlan.TryParse(JsonSerializer.Serialize(dash), allowPrivate, out _, out _);
     }
 
-    private static bool ValidMetadata(MediaMergeMetadata metadata)
+    internal static bool ValidMetadata(MediaMergeMetadata metadata)
     {
         if ((metadata.Title?.Length ?? 0) > 512 || (metadata.Uploader?.Length ?? 0) > 256
             || (metadata.Description?.Length ?? 0) > 8192 || metadata.Chapters is not { Count: <= 200 }

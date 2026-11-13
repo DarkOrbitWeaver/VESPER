@@ -54,5 +54,9 @@
   "video-only.webm": {
     "bytes": 5740,
     "sha256": "dd5bdbfe152d7870de66110e874e498a03fc57ba9bd1ed66824f1264ce9afeb0"
+  },
+  "quiet-track.mp3": {
+    "bytes": 3552,
+    "sha256": "51550a43c28927f6405424163a3562cdf2269cbe556e45981289fcefa4a4528"
   }
 }

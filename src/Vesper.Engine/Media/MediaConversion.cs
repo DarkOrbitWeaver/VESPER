@@ -6,14 +6,19 @@ namespace Vesper.Engine;
 
 public sealed partial class DownloadEngine
 {
-    private sealed record ConvertedFile(long Bytes, string Digest);
+    private sealed record PreparedMediaFile(long Bytes, string Digest, string Path, string FileName);
     private readonly SemaphoreSlim _conversionSlot = new(1);
 
     private static string OutputExtension(MediaOutput output) => output == MediaOutput.M4a ? ".m4a" : ".mp4";
     private static string ConversionPath(DownloadJob job) => job.PartialPath + ".convert.mp4";
     private static string ConversionAudioPath(DownloadJob job) => job.PartialPath + ".convert-audio.mp4";
+    private static string Mp3MetadataPath(DownloadJob job) => job.PartialPath + ".tagged.mp3";
 
-    private async Task<ConvertedFile?> ConvertMediaAsync(DownloadJob job, CancellationToken ct)
+    internal static string PublicationStagePath(DownloadJob job) =>
+        job.Output == MediaOutput.Original && job.MediaMetadataJson is not null
+            ? Mp3MetadataPath(job) : ConversionPath(job);
+
+    private async Task<PreparedMediaFile?> ConvertMediaAsync(DownloadJob job, CancellationToken ct)
     {
         if (job.ExpectedSha256 is not null) return null;
         UpdateJob(job, j => { j.State = JobState.Converting; j.Reason = ""; j.Message = "Preparing a file for more devices."; });
@@ -65,7 +70,8 @@ public sealed partial class DownloadEngine
             output.Position = 0;
             string digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             ready = true;
-            return new ConvertedFile(output.Length, digest);
+            return new PreparedMediaFile(output.Length, digest, stage,
+                Path.ChangeExtension(job.FileName, OutputExtension(job.Output)));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException or NotSupportedException
             or MediaContainerException or DllNotFoundException or EntryPointNotFoundException)
@@ -77,6 +83,81 @@ public sealed partial class DownloadEngine
         {
             if (owned && !ready) DeleteTemporaryFile(job, stage);
             _conversionSlot.Release();
+        }
+    }
+
+    private async Task<(PreparedMediaFile? File, string? Notice)> PrepareMp3OutputAsync(DownloadJob job, CancellationToken ct)
+    {
+        if (job.MediaMetadataJson is null) return (null, null);
+        if (job.Output != MediaOutput.Original || !string.Equals(Path.GetExtension(job.FileName), ".mp3", StringComparison.OrdinalIgnoreCase))
+            return (null, "Track tags were not added because the file name no longer uses the MP3 format.");
+        if (!MediaMergePlan.TryParseMetadata(job.MediaMetadataJson, out MediaMergeMetadata? metadata) || metadata is null)
+            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+
+        try
+        {
+            using var probe = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (Mp3MetadataWriter.HasId3v2Tag(probe))
+                return (null, "VESPER kept the MP3's existing tags unchanged; newly discovered details and artwork were not applied.");
+            if (!Mp3MetadataWriter.IsMpegLayer3(probe))
+                return (null, "VESPER could not safely add tags to this MP3; the original was saved unchanged.");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log(job.Id, "media-metadata", ex.Message);
+            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+        }
+
+        bool artworkRequested = !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl);
+        MediaThumbnail? cover = artworkRequested
+            ? await MediaThumbnail.FetchAsync(job.MediaThumbnailUrl, _http, Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
+            : null;
+        string? artworkNotice = artworkRequested && cover is null
+            ? "Track details were saved, but valid source artwork was unavailable."
+            : null;
+
+        string stage = Mp3MetadataPath(job);
+        if (!DeleteTemporaryFile(job, stage))
+            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+        bool owned = false;
+        bool ready = false;
+        try
+        {
+            if (PathSafety.Inspect(job.PartialPath) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
+                return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+
+            using var source = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var output = new FileStream(stage, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16,
+                FileOptions.SequentialScan);
+            owned = true;
+            Mp3MetadataWriteResult result = await Mp3MetadataWriter.TryWriteAsync(source, output, metadata, cover, ct).ConfigureAwait(false);
+            if (result != Mp3MetadataWriteResult.Written)
+            {
+                string notice = result switch
+                {
+                    Mp3MetadataWriteResult.ExistingTags => "VESPER kept the MP3's existing tags unchanged; newly discovered details and artwork were not applied.",
+                    Mp3MetadataWriteResult.NoTags => "No supported source details were available to embed; the original MP3 was saved unchanged.",
+                    _ => "VESPER could not safely add tags to this MP3; the original was saved unchanged."
+                };
+                if (result != Mp3MetadataWriteResult.ExistingTags && artworkNotice is not null)
+                    notice += " " + artworkNotice;
+                return (null, notice);
+            }
+
+            output.Flush(flushToDisk: true);
+            output.Position = 0;
+            string digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+            ready = true;
+            return (new PreparedMediaFile(output.Length, digest, stage, job.FileName), artworkNotice);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Log(job.Id, "media-metadata", ex.Message);
+            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+        }
+        finally
+        {
+            if (owned && !ready) DeleteTemporaryFile(job, stage);
         }
     }
 

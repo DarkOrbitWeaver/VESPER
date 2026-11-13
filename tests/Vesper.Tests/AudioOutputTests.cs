@@ -88,6 +88,61 @@ public sealed class AudioOutputTests
     }
 
     [Fact]
+    public void DirectBandcampMp3CarriesOnlySourceProvidedAudioTags()
+    {
+        var mp3 = new MediaRepresentation
+        {
+            Id = "bandcamp-mp3", Url = new Uri("https://cdn.example.com/song.mp3"),
+            Content = StreamContent.AudioOnly, Container = "mp3", AudioCodec = "mp3"
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://fixtureband.bandcamp.com/album/fixture-album"),
+            Provider = "bandcamp", MediaId = "1001", Kind = MediaKind.Audio,
+            Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album", AlbumArtist = "Fixture Band",
+            TrackNumber = 2, DiscNumber = 1, ReleaseDate = "2024-03-12",
+            Thumbnail = new Uri("https://f4.bcbits.com/img/a123456_10.jpg"), Representations = [mp3]
+        };
+
+        MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(
+            MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly).Choice);
+
+        Assert.Equal(JobKind.Http, choice.Kind);
+        Assert.Equal("Song One.mp3", choice.FileName);
+        Assert.NotNull(choice.MediaMetadataJson);
+        Assert.True(MediaMergePlan.TryParseMetadata(choice.MediaMetadataJson, out MediaMergeMetadata? metadata));
+        Assert.Equal("Fixture Band", metadata!.Artist);
+        Assert.Equal("Fixture Album", metadata.Album);
+        Assert.Equal(2, metadata.TrackNumber);
+        Assert.Equal("2024-03-12", metadata.ReleaseDate);
+        Assert.Equal("https://f4.bcbits.com/img/a123456_10.jpg", choice.ThumbnailUrl);
+    }
+
+    [Fact]
+    public void DirectAudioMp3CanCarrySourceCoverWithoutInventedTextTags()
+    {
+        var mp3 = new MediaRepresentation
+        {
+            Id = "bandcamp-mp3", Url = new Uri("https://cdn.example.com/song.mp3"),
+            Content = StreamContent.AudioOnly, Container = "mp3", AudioCodec = "mp3"
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://bandcamp.com/track/untitled"), Provider = "bandcamp", Kind = MediaKind.Audio,
+            Thumbnail = new Uri("https://cdn.example.com/cover.png"), Representations = [mp3]
+        };
+
+        MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(
+            MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly).Choice);
+
+        Assert.NotNull(choice.MediaMetadataJson);
+        Assert.True(MediaMergePlan.TryParseMetadata(choice.MediaMetadataJson, out MediaMergeMetadata? metadata));
+        Assert.Null(metadata!.Title);
+        Assert.Null(metadata.Artist);
+        Assert.Null(metadata.Album);
+    }
+
+    [Fact]
     public void Audio_track_selection_is_exact_and_does_not_fall_back_to_another_track()
     {
         var english = Audio("english", "aac", "m4a", 128) with { AudioTrackId = "en-main", AudioLanguage = "en" };

@@ -14,7 +14,7 @@ internal sealed record MediaDownloadChoice(
     string? Quality = null, string? ThumbnailUrl = null, DateTimeOffset? ExpiresAt = null,
     string? MediaPlanJson = null, string? FormatId = null, MediaOutput Output = MediaOutput.Original,
     string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null,
-    IReadOnlyList<SubtitleTrack>? SubtitleTracks = null)
+    IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null)
 {
     public string DisplayContainer => Output switch
     {
@@ -253,7 +253,10 @@ internal static class MediaTransferBridge
             step.Context.Referer, step.Context.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
             item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
-            SubtitleTracks: subtitles), null);
+            SubtitleTracks: subtitles,
+            MediaMetadataJson: step.Protocol == StreamProtocol.Http && item.Kind == MediaKind.Audio
+                && string.Equals(step.Container, "mp3", StringComparison.OrdinalIgnoreCase)
+                    ? SerializeAudioMetadata(item) : null), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
@@ -355,6 +358,21 @@ internal static class MediaTransferBridge
             ? null : metadata;
     }
 
+    private static string? SerializeAudioMetadata(MediaItem item)
+    {
+        MediaMergeMetadata? metadata = MergeMetadata(item, includeChapters: false);
+        if (metadata is null)
+        {
+            if (item.Thumbnail is null) return null;
+            metadata = new MediaMergeMetadata();
+        }
+        metadata = metadata with { Uploader = null, Description = null, Duration = null, Chapters = [] };
+        if (metadata.Title is null && metadata.Artist is null && metadata.Album is null && metadata.AlbumArtist is null
+            && metadata.TrackNumber is null && metadata.DiscNumber is null && metadata.ReleaseDate is null
+            && item.Thumbnail is null) return null;
+        return JsonSerializer.Serialize(metadata);
+    }
+
     private static bool ValidChapters(IReadOnlyList<MediaMergeChapter> chapters, TimeSpan? duration)
     {
         TimeSpan previousStart = TimeSpan.MinValue;
@@ -429,7 +447,8 @@ internal static class MediaTransferBridge
                     Output = MediaOutput.Original,
                     ConvertedVideoQuality = null,
                     ConvertedAudioCodec = null,
-                    SubtitleTracks = null
+                    SubtitleTracks = null,
+                    MediaMetadataJson = null
                 });
             }
         }

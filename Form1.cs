@@ -735,7 +735,8 @@ public partial class Form1 : Form
                 Kind: media.Kind, OriginalPageUrl: media.OriginalPageUrl,
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
-                MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId, Output: media.Output));
+                MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId,
+                Output: media.Output, MediaMetadataJson: media.MediaMetadataJson));
             Record(result, media.Url);
         }
         foreach (string url in dialog.DownloadUrls)
