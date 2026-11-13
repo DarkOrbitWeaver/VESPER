@@ -13,7 +13,8 @@ internal sealed record MediaDownloadChoice(
     string? OriginalPageUrl = null, string? Provider = null, string? MediaId = null,
     string? Quality = null, string? ThumbnailUrl = null, DateTimeOffset? ExpiresAt = null,
     string? MediaPlanJson = null, string? FormatId = null, MediaOutput Output = MediaOutput.Original,
-    string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null)
+    string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null,
+    IReadOnlyList<SubtitleTrack>? SubtitleTracks = null)
 {
     public string DisplayContainer => Output switch
     {
@@ -166,6 +167,12 @@ internal static class MediaTransferBridge
                 selection = null;
                 return (null, "The selected audio track isn't available in this exact format.");
             }
+            FormatSelection? subtitleSelection = FormatSelector.Select(item with { Representations = [exact] },
+                new FormatPreferences
+                {
+                    SubtitleLanguages = prefs.SubtitleLanguages,
+                    IncludeAutoSubtitles = prefs.IncludeAutoSubtitles
+                }).Selection;
             selection = new FormatSelection
             {
                 Video = exact.Content == StreamContent.AudioOnly ? null : exact,
@@ -175,7 +182,8 @@ internal static class MediaTransferBridge
                 EstimatedSize = exact.FileSize,
                 Summary = exact.Content == StreamContent.AudioOnly
                     ? $"audio {exact.AudioCodec ?? exact.Container ?? ""} {(exact.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
-                    : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}"
+                    : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}",
+                Subtitles = subtitleSelection?.Subtitles ?? []
             };
         }
         else selection = FormatSelector.Select(PlayableOnly(item), prefs).Selection;
@@ -186,6 +194,11 @@ internal static class MediaTransferBridge
         PlanResult planResult = DownloadPlanBuilder.Build(item, selection);
         if (planResult.Plan is not { } plan)
             return (null, planResult.Error?.UserMessage ?? "This format isn't ready to download.");
+        IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
+        if (subtitles.Count != selection.Subtitles.Count)
+            return (null, "A selected subtitle link failed source validation.");
+        if (subtitles.Any(subtitle => !IsDirectSubtitle(subtitle)))
+            return (null, "This subtitle uses segmented transport that VESPER can't save as a sidecar yet.");
 
         if (selection.NeedsMuxing)
         {
@@ -239,7 +252,8 @@ internal static class MediaTransferBridge
             step.Protocol == StreamProtocol.Hls ? JobKind.Hls : step.Protocol == StreamProtocol.Dash ? JobKind.Dash : JobKind.Http,
             step.Context.Referer, step.Context.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
-            item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id), null);
+            item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
+            SubtitleTracks: subtitles), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
@@ -247,6 +261,11 @@ internal static class MediaTransferBridge
         DownloadPlan plan, IReadOnlyList<MediaRepresentation> tracks, string container,
         double? clipStartSeconds, double? clipEndSeconds)
     {
+        IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
+        if (subtitles.Count != selection.Subtitles.Count)
+            return (null, "A selected subtitle link failed source validation.");
+        if (subtitles.Any(subtitle => !IsDirectSubtitle(subtitle)))
+            return (null, "This subtitle uses segmented transport that VESPER can't save as a sidecar yet.");
         if (clipStartSeconds is not null && (tracks.Count != 2
             || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
@@ -302,7 +321,48 @@ internal static class MediaTransferBridge
         string summary = DisplayQuality(selection.Summary);
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
-            merge.ToJson(), string.Join("+", tracks.Select(t => t.Id))), null);
+            merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles), null);
+    }
+
+    private static IReadOnlyList<SubtitleTrack> ValidatedSubtitles(FormatSelection selection, DownloadPlan plan) =>
+        selection.Subtitles.Where(subtitle => plan.Subtitles.Any(step => step.Url == subtitle.Url
+            && step.Container == subtitle.Format)).ToArray();
+
+    internal static bool IsDirectSubtitle(SubtitleTrack track) =>
+        track.Format.ToLowerInvariant() is "vtt" or "srt" or "ttml";
+
+    internal static IReadOnlyList<MediaDownloadChoice> ExpandSubtitleChoices(IEnumerable<MediaDownloadChoice> choices)
+    {
+        var expanded = new List<MediaDownloadChoice>();
+        foreach (MediaDownloadChoice choice in choices)
+        {
+            expanded.Add(choice with { SubtitleTracks = null });
+            foreach (SubtitleTrack subtitle in choice.SubtitleTracks ?? [])
+            {
+                if (!IsDirectSubtitle(subtitle)) continue;
+                string language = Vesper.MediaResolver.Utilities.TextUtil.NormalizeLang(subtitle.Language);
+                string fileName = FileNames.Sanitize(
+                    $"{Path.GetFileNameWithoutExtension(choice.FileName)}.{language}.{subtitle.Format.ToLowerInvariant()}");
+                expanded.Add(choice with
+                {
+                    Url = subtitle.Url.AbsoluteUri,
+                    FileName = fileName,
+                    Kind = JobKind.Http,
+                    Provider = null,
+                    MediaId = null,
+                    Quality = $"Subtitle · {language}",
+                    ThumbnailUrl = null,
+                    ExpiresAt = null,
+                    MediaPlanJson = null,
+                    FormatId = null,
+                    Output = MediaOutput.Original,
+                    ConvertedVideoQuality = null,
+                    ConvertedAudioCodec = null,
+                    SubtitleTracks = null
+                });
+            }
+        }
+        return expanded;
     }
 
     internal static bool SupportsSegmentClip(MediaDownloadChoice choice)

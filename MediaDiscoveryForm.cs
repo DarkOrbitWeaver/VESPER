@@ -7,6 +7,7 @@ using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Playlists;
+using Vesper.MediaResolver.Utilities;
 using QualityMode = Vesper.MediaResolver.Formats.QualityMode;
 
 namespace VESPER;
@@ -44,6 +45,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperChoice _outputChoice;
     private readonly VesperChoice _audioOutputChoice;
     private readonly VesperChoice _audioTrack;
+    private readonly VesperChoice _subtitleTrack;
     private readonly VesperChoice _customFormat;
     private readonly CheckBox _clipCheck;
     private readonly Label _clipStartLabel;
@@ -59,6 +61,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperButton _cancel;
     private readonly List<MediaRepresentation> _playableFormats = [];
     private AudioTrack[] _audioTrackOptions = [];
+    private SubtitleTrack[] _subtitleTrackOptions = [];
     private readonly Panel _presetOptions;
     private readonly List<MediaQualityOption> _presets = [];
     private readonly MediaItem? _sample;
@@ -153,11 +156,21 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             UpdateChoiceSummary();
             FitToContent();
         };
+        _subtitleTrack = new VesperChoice { AccessibleName = "Subtitle language" };
+        _subtitleTrack.ApplyPalette(_colors);
+        _subtitleTrack.SelectedIndexChanged += (_, _) =>
+        {
+            if (_state != ViewState.Ready || _item is null) return;
+            RefreshPresets(_item);
+            UpdateChoiceSummary();
+            FitToContent();
+        };
         _customLabel = L("Exact available format", 8.5f, muted: true);
         _customFormat = new VesperChoice { AccessibleName = "Exact format", Symbol = VesperIcon.Layers };
         _customFormat.ApplyPalette(_colors);
         _customFormat.SelectedIndexChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
-        _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice, _audioTrack, _customLabel, _customFormat]);
+        _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice,
+            _audioTrack, _subtitleTrack, _customLabel, _customFormat]);
         _clipCheck = new CheckBox
         {
             Text = "Time range", AccessibleName = "Download a time range", AutoSize = false,
@@ -320,11 +333,19 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             int outputWidth = Math.Min(S(132), contentWidth / 2);
             Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
-            if (_audioTrack.Visible)
+            if (_audioTrack.Visible && _subtitleTrack.Visible)
+            {
+                int trackAreaWidth = contentWidth - (_outputChoice.Visible || _audioOutputChoice.Visible ? outputWidth + S(8) : 0);
+                int choiceWidth = (trackAreaWidth - S(8)) / 2;
+                Place(_audioTrack, margin, 181, choiceWidth, 28);
+                Place(_subtitleTrack, margin + choiceWidth + S(8), 181, choiceWidth, 28);
+            }
+            else if (_audioTrack.Visible || _subtitleTrack.Visible)
             {
                 int trackAreaWidth = contentWidth - (_outputChoice.Visible || _audioOutputChoice.Visible ? outputWidth + S(8) : 0);
                 Place(_qualityLabel, margin, 181, S(96), 26);
-                Place(_audioTrack, margin + S(96), 181, trackAreaWidth - S(96), 28);
+                Place(_audioTrack.Visible ? _audioTrack : _subtitleTrack,
+                    margin + S(96), 181, trackAreaWidth - S(96), 28);
             }
             else
                 Place(_qualityLabel, margin, 181, contentWidth - outputWidth - S(8), 26);
@@ -611,6 +632,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
         _item = item with { Representations = _playableFormats.ToArray() };
         ConfigureAudioTracks(_item);
+        ConfigureSubtitleTracks(_item);
 
         string[] options = _playableFormats.Select(r =>
         {
@@ -649,7 +671,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             FormatPreferences.SmallestSuitable, FormatPreferences.AudioOnly];
         for (int i = 0; i < preferences.Length; i++)
         {
-            FormatPreferences selected = WithSelectedAudioTrack(preferences[i]);
+            FormatPreferences selected = WithSelectedTracks(preferences[i]);
             var result = Prepare(item, selected, output: OutputPreference(selected));
             if (result.Choice is { } choice)
                 _presets[i].SetFormat(choice.DisplayDetail, choice.DisplayContainer, available: true);
@@ -685,8 +707,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         bool custom = IsExactFormat && _playableFormats.Count > 0;
         bool hasTrackChoice = _state == ViewState.Ready && _audioTrackOptions.Length > 1;
+        bool hasSubtitleChoice = _state == ViewState.Ready && _subtitleTrackOptions.Length > 0;
         _audioTrack.Visible = hasTrackChoice;
-        _qualityLabel.Text = hasTrackChoice ? "Audio track" : "Quality";
+        _subtitleTrack.Visible = hasSubtitleChoice;
+        _qualityLabel.Visible = (_state == ViewState.Ready || _state == ViewState.Collection) && !(hasTrackChoice && hasSubtitleChoice);
+        _qualityLabel.Text = hasTrackChoice ? "Audio track" : hasSubtitleChoice ? "Subtitles" : "Quality";
         _customLabel.Visible = _customFormat.Visible = custom;
         _customFormat.Enabled = custom && !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
@@ -716,6 +741,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             if (_clipCheck.Checked)
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
                     + "Uses complete HLS/DASH segments; the saved format shows the actual boundaries.";
+            if (choice.SubtitleTracks is { Count: > 0 })
+                _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
+                    + "Subtitles will be saved as a separate language file.";
         }
         else
             _notice.Text = result.Error ?? "This preference isn't available for the source.";
@@ -779,18 +807,27 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private FormatPreferences CurrentPreferences() => (_state == ViewState.Collection ? _quality.SelectedIndex : _presetIndex) switch
     {
-        1 => WithSelectedAudioTrack(FormatPreferences.BalancedQuality),
-        2 => WithSelectedAudioTrack(FormatPreferences.SmallestSuitable),
-        3 => WithSelectedAudioTrack(FormatPreferences.AudioOnly),
-        _ => WithSelectedAudioTrack(FormatPreferences.BestQuality)
+        1 => WithSelectedTracks(FormatPreferences.BalancedQuality),
+        2 => WithSelectedTracks(FormatPreferences.SmallestSuitable),
+        3 => WithSelectedTracks(FormatPreferences.AudioOnly),
+        _ => WithSelectedTracks(FormatPreferences.BestQuality)
     };
 
-    private FormatPreferences WithSelectedAudioTrack(FormatPreferences preferences)
+    private FormatPreferences WithSelectedTracks(FormatPreferences preferences)
     {
         string? trackId = _state == ViewState.Ready && _audioTrack.Visible && _audioTrack.SelectedIndex > 0
             && _audioTrack.SelectedIndex <= _audioTrackOptions.Length
                 ? _audioTrackOptions[_audioTrack.SelectedIndex - 1].Id : null;
-        return preferences with { AudioTrackId = trackId };
+        SubtitleTrack? subtitle = _state == ViewState.Ready && _subtitleTrack.Visible && _subtitleTrack.SelectedIndex > 0
+            && _subtitleTrack.SelectedIndex <= _subtitleTrackOptions.Length
+                ? _subtitleTrackOptions[_subtitleTrack.SelectedIndex - 1] : null;
+        IReadOnlyList<string> languages = subtitle is null ? [] : [TextUtil.NormalizeLang(subtitle.Language)];
+        return preferences with
+        {
+            AudioTrackId = trackId,
+            SubtitleLanguages = languages,
+            IncludeAutoSubtitles = subtitle?.IsAutoGenerated == true
+        };
     }
 
     private void ConfigureAudioTracks(MediaItem item)
@@ -820,6 +857,20 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _audioTrack.SetItems(["Automatic", .. labels]);
     }
 
+    private void ConfigureSubtitleTracks(MediaItem item)
+    {
+        _subtitleTrackOptions = item.Subtitles
+            .Where(MediaTransferBridge.IsDirectSubtitle)
+            .GroupBy(subtitle => TextUtil.NormalizeLang(subtitle.Language), StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderBy(subtitle => subtitle.IsAutoGenerated)
+                .ThenBy(subtitle => subtitle.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(subtitle => subtitle.Url.AbsoluteUri, StringComparer.Ordinal)
+                .First())
+            .OrderBy(subtitle => TextUtil.NormalizeLang(subtitle.Language), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        _subtitleTrack.SetItems(["Subtitles: Off", .. _subtitleTrackOptions.Select(SubtitleTrackLabel)]);
+    }
+
     private static string AudioTrackLabel(AudioTrack track)
     {
         string label = track.Name ?? track.Language ?? "Audio track";
@@ -829,7 +880,17 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         if (track.Channels is { } channels) details.Add($"{channels} ch");
         if (track.Codec is { Length: > 0 } codec) details.Add(codec.ToUpperInvariant());
         if (track.IsDefault) details.Add("default");
-        return details.Count == 0 ? label : label + " · " + string.Join(" · ", details);
+        return "Audio: " + (details.Count == 0 ? label : label + " · " + string.Join(" · ", details));
+    }
+
+    private static string SubtitleTrackLabel(SubtitleTrack track)
+    {
+        string language = TextUtil.NormalizeLang(track.Language);
+        string name = TextUtil.Clip(track.Name, 80);
+        string label = name.Length > 0 && !string.Equals(name, language, StringComparison.OrdinalIgnoreCase)
+            ? language + " · " + name : language;
+        if (track.IsAutoGenerated) label += " · generated";
+        return "Subtitles: " + label;
     }
 
     private async Task LoadCollectionAsync()
@@ -951,7 +1012,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 _status.Text = "Preview selection prepared. Sample data stays offline.";
                 return;
             }
-            Selections = jobs;
+            Selections = MediaTransferBridge.ExpandSubtitleChoices(jobs);
             QueueOnly = queueOnly;
             DialogResult = DialogResult.OK;
             Close();
@@ -979,6 +1040,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _entries.Enabled = !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
         _audioTrack.Enabled = !_busy;
+        _subtitleTrack.Enabled = !_busy;
         _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
         _outputChoice.Enabled = !_busy;
         _audioOutputChoice.Enabled = !_busy;
