@@ -7,6 +7,37 @@ namespace Vesper.Tests;
 public class SequentialAndResumeTests
 {
     [Fact]
+    public async Task Closing_the_schedule_does_not_cancel_finalization()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        using var h = new Harness(point =>
+        {
+            if (point != "finalize.afterFlush") return;
+            entered.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("The finalization test was not released.");
+        });
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        Guid id = h.Add(server.Url("/file"), "scheduled.bin");
+
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)), "The download did not reach finalization.");
+            Assert.Equal(JobState.Finalizing, h.Engine.Snapshot(id)!.State);
+            TimeOnly now = TimeOnly.FromDateTime(DateTime.Now);
+            var closed = new SchedulePolicy(true, now.AddHours(1), now.AddHours(2));
+            Assert.False(closed.IsOpen(DateTime.Now));
+            h.Engine.Options.Schedule = closed;
+            h.Engine.SettingsChanged();
+        }
+        finally { release.Set(); }
+
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
     public async Task A_plain_download_produces_identical_bytes_and_the_expected_state()
     {
         await using var server = new FaultServer(); await server.StartAsync();

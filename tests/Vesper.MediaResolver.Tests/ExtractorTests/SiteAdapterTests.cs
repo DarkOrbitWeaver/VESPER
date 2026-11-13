@@ -541,7 +541,8 @@ public class SiteAdapterTests
         var ctx = item.Representations[0].Context;
         Assert.Equal("tt_chain_token=abc", ctx.CookieHeader);
         Assert.Contains("tiktok.com", ctx.CredentialHosts);
-        Assert.False(ctx.MayForwardCredentialsTo("evil.example.net"));
+        Assert.Equal(new Uri("https://www.tiktok.com/"), ctx.CredentialOrigin);
+        Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://evil.example.net/")));
     }
 
     [Fact]

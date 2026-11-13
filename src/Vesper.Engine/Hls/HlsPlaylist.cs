@@ -11,8 +11,9 @@ public sealed class HlsMedia
 {
     public List<HlsSegment> Segments { get; } = [];
     public bool IsVod { get; set; }
-    /// <summary>Set when the playlist uses protection VESPER will not (and must not) work around.</summary>
+    /// <summary>Set when the playlist uses a feature VESPER does not support.</summary>
     public string? Unsupported { get; set; }
+    public string UnsupportedReasonCode { get; set; } = "unsupported";
     public double TotalSeconds => Segments.Sum(s => s.Duration);
 }
 
@@ -77,19 +78,19 @@ public static class HlsParser
                 long.TryParse(line["#EXT-X-MEDIA-SEQUENCE:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out sequence);
             else if (line.StartsWith("#EXT-X-ENDLIST", StringComparison.Ordinal)) media.IsVod = true;
             else if (line is "#EXT-X-DISCONTINUITY" or "#EXT-X-GAP" or "#EXT-X-I-FRAMES-ONLY")
-                media.Unsupported = "Discontinuous, missing or I-frame-only media requires processing that is not supported.";
+                SetUnsupported(media, "Discontinuous, missing or I-frame-only media requires processing that is not supported.");
             else if (line.StartsWith("#EXTINF:", StringComparison.Ordinal))
                 double.TryParse(line["#EXTINF:".Length..].Split(',')[0], NumberStyles.Float, CultureInfo.InvariantCulture, out duration);
             else if (line.StartsWith("#EXT-X-BYTERANGE:", StringComparison.Ordinal))
             {
                 string[] parts = line["#EXT-X-BYTERANGE:".Length..].Split('@');
                 if (parts.Length > 2 || !long.TryParse(parts[0], out long len) || len <= 0)
-                    media.Unsupported = "The playlist contains an invalid byte-range length.";
+                    SetUnsupported(media, "The playlist contains an invalid byte-range length.");
                 else rangeLength = len;
                 implicitRange = parts.Length == 1;
                 if (implicitRange) rangeOffset = nextOffset;
                 else if (long.TryParse(parts[1], out long off) && off >= 0) rangeOffset = off;
-                else media.Unsupported = "The playlist contains an invalid byte-range offset.";
+                else SetUnsupported(media, "The playlist contains an invalid byte-range offset.");
             }
             else if (line.StartsWith("#EXT-X-KEY:", StringComparison.Ordinal))
             {
@@ -100,10 +101,20 @@ public static class HlsParser
                 else if (method == "AES-128" && format == "identity")
                 {
                     byte[]? iv = ParseIv(a.GetValueOrDefault("IV"));
-                    if (a.ContainsKey("IV") && iv is null) media.Unsupported = "The AES-128 IV is invalid.";
-                    key = new HlsKey(a.GetValueOrDefault("URI") is { } k ? new Uri(baseUri, k).AbsoluteUri : null, iv);
+                    if (a.ContainsKey("IV") && iv is null)
+                        SetUnsupported(media, "The AES-128 IV is invalid.", "key");
+                    string? keyUri = null;
+                    if (a.GetValueOrDefault("URI") is not { } value || !TryResolveHttpUri(baseUri, value, out keyUri))
+                        SetUnsupported(media, "The AES-128 key address is invalid or missing.", "key");
+                    key = new HlsKey(keyUri, iv);
                 }
-                else media.Unsupported = $"The stream uses protection that VESPER does not support ({method}/{format}).";
+                else
+                {
+                    bool drm = !string.Equals(format, "identity", StringComparison.OrdinalIgnoreCase);
+                    SetUnsupported(media,
+                        $"The stream uses protection that VESPER does not support ({method}/{format}).",
+                        drm ? "drm" : "unsupported");
+                }
             }
             else if (line.StartsWith("#EXT-X-MAP:", StringComparison.Ordinal))
             {
@@ -112,23 +123,29 @@ public static class HlsParser
                 if (a.GetValueOrDefault("BYTERANGE")?.Split('@') is { } br)
                 {
                     if (br.Length != 2 || !long.TryParse(br[0], out long l) || l <= 0 || !long.TryParse(br[1], out long o) || o < 0 || o > long.MaxValue - l)
-                        media.Unsupported = "An initialization byte range needs a valid explicit offset.";
+                        SetUnsupported(media, "An initialization byte range needs a valid explicit offset.");
                     else { length = l; offset = o; }
                 }
-                if (!a.TryGetValue("URI", out string? mapUrl)) media.Unsupported = "Initialization has no URI.";
-                else map = new HlsMap(new Uri(baseUri, mapUrl).AbsoluteUri, length, offset, key);
-                if (key is { Iv: null }) media.Unsupported = "Encrypted initialization requires an explicit AES IV.";
+                if (!a.TryGetValue("URI", out string? mapUrl)
+                    || !TryResolveHttpUri(baseUri, mapUrl, out string resolvedMapUrl))
+                    SetUnsupported(media, "Initialization has an invalid or missing URI.");
+                else map = new HlsMap(resolvedMapUrl, length, offset, key);
+                if (key is { Iv: null }) SetUnsupported(media, "Encrypted initialization requires an explicit AES IV.", "key");
             }
             else if (!line.StartsWith('#'))
             {
-                string resource = new Uri(baseUri, line).AbsoluteUri;
-                if (media.Segments.Count >= 50_000) { media.Unsupported = "The playlist exceeds the segment limit."; break; }
-                if (duration <= 0 || !double.IsFinite(duration)) media.Unsupported = "A segment has no valid finite duration.";
+                if (!TryResolveHttpUri(baseUri, line, out string resource))
+                {
+                    SetUnsupported(media, "A media segment address is invalid.");
+                    break;
+                }
+                if (media.Segments.Count >= 50_000) { SetUnsupported(media, "The playlist exceeds the segment limit."); break; }
+                if (duration <= 0 || !double.IsFinite(duration)) SetUnsupported(media, "A segment has no valid finite duration.");
                 if (implicitRange && (previousResource != resource || nextOffset is null))
-                    media.Unsupported = "An implicit byte range must follow a range of the same resource.";
+                    SetUnsupported(media, "An implicit byte range must follow a range of the same resource.");
                 if (rangeLength is long rl && rangeOffset is long ro)
                 {
-                    if (ro > long.MaxValue - rl) media.Unsupported = "A byte range overflows.";
+                    if (ro > long.MaxValue - rl) SetUnsupported(media, "A byte range overflows.");
                     else nextOffset = ro + rl;
                 }
                 else nextOffset = null;
@@ -139,6 +156,31 @@ public static class HlsParser
             }
         }
         return media;
+    }
+
+    public static bool IsDrmSessionKey(string line)
+    {
+        Dictionary<string, string> attributes = Attributes(line);
+        return attributes.TryGetValue("KEYFORMAT", out string? format)
+            && !string.Equals(format, "identity", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryResolveHttpUri(Uri baseUri, string value, out string absoluteUri)
+    {
+        absoluteUri = "";
+        if (!Uri.TryCreate(baseUri, value, out Uri? resolved)
+            || !UrlPolicy.TryParse(resolved.AbsoluteUri, out _, out _))
+            return false;
+
+        absoluteUri = resolved.AbsoluteUri;
+        return true;
+    }
+
+    private static void SetUnsupported(HlsMedia media, string reason, string code = "unsupported")
+    {
+        if (media.Unsupported is not null && code != "drm") return;
+        media.Unsupported = reason;
+        media.UnsupportedReasonCode = code;
     }
 
     private static byte[]? ParseIv(string? text)

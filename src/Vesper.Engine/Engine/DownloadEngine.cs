@@ -234,7 +234,8 @@ public sealed partial class DownloadEngine : IDisposable
             }
             else
             {
-                foreach (JobSession session in _sessions.Values.Where(s => !_forced.Contains(s.Job.Id)))
+                foreach (JobSession session in _sessions.Values.Where(s => !_forced.Contains(s.Job.Id)
+                    && s.Job.State is not (JobState.Verifying or JobState.Converting or JobState.Finalizing)))
                 {
                     session.Intent = StopIntent.Window;
                     session.Cts.Cancel();

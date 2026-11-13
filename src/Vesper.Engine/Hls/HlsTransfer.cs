@@ -31,8 +31,13 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (!HlsParser.IsPlaylist(text)) return RunOutcome.NeedsAttention("not-playlist", "The address did not return an HLS playlist.");
         if (HlsParser.IsMaster(text))
         {
-            if (text.Split('\n').Any(l => l.Trim().StartsWith("#EXT-X-SESSION-KEY:", StringComparison.Ordinal)))
-                return RunOutcome.NeedsAttention("drm", "Master session keys are not supported; no protection is bypassed.");
+            string[] sessionKeys = text.Split('\n').Select(line => line.Trim())
+                .Where(line => line.StartsWith("#EXT-X-SESSION-KEY:", StringComparison.Ordinal)).ToArray();
+            if (sessionKeys.Length > 0)
+            {
+                string reasonCode = sessionKeys.Any(HlsParser.IsDrmSessionKey) ? "drm" : "unsupported";
+                return RunOutcome.NeedsAttention(reasonCode, "Master session keys are not supported.");
+            }
             IReadOnlyList<HlsVariant> usable = [.. HlsParser.ParseMaster(text, baseUri).Where(v => !v.NeedsSeparateAudio)];
             if (usable.Count == 0)
                 return RunOutcome.NeedsAttention("separate-audio", "Every quality keeps audio separate; VESPER does not include a verified muxer for this combination.");
@@ -41,10 +46,10 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         }
         playlistUrl = baseUri.AbsoluteUri;
         HlsMedia media = HlsParser.ParseMedia(text, baseUri);
-        if (media.Unsupported is { } reason) return RunOutcome.NeedsAttention("drm", reason);
+        if (media.Unsupported is { } reason) return RunOutcome.NeedsAttention(media.UnsupportedReasonCode, reason);
         if (!media.IsVod) return RunOutcome.NeedsAttention("live", "The playlist is not ended. VESPER downloads completed VOD playlists only.");
         if (media.Segments.Count == 0) return RunOutcome.Failed("empty", "The playlist contains no media segments.");
-        if (media.Segments.Select(segment => segment.Map).Distinct().Count() > 1)
+        if (media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
             return RunOutcome.NeedsAttention("unsupported", "Initialization URI, byte range or encryption changes part-way. A remux is required; saved data was kept.");
         string planHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(media.Segments))));
         int next = cursor?.Next ?? 0;
@@ -222,7 +227,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (key.Uri is null) throw new RunnerStop(RunOutcome.NeedsAttention("key", "An encrypted stream has no key address."));
         if (!cache.TryGetValue(key.Uri, out byte[]? material))
         {
-            UrlPolicy.TryParse(key.Uri, out Uri keyUri, out _);
+            if (!UrlPolicy.TryParse(key.Uri, out Uri keyUri, out _))
+                throw new RunnerStop(RunOutcome.NeedsAttention("key", "The HLS key address is invalid or not permitted."));
             using HttpResponseMessage response = await http.SendAsync(keyUri, Spec(null, null), ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode) throw StatusStop(response);
             material = await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false);
@@ -239,6 +245,16 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         aes.Key = material;
         try { return aes.DecryptCbc(data, iv, PaddingMode.PKCS7); }
         catch (CryptographicException) { throw new RunnerStop(RunOutcome.NeedsAttention("decrypt", "A segment could not be decrypted with the supplied key.")); }
+    }
+
+    private static bool SameInitialization(HlsMap? left, HlsMap? right)
+    {
+        if (left is null || right is null) return left is null && right is null;
+        if (left.Uri != right.Uri || left.Length != right.Length || left.Offset != right.Offset) return false;
+        if (left.Key is null || right.Key is null) return left.Key is null && right.Key is null;
+        if (left.Key.Uri != right.Key.Uri) return false;
+        if (left.Key.Iv is null || right.Key.Iv is null) return left.Key.Iv is null && right.Key.Iv is null;
+        return left.Key.Iv.AsSpan().SequenceEqual(right.Key.Iv);
     }
 
     private static byte[] SequenceIv(long sequence)

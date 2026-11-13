@@ -202,6 +202,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         string State()
         {
             JobSnapshot? snapshot = engine.BrowserTransferSnapshot(id);
+            if (snapshot?.State == JobState.Cancelled && engine.BrowserTransferIsRunning(id)) return "stopping";
             string current = BrowserTransferState(snapshot);
             if (current != "complete") return current;
             if (snapshot is not { FinalPath: { } path, TotalBytes: long expected }) return "failed";

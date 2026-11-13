@@ -276,15 +276,33 @@ async function playerOptions(message, sender) {
   if (mediaLookups.has(lookupKey)) return mediaLookups.get(lookupKey);
   const task = (async () => {
     const state = await tabState(tab);
-    const observed = url => state.sources.find(s => sender.documentId && s.documentId === sender.documentId
-      && (s.frameId ?? 0) === frame && s.url === url.href && s.seen >= Math.max(Date.now() - 10 * 60_000, message.mediaChangedAt || 0));
+    const now = Date.now();
+    const changedAt = Number.isFinite(message.mediaChangedAt) ? message.mediaChangedAt : 0;
+    const cutoff = Math.max(now - 10 * 60_000, changedAt > 0 ? changedAt - 2000 : 0);
+    const currentEvidence = source => sender.documentId && source.documentId === sender.documentId
+      && (source.frameId ?? 0) === frame && Number.isFinite(source.seen)
+      && source.seen >= cutoff && source.seen <= now + 1000;
+    const observed = url => state.sources.find(s => currentEvidence(s) && s.url === url.href);
     const matching = source ? observed(source) : null;
     const candidate = url => {
       const evidence = observed(url);
       return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
     };
     const matchedManifest = manifest && observed(manifest);
-    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null].filter(Boolean).map(candidate);
+    const possibleManifests = [];
+    if (!manifest && source === null && message.playerPlaying === true && Number.isInteger(message.generation) && message.generation > 0
+        && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
+      const manifestCutoff = Math.max(now - 120_000, changedAt - 2000);
+      for (const evidence of state.sources) {
+        if (currentEvidence(evidence) && evidence.seen >= manifestCutoff && ['hls', 'dash'].includes(evidence.kind)
+            && !possibleManifests.some(item => item.url === evidence.url))
+          possibleManifests.push(evidence);
+      }
+    }
+    const unambiguousManifest = possibleManifests.length === 1
+      ? VesperPlayerSource.http(possibleManifests[0].url) : null;
+    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null,
+      unambiguousManifest].filter(Boolean).map(candidate);
     const complete = source && matching?.kind === 'direct' && matching.complete && /^(?:audio|video)\//.test(matching.mime)
       && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
     const title = binding || !youTube ? message.title : undefined;

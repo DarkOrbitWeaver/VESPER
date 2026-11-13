@@ -80,7 +80,11 @@ internal static class BrowserMessageValidator
     private static MediaRequestContext BuildContext(BrowserDiscoveryMessage m, Uri page, DateTimeOffset now, List<string> warnings)
     {
         string? ua = m.UserAgent is { Length: > 0 and <= 256 } u && IsPrintableAscii(u) ? u : null;
-        var baseCtx = new MediaRequestContext { Referer = UrlUtil.WithoutFragment(page).AbsoluteUri, UserAgent = ua };
+        var baseCtx = new MediaRequestContext
+        {
+            Referer = UrlUtil.WithoutFragment(page).AbsoluteUri,
+            UserAgent = ua
+        };
 
         var auth = m.Authorization;
         if (auth is null) return baseCtx;
@@ -130,6 +134,7 @@ internal static class BrowserMessageValidator
             AcceptLanguage = acceptLanguage,
             CookieHeader = cookie,
             SensitiveHeaders = sensitive,
+            CredentialOrigin = new Uri(UrlUtil.Origin(page)),
             CredentialHosts = hosts.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
         };
     }

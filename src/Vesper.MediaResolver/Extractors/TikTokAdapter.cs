@@ -71,6 +71,7 @@ internal sealed class TikTokAdapter : AdapterBase
         {
             Referer = "https://www.tiktok.com/",
             CookieHeader = cookie.Length is > 0 and < 4000 ? cookie : null,
+            CredentialOrigin = new Uri("https://www.tiktok.com/"),
             CredentialHosts = CredentialHosts
         };
 

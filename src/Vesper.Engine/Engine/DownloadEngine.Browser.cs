@@ -13,6 +13,11 @@ public sealed partial class DownloadEngine
         lock (_lock) return BrowserTransferLocked(transferId) is { } job ? SnapshotLocked(job) : null;
     }
 
+    public bool BrowserTransferIsRunning(string transferId)
+    {
+        lock (_lock) return BrowserTransferLocked(transferId) is { } job && _sessions.ContainsKey(job.Id);
+    }
+
     public bool AcceptBrowserTransfer(string transferId)
     {
         lock (_lock)
