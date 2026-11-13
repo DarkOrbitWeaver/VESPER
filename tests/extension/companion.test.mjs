@@ -59,7 +59,9 @@ test('the supplied atlas uses less than 4 MiB decoded and a perched companion ha
   assert.ok(800 * 1200 * 4 < 4 * 1024 * 1024);
   const f = fixture();
   f.advance(30_000);
-  assert.deepEqual(f.sprites, [2]);
+  assert.equal(f.sprites[0], 2);
+  assert.ok(f.sprites.some(frame => frame >= 57 && frame < 66));
+  assert.equal(f.sprites.at(-1), 2);
   assert.equal(f.frames(), 0);
   assert.equal(f.tasks.size, 0);
   assert.equal(f.companion.canvas.style.transform, 'scaleX(-1)');
@@ -69,7 +71,7 @@ test('the supplied atlas uses less than 4 MiB decoded and a perched companion ha
 
 test('opening the picker flies beside it, and a confirmed handoff returns to the perch', () => {
   const f = fixture();
-  f.companion.setPickerOpen(true);
+  f.companion.setPickerOpen(true, false, true);
   f.advance(800);
   assert.equal(f.companion.mode, 'beside-picker');
   assert.match(f.button.style.transform, /466\.00px,22\.00px/);
@@ -77,6 +79,7 @@ test('opening the picker flies beside it, and a confirmed handoff returns to the
   f.advance(400);
   assert.equal(f.frames(), flightFrames);
   assert.ok(f.sprites.some(frame => frame >= 23 && frame < 33));
+  assert.ok(f.sprites.some(frame => frame >= 11 && frame < 23));
   assert.equal(f.tasks.size, 0);
 
   f.companion.setPickerOpen(false, true);

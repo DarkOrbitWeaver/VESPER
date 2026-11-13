@@ -7,10 +7,13 @@
   const lifetime = new AbortController();
   const { signal } = lifetime;
   const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_RADIUS = 100;
+  const PREVIEW_EXIT_GRACE = 900, PREVIEW_MAX_LATCH = 2200;
   let video = null;            // the player the butterfly is attached to
   let host = null, root = null, button = null, panel = null, receipt = null;
-  let frame = 0, listening = false, pointer = null, panelRequest = 0, unwatchTheme = null;
-  let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, panelMotion = null;
+  let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
+  let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
+  let previewRemovedAt = 0, panelMotion = null;
+  let activePreview = null;
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -68,9 +71,13 @@
     pageUrl = current;
     if (!changed) return;
     mediaChangedAt = Date.now();
+    activePreview = null;
+    pointerTarget = null;
     if (panelMedia || receiptTimer) closePanel();
+    if (video && !video.isConnected) detach();
   }
   window.navigation?.addEventListener('currententrychange', syncPage, { signal });
+  window.addEventListener('popstate', syncPage, { signal });
 
   function playerSource(player) {
     return player.currentSrc || player.src || '';
@@ -78,8 +85,11 @@
 
   function isCurrentRequest(request) {
     if (!alive() || request !== panelRequest || !panelMedia) return false;
-    if (panelMedia.identity === VesperPlayerSource.identity(pageAddress()) && panelMedia.player === video &&
-        video?.isConnected && panelMedia.src === playerSource(video)) return true;
+    const pageMatches = panelMedia.documentIdentity === VesperPlayerSource.identity(pageAddress());
+    const previewMatches = !activePreview || activePreview.key === panelMedia.targetKey;
+    const binding = panelMedia.player && playback.get(panelMedia.player);
+    const sourceMatches = !panelMedia.generation || !binding || binding.generation === panelMedia.generation;
+    if (pageMatches && previewMatches && sourceMatches) return true;
     closePanel();
     return false;
   }
@@ -96,11 +106,63 @@
     return style.visibility === 'hidden' || style.visibility === 'collapse' ? null : { left, top, right, bottom };
   }
 
+  function cardContext(node, includePlayer) {
+    if (!(node instanceof Element)) return null;
+    const origin = new URL(pageAddress()).origin;
+    for (let card = node, depth = 0; card && depth < 9 && card !== document.body; card = card.parentElement, depth++) {
+      const allVideos = [...card.querySelectorAll('video')];
+      if (allVideos.length > 4) continue;
+      const videos = includePlayer ? allVideos.filter(el => observed.has(el) && visiblePlayer(el)) : [];
+      if (includePlayer && !videos.length) continue;
+      const pages = new Map();
+      for (const link of [...card.querySelectorAll('a[href]')].slice(0, 32)) {
+        try {
+          const url = new URL(link.href);
+          if (url.origin !== origin) continue;
+          const identity = VesperPlayerSource.identity(url.href);
+          if (/^(youtube|instagram|tiktok|facebook):/.test(identity || '')) pages.set(identity, url.href);
+        } catch { /* Ignore malformed page links. */ }
+      }
+      if (pages.size !== 1) continue;
+      videos.sort((a, b) => {
+        const area = el => { const r = el.getBoundingClientRect(); return r.width * r.height * (el.paused ? 1 : 1.15); };
+        return area(b) - area(a);
+      });
+      return { page: pages.values().next().value, player: videos[0] };
+    }
+    return null;
+  }
+
+  function cardPage(node) { return cardContext(node, false)?.page || null; }
+
+  function cardPreview(target) {
+    const card = cardContext(target, true);
+    if (card?.player) {
+      const page = card.page;
+      const player = card.player;
+      const src = playerSource(player) || (activePreview?.player === player ? activePreview.binding?.src : '') || '';
+      const key = `${VesperPlayerSource.identity(page)}|${page}|${src}|${playback.get(player)?.generation || 0}`;
+      return { player, page, key };
+    }
+    return null;
+  }
+
+  function pageForPlayer(el) {
+    return cardPage(el)?.page || (activePreview?.player === el ? activePreview.page : pageAddress());
+  }
+
   function selectPlayer() {
     if (!alive()) return;
+    if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
+    if (video && !video.isConnected && activePreview?.player === video && holdDisconnectedPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
     let best = null, bestArea = 0;
+    if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))) {
+      const rect = visiblePlayer(activePreview.player);
+      if (rect) { best = activePreview.player; bestArea = Infinity; }
+    }
     for (const el of observed) {
+      if (bestArea === Infinity) break;
       if (fullscreen && !fullscreen.contains(el)) continue;
       const r = visiblePlayer(el);
       if (!r) continue;
@@ -108,8 +170,10 @@
       if (area > bestArea) { best = el; bestArea = area; }
     }
     if (best) attach(best);
-    else if (video && !video.isConnected) detach();
-    else if (video) place();
+    else if (video && !video.isConnected) {
+      if (holdDisconnectedPreview()) place();
+      else detach();
+    } else if (video) place();
   }
 
   function consider(el) {
@@ -120,8 +184,19 @@
       observed.add(el);
       visibility.observe(el);
     }
-    if (el.readyState >= 1 && playback.get(el)?.src !== src)
-      playback.set(el, { src, page: pageAddress(), generation: ++generation });
+    const page = pageForPlayer(el);
+    const previous = playback.get(el);
+    if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)) {
+      const changedAt = Date.now();
+      const binding = { src, page, generation: ++generation, changedAt };
+      playback.set(el, binding);
+      if (activePreview?.player === el) {
+        activePreview = { ...activePreview, page, src,
+          key: `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}`, binding };
+        if (panelMedia && panelMedia.targetKey !== activePreview.key) closePanel();
+      }
+      if (el === video) mediaChangedAt = changedAt;
+    }
   }
 
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
@@ -133,11 +208,13 @@
     if (!alive()) return;
     if (type === 'emptied') {
       protectedVideos.delete(e.target);
+      if (activePreview?.player === e.target && playback.has(e.target))
+        activePreview = { ...activePreview, binding: playback.get(e.target) };
       playback.delete(e.target);
     }
     if (e.target !== video) return;
     if (type === 'emptied') mediaChangedAt = Date.now();
-    if (panelMedia || receiptTimer) closePanel();
+    if (!panelMedia && receiptTimer) closePanel();
   }, { capture: true, passive: true, signal });
   document.addEventListener('encrypted', (e) => {
     if (!alive() || !(e.target instanceof HTMLMediaElement)) return;
@@ -261,7 +338,14 @@
   }, { signal });
 
   function attach(el) {
-    if (video === el && host) { place(); return; }
+    if (video === el && host) {
+      clearTimeout(previewExitTimer);
+      previewExitTimer = previewRemovedAt = 0;
+      place();
+      return;
+    }
+    clearTimeout(previewExitTimer);
+    previewExitTimer = previewRemovedAt = 0;
     closePanel();
     resize.disconnect();
     video = el;
@@ -282,6 +366,8 @@
 
   function detach() {
     listening = false;
+    clearTimeout(previewExitTimer);
+    previewExitTimer = previewRemovedAt = 0;
     closePanel();
     resize.disconnect();
     unwatchTheme?.();
@@ -293,6 +379,7 @@
     cancelAnimationFrame(frame);
     frame = 0;
     perch = null;
+    activePreview = null;
     companion?.dispose();
     companion = null;
     host?.remove(); host = root = button = panel = receipt = null; video = null;
@@ -300,7 +387,11 @@
 
   function place() {
     if (!alive()) return;
-    if (!video || !video.isConnected) return detach();
+    if (!video || !video.isConnected) {
+      if (panelMedia && panel?.classList.contains('show')) { button.hidden = true; updateFlyVisibility(); return; }
+      if (holdDisconnectedPreview()) { updateFlyVisibility(); return; }
+      return detach();
+    }
     const fullscreen = document.fullscreenElement;
     const r = visiblePlayer(video);
     button.hidden = !r || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
@@ -323,7 +414,10 @@
   }
 
   function playerPerch(rect, fullscreen) {
-    const corners = [{ x: rect.right - FLY_SIZE - 10, faceLeft: true }, { x: rect.left + 10, faceLeft: false }];
+    const preview = activePreview?.player === video && !fullscreen;
+    const right = { x: rect.right - FLY_SIZE - 10, faceLeft: true };
+    const left = { x: rect.left + 10, faceLeft: false };
+    const corners = preview ? [left, right] : [right, left];
     const border = Math.abs(video.getBoundingClientRect().top - rect.top) < 2;
     const clear = (x, y) => y >= 4 && ![8, FLY_SIZE / 2, FLY_SIZE - 8].some(offset =>
       document.elementsFromPoint(x + offset, y + FLY_SIZE / 2)
@@ -350,13 +444,54 @@
 
   function onPointer(e) {
     if (!alive()) return;
-    if (document.fullscreenElement) {
-      pointer = { x: e.clientX, y: e.clientY };
-      updateFlyVisibility();
+    pointer = { x: e.clientX, y: e.clientY };
+    if (e.target !== pointerTarget) {
+      pointerTarget = e.target;
+      const preview = cardPreview(e.target);
+      if (preview && (preview.player !== activePreview?.player || preview.key !== activePreview?.key)) {
+        activePreview = preview;
+        consider(preview.player);
+        if (panelMedia && panelMedia.targetKey !== preview.key) closePanel();
+        selectPlayer();
+      }
     }
+    updateFlyVisibility();
+    if (video && !video.isConnected && !panelMedia) holdDisconnectedPreview();
     companion?.pointerMove(e.clientX, e.clientY);
   }
-  function clearPointer() { pointer = null; companion?.pointerMove(-Infinity, -Infinity); updateFlyVisibility(); }
+  function clearPointer() {
+    pointer = pointerTarget = null;
+    companion?.pointerMove(-Infinity, -Infinity);
+    updateFlyVisibility();
+    if (video && !video.isConnected && !panelMedia) holdDisconnectedPreview();
+  }
+
+  function previewLatched() {
+    if (panel?.classList.contains('show') || button?.matches(':hover,:focus-visible')) return true;
+    return !!pointer && !!perch && Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) <= 90;
+  }
+
+  function holdDisconnectedPreview() {
+    if (!video || video.isConnected || activePreview?.player !== video || panelMedia) return false;
+    if (!previewRemovedAt) previewRemovedAt = Date.now();
+    if (!previewExitTimer) {
+      const player = video;
+      const elapsed = Date.now() - previewRemovedAt;
+      const delay = Math.min(PREVIEW_EXIT_GRACE, Math.max(0, PREVIEW_MAX_LATCH - elapsed));
+      previewExitTimer = setTimeout(() => {
+        previewExitTimer = 0;
+        if (video !== player || player.isConnected) { previewRemovedAt = 0; return; }
+        if (panelMedia) return;
+        if (previewLatched() && Date.now() - previewRemovedAt < PREVIEW_MAX_LATCH) {
+          holdDisconnectedPreview();
+          return;
+        }
+        activePreview = null;
+        detach();
+      }, delay);
+    }
+    return true;
+  }
 
   // ------------------------------------------------------------ the quality picker
 
@@ -383,6 +518,7 @@
     button?.setAttribute('aria-expanded', 'false');
     companion?.setPickerOpen(false, acknowledged);
     updateFlyVisibility();
+    if (video && !video.isConnected) holdDisconnectedPreview();
   }
 
   async function togglePanel() {
@@ -394,39 +530,48 @@
 
   async function loadFormats() {
     syncPage();
-    if (!video?.isConnected || !panel) return;
+    if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
     dismissReceipt();
     receipt.textContent = '';
     const request = ++panelRequest;
-    const src = playerSource(video);
-    const identity = VesperPlayerSource.identity(pageUrl);
-    const binding = playback.get(video);
+    const player = video;
+    const preview = activePreview?.player === player ? activePreview : null;
+    const src = playerSource(player) || preview?.binding?.src || '';
+    const targetPage = activePreview?.player === player ? activePreview.page : pageForPlayer(player);
+    const identity = VesperPlayerSource.identity(targetPage);
+    const binding = playback.get(player) || preview?.binding;
     const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
-    panelMedia = { identity, player: video, src };
+    const targetKey = activePreview?.player === player ? activePreview.key
+      : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
+    panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), targetKey,
+      player, pageUrl: targetPage, src, generation: current ? binding.generation : 0 };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
-    companion.setPickerOpen(true);
+    companion.setPickerOpen(true, false, true);
     updateFlyVisibility();
-    const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
-    const poster = current ? video.poster || document.querySelector('meta[property="og:image"]')?.content || '' : '';
-    const duration = current && Number.isFinite(video.duration) ? video.duration : null;
-    if (video.mediaKeys || protectedVideos.has(video))
+    const isPreview = !!preview;
+    const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
+    const poster = current ? player.poster || (!isPreview && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
+    const duration = current && Number.isFinite(player.duration) ? player.duration : null;
+    if (player.mediaKeys || protectedVideos.has(player))
       return renderShell(title, poster, duration, element('div', 'msg bad', 'This video is protected by DRM.'));
 
     const loading = element('div', 'msg', 'Loading formats…');
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
-    const result = await send({ type: 'media-options', pageUrl, mediaChangedAt, title, playerPlaying: !video.paused && !video.ended,
-      playerPageUrl: current ? binding.page : '', playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+    const result = await send({ type: 'media-options', pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
+      title, playerPlaying: !player.paused && !player.ended, playerPageUrl: targetPage,
+      playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
-    if (!result?.ok || !result.data?.choices?.length) {
+    if (!result?.ok || (!result.data?.choices?.length && !result.data?.sourceChoices?.length)) {
       const message = errorMessage(result);
       if (!['protected', 'blocked', 'chrome-format'].includes(result?.code)) appendRetry(message, loadFormats, result?.data?.retryAt);
       return renderShell(title, poster, duration, message);
     }
     const formats = result.data;
+    if (formats.sourceChoices?.length) return renderSourceChoices(title, poster, duration, formats);
     choice = formats.choices[0];
     renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? duration, formats);
   }
@@ -563,6 +708,41 @@
     renderShell(title, poster, seconds, ...body, footer);
   }
 
+  function renderSourceChoices(title, poster, seconds, formats) {
+    const list = element('div', 'list');
+    list.setAttribute('role', 'group');
+    list.setAttribute('aria-label', 'Choose a stream');
+    for (const source of formats.sourceChoices) {
+      const option = element('button', 'opt');
+      const labels = element('span');
+      labels.append(element('b', '', source.label), element('small', '', source.detail));
+      option.append(element('span', 'icon balanced', '›'), labels);
+      option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds); };
+      list.append(option);
+    }
+    renderShell(title, poster, seconds, element('div', 'msg', 'Choose the stream to inspect.'), list);
+  }
+
+  async function inspectSource(token, title, poster, seconds) {
+    if (!panelMedia || !isCurrentRequest(panelRequest)) return;
+    const request = panelRequest;
+    const loading = element('div', 'msg', 'Checking selected stream…');
+    loading.setAttribute('role', 'status');
+    renderShell(title, poster, seconds, loading);
+    const result = await send({ type: 'media-source-select', sourceChoice: token,
+      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src });
+    if (!isCurrentRequest(request)) return;
+    if (result?.ok && result.data?.choices?.length) {
+      const formats = result.data;
+      choice = formats.choices[0];
+      return renderChoices(formats.title || title, formats.thumbnail || poster,
+        formats.duration ?? seconds, formats);
+    }
+    const message = errorMessage(result);
+    appendRetry(message, loadFormats);
+    renderShell(title, poster, seconds, message);
+  }
+
   async function deliver(title, poster, seconds, formats, formatChoice, mode, request) {
     if (!isCurrentRequest(request)) return;
     const sending = element('div', 'msg', formats.browserChoice ? 'Starting in Chrome…' : 'Sending to VESPER…');
@@ -570,7 +750,8 @@
     const hadFocus = panel.contains(root.activeElement);
     const close = renderShell(title, poster, seconds, sending);
     if (hadFocus) close.focus({ preventScroll: true });
-    const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice, pageUrl }
+    const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
+      pageUrl: panelMedia.pageUrl }
       : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode });
     if (!isCurrentRequest(request)) return;
     if (reply?.ok) {
@@ -624,6 +805,15 @@
       duplicate: 'This link is already in VESPER.',
       cancelled: 'Cancelled in VESPER.',
       timeout: 'VESPER didn’t answer in time.',
+      'no-media': 'No downloadable media was found for this page.',
+      unavailable: 'This media is unavailable or has been removed.',
+      'source-expired': 'The media link expired. Reopen the preview to refresh it.',
+      'sign-in': 'This media requires a sign-in to access.',
+      'browser-context': 'The site requires a browser session or verification step.',
+      blocked: 'The site blocked the request or restricted its region.',
+      network: 'The media link could not be reached. Check your connection and retry.',
+      'resolver-error': 'The media resolver hit a temporary problem. Try again shortly.',
+      invalid: reply?.message || 'The current media selection is invalid.',
       unsupported: reply?.message || 'This source can’t be downloaded.'
     }[reply?.code] || reply?.message || 'Something went wrong.';
     return element('div', 'msg bad', text);

@@ -120,6 +120,7 @@ const SEGMENT = /\.(ts|m4s|aac|vtt|webvtt|cmfv|cmfa|key)(\?|$)/i;
 const DIRECT = /\.(mp4|webm|m4v|mov|mkv|mp3|m4a|flac|wav|ogg|opus)(\?|$)/i;
 const sourceWrites = new Map();
 const mediaLookups = new Map();
+const sourceSelections = new Map();
 const browserChoices = new Map();
 const browserChoiceStarts = new Map();
 const browserChoicesKey = 'vesperBrowserChoices';
@@ -230,6 +231,29 @@ async function addSource(tabId, source) {
   });
 }
 
+function sourceLabel(source, index) {
+  const url = new URL(source.url);
+  return {
+    token: source.token,
+    label: `${source.kind.toUpperCase()} stream ${index + 1}`,
+    detail: url.hostname
+  };
+}
+
+function rememberSourceSelections(sources, context) {
+  const now = Date.now();
+  for (const [token, selection] of sourceSelections)
+    if (selection.expires <= now) sourceSelections.delete(token);
+  while (sourceSelections.size + sources.length > 32)
+    sourceSelections.delete(sourceSelections.keys().next().value);
+  return sources.map((source, index) => {
+    const token = crypto.randomUUID();
+    sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
+      seen: source.seen, expires: now + 60_000 });
+    return sourceLabel({ ...source, token }, index);
+  });
+}
+
 // Narrow listeners: only media requests, plus playlist-looking URLs. The worker sleeps otherwise.
 chrome.webRequest.onResponseStarted.addListener((details) => {
   if (details.method !== 'GET' || ![200, 206].includes(details.statusCode)) return;
@@ -299,10 +323,14 @@ async function playerOptions(message, sender) {
           possibleManifests.push(evidence);
       }
     }
-    const unambiguousManifest = possibleManifests.length === 1
-      ? VesperPlayerSource.http(possibleManifests[0].url) : null;
-    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null,
-      unambiguousManifest].filter(Boolean).map(candidate);
+    if (route !== 'chrome' && possibleManifests.length > 0) {
+      const sources = possibleManifests.sort((a, b) => b.seen - a.seen);
+      const sourceChoices = rememberSourceSelections(sources, { identity, tab, frame, documentId: sender.documentId,
+        generation: message.generation, playerUrl: source?.href || message.playerUrl, title: binding ? message.title : undefined });
+      return { ok: true, data: { title: binding ? message.title : undefined, sourceChoices } };
+    }
+    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
+      .filter(Boolean).map(candidate);
     const complete = source && matching?.kind === 'direct' && matching.complete && /^(?:audio|video)\//.test(matching.mime)
       && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
     const title = binding || !youTube ? message.title : undefined;
@@ -310,7 +338,7 @@ async function playerOptions(message, sender) {
     if (route !== 'chrome') {
       const reply = await nativeRequest(envelope('media-options', { url: page.href, pageTitle: title,
         candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
-      if (reply.ok || !complete || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'unavailable', 'timeout'].includes(reply.code)) return reply;
+      if (reply.ok || !complete || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
     }
     if (!complete) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a complete file for this player.' };
     await browserChoicesReady;
@@ -343,6 +371,33 @@ async function selectBrowserFile(message, sender) {
   browserChoiceStarts.set(message.browserChoice, operation);
   try { return await operation; }
   finally { if (browserChoiceStarts.get(message.browserChoice) === operation) browserChoiceStarts.delete(message.browserChoice); }
+}
+
+async function selectMediaSource(message, sender) {
+  const token = message.sourceChoice;
+  const selection = sourceSelections.get(token);
+  if (!selection || selection.expires <= Date.now()) {
+    sourceSelections.delete(token);
+    return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
+  }
+  const page = mediaPage(message, sender);
+  if (!page || selection.tab !== sender.tab?.id || selection.frame !== (sender.frameId ?? 0)
+      || selection.documentId !== sender.documentId || selection.identity !== VesperPlayerSource.identity(page.href)
+      || selection.generation !== message.generation || selection.playerUrl !== (message.playerUrl || '')) {
+    sourceSelections.delete(token);
+    return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
+  }
+  sourceSelections.delete(token);
+  const state = await tabState(selection.tab);
+  const evidence = state.sources.find(source => source.url === selection.url && source.documentId === selection.documentId
+    && (source.frameId ?? 0) === selection.frame && source.seen === selection.seen);
+  if (!evidence || evidence.seen < Date.now() - 120_000 || evidence.seen > Date.now() + 1000)
+    return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
+  const { route } = await settings();
+  if (route === 'chrome')
+    return { ok: false, code: 'chrome-format', message: 'Chrome has not exposed a complete file for this player.' };
+  return nativeRequest(envelope('media-options', { url: page.href, pageTitle: selection.title,
+    candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }
 
 async function confirmOrStartBrowserChoice(choice) {
@@ -429,6 +484,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'chrome-downloads': return listChromeDownloads();
       case 'move-download': return moveChromeDownload(message.downloadId, 'download');
       case 'media-options': return playerOptions(message, sender);
+      case 'media-source-select': return selectMediaSource(message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
       case 'media-select': {
         const { mediaSession, formatChoice, mode } = message;
