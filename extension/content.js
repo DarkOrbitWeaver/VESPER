@@ -147,6 +147,27 @@
     return null;
   }
 
+  function activatePreview(preview) {
+    if (!preview || (preview.player === activePreview?.player && preview.key === activePreview?.key)) return false;
+    activePreview = preview;
+    consider(preview.player);
+    if (panelMedia && panelMedia.targetKey !== preview.key) closePanel();
+    return true;
+  }
+
+  function refreshHoveredPreview(player) {
+    if (!pointer) return false;
+    const target = document.elementFromPoint(pointer.x, pointer.y) || pointerTarget;
+    const preview = cardPreview(target);
+    return preview?.player === player && activatePreview(preview);
+  }
+
+  function handlePlayerPlaying(el) {
+    if (!observed.has(el)) return;
+    refreshHoveredPreview(el);
+    selectPlayer();
+  }
+
   function pageForPlayer(el) {
     return cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
   }
@@ -202,7 +223,7 @@
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
   for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
     consider(e.target);
-    if (type === 'playing' && observed.has(e.target)) selectPlayer();
+    if (type === 'playing') handlePlayerPlaying(e.target);
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
     if (!alive()) return;
@@ -447,13 +468,7 @@
     pointer = { x: e.clientX, y: e.clientY };
     if (e.target !== pointerTarget) {
       pointerTarget = e.target;
-      const preview = cardPreview(e.target);
-      if (preview && (preview.player !== activePreview?.player || preview.key !== activePreview?.key)) {
-        activePreview = preview;
-        consider(preview.player);
-        if (panelMedia && panelMedia.targetKey !== preview.key) closePanel();
-        selectPlayer();
-      }
+      if (activatePreview(cardPreview(e.target))) selectPlayer();
     }
     updateFlyVisibility();
     if (video && !video.isConnected && !panelMedia) holdDisconnectedPreview();
