@@ -389,6 +389,7 @@ public sealed class VesperChoice : Control
             UpdateSelection();
             Invalidate();
             SelectedIndexChanged?.Invoke(this, EventArgs.Empty);
+            if (IsHandleCreated) AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1);
         }
     }
 
@@ -426,12 +427,28 @@ public sealed class VesperChoice : Control
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
             ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable |
             ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
+        AccessibleRole = AccessibleRole.ComboBox;
         Height = 32;
         Width = 145;
         Font = new Font("Segoe UI", 9F);
         TabStop = true;
         Cursor = Cursors.Hand;
         VesperMenuTheme.Apply(_menu, _palette);
+    }
+
+    protected override AccessibleObject CreateAccessibilityInstance() => new ChoiceAccessibleObject(this);
+
+    private sealed class ChoiceAccessibleObject(VesperChoice owner) : Control.ControlAccessibleObject(owner)
+    {
+        public override string? Value
+        {
+            get => owner.SelectedText;
+            set
+            {
+                int index = Array.IndexOf(owner._items, value);
+                if (index >= 0) owner.SelectedIndex = index;
+            }
+        }
     }
 
     private void UpdateSelection()
