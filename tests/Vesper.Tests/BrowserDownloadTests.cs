@@ -73,6 +73,24 @@ public sealed class BrowserDownloadTests
         Assert.Equal(complete.FinalPath, Assert.Single(harness.Files()));
     }
 
+    [Fact]
+    public async Task Abandon_reports_stopping_until_the_browser_transfer_session_exits()
+    {
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = Stage(harness, server, new BrowserTransferProof(server.V1.Length, "\"p1\"", null));
+        await harness.WaitAsync(id, job => job.Reason == "browser-ready");
+
+        Assert.True(harness.Engine.BrowserTransferIsRunning(TransferId));
+        harness.Engine.AbandonBrowserTransfer(TransferId);
+        JobSnapshot stopped = await harness.WaitAsync(id, job => job.State == JobState.Cancelled
+            && !harness.Engine.BrowserTransferIsRunning(TransferId));
+
+        Assert.Equal("browser-fallback", stopped.Reason);
+        Assert.False(harness.Engine.BrowserTransferIsRunning(TransferId));
+    }
+
     [Theory]
     [InlineData(1, "\"p1\"", "application/octet-stream")]
     [InlineData(0, "\"older\"", "application/octet-stream")]

@@ -96,6 +96,7 @@ public class UrlSecurityTests
             Referer = "https://example.com/page?session=ABC",
             CookieHeader = "sid=TOPSECRET",
             SensitiveHeaders = new Dictionary<string, string> { ["Authorization"] = "Bearer TOPSECRET" },
+            CredentialOrigin = new Uri("https://example.com/"),
             CredentialHosts = ["example.com"]
         };
         Assert.DoesNotContain("TOPSECRET", ctx.ToString());
@@ -112,11 +113,15 @@ public class UrlSecurityTests
     [Fact]
     public void CredentialScoping_ExactAndSubdomainOnly()
     {
-        var ctx = new MediaRequestContext { CookieHeader = "a=b", CredentialHosts = ["example.com"] };
-        Assert.True(ctx.MayForwardCredentialsTo("example.com"));
-        Assert.True(ctx.MayForwardCredentialsTo("media.example.com"));
-        Assert.False(ctx.MayForwardCredentialsTo("notexample.com"));
-        Assert.False(ctx.MayForwardCredentialsTo("example.com.evil.net"));
+        var ctx = new MediaRequestContext
+        {
+            CookieHeader = "a=b", CredentialOrigin = new Uri("https://example.com/"),
+            CredentialHosts = ["example.com"]
+        };
+        Assert.True(ctx.MayForwardCredentialsTo(new Uri("https://example.com/")));
+        Assert.True(ctx.MayForwardCredentialsTo(new Uri("https://media.example.com/")));
+        Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://notexample.com/")));
+        Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://example.com.evil.net/")));
         Assert.DoesNotContain(ctx.HeadersFor(new Uri("https://evil.net/x")), h => h.Key == "Cookie");
         Assert.Contains(ctx.HeadersFor(new Uri("https://media.example.com/x")), h => h.Key == "Cookie");
     }

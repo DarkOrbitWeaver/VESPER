@@ -59,8 +59,36 @@ public class BrowserContextTests
         Assert.False(v.Context.SensitiveHeaders.ContainsKey("X-Evil"));
         Assert.Equal("de", v.Context.AcceptLanguage);
         Assert.True(new[] { "example.com", "media.example.com" }.SequenceEqual(v.Context.CredentialHosts.OrderBy(x => x)));
+        Assert.Equal(new Uri("https://example.com/"), v.Context.CredentialOrigin);
         Assert.Contains(v.Warnings, w => w.Contains("X-Evil"));
         Assert.Contains(v.Warnings, w => w.Contains("cdn.evil.net"));
+    }
+
+    [Fact]
+    public void CrossOriginReferrerIsReducedAndDowngradesGetNoReferrer()
+    {
+        var context = Validate(Message()).Context;
+
+        Assert.Equal("https://example.com/watch/42", context.HeadersFor(new Uri("https://example.com/media"))
+            .Single(header => header.Key == "Referer").Value);
+        Assert.Equal("https://example.com/", context.HeadersFor(new Uri("https://cdn.example.net/media"))
+            .Single(header => header.Key == "Referer").Value);
+        Assert.DoesNotContain(context.HeadersFor(new Uri("http://example.com/media")), header => header.Key == "Referer");
+    }
+
+    [Fact]
+    public void BrowserCredentialsStayOnTheIssuingSchemeAndPort()
+    {
+        var context = Validate(Message(new BrowserAuthorization
+        {
+            Origin = "https://example.com", ConsentGranted = true, CookieHeader = "sid=1",
+            AllowedHosts = ["media.example.com"]
+        })).Context;
+
+        Assert.Contains(context.HeadersFor(new Uri("https://media.example.com/video")), header => header.Key == "Cookie");
+        Assert.DoesNotContain(context.HeadersFor(new Uri("http://example.com/video")), header => header.Key == "Cookie");
+        Assert.DoesNotContain(context.HeadersFor(new Uri("https://example.com:8443/video")), header => header.Key == "Cookie");
+        Assert.DoesNotContain(context.HeadersFor(new Uri("https://cdn.example.net/video")), header => header.Key == "Cookie");
     }
 
     [Fact]

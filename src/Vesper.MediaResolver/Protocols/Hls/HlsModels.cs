@@ -49,8 +49,8 @@ public sealed class HlsMediaPlaylist
 
     public bool HasInitSegment => Segments.Count > 0 && Segments[0].Map is not null;
 
-    /// <summary>A playlist is live unless it is closed with ENDLIST or declared VOD.</summary>
-    public bool IsLive => !IsEndList && !string.Equals(PlaylistType, "VOD", StringComparison.OrdinalIgnoreCase);
+    /// <summary>A playlist is live until it is closed with ENDLIST.</summary>
+    public bool IsLive => !IsEndList;
 }
 
 public sealed class HlsParseResult

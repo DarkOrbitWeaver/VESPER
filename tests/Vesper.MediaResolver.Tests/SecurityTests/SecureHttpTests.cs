@@ -69,16 +69,44 @@ public class SecureHttpTests
             .Add("https://cdn.other-site.net/file", "ok", "text/plain")
             .AddRedirect("https://example.com/start2", "https://media.example.com/file")
             .Add("https://media.example.com/file", "ok", "text/plain");
-        var ctx = new MediaRequestContext { Referer = "https://example.com/", CookieHeader = "sid=1", CredentialHosts = ["example.com"] };
+        var ctx = new MediaRequestContext
+        {
+            Referer = "https://example.com/watch?id=secret", CookieHeader = "sid=1",
+            CredentialOrigin = new Uri("https://example.com/"), CredentialHosts = ["example.com"]
+        };
         var c = Client(h);
 
         await c.GetStringAsync(new Uri("https://example.com/start"), ctx, default);
         Assert.True(h.Requests[0].Headers.ContainsKey("Cookie"));
         Assert.False(h.Requests[1].Headers.ContainsKey("Cookie"));
-        Assert.True(h.Requests[1].Headers.ContainsKey("Referer"));       // non-secret context still flows
+        Assert.Equal("https://example.com/", h.Requests[1].Headers["Referer"]);
+        Assert.DoesNotContain("secret", h.Requests[1].Headers["Referer"]);
 
         await c.GetStringAsync(new Uri("https://example.com/start2"), ctx, default);
         Assert.True(h.Requests[3].Headers.ContainsKey("Cookie"));        // subdomain of the credential host
+        Assert.Equal("https://example.com/", h.Requests[3].Headers["Referer"]);
+    }
+
+    [Fact]
+    public async Task CredentialsAreNotForwardedAcrossSchemeOrPort()
+    {
+        var h = new FakeHttpHandler()
+            .Add("http://example.com/video", "ok", "text/plain")
+            .Add("https://example.com:8443/video", "ok", "text/plain");
+        var context = new MediaRequestContext
+        {
+            Referer = "https://example.com/watch?token=secret", CookieHeader = "sid=1",
+            SensitiveHeaders = new Dictionary<string, string> { ["Authorization"] = "Bearer token" },
+            CredentialOrigin = new Uri("https://example.com/"), CredentialHosts = ["example.com"]
+        };
+        var client = Client(h);
+
+        await client.GetStringAsync(new Uri("http://example.com/video"), context, default);
+        await client.GetStringAsync(new Uri("https://example.com:8443/video"), context, default);
+
+        Assert.DoesNotContain(h.Requests[0].Headers.Keys, key => key is "Cookie" or "Authorization" or "Referer");
+        Assert.DoesNotContain(h.Requests[1].Headers.Keys, key => key is "Cookie" or "Authorization");
+        Assert.Equal("https://example.com/", h.Requests[1].Headers["Referer"]);
     }
 
     [Fact]

@@ -80,13 +80,16 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     return port;
   };
   let sequence = 0;
-  const context = { chrome, URL, crypto: { randomUUID: () => `test-uuid-${++sequence}-aaaa` }, navigator: { userAgent: 'test' }, setTimeout, clearTimeout, console };
+  let now = Date.now();
+  const TestDate = class extends Date { static now() { return now; } };
+  const context = { chrome, URL, Date: TestDate, crypto: { randomUUID: () => `test-uuid-${++sequence}-aaaa` }, navigator: { userAgent: 'test' }, setTimeout, clearTimeout, console };
   vm.createContext(context);
   context.importScripts = (...files) => {
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, actions, cookieLookups, badges, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onMedia, onContextClicked, ports,
+    advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
     message: (msg, sender = {}) => new Promise(resolve => onMessage(msg, sender, resolve)) };
 }
@@ -176,6 +179,19 @@ test('automatic handoff verifies the response before pausing Chrome and accepts 
   assert.equal(app.sent[1].operation, 'accept');
   assert.equal(app.sent[2].operation, 'watch');
   assert.equal(file.paused, true);
+});
+
+test('automatic queued results without transfer readiness leave Chrome running', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': { ok: true, results: [{ status: 'queued' }] },
+    'browser-transfer': transfer('failed') }, { download: file, prefs: { handoff: 'queue' } });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(app.actions.includes('pause'), false);
+  assert.equal(file.paused, false);
+  assert.equal(app.sent[0].mode, 'queue');
+  assert.equal(app.sent[1].operation, 'abandon');
 });
 
 test('automatic handoff includes extensionless files and starts them by default', async () => {
@@ -306,6 +322,42 @@ test('Chrome can complete while VESPER is staging the handoff', async () => {
   assert.equal(app.sent.at(-1).transferId, app.sent[0].id);
 });
 
+test('an unknown abandon state keeps a paused Chrome download parked', async () => {
+  const file = activeDownload();
+  let state = 'active';
+  const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer(state) }, { download: file });
+  await observe(app, file);
+
+  const result = await app.message({ type: 'move-download', downloadId: file.id });
+  state = 'stopping';
+  await app.recover();
+
+  assert.equal(result.chromePaused, true);
+  assert.equal(file.paused, true);
+  assert.equal(app.actions.includes('resume'), false);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'parked');
+});
+
+test('a browser watch that reaches its timeout is rearmed', async () => {
+  const file = activeDownload();
+  let app;
+  let watches = 0;
+  const replies = { 'browser-submit': started, 'browser-transfer': message => {
+    if (message.operation !== 'watch') return transfer('active');
+    watches++;
+    if (watches === 1) { app.advanceTime(25000); return transfer('active'); }
+    return transfer('complete');
+  } };
+  app = load(replies, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  for (let attempt = 0; attempt < 20 && !app.actions.includes('cancel'); attempt++)
+    await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(watches, 2);
+  assert.equal(app.actions.includes('cancel'), true);
+});
+
 test('recovery resumes only a Chrome download paused by VESPER when the transfer fails', async () => {
   for (const alreadyPaused of [false, true]) {
     const file = { ...activeDownload(), paused: alreadyPaused };
@@ -374,6 +426,54 @@ test('a blob player only receives its declared manifest from its current frame a
   await app.message({ type: 'media-options', pageUrl: current, playerPageUrl: current,
     playerUrl: 'blob:https://example.com/video', manifestUrl: 'https://cdn.example/iframe.m3u8' }, sender);
   assert.equal(app.sent[1].candidates.length, 0);
+});
+
+test('a playing blob player can use its one recent manifest from the same frame and document', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://example.com/watch/42';
+  const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://cdn.example.com/video/playlist.m3u8', tabId: 7, frameId: 2,
+    documentId: 'active-player', method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 100,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://example.com/player', generation: 3, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+
+  assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
+    ['https://cdn.example.com/video/playlist.m3u8']);
+});
+
+test('a blob player gets no unassociated manifest when its current frame is ambiguous', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://example.com/watch/42';
+  const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
+  const changedAt = Date.now();
+  for (const name of ['ad.m3u8', 'video.m3u8'])
+    await app.onMedia({ url: `https://cdn.example.com/${name}`, tabId: 7, frameId: 2,
+      documentId: 'active-player', method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 100,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://example.com/player', generation: 3, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+
+  assert.deepEqual([...app.sent[0].candidates], []);
+});
+
+test('direct player evidence observed just before playback metadata is still current', async () => {
+  const app = load({}, { prefs: { route: 'chrome' } });
+  const page = 'https://www.youtube.com/shorts/bbbbbbbbbbb';
+  const playerUrl = 'https://video.example/current.mp4';
+  const sender = { url: page, tab: { id: 9 }, frameId: 0, documentId: 'current' };
+  const seenAt = Date.now();
+  await app.onMedia({ url: playerUrl, documentId: 'current', frameId: 0, tabId: 9, method: 'GET', statusCode: 200,
+    type: 'media', timeStamp: seenAt, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+
+  const options = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl, mediaChangedAt: seenAt + 500 }, sender);
+
+  assert.equal(options.ok, true);
+  assert.equal(options.data.choices[0].container, 'MP4');
 });
 
 test('a Chrome route uses one observed complete file and rejects stale or foreign selections', async () => {

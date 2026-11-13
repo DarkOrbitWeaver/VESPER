@@ -201,8 +201,7 @@ function moveChromeDownload(id, mode, automatic = false) {
     }]);
     const reply = await nativeRequest(envelope('browser-submit', { id: record.transferId, mode, items, authorized, browserProof: proof }), 24000);
     const result = reply.results?.[0];
-    const queued = mode !== 'download' && result?.status === 'queued';
-    if (!reply.ok || result?.transferReady !== true && !queued) {
+    if (!reply.ok || result?.transferReady !== true) {
       // A delayed reply cannot publish a tentative download. Release the job if the helper answered.
       if (reply.ok) await transferCommand(record.transferId, 'abandon');
       return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
@@ -235,10 +234,15 @@ function moveChromeDownload(id, mode, automatic = false) {
 }
 
 async function restoreChromeDownload(id, record) {
-  const stopped = await transferCommand(record.transferId, 'abandon');
+  let stopped;
+  try { stopped = await transferCommand(record.transferId, 'abandon'); }
+  catch {
+    await armBrowserRecovery();
+    return;
+  }
   if (stopped.ok && stopped.data?.state === 'complete') { await finishBrowserHandoff(id, record); return; }
-  if (stopped.ok && stopped.data?.state === 'active') {
-    // The file can already be publishing when Chrome asks VESPER to stop. Wait for that operation to settle.
+  if (!stopped.ok || stopped.data?.state !== 'failed') {
+    // Keep Chrome parked until VESPER confirms the transfer has stopped or completed.
     await armBrowserRecovery();
     return;
   }
@@ -256,10 +260,20 @@ async function finishBrowserHandoff(id, record) {
 }
 
 function watchChromeDownload(id, record) {
+  const startedAt = Date.now();
   void transferCommand(record.transferId, 'watch').then(reply => {
-    if (!reply.ok || reply.data?.state !== 'active')
-      return inBrowserOrder(id, () => reconcileChromeDownload(id, record, reply));
-  }).catch(() => {});  // The one-shot recovery alarm can reconnect if the worker was suspended.
+    if (reply.ok && reply.data?.state === 'active') {
+      if (Date.now() - startedAt >= 20000) {
+        return readBrowserRecords().then(records => {
+          const current = records[id];
+          if (current?.transferId === record.transferId && current.stage === 'parked')
+            watchChromeDownload(id, current);
+        });
+      }
+      return armBrowserRecovery();
+    }
+    return inBrowserOrder(id, () => reconcileChromeDownload(id, record, reply));
+  }).catch(() => armBrowserRecovery());
 }
 
 async function reconcileChromeDownload(id, record, knownReply) {

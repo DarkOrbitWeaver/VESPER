@@ -28,6 +28,82 @@ public class HlsTests
     }
 
     [Fact]
+    public async Task Repeated_equal_key_and_map_tags_keep_one_initialization_identity()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        byte[] initialization = DashTransferTests.Fixture("av-init.mp4");
+        byte[][] fragments = [DashTransferTests.Fixture("av-1.m4s"), DashTransferTests.Fixture("av-2.m4s"), DashTransferTests.Fixture("av-3.m4s")];
+        byte[] Encrypt(byte[] bytes)
+        {
+            using var aes = System.Security.Cryptography.Aes.Create();
+            aes.Key = FaultServer.HlsKey;
+            return aes.EncryptCbc(bytes, FaultServer.HlsIv, System.Security.Cryptography.PaddingMode.PKCS7);
+        }
+
+        server.HlsFiles["/hls/repeated/key.bin"] = FaultServer.HlsKey;
+        server.HlsFiles["/hls/repeated/init.mp4"] = Encrypt(initialization);
+        for (int i = 0; i < fragments.Length; i++)
+            server.HlsFiles[$"/hls/repeated/s{i}.m4s"] = Encrypt(fragments[i]);
+
+        string key = "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x" + Convert.ToHexString(FaultServer.HlsIv);
+        server.HlsPlaylists["/hls/repeated/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-VERSION:7", key, "#EXT-X-MAP:URI=\"init.mp4\"",
+            "#EXTINF:1,", "s0.m4s", key, "#EXT-X-MAP:URI=\"init.mp4\"",
+            "#EXTINF:1,", "s1.m4s", "#EXTINF:1,", "s2.m4s", "#EXT-X-ENDLIST", "");
+
+        using var h = new Harness();
+        JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, "/hls/repeated/index.m3u8"), JobState.Completed);
+        byte[] expected = [.. initialization, .. fragments.SelectMany(fragment => fragment)];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
+    public async Task Unsupported_hls_features_are_not_reported_as_drm()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/discontinuous/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:4,\ns1.ts\n#EXT-X-ENDLIST\n";
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, "/hls/discontinuous/index.m3u8"),
+            state => state.State == JobState.NeedsAttention);
+        Assert.Equal("unsupported", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+    }
+
+    [Fact]
+    public async Task Master_session_key_detection_checks_every_key_format()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/session-keys/index.m3u8";
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U",
+            "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"key.bin\",KEYFORMAT=\"identity\"",
+            "#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\",KEYFORMAT=\"com.apple.streamingkeydelivery\"",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000000", "variant.m3u8", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, path), state => state.State == JobState.NeedsAttention);
+
+        Assert.Equal("drm", stopped.Reason);
+    }
+
+    [Fact]
+    public async Task Invalid_hls_key_uri_is_rejected_before_any_media_request()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/invalid-key/index.m3u8";
+        server.HlsPlaylists[path] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-KEY:METHOD=AES-128,URI=\"file:///C:/Windows/win.ini\"\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n";
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, path), state => state.State == JobState.NeedsAttention);
+        Assert.Equal("key", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Equal(1, server.Hits(path));
+        Assert.Equal(0, server.Hits("/hls/invalid-key/s0.ts"));
+    }
+
+    [Fact]
     public async Task A_master_playlist_downloads_the_best_quality()
     {
         await using var server = new FaultServer(); await server.StartAsync();

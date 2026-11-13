@@ -135,6 +135,15 @@ public class HlsParserTests
     }
 
     [Fact]
+    public async Task VodPlaylistWithoutEndList_IsStillIncomplete()
+    {
+        const string vod = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg.ts\n";
+        var ex = await Assert.ThrowsAsync<MediaResolverException>(() =>
+            Manifests().ResolveTextAsync(vod, MasterUrl, MediaRequestContext.Empty, CancellationToken.None));
+        Assert.Equal(MediaErrorCode.LiveStreamNotSupported, ex.Error.Code);
+    }
+
+    [Fact]
     public void MissingHeader_AndHostileUris_AreRejected()
     {
         var a = Assert.Throws<MediaResolverException>(() => HlsParser.Parse("<html>nope</html>", MasterUrl));

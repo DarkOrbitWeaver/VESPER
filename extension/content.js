@@ -417,7 +417,7 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
-    const result = await send({ type: 'media-options', pageUrl, mediaChangedAt, title,
+    const result = await send({ type: 'media-options', pageUrl, mediaChangedAt, title, playerPlaying: !video.paused && !video.ended,
       playerPageUrl: current ? binding.page : '', playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
