@@ -14,7 +14,8 @@ internal static class RecoveryManifest
     public const string Extension = ".vmeta";
 
     private sealed record Body(int V, Guid JobId, long Generation, string Url, string FileName, long? Total,
-        string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0);
+        string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0,
+        string? MediaMetadataJson = null, string? MediaThumbnailUrl = null);
 
     private sealed record Envelope(string Check, string Body);
 
@@ -24,7 +25,8 @@ internal static class RecoveryManifest
     {
         if (job.PartialPath.Length == 0) return;
         var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
-            job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder, (int)job.Kind);
+            job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder,
+            (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl));
         string bodyJson = JsonSerializer.Serialize(body);
         string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
 
@@ -57,6 +59,11 @@ internal static class RecoveryManifest
             long length = File.Exists(partial) ? new FileInfo(partial).Length : -1;
             if (length < 0) { problem = "partial file missing"; return false; }
             extents.ClampTo(length);   // never claim bytes the file cannot contain
+            string? thumbnailUrl = UrlPolicy.TryParse(body.MediaThumbnailUrl, out Uri thumbnail, out _)
+                ? thumbnail.GetLeftPart(UriPartial.Path) : null;
+            string? mediaMetadataJson = MediaMergePlan.TryParseMetadata(body.MediaMetadataJson, out MediaMergeMetadata? metadata)
+                && (MediaMergePlan.HasMp3TagValues(metadata!) || thumbnailUrl is not null)
+                ? JsonSerializer.Serialize(metadata) : null;
 
             job = new DownloadJob
             {
@@ -66,6 +73,8 @@ internal static class RecoveryManifest
                 Message = body.Kind == 0 ? "Restored from a recovery file. Provide the download link again to continue."
                     : "Streaming partial restored without a private transfer plan. Resolve a new copy; saved fragments were kept and must not be treated as an ordinary HTTP file.",
                 ETag = body.ETag, Identity = (IdentityLevel)body.Identity, AcceptsRanges = true, Generation = body.Generation,
+                MediaMetadataJson = mediaMetadataJson,
+                MediaThumbnailUrl = thumbnailUrl,
                 LastModified = DateTimeOffset.TryParse(body.LastModified, out DateTimeOffset lm) ? lm : null
             };
             return true;
@@ -76,6 +85,9 @@ internal static class RecoveryManifest
             return false;
         }
     }
+
+    private static string? ResourcePath(string? address) => UrlPolicy.TryParse(address, out Uri uri, out _)
+        ? uri.GetLeftPart(UriPartial.Path) : null;
 
     private static string Hash(string text) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
 }

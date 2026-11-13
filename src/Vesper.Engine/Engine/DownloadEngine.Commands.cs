@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 
 namespace Vesper.Engine;
 
@@ -29,7 +30,8 @@ public sealed record AddRequest(
     string? MediaPlanJson = null,
     string? MediaFormatId = null,
     MediaOutput Output = MediaOutput.Original,
-    BrowserTransferProof? BrowserProof = null);
+    BrowserTransferProof? BrowserProof = null,
+    string? MediaMetadataJson = null);
 
 public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
 {
@@ -82,6 +84,19 @@ public sealed partial class DownloadEngine
         if (request.Kind == JobKind.Merge && (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out _)
             || request.Secrets is { Count: > 0 } || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid media merge plan without credentials or file checksums is required.");
+
+        MediaMergeMetadata? mediaMetadata = null;
+        if (request.MediaMetadataJson is not null)
+        {
+            if (request.Kind != JobKind.Http || request.MediaProvider is not { Length: > 0 and <= 80 }
+                || request.Output != MediaOutput.Original || request.BrowserProof is not null || request.Secrets is { Count: > 0 }
+                || request.ExpectedSha256 is not null || request.PieceMapJson is not null || request.MediaPlanJson is not null
+                || !string.Equals(Path.GetExtension(request.FileName ?? uri.AbsolutePath), ".mp3", StringComparison.OrdinalIgnoreCase)
+                || !MediaMergePlan.TryParseMetadata(request.MediaMetadataJson, out mediaMetadata)
+                || (mediaMetadata is not null && !MediaMergePlan.HasMp3TagValues(mediaMetadata)
+                    && string.IsNullOrWhiteSpace(request.MediaThumbnailUrl)))
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded MP3 metadata requires a discovered MP3 download without credentials or a file checksum.");
+        }
 
         string? expected = null;
         if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) && !TryNormalizeSha256(request.ExpectedSha256, out expected))
@@ -151,6 +166,7 @@ public sealed partial class DownloadEngine
                 MediaFormatId = request.MediaFormatId is { Length: <= 256 } ? request.MediaFormatId : null,
                 MediaQuality = request.MediaQuality is { Length: <= 180 } ? request.MediaQuality : null,
                 MediaThumbnailUrl = request.MediaThumbnailUrl is { Length: <= 4096 } ? request.MediaThumbnailUrl : null,
+                MediaMetadataJson = mediaMetadata is null ? null : JsonSerializer.Serialize(mediaMetadata),
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
@@ -343,8 +359,19 @@ public sealed partial class DownloadEngine
     /// Renames the entry. For unfinished downloads this is the name the file will be published under;
     /// for completed ones it only changes the record, never the file on disk.
     /// </summary>
-    public void Rename(Guid id, string name) =>
-        UpdateIfExists(id, j => { j.FileName = FileNames.Sanitize(name, j.FileName); j.NameLocked = true; });
+    public void Rename(Guid id, string name) => UpdateIfExists(id, job =>
+    {
+        string sanitized = FileNames.Sanitize(name, job.FileName);
+        bool sourceIsMp3 = job.MediaProvider is not null
+            && string.Equals(Path.GetExtension(job.FileName), ".mp3", StringComparison.OrdinalIgnoreCase);
+        if (sourceIsMp3 && !string.Equals(Path.GetExtension(sanitized), ".mp3", StringComparison.OrdinalIgnoreCase))
+        {
+            sanitized = Path.ChangeExtension(sanitized, ".mp3");
+            job.Message = "This discovered audio is MP3, so its .mp3 extension was kept.";
+        }
+        job.FileName = sanitized;
+        job.NameLocked = true;
+    });
 
     // ---- remove / delete / discard — three distinct, explicit operations ---------------------------------------------------
 
@@ -419,9 +446,9 @@ public sealed partial class DownloadEngine
             {
                 if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
                 if (!MergeTransfer.DeleteSidecars(job)) throw new IOException("A merge track file could not be deleted.");
-                if (job.Output != MediaOutput.Original
-                    && (!DeleteTemporaryFile(job, ConversionPath(job)) || !DeleteTemporaryFile(job, ConversionAudioPath(job))))
-                    throw new IOException("A temporary conversion file could not be deleted.");
+                if (!DeleteTemporaryFile(job, PublicationStagePath(job))
+                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionAudioPath(job)))
+                    throw new IOException("A temporary media file could not be deleted.");
                 RecoveryManifest.Delete(job.PartialPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

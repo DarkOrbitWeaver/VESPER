@@ -56,13 +56,17 @@ public sealed partial class DownloadEngine
 
         ct.ThrowIfCancellationRequested();
         session.CloseFile();                                  // release the handle before renaming
-        ConvertedFile? converted = job.Output == MediaOutput.Original
-            ? null : await ConvertMediaAsync(job, ct).ConfigureAwait(false);
-        if (ct.IsCancellationRequested && converted is not null) DeleteTemporaryFile(job, ConversionPath(job));
+        PreparedMediaFile? prepared;
+        string? completionNotice = null;
+        if (job.Output == MediaOutput.Original)
+            (prepared, completionNotice) = await PrepareMp3OutputAsync(job, ct).ConfigureAwait(false);
+        else prepared = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
+        if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
+        if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path);
         ct.ThrowIfCancellationRequested();
-        RunOutcome outcome = Publish(job, converted);
-        if (converted is not null && outcome.State != JobState.Completed)
-            DeleteTemporaryFile(job, ConversionPath(job));
+        RunOutcome outcome = Publish(job, prepared, completionNotice);
+        if (prepared is not null && outcome.State != JobState.Completed)
+            DeleteTemporaryFile(job, prepared.Path);
         return outcome;
     }
 
@@ -86,13 +90,13 @@ public sealed partial class DownloadEngine
     /// Publishes with "create or fail" semantics: File.Move never overwrites. The chosen name is persisted BEFORE
     /// the rename so a crash between the rename and the database update can be reconciled on restart.
     /// </summary>
-    private RunOutcome Publish(DownloadJob job, ConvertedFile? converted)
+    private RunOutcome Publish(DownloadJob job, PreparedMediaFile? prepared, string? completionNotice = null)
     {
         if (!PathSafety.TryResolveFolder(job.DestinationFolder, create: true, out _, out string problem))
             return RunOutcome.NeedsAttention("destination", problem + " The finished file is waiting at " + PathSafety.ForDisplay(job.PartialPath));
 
-        string source = converted is null ? job.PartialPath : ConversionPath(job);
-        string fileName = converted is null ? job.FileName : Path.ChangeExtension(job.FileName, OutputExtension(job.Output));
+        string source = prepared?.Path ?? job.PartialPath;
+        string fileName = prepared is not null && job.MediaMetadataJson is not null ? job.FileName : prepared?.FileName ?? job.FileName;
         WriteMarkOfTheWeb(job, source);
 
         for (int attempt = 0; attempt < 50; attempt++)
@@ -102,8 +106,8 @@ public sealed partial class DownloadEngine
             {
                 j.State = JobState.Finalizing;
                 j.PendingFinalPath = target;
-                j.PendingConversionBytes = converted?.Bytes;
-                j.PendingConversionDigest = converted?.Digest;
+                j.PendingConversionBytes = prepared?.Bytes;
+                j.PendingConversionDigest = prepared?.Digest;
             });
             Failpoint("finalize.beforeMove");
             try
@@ -120,7 +124,15 @@ public sealed partial class DownloadEngine
             }
 
             Failpoint("finalize.afterMove");
-            UpdateJob(job, j => MarkPublished(j, target));
+            UpdateJob(job, j =>
+            {
+                MarkPublished(j, target);
+                if (completionNotice is { Length: > 0 })
+                {
+                    j.Reason = "media-metadata";
+                    j.Message = completionNotice;
+                }
+            });
             FinishPublication(job);
             Log(job.Id, "completed", job.FileName);
             return job.Reason.Length == 0 ? RunOutcome.Done() : new RunOutcome(JobState.Completed, job.Reason, job.Message);
@@ -197,7 +209,7 @@ public sealed partial class DownloadEngine
     {
         // A converted file is published from a sidecar. The source is still present until the database commit.
         if (job.PendingConversionBytes is not null && job.PendingFinalPath is { } converted
-            && !File.Exists(ConversionPath(job)) && MatchesConversion(job, converted))
+            && !File.Exists(PublicationStagePath(job)) && MatchesConversion(job, converted))
         {
             MarkPublished(job, converted);
             SaveLocked(job);
@@ -245,8 +257,16 @@ public sealed partial class DownloadEngine
             var extents = new ExtentSet();
             extents.Add(new ByteRange(0, bytes));
             job.Extents = extents;
-            job.ContentType = job.Output == MediaOutput.M4a ? "audio/mp4" : "video/mp4";
-            job.MediaQuality = job.Output == MediaOutput.M4a ? "Audio AAC" : "H.264 + AAC";
+            if (job.Output == MediaOutput.Original && string.Equals(Path.GetExtension(target), ".mp3", StringComparison.OrdinalIgnoreCase))
+            {
+                job.ContentType = "audio/mpeg";
+                job.MediaQuality ??= "MP3";
+            }
+            else
+            {
+                job.ContentType = job.Output == MediaOutput.M4a ? "audio/mp4" : "video/mp4";
+                job.MediaQuality = job.Output == MediaOutput.M4a ? "Audio AAC" : "H.264 + AAC";
+            }
             job.Category = FileNames.CategoryFor(job.FileName);
         }
         else if (job.Output != MediaOutput.Original)

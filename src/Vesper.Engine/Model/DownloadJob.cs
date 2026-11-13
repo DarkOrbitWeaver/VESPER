@@ -126,6 +126,9 @@ public sealed class DownloadJob
     /// <summary>Versioned media plan or selected clip range. No cookies, keys or authorization headers.</summary>
     public string? MediaPlanJson { get; set; }
 
+    /// <summary>Bounded source-provided audio tags used when finalizing a directly downloaded MP3.</summary>
+    public string? MediaMetadataJson { get; set; }
+
     /// <summary>Incremented by every durable checkpoint; also written to the recovery manifest.</summary>
     public long Generation { get; set; }
 

@@ -52,6 +52,9 @@ public sealed class JobStore : IDisposable
         """,
         """
         ALTER TABLE jobs ADD COLUMN browser_proof TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN media_metadata_json TEXT;
         """
     ];
 
@@ -153,7 +156,7 @@ public sealed class JobStore : IDisposable
         "accepts_ranges", "identity_level", "content_type", "category", "referer", "user_agent", "expected_sha256", "piece_map",
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
         "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
-        "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof"
+        "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json"
     ];
 
     private static readonly string UpsertSql =
@@ -256,6 +259,7 @@ public sealed class JobStore : IDisposable
         yield return ("pending_conversion_bytes", j.PendingConversionBytes);
         yield return ("pending_conversion_digest", j.PendingConversionDigest);
         yield return ("browser_proof", j.BrowserProof is null ? null : JsonSerializer.Serialize(j.BrowserProof));
+        yield return ("media_metadata_json", ProtectedMediaState.Protect(j.MediaMetadataJson));
         yield return ("generation", j.Generation);
         yield return ("original_page_url", ProtectedMediaState.Protect(j.OriginalPageUrl));
         yield return ("media_provider", j.MediaProvider);
@@ -319,6 +323,7 @@ public sealed class JobStore : IDisposable
             NonResumable = Int("non_resumable") != 0,
             MediaState = ProtectedMediaState.Unprotect(NStr("media_state")),
             MediaPlanJson = ProtectedMediaState.Unprotect(NStr("media_plan_json")),
+            MediaMetadataJson = ProtectedMediaState.Unprotect(NStr("media_metadata_json")),
             MediaFormatId = NStr("media_format_id"),
             Output = (MediaOutput)Int("media_output"),
             Generation = Int("generation"),
