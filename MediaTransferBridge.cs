@@ -223,18 +223,48 @@ internal static class MediaTransferBridge
         if (tracks.Any(t => t.Context.HasCredentials || t.Context.Origin is not null || t.Context.AcceptLanguage is not null
             || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer))
             return (null, "These streams need different request contexts, which a single merge job cannot carry.");
-        if (tracks.Any(t => t.FileSize is not > 0 || t.Container is null))
-            return (null, "A stream's exact size is unknown, so it cannot be merged safely.");
+        if (tracks.Any(t => t.Container is null || t.Protocol == StreamProtocol.Http && t.FileSize is not > 0
+            || t.Protocol == StreamProtocol.Hls && t.Container is not ("mp4" or "m4a" or "ts")
+            || t.Protocol == StreamProtocol.Dash && t.Segments is not { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
+            || t.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash)))
+            return (null, "A selected stream has no complete native download plan.");
+
+        var mergeTracks = new List<MergeTrack>(tracks.Count);
+        foreach (MediaRepresentation track in tracks)
+        {
+            string role = track.HasVideo ? "video" : "audio";
+            MergeMediaSource? source = null;
+            if (track.Protocol == StreamProtocol.Hls)
+                source = new MergeMediaSource("hls", PlaylistUrl: track.Url.AbsoluteUri);
+            else if (track.Protocol == StreamProtocol.Dash && track.Segments is { } segments)
+            {
+                var dash = new DashDownloadPlan
+                {
+                    RepresentationId = track.Id,
+                    Provider = item.Provider,
+                    MediaId = item.MediaId,
+                    Initialization = new DashFragment(segments.InitializationUrl!.AbsoluteUri,
+                        segments.InitializationRange?.Offset, segments.InitializationRange?.Length),
+                    Fragments = segments.Segments.Select(segment => new DashFragment(segment.Url.AbsoluteUri,
+                        segment.Range?.Offset, segment.Range?.Length)).ToArray(),
+                    RequireAudio = role == "audio",
+                    RequireVideo = role == "video"
+                };
+                source = new MergeMediaSource("dash", Dash: dash);
+            }
+            mergeTracks.Add(new MergeTrack(role, track.Id, track.Url.AbsoluteUri, source is null ? track.FileSize!.Value : 0,
+                track.Container!, track.HasVideo ? track.VideoCodec : track.AudioCodec, track.ContentIdentity,
+                track.AudioLanguage is { Length: 3 } lang ? lang : null, source));
+        }
         var merge = new MediaMergePlan
         {
+            Version = mergeTracks.Any(track => track.Source is not null) ? 2 : 1,
             Provider = item.Provider,
             MediaId = item.MediaId,
             OutputContainer = container,
             RequireAudio = tracks.Any(t => t.HasAudio),
             RequireVideo = tracks.Any(t => t.HasVideo),
-            Tracks = tracks.Select(t => new MergeTrack(t.HasVideo ? "video" : "audio", t.Id, t.Url.AbsoluteUri, t.FileSize!.Value,
-                t.Container!, t.HasVideo ? t.VideoCodec : t.AudioCodec, t.ContentIdentity,
-                t.AudioLanguage is { Length: 3 } lang ? lang : null)).ToArray()
+            Tracks = mergeTracks
         };
         string name = Path.ChangeExtension(plan.SuggestedFileName, container);
         string summary = DisplayQuality(selection.Summary);

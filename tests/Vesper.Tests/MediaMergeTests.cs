@@ -1,5 +1,9 @@
 using System.Text;
+using System.Text.Json;
+using VESPER;
 using Vesper.Engine;
+using Vesper.MediaResolver.Formats;
+using Vesper.MediaResolver.Models;
 using Xunit;
 
 namespace Vesper.Tests;
@@ -145,6 +149,92 @@ public sealed class MediaMergeTests
         Assert.False(MediaMergePlan.TryParse((original with { OutputContainer = "m4a" }).ToJson(), false, out _, out _));
         Assert.False(MediaMergePlan.TryParse((original with { Tracks = [.. original.Tracks, .. original.Tracks, .. original.Tracks] }).ToJson(), false, out _, out _));
     }
+
+    [Fact]
+    public void MediaTransferBridge_PreparesSeparateHlsRenditionsAsOneNativeMerge()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "hls-video-720", Url = new Uri("https://cdn.example.com/video.m3u8"), Protocol = StreamProtocol.Hls,
+            Content = StreamContent.VideoOnly, Container = "mp4", VideoCodec = "h264", Height = 720
+        };
+        var audio = new MediaRepresentation
+        {
+            Id = "hls-audio-main", Url = new Uri("https://cdn.example.com/audio.m3u8"), Protocol = StreamProtocol.Hls,
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", IsDefaultAudio = true
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "hls", MediaId = "one", Title = "One",
+            Duration = TimeSpan.FromSeconds(6), Representations = [video, audio]
+        };
+
+        var prepared = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
+
+        Assert.Null(prepared.Error);
+        Assert.NotNull(prepared.Choice);
+        Assert.Equal(JobKind.Merge, prepared.Choice!.Kind);
+        Assert.Equal(".mp4", Path.GetExtension(prepared.Choice.FileName));
+        Assert.True(MediaMergePlan.TryParse(prepared.Choice.MediaPlanJson, allowPrivate: false, out MediaMergePlan plan, out string error), error);
+        Assert.Equal(2, plan.Version);
+        Assert.Collection(plan.Tracks,
+            track => Assert.Equal("hls", track.Source?.Protocol),
+            track => Assert.Equal("hls", track.Source?.Protocol));
+    }
+
+    [Fact]
+    public void MediaTransferBridge_PreparesSeparateDashRenditionsAsOneNativeMerge()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "dash-video-720", Url = new Uri("https://cdn.example.com/manifest.mpd"), Protocol = StreamProtocol.Dash,
+            Content = StreamContent.VideoOnly, Container = "mp4", VideoCodec = "h264", Height = 720,
+            Segments = DashSegments("video")
+        };
+        var audio = new MediaRepresentation
+        {
+            Id = "dash-audio-main", Url = new Uri("https://cdn.example.com/manifest.mpd"), Protocol = StreamProtocol.Dash,
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", Segments = DashSegments("audio")
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "dash", MediaId = "one", Title = "One",
+            Duration = TimeSpan.FromSeconds(6), Representations = [video, audio]
+        };
+
+        var prepared = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
+
+        Assert.Null(prepared.Error);
+        Assert.Equal(JobKind.Merge, prepared.Choice?.Kind);
+        Assert.True(MediaMergePlan.TryParse(prepared.Choice?.MediaPlanJson, allowPrivate: false, out MediaMergePlan plan, out string error), error);
+        Assert.Collection(plan.Tracks,
+            track => { Assert.Equal("dash", track.Source?.Protocol); Assert.True(track.Source?.Dash?.RequireVideo); },
+            track => { Assert.Equal("dash", track.Source?.Protocol); Assert.True(track.Source?.Dash?.RequireAudio); });
+    }
+
+    [Fact]
+    public void HlsTransportStreams_OnlyOfferTheH264AacMatroskaPath()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "v", Url = new Uri("https://cdn.example.com/video.m3u8"), Protocol = StreamProtocol.Hls,
+            Content = StreamContent.VideoOnly, Container = "ts", VideoCodec = "h264"
+        };
+        var audio = new MediaRepresentation
+        {
+            Id = "a", Url = new Uri("https://cdn.example.com/audio.m3u8"), Protocol = StreamProtocol.Hls,
+            Content = StreamContent.AudioOnly, Container = "ts", AudioCodec = "aac"
+        };
+        Assert.Equal("mkv", MergeCapability.MergeContainer(video, audio));
+        Assert.Null(MergeCapability.MergeContainer(video, audio with { AudioCodec = "opus" }));
+        Assert.Null(MergeCapability.MergeContainer(video with { Protocol = StreamProtocol.Http, FileSize = 100 }, audio));
+    }
+
+    private static SegmentPlan DashSegments(string id) => new()
+    {
+        InitializationUrl = new Uri($"https://cdn.example.com/{id}-init.mp4"), IsFragmentedMp4 = true,
+        Segments = [new MediaSegment(new Uri($"https://cdn.example.com/{id}-one.m4s"), 1)]
+    };
 
     [Fact]
     public async Task MergeJob_DownloadsBothTracks_MergesAndPublishesOneValidatedFile()

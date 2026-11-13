@@ -10,7 +10,10 @@ namespace Vesper.Engine;
 /// and content length). It is what allows a refreshed signed URL to continue committed bytes; titles or video ids never do.
 /// </summary>
 public sealed record MergeTrack(string Role, string FormatId, string Url, long Size, string Container,
-    string? Codec = null, string? Identity = null, string? Language = null);
+    string? Codec = null, string? Identity = null, string? Language = null, MergeMediaSource? Source = null);
+
+/// <summary>Plan for a segmented rendition. HLS resolves a static playlist at run time; DASH has explicit fMP4 parts.</summary>
+public sealed record MergeMediaSource(string Protocol, string? PlaylistUrl = null, DashDownloadPlan? Dash = null);
 
 /// <summary>
 /// Immutable plan for a native remux job (separate video + audio, or a single track normalised into a clean container).
@@ -30,7 +33,9 @@ public sealed record MediaMergePlan
     public bool RequireVideo { get; init; }
 
     public string ToJson() => JsonSerializer.Serialize(this);
-    public long TotalBytes => Tracks.Sum(t => t.Size);
+    public long TotalBytes => Tracks.Where(t => t.Source is null).Sum(t => t.Size);
+
+    internal bool IsSegmented => Tracks.Any(track => track.Source is not null);
 
     internal long OffsetOf(int index)
     {
@@ -51,8 +56,12 @@ public sealed record MediaMergePlan
             sb.Append(Version).Append('|').Append(Provider).Append('|').Append(MediaId).Append('|').Append(OutputContainer)
               .Append('|').Append(RequireAudio).Append('|').Append(RequireVideo);
             foreach (var t in Tracks)
+            {
                 sb.Append("|T:").Append(t.Role).Append(',').Append(t.FormatId).Append(',').Append(t.Size).Append(',')
                   .Append(t.Container).Append(',').Append(t.Codec).Append(',').Append(t.Identity).Append(',').Append(t.Language);
+                if (t.Source is not null)
+                    sb.Append(",S:").Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(t.Source)))));
+            }
             return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
         }
     }
@@ -78,29 +87,53 @@ public sealed record MediaMergePlan
     {
         plan = null!;
         error = "The media merge plan is missing or invalid. Resolve the source again; saved data was kept.";
-        if (json is null || json.Length > 256 * 1024) return false;
+        if (json is null || json.Length > 24 * 1024 * 1024) return false;
         try
         {
-            var value = JsonSerializer.Deserialize<MediaMergePlan>(json, new JsonSerializerOptions { MaxDepth = 8 });
-            if (value is null || value.Version != 1 || !Outputs.Contains(value.OutputContainer)
+            var value = JsonSerializer.Deserialize<MediaMergePlan>(json, new JsonSerializerOptions { MaxDepth = 12 });
+            if (value is null || value.Version is not (1 or 2) || !Outputs.Contains(value.OutputContainer)
                 || value.Tracks is not { Count: >= 1 and <= 4 }
                 || (value.Provider?.Length ?? 0) > 80 || (value.MediaId?.Length ?? 0) > 256) return false;
+            bool segmented = value.Tracks.Any(track => track?.Source is not null);
+            if (segmented != (value.Version == 2) || (segmented && value.Tracks.Any(track => track?.Source is null))) return false;
             int videos = 0, audios = 0;
             foreach (var t in value.Tracks)
             {
                 if (t is null || t.Role is not ("video" or "audio") || t.FormatId is not { Length: > 0 and <= 256 }
-                    || t.Size <= 0 || t.Size > MaxTrackBytes || t.Container is not ("mp4" or "m4a" or "webm")
+                    || (t.Source is null ? t.Size <= 0 || t.Size > MaxTrackBytes : t.Size != 0)
+                    || t.Container is not ("mp4" or "m4a" or "webm" or "ts")
                     || (t.Identity?.Length ?? 0) > 512 || (t.Codec?.Length ?? 0) > 64 || (t.Language?.Length ?? 0) > 35
                     || t.Url is not { Length: > 0 and <= 16384 } || !UrlPolicy.TryParse(t.Url, out var uri, out _)) return false;
                 UrlPolicy.EnsureAllowed(uri, allowPrivate);
+                if (t.Source is { } source && !ValidSource(t, source, allowPrivate)) return false;
                 if (t.Role == "video") videos++; else audios++;
             }
             if (videos > 1 || (value.RequireVideo && videos == 0) || (value.RequireAudio && audios == 0)) return false;
+            if (segmented && (videos != 1 || audios != 1 || !value.RequireVideo || !value.RequireAudio
+                || value.Tracks.Select(t => t.Source!.Protocol).Distinct(StringComparer.Ordinal).Count() != 1)) return false;
             if (value.OutputContainer == "m4a" && videos > 0) return false;
             plan = value;
             error = "";
             return true;
         }
         catch (Exception ex) when (ex is JsonException or ArgumentException or BlockedAddressException or NotSupportedException) { return false; }
+    }
+
+    private static bool ValidSource(MergeTrack track, MergeMediaSource source, bool allowPrivate)
+    {
+        if (source.Protocol == "hls")
+        {
+            if (source.PlaylistUrl is not { Length: > 0 and <= 16384 } playlist || source.Dash is not null
+                || !string.Equals(playlist, track.Url, StringComparison.Ordinal)
+                || !UrlPolicy.TryParse(playlist, out var uri, out _)) return false;
+            UrlPolicy.EnsureAllowed(uri, allowPrivate);
+            return track.Container is "mp4" or "m4a" or "ts";
+        }
+        if (source.Protocol != "dash" || source.PlaylistUrl is not null || source.Dash is not { } dash
+            || track.Container is not ("mp4" or "m4a")
+            || dash.RepresentationId != track.FormatId
+            || dash.RequireAudio != (track.Role == "audio")
+            || dash.RequireVideo != (track.Role == "video")) return false;
+        return DashDownloadPlan.TryParse(JsonSerializer.Serialize(dash), allowPrivate, out _, out _);
     }
 }

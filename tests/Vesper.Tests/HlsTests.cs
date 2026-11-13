@@ -213,4 +213,103 @@ public class HlsTests
         Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!)); Assert.EndsWith(".mp4", done.FinalPath);
     }
 
+    [Fact]
+    public async Task SegmentedMergeJob_MergesSeparateHlsFragmentedRenditions()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        void AddFmp4Rendition(string root, string init, params string[] fragments)
+        {
+            server.HlsPlaylists[$"{root}/index.m3u8"] = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+                + string.Concat(fragments.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+            server.HlsFiles[$"{root}/init.mp4"] = DashTransferTests.Fixture(init);
+            foreach (string name in fragments) server.HlsFiles[$"{root}/{name}"] = DashTransferTests.Fixture(name);
+        }
+        AddFmp4Rendition("/hls/merge/video", "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s");
+        AddFmp4Rendition("/hls/merge/audio", "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s");
+
+        string videoUrl = server.Url("/hls/merge/video/index.m3u8");
+        string audioUrl = server.Url("/hls/merge/audio/index.m3u8");
+        var plan = new MediaMergePlan
+        {
+            Version = 2, OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "hls-video", videoUrl, 0, "mp4", "h264", Source: new MergeMediaSource("hls", videoUrl)),
+                new MergeTrack("audio", "hls-audio", audioUrl, 0, "m4a", "aac", Source: new MergeMediaSource("hls", audioUrl))
+            ]
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(videoUrl, FileName: "hls-merged.mp4", Kind: JobKind.Merge,
+            MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
+        Assert.False(File.Exists(done.PartialPath + ".tracks"));
+    }
+
+    [Fact]
+    public async Task SegmentedMerge_DecryptsAes128RenditionsAndReusesTheKey()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/merge-encrypted";
+        const string keyPath = root + "/key.bin";
+        server.HlsFiles[keyPath] = FaultServer.HlsKey;
+
+        byte[] Encrypt(byte[] bytes, byte[] iv)
+        {
+            using var aes = System.Security.Cryptography.Aes.Create();
+            aes.Key = FaultServer.HlsKey;
+            return aes.EncryptCbc(bytes, iv, System.Security.Cryptography.PaddingMode.PKCS7);
+        }
+
+        byte[] SequenceIv(int sequence)
+        {
+            var iv = new byte[16];
+            for (int i = 0; i < 4; i++) iv[15 - i] = (byte)(sequence >> (8 * i));
+            return iv;
+        }
+
+        foreach (string rendition in new[] { "video", "audio" })
+        {
+            string path = $"{root}/{rendition}";
+            server.HlsFiles[$"{path}/init.mp4"] = Encrypt(DashTransferTests.Fixture("av-init.mp4"), FaultServer.HlsIv);
+            string[] fragments = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
+            for (int i = 0; i < fragments.Length; i++)
+                server.HlsFiles[$"{path}/{fragments[i]}"] = Encrypt(DashTransferTests.Fixture(fragments[i]), SequenceIv(i));
+
+            server.HlsPlaylists[$"{path}/index.m3u8"] = string.Join('\n',
+                "#EXTM3U", "#EXT-X-VERSION:7",
+                $"#EXT-X-KEY:METHOD=AES-128,URI=\"../key.bin\",IV=0x{Convert.ToHexString(FaultServer.HlsIv)}",
+                "#EXT-X-MAP:URI=\"init.mp4\"",
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"../key.bin\"",
+                string.Join('\n', fragments.Select(fragment => $"#EXTINF:1,\n{fragment}")),
+                "#EXT-X-ENDLIST", "");
+        }
+
+        string videoUrl = server.Url($"{root}/video/index.m3u8");
+        string audioUrl = server.Url($"{root}/audio/index.m3u8");
+        var plan = new MediaMergePlan
+        {
+            Version = 2, OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "hls-video", videoUrl, 0, "mp4", "h264", Source: new MergeMediaSource("hls", videoUrl)),
+                new MergeTrack("audio", "hls-audio", audioUrl, 0, "m4a", "aac", Source: new MergeMediaSource("hls", audioUrl))
+            ]
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(videoUrl, FileName: "hls-encrypted-merged.mp4", Kind: JobKind.Merge,
+            MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
+        Assert.Equal(1, server.Hits(keyPath));
+    }
+
 }

@@ -26,6 +26,32 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public void ClearFragments_DemuxAndRemuxWithoutLosingSamples()
+    {
+        byte[] initialization = Fixture("av-init.mp4");
+        var mp4 = FragmentedMp4.Open(initialization, captureSamples: true);
+        using var source = new MemoryStream();
+        source.Write(initialization);
+        for (int i = 1; i <= 3; i++)
+        {
+            byte[] fragment = Fixture($"av-{i}.m4s");
+            mp4.ValidateFragment(fragment, source.Position);
+            source.Write(fragment);
+        }
+        mp4.Finish(requireAudio: true, requireVideo: true);
+        List<DemuxedTrack> tracks = mp4.GetTracks();
+
+        Assert.Collection(tracks.OrderBy(track => track.Kind),
+            track => { Assert.Equal(TrackKind.Video, track.Kind); Assert.Equal("h264", track.Codec); Assert.NotEmpty(track.Samples); },
+            track => { Assert.Equal(TrackKind.Audio, track.Kind); Assert.Equal("aac", track.Codec); Assert.NotEmpty(track.Samples); });
+
+        using var output = new MemoryStream();
+        var inputs = tracks.Select(track => (Track: track, Source: (Stream)source)).ToList();
+        MediaMerger.Merge(inputs, "mp4", output, CancellationToken.None);
+        MediaMerger.Validate(output, output.Length, tracks, CancellationToken.None);
+    }
+
+    [Fact]
     public void AudioOnly_IsSupported_ButCannotPretendToContainVideo()
     {
         var mp4 = FragmentedMp4.Open(Fixture("audio-init.mp4"));
@@ -108,6 +134,33 @@ public sealed class DashTransferTests
         Assert.Equal(Expected, await File.ReadAllBytesAsync(job.FinalPath!));
         Assert.EndsWith(".mp4", job.FinalPath);
         Assert.Equal(Expected.Length, job.CommittedBytes);
+    }
+
+    [Fact]
+    public async Task SegmentedMerge_ResumesSeparateDashRenditionsAndRemuxesThem()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.ExpireSecond = true;
+        using var h = new Harness();
+        MediaMergePlan plan = SegmentedPlan(server);
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "dash-merged.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot waiting = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.True(waiting.CommittedBytes > 0);
+        Assert.Equal(1, server.Hits("/av-1.m4s"));
+
+        h.Restart();
+        server.ExpireSecond = false;
+        h.Engine.Resume(added.JobId);
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        Assert.Equal(2, server.Hits("/av-1.m4s"));
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
+        Assert.False(File.Exists(done.PartialPath + ".tracks"));
     }
 
     [Fact]
@@ -212,6 +265,34 @@ public sealed class DashTransferTests
         Assert.True(added.Ok, added.Message); return added.JobId;
     }
 
+    private static MediaMergePlan SegmentedPlan(FixtureServer server)
+    {
+        string source = server.Url("/manifest.mpd");
+        DashDownloadPlan video = server.Plan(ranges: false) with
+        {
+            RepresentationId = "video-source",
+            RequireAudio = false,
+            RequireVideo = true
+        };
+        var audio = new DashDownloadPlan
+        {
+            RepresentationId = "audio-source",
+            Initialization = new DashFragment(server.Url("/av-init.mp4")),
+            Fragments = Enumerable.Range(1, 3).Select(i => new DashFragment(server.Url($"/av-{i}.m4s"))).ToArray(),
+            RequireAudio = true,
+            RequireVideo = false
+        };
+        return new MediaMergePlan
+        {
+            Version = 2, OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", video.RepresentationId, source, 0, "mp4", "h264", Source: new MergeMediaSource("dash", Dash: video)),
+                new MergeTrack("audio", audio.RepresentationId, source, 0, "m4a", "aac", Source: new MergeMediaSource("dash", Dash: audio))
+            ]
+        };
+    }
+
     private sealed class FixtureServer : IAsyncDisposable
     {
         private readonly WebApplication _app;
@@ -224,7 +305,7 @@ public sealed class DashTransferTests
         internal int Hits(string path) => _hits.GetValueOrDefault(path);
         private FixtureServer()
         {
-            foreach (string name in new[] { "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s" }) _objects["/" + name] = Fixture(name);
+            foreach (string name in new[] { "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s", "audio-init.mp4", "audio-1.m4s" }) _objects["/" + name] = Fixture(name);
             _objects["/all.mp4"] = Expected;
             var builder = WebApplication.CreateSlimBuilder(); builder.WebHost.UseUrls("http://127.0.0.1:0"); builder.Logging.ClearProviders();
             _app = builder.Build(); _app.Run(ServeAsync);

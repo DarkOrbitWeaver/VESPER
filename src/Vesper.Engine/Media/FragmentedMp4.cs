@@ -17,22 +17,26 @@ internal sealed record Mp4Progress(uint Sequence, IReadOnlyList<Mp4TrackProgress
 /// </summary>
 internal sealed class FragmentedMp4
 {
+    private const long MaxSamples = 2_000_000;
     private readonly record struct Box(string Type, int Start, int Payload, int End);
-    private sealed class Track(uint id, string handler, uint duration, uint size)
+    private sealed class Track(uint id, string handler, uint duration, uint size, uint sampleFlags, DemuxedTrack media)
     {
         internal uint Id = id, DefaultDuration = duration, DefaultSize = size;
+        internal uint DefaultSampleFlags = sampleFlags;
         internal string Handler = handler;
+        internal DemuxedTrack Media = media;
         internal ulong? Next;
         internal long Samples;
     }
     private readonly Dictionary<uint, Track> _tracks = [];
+    private bool _captureSamples;
     private uint _sequence;
     internal bool HasAudio => _tracks.Values.Any(t => t.Handler == "soun");
     internal bool HasVideo => _tracks.Values.Any(t => t.Handler == "vide");
 
-    internal static FragmentedMp4 Open(ReadOnlySpan<byte> data)
+    internal static FragmentedMp4 Open(ReadOnlySpan<byte> data, bool captureSamples = false)
     {
-        var result = new FragmentedMp4();
+        var result = new FragmentedMp4 { _captureSamples = captureSamples };
         var top = Boxes(data, 0, data.Length);
         if (top.Count(b => b.Type == "ftyp") != 1 || top.Count(b => b.Type == "moov") != 1
             || top.Any(b => b.Type is not ("ftyp" or "moov" or "free" or "skip")))
@@ -44,14 +48,15 @@ internal sealed class FragmentedMp4
         if (children.Any(b => b.Type == "pssh")) throw Bad("Protected initialization is not supported.");
         var traks = children.Where(b => b.Type == "trak").ToList();
         if (traks.Count is < 1 or > 2) throw Bad("Only one audio track, one video track, or a source-muxed pair is supported.");
-        var defaults = new Dictionary<uint, (uint Duration, uint Size)>();
+        var defaults = new Dictionary<uint, (uint Duration, uint Size, uint Flags)>();
         var mvex = One(children, "mvex");
         foreach (var trex in Boxes(data, mvex.Payload, mvex.End).Where(b => b.Type == "trex"))
         {
             Need(trex, 24);
             if (U32(data, trex.Payload) != 0 || U32(data, trex.Payload + 8) != 1)
                 throw Bad("Unsupported trex version or sample-description index.");
-            if (!defaults.TryAdd(U32(data, trex.Payload + 4), (U32(data, trex.Payload + 12), U32(data, trex.Payload + 16))))
+            if (!defaults.TryAdd(U32(data, trex.Payload + 4),
+                (U32(data, trex.Payload + 12), U32(data, trex.Payload + 16), U32(data, trex.Payload + 20))))
                 throw Bad("Duplicate trex track.");
         }
         var handlers = new HashSet<string>();
@@ -69,7 +74,10 @@ internal sealed class FragmentedMp4
             if (handler is not ("vide" or "soun") || !handlers.Add(handler)) throw Bad("Unsupported or duplicate track type.");
             var mdhd = One(md, "mdhd"); Need(mdhd, 24);
             if (data[mdhd.Payload] is not (0 or 1)) throw Bad("Unsupported mdhd version.");
-            if (U32(data, mdhd.Payload + (data[mdhd.Payload] == 0 ? 12 : 20)) == 0) throw Bad("Zero track timescale.");
+            int mdhdVersion = data[mdhd.Payload];
+            if (mdhdVersion == 1) Need(mdhd, 34);
+            uint timescale = U32(data, mdhd.Payload + (mdhdVersion == 0 ? 12 : 20));
+            if (timescale == 0) throw Bad("Zero track timescale.");
             var minf = One(md, "minf"); var stbl = One(Boxes(data, minf.Payload, minf.End), "stbl");
             var st = Boxes(data, stbl.Payload, stbl.End); var stsd = One(st, "stsd"); Need(stsd, 8);
             if (U32(data, stsd.Payload) != 0 || U32(data, stsd.Payload + 4) != 1) throw Bad("Exactly one clear sample description is required.");
@@ -95,7 +103,23 @@ internal sealed class FragmentedMp4
                 if (U32(data, table.Payload + (table.Type == "stsz" ? 8 : 4)) != 0)
                     throw Bad("Initialization contains non-fragmented samples.");
             }
-            if (id == 0 || !defaults.TryGetValue(id, out var def) || !result._tracks.TryAdd(id, new Track(id, handler, def.Duration, def.Size)))
+            if (id == 0 || !defaults.TryGetValue(id, out var def))
+                throw Bad("Missing or invalid track defaults.");
+            byte[] sampleEntry = data.Slice(entry.Start, entry.End - entry.Start).ToArray();
+            var mediaTrack = new DemuxedTrack
+            {
+                Kind = handler == "vide" ? TrackKind.Video : TrackKind.Audio,
+                SourceContainer = "mp4",
+                Timescale = timescale,
+                Language = Mp4Demuxer.UnpackLanguage(U16(data, mdhd.Payload + (mdhdVersion == 0 ? 20 : 32))),
+                Mp4SampleEntry = sampleEntry
+            };
+            Mp4Demuxer.ParseSampleEntry(mediaTrack, sampleEntry, 0, sampleEntry.Length);
+            if (handler == "vide" && (mediaTrack.Width <= 0 || mediaTrack.Height <= 0))
+                throw Bad("The video sample entry has invalid dimensions.");
+            if (handler == "soun" && (mediaTrack.SampleRate <= 0 || mediaTrack.Channels <= 0))
+                throw Bad("The audio sample entry has invalid channels or sample rate.");
+            if (!result._tracks.TryAdd(id, new Track(id, handler, def.Duration, def.Size, def.Flags, mediaTrack)))
                 throw Bad("Missing, duplicate or invalid track defaults.");
         }
         if (defaults.Count != result._tracks.Count) throw Bad("Track defaults do not match initialization tracks.");
@@ -103,6 +127,8 @@ internal sealed class FragmentedMp4
     }
 
     internal Mp4Progress Snapshot() => new(_sequence, _tracks.Values.Select(t => new Mp4TrackProgress(t.Id, t.Next, t.Samples)).ToArray());
+
+    internal List<DemuxedTrack> GetTracks() => [.. _tracks.Values.Select(t => t.Media)];
 
     internal void Restore(Mp4Progress progress)
     {
@@ -117,7 +143,7 @@ internal sealed class FragmentedMp4
         _sequence = progress.Sequence;
     }
 
-    internal void ValidateFragment(ReadOnlySpan<byte> data)
+    internal void ValidateFragment(ReadOnlySpan<byte> data, long sourceOffset = 0)
     {
         var boxes = Boxes(data, 0, data.Length);
         bool sawMedia = false;
@@ -147,11 +173,11 @@ internal sealed class FragmentedMp4
                 uint id = U32(data, tfhd.Payload + 4);
                 if (!_tracks.TryGetValue(id, out var track) || !seen.Add(id)) throw Bad("Unknown or duplicate fragment track.");
                 int p = tfhd.Payload + 8;
-                uint duration = track.DefaultDuration, size = track.DefaultSize;
+                uint duration = track.DefaultDuration, size = track.DefaultSize, sampleFlags = track.DefaultSampleFlags;
                 if ((flags & 2) != 0 && Read(data, ref p, tfhd.End) != 1) throw Bad("Sample description changed.");
                 if ((flags & 8) != 0) duration = Read(data, ref p, tfhd.End);
                 if ((flags & 16) != 0) size = Read(data, ref p, tfhd.End);
-                if ((flags & 32) != 0) Read(data, ref p, tfhd.End);
+                if ((flags & 32) != 0) sampleFlags = Read(data, ref p, tfhd.End);
                 if (p != tfhd.End) throw Bad("Invalid tfhd length.");
                 var tfdt = One(tb, "tfdt"); Need(tfdt, 8);
                 uint tv = U32(data, tfdt.Payload);
@@ -166,20 +192,39 @@ internal sealed class FragmentedMp4
                     Need(run, 12);
                     uint rf = U32(data, run.Payload);
                     if ((rf & 1) == 0 || (rf & ~0x01000f05u) != 0) throw Bad("Unsupported trun flags or missing data offset.");
+                    if ((rf & 0x00000400) != 0 && (rf & 0x00000004) != 0)
+                        throw Bad("A track run has conflicting sample-flag fields.");
                     uint count = U32(data, run.Payload + 4);
-                    if (count is 0 or > 100_000) throw Bad("Invalid sample count.");
+                    if (count is 0 or > 100_000 || track.Samples > MaxSamples - count)
+                        throw Bad("Invalid or excessive sample count.");
                     int q = run.Payload + 8;
                     long start = checked((long)moof.Start + unchecked((int)Read(data, ref q, run.End)));
-                    if ((rf & 4) != 0) Read(data, ref q, run.End);
+                    uint firstFlags = (rf & 4) != 0 ? Read(data, ref q, run.End) : sampleFlags;
                     long bytes = 0;
+                    long sampleOffset = start;
                     for (int sample = 0; sample < count; sample++)
                     {
                         uint d = (rf & 0x100) != 0 ? Read(data, ref q, run.End) : duration;
                         uint n = (rf & 0x200) != 0 ? Read(data, ref q, run.End) : size;
-                        if ((rf & 0x400) != 0) Read(data, ref q, run.End);
-                        if ((rf & 0x800) != 0) Read(data, ref q, run.End); // signed when version=1; preserved unchanged
-                        if (d == 0 || n == 0 || decode > ulong.MaxValue - d) throw Bad("Invalid sample duration, size or decode timestamp.");
-                        decode += d; bytes = checked(bytes + n);
+                        uint sf = (rf & 0x400) != 0 ? Read(data, ref q, run.End) : sample == 0 ? firstFlags : sampleFlags;
+                        uint rawCts = (rf & 0x800) != 0 ? Read(data, ref q, run.End) : 0;
+                        long cts = (rf & 0x800) == 0 ? 0 : (rf >> 24) == 1 ? unchecked((int)rawCts) : rawCts;
+                        if (d == 0 || d > int.MaxValue || n == 0 || n > int.MaxValue || decode > long.MaxValue
+                            || decode > ulong.MaxValue - d || cts is < int.MinValue or > int.MaxValue)
+                            throw Bad("Invalid sample duration, size, composition offset or decode timestamp.");
+                        if (_captureSamples)
+                            track.Media.Samples.Add(new TrackSample
+                            {
+                                Offset = checked(sourceOffset + sampleOffset),
+                                Size = (int)n,
+                                Dts = (long)decode,
+                                CtsOffset = (int)cts,
+                                Duration = (int)d,
+                                Key = (sf & 0x00010000) == 0
+                            });
+                        decode += d;
+                        bytes = checked(bytes + n);
+                        sampleOffset = checked(sampleOffset + n);
                     }
                     if (q != run.End || start < mdat.Payload || start > mdat.End || bytes > mdat.End - start)
                         throw Bad("A sample run points outside its mdat payload.");
@@ -231,6 +276,7 @@ internal sealed class FragmentedMp4
     }
     private static void Need(Box b, int length) { if (b.End - b.Payload < length) throw Bad($"Truncated {b.Type} box."); }
     private static uint U32(ReadOnlySpan<byte> b, int p) => BinaryPrimitives.ReadUInt32BigEndian(b.Slice(p, 4));
+    private static ushort U16(ReadOnlySpan<byte> b, int p) => BinaryPrimitives.ReadUInt16BigEndian(b.Slice(p, 2));
     private static uint Read(ReadOnlySpan<byte> b, ref int p, int end)
     {
         if (end - p < 4) throw Bad("Truncated sample table.");
