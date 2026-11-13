@@ -47,7 +47,7 @@ internal sealed class SetupWindow : Form
             Icon = _icon = (Icon)icon.Clone();
 
         _canvas = new FirstFlightCanvas(palette) { Dock = DockStyle.Fill };
-        _canvas.IntroFinished += RefreshControls;
+        _canvas.IntroFinished += IntroFinished;
         _status.Font = _statusFont;
         _note.Font = _noteFont;
         Controls.AddRange([_action, _skip, _cancel, _extension, _status, _note, _meter, _canvas]);
@@ -104,7 +104,7 @@ internal sealed class SetupWindow : Form
         finally
         {
             _cancellation = null;
-            _canvas.StopIntro();
+            if (_view != View.Complete || _mode != SetupMode.Install) _canvas.StopIntro();
             RefreshControls();
             if (_view == View.Cancelled && _closeAfterCancel) Close();
             else _action.Focus();
@@ -114,7 +114,7 @@ internal sealed class SetupWindow : Form
     private void RefreshControls()
     {
         bool working = _view == View.Working;
-        bool intro = working && _canvas.Playing;
+        bool intro = _canvas.Playing;
         _action.Visible = !working;
         _cancel.Visible = working && !intro;
         _cancel.Enabled = _cancellation?.IsCancellationRequested == false;
@@ -148,19 +148,29 @@ internal sealed class SetupWindow : Form
         _note.Text = _view switch
         {
             View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, and history will be kept.",
-            View.Ready when _mode == SetupMode.Install => "Installs for this Windows account",
+            View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
             View.Complete when _mode != SetupMode.Uninstall => "In Chrome, use Developer mode → Load unpacked to enable the bundled extension.",
             View.Complete => "Your downloads, settings, and history were kept.",
             _ => ""
         };
-        AcceptButton = intro ? _skip : working ? null : _action;
+        AcceptButton = intro && working ? _skip : working ? null : _action;
+    }
+
+    private void IntroFinished()
+    {
+        bool skipHadFocus = _skip.Focused;
+        RefreshControls();
+        if (!skipHadFocus) return;
+        if (_view == View.Working) _cancel.Focus();
+        else _action.Focus();
     }
 
     private void SkipIntro()
     {
         _canvas.StopIntro();
         RefreshControls();
-        _cancel.Focus();
+        if (_view == View.Working) _cancel.Focus();
+        else _action.Focus();
     }
 
     private void RequestCancellation()
