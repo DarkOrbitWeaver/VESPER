@@ -588,6 +588,47 @@ public sealed class MediaMergeTests
     }
 
     [Fact]
+    public void WebmAudioMergeEmbedsMusicTagsAndCoverWithoutChangingAudioSamples()
+    {
+        var source = new MemoryStream(Fixture("muxed.webm"));
+        DemuxedTrack audio = Assert.Single(MediaMerger.Demux(source, source.Length, default), track => track.Kind == TrackKind.Audio);
+        var metadata = new MediaMergeMetadata
+        {
+            Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album", AlbumArtist = "Fixture Band",
+            TrackNumber = 2, DiscNumber = 1, ReleaseDate = "2024-03-12"
+        };
+        MediaThumbnail thumbnail = Assert.IsType<MediaThumbnail>(MediaThumbnail.TryCreate(TinyPng()));
+        var output = new MemoryStream();
+
+        MergeResult result = MediaMerger.Merge([(audio, source)], "webm", output, default, metadata, thumbnail);
+        MediaMerger.Validate(output, output.Length, [audio], default, result.Metadata, result.ThumbnailSha256);
+        MediaMergeMetadata stored = WebmDemuxer.ReadMetadata(output, output.Length);
+        MediaThumbnail storedCover = Assert.IsType<MediaThumbnail>(WebmDemuxer.ReadThumbnail(output, output.Length));
+        DemuxedTrack muxedAudio = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+
+        Assert.Equal("webm", result.Container);
+        Assert.Equal(metadata.Title, stored.Title);
+        Assert.Equal(metadata.Artist, stored.Artist);
+        Assert.Equal(metadata.Album, stored.Album);
+        Assert.Equal(metadata.AlbumArtist, stored.AlbumArtist);
+        Assert.Equal(metadata.TrackNumber, stored.TrackNumber);
+        Assert.Equal(metadata.DiscNumber, stored.DiscNumber);
+        Assert.Equal(metadata.ReleaseDate, stored.ReleaseDate);
+        Assert.Equal(thumbnail.Sha256, storedCover.Sha256);
+        AssertSamePayloads(audio, source, muxedAudio, output);
+
+        string? qaPath = Environment.GetEnvironmentVariable("VESPER_MEDIA_QA_WEBM_MUSIC");
+        if (!string.IsNullOrWhiteSpace(qaPath))
+        {
+            string fullPath = Path.GetFullPath(qaPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            using var qaFile = File.Create(fullPath);
+            output.Position = 0;
+            output.CopyTo(qaFile);
+        }
+    }
+
+    [Fact]
     public void M4aMerge_InvalidOrMissingCoverDoesNotPreventAudioOutput()
     {
         var audioStream = new MemoryStream(AacFmp4());
