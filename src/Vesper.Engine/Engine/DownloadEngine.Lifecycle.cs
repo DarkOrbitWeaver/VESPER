@@ -59,7 +59,7 @@ public sealed partial class DownloadEngine
         PreparedMediaFile? prepared;
         string? completionNotice = null;
         if (job.Output == MediaOutput.Original)
-            (prepared, completionNotice) = await PrepareMp3OutputAsync(job, ct).ConfigureAwait(false);
+            (prepared, completionNotice) = await PrepareAudioMetadataAsync(job, ct).ConfigureAwait(false);
         else prepared = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
         if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
         if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path);

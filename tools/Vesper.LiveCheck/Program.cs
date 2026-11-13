@@ -118,7 +118,9 @@ async Task<Dictionary<string, object?>> RunAsync(string platform, string scenari
     sw.Restart();
     AddResult added = engine.Add(new AddRequest(choice.Url, downloads, choice.FileName, true, choice.Referer, choice.UserAgent,
         Kind: choice.Kind, OriginalPageUrl: choice.OriginalPageUrl, MediaProvider: choice.Provider, MediaId: choice.MediaId,
-        MediaQuality: choice.Quality, MediaExpiresAt: choice.ExpiresAt, MediaPlanJson: choice.MediaPlanJson, MediaFormatId: choice.FormatId));
+        MediaQuality: choice.Quality, MediaThumbnailUrl: choice.ThumbnailUrl, MediaExpiresAt: choice.ExpiresAt,
+        MediaPlanJson: choice.MediaPlanJson, MediaFormatId: choice.FormatId, Output: choice.Output,
+        MediaMetadataJson: choice.MediaMetadataJson));
     if (!added.Ok)
     {
         row["download"] = "fail";
@@ -143,23 +145,34 @@ async Task<Dictionary<string, object?>> RunAsync(string platform, string scenari
     row["file"] = Path.GetFileName(path);
     row["bytes"] = new FileInfo(path).Length;
     row["mbPerSecond"] = Math.Round(new FileInfo(path).Length / 1048576.0 / Math.Max(0.1, sw.Elapsed.TotalSeconds), 1);
-    try
+    string extension = Path.GetExtension(path).ToLowerInvariant();
+    if (extension is ".mp3" or ".flac" or ".ogg" or ".opus")
     {
-        using var fs = File.OpenRead(path);
-        var tracks = MediaMerger.Demux(fs, fs.Length, CancellationToken.None);
-        row["tracks"] = string.Join(", ", tracks.Select(x => $"{x.Kind.ToString().ToLowerInvariant()}:{x.Codec}{(x.Kind == TrackKind.Video ? $" {x.Width}x{x.Height}" : "")} {x.DurationSeconds:0.0}s"));
-        bool audio = tracks.Any(x => x.Kind == TrackKind.Audio);
-        row["audio"] = audio ? "verified" : "MISSING";
-        row["vesperValidation"] = "pass";
+        row["tracks"] = "native container inspection is not implemented";
+        row["audio"] = "not parsed by VESPER";
+        row["vesperValidation"] = "unavailable for this direct audio format";
     }
-    catch (Exception ex) { row["vesperValidation"] = "fail: " + ex.Message; }
+    else
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            var tracks = MediaMerger.Demux(fs, fs.Length, CancellationToken.None);
+            row["tracks"] = string.Join(", ", tracks.Select(x => $"{x.Kind.ToString().ToLowerInvariant()}:{x.Codec}{(x.Kind == TrackKind.Video ? $" {x.Width}x{x.Height}" : "")} {x.DurationSeconds:0.0}s"));
+            bool audio = tracks.Any(x => x.Kind == TrackKind.Audio);
+            row["audio"] = audio ? "verified" : "MISSING";
+            row["vesperValidation"] = "pass";
+        }
+        catch (Exception ex) { row["vesperValidation"] = "fail: " + ex.Message; }
+    }
     if (ffmpegDir is not null) row["independentValidation"] = Independent(path);
     return row;
 }
 
 string Independent(string path)
 {
-    var (code, probe, _) = Exec(Path.Combine(ffmpegDir!, "ffprobe"), $"-v error -show_entries stream=codec_type,codec_name,width,height:format=format_name,duration -of compact \"{path}\"", 120);
+    var (code, probe, _) = Exec(Path.Combine(ffmpegDir!, "ffprobe"),
+        $"-v error -show_entries stream=codec_type,codec_name,width,height,sample_rate,channels:stream_disposition=attached_pic:stream_tags=title,artist,album,album_artist,track,disc,date:format=format_name,duration:format_tags=title,artist,album,album_artist,track,disc,date -of compact \"{path}\"", 120);
     if (code != 0) return "ffprobe failed";
     long size = new FileInfo(path).Length;
     // Full decode for files up to 400 MB; larger files: first 90 s and last 60 s plus container duration check.

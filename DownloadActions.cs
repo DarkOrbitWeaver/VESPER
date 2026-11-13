@@ -149,14 +149,15 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
 
     public void Rename(JobSnapshot s)
     {
-        bool sourceIsMp3 = s.MediaProvider is not null
-            && string.Equals(Path.GetExtension(s.FileName), ".mp3", StringComparison.OrdinalIgnoreCase);
+        string extension = Path.GetExtension(s.FileName);
+        bool sourceIsTaggedAudio = s.MediaProvider is not null
+            && extension.ToLowerInvariant() is (".mp3" or ".flac" or ".ogg" or ".opus");
         string hint = s.State == JobState.Completed
-            ? sourceIsMp3
-                ? "Renames the entry in VESPER only. The file on disk keeps its name and .mp3 extension."
+            ? sourceIsTaggedAudio
+                ? $"Renames the entry in VESPER only. The file on disk keeps its name and {extension} extension."
                 : "Renames the entry in VESPER only. The file on disk keeps its name."
-            : sourceIsMp3
-                ? "You can change its name, but the .mp3 extension stays to match the audio format."
+            : sourceIsTaggedAudio
+                ? $"You can change its name, but the {extension} extension stays to match the audio format."
                 : "Used as the file name when the download finishes.";
         string? name = AskForText("Rename entry", "Name", s.FileName, hint);
         if (!string.IsNullOrWhiteSpace(name)) engine.Rename(s.Id, name);

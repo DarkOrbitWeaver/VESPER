@@ -7,16 +7,17 @@ namespace Vesper.Engine;
 public sealed partial class DownloadEngine
 {
     private sealed record PreparedMediaFile(long Bytes, string Digest, string Path, string FileName);
+    private enum AudioMetadataWriteStatus { Written, NoChanges, ExistingTags, UnsupportedAudio }
     private readonly SemaphoreSlim _conversionSlot = new(1);
 
     private static string OutputExtension(MediaOutput output) => output == MediaOutput.M4a ? ".m4a" : ".mp4";
     private static string ConversionPath(DownloadJob job) => job.PartialPath + ".convert.mp4";
     private static string ConversionAudioPath(DownloadJob job) => job.PartialPath + ".convert-audio.mp4";
-    private static string Mp3MetadataPath(DownloadJob job) => job.PartialPath + ".tagged.mp3";
+    private static string AudioMetadataPath(DownloadJob job) => job.PartialPath + ".tagged" + Path.GetExtension(job.FileName);
 
     internal static string PublicationStagePath(DownloadJob job) =>
         job.Output == MediaOutput.Original && job.MediaMetadataJson is not null
-            ? Mp3MetadataPath(job) : ConversionPath(job);
+            ? AudioMetadataPath(job) : ConversionPath(job);
 
     private async Task<PreparedMediaFile?> ConvertMediaAsync(DownloadJob job, CancellationToken ct)
     {
@@ -86,27 +87,14 @@ public sealed partial class DownloadEngine
         }
     }
 
-    private async Task<(PreparedMediaFile? File, string? Notice)> PrepareMp3OutputAsync(DownloadJob job, CancellationToken ct)
+    private async Task<(PreparedMediaFile? File, string? Notice)> PrepareAudioMetadataAsync(DownloadJob job, CancellationToken ct)
     {
         if (job.MediaMetadataJson is null) return (null, null);
-        if (job.Output != MediaOutput.Original || !string.Equals(Path.GetExtension(job.FileName), ".mp3", StringComparison.OrdinalIgnoreCase))
-            return (null, "Track tags were not added because the file name no longer uses the MP3 format.");
+        string extension = Path.GetExtension(job.FileName).ToLowerInvariant();
+        if (job.Output != MediaOutput.Original || !MediaMergePlan.SupportsAudioMetadataFile(job.FileName))
+            return (null, "Track details were not embedded because the saved file name no longer matches a supported audio format.");
         if (!MediaMergePlan.TryParseMetadata(job.MediaMetadataJson, out MediaMergeMetadata? metadata) || metadata is null)
-            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
-
-        try
-        {
-            using var probe = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            if (Mp3MetadataWriter.HasId3v2Tag(probe))
-                return (null, "VESPER kept the MP3's existing tags unchanged; newly discovered details and artwork were not applied.");
-            if (!Mp3MetadataWriter.IsMpegLayer3(probe))
-                return (null, "VESPER could not safely add tags to this MP3; the original was saved unchanged.");
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            Log(job.Id, "media-metadata", ex.Message);
-            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
-        }
+            return (null, "Track details could not be embedded; the original audio file was saved unchanged.");
 
         bool artworkRequested = !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl);
         MediaThumbnail? cover = artworkRequested
@@ -116,30 +104,31 @@ public sealed partial class DownloadEngine
             ? "Track details were saved, but valid source artwork was unavailable."
             : null;
 
-        string stage = Mp3MetadataPath(job);
+        string stage = AudioMetadataPath(job);
         if (!DeleteTemporaryFile(job, stage))
-            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+            return (null, "Track details could not be embedded; the original audio file was saved unchanged.");
         bool owned = false;
         bool ready = false;
         try
         {
             if (PathSafety.Inspect(job.PartialPath) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
-                return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+                return (null, "Track details could not be embedded; the original audio file was saved unchanged.");
 
             using var source = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var output = new FileStream(stage, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16,
                 FileOptions.SequentialScan);
             owned = true;
-            Mp3MetadataWriteResult result = await Mp3MetadataWriter.TryWriteAsync(source, output, metadata, cover, ct).ConfigureAwait(false);
-            if (result != Mp3MetadataWriteResult.Written)
+            AudioMetadataWriteStatus result = await WriteAudioMetadataAsync(extension, source, output, metadata, cover, ct)
+                .ConfigureAwait(false);
+            if (result != AudioMetadataWriteStatus.Written)
             {
                 string notice = result switch
                 {
-                    Mp3MetadataWriteResult.ExistingTags => "VESPER kept the MP3's existing tags unchanged; newly discovered details and artwork were not applied.",
-                    Mp3MetadataWriteResult.NoTags => "No supported source details were available to embed; the original MP3 was saved unchanged.",
-                    _ => "VESPER could not safely add tags to this MP3; the original was saved unchanged."
+                    AudioMetadataWriteStatus.ExistingTags => "VESPER kept the MP3's existing tags unchanged; newly discovered details and artwork were not applied.",
+                    AudioMetadataWriteStatus.NoChanges => "No supported source details were available to embed; the original audio file was saved unchanged.",
+                    _ => $"VESPER could not safely add tags to this {extension[1..].ToUpperInvariant()} file; the original was saved unchanged."
                 };
-                if (result != Mp3MetadataWriteResult.ExistingTags && artworkNotice is not null)
+                if (result != AudioMetadataWriteStatus.ExistingTags && artworkNotice is not null)
                     notice += " " + artworkNotice;
                 return (null, notice);
             }
@@ -153,12 +142,55 @@ public sealed partial class DownloadEngine
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Log(job.Id, "media-metadata", ex.Message);
-            return (null, "Track details could not be embedded; the original MP3 was saved unchanged.");
+            return (null, "Track details could not be embedded; the original audio file was saved unchanged.");
         }
         finally
         {
             if (owned && !ready) DeleteTemporaryFile(job, stage);
         }
+    }
+
+    private static async Task<AudioMetadataWriteStatus> WriteAudioMetadataAsync(string extension, Stream source,
+        Stream destination, MediaMergeMetadata metadata, MediaThumbnail? cover, CancellationToken ct)
+    {
+        if (extension == ".mp3")
+        {
+            Mp3MetadataWriteResult result = await Mp3MetadataWriter.TryWriteAsync(source, destination, metadata, cover, ct)
+                .ConfigureAwait(false);
+            return result switch
+            {
+                Mp3MetadataWriteResult.Written => AudioMetadataWriteStatus.Written,
+                Mp3MetadataWriteResult.ExistingTags => AudioMetadataWriteStatus.ExistingTags,
+                Mp3MetadataWriteResult.NoTags => AudioMetadataWriteStatus.NoChanges,
+                _ => AudioMetadataWriteStatus.UnsupportedAudio
+            };
+        }
+
+        if (extension == ".flac")
+        {
+            FlacMetadataWriteResult result = await FlacMetadataWriter.TryWriteAsync(source, destination, metadata, cover, ct)
+                .ConfigureAwait(false);
+            return result switch
+            {
+                FlacMetadataWriteResult.Written => AudioMetadataWriteStatus.Written,
+                FlacMetadataWriteResult.NoChanges => AudioMetadataWriteStatus.NoChanges,
+                _ => AudioMetadataWriteStatus.UnsupportedAudio
+            };
+        }
+
+        if (extension is ".ogg" or ".opus")
+        {
+            OggAudioMetadataWriteResult result = await OggAudioMetadataWriter.TryWriteAsync(source, destination, metadata, cover, ct)
+                .ConfigureAwait(false);
+            return result switch
+            {
+                OggAudioMetadataWriteResult.Written => AudioMetadataWriteStatus.Written,
+                OggAudioMetadataWriteResult.NoChanges => AudioMetadataWriteStatus.NoChanges,
+                _ => AudioMetadataWriteStatus.UnsupportedAudio
+            };
+        }
+
+        return AudioMetadataWriteStatus.UnsupportedAudio;
     }
 
     // Use the original MP4 track when it is available, so its decode timestamps and video samples survive audio conversion.

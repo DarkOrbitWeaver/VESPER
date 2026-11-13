@@ -142,6 +142,37 @@ public sealed class AudioOutputTests
         Assert.Null(metadata.Album);
     }
 
+    [Theory]
+    [InlineData("flac", "flac", "Song One.flac")]
+    [InlineData("ogg", "vorbis", "Song One.ogg")]
+    [InlineData("vorbis", "vorbis", "Song One.ogg")]
+    [InlineData("opus", "opus", "Song One.opus")]
+    public void DirectAudioFormatsCarryTagsAndUsePlayerFriendlyExtensions(string container, string codec, string fileName)
+    {
+        var audio = new MediaRepresentation
+        {
+            Id = "bandcamp-audio", Url = new Uri("https://cdn.example.com/song." + container),
+            Content = StreamContent.AudioOnly, Container = container, AudioCodec = codec
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://fixtureband.bandcamp.com/track/song-one"), Provider = "bandcamp", Kind = MediaKind.Audio,
+            Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album",
+            Thumbnail = new Uri("https://cdn.example.com/cover.png"), Representations = [audio]
+        };
+
+        MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            new FormatPreferences { Mode = QualityMode.AudioOnly, AudioCodecs = [codec] }).Choice);
+
+        Assert.Equal(JobKind.Http, choice.Kind);
+        Assert.Equal(fileName, choice.FileName);
+        Assert.NotNull(choice.MediaMetadataJson);
+        Assert.True(MediaMergePlan.TryParseMetadata(choice.MediaMetadataJson, out MediaMergeMetadata? metadata));
+        Assert.Equal("Song One", metadata!.Title);
+        Assert.Equal("Fixture Band", metadata.Artist);
+        Assert.Equal("Fixture Album", metadata.Album);
+    }
+
     [Fact]
     public void Audio_track_selection_is_exact_and_does_not_fall_back_to_another_track()
     {
