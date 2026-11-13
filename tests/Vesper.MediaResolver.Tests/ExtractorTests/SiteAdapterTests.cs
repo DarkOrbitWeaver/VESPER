@@ -262,6 +262,11 @@ public class SiteAdapterTests
         var item = res.Item!;
         Assert.Equal("Song One", item.Title);
         Assert.Equal("Fixture Band", item.Uploader);
+        Assert.Equal("Fixture Band", item.Artist);
+        Assert.Equal("Fixture Band", item.AlbumArtist);
+        Assert.Null(item.Album); // The track page does not identify its album in this source record.
+        Assert.Equal(1, item.TrackNumber);
+        Assert.Equal("2024-03-12", item.ReleaseDate);
         Assert.Equal(MediaKind.Audio, item.Kind);
         Assert.Equal(TimeSpan.FromSeconds(201.5), item.Duration);
         var rep = Assert.Single(item.Representations);
@@ -284,6 +289,11 @@ public class SiteAdapterTests
         Assert.Equal(3, c.TotalCount);
         Assert.Equal("Fixture Album", c.Title);
         Assert.All(c.Entries, e => Assert.NotNull(e.Resolved));
+        Assert.Equal("Fixture Album", c.Entries[0].Resolved!.Album);
+        Assert.Equal("Fixture Band", c.Entries[0].Resolved.Artist);
+        Assert.Equal("Fixture Band", c.Entries[0].Resolved.AlbumArtist);
+        Assert.Equal(1, c.Entries[0].Resolved.TrackNumber);
+        Assert.Equal("2024-03-12", c.Entries[0].Resolved.ReleaseDate);
         Assert.Equal("https://fixtureband.bandcamp.com/track/song-two", c.Entries[1].Url.AbsoluteUri);
     }
 

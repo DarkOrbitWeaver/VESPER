@@ -24,6 +24,12 @@ public sealed record MediaItem
     public string Title { get; init; } = "";
     public string? Description { get; init; }
     public string? Uploader { get; init; }
+    public string? Artist { get; init; }
+    public string? Album { get; init; }
+    public string? AlbumArtist { get; init; }
+    public int? TrackNumber { get; init; }
+    public int? DiscNumber { get; init; }
+    public string? ReleaseDate { get; init; }
     public TimeSpan? Duration { get; init; }
     public Uri? Thumbnail { get; init; }
     public MediaKind Kind { get; init; } = MediaKind.Video;

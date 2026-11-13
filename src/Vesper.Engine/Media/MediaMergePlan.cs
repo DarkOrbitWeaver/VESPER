@@ -23,6 +23,12 @@ public sealed record MediaMergeMetadata
     public string? Title { get; init; }
     public string? Uploader { get; init; }
     public string? Description { get; init; }
+    public string? Artist { get; init; }
+    public string? Album { get; init; }
+    public string? AlbumArtist { get; init; }
+    public int? TrackNumber { get; init; }
+    public int? DiscNumber { get; init; }
+    public string? ReleaseDate { get; init; }
     public TimeSpan? Duration { get; init; }
     public IReadOnlyList<MediaMergeChapter> Chapters { get; init; } = [];
 }
@@ -161,6 +167,10 @@ public sealed record MediaMergePlan
     {
         if ((metadata.Title?.Length ?? 0) > 512 || (metadata.Uploader?.Length ?? 0) > 256
             || (metadata.Description?.Length ?? 0) > 8192 || metadata.Chapters is not { Count: <= 200 }
+            || (metadata.Artist?.Length ?? 0) > 256 || (metadata.Album?.Length ?? 0) > 512
+            || (metadata.AlbumArtist?.Length ?? 0) > 256
+            || metadata.TrackNumber is < 1 or > 999 || metadata.DiscNumber is < 1 or > 999
+            || !ValidReleaseDate(metadata.ReleaseDate)
             || metadata.Duration is { } duration && (duration <= TimeSpan.Zero || duration > TimeSpan.FromDays(365))) return false;
         TimeSpan previousStart = TimeSpan.MinValue;
         TimeSpan? previousEnd = null;
@@ -177,4 +187,10 @@ public sealed record MediaMergePlan
         }
         return true;
     }
+
+    private static bool ValidReleaseDate(string? value) => value is null
+        || value.Length <= 10 && (DateOnly.TryParseExact(value, "yyyy", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out _)
+            || DateOnly.TryParseExact(value, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out _));
 }

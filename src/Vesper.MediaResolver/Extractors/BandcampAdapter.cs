@@ -28,6 +28,18 @@ internal sealed class BandcampAdapter : AdapterBase
 
     public override bool CanHandle(Uri url) => Matches(url);
 
+    private static int? PositiveNumber(int? value) => value is > 0 and <= 999 ? value : null;
+
+    private static string? NormalizeReleaseDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        string datePart = value.Length >= 10 ? value[..10] : value;
+        return DateOnly.TryParseExact(datePart, ["yyyy-MM-dd", "yyyy"],
+            System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out DateOnly date)
+            ? date.ToString(datePart.Length == 4 ? "yyyy" : "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)
+            : null;
+    }
+
     public override async Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct)
     {
         var page = await GetPageAsync(request.Url, null, ct).ConfigureAwait(false);
@@ -43,6 +55,10 @@ internal sealed class BandcampAdapter : AdapterBase
         var tr = doc.RootElement;
         string? artist = tr.P("artist").Str();
         string albumTitle = tr.P("current").P("title").Str() ?? "";
+        string? album = tr.P("album_title").Str();
+        if (album is null && request.Url.AbsolutePath.StartsWith("/album/", StringComparison.Ordinal))
+            album = albumTitle;
+        string? releaseDate = NormalizeReleaseDate(tr.P("current").P("publish_date").Str() ?? tr.P("publish_date").Str());
         Uri? art = tr.P("art_id").Long() is { } artId && artId > 0 ? new Uri($"https://f4.bcbits.com/img/a{artId}_10.jpg") : null;
 
         var items = new List<(MediaItem Item, string? Link)>();
@@ -81,6 +97,12 @@ internal sealed class BandcampAdapter : AdapterBase
                 MediaId = t.P("track_id").Str() ?? t.P("id").Str(),
                 Title = t.P("title").Str() ?? albumTitle,
                 Uploader = artist,
+                Artist = t.P("artist").Str() ?? artist,
+                Album = album,
+                AlbumArtist = tr.P("album_artist").Str() ?? artist,
+                TrackNumber = PositiveNumber(t.P("track_num").Int()),
+                DiscNumber = PositiveNumber(t.P("disc_num").Int()),
+                ReleaseDate = releaseDate,
                 Duration = TextUtil.Seconds(t.P("duration").Dbl()),
                 Thumbnail = art,
                 Kind = MediaKind.Audio,

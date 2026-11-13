@@ -332,6 +332,14 @@ internal static class MediaTransferBridge
             Title = LimitMetadata(item.Title, 512),
             Uploader = LimitMetadata(item.Uploader, 256),
             Description = LimitMetadata(item.Description, 8192),
+            Artist = LimitMetadata(item.Artist, 256),
+            Album = LimitMetadata(item.Album, 512),
+            AlbumArtist = LimitMetadata(item.AlbumArtist, 256),
+            TrackNumber = item.TrackNumber is > 0 and <= 999 ? item.TrackNumber : null,
+            DiscNumber = item.DiscNumber is > 0 and <= 999 ? item.DiscNumber : null,
+            ReleaseDate = item.ReleaseDate is { Length: <= 10 } releaseDate
+                && DateOnly.TryParseExact(releaseDate, ["yyyy", "yyyy-MM-dd"], System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.None, out _) ? releaseDate : null,
             Duration = item.Duration is { } duration && duration > TimeSpan.Zero && duration <= TimeSpan.FromDays(365)
                 ? duration : null
         };
@@ -341,7 +349,9 @@ internal static class MediaTransferBridge
                 new MediaMergeChapter(LimitMetadata(chapter.Title, 256) ?? "", chapter.Start, chapter.End)).ToArray();
             if (ValidChapters(chapters, metadata.Duration)) metadata = metadata with { Chapters = chapters };
         }
-        return metadata.Title is null && metadata.Uploader is null && metadata.Description is null && metadata.Chapters.Count == 0
+        return metadata.Title is null && metadata.Uploader is null && metadata.Description is null && metadata.Artist is null
+            && metadata.Album is null && metadata.AlbumArtist is null && metadata.TrackNumber is null && metadata.DiscNumber is null
+            && metadata.ReleaseDate is null && metadata.Chapters.Count == 0
             ? null : metadata;
     }
 
@@ -380,6 +390,8 @@ internal static class MediaTransferBridge
 
     internal static bool IsDirectSubtitle(SubtitleTrack track) =>
         track.Format.ToLowerInvariant() is "vtt" or "srt" or "ttml";
+
+    internal static bool IsSelectableSubtitle(SubtitleTrack track) => IsSupportedSubtitle(track);
 
     private static bool IsSupportedSubtitle(SubtitleTrack track) => IsDirectSubtitle(track)
         || string.Equals(track.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase);

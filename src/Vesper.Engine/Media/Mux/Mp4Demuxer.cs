@@ -103,7 +103,10 @@ internal static class MuxIo
     }
 
     public static string FourCc(ReadOnlySpan<byte> b) =>
-        string.Create(4, b[..4].ToArray(), (dst, src) => { for (int i = 0; i < 4; i++) dst[i] = src[i] is >= 32 and < 127 ? (char)src[i] : '?'; });
+        string.Create(4, b[..4].ToArray(), (dst, src) =>
+        {
+            for (int i = 0; i < 4; i++) dst[i] = src[i] == 0xA9 ? '\u00A9' : src[i] is >= 32 and < 127 ? (char)src[i] : '?';
+        });
 }
 
 /// <summary>
@@ -189,35 +192,11 @@ internal static class Mp4Demuxer
 
     internal static MediaMergeMetadata ReadMetadata(Stream s, long length)
     {
-        byte[]? moov = null;
-        long pos = 0;
-        Span<byte> header = stackalloc byte[16];
-        while (pos < length)
-        {
-            if (length - pos < 8) throw Bad("a top-level box header is truncated");
-            MuxIo.ReadExact(s, pos, header[..8]);
-            ulong size = BinaryPrimitives.ReadUInt32BigEndian(header);
-            string type = MuxIo.FourCc(header[4..8]);
-            int headerLength = 8;
-            if (size == 1)
-            {
-                if (length - pos < 16) throw Bad("a 64-bit top-level box header is truncated");
-                MuxIo.ReadExact(s, pos + 8, header[8..16]);
-                size = BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
-                headerLength = 16;
-            }
-            else if (size == 0) size = (ulong)(length - pos);
-            if (size < (ulong)headerLength || size > (ulong)(length - pos)) throw Bad($"box '{type}' has an invalid size");
-            if (type == "moov")
-            {
-                moov = MuxIo.Load(s, pos + headerLength, (long)size - headerLength, MaxMoovBytes, "movie header");
-                break;
-            }
-            pos += (long)size;
-        }
-        if (moov is null) throw Bad("no movie header was found");
+        byte[] moov = ReadMovieHeader(s, length);
 
         string? title = null, uploader = null, description = null;
+        string? artist = null, album = null, albumArtist = null, releaseDate = null;
+        int? trackNumber = null, discNumber = null;
         uint chapterTrackId = 0;
         var tracks = new List<(uint Id, string Handler, int Start, int End)>();
         foreach (var child in Children(moov, 0, moov.Length))
@@ -229,6 +208,17 @@ internal static class Mp4Demuxer
                     if (value.Type == "titl") title = Read3GppText(moov, value, 512);
                     else if (value.Type == "dscp") description = Read3GppText(moov, value, 8192);
                     else if (value.Type == "auth") uploader = Read3GppText(moov, value, 256);
+                    else if (value.Type == "meta")
+                    {
+                        MediaMergeMetadata apple = ReadAppleMetadata(moov, value);
+                        title ??= apple.Title;
+                        artist = apple.Artist;
+                        album = apple.Album;
+                        albumArtist = apple.AlbumArtist;
+                        trackNumber = apple.TrackNumber;
+                        discNumber = apple.DiscNumber;
+                        releaseDate = apple.ReleaseDate;
+                    }
                 }
             }
             else if (child.Type == "trak")
@@ -253,7 +243,122 @@ internal static class Mp4Demuxer
             throw Bad("a chapter track reference does not name a text track");
         IReadOnlyList<MediaMergeChapter> chapters = chapterTrackId == 0 ? [] : ReadChapterTrack(s, length, moov,
             tracks.First(track => track.Id == chapterTrackId && track.Handler == "text"));
-        return new MediaMergeMetadata { Title = title, Uploader = uploader, Description = description, Chapters = chapters };
+        return new MediaMergeMetadata
+        {
+            Title = title, Uploader = uploader, Description = description, Artist = artist, Album = album,
+            AlbumArtist = albumArtist, TrackNumber = trackNumber, DiscNumber = discNumber,
+            ReleaseDate = releaseDate, Chapters = chapters
+        };
+    }
+
+    internal static MediaThumbnail? ReadThumbnail(Stream s, long length)
+    {
+        byte[] moov = ReadMovieHeader(s, length);
+        MediaThumbnail? found = null;
+        foreach (var udta in Children(moov, 0, moov.Length).Where(child => child.Type == "udta"))
+        foreach (var meta in Children(moov, udta.Start, udta.End).Where(child => child.Type == "meta"))
+        {
+            if (meta.End - meta.Start < 4) throw Bad("an MP4 metadata box is truncated");
+            var list = Find(moov, meta.Start + 4, meta.End, "ilst");
+            if (list is null) continue;
+            foreach (var cover in Children(moov, list.Value.Start, list.Value.End).Where(child => child.Type == "covr"))
+            foreach (var data in Children(moov, cover.Start, cover.End).Where(child => child.Type == "data"))
+            {
+                if (data.End - data.Start < 8 || data.End - data.Start - 8 > MediaThumbnail.MaxBytes)
+                    throw Bad("an MP4 cover image has an invalid size");
+                uint kind = U32(moov, data.Start, data.End);
+                string mediaType = kind switch { 13 => "image/jpeg", 14 => "image/png", _ => "" };
+                if (mediaType.Length == 0) continue;
+                byte[] bytes = moov.AsSpan(data.Start + 8, data.End - data.Start - 8).ToArray();
+                MediaThumbnail? thumbnail = MediaThumbnail.TryCreate(bytes);
+                if (thumbnail is null || thumbnail.MediaType != mediaType)
+                    throw Bad("an MP4 cover image is invalid");
+                if (found is not null) throw Bad("the MP4 output contains more than one cover image");
+                found = thumbnail;
+            }
+        }
+        return found;
+    }
+
+    private static byte[] ReadMovieHeader(Stream s, long length)
+    {
+        long pos = 0;
+        Span<byte> header = stackalloc byte[16];
+        while (pos < length)
+        {
+            if (length - pos < 8) throw Bad("a top-level box header is truncated");
+            MuxIo.ReadExact(s, pos, header[..8]);
+            ulong size = BinaryPrimitives.ReadUInt32BigEndian(header);
+            string type = MuxIo.FourCc(header[4..8]);
+            int headerLength = 8;
+            if (size == 1)
+            {
+                if (length - pos < 16) throw Bad("a 64-bit top-level box header is truncated");
+                MuxIo.ReadExact(s, pos + 8, header[8..16]);
+                size = BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
+                headerLength = 16;
+            }
+            else if (size == 0) size = (ulong)(length - pos);
+            if (size < (ulong)headerLength || size > (ulong)(length - pos)) throw Bad($"box '{type}' has an invalid size");
+            if (type == "moov") return MuxIo.Load(s, pos + headerLength, (long)size - headerLength, MaxMoovBytes, "movie header");
+            pos += (long)size;
+        }
+        throw Bad("no movie header was found");
+    }
+
+    private static MediaMergeMetadata ReadAppleMetadata(byte[] moov, (string Type, int Start, int End) meta)
+    {
+        if (meta.End - meta.Start < 4) throw Bad("an MP4 metadata box is truncated");
+        var list = Find(moov, meta.Start + 4, meta.End, "ilst");
+        if (list is null) return new MediaMergeMetadata();
+        string? title = null, artist = null, album = null, albumArtist = null, releaseDate = null;
+        int? track = null, disc = null;
+        foreach (var item in Children(moov, list.Value.Start, list.Value.End))
+        {
+            var data = Find(moov, item.Start, item.End, "data");
+            if (data is null || data.Value.End - data.Value.Start < 8) continue;
+            uint kind = U32(moov, data.Value.Start, data.Value.End);
+            if (item.Type is "\u00A9nam" or "\u00A9ART" or "\u00A9alb" or "aART" or "\u00A9day")
+            {
+                if (kind != 1) continue;
+                string value = ReadAppleText(moov, data.Value, item.Type switch
+                {
+                    "\u00A9nam" => 512,
+                    "\u00A9alb" => 512,
+                    "\u00A9day" => 10,
+                    _ => 256
+                });
+                if (item.Type == "\u00A9nam") title = value;
+                else if (item.Type == "\u00A9ART") artist = value;
+                else if (item.Type == "\u00A9alb") album = value;
+                else if (item.Type == "aART") albumArtist = value;
+                else releaseDate = value;
+            }
+            else if (item.Type is "trkn" or "disk" && kind == 0 && data.Value.End - data.Value.Start >= 16)
+            {
+                ushort value = BinaryPrimitives.ReadUInt16BigEndian(moov.AsSpan(data.Value.Start + 10, 2));
+                if (value is 0 or > 999) throw Bad("an MP4 track or disc number is invalid");
+                if (item.Type == "trkn") track = value; else disc = value;
+            }
+        }
+        return new MediaMergeMetadata
+        {
+            Title = title, Artist = artist, Album = album, AlbumArtist = albumArtist,
+            TrackNumber = track, DiscNumber = disc, ReleaseDate = releaseDate
+        };
+    }
+
+    private static string ReadAppleText(byte[] data, (string Type, int Start, int End) box, int maxLength)
+    {
+        int start = box.Start + 8, length = box.End - start;
+        if (length > maxLength * 4) throw Bad("an MP4 metadata string is too long");
+        try
+        {
+            string value = new UTF8Encoding(false, true).GetString(data, start, length);
+            if (value.Length > maxLength) throw Bad("an MP4 metadata string is too long");
+            return value;
+        }
+        catch (DecoderFallbackException) { throw Bad("an MP4 metadata string is not valid UTF-8"); }
     }
 
     private static string Read3GppText(byte[] moov, (string Type, int Start, int End) box, int maxLength)

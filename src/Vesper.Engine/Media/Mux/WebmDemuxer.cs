@@ -159,7 +159,8 @@ internal static class WebmDemuxer
         if (segment.Id != IdSegment) throw Bad("the segment is missing");
         long segmentStart = segmentHeaderPos + segment.HeaderLength;
         long segmentEnd = segment.Size < 0 ? length : Math.Min(length, segmentStart + segment.Size);
-        string? title = null, uploader = null, description = null;
+        string? title = null, artist = null, album = null, albumArtist = null, releaseDate = null, uploader = null, description = null;
+        int? trackNumber = null, discNumber = null;
         var chapters = new List<MediaMergeChapter>();
         long pos = segmentStart;
         while (pos < segmentEnd)
@@ -181,12 +182,18 @@ internal static class WebmDemuxer
                     foreach (var child in Elements(data, 0, data.Length))
                         if (child.Id == 0x7BA9) title = Text(data, child, 512);
                 }
-                else if (element.Id == IdTags) ReadTags(data, ref uploader, ref description);
+                else if (element.Id == IdTags)
+                    ReadTags(data, ref artist, ref album, ref albumArtist, ref releaseDate, ref trackNumber, ref discNumber,
+                        ref uploader, ref description);
                 else ReadChapters(data, chapters);
             }
             pos = dataStart + element.Size;
         }
-        return new MediaMergeMetadata { Title = title, Uploader = uploader, Description = description, Chapters = chapters };
+        return new MediaMergeMetadata
+        {
+            Title = title, Artist = artist, Album = album, AlbumArtist = albumArtist, ReleaseDate = releaseDate,
+            TrackNumber = trackNumber, DiscNumber = discNumber, Uploader = uploader, Description = description, Chapters = chapters
+        };
     }
 
     internal static MediaThumbnail? ReadThumbnail(Stream s, long length)
@@ -244,7 +251,8 @@ internal static class WebmDemuxer
         return found;
     }
 
-    private static void ReadTags(byte[] data, ref string? uploader, ref string? description)
+    private static void ReadTags(byte[] data, ref string? artist, ref string? album, ref string? albumArtist,
+        ref string? releaseDate, ref int? trackNumber, ref int? discNumber, ref string? uploader, ref string? description)
     {
         foreach (var tag in Elements(data, 0, data.Length).Where(element => element.Id == 0x7373))
         foreach (var child in Elements(data, tag.Start, tag.Start + tag.Length).Where(element => element.Id == 0x67C8))
@@ -256,7 +264,17 @@ internal static class WebmDemuxer
                 else if (field.Id == 0x4487) value = Text(data, field, 8192);
             }
             if (name is null || value is null) continue;
-            if (name.Equals("ARTIST", StringComparison.OrdinalIgnoreCase)) uploader = value;
+            if (name.Equals("ARTIST", StringComparison.OrdinalIgnoreCase)) artist = value;
+            else if (name.Equals("ALBUM", StringComparison.OrdinalIgnoreCase)) album = value;
+            else if (name.Equals("ALBUM_ARTIST", StringComparison.OrdinalIgnoreCase)) albumArtist = value;
+            else if (name.Equals("PART_NUMBER", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsedTrack)
+                && parsedTrack is > 0 and <= 999) trackNumber = parsedTrack;
+            else if (name.Equals("DISC_NUMBER", StringComparison.OrdinalIgnoreCase)
+                && int.TryParse(value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int parsedDisc)
+                && parsedDisc is > 0 and <= 999) discNumber = parsedDisc;
+            else if (name.Equals("DATE_RELEASED", StringComparison.OrdinalIgnoreCase)) releaseDate = value;
+            else if (name.Equals("UPLOADER", StringComparison.OrdinalIgnoreCase)) uploader = value;
             else if (name.Equals("COMMENT", StringComparison.OrdinalIgnoreCase)) description = value;
         }
     }
