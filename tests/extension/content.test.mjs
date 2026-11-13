@@ -5,6 +5,86 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 
+test('the Butterfly motion picker explains its motion choices', () => {
+  const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
+  const selectTag = popup.match(/<select id="motion"([^>]*)>([\s\S]*?)<\/select>/);
+  const attributes = selectTag?.[1] || '';
+  const select = selectTag?.[2];
+  assert.ok(select);
+  const options = [...select.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)]
+    .map(([, value, label]) => [value, label]);
+  assert.deepEqual(options, [
+    ['system', 'Follow system'], ['animate', 'Always animate'], ['still', 'No animation']
+  ]);
+  assert.match(attributes, /aria-describedby="motion-hint"/);
+  assert.match(popup, /<small id="motion-hint" class="hint">Follow system respects your reduced-motion setting\.<\/small>/);
+});
+
+test('System motion follows the reduced-motion preference and explicit choices override it', () => {
+  const document = new EventTarget();
+  document.querySelectorAll = () => [];
+  const window = new EventTarget();
+  const motion = Object.assign(new EventTarget(), { matches: true });
+  let updatePreference;
+  const context = vm.createContext({
+    window, document, AbortController, URL, location: { href: 'https://example.test/watch' },
+    matchMedia: query => {
+      assert.equal(query, '(prefers-reduced-motion: reduce)');
+      return motion;
+    },
+    ResizeObserver: class { observe() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
+    VesperTheme: {
+      available: () => true,
+      contextGone: () => false,
+      watchPreference(key, fallback, apply) {
+        assert.equal(key, 'motion');
+        assert.equal(fallback, 'system');
+        updatePreference = apply;
+        return () => {};
+      }
+    },
+    chrome: { runtime: { id: 'vesper-test' } }
+  });
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testMotion = {
+    still, applyMotion, setTargets: (nextHost, nextCompanion) => { host = nextHost; companion = nextCompanion; }
+  };\n})();`);
+  vm.runInContext(content, context);
+
+  const attributes = new Set();
+  const stillModes = [];
+  window.__testMotion.setTargets({
+    toggleAttribute(name, value) { if (value) attributes.add(name); else attributes.delete(name); }
+  }, { setStill: value => stillModes.push(value) });
+
+  assert.equal(window.__testMotion.still(), true);
+  updatePreference('system');
+  assert.equal(window.__testMotion.still(), true);
+  assert.equal(attributes.has('data-vesper-still'), true);
+  assert.equal(stillModes.at(-1), true);
+
+  motion.matches = false;
+  motion.dispatchEvent(new Event('change'));
+  assert.equal(window.__testMotion.still(), false);
+  assert.equal(attributes.has('data-vesper-still'), false);
+  assert.equal(stillModes.at(-1), false);
+
+  motion.matches = true;
+  motion.dispatchEvent(new Event('change'));
+  assert.equal(window.__testMotion.still(), true);
+  updatePreference('animate');
+  assert.equal(window.__testMotion.still(), false);
+  assert.equal(attributes.has('data-vesper-still'), false);
+  motion.matches = false;
+  motion.dispatchEvent(new Event('change'));
+  assert.equal(window.__testMotion.still(), false);
+
+  updatePreference('still');
+  assert.equal(window.__testMotion.still(), true);
+  assert.equal(attributes.has('data-vesper-still'), true);
+  assert.equal(stillModes.at(-1), true);
+});
+
 test('an orphaned content script disconnects observers and storage listeners on the next page event', async () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();
