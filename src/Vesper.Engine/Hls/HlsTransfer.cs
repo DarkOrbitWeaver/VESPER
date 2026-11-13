@@ -49,6 +49,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (media.Unsupported is { } reason) return RunOutcome.NeedsAttention(media.UnsupportedReasonCode, reason);
         if (!media.IsVod) return RunOutcome.NeedsAttention("live", "The playlist is not ended. VESPER downloads completed VOD playlists only.");
         if (media.Segments.Count == 0) return RunOutcome.Failed("empty", "The playlist contains no media segments.");
+        if (media.Segments.Any(segment => segment.DiscontinuityBefore || segment.IsGap))
+            return RunOutcome.NeedsAttention("unsupported", "Discontinuous or missing media requires processing that is not supported.");
         if (media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
             return RunOutcome.NeedsAttention("unsupported", "Initialization URI, byte range or encryption changes part-way. A remux is required; saved data was kept.");
         string planHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(media.Segments))));
