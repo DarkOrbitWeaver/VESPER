@@ -147,9 +147,10 @@ internal sealed class FirstFlightCanvas : Control
         Bitmap wordmark = Art("brand.wordmark_" + theme);
         float fraction = MathF.Ceiling(Math.Clamp((float)((time - WordmarkStart) / (HoldStart - WordmarkStart)), 0, 1) * 16) / 16;
         float height = 376f * wordmark.Height / wordmark.Width;
+        const float wordmarkY = 323;
         var saved = graphics.Save();
-        graphics.SetClip(new RectangleF(212, 333, 376 * fraction, height + 1));
-        Draw(graphics, wordmark, new RectangleF(212, 333, 376, height), fade);
+        graphics.SetClip(new RectangleF(212, wordmarkY, 376 * fraction, height + 1));
+        Draw(graphics, wordmark, new RectangleF(212, wordmarkY, 376, height), fade);
         graphics.Restore(saved);
     }
 

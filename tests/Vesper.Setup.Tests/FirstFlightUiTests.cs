@@ -92,22 +92,27 @@ public sealed class FirstFlightUiTests
         }
     });
 
-    [Fact]
-    public void VisibleSetupWindowCanBeCapturedDuringAndAfterTheIntro()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void VisibleSetupWindowCanBeCapturedDuringAndAfterTheIntro(bool dark)
     {
         if (Environment.GetEnvironmentVariable("VESPER_SETUP_QA") is not { Length: > 0 } folder) return;
 
         Directory.CreateDirectory(folder);
+        string theme = dark ? "dark" : "light";
         OnSta(() =>
         {
             var paths = new InstallPaths(Path.GetTempPath(), Path.GetTempPath(), Path.GetTempPath());
-            using var window = new SetupWindow(SetupMode.Install, paths, VesperPalette.BotanicalDark,
+            VesperPalette palette = dark ? VesperPalette.BotanicalDark : VesperPalette.BotanicalLight;
+            using var window = new SetupWindow(SetupMode.Install, paths, palette,
                 (progress, _) => progress.Report(new("Verifying setup payload", 1, 1)));
             FirstFlightCanvas canvas = window.Controls.OfType<FirstFlightCanvas>().Single();
             using var captureTimer = new System.Windows.Forms.Timer { Interval = 25 };
             var introClock = new Stopwatch();
             bool installCompleted = false;
             bool introCaptured = false;
+            bool publisherCaptured = false;
             Exception? failure = null;
 
             captureTimer.Tick += (_, _) =>
@@ -128,11 +133,18 @@ public sealed class FirstFlightUiTests
                         Assert.True(skipButton.Visible, "Skip intro should remain available while the intro continues.");
                         Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(openButton));
                         Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(skipButton));
-                        SaveVisibleWindow(window, Path.Combine(folder, "setup-window-fast-complete-intro.png"));
+                        SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-fast-complete-intro.png"));
                         introCaptured = true;
                     }
 
-                    if (!introCaptured || canvas.Playing) return;
+                    if (!publisherCaptured && introClock.Elapsed.TotalSeconds >= 4.98)
+                    {
+                        Assert.True(canvas.Playing, "The publisher reveal ended before its screenshot was captured.");
+                        SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-publisher-reveal.png"));
+                        publisherCaptured = true;
+                    }
+
+                    if (!introCaptured || !publisherCaptured || canvas.Playing) return;
                     Label completeLabel = window.Controls.OfType<Label>().Single(label => label.Text == "Installation complete");
                     VesperButton completedAction = Assert.IsType<VesperButton>(window.AcceptButton);
                     Assert.Equal("Open VESPER", completedAction.Text);
@@ -140,7 +152,7 @@ public sealed class FirstFlightUiTests
                     Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(completeLabel));
                     window.Refresh();
                     completedAction.Refresh();
-                    SaveVisibleWindow(window, Path.Combine(folder, "setup-window-post-intro-completion.png"));
+                    SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-post-intro-completion.png"));
                     captureTimer.Stop();
                     window.Close();
                 }
@@ -175,7 +187,7 @@ public sealed class FirstFlightUiTests
 
             Application.Run(window);
             if (failure is not null) ExceptionDispatchInfo.Capture(failure).Throw();
-            Assert.True(introCaptured, "The intro screenshot was not captured.");
+            Assert.True(introCaptured && publisherCaptured, "The intro and publisher screenshots were not both captured.");
         }, TimeSpan.FromSeconds(15));
     }
 
