@@ -76,7 +76,7 @@ internal static class MatroskaMuxer
         Master(output, WebmDemuxer.IdTracks, tracks.ToArray());
 
         long tagsPos = -1;
-        if (metadata is { } tagMetadata && (tagMetadata.Uploader is { Length: > 0 } || tagMetadata.Description is { Length: > 0 }))
+        if (metadata is { } tagMetadata && HasMatroskaTags(tagMetadata))
         {
             tagsPos = output.Position - segData;
             Master(output, WebmDemuxer.IdTags, Tags(tagMetadata));
@@ -203,12 +203,24 @@ internal static class MatroskaMuxer
     {
         var tag = new MemoryStream();
         Master(tag, 0x63C0, []); // Empty Targets applies these values to the whole file.
-        if (metadata.Uploader is { Length: > 0 } uploader) WriteSimpleTag(tag, "ARTIST", uploader);
+        if (metadata.Artist is { Length: > 0 } artist) WriteSimpleTag(tag, "ARTIST", artist);
+        if (metadata.Album is { Length: > 0 } album) WriteSimpleTag(tag, "ALBUM", album);
+        if (metadata.AlbumArtist is { Length: > 0 } albumArtist) WriteSimpleTag(tag, "ALBUM_ARTIST", albumArtist);
+        if (metadata.TrackNumber is { } track) WriteSimpleTag(tag, "PART_NUMBER", track.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (metadata.DiscNumber is { } disc) WriteSimpleTag(tag, "DISC_NUMBER", disc.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        if (metadata.ReleaseDate is { Length: > 0 } releaseDate) WriteSimpleTag(tag, "DATE_RELEASED", releaseDate);
+        if (metadata.Uploader is { Length: > 0 } uploader) WriteSimpleTag(tag, "UPLOADER", uploader);
         if (metadata.Description is { Length: > 0 } description) WriteSimpleTag(tag, "COMMENT", description);
         var tags = new MemoryStream();
         Master(tags, 0x7373, tag.ToArray());
         return tags.ToArray();
     }
+
+    private static bool HasMatroskaTags(MediaMergeMetadata metadata) =>
+        metadata.Artist is { Length: > 0 } || metadata.Album is { Length: > 0 }
+        || metadata.AlbumArtist is { Length: > 0 } || metadata.TrackNumber is not null
+        || metadata.DiscNumber is not null || metadata.ReleaseDate is { Length: > 0 }
+        || metadata.Uploader is { Length: > 0 } || metadata.Description is { Length: > 0 };
 
     private static void WriteSimpleTag(Stream tag, string name, string value)
     {
@@ -419,15 +431,15 @@ internal static class MediaMerger
     public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
         Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
-        if (thumbnail is not null && container != "mkv")
-            throw new MediaContainerException("Cover images are only supported in Matroska output.");
+        if (thumbnail is not null && container is not ("mkv" or "mp4" or "m4a"))
+            throw new MediaContainerException("Cover images are supported only in MP4/M4A and Matroska output.");
         long bytes;
         MediaMergeMetadata? writtenMetadata;
         switch (container)
         {
             case "mp4":
             case "m4a":
-                bytes = Mp4Muxer.Write(inputs, output, ct, metadata, out writtenMetadata);
+                bytes = Mp4Muxer.Write(inputs, output, ct, metadata, thumbnail, out writtenMetadata);
                 break;
             case "webm":
             case "mkv":
@@ -464,12 +476,16 @@ internal static class MediaMerger
             MediaMergeMetadata actual = WebmDemuxer.LooksLikeMatroska(output, length)
                 ? WebmDemuxer.ReadMetadata(output, length) : Mp4Demuxer.ReadMetadata(output, length);
             if (actual.Title != expectedMetadata.Title || actual.Uploader != expectedMetadata.Uploader
-                || actual.Description != expectedMetadata.Description || !actual.Chapters.SequenceEqual(expectedMetadata.Chapters))
+                || actual.Description != expectedMetadata.Description || actual.Artist != expectedMetadata.Artist
+                || actual.Album != expectedMetadata.Album || actual.AlbumArtist != expectedMetadata.AlbumArtist
+                || actual.TrackNumber != expectedMetadata.TrackNumber || actual.DiscNumber != expectedMetadata.DiscNumber
+                || actual.ReleaseDate != expectedMetadata.ReleaseDate || !actual.Chapters.SequenceEqual(expectedMetadata.Chapters))
                 throw new MediaContainerException("The merged file did not retain the selected title, tags and chapters.");
         }
         if (expectedThumbnailSha256 is not null)
         {
-            MediaThumbnail? thumbnail = WebmDemuxer.ReadThumbnail(output, length);
+            MediaThumbnail? thumbnail = WebmDemuxer.LooksLikeMatroska(output, length)
+                ? WebmDemuxer.ReadThumbnail(output, length) : Mp4Demuxer.ReadThumbnail(output, length);
             if (thumbnail?.Sha256 != expectedThumbnailSha256)
                 throw new MediaContainerException("The merged file did not retain the selected cover image.");
         }

@@ -10,7 +10,7 @@ internal sealed class BoxWriter
     private readonly MemoryStream _ms = new();
     public long Length => _ms.Length;
     public byte[] ToArray() => _ms.ToArray();
-    public int Begin(string type) { int p = (int)_ms.Length; U32(0); Ascii(type); return p; }
+    public int Begin(string type) { int p = (int)_ms.Length; U32(0); FourCc(type); return p; }
     public int BeginFull(string type, byte version, uint flags) { int p = Begin(type); U32(((uint)version << 24) | (flags & 0xFFFFFF)); return p; }
     public void End(int start)
     {
@@ -26,6 +26,11 @@ internal sealed class BoxWriter
     public void U64(ulong v) { Span<byte> b = stackalloc byte[8]; BinaryPrimitives.WriteUInt64BigEndian(b, v); _ms.Write(b); }
     public void Bytes(ReadOnlySpan<byte> v) => _ms.Write(v);
     public void Ascii(string v) => _ms.Write(Encoding.ASCII.GetBytes(v));
+    public void FourCc(string v)
+    {
+        if (v.Length != 4) throw new ArgumentException("An MP4 box type must contain four characters.", nameof(v));
+        _ms.Write(Encoding.Latin1.GetBytes(v));
+    }
     public void Zero(int n) { for (int i = 0; i < n; i++) _ms.WriteByte(0); }
     public void Matrix() { U32(0x00010000); U32(0); U32(0); U32(0); U32(0x00010000); U32(0); U32(0); U32(0); U32(0x40000000); }
 }
@@ -50,7 +55,7 @@ internal static class Mp4Muxer
     }
 
     public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output,
-        CancellationToken ct, MediaMergeMetadata? metadata, out MediaMergeMetadata? writtenMetadata)
+        CancellationToken ct, MediaMergeMetadata? metadata, MediaThumbnail? thumbnail, out MediaMergeMetadata? writtenMetadata)
     {
         if (inputs.Count is < 1 or > 8) throw new MediaContainerException("An MP4 output needs between one and eight tracks.");
         foreach (var (t, _) in inputs)
@@ -86,11 +91,11 @@ internal static class Mp4Muxer
 
         byte[] ftyp = BuildFtyp(inputs.Select(i => i.Track).ToList());
         int mdatHeader = payload + 8 > uint.MaxValue ? 16 : 8;
-        byte[] moov = BuildMoov(inputs, chunks, 0, false, mediaPayload, chapterTrack, writtenMetadata);
+        byte[] moov = BuildMoov(inputs, chunks, 0, false, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
         bool co64 = ftyp.Length + moov.Length + mdatHeader + payload > uint.MaxValue;
-        if (co64) moov = BuildMoov(inputs, chunks, 0, true, mediaPayload, chapterTrack, writtenMetadata);
+        if (co64) moov = BuildMoov(inputs, chunks, 0, true, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
         long baseOffset = ftyp.Length + moov.Length + mdatHeader;
-        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64, mediaPayload, chapterTrack, writtenMetadata);
+        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
         if (final.Length != moov.Length) throw new InvalidOperationException("MP4 header size changed between passes.");
 
         output.Write(ftyp);
@@ -228,15 +233,75 @@ internal static class Mp4Muxer
         return w.ToArray();
     }
 
-    private static byte[] UserData(MediaMergeMetadata metadata)
+    private static byte[] UserData(MediaMergeMetadata? metadata, MediaThumbnail? thumbnail)
     {
         var w = new BoxWriter();
         int udta = w.Begin("udta");
-        if (metadata.Title is { Length: > 0 } title) Write3GppText(w, "titl", title);
-        if (metadata.Description is { Length: > 0 } description) Write3GppText(w, "dscp", description);
-        if (metadata.Uploader is { Length: > 0 } uploader) Write3GppText(w, "auth", uploader);
+        if (metadata?.Title is { Length: > 0 } title) Write3GppText(w, "titl", title);
+        if (metadata?.Description is { Length: > 0 } description) Write3GppText(w, "dscp", description);
+        if (metadata?.Uploader is { Length: > 0 } uploader) Write3GppText(w, "auth", uploader);
+        if (metadata is not null || thumbnail is not null) WriteAppleMetadata(w, metadata, thumbnail);
         w.End(udta);
         return w.ToArray();
+    }
+
+    private static void WriteAppleMetadata(BoxWriter w, MediaMergeMetadata? metadata, MediaThumbnail? thumbnail)
+    {
+        int meta = w.BeginFull("meta", 0, 0);
+        int handler = w.BeginFull("hdlr", 0, 0);
+        w.U32(0);
+        w.Ascii("mdir");
+        w.Zero(12);
+        w.Ascii("appl");
+        w.U8(0);
+        w.End(handler);
+
+        int list = w.Begin("ilst");
+        if (metadata?.Title is { Length: > 0 } title) WriteTextTag(w, "\u00A9nam", title);
+        if (metadata?.Artist is { Length: > 0 } artist) WriteTextTag(w, "\u00A9ART", artist);
+        if (metadata?.Album is { Length: > 0 } album) WriteTextTag(w, "\u00A9alb", album);
+        if (metadata?.AlbumArtist is { Length: > 0 } albumArtist) WriteTextTag(w, "aART", albumArtist);
+        if (metadata?.ReleaseDate is { Length: > 0 } releaseDate) WriteTextTag(w, "\u00A9day", releaseDate);
+        if (metadata?.TrackNumber is { } track) WriteNumberTag(w, "trkn", track);
+        if (metadata?.DiscNumber is { } disc) WriteNumberTag(w, "disk", disc);
+        if (thumbnail is not null) WriteCoverTag(w, thumbnail);
+        w.End(list);
+        w.End(meta);
+    }
+
+    private static void WriteTextTag(BoxWriter w, string type, string value)
+    {
+        int tag = w.Begin(type);
+        int data = w.Begin("data");
+        w.U32(1); // UTF-8
+        w.U32(0);
+        w.Bytes(Encoding.UTF8.GetBytes(value));
+        w.End(data);
+        w.End(tag);
+    }
+
+    private static void WriteNumberTag(BoxWriter w, string type, int value)
+    {
+        int tag = w.Begin(type);
+        int data = w.Begin("data");
+        w.U32(0);
+        w.U32(0);
+        w.U16(0);
+        w.U16((ushort)value);
+        w.U32(0);
+        w.End(data);
+        w.End(tag);
+    }
+
+    private static void WriteCoverTag(BoxWriter w, MediaThumbnail thumbnail)
+    {
+        int tag = w.Begin("covr");
+        int data = w.Begin("data");
+        w.U32(thumbnail.MediaType == "image/jpeg" ? 13u : 14u);
+        w.U32(0);
+        w.Bytes(thumbnail.Data);
+        w.End(data);
+        w.End(tag);
     }
 
     private static void Write3GppText(BoxWriter w, string type, string value)
@@ -254,7 +319,8 @@ internal static class Mp4Muxer
     private static ulong ToMovie(long ticks, long timescale) => ticks <= 0 ? 0 : (ulong)(((Int128)ticks * MovieTimescale + timescale / 2) / timescale);
 
     private static byte[] BuildMoov(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, List<Chunk> chunks,
-        long baseOffset, bool co64, long mediaPayload, ChapterTrackData chapterTrack, MediaMergeMetadata? metadata)
+        long baseOffset, bool co64, long mediaPayload, ChapterTrackData chapterTrack, MediaMergeMetadata? metadata,
+        MediaThumbnail? thumbnail)
     {
         var w = new BoxWriter();
         int moov = w.Begin("moov");
@@ -341,8 +407,7 @@ internal static class Mp4Muxer
         }
         if (chapterTrack.Samples.Count > 0)
             WriteChapterTrack(w, chapterTrack, (uint)inputs.Count + 1, movieDuration, baseOffset + mediaPayload, co64);
-        if (metadata is { } values && (values.Title is { Length: > 0 } || values.Uploader is { Length: > 0 }
-            || values.Description is { Length: > 0 })) w.Bytes(UserData(values));
+        if (metadata is not null || thumbnail is not null) w.Bytes(UserData(metadata, thumbnail));
         w.End(moov);
         return w.ToArray();
     }

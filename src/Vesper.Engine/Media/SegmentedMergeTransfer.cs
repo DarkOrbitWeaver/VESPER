@@ -353,7 +353,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             if (container is null)
                 return RunOutcome.NeedsAttention("unsupported-container",
                     $"The downloaded codecs ({string.Join(", ", inputs.Select(input => input.Track.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Saved data was kept.");
-            MediaThumbnail? thumbnail = container == "mkv"
+            MediaThumbnail? thumbnail = container is "mkv" or "mp4" or "m4a"
                 ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
                 : null;
             using (var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))

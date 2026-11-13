@@ -464,6 +464,12 @@ public sealed class MediaMergeTests
             Title = "A short film",
             Uploader = "VESPER test channel",
             Description = "A native chapter metadata check.",
+            Artist = "Fixture Artist",
+            Album = "Fixture Album",
+            AlbumArtist = "Fixture Album Artist",
+            TrackNumber = 2,
+            DiscNumber = 1,
+            ReleaseDate = "2024-03-12",
             Duration = mediaDuration,
             Chapters =
             [
@@ -481,6 +487,12 @@ public sealed class MediaMergeTests
         Assert.Equal(metadata.Title, stored.Title);
         Assert.Equal(metadata.Uploader, stored.Uploader);
         Assert.Equal(metadata.Description, stored.Description);
+        Assert.Equal(metadata.Artist, stored.Artist);
+        Assert.Equal(metadata.Album, stored.Album);
+        Assert.Equal(metadata.AlbumArtist, stored.AlbumArtist);
+        Assert.Equal(metadata.TrackNumber, stored.TrackNumber);
+        Assert.Equal(metadata.DiscNumber, stored.DiscNumber);
+        Assert.Equal(metadata.ReleaseDate, stored.ReleaseDate);
         Assert.Equal(metadata.Chapters, stored.Chapters);
     }
 
@@ -527,6 +539,66 @@ public sealed class MediaMergeTests
         Assert.Equal("Stored as 3GPP metadata.", stored.Description);
         Assert.Equal(result.Metadata!.Chapters, stored.Chapters);
         Assert.Equal(2, MediaMerger.Demux(output, output.Length, default).Count);
+    }
+
+    [Fact]
+    public void M4aMerge_EmbedsMusicTagsAndValidatedCoverWithoutChangingAudioSamples()
+    {
+        var audioStream = new MemoryStream(AacFmp4());
+        DemuxedTrack audio = Track(audioStream, TrackKind.Audio);
+        var metadata = new MediaMergeMetadata
+        {
+            Title = "Song One",
+            Artist = "Fixture Band",
+            Album = "Fixture Album",
+            AlbumArtist = "Fixture Band",
+            TrackNumber = 2,
+            DiscNumber = 1,
+            ReleaseDate = "2024-03-12"
+        };
+        MediaThumbnail thumbnail = Assert.IsType<MediaThumbnail>(MediaThumbnail.TryCreate(TinyPng()));
+        var output = new MemoryStream();
+
+        MergeResult result = MediaMerger.Merge([(audio, audioStream)], "m4a", output, default, metadata, thumbnail);
+        MediaMerger.Validate(output, output.Length, [audio], default, result.Metadata, result.ThumbnailSha256);
+        MediaMergeMetadata stored = Mp4Demuxer.ReadMetadata(output, output.Length);
+        MediaThumbnail storedCover = Assert.IsType<MediaThumbnail>(Mp4Demuxer.ReadThumbnail(output, output.Length));
+        DemuxedTrack muxedAudio = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+
+        Assert.Equal(metadata.Title, stored.Title);
+        Assert.Equal(metadata.Artist, stored.Artist);
+        Assert.Equal(metadata.Album, stored.Album);
+        Assert.Equal(metadata.AlbumArtist, stored.AlbumArtist);
+        Assert.Equal(metadata.TrackNumber, stored.TrackNumber);
+        Assert.Equal(metadata.DiscNumber, stored.DiscNumber);
+        Assert.Equal(metadata.ReleaseDate, stored.ReleaseDate);
+        Assert.Equal(thumbnail.Sha256, storedCover.Sha256);
+        AssertSamePayloads(audio, audioStream, muxedAudio, output);
+        Assert.True(output.ToArray().AsSpan().IndexOf(new byte[] { 0xA9, (byte)'n', (byte)'a', (byte)'m' }) >= 0);
+
+        string? qaPath = Environment.GetEnvironmentVariable("VESPER_MEDIA_QA");
+        if (!string.IsNullOrWhiteSpace(qaPath))
+        {
+            string fullPath = Path.GetFullPath(qaPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            using var qaFile = File.Create(fullPath);
+            output.Position = 0;
+            output.CopyTo(qaFile);
+        }
+    }
+
+    [Fact]
+    public void M4aMerge_InvalidOrMissingCoverDoesNotPreventAudioOutput()
+    {
+        var audioStream = new MemoryStream(AacFmp4());
+        DemuxedTrack audio = Track(audioStream, TrackKind.Audio);
+        var output = new MemoryStream();
+
+        Assert.Null(MediaThumbnail.TryCreate([1, 2, 3, 4]));
+        var metadata = new MediaMergeMetadata { Title = "Song One" };
+        MediaMerger.Merge([(audio, audioStream)], "m4a", output, default, metadata, thumbnail: null);
+        MediaMerger.Validate(output, output.Length, [audio], default, metadata);
+        Assert.Null(Mp4Demuxer.ReadThumbnail(output, output.Length));
     }
 
     [Fact]
@@ -619,6 +691,10 @@ public sealed class MediaMergeTests
                 Chapters = [new MediaMergeChapter("Bad chapter", TimeSpan.FromSeconds(-1))]
             }
         }).ToJson(), false, out _, out _));
+        Assert.False(MediaMergePlan.TryParse((original with
+        {
+            Metadata = new MediaMergeMetadata { TrackNumber = 0, ReleaseDate = "next spring" }
+        }).ToJson(), false, out _, out _));
         Assert.False(MediaMergePlan.TryParse((original with { Tracks = [.. original.Tracks, .. original.Tracks, .. original.Tracks] }).ToJson(), false, out _, out _));
     }
 
@@ -641,6 +717,8 @@ public sealed class MediaMergeTests
         {
             SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "hls", MediaId = "one", Title = "One",
             Description = "A test description.", Uploader = "Test channel", Duration = TimeSpan.FromSeconds(6),
+            Artist = "Known artist", Album = "Known album", AlbumArtist = "Album artist",
+            TrackNumber = 2, DiscNumber = 1, ReleaseDate = "2024-03-12",
             Chapters = [new Chapter("Start", TimeSpan.Zero, TimeSpan.FromSeconds(3)),
                 new Chapter("Finish", TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(6))],
             Representations = [video, audio, commentary],
@@ -661,6 +739,12 @@ public sealed class MediaMergeTests
         Assert.Equal("One", plan.Metadata?.Title);
         Assert.Equal("Test channel", plan.Metadata?.Uploader);
         Assert.Equal("A test description.", plan.Metadata?.Description);
+        Assert.Equal("Known artist", plan.Metadata?.Artist);
+        Assert.Equal("Known album", plan.Metadata?.Album);
+        Assert.Equal("Album artist", plan.Metadata?.AlbumArtist);
+        Assert.Equal(2, plan.Metadata?.TrackNumber);
+        Assert.Equal(1, plan.Metadata?.DiscNumber);
+        Assert.Equal("2024-03-12", plan.Metadata?.ReleaseDate);
         Assert.Equal(2, plan.Metadata?.Chapters.Count);
 
         var selectedTrack = MediaTransferBridge.Prepare(item,
@@ -687,12 +771,16 @@ public sealed class MediaMergeTests
             Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac"
         };
         var subtitle = new SubtitleTrack(new Uri("https://cdn.example.com/captions/en.vtt"), "en", "English", "vtt");
+        var french = new SubtitleTrack(new Uri("https://cdn.example.com/captions/fr.srt"), "fr", "French", "srt");
         var item = new MediaItem
         {
             SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "test", MediaId = "one",
-            Title = "One", Representations = [stream], Subtitles = [subtitle]
+            Title = "One", Representations = [stream], Subtitles = [subtitle, french]
         };
-        FormatPreferences preferences = FormatPreferences.BestQuality with { SubtitleLanguages = ["en"] };
+        var defaults = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
+        Assert.Null(defaults.Error);
+        Assert.Empty(defaults.Choice!.SubtitleTracks ?? []);
+        FormatPreferences preferences = FormatPreferences.BestQuality with { SubtitleLanguages = ["en", "fr"] };
 
         var prepared = MediaTransferBridge.Prepare(item, preferences);
         var exact = MediaTransferBridge.Prepare(item, preferences, stream);
@@ -700,8 +788,8 @@ public sealed class MediaMergeTests
         Assert.Null(exact.Error);
         MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice!])];
 
-        Assert.Single(exact.Choice!.SubtitleTracks!);
-        Assert.Equal(2, jobs.Length);
+        Assert.Equal(2, exact.Choice!.SubtitleTracks!.Count);
+        Assert.Equal(3, jobs.Length);
         Assert.Equal(JobKind.Http, jobs[1].Kind);
         Assert.Equal(subtitle.Url.AbsoluteUri, jobs[1].Url);
         Assert.Equal("One.en.vtt", jobs[1].FileName);
@@ -709,6 +797,10 @@ public sealed class MediaMergeTests
         Assert.Null(jobs[1].Provider);
         Assert.Null(jobs[1].MediaPlanJson);
         Assert.Null(jobs[1].SubtitleTracks);
+        Assert.Equal(JobKind.Http, jobs[2].Kind);
+        Assert.Equal(french.Url.AbsoluteUri, jobs[2].Url);
+        Assert.Equal("One.fr.srt", jobs[2].FileName);
+        Assert.Null(jobs[2].SubtitleTracks);
 
         var segmented = MediaTransferBridge.Prepare(item with
         {
@@ -890,6 +982,56 @@ public sealed class MediaMergeTests
         Assert.Equal(JobState.Completed, noCoverDone.State);
         using var noCoverOutput = File.OpenRead(noCoverDone.FinalPath!);
         Assert.Null(WebmDemuxer.ReadThumbnail(noCoverOutput, noCoverOutput.Length));
+    }
+
+    [Fact]
+    public async Task MergeJob_EmbedsMusicTagsAndCoverInM4a_AndKeepsGoingWhenCoverIsInvalid()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = AacFmp4();
+        server.Extra["/m/song.m4a"] = audio;
+        server.Extra["/m/song-no-cover.m4a"] = audio;
+        server.Extra["/m/cover.png"] = TinyPng();
+        server.Extra["/m/bad-cover.png"] = Payloads.Make(128, 12);
+        await server.StartAsync();
+        using var h = new Harness();
+
+        async Task<(JobSnapshot Job, MediaMergePlan Plan)> AddAndWait(string id, string audioPath, string coverPath, string name)
+        {
+            var plan = new MediaMergePlan
+            {
+                Provider = "bandcamp", MediaId = id, OutputContainer = "m4a",
+                Metadata = new MediaMergeMetadata
+                {
+                    Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album",
+                    AlbumArtist = "Fixture Band", TrackNumber = 2, DiscNumber = 1, ReleaseDate = "2024-03-12"
+                },
+                Tracks = [new MergeTrack("audio", "mp3-128", server.Url(audioPath), audio.Length, "m4a", "aac", id)]
+            };
+            AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: name, Kind: JobKind.Merge,
+                MediaProvider: "bandcamp", MediaId: id, MediaPlanJson: plan.ToJson(),
+                MediaThumbnailUrl: server.Url(coverPath)));
+            Assert.True(added.Ok, added.Message);
+            JobSnapshot done = await h.WaitAsync(added.JobId,
+                snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+            Assert.Equal(JobState.Completed, done.State);
+            return (done, plan);
+        }
+
+        var (withCover, expectedPlan) = await AddAndWait("song-cover", "/m/song.m4a", "/m/cover.png", "song-cover.m4a");
+        using (var output = File.OpenRead(withCover.FinalPath!))
+        {
+            MediaMergeMetadata stored = Mp4Demuxer.ReadMetadata(output, output.Length);
+            Assert.Equal(expectedPlan.Metadata, stored);
+            Assert.Equal(Payloads.Sha256(TinyPng()), Assert.IsType<MediaThumbnail>(Mp4Demuxer.ReadThumbnail(output, output.Length)).Sha256);
+            DemuxedTrack muxed = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+            using var source = new MemoryStream(audio);
+            AssertSamePayloads(Track(source, TrackKind.Audio), source, muxed, output);
+        }
+
+        var (withoutCover, _) = await AddAndWait("song-no-cover", "/m/song-no-cover.m4a", "/m/bad-cover.png", "song-no-cover.m4a");
+        using var noCoverOutput = File.OpenRead(withoutCover.FinalPath!);
+        Assert.Null(Mp4Demuxer.ReadThumbnail(noCoverOutput, noCoverOutput.Length));
     }
 
     [Fact]
