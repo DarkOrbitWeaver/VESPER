@@ -1,3 +1,4 @@
+using System.Text;
 using Vesper.Engine;
 using Xunit;
 
@@ -9,6 +10,43 @@ public sealed class MediaConversionTests
     {
         string folder = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
         return [.. File.ReadAllBytes(Path.Combine(folder, "audio-init.mp4")), .. File.ReadAllBytes(Path.Combine(folder, "audio-1.m4s"))];
+    }
+
+    [WindowsFact]
+    public async Task WindowsMediaFoundation_PreservesFragmentedAacInAnM4aOutput()
+    {
+        await using var server = new FaultServer();
+        byte[] sourceBytes = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = AddAudio(harness, server);
+
+        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("", done.Reason);
+        Assert.Equal("audio.m4a", done.FileName);
+        Assert.Equal("audio/mp4", done.ContentType);
+        Assert.Equal("Audio AAC", done.MediaQuality);
+        Assert.NotNull(done.FinalPath);
+        Assert.True(server.Hits("/audio.mp4") > 0);
+
+        byte[] outputBytes = await File.ReadAllBytesAsync(done.FinalPath!);
+        Assert.True(outputBytes.Length > 8);
+        Assert.Equal("ftyp", Encoding.ASCII.GetString(outputBytes, 4, 4));
+        Assert.Equal(outputBytes.LongLength, done.TotalBytes);
+
+        using var source = new MemoryStream(sourceBytes);
+        DemuxedTrack sourceAudio = Assert.Single(MediaMerger.Demux(source, source.Length, default));
+        using var output = new MemoryStream(outputBytes);
+        DemuxedTrack outputAudio = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+
+        Assert.Equal(TrackKind.Audio, outputAudio.Kind);
+        Assert.Equal("aac", outputAudio.Codec);
+        Assert.Equal("mp4", outputAudio.SourceContainer);
+        Assert.Equal(sourceAudio.Channels, outputAudio.Channels);
+        Assert.Equal(sourceAudio.SampleRate, outputAudio.SampleRate);
+        Assert.NotEmpty(outputAudio.Samples);
+        Assert.InRange(Math.Abs(outputAudio.DurationSeconds - sourceAudio.DurationSeconds), 0, 0.05);
     }
 
     [Fact]

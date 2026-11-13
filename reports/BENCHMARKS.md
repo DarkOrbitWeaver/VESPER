@@ -76,3 +76,31 @@ Baseline compilation of this harness uses `-p:Baseline=true -p:VesperSourceRoot=
 Temporary tools were outside the source tree: .NET SDK 10.0.404; John Van Sickle FFmpeg/ffprobe 7.0.2 static (GPLv3-enabled build, ~40 MiB compressed download);
 BtbN current `N-128728-g49a3b1f259-20261110` GPLv3-enabled build (~149 MiB compressed download).
 They were used only for fixture generation/independent validation and are not distributed or invoked by VESPER. No package/runtime dependency was added.
+
+## Extreme performance baseline
+
+Date: 2026-11-13. Baseline `07d6143`; comparison source was HEAD `126465c` plus the then-dirty working-tree index and benchmark changes. The queue index and terminal-entry cleanup are now committed as `dc34329`. Both comparison versions were Release, framework-dependent apphosts using .NET 10.0.15; build/test commands used cached assets with `--no-restore`.
+
+Host: Windows 11 build 26200, AMD Ryzen 5 5600X, 12 logical processors, 15.9 GiB RAM, .NET SDK 11.0.100, x64.
+
+Method: 20 alternating process-start samples; 60-second idle capture per revision; a visible 10,000-row WinForms grid for draw, scroll and three-row progress repaint p95; five alternating throughput runs per revision, each with five 96 MiB hash-checked loopback transfers at one and four connections; five groups of 20 16 KiB direct-transfer samples; 15 samples of adding 2,000 queued jobs; and local HLS/DASH merge plus 600-second fixture remux benchmarks. These are local synthetic workloads, not internet throughput or comparisons with other download managers.
+
+| Measurement | Baseline | Current | Change |
+|---|---:|---:|---:|
+| Process startup median | 476.28 ms | 473.34 ms | 0.6% faster |
+| Idle private memory median | 22.04 MiB | 22.15 MiB | +0.11 MiB |
+| Idle CPU over 60.5 s | 0.000% | 0.000% | no measurable CPU use at 0.001% precision |
+| Grid draw p95, 10,000 rows | 5.16 ms | 5.44 ms | within the 16.7 ms target |
+| Scroll repaint p95 | 4.91 ms | 4.60 ms | 6.3% faster |
+| Three-row progress repaint p95 | 1.99 ms | 1.79 ms | 10.1% faster |
+| 96 MiB loopback, one connection | 39.55 MiB/s | 38.07 MiB/s | 3.8% lower; gate is 5% |
+| 96 MiB loopback, four connections | 78.89 MiB/s | 77.70 MiB/s | 1.5% lower; gate is 5% |
+| 16 KiB direct transfer median | 19.42 ms | 19.31 ms | 0.6% faster |
+| Add 2,000 queued jobs median | 6,403.74 ms | 5,045.17 ms | 21.2% faster |
+| Queue allocations per 2,000 jobs | 1,725.88 MiB | 59.35 MiB | 96.6% lower |
+
+The queue index was the measured improvement. A final review also removed terminal jobs from the index on completion/cancellation and startup recovery, avoiding a second long-lived copy of completed URL keys. The post-cleanup add-only run measured 4,872.93 ms and 59.28 MiB for 2,000 queued jobs, consistent with the full comparison. All startup, idle memory, UI responsiveness, throughput, small-transfer latency and queue gates passed.
+
+Media implementation files were identical at both revisions. The first capture reported MP4 44.83 → 42.02 ms, WebM 65.64 → 62.05 ms, and MKV 62.42 → 83.01 ms; HLS merge 124.64 → 138.55 ms and DASH 127.23 → 132.79 ms. A current-only repeat produced MP4 41.56 ms, WebM 62.16 ms, MKV 62.39 ms, HLS 123.22 ms and DASH 128.67 ms. That repeat matched the baseline closely, including MKV, so the first-run MKV/HLS differences were not treated as code regressions.
+
+Independent output validation used FFmpeg/ffprobe 8.1.1 on files created by VESPER's native remux benchmark. All three fully decoded: MP4, 600.544 s, H.264 128×72 + AAC 48 kHz mono; WebM, 600.348 s, VP9 128×72 + Opus 48 kHz mono; MKV, 600.348 s, H.264 128×72 + Opus 48 kHz mono. The Windows Media Foundation fragmented-AAC conversion also fully decoded as a 1.021 s, 48 kHz mono AAC M4A. These deterministic outputs were temporary and removed after validation; external tools are development-only. The focused index checks, 321 non-benchmark engine tests, 15 Windows tests and all captured baseline/current performance test runs passed. Raw performance logs and JSON are in `release/performance-20261113-175157/`.
