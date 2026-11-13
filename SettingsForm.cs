@@ -253,6 +253,7 @@ internal sealed class SettingsForm : VesperPopupForm
         });
         var previewSound = Button("Preview sound", 140, symbol: VesperIcon.Audio);
         previewSound.SetBounds(257, 437, 140, 29);
+        sound.Width = previewSound.Left - sound.Left - 8;
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
         var clipboard = Check("Offer to download links I copy", 25, 475, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
         var tray = Check("Keep VESPER in the tray when I close the window", 25, 503, _draft.CloseToTray, v => _draft.CloseToTray = v);
@@ -312,6 +313,7 @@ internal sealed class SettingsForm : VesperPopupForm
         void Layout()
         {
             concurrency.Left = Math.Max(292, page.ClientSize.Width - 25 - concurrency.Width);
+            globalNote.Width = Math.Max(200, page.ClientSize.Width - 70);
             unit.Width = Math.Max(160, page.ClientSize.Width - 204);
             bool showLimit = _globalEnabled.Checked;
             _globalFrame.Visible = unit.Visible = showLimit;
@@ -387,7 +389,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var page = Page("Network", "Connections, schedule and privacy.");
         var connLabel = Label("Download connections", 9, bold: true);
         connLabel.SetBounds(25, 108, 300, 22);
-        var connNote = Label("Downloads a file in parts when supported. Four is a good default.", 8, muted: true);
+        var connNote = Label("Downloads use parts when supported; four is a good default.", 8, muted: true);
         connNote.SetBounds(25, 133, 360, 20);
         int[] counts = [1, 2, 3, 4, 6, 8];
         var connections = Choice(["1", "2", "3", "4", "6", "8"],
@@ -397,7 +399,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var separator1 = Divider(169);
 
         var schedule = Check("Only download between set hours", 25, 185, _draft.ScheduleEnabled, v => { _draft.ScheduleEnabled = v; UpdateSchedule(); });
-        var scheduleNote = Label("Outside this window nothing starts and running downloads pause until it opens again.", 8, muted: true);
+        var scheduleNote = Label("Downloads wait outside these hours; active downloads pause.", 8, muted: true);
         scheduleNote.SetBounds(45, 211, 490, 20);
         (_scheduleStartFrame, _scheduleStart) = Input(_draft.ScheduleStart, 90);
         _scheduleStartFrame.Location = new Point(25, 240);
@@ -411,7 +413,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
         var proxyLabel = Label("Proxy", 9, bold: true);
         proxyLabel.SetBounds(25, 303, 250, 22);
-        var proxyNote = Label("Most people can leave this on Direct. Use a proxy only if needed.", 8, muted: true);
+        var proxyNote = Label("Direct is fine for most people. Use a proxy if needed.", 8, muted: true);
         proxyNote.SetBounds(25, 328, 360, 20);
         int proxyIndex = _draft.ProxyMode switch { "System" => 1, "Custom" => 2, _ => 0 };
         var proxy = Choice(["Direct", "System", "Custom"], proxyIndex, 126, "Proxy mode");
@@ -439,9 +441,12 @@ internal sealed class SettingsForm : VesperPopupForm
         {
             int right = page.ClientSize.Width - 25;
             connections.Left = Math.Max(292, right - connections.Width);
+            connNote.Width = Math.Max(200, connections.Left - connNote.Left - 8);
             proxy.Left = Math.Max(292, right - proxy.Width);
+            proxyNote.Width = Math.Max(200, proxy.Left - proxyNote.Left - 8);
             _proxyFrame.Width = Math.Max(200, right - 25);
             scheduleNote.Width = Math.Max(200, right - 45);
+            scheduleHint.Width = Math.Max(120, right - scheduleHint.Left);
             privateNote.Width = Math.Max(200, right - 45);
         }
         page.Resize += (_, _) => Layout();
