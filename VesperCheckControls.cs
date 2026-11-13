@@ -15,6 +15,7 @@ internal sealed class VesperCheckBox : CheckBox
     {
         if (_palette.HighContrast) { base.OnPaint(e); return; }
 
+        VesperPanel.PaintBackdrop(this, e);
         int size = UiKit.Scale(this, 14);
         var mark = new Rectangle(1, (Height - size) / 2, size, size);
         VesperDrawing.CheckBox(e.Graphics, mark, _palette, Checked, Enabled);
