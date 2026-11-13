@@ -155,10 +155,17 @@ internal static class MediaTransferBridge
             var pool = item with { Representations = item.Representations.Where(r => ReferenceEquals(r, exact) || r == exact || r.Content == StreamContent.AudioOnly).ToArray() };
             var paired = FormatSelector.Select(PlayableOnly(pool), prefs).Selection;
             selection = paired?.Video == exact && paired.Audio is not null ? paired : null;
-            if (selection is null) return (null, "This video-only format has no audio stream VESPER can merge with it.");
+            if (selection is null) return (null, prefs.AudioTrackId is null
+                ? "This video-only format has no audio stream VESPER can merge with it."
+                : "The selected audio track can't be merged with this video format.");
         }
         else if (exact is not null)
         {
+            if (!string.IsNullOrWhiteSpace(prefs.AudioTrackId) && exact.AudioTrackId != prefs.AudioTrackId)
+            {
+                selection = null;
+                return (null, "The selected audio track isn't available in this exact format.");
+            }
             selection = new FormatSelection
             {
                 Video = exact.Content == StreamContent.AudioOnly ? null : exact,
@@ -172,7 +179,9 @@ internal static class MediaTransferBridge
             };
         }
         else selection = FormatSelector.Select(PlayableOnly(item), prefs).Selection;
-        if (selection is null) return (null, "No compatible format satisfies this preference.");
+        if (selection is null) return (null, prefs.AudioTrackId is null
+            ? "No compatible format satisfies this preference."
+            : "No supported format can use the selected audio track.");
 
         PlanResult planResult = DownloadPlanBuilder.Build(item, selection);
         if (planResult.Plan is not { } plan)

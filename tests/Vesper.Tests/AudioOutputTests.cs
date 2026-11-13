@@ -87,6 +87,39 @@ public sealed class AudioOutputTests
         Assert.Equal("audio aac 320 kbps", choice.DisplayDetail);
     }
 
+    [Fact]
+    public void Audio_track_selection_is_exact_and_does_not_fall_back_to_another_track()
+    {
+        var english = Audio("english", "aac", "m4a", 128) with { AudioTrackId = "en-main", AudioLanguage = "en" };
+        var commentary = Audio("commentary", "aac", "m4a", 128) with { AudioTrackId = "en-commentary", AudioLanguage = "en" };
+        var item = Item(english, commentary);
+
+        SelectionResult selected = FormatSelector.Select(item, FormatPreferences.AudioOnly with { AudioTrackId = "en-commentary" });
+        SelectionResult missing = FormatSelector.Select(item, FormatPreferences.AudioOnly with { AudioTrackId = "missing" });
+
+        Assert.Equal("commentary", selected.Selection?.Audio?.Id);
+        Assert.Null(missing.Selection);
+        Assert.Contains("selected audio track", missing.Error?.Diagnostic, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Audio_track_selection_uses_a_matching_muxed_source_only_when_extraction_is_required()
+    {
+        var otherAudio = Audio("english", "aac", "m4a", 128) with { AudioTrackId = "en-main" };
+        var muxed = new MediaRepresentation
+        {
+            Id = "commentary-muxed", Url = new Uri("https://example.com/commentary.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            AudioTrackId = "en-commentary", Height = 360
+        };
+
+        SelectionResult selected = FormatSelector.Select(Item(otherAudio, muxed),
+            FormatPreferences.AudioOnly with { AudioTrackId = "en-commentary" });
+
+        Assert.Equal(muxed.Id, selected.Selection?.Video?.Id);
+        Assert.True(selected.Selection?.Requirements.HasFlag(ProcessingRequirement.ExtractAudio));
+    }
+
     private static MediaItem Item(params MediaRepresentation[] streams) => new()
     {
         SourceUrl = new Uri("https://example.com/recording"), Title = "Recording", MediaId = "1", Provider = "fixture",

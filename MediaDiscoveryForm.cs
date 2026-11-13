@@ -43,6 +43,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperChoice _quality;
     private readonly VesperChoice _outputChoice;
     private readonly VesperChoice _audioOutputChoice;
+    private readonly VesperChoice _audioTrack;
     private readonly VesperChoice _customFormat;
     private readonly CheckBox _clipCheck;
     private readonly Label _clipStartLabel;
@@ -57,6 +58,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperButton _viewPage;
     private readonly VesperButton _cancel;
     private readonly List<MediaRepresentation> _playableFormats = [];
+    private AudioTrack[] _audioTrackOptions = [];
     private readonly Panel _presetOptions;
     private readonly List<MediaQualityOption> _presets = [];
     private readonly MediaItem? _sample;
@@ -142,11 +144,20 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _audioOutputChoice = new VesperChoice { AccessibleName = "Audio output format" };
         _audioOutputChoice.ApplyPalette(_colors);
         _audioOutputChoice.SetItems("M4A (AAC)", "Original audio");
+        _audioTrack = new VesperChoice { AccessibleName = "Audio track" };
+        _audioTrack.ApplyPalette(_colors);
+        _audioTrack.SelectedIndexChanged += (_, _) =>
+        {
+            if (_state != ViewState.Ready || _item is null) return;
+            RefreshPresets(_item);
+            UpdateChoiceSummary();
+            FitToContent();
+        };
         _customLabel = L("Exact available format", 8.5f, muted: true);
         _customFormat = new VesperChoice { AccessibleName = "Exact format", Symbol = VesperIcon.Layers };
         _customFormat.ApplyPalette(_colors);
         _customFormat.SelectedIndexChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
-        _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice, _customLabel, _customFormat]);
+        _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice, _audioTrack, _customLabel, _customFormat]);
         _clipCheck = new CheckBox
         {
             Text = "Time range", AccessibleName = "Download a time range", AutoSize = false,
@@ -307,9 +318,16 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Place(_status, margin, 153, statusWidth, _state == ViewState.Unavailable ? 57 : 34);
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
             int outputWidth = Math.Min(S(132), contentWidth / 2);
-            Place(_qualityLabel, margin, 181, contentWidth - outputWidth - S(8), 26);
             Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
+            if (_audioTrack.Visible)
+            {
+                int trackAreaWidth = contentWidth - (_outputChoice.Visible || _audioOutputChoice.Visible ? outputWidth + S(8) : 0);
+                Place(_qualityLabel, margin, 181, S(96), 26);
+                Place(_audioTrack, margin + S(96), 181, trackAreaWidth - S(96), 28);
+            }
+            else
+                Place(_qualityLabel, margin, 181, contentWidth - outputWidth - S(8), 26);
             Place(_quality, margin, 211, contentWidth, 34);
             Place(_entries, margin, 256, contentWidth, 152);
             Place(_presetOptions, margin, 211, contentWidth, 181);
@@ -592,6 +610,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         }
 
         _item = item with { Representations = _playableFormats.ToArray() };
+        ConfigureAudioTracks(_item);
 
         string[] options = _playableFormats.Select(r =>
         {
@@ -630,7 +649,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             FormatPreferences.SmallestSuitable, FormatPreferences.AudioOnly];
         for (int i = 0; i < preferences.Length; i++)
         {
-            var result = Prepare(item, preferences[i], output: OutputPreference(preferences[i]));
+            FormatPreferences selected = WithSelectedAudioTrack(preferences[i]);
+            var result = Prepare(item, selected, output: OutputPreference(selected));
             if (result.Choice is { } choice)
                 _presets[i].SetFormat(choice.DisplayDetail, choice.DisplayContainer, available: true);
             else _presets[i].SetFormat("Unavailable for this source", "", available: false);
@@ -664,6 +684,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private void UpdateQualityUi()
     {
         bool custom = IsExactFormat && _playableFormats.Count > 0;
+        bool hasTrackChoice = _state == ViewState.Ready && _audioTrackOptions.Length > 1;
+        _audioTrack.Visible = hasTrackChoice;
+        _qualityLabel.Text = hasTrackChoice ? "Audio track" : "Quality";
         _customLabel.Visible = _customFormat.Visible = custom;
         _customFormat.Enabled = custom && !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
@@ -756,11 +779,58 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private FormatPreferences CurrentPreferences() => (_state == ViewState.Collection ? _quality.SelectedIndex : _presetIndex) switch
     {
-        1 => FormatPreferences.BalancedQuality,
-        2 => FormatPreferences.SmallestSuitable,
-        3 => FormatPreferences.AudioOnly,
-        _ => FormatPreferences.BestQuality
+        1 => WithSelectedAudioTrack(FormatPreferences.BalancedQuality),
+        2 => WithSelectedAudioTrack(FormatPreferences.SmallestSuitable),
+        3 => WithSelectedAudioTrack(FormatPreferences.AudioOnly),
+        _ => WithSelectedAudioTrack(FormatPreferences.BestQuality)
     };
+
+    private FormatPreferences WithSelectedAudioTrack(FormatPreferences preferences)
+    {
+        string? trackId = _state == ViewState.Ready && _audioTrack.Visible && _audioTrack.SelectedIndex > 0
+            && _audioTrack.SelectedIndex <= _audioTrackOptions.Length
+                ? _audioTrackOptions[_audioTrack.SelectedIndex - 1].Id : null;
+        return preferences with { AudioTrackId = trackId };
+    }
+
+    private void ConfigureAudioTracks(MediaItem item)
+    {
+        var availableIds = item.Representations
+            .Where(representation => representation.HasAudio && !string.IsNullOrWhiteSpace(representation.AudioTrackId))
+            .Select(representation => representation.AudioTrackId!)
+            .ToHashSet(StringComparer.Ordinal);
+        AudioTrack[] inferred = item.Representations
+            .Where(representation => representation.HasAudio && !string.IsNullOrWhiteSpace(representation.AudioTrackId))
+            .Select(representation => new AudioTrack(representation.AudioTrackId!, representation.AudioLanguage, null,
+                representation.IsDefaultAudio, representation.AudioChannels, representation.AudioCodec)).ToArray();
+        _audioTrackOptions = item.AudioTracks.Concat(inferred)
+            .Where(track => availableIds.Contains(track.Id))
+            .GroupBy(track => track.Id, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .OrderByDescending(track => track.IsDefault)
+            .ThenBy(track => track.Language, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(track => track.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(track => track.Id, StringComparer.Ordinal)
+            .ToArray();
+        string[] labels = _audioTrackOptions.Select(AudioTrackLabel).ToArray();
+        var duplicateLabels = labels.GroupBy(label => label, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < labels.Length; i++)
+            if (duplicateLabels.Contains(labels[i])) labels[i] += $" · Track {i + 1}";
+        _audioTrack.SetItems(["Automatic", .. labels]);
+    }
+
+    private static string AudioTrackLabel(AudioTrack track)
+    {
+        string label = track.Name ?? track.Language ?? "Audio track";
+        var details = new List<string>();
+        if (track.Language is { Length: > 0 } language && !string.Equals(label, language, StringComparison.OrdinalIgnoreCase))
+            details.Add(language);
+        if (track.Channels is { } channels) details.Add($"{channels} ch");
+        if (track.Codec is { Length: > 0 } codec) details.Add(codec.ToUpperInvariant());
+        if (track.IsDefault) details.Add("default");
+        return details.Count == 0 ? label : label + " · " + string.Join(" · ", details);
+    }
 
     private async Task LoadCollectionAsync()
     {
@@ -908,6 +978,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _collectionButton.Enabled = !_busy;
         _entries.Enabled = !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
+        _audioTrack.Enabled = !_busy;
         _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
         _outputChoice.Enabled = !_busy;
         _audioOutputChoice.Enabled = !_busy;
