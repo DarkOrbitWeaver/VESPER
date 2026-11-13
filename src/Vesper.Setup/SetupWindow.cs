@@ -51,6 +51,7 @@ internal sealed class SetupWindow : Form
         _status.Font = _statusFont;
         _note.Font = _noteFont;
         Controls.AddRange([_action, _skip, _cancel, _extension, _status, _note, _meter, _canvas]);
+        _canvas.SendToBack();
         _action.Click += (_, _) => StartOrOpen();
         _skip.Click += (_, _) => SkipIntro();
         _cancel.Click += (_, _) => RequestCancellation();
