@@ -33,7 +33,7 @@ public sealed class FirstFlightUiTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void RealOutcomeInterruptsTheIntro(bool success) => OnSta(() =>
+    public void FastInstallOutcomeDoesNotDelayOrCutTheIntro(bool success) => OnSta(() =>
     {
         var paths = new InstallPaths(Path.GetTempPath(), Path.GetTempPath(), Path.GetTempPath());
         using var window = new SetupWindow(SetupMode.Install, paths, VesperPalette.BotanicalDark, (progress, _) =>
@@ -42,6 +42,7 @@ public sealed class FirstFlightUiTests
             if (!success) throw new IOException("The test package is damaged.");
         });
         _ = window.Handle;
+        Assert.Contains(window.Controls.OfType<Label>(), label => label.Text == "For this Windows account only.");
         var stopwatch = Stopwatch.StartNew();
         Task install = window.RunAttemptAsync(animate: true);
         while (!install.IsCompleted && stopwatch.Elapsed < TimeSpan.FromSeconds(3))
@@ -51,9 +52,17 @@ public sealed class FirstFlightUiTests
         }
         Assert.True(install.IsCompleted, "The installation outcome was delayed by the intro.");
         install.GetAwaiter().GetResult();
-        Assert.False(window.Controls.OfType<FirstFlightCanvas>().Single().Playing);
-        Assert.Contains(window.Controls.OfType<Label>(), label => label.Text ==
-            (success ? "Installation complete" : "The test package is damaged."));
+        FirstFlightCanvas canvas = window.Controls.OfType<FirstFlightCanvas>().Single();
+        if (success)
+        {
+            Assert.True(canvas.Playing, "A fast successful install cut off the First Flight sequence.");
+            Assert.Equal("Open VESPER", Assert.IsType<VesperButton>(window.AcceptButton).Text);
+        }
+        else
+        {
+            Assert.False(canvas.Playing, "A failed install should reveal its error immediately.");
+            Assert.Contains(window.Controls.OfType<Label>(), label => label.Text == "The test package is damaged.");
+        }
     });
 
     private static void AssertBlank(Bitmap image, Color color)
