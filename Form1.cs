@@ -660,7 +660,7 @@ public partial class Form1 : Form
         };
 
         _grid.EmptyTitle = _items.Count == 0 ? "No downloads yet" : "No matching downloads";
-        _grid.EmptyHint = _items.Count == 0 ? "Add a link to start downloading, or send one from your browser with the VESPER extension." : "";
+        _grid.EmptyHint = _items.Count == 0 ? "Add a link or send one from your browser." : "";
         _grid.SetItems(records.ToList());
         UpdateFooter();
         UpdateSelectedTools();
