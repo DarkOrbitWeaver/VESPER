@@ -200,6 +200,11 @@ public static class HlsParser
                 if (duration <= 0 || !double.IsFinite(duration)) SetUnsupported(media, "A segment has no valid finite duration.");
                 if (implicitRange && (previousResource != resource || nextOffset is null))
                     SetUnsupported(media, "An implicit byte range must follow a range of the same resource.");
+                if (sequence == long.MaxValue)
+                {
+                    SetUnsupported(media, "The media sequence number overflows.");
+                    break;
+                }
                 if (rangeLength is long rl && rangeOffset is long ro)
                 {
                     if (ro > long.MaxValue - rl) SetUnsupported(media, "A byte range overflows.");

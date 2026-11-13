@@ -537,8 +537,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         private readonly Dictionary<string, string> _expected = new(StringComparer.Ordinal);
         private readonly Dictionary<string, string> _fingerprints = new(StringComparer.Ordinal);
         internal bool Valid { get; private set; } = true;
-        internal IEnumerable<string> Fingerprints => _fingerprints.Select(pair => pair.Key + ":" + pair.Value)
-            .OrderBy(value => value, StringComparer.Ordinal);
+        internal IEnumerable<string> Fingerprints => _fingerprints.Select(pair => pair.Key + ":" + pair.Value);
 
         internal HlsKeyCache(IEnumerable<string>? saved)
         {
@@ -555,9 +554,12 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         internal async Task<byte[]> GetAsync(string uri, Func<string, long?, long?, long, CancellationToken, Task<byte[]>> fetch, CancellationToken ct)
         {
             if (_keys.TryGetValue(uri, out byte[]? existing)) return existing;
-            if (_keys.Count >= 32) throw new MediaContainerException("The HLS rendition uses too many distinct encryption keys.");
             byte[] key = await fetch(uri, null, null, 64, ct).ConfigureAwait(false);
-            if (key.Length != 16) throw new MediaContainerException("The HLS rendition key is not a valid AES-128 key.");
+            if (key.Length != 16)
+            {
+                CryptographicOperations.ZeroMemory(key);
+                throw new MediaContainerException("The HLS rendition key is not a valid AES-128 key.");
+            }
             string uriHash = Hash(Encoding.UTF8.GetBytes(uri));
             string keyHash = Hash(key);
             if (_expected.TryGetValue(uriHash, out string? expected) && expected != keyHash)
@@ -565,6 +567,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 CryptographicOperations.ZeroMemory(key);
                 throw new RunnerStop(NeedsAttention("key-changed", "An HLS encryption key changed since committed segments were downloaded."));
             }
+            if (_keys.Count >= 32)
+            {
+                string oldUri = _keys.Keys.First();
+                CryptographicOperations.ZeroMemory(_keys[oldUri]);
+                _keys.Remove(oldUri);
+            }
+            _fingerprints.Remove(uriHash);
+            if (_fingerprints.Count >= 32) _fingerprints.Remove(_fingerprints.Keys.First());
             _fingerprints[uriHash] = keyHash;
             _keys.Add(uri, key);
             return key;

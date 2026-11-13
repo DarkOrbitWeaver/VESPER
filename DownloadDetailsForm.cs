@@ -304,7 +304,10 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         return _job.State switch
         {
             JobState.Completed when _job.FileMissing => ("Completed · file missing", VesperIcon.Warning, _colors.Amber),
+            JobState.Completed when _job.Reason == "live-gaps" => ("Completed with gaps", VesperIcon.Warning, _colors.Amber),
             JobState.Completed => ("Completed", VesperIcon.Check, _colors.MutedGreen),
+            JobState.Downloading when _job.IsLiveRecording =>
+                (_job.Message.StartsWith("Recording live", StringComparison.Ordinal) ? _job.Message : "Recording live", VesperIcon.Download, _colors.MutedGreen),
             JobState.Downloading => (_job.Fraction is null ? "Downloading" : $"Downloading ({percent}%)", VesperIcon.Download, _colors.MutedGreen),
             JobState.Resolving => ("Contacting server", VesperIcon.Info, _colors.Muted),
             JobState.Paused => ("Paused", VesperIcon.Pause, _colors.Amber),
@@ -327,6 +330,8 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     {
         JobState.Completed when _job.FileMissing => "The saved file is no longer at its recorded location. The download itself did not fail.",
         JobState.Completed when _job.Kind == JobKind.BrowserFile => "Chrome saved this file.",
+        JobState.Completed when _job.Reason == "live-gaps" => "The recording was saved with missing live media. " + _job.Message,
+        JobState.Completed when _job.Reason == "live-stopped" => _job.Message,
         JobState.NeedsLink => $"The link no longer works. {(_job.CommittedBytes > 0 ? $"{Formatting.Bytes(_job.CommittedBytes)} is saved. " : "")}" +
             "VESPER checks that a replacement serves the same file before reusing any saved data.",
         JobState.Paused when _job.CommittedBytes > 0 => $"{Formatting.Bytes(_job.CommittedBytes)} is saved safely and will be reused.",
@@ -396,14 +401,25 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
                 yield return ("Show in folder", false, () => _actions.ShowFolder(j));
                 break;
             case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Converting:
+                if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
                 yield return ("Pause", false, () => _engine.Pause(j.Id));
                 break;
-            case JobState.Paused: yield return ("Resume", true, () => _engine.Resume(j.Id)); break;
-            case JobState.Queued: yield return ("Start now", true, () => _engine.StartNow(j.Id)); break;
-            case JobState.NeedsLink: yield return ("Replace link", true, () => _actions.ReplaceLink(j)); break;
+            case JobState.Paused:
+                if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
+                yield return ("Resume", !j.IsLiveRecording, () => _engine.Resume(j.Id));
+                break;
+            case JobState.Queued:
+                if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
+                yield return ("Start now", !j.IsLiveRecording, () => _engine.StartNow(j.Id));
+                break;
+            case JobState.NeedsLink:
+                yield return ("Replace link", true, () => _actions.ReplaceLink(j));
+                if (j.IsLiveRecording) yield return ("Stop and keep", false, () => _engine.StopAndKeepLive(j.Id));
+                break;
             case JobState.Failed:
                 yield return ("Try again", true, () => _engine.Resume(j.Id));
                 yield return ("Replace link", false, () => _actions.ReplaceLink(j));
+                if (j.IsLiveRecording) yield return ("Stop and keep", false, () => _engine.StopAndKeepLive(j.Id));
                 break;
             case JobState.Suspect:
                 yield return ("Show partial file", false, () => _actions.ShowFolder(j));
@@ -411,6 +427,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
                 break;
             case JobState.NeedsAttention:
                 foreach (var action in AttentionActions(j)) yield return action;
+                if (j.IsLiveRecording) yield return ("Stop and keep", false, () => _engine.StopAndKeepLive(j.Id));
                 break;
         }
     }

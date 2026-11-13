@@ -42,6 +42,7 @@ public sealed class JobSnapshot
 
     /// <summary>Completed job whose file is no longer where it was published. Not a failure.</summary>
     public bool FileMissing { get; init; }
+    public bool IsLiveRecording { get; init; }
     public IdentityLevel Identity { get; init; }
     public bool AcceptsRanges { get; init; }
     public string? ContentType { get; init; }

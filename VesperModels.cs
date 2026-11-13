@@ -100,6 +100,7 @@ internal sealed class DownloadItem
 
     private static string TransferText(JobSnapshot s) => s.State switch
     {
+        JobState.Downloading when s.IsLiveRecording => s.Message,
         JobState.Downloading when s.WaitingForData => "Waiting for data…",
         JobState.Downloading when s.SpeedBytesPerSecond > 0 => Formatting.Rate(s.SpeedBytesPerSecond),
         JobState.Downloading => s.Message,
