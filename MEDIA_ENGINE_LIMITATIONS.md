@@ -1,25 +1,34 @@
 # Media engine limits
 
-Current scope on `main`, 2026-11-12. Live-site results in [the compatibility matrix](MEDIA_ENGINE_COMPATIBILITY.md) are from 2026-11-11 and may change as providers change their sites.
+Current scope on `main`, 2026-11-13. See the [live compatibility matrix](MEDIA_ENGINE_COMPATIBILITY.md); provider behavior can change without notice.
 
 ## Transfer and media processing
 
-- The engine downloads direct HTTP and HTTPS files and supports single-representation HLS and DASH segment plans. It refuses live capture and DRM-protected manifests.
-- The in-process C# remuxer joins compatible, clear HTTP video and audio tracks into MP4, WebM, or MKV without re-encoding. It validates the output before publication. Separate HLS audio renditions and separate DASH segment-list tracks are not merged.
-- VESPER does not bundle or invoke ffmpeg, yt-dlp, or Python. A narrow Windows Media Foundation conversion path uses codecs available on Windows; it is not a general-purpose transcoder.
-- Subtitle and caption metadata may be listed, but subtitle downloads and muxing into media outputs are not supported.
+- Direct HTTP and HTTPS files are supported. The native engine also handles completed HLS and clear DASH plans, separate video/audio rendition merging, time ranges on completed segmented HLS/DASH plans, MPEG-TS HLS segments, and recoverable single-rendition HLS live recording.
+- HLS live recording requires one usable rendition with audio included. It can resume from committed segment sequences and stop while keeping the playable prefix. Separate live audio/video renditions, live time ranges, and DRM-protected or unsupported encryption formats are not supported.
+- Compatible clear audio/video tracks are remuxed without re-encoding into MP4, M4A, WebM, or MKV. Output is validated before publication. Damaged or mismatched tracks and unsupported codecs are not repaired or transcoded into supported codecs.
+- Direct MP3 uses ID3v2.4/APIC; FLAC uses Vorbis Comments/PICTURE; Ogg Vorbis and Opus use their codec comment packets and `METADATA_BLOCK_PICTURE`. These rewrites preserve encoded audio bytes. MP3 files that already have an ID3v2 tag are kept unchanged, so newly discovered details or artwork are not applied. Ogg tagging rejects chained, multiplexed, malformed, or oversized comment streams and leaves the original audio untouched.
+- Native MP4/M4A outputs use MP4 metadata atoms; Matroska outputs use tags, chapters, and cover attachments. WebM can carry its supported text tags, but this muxer does not embed cover attachments. Direct WAV, AIFF, and other unlisted audio formats are downloaded unchanged without automatic metadata embedding.
+- A separate Windows music-player display check has not been possible in this environment. Real Bandcamp MP3 and generated FLAC/Vorbis/Opus outputs were inspected with FFprobe and fully decoded with FFmpeg 8.1.1; the manual checklist still asks for a compatible Windows player check.
+- VESPER does not bundle or invoke FFmpeg, yt-dlp, or Python. Its Windows Media Foundation conversion path uses codecs available on Windows and is not a general-purpose transcoder. The native media validator does not parse direct MP3, FLAC, Ogg, or Opus files; independent inspection is used for those formats.
+
+## Subtitles and chapters
+
+- Subtitle selection is optional and defaults to Off. Supported direct SRT, VTT, and TTML tracks are saved as separate files. Completed HLS WebVTT playlists can be combined and converted to SRT; encrypted or live HLS subtitles are not supported.
+- Embedded subtitle tracks are not supported by the current muxers. The merge plan represents audio/video tracks only, subtitle choices become independent sidecar jobs, and the output demuxers do not validate subtitle tracks. VESPER does not burn subtitles into video.
+- Source chapters are written where the selected MP4 or Matroska output supports them. VESPER does not invent missing metadata or artwork.
 
 ## Site discovery
 
 - YouTube formats that require player JavaScript signature or `n` challenge execution are omitted. VESPER does not manufacture proof-of-origin tokens or bypass DRM, sign-in, age, or bot checks. Browser-assisted discovery can contribute page evidence, but it does not execute those challenges.
-- Live streams are detected and refused. A completed recording can be downloaded when its provider exposes a supported completed-file representation.
-- Provider support is implementation-specific and can change without notice. The 2026-11-11 live matrix recorded 18 of 20 cases in its defined supported set; YouTube Mix and one Vimeo sample were not resolved successfully.
-- The generic remuxer requires clear, structurally supported inputs and known sizes for each track. It does not repair damaged or mismatched tracks, and it does not transcode unsupported codecs into a supported container.
+- Live YouTube and other provider-specific live pages may be refused even though the generic engine can record supported HLS live playlists. Completed recordings can be downloaded when a provider exposes a supported completed-file representation.
+- Provider support is implementation-specific. The 2026-11-11 live matrix recorded 18 of 20 cases in its defined supported set; YouTube Mix and one Vimeo sample were not resolved. The public Bandcamp test track was rechecked on 2026-11-13 with FFprobe tag/art inspection and a full FFmpeg decode.
 
 ## Browser and recovery boundaries
 
 - The extension can keep Chrome-owned transfers when Chrome's network connection is required. Native helper registration does not enable the extension; Chrome approval remains a separate action.
+- The current UI test environment exposes no native Chrome browser, so live Chrome interception/native messaging and live YouTube/Instagram/TikTok journeys remain unverified. The manual workflow matrix records the exact checks to perform; extension unit tests do not prove live-site behavior.
 - The extension's optional cookie permission defaults off. If the user enables **Use site sign-in**, credentials remain scoped to the consented source origin.
-- A recovered media merge must retain the same provider identity, track roles, format IDs, sizes, and codecs. If the refreshed source cannot prove that identity, VESPER keeps the partial data and asks for a new link or user action.
+- Recovered media merges require the same provider identity, track roles, format IDs, sizes, and codecs. If a refreshed source cannot prove that identity, VESPER keeps partial data and asks for a new link or user action.
 
-For current build status, automated results, measured performance, and Windows checks still pending, see [release status](DOCUMENTATION/RELEASE.md).
+For current build status, automated results, measured performance, and Windows checks still pending, see [release status](DOCUMENTATION/RELEASE.md) and the [manual Windows workflow checklist](DOCUMENTATION/MANUAL_WINDOWS_TEST_CHECKLIST.md).

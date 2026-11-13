@@ -245,6 +245,8 @@ internal static class MediaTransferBridge
         }
         string name = step.Protocol == StreamProtocol.Hls
             ? Path.GetFileNameWithoutExtension(plan.SuggestedFileName) : plan.SuggestedFileName;
+        if (item.Kind == MediaKind.Audio && step.Protocol == StreamProtocol.Http && step.Container == "vorbis")
+            name = Path.ChangeExtension(name, ".ogg");
         string? mediaPlan = dashPlan;
         if (step.Protocol == StreamProtocol.Hls && clipStartSeconds is double clipStart)
             mediaPlan = JsonSerializer.Serialize(new MediaTimeRange(clipStart, clipEndSeconds!.Value));
@@ -255,7 +257,7 @@ internal static class MediaTransferBridge
             item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
             SubtitleTracks: subtitles,
             MediaMetadataJson: step.Protocol == StreamProtocol.Http && item.Kind == MediaKind.Audio
-                && string.Equals(step.Container, "mp3", StringComparison.OrdinalIgnoreCase)
+                && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
                     ? SerializeAudioMetadata(item) : null), null);
     }
 

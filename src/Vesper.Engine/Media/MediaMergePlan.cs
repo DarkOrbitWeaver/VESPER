@@ -160,10 +160,13 @@ public sealed record MediaMergePlan
         catch (JsonException) { return false; }
     }
 
-    internal static bool HasMp3TagValues(MediaMergeMetadata metadata) =>
+    internal static bool HasAudioTagValues(MediaMergeMetadata metadata) =>
         metadata.Title is { Length: > 0 } || metadata.Artist is { Length: > 0 } || metadata.Album is { Length: > 0 }
         || metadata.AlbumArtist is { Length: > 0 } || metadata.TrackNumber is not null || metadata.DiscNumber is not null
         || metadata.ReleaseDate is { Length: > 0 };
+
+    internal static bool SupportsAudioMetadataFile(string? fileName) =>
+        Path.GetExtension(fileName)?.ToLowerInvariant() is ".mp3" or ".flac" or ".ogg" or ".opus";
 
     private static bool ValidSource(MergeTrack track, MergeMediaSource source, bool allowPrivate)
     {

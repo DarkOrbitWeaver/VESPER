@@ -61,8 +61,9 @@ internal static class RecoveryManifest
             extents.ClampTo(length);   // never claim bytes the file cannot contain
             string? thumbnailUrl = UrlPolicy.TryParse(body.MediaThumbnailUrl, out Uri thumbnail, out _)
                 ? thumbnail.GetLeftPart(UriPartial.Path) : null;
-            string? mediaMetadataJson = MediaMergePlan.TryParseMetadata(body.MediaMetadataJson, out MediaMergeMetadata? metadata)
-                && (MediaMergePlan.HasMp3TagValues(metadata!) || thumbnailUrl is not null)
+            string? mediaMetadataJson = MediaMergePlan.SupportsAudioMetadataFile(body.FileName)
+                && MediaMergePlan.TryParseMetadata(body.MediaMetadataJson, out MediaMergeMetadata? metadata)
+                && (MediaMergePlan.HasAudioTagValues(metadata!) || thumbnailUrl is not null)
                 ? JsonSerializer.Serialize(metadata) : null;
 
             job = new DownloadJob

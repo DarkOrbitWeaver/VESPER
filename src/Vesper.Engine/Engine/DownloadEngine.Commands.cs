@@ -91,11 +91,11 @@ public sealed partial class DownloadEngine
             if (request.Kind != JobKind.Http || request.MediaProvider is not { Length: > 0 and <= 80 }
                 || request.Output != MediaOutput.Original || request.BrowserProof is not null || request.Secrets is { Count: > 0 }
                 || request.ExpectedSha256 is not null || request.PieceMapJson is not null || request.MediaPlanJson is not null
-                || !string.Equals(Path.GetExtension(request.FileName ?? uri.AbsolutePath), ".mp3", StringComparison.OrdinalIgnoreCase)
+                || !MediaMergePlan.SupportsAudioMetadataFile(request.FileName ?? uri.AbsolutePath)
                 || !MediaMergePlan.TryParseMetadata(request.MediaMetadataJson, out mediaMetadata)
-                || (mediaMetadata is not null && !MediaMergePlan.HasMp3TagValues(mediaMetadata)
+                || (mediaMetadata is not null && !MediaMergePlan.HasAudioTagValues(mediaMetadata)
                     && string.IsNullOrWhiteSpace(request.MediaThumbnailUrl)))
-                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded MP3 metadata requires a discovered MP3 download without credentials or a file checksum.");
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded audio metadata requires a discovered MP3, FLAC, Ogg or Opus download without credentials or a file checksum.");
         }
 
         string? expected = null;
@@ -362,12 +362,12 @@ public sealed partial class DownloadEngine
     public void Rename(Guid id, string name) => UpdateIfExists(id, job =>
     {
         string sanitized = FileNames.Sanitize(name, job.FileName);
-        bool sourceIsMp3 = job.MediaProvider is not null
-            && string.Equals(Path.GetExtension(job.FileName), ".mp3", StringComparison.OrdinalIgnoreCase);
-        if (sourceIsMp3 && !string.Equals(Path.GetExtension(sanitized), ".mp3", StringComparison.OrdinalIgnoreCase))
+        string sourceExtension = Path.GetExtension(job.FileName);
+        bool sourceIsTaggedAudio = job.MediaProvider is not null && MediaMergePlan.SupportsAudioMetadataFile(job.FileName);
+        if (sourceIsTaggedAudio && !string.Equals(Path.GetExtension(sanitized), sourceExtension, StringComparison.OrdinalIgnoreCase))
         {
-            sanitized = Path.ChangeExtension(sanitized, ".mp3");
-            job.Message = "This discovered audio is MP3, so its .mp3 extension was kept.";
+            sanitized = Path.ChangeExtension(sanitized, sourceExtension);
+            job.Message = $"This discovered audio uses {sourceExtension}, so its original extension was kept.";
         }
         job.FileName = sanitized;
         job.NameLocked = true;

@@ -1,7 +1,7 @@
-# Live compatibility matrix — tested 2026-11-11
+# Live compatibility matrix — runs from 2026-11-11 and 2026-11-13
 
 Runner: `tools/Vesper.LiveCheck` (same `MediaTransferBridge` + real `DownloadEngine` as the app) over `tests/live/corpus.tsv`.
-Independent validation: ffprobe/ffmpeg 7.0.2 static (development tool, not bundled): full decode with `-xerror` (files ≤ 400 MB) or first 90 s + last 60 s decode plus container duration (larger files). Raw evidence: `reports/live/2026-11-11/`.
+Independent validation: ffprobe/ffmpeg development tools, not bundled. The 2026-11-11 rows used 7.0.2 static; the Bandcamp recheck used FFmpeg 8.1.1 Essentials. Full decode uses `-xerror` (files ≤ 400 MB) or first 90 s + last 60 s decode plus container duration (larger files). Raw evidence for the original run: `reports/live/2026-11-11/`.
 "VESPER validation" = built-in demux of the published file (track kinds, codecs, sample counts, durations). It understands MP4/WebM/MKV only.
 
 | Platform | Scenario | Discovery | Format selection | Download | Audio present | Output validity (independent) | Tested | Failure reason / notes | Limitations |
@@ -23,7 +23,7 @@ Independent validation: ffprobe/ffmpeg 7.0.2 static (development tool, not bundl
 | YouTube | Playlist with continuation (NASA uploads) | pass | n/a | n/a | n/a | n/a | 2026-11-11 | 200 entries in 2 requests (continuation followed), `IsComplete=false` because the 200-item bound was reached | First run failed (2026 `lockupViewModel` markup); fixed and re-run the same day |
 | YouTube | Mix / radio | **fail** | n/a | n/a | n/a | n/a | 2026-11-11 | watch pages no longer embed the Mix panel; now reported as `SourceChanged` with that reason | Needs InnerTube `next` endpoint (not implemented) |
 | PeerTube | framatube "What is PeerTube?" | pass | pass (HLS 480p) | pass (50 s) | verified | full decode ok; h264 + aac | 2026-11-11 | — | HLS fetch slow (serial segments) |
-| Bandcamp | yt-dlp public test track | pass | pass (mp3-128) | pass | verified (ffprobe) | full decode ok; mp3 | 2026-11-11 | VESPER validator does not parse MP3 | — |
+| Bandcamp | yt-dlp public test track | pass | pass (mp3-128) | pass | verified (ffprobe) | full decode ok; MP3 with title/artist and attached 1200×1200 cover | 2026-11-13 | VESPER native validator does not parse direct MP3 | — |
 | Internet Archive | `BigBuckBunny_124` smallest | pass | pass (AVI) | pass (332 MB) | verified (ffprobe) | full decode ok; mpeg4 + audio | 2026-11-11 | VESPER validator does not parse AVI | — |
 | Podcast RSS | NPR feed | pass | n/a | n/a | n/a | n/a | 2026-11-11 | 200 enclosures listed (bounded) | — |
 | Vimeo | `76979871` | **fail** | n/a | n/a | n/a | n/a | 2026-11-11 | `DrmProtected: HLS playlist uses a DRM key format` | Not yet investigated whether a clear rendition exists |

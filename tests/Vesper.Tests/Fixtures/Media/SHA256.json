@@ -58,5 +58,17 @@
   "quiet-track.mp3": {
     "bytes": 3552,
     "sha256": "51550a43c28927f6405424163a3562cdf2269cbe556e45981289fcefa4a4528"
+  },
+  "quiet-track.flac": {
+    "bytes": 8509,
+    "sha256": "c14f5928ac6a036683ac83ab551f13619ff69279ee37153c1104833f36486367"
+  },
+  "quiet-track.ogg": {
+    "bytes": 3313,
+    "sha256": "a97d30ab5c21ccf1e671545f5344e468da12700d1e3ff16ccce535bbd9b410cc"
+  },
+  "quiet-track.opus": {
+    "bytes": 2270,
+    "sha256": "f671361fdcaa3ca9a1136664073f41966645211432bc93bf8a02a8d6643c94ac"
   }
 }

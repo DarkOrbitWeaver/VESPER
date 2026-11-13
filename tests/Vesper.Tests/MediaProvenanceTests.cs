@@ -59,12 +59,17 @@ public sealed class MediaProvenanceTests
         Assert.Null(job.MediaMetadataJson);
     }
 
-    [Fact]
-    public void Recovery_manifest_keeps_valid_audio_tags_without_claiming_uncommitted_bytes()
+    [Theory]
+    [InlineData("mp3")]
+    [InlineData("flac")]
+    [InlineData("ogg")]
+    [InlineData("opus")]
+    public void Recovery_manifest_keeps_valid_audio_tags_without_claiming_uncommitted_bytes(string extension)
     {
-        string dir = Path.Combine(Path.GetTempPath(), "vesper-mp3-manifest-" + Guid.NewGuid().ToString("N"));
+        string dir = Path.Combine(Path.GetTempPath(), "vesper-audio-manifest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
-        string partialPath = Path.Combine(dir, "song.mp3.part");
+        string fileName = "song." + extension;
+        string partialPath = Path.Combine(dir, fileName + ".part");
         byte[] partial = new byte[128];
         File.WriteAllBytes(partialPath, partial);
         const string metadataJson = "{\"Title\":\"Song\",\"Artist\":\"Band\",\"Album\":\"Record\"}";
@@ -72,7 +77,7 @@ public sealed class MediaProvenanceTests
         {
             var job = new DownloadJob
             {
-                Kind = JobKind.Http, SourceUrl = "https://cdn.example.com/song.mp3", FileName = "song.mp3",
+                Kind = JobKind.Http, SourceUrl = "https://cdn.example.com/" + fileName, FileName = fileName,
                 DestinationFolder = dir, PartialPath = partialPath, TotalBytes = 512, MediaMetadataJson = metadataJson,
                 MediaThumbnailUrl = "https://cdn.example.com/cover.png?signature=private"
             };
@@ -90,6 +95,33 @@ public sealed class MediaProvenanceTests
             Assert.False(recovered.Extents.Covers(0, 512));
         }
         finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("mp3")]
+    [InlineData("flac")]
+    [InlineData("ogg")]
+    [InlineData("opus")]
+    public void Discovered_audio_metadata_is_accepted_only_for_supported_output_extensions(string extension)
+    {
+        using var harness = new Harness();
+        const string metadata = "{\"Title\":\"Song\",\"Artist\":\"Band\"}";
+        AddResult result = harness.Engine.Add(new AddRequest("https://cdn.example.com/song." + extension,
+            FileName: "song." + extension, StartNow: false, Kind: JobKind.Http, MediaProvider: "bandcamp",
+            MediaMetadataJson: metadata));
+
+        Assert.True(result.Ok, result.Message);
+    }
+
+    [Fact]
+    public void Discovered_audio_metadata_rejects_unknown_extensions()
+    {
+        using var harness = new Harness();
+        AddResult result = harness.Engine.Add(new AddRequest("https://cdn.example.com/song.vorbi",
+            FileName: "song.vorbi", StartNow: false, Kind: JobKind.Http, MediaProvider: "bandcamp",
+            MediaMetadataJson: "{\"Title\":\"Song\"}"));
+
+        Assert.Equal(AddStatus.Invalid, result.Status);
     }
 
     [Fact]
