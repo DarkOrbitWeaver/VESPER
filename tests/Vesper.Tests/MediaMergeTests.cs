@@ -176,12 +176,15 @@ public sealed class MediaMergeTests
         var audio = new MediaRepresentation
         {
             Id = "hls-audio-main", Url = new Uri("https://cdn.example.com/audio.m3u8"), Protocol = StreamProtocol.Hls,
-            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", IsDefaultAudio = true
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", IsDefaultAudio = true,
+            AudioTrackId = "main", AudioLanguage = "en"
         };
+        var commentary = audio with { Id = "hls-audio-commentary", AudioTrackId = "commentary", IsDefaultAudio = false };
         var item = new MediaItem
         {
             SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "hls", MediaId = "one", Title = "One",
-            Duration = TimeSpan.FromSeconds(6), Representations = [video, audio]
+            Duration = TimeSpan.FromSeconds(6), Representations = [video, audio, commentary],
+            AudioTracks = [new AudioTrack("main", "en", "Main", true), new AudioTrack("commentary", "en", "Commentary")]
         };
 
         var prepared = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
@@ -195,6 +198,12 @@ public sealed class MediaMergeTests
         Assert.Collection(plan.Tracks,
             track => Assert.Equal("hls", track.Source?.Protocol),
             track => Assert.Equal("hls", track.Source?.Protocol));
+
+        var selectedTrack = MediaTransferBridge.Prepare(item,
+            FormatPreferences.BestQuality with { AudioTrackId = "commentary" });
+        Assert.Null(selectedTrack.Error);
+        Assert.True(MediaMergePlan.TryParse(selectedTrack.Choice?.MediaPlanJson, false, out MediaMergePlan selectedPlan, out error), error);
+        Assert.Equal("hls-audio-commentary", selectedPlan.Tracks.Single(track => track.Role == "audio").FormatId);
 
         var clipped = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality,
             clipStartSeconds: 1.1, clipEndSeconds: 2.2);

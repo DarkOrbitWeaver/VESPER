@@ -18,6 +18,9 @@ public static class FormatSelector
         if (reps.Count == 0) return Fail(MediaErrors.NoMedia("Item has no downloadable representations", false));
 
         var audios = reps.Where(r => r.Content == StreamContent.AudioOnly).ToList();
+        if (!string.IsNullOrWhiteSpace(prefs.AudioTrackId)
+            && !reps.Any(r => r.HasAudio && r.AudioTrackId == prefs.AudioTrackId))
+            return Fail(MediaErrors.NoFormat("The selected audio track is not available in a playable format"));
         bool anyVideo = reps.Any(r => r.HasVideo);
 
         var result = prefs.Mode == QualityMode.AudioOnly || !anyVideo
@@ -55,7 +58,8 @@ public static class FormatSelector
     private static SelectionResult SelectVideo(MediaItem item, List<MediaRepresentation> reps, List<MediaRepresentation> audios, FormatPreferences p)
     {
         var combos = new List<Combo>();
-        foreach (var full in reps.Where(x => x.Content == StreamContent.VideoAndAudio))
+        foreach (var full in reps.Where(x => x.Content == StreamContent.VideoAndAudio
+                     && (string.IsNullOrWhiteSpace(p.AudioTrackId) || x.AudioTrackId == p.AudioTrackId)))
             combos.Add(new Combo(full, null, p.Container));
 
         foreach (var v in reps.Where(x => x.Content == StreamContent.VideoOnly))
@@ -249,8 +253,8 @@ public static class FormatSelector
     {
         if (audios.Count > 0)
         {
-            var a = PickAudio(audios, p, null)!;
-            return Ok(new FormatSelection
+            var a = PickAudio(audios, p, null);
+            if (a is not null) return Ok(new FormatSelection
             {
                 Audio = a,
                 Requirements = a.Requirements,
@@ -259,10 +263,13 @@ public static class FormatSelector
                 EstimatedSizeIsEstimate = a.FileSizeIsEstimate,
                 Summary = $"audio {a.AudioCodec ?? a.Container ?? ""} {(a.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
             });
+            if (string.IsNullOrWhiteSpace(p.AudioTrackId))
+                return Fail(MediaErrors.NoFormat("No playable audio-only format is available"));
         }
 
         // No audio-only stream: the only honest answer is a muxed stream plus an explicit extraction requirement.
-        var muxed = reps.Where(r => r.Content == StreamContent.VideoAndAudio).ToList();
+        var muxed = reps.Where(r => r.Content == StreamContent.VideoAndAudio
+            && (string.IsNullOrWhiteSpace(p.AudioTrackId) || r.AudioTrackId == p.AudioTrackId)).ToList();
         if (muxed.Count == 0)
             return Fail(MediaErrors.NoFormat("No stream with audio exists"));
 
@@ -275,7 +282,9 @@ public static class FormatSelector
             EstimatedSize = smallest.FileSize,
             EstimatedSizeIsEstimate = smallest.FileSizeIsEstimate,
             IsFallback = true,
-            FallbackReason = "No audio-only stream exists; the lowest-quality complete stream is selected and audio must be extracted by an external tool",
+            FallbackReason = audios.Count > 0
+                ? "The selected audio track is only available in a complete stream and must be extracted by an external tool"
+                : "No audio-only stream exists; the lowest-quality complete stream is selected and audio must be extracted by an external tool",
             Summary = "audio extraction from a complete stream (external tool required)"
         });
     }
@@ -297,6 +306,9 @@ public static class FormatSelector
         }
 
         var list = pool.ToList();
+        if (!string.IsNullOrWhiteSpace(p.AudioTrackId))
+            list = list.Where(a => a.AudioTrackId == p.AudioTrackId).ToList();
+        if (list.Count == 0) return null;
         if (list.Any(a => !a.IsAudioDescription)) list = list.Where(a => !a.IsAudioDescription).ToList();
         if (p.MaxAudioChannels is { } maxCh && list.Any(a => (a.AudioChannels ?? 2) <= maxCh))
             list = list.Where(a => (a.AudioChannels ?? 2) <= maxCh).ToList();

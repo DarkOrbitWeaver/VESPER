@@ -41,6 +41,8 @@ public sealed record FormatPreferences
     public IReadOnlyList<string> AudioCodecs { get; init; } = [];
 
     public string? AudioLanguage { get; init; }
+    /// <summary>Exact source audio track to select; null keeps the normal language/default ranking.</summary>
+    public string? AudioTrackId { get; init; }
     public int? MaxAudioChannels { get; init; }
     public bool PreferSurround { get; init; }
 
