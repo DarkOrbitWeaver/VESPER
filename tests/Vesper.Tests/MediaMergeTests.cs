@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using VESPER;
@@ -5,6 +7,7 @@ using Vesper.Engine;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Vesper.Tests;
 
@@ -12,8 +15,14 @@ namespace Vesper.Tests;
 /// Native remux coverage using the checked-in CC0 synthetic fixtures (real H.264/AAC/VP9/Opus bitstreams) plus
 /// mutated copies for adversarial input. Every merge is re-read and compared sample-by-sample with its sources.
 /// </summary>
+[Collection("Process handle checks")]
 public sealed class MediaMergeTests
 {
+    private const int BenchmarkDurationSeconds = 600;
+    private readonly ITestOutputHelper _output;
+
+    public MediaMergeTests(ITestOutputHelper output) => _output = output;
+
     [Fact]
     public void MediaTimeRange_RequiresFullContinuousCoverage()
     {
@@ -33,6 +42,360 @@ public sealed class MediaMergeTests
     private static byte[] AacFmp4() => [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
     private static byte[] TinyPng() => Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=");
+
+    private static DemuxedTrack Repeat(DemuxedTrack source, int count)
+    {
+        var repeated = new DemuxedTrack
+        {
+            Kind = source.Kind,
+            Codec = source.Codec,
+            SourceContainer = source.SourceContainer,
+            Timescale = source.Timescale,
+            Mp4SampleEntry = source.Mp4SampleEntry,
+            CodecPrivate = source.CodecPrivate,
+            MatroskaCodecId = source.MatroskaCodecId,
+            MatroskaSettings = source.MatroskaSettings,
+            Width = source.Width,
+            Height = source.Height,
+            Channels = source.Channels,
+            SampleRate = source.SampleRate,
+            BitDepth = source.BitDepth,
+            CodecDelayNs = source.CodecDelayNs,
+            SeekPreRollNs = source.SeekPreRollNs,
+            DefaultDurationNs = source.DefaultDurationNs,
+            Language = source.Language,
+            EditMediaTime = source.EditMediaTime,
+            Samples = new List<TrackSample>(checked(source.Samples.Count * count))
+        };
+        long duration = source.DurationTicks;
+        for (int repeat = 0; repeat < count; repeat++)
+        {
+            long offset = checked(duration * repeat);
+            foreach (TrackSample sample in source.Samples)
+            {
+                TrackSample copy = sample;
+                copy.Dts = checked(copy.Dts + offset);
+                repeated.Samples.Add(copy);
+            }
+        }
+        return repeated;
+    }
+
+    private static int RepeatsFor(DemuxedTrack track) =>
+        Math.Max(1, (int)Math.Ceiling(BenchmarkDurationSeconds / track.DurationSeconds));
+
+    [Fact]
+    [Trait("Category", "MediaBenchmark")]
+    public async Task Measure_large_local_remux_paths()
+    {
+        // Repeated checked-in samples create a long remux workload without network or transcoding.
+        string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string outputFolder = Path.Combine(tempRoot, "vesper-media-benchmark-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outputFolder);
+
+        try
+        {
+            var disk = new DriveInfo(Path.GetPathRoot(outputFolder)!);
+            _output.WriteLine($"environment: os={RuntimeInformation.OSDescription}; runtime={Environment.Version}; processors={Environment.ProcessorCount}; available-memory={GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024)} MiB; disk-free={disk.AvailableFreeSpace / (1024 * 1024)} MiB");
+
+            string fixtureFolder = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
+            string videoPath = Path.Combine(fixtureFolder, "video-only.mp4");
+            string webmPath = Path.Combine(fixtureFolder, "muxed.webm");
+            string audioPath = Path.Combine(outputFolder, "audio.mp4");
+            File.WriteAllBytes(audioPath, AacFmp4());
+
+            using var mp4VideoSource = new FileStream(videoPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                FileOptions.SequentialScan);
+            DemuxedTrack mp4Video = Track(mp4VideoSource, TrackKind.Video);
+            using var mp4AudioSource = new FileStream(audioPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                FileOptions.SequentialScan);
+            DemuxedTrack mp4Audio = Track(mp4AudioSource, TrackKind.Audio);
+            var mp4Inputs = new List<(DemuxedTrack Track, Stream Source)>
+            {
+                (Repeat(mp4Video, RepeatsFor(mp4Video)), mp4VideoSource),
+                (Repeat(mp4Audio, RepeatsFor(mp4Audio)), mp4AudioSource)
+            };
+
+            using var webmSource = new FileStream(webmPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                FileOptions.SequentialScan);
+            List<DemuxedTrack> webmTracks = MediaMerger.Demux(webmSource, webmSource.Length, default);
+            DemuxedTrack webmVideo = webmTracks.Single(track => track.Kind == TrackKind.Video);
+            DemuxedTrack webmAudio = webmTracks.Single(track => track.Kind == TrackKind.Audio);
+            var webmInputs = new List<(DemuxedTrack Track, Stream Source)>
+            {
+                (Repeat(webmVideo, RepeatsFor(webmVideo)), webmSource),
+                (Repeat(webmAudio, RepeatsFor(webmAudio)), webmSource)
+            };
+
+            using var mkvAudioSource = new FileStream(webmPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
+                FileOptions.SequentialScan);
+            DemuxedTrack mkvAudio = Track(mkvAudioSource, TrackKind.Audio);
+            var mkvInputs = new List<(DemuxedTrack Track, Stream Source)>
+            {
+                (Repeat(mp4Video, RepeatsFor(mp4Video)), mp4VideoSource),
+                (Repeat(mkvAudio, RepeatsFor(mkvAudio)), mkvAudioSource)
+            };
+
+            await MeasureRemux("mp4", mp4Inputs, outputFolder);
+            await MeasureRemux("webm", webmInputs, outputFolder);
+            await MeasureRemux("mkv", mkvInputs, outputFolder);
+        }
+        finally
+        {
+            string fullOutputFolder = Path.GetFullPath(outputFolder).TrimEnd(Path.DirectorySeparatorChar);
+            if (!fullOutputFolder.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase)
+                || !Path.GetFileName(fullOutputFolder).StartsWith("vesper-media-benchmark-", StringComparison.Ordinal))
+                throw new IOException($"Refusing to remove an unexpected benchmark directory: {fullOutputFolder}");
+            Directory.Delete(fullOutputFolder, recursive: true);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "SegmentedMergeBenchmark")]
+    public async Task Measure_local_hls_and_dash_rendition_merges()
+    {
+        foreach (string protocol in new[] { "hls", "dash" })
+        {
+            var runs = new List<SegmentedMergeSample>();
+            for (int run = 0; run < 4; run++)
+            {
+                SegmentedMergeSample sample = await RunSegmentedMerge(protocol);
+                _output.WriteLine($"segmented: protocol={protocol}; run={run}; elapsed-ms={sample.ElapsedMs:0.###}; media-bytes={sample.MediaBytes}; entity-bytes={sample.EntityBytes}; output-bytes={sample.OutputBytes}; managed-allocated-MiB={sample.AllocatedMiB:0.###}; validation-ms={sample.ValidationMs:0.###}; tracks={sample.TrackCount}; samples={sample.SampleCount}; requests={sample.Requests}");
+                if (run > 0) runs.Add(sample);
+            }
+
+            _output.WriteLine($"segmented-median: protocol={protocol}; samples=3 after one warm-up; elapsed-ms={Median(runs.Select(run => run.ElapsedMs).ToArray()):0.###}; media-bytes={Median(runs.Select(run => (double)run.MediaBytes).ToArray()):0}; entity-bytes={Median(runs.Select(run => (double)run.EntityBytes).ToArray()):0}; output-bytes={Median(runs.Select(run => (double)run.OutputBytes).ToArray()):0}; managed-allocated-MiB={Median(runs.Select(run => run.AllocatedMiB).ToArray()):0.###}; validation-ms={Median(runs.Select(run => run.ValidationMs).ToArray()):0.###}; requests={Median(runs.Select(run => (double)run.Requests).ToArray()):0}");
+        }
+    }
+
+    private sealed record SegmentedMergeSample(double ElapsedMs, long MediaBytes, long EntityBytes, long OutputBytes,
+        double AllocatedMiB, double ValidationMs, int TrackCount, int SampleCount, int Requests);
+
+    private async Task<SegmentedMergeSample> RunSegmentedMerge(string protocol)
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        MediaMergePlan plan = CreateSegmentedPlan(server, protocol);
+        using var harness = new Harness();
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        long allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+        var watch = Stopwatch.StartNew();
+        AddResult added = harness.Engine.Add(new AddRequest(plan.Tracks[0].Url,
+            FileName: $"{protocol}-benchmark.mp4", Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await harness.WaitAsync(added.JobId,
+            job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink);
+        watch.Stop();
+        string requestedPaths = string.Join(", ", server.Requests.OrderBy(entry => entry.Key)
+            .Select(entry => $"{entry.Key}={entry.Value.Count}"));
+        Assert.True(done.State == JobState.Completed,
+            $"{done.State} {done.Reason}: {done.Message}; requests: {requestedPaths}");
+
+        long allocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+        long mediaBytes = ServedMediaBytes(server);
+        long entityBytes = ServedEntityBytes(server);
+        int requests = server.Requests.Values.Sum(queue => queue.Count);
+        long outputBytes = new FileInfo(done.FinalPath!).Length;
+        var validationWatch = Stopwatch.StartNew();
+        (int trackCount, int sampleCount) = ValidateSegmentedOutput(done.FinalPath!);
+        validationWatch.Stop();
+
+        Assert.Equal(protocol == "hls" ? 10 : 8, requests);
+        Assert.True(mediaBytes > 0);
+        Assert.True(entityBytes >= mediaBytes);
+        return new SegmentedMergeSample(watch.Elapsed.TotalMilliseconds, mediaBytes, entityBytes, outputBytes,
+            allocatedBytes / (1024.0 * 1024.0), validationWatch.Elapsed.TotalMilliseconds, trackCount, sampleCount, requests);
+    }
+
+    private static MediaMergePlan CreateSegmentedPlan(FaultServer server, string protocol)
+    {
+        const string initName = "av-init.mp4";
+        string[] fragmentNames = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
+        byte[] initialization = Fixture(initName);
+        var fragments = fragmentNames.Select(Fixture).ToArray();
+        var tracks = new List<MergeTrack>(2);
+
+        foreach (string role in new[] { "video", "audio" })
+        {
+            string root = protocol == "hls" ? $"/hls/segmented-benchmark/{role}" : $"/dash/segmented-benchmark/{role}";
+            string url;
+            MergeMediaSource source;
+            if (protocol == "hls")
+            {
+                string playlistPath = root + "/index.m3u8";
+                string playlist = $"#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"{initName}\"\n"
+                    + string.Concat(fragmentNames.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+                server.HlsPlaylists[playlistPath] = playlist;
+                server.HlsFiles[root + "/" + initName] = initialization;
+                for (int i = 0; i < fragmentNames.Length; i++)
+                    server.HlsFiles[root + "/" + fragmentNames[i]] = fragments[i];
+                url = server.Url(playlistPath);
+                source = new MergeMediaSource("hls", PlaylistUrl: url);
+            }
+            else
+            {
+                string initPath = root + "/" + initName;
+                server.Extra[initPath] = initialization;
+                var dashPlan = new DashDownloadPlan
+                {
+                    RepresentationId = role + "-fixture",
+                    Initialization = new DashFragment(server.Url(initPath)),
+                    Fragments = fragmentNames.Select((name, index) =>
+                        new DashFragment(server.Url(root + "/" + name), DurationSeconds: 1, StartSeconds: index)).ToArray(),
+                    RequireAudio = role == "audio",
+                    RequireVideo = role == "video"
+                };
+                for (int i = 0; i < fragmentNames.Length; i++)
+                    server.Extra[root + "/" + fragmentNames[i]] = fragments[i];
+                url = server.Url("/manifest.mpd");
+                source = new MergeMediaSource("dash", Dash: dashPlan);
+            }
+
+            tracks.Add(new MergeTrack(role, role + "-fixture", url, 0,
+                role == "video" ? "mp4" : "m4a", role == "video" ? "h264" : "aac", Source: source));
+        }
+
+        return new MediaMergePlan
+        {
+            Version = 2,
+            OutputContainer = "mp4",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks = tracks
+        };
+    }
+
+    private static long ServedMediaBytes(FaultServer server)
+    {
+        long total = 0;
+        foreach (var entry in server.HlsFiles) total = checked(total + (long)entry.Value.Length * server.Hits(entry.Key));
+        foreach (var entry in server.Extra) total = checked(total + (long)entry.Value.Length * server.Hits(entry.Key));
+        return total;
+    }
+
+    private static long ServedEntityBytes(FaultServer server)
+    {
+        // The fixture server sends complete, uncompressed bodies, so path hit counts give exact entity bytes.
+        long total = ServedMediaBytes(server);
+        foreach (var entry in server.HlsPlaylists)
+            total = checked(total + (long)Encoding.UTF8.GetByteCount(entry.Value) * server.Hits(entry.Key));
+        return total;
+    }
+
+    private static (int TrackCount, int SampleCount) ValidateSegmentedOutput(string path)
+    {
+        byte[] sourceBytes = [.. Fixture("av-init.mp4"), .. Fixture("av-1.m4s"), .. Fixture("av-2.m4s"), .. Fixture("av-3.m4s")];
+        using var source = new MemoryStream(sourceBytes);
+        List<DemuxedTrack> expected = MediaMerger.Demux(source, source.Length, default);
+        using var output = File.OpenRead(path);
+        MediaMerger.Validate(output, output.Length, expected, default);
+        List<DemuxedTrack> actual = MediaMerger.Demux(output, output.Length, default);
+        foreach (TrackKind kind in new[] { TrackKind.Video, TrackKind.Audio })
+            AssertSamePayloads(expected.Single(track => track.Kind == kind), source,
+                actual.Single(track => track.Kind == kind), output);
+        return (actual.Count, actual.Sum(track => track.Samples.Count));
+    }
+
+    private async Task MeasureRemux(string container, IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs,
+        string outputFolder)
+    {
+        var mergeTimes = new List<double>();
+        var validationTimes = new List<double>();
+        var mergeAllocations = new List<double>();
+        var validationAllocations = new List<double>();
+        var peakGrowth = new List<double>();
+        long outputBytes = 0;
+        double outputDuration = 0;
+
+        for (int run = 0; run < 4; run++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            long allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+            var mergeWatch = Stopwatch.StartNew();
+            string outputPath = Path.Combine(outputFolder, $"{container}-{run}.media");
+            long mergeAllocatedBytes = 0;
+            long peak = await MeasurePeakWorkingSet(() =>
+            {
+                using var output = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 16,
+                    FileOptions.SequentialScan);
+                MergeResult result = MediaMerger.Merge(inputs, container, output, default);
+                output.Flush(flushToDisk: true);
+                outputBytes = result.Bytes;
+                outputDuration = result.DurationSeconds;
+                mergeWatch.Stop();
+                mergeAllocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+
+                long validationAllocatedBytes = GC.GetTotalAllocatedBytes(precise: true);
+                var validationWatch = Stopwatch.StartNew();
+                MediaMerger.Validate(output, output.Length, inputs.Select(input => input.Track).ToArray(), default);
+                validationWatch.Stop();
+                validationAllocations.Add((GC.GetTotalAllocatedBytes(precise: true) - validationAllocatedBytes) / (1024.0 * 1024.0));
+                validationTimes.Add(validationWatch.Elapsed.TotalMilliseconds);
+            });
+            mergeTimes.Add(mergeWatch.Elapsed.TotalMilliseconds);
+            mergeAllocations.Add(mergeAllocatedBytes / (1024.0 * 1024.0));
+            peakGrowth.Add(peak / (1024.0 * 1024.0));
+            File.Delete(outputPath);
+        }
+
+        double medianMerge = Median(mergeTimes.Skip(1).ToArray());
+        double medianValidation = Median(validationTimes.Skip(1).ToArray());
+        double medianMergeAllocated = Median(mergeAllocations.Skip(1).ToArray());
+        double medianValidationAllocated = Median(validationAllocations.Skip(1).ToArray());
+        double peakWorkingSetGrowthMiB = peakGrowth.Max();
+        double mibPerSecond = outputBytes / (1024.0 * 1024.0) / (medianMerge / 1000.0);
+        _output.WriteLine($"remux: container={container}; duration={outputDuration:0.###}s; samples={inputs.Sum(input => input.Track.Samples.Count)}; bytes={outputBytes}; merge-p50-ms={medianMerge:0.###}; validate-p50-ms={medianValidation:0.###}; merge-MiB-s={mibPerSecond:0.###}; merge-allocated-MiB={medianMergeAllocated:0.###}; validate-allocated-MiB={medianValidationAllocated:0.###}; peak-process-working-set-growth-MiB={peakWorkingSetGrowthMiB:0.###}");
+    }
+
+    private static async Task<long> MeasurePeakWorkingSet(Action operation)
+    {
+        using var done = new ManualResetEventSlim();
+        using Process initial = Process.GetCurrentProcess();
+        initial.Refresh();
+        long baseline = initial.WorkingSet64;
+        long peak = baseline;
+        Task sampler = Task.Run(() =>
+        {
+            using Process process = Process.GetCurrentProcess();
+            while (!done.Wait(10))
+            {
+                process.Refresh();
+                long current = process.WorkingSet64;
+                long observed;
+                do
+                {
+                    observed = Interlocked.Read(ref peak);
+                    if (current <= observed) break;
+                }
+                while (Interlocked.CompareExchange(ref peak, current, observed) != observed);
+            }
+            process.Refresh();
+            long final = process.WorkingSet64;
+            if (final > Interlocked.Read(ref peak)) Interlocked.Exchange(ref peak, final);
+        });
+
+        try
+        {
+            operation();
+        }
+        finally
+        {
+            done.Set();
+            await sampler;
+        }
+        return Math.Max(0, peak - baseline);
+    }
+
+    private static double Median(double[] values)
+    {
+        Array.Sort(values);
+        return values[values.Length / 2];
+    }
 
     private static DemuxedTrack Track(Stream s, TrackKind kind) => MediaMerger.Demux(s, s.Length, default).First(t => t.Kind == kind);
 

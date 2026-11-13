@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Vesper.Engine;
 using Vesper.MediaResolver.Models;
 
 namespace VESPER;
@@ -81,6 +82,14 @@ internal static class BotanicalPreview
         Application.DoEvents();
     }
 
+    private static void ShowForMeasure(Form form)
+    {
+        form.StartPosition = FormStartPosition.Manual;
+        form.Location = new Point(SystemInformation.VirtualScreen.Left + 8, SystemInformation.VirtualScreen.Top + 8);
+        form.Show();
+        Application.DoEvents();
+    }
+
     private static void Save(Control control, string folder, string name)
     {
         control.Refresh();
@@ -112,7 +121,7 @@ internal static class BotanicalPreview
         uint gdiEnd = GetGuiResources(process.Handle, 0);
         using var main = CreateMain(prefs, botanical);
         main.LoadPreviewRows(rows);
-        ShowOffscreen(main);
+        ShowForMeasure(main);
         var grid = Descendants(main).OfType<DownloadGrid>().Single();
 
         using var bitmap = new Bitmap(grid.Width, grid.Height);
@@ -124,11 +133,104 @@ internal static class BotanicalPreview
             grid.DrawToBitmap(bitmap, grid.ClientRectangle);
             if (i >= 10) paint.Add(sw.Elapsed.TotalMilliseconds);
         }
+
+        int gridPaints = 0;
+        grid.Paint += (_, _) => gridPaints++;
+        grid.AutoScrollPosition = Point.Empty;
+        Application.DoEvents();
+        gridPaints = 0;
+
+        var scroll = new List<double>();
+        for (int i = 0; i < 120; i++)
+        {
+            int beforePaints = gridPaints;
+            var sw = Stopwatch.StartNew();
+            grid.AutoScrollPosition = new Point(0, (i + 1) * 96);
+            grid.Invalidate();
+            grid.Update();
+            Application.DoEvents();
+            sw.Stop();
+            if (gridPaints == beforePaints)
+                throw new InvalidOperationException("A preview scroll did not paint the download grid.");
+            if (i >= 10) scroll.Add(sw.Elapsed.TotalMilliseconds);
+        }
+
+        grid.AutoScrollPosition = Point.Empty;
+        Application.DoEvents();
+        DownloadItem[] activeItems = grid.VisibleItems.Take(3).ToArray();
+        if (activeItems.Length != 3)
+            throw new InvalidOperationException("The preview needs three visible rows for a progress batch.");
+
+        for (int i = 0; i < activeItems.Length; i++)
+            activeItems[i].UpdateFrom(ProgressSnapshot(activeItems[i], 10_000_000 + i * 1_000_000));
+        grid.Refresh();
+        Application.DoEvents();
+
+        var progress = new List<double>();
+        var progressBatch = new JobSnapshot[activeItems.Length];
+        for (int sample = 0; sample < 80; sample++)
+        {
+            for (int i = 0; i < activeItems.Length; i++)
+                progressBatch[i] = ProgressSnapshot(activeItems[i], (sample + 11) * 1_000_000L + i * 100_000L);
+
+            int beforePaints = gridPaints;
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < activeItems.Length; i++)
+                activeItems[i].UpdateFrom(progressBatch[i]);
+            grid.RefreshRows(progressBatch, static snapshot => snapshot.Id);
+            grid.Update();
+            Application.DoEvents();
+            sw.Stop();
+            if (gridPaints == beforePaints)
+                throw new InvalidOperationException("A preview progress batch did not paint the download grid.");
+            if (sample >= 8) progress.Add(sw.Elapsed.TotalMilliseconds);
+        }
+
         start.Sort();
         paint.Sort();
-        return new { Rows = rows.Length, WarmFormMedianMs = Math.Round((start[9] + start[10]) / 2, 2),
-            GridDrawP95Ms = Math.Round(paint[113], 2), GdiChangeAfter20MainWindows = (int)gdiEnd - (int)gdiStart };
+        (double ScrollP50Ms, double ScrollP95Ms) = Percentiles(scroll);
+        (double ProgressP50Ms, double ProgressP95Ms) = Percentiles(progress);
+        return new
+        {
+            Rows = rows.Length,
+            WarmFormMedianMs = Math.Round((start[9] + start[10]) / 2, 2),
+            GridDrawP95Ms = Math.Round(paint[113], 2),
+            ScrollSamples = scroll.Count,
+            GridScrollP50Ms = ScrollP50Ms,
+            GridScrollP95Ms = ScrollP95Ms,
+            ProgressBatchSize = activeItems.Length,
+            ProgressSamples = progress.Count,
+            ProgressBatchP50Ms = ProgressP50Ms,
+            ProgressBatchP95Ms = ProgressP95Ms,
+            GdiChangeAfter20MainWindows = (int)gdiEnd - (int)gdiStart
+        };
     }
+
+    private static (double P50, double P95) Percentiles(List<double> samples)
+    {
+        samples.Sort();
+        int middle = samples.Count / 2;
+        double p50 = samples.Count % 2 == 0
+            ? (samples[middle - 1] + samples[middle]) / 2
+            : samples[middle];
+        int p95 = Math.Clamp((int)Math.Ceiling(samples.Count * 0.95) - 1, 0, samples.Count - 1);
+        return (Math.Round(p50, 2), Math.Round(samples[p95], 2));
+    }
+
+    private static JobSnapshot ProgressSnapshot(DownloadItem item, long progressBytes) => new()
+    {
+        Id = item.Id,
+        Kind = JobKind.Http,
+        FileName = item.Name,
+        SourceUrl = item.SourceUrl,
+        Destination = item.Destination,
+        State = JobState.Downloading,
+        TotalBytes = 100_000_000,
+        ProgressBytes = progressBytes,
+        SpeedBytesPerSecond = 1_250_000 + progressBytes / 10,
+        Eta = TimeSpan.FromSeconds(80),
+        CreatedUtc = item.CreatedUtc
+    };
 
     private static IEnumerable<Control> Descendants(Control control)
     {
