@@ -104,3 +104,17 @@ The queue index was the measured improvement. A final review also removed termin
 Media implementation files were identical at both revisions. The first capture reported MP4 44.83 → 42.02 ms, WebM 65.64 → 62.05 ms, and MKV 62.42 → 83.01 ms; HLS merge 124.64 → 138.55 ms and DASH 127.23 → 132.79 ms. A current-only repeat produced MP4 41.56 ms, WebM 62.16 ms, MKV 62.39 ms, HLS 123.22 ms and DASH 128.67 ms. That repeat matched the baseline closely, including MKV, so the first-run MKV/HLS differences were not treated as code regressions.
 
 Independent output validation used FFmpeg/ffprobe 8.1.1 on files created by VESPER's native remux benchmark. All three fully decoded: MP4, 600.544 s, H.264 128×72 + AAC 48 kHz mono; WebM, 600.348 s, VP9 128×72 + Opus 48 kHz mono; MKV, 600.348 s, H.264 128×72 + Opus 48 kHz mono. The Windows Media Foundation fragmented-AAC conversion also fully decoded as a 1.021 s, 48 kHz mono AAC M4A. These deterministic outputs were temporary and removed after validation; external tools are development-only. The focused index checks, 321 non-benchmark engine tests, 15 Windows tests and all captured baseline/current performance test runs passed. Raw performance logs and JSON are in `release/performance-20261113-175157/`.
+
+## Goal 5 performance follow-up
+
+Date: 2026-11-13, same Windows 11 host and .NET 10.0.15 runtime as the Goal 4 Windows run. The focused `Measure_*` tests used local loopback or checked-in media and ran with `--no-restore`. These measurements were taken before the WebM cover-attachment change; the benchmark media has no cover and does not exercise that branch.
+
+| Measurement | Goal 4 current | Goal 5 follow-up | Change |
+|---|---:|---:|---:|
+| 96 MiB loopback, one connection median | 38.07 MiB/s | 37.84 MiB/s | 0.6% lower |
+| 96 MiB loopback, four connections median | 77.70 MiB/s | 78.63 MiB/s | 1.2% higher |
+| 16 KiB direct transfer median | 19.31 ms | 19.27 ms | 0.2% faster |
+| Add 2,000 queued jobs median | 5,045 ms | 4,893 ms | 3.0% faster |
+| Queue allocations per 2,000 jobs | 59.35 MiB | 59.93 MiB | 1.0% higher |
+
+The measured loopback and small-transfer changes stayed within the existing 5% throughput gate. Local segmented merge medians were 87.86 ms for HLS and 96.13 ms for DASH. Startup, idle use, and visible-grid repaint measurements were not repeated in this follow-up. Direct audio tagging runs only during finalization; WebM attachments are written only when a WebM output has valid source artwork. Neither adds idle work.
