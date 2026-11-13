@@ -43,6 +43,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             return RunOutcome.NeedsAttention("merge-plan", error);
         if (!PathSafety.TryResolveFolder(Job.DestinationFolder, create: true, out _, out var folderError))
             return RunOutcome.NeedsAttention("destination", folderError + " Saved data was kept.");
+        if (plan.IsSegmented)
+            return await new SegmentedMergeTransfer(engine, session, http).RunAsync(plan, ct).ConfigureAwait(false);
         string fingerprint = plan.Fingerprint;
         Cursor? cursor = null;
         if (Job.MediaState is not null)

@@ -130,7 +130,21 @@ public sealed class YouTubeStrategyTests
         Assert.Null(MergeCapability.MergeContainer(V("h264", "mp4") with { FileSize = null }, A("aac", "m4a")));
         Assert.Null(MergeCapability.MergeContainer(V("h264", "mp4") with { Protocol = StreamProtocol.Hls }, A("aac", "m4a")));
         Assert.Null(MergeCapability.MergeContainer(V("prores", "mov"), A("aac", "m4a")));
+        var hlsVideo = V("h264", "ts") with { Protocol = StreamProtocol.Hls, FileSize = null };
+        var hlsAudio = A("aac", "ts") with { Protocol = StreamProtocol.Hls, FileSize = null };
+        Assert.Equal("mkv", MergeCapability.MergeContainer(hlsVideo, hlsAudio));
+        Assert.Null(MergeCapability.MergeContainer(hlsVideo, A("opus", "webm") with { Protocol = StreamProtocol.Hls }));
+        var dashVideo = V("h264", "mp4") with { Protocol = StreamProtocol.Dash, FileSize = null, Segments = Fmp4Plan() };
+        var dashAudio = A("aac", "m4a") with { Protocol = StreamProtocol.Dash, FileSize = null, Segments = Fmp4Plan() };
+        Assert.Equal("mp4", MergeCapability.MergeContainer(dashVideo, dashAudio));
+        Assert.Null(MergeCapability.MergeContainer(dashVideo, dashAudio with { Segments = null }));
         Assert.Equal("m4a", MergeCapability.AudioContainer(A("aac", "m4a")));
         Assert.Equal("webm", MergeCapability.AudioContainer(A("opus", "webm")));
     }
+
+    private static SegmentPlan Fmp4Plan() => new()
+    {
+        InitializationUrl = new Uri("https://cdn.example.com/init.mp4"), IsFragmentedMp4 = true,
+        Segments = [new MediaSegment(new Uri("https://cdn.example.com/one.m4s"), 1)]
+    };
 }

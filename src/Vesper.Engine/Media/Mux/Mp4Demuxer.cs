@@ -308,7 +308,7 @@ internal static class Mp4Demuxer
         return (id, track);
     }
 
-    private static void ParseSampleEntry(DemuxedTrack t, byte[] b, int start, int end)
+    internal static void ParseSampleEntry(DemuxedTrack t, byte[] b, int start, int end)
     {
         string fourcc = MuxIo.FourCc(b.AsSpan(start + 4, 4));
         int payload = start + 8;
@@ -424,7 +424,7 @@ internal static class Mp4Demuxer
         return head.ToArray();
     }
 
-    private static string UnpackLanguage(ushort v)
+    internal static string UnpackLanguage(ushort v)
     {
         if (v == 0 || v == 0x7FFF) return "und";
         Span<char> c = stackalloc char[3];
