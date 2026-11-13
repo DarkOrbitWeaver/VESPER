@@ -174,6 +174,34 @@ public sealed class AudioOutputTests
     }
 
     [Fact]
+    public void WebmAudioChoiceCarriesTagsAndArtworkIntoTheNativeMergePlan()
+    {
+        var audio = new MediaRepresentation
+        {
+            Id = "webm-opus", Url = new Uri("https://cdn.example.com/song.webm"), Protocol = StreamProtocol.Http,
+            Content = StreamContent.AudioOnly, Container = "webm", AudioCodec = "opus", FileSize = 300_000,
+            ContentIdentity = "fixture-audio-identity"
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://www.youtube.com/watch?v=fixture"), Provider = "youtube", Kind = MediaKind.Audio,
+            Title = "Song One", Artist = "Fixture Band", Album = "Fixture Album",
+            Thumbnail = new Uri("https://cdn.example.com/cover.png"), Representations = [audio]
+        };
+
+        MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(
+            MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly).Choice);
+
+        Assert.Equal(JobKind.Merge, choice.Kind);
+        Assert.Equal("Song One.webm", choice.FileName);
+        Assert.Equal("https://cdn.example.com/cover.png", choice.ThumbnailUrl);
+        Assert.True(MediaMergePlan.TryParse(choice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.Equal("webm", plan.OutputContainer);
+        Assert.Equal("Fixture Band", plan.Metadata!.Artist);
+        Assert.Equal("Fixture Album", plan.Metadata.Album);
+    }
+
+    [Fact]
     public void Audio_track_selection_is_exact_and_does_not_fall_back_to_another_track()
     {
         var english = Audio("english", "aac", "m4a", 128) with { AudioTrackId = "en-main", AudioLanguage = "en" };
