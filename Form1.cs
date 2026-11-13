@@ -639,8 +639,7 @@ public partial class Form1 : Form
 
         string term = _search.Text.Trim();
         if (term.Length > 0)
-            records = records.Where(r => r.Name.Contains(term, StringComparison.OrdinalIgnoreCase)
-                || r.Extension.Contains(term, StringComparison.OrdinalIgnoreCase));
+            records = records.Where(r => r.MatchesSearch(term));
 
         records = _filter.SelectedText switch
         {

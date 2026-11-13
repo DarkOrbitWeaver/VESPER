@@ -63,6 +63,27 @@ internal sealed class DownloadItem
             = (n.Snapshot, n.Name, n.Extension, n.FileType, n.Size, n.SizeBytes, n.SourceUrl, n.Destination, n.Status, n.Percent, n.Transfer, n.Eta, n.Detail, n.RateCap);
     }
 
+    public bool MatchesSearch(string term)
+    {
+        if (string.IsNullOrWhiteSpace(term)) return true;
+        if (Contains(Name) || Contains(Extension) || Contains(FileType) || Contains(Status.ToString())) return true;
+
+        JobSnapshot? snapshot = Snapshot;
+        if (snapshot is null) return false;
+        if (Contains(snapshot.Category) || Contains(snapshot.MediaProvider) || Contains(snapshot.MediaId)
+            || Contains(snapshot.MediaQuality) || Contains(snapshot.MediaFormatId) || Contains(snapshot.ContentType)
+            || Contains(snapshot.Reason))
+            return true;
+
+        string page = snapshot.OriginalPageUrl ?? snapshot.SourceUrl;
+        if (!Uri.TryCreate(page, UriKind.Absolute, out Uri? uri)) return false;
+
+        // Signed query strings can contain credentials. Search only the public host and path.
+        return Contains(uri.Host) || Contains(uri.AbsolutePath);
+
+        bool Contains(string? value) => value?.Contains(term, StringComparison.OrdinalIgnoreCase) == true;
+    }
+
     public void UpdateFromBrowser(string profile, BrowserActiveFile file)
     {
         BrowserProfile = profile;
