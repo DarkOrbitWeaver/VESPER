@@ -48,7 +48,10 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (BrowserTransferLocked(transferId) is not { } job || job.State is JobState.Completed or JobState.Finalizing) return;
+            bool wasCandidate = IsDuplicateCandidate(job);
+            string previousSourceUrl = job.SourceUrl;
             job.State = JobState.Cancelled;
+            ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             job.Reason = BrowserFallbackOutcome.Reason;
             job.Message = BrowserFallbackOutcome.Message;
             job.NextRetryUtc = null;
@@ -100,6 +103,7 @@ public sealed partial class DownloadEngine
             };
             job.Extents.Add(new ByteRange(0, file.Length));
             SaveLocked(job, submission);
+            if (replace) RemoveDuplicateCandidateLocked(prior!, prior!.SourceUrl);
             _jobs[job.Id] = job;
             _credentials.Remove(job.Id);
             _missing.Remove(job.Id);
