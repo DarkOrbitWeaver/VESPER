@@ -1,16 +1,31 @@
 using System.Globalization;
+using System.Text.Json.Serialization;
 
 namespace Vesper.Engine;
 
 public sealed record HlsVariant(string Uri, long Bandwidth, int Width, int Height, string? Codecs, bool NeedsSeparateAudio, bool AudioOnly);
 public sealed record HlsKey(string? Uri, byte[]? Iv);
 public sealed record HlsMap(string Uri, long? Length, long? Offset, HlsKey? Key = null);
-public sealed record HlsSegment(string Uri, double Duration, long? RangeLength, long? RangeOffset, HlsKey? Key, HlsMap? Map, long Sequence);
+public sealed record HlsSegment(string Uri, double Duration, long? RangeLength, long? RangeOffset, HlsKey? Key, HlsMap? Map, long Sequence)
+{
+    [JsonIgnore]
+    public bool DiscontinuityBefore { get; init; }
+
+    [JsonIgnore]
+    public bool IsGap { get; init; }
+
+    [JsonIgnore]
+    public long DiscontinuitySequence { get; init; }
+}
 
 public sealed class HlsMedia
 {
     public List<HlsSegment> Segments { get; } = [];
     public bool IsVod { get; set; }
+    public long MediaSequence { get; set; }
+    public long DiscontinuitySequence { get; set; }
+    public int TargetDuration { get; set; }
+    public string? PlaylistType { get; set; }
     /// <summary>Set when the playlist uses a feature VESPER does not support.</summary>
     public string? Unsupported { get; set; }
     public string UnsupportedReasonCode { get; set; } = "unsupported";
@@ -59,25 +74,67 @@ public static class HlsParser
     }
 
     public static HlsMedia ParseMedia(string text, Uri baseUri)
+        => ParseMedia(text, baseUri, allowTimelineChanges: false);
+
+    internal static HlsMedia ParseMedia(string text, Uri baseUri, bool allowTimelineChanges)
     {
         var media = new HlsMedia();
         HlsKey? key = null;
         HlsMap? map = null;
-        long sequence = 0;
+        long sequence = 0, discontinuitySequence = 0;
         double duration = 0;
         long? rangeLength = null, rangeOffset = null, nextOffset = null;
         string? previousResource = null;
-        bool implicitRange = false;
+        bool implicitRange = false, discontinuityBefore = false, gap = false;
 
         foreach (string raw in text.Replace("\r", "").Split('\n'))
         {
             string line = raw.Trim();
             if (line.Length == 0) continue;
 
-            if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:", StringComparison.Ordinal))
-                long.TryParse(line["#EXT-X-MEDIA-SEQUENCE:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out sequence);
+            if (line.StartsWith("#EXT-X-TARGETDURATION:", StringComparison.Ordinal))
+            {
+                if (!int.TryParse(line["#EXT-X-TARGETDURATION:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out int target)
+                    || target <= 0)
+                    SetUnsupported(media, "The playlist has an invalid target duration.");
+                else media.TargetDuration = target;
+            }
+            else if (line.StartsWith("#EXT-X-MEDIA-SEQUENCE:", StringComparison.Ordinal))
+            {
+                if (media.Segments.Count > 0
+                    || !long.TryParse(line["#EXT-X-MEDIA-SEQUENCE:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out sequence))
+                    SetUnsupported(media, "The playlist has an invalid media sequence.");
+                else media.MediaSequence = sequence;
+            }
+            else if (line.StartsWith("#EXT-X-DISCONTINUITY-SEQUENCE:", StringComparison.Ordinal))
+            {
+                if (media.Segments.Count > 0
+                    || !long.TryParse(line["#EXT-X-DISCONTINUITY-SEQUENCE:".Length..], NumberStyles.None, CultureInfo.InvariantCulture, out discontinuitySequence))
+                    SetUnsupported(media, "The playlist has an invalid discontinuity sequence.");
+                else media.DiscontinuitySequence = discontinuitySequence;
+            }
+            else if (line.StartsWith("#EXT-X-PLAYLIST-TYPE:", StringComparison.Ordinal))
+            {
+                string type = line["#EXT-X-PLAYLIST-TYPE:".Length..];
+                if (type is not ("EVENT" or "VOD")) SetUnsupported(media, "The playlist type is unsupported.");
+                else media.PlaylistType = type;
+            }
             else if (line.StartsWith("#EXT-X-ENDLIST", StringComparison.Ordinal)) media.IsVod = true;
-            else if (line is "#EXT-X-DISCONTINUITY" or "#EXT-X-GAP" or "#EXT-X-I-FRAMES-ONLY")
+            else if (line == "#EXT-X-DISCONTINUITY")
+            {
+                if (discontinuitySequence == long.MaxValue) SetUnsupported(media, "The playlist discontinuity sequence overflows.");
+                else discontinuitySequence++;
+                discontinuityBefore = true;
+                if (!allowTimelineChanges)
+                    SetUnsupported(media, "Discontinuous, missing or I-frame-only media requires processing that is not supported.");
+            }
+            else if (line == "#EXT-X-GAP")
+            {
+                gap = true;
+                if (!allowTimelineChanges)
+                    SetUnsupported(media, "Discontinuous, missing or I-frame-only media requires processing that is not supported.");
+            }
+            else if (line == "#EXT-X-I-FRAMES-ONLY")
                 SetUnsupported(media, "Discontinuous, missing or I-frame-only media requires processing that is not supported.");
             else if (line.StartsWith("#EXTINF:", StringComparison.Ordinal))
                 double.TryParse(line["#EXTINF:".Length..].Split(',')[0], NumberStyles.Float, CultureInfo.InvariantCulture, out duration);
@@ -149,9 +206,15 @@ public static class HlsParser
                     else nextOffset = ro + rl;
                 }
                 else nextOffset = null;
-                media.Segments.Add(new HlsSegment(resource, duration, rangeLength, rangeOffset, key, map, sequence++));
+                media.Segments.Add(new HlsSegment(resource, duration, rangeLength, rangeOffset, key, map, sequence++)
+                {
+                    DiscontinuityBefore = discontinuityBefore,
+                    IsGap = gap,
+                    DiscontinuitySequence = discontinuitySequence
+                });
                 previousResource = resource;
                 rangeLength = rangeOffset = null; implicitRange = false;
+                discontinuityBefore = gap = false;
                 duration = 0;
             }
         }

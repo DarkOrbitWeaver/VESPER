@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -69,6 +70,58 @@ public class HlsTests
             state => state.State == JobState.NeedsAttention);
         Assert.Equal("unsupported", stopped.Reason);
         Assert.Equal(0, stopped.CommittedBytes);
+    }
+
+    [Fact]
+    public void Live_playlist_retains_sequence_target_duration_and_discontinuity_metadata()
+    {
+        var media = HlsParser.ParseMedia(string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:6", "#EXT-X-MEDIA-SEQUENCE:41",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:3", "#EXTINF:6,", "first.ts",
+            "#EXT-X-DISCONTINUITY", "#EXT-X-GAP", "#EXTINF:5,", "second.ts", ""),
+            new Uri("https://media.example.com/live/index.m3u8"), allowTimelineChanges: true);
+
+        Assert.False(media.IsVod);
+        Assert.Equal(6, media.TargetDuration);
+        Assert.Equal(41, media.MediaSequence);
+        Assert.Equal(3, media.DiscontinuitySequence);
+        Assert.Collection(media.Segments,
+            first =>
+            {
+                Assert.Equal(41, first.Sequence);
+                Assert.False(first.DiscontinuityBefore);
+                Assert.False(first.IsGap);
+                Assert.Equal(3, first.DiscontinuitySequence);
+            },
+            second =>
+            {
+                Assert.Equal(42, second.Sequence);
+                Assert.True(second.DiscontinuityBefore);
+                Assert.True(second.IsGap);
+                Assert.Equal(4, second.DiscontinuitySequence);
+            });
+        Assert.Null(media.Unsupported);
+
+        string previousPlanShape = JsonSerializer.Serialize(media.Segments.Select(segment => new
+        {
+            segment.Uri, segment.Duration, segment.RangeLength, segment.RangeOffset, segment.Key, segment.Map, segment.Sequence
+        }));
+        Assert.Equal(previousPlanShape, JsonSerializer.Serialize(media.Segments));
+    }
+
+    [Fact]
+    public async Task VOD_with_a_gap_is_not_published_as_complete()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/gap/index.m3u8";
+        server.HlsPlaylists[path] = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-GAP\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n";
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, path), state => state.State == JobState.NeedsAttention);
+
+        Assert.Equal("unsupported", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Equal(0, server.Hits("/hls/gap/s0.ts"));
     }
 
     [Fact]
