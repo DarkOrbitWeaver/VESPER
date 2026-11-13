@@ -366,7 +366,8 @@ internal static class MediaTransferBridge
     private static string? LimitMetadata(string? value, int maxLength)
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
-        string trimmed = value.Trim();
+        string trimmed = value.Trim().Replace("\0", "", StringComparison.Ordinal);
+        trimmed = System.Text.Encoding.UTF8.GetString(System.Text.Encoding.UTF8.GetBytes(trimmed));
         if (trimmed.Length <= maxLength) return trimmed;
         string limited = trimmed[..maxLength];
         if (char.IsHighSurrogate(limited[^1])) limited = limited[..^1];

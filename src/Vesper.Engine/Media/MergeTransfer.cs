@@ -233,11 +233,10 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                         $"The downloaded codecs ({string.Join(", ", expected.Select(t => t.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Nothing was published; saved data was kept.");
                 EnsureSpace(plan.TotalBytes + (1 << 20));
                 using var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20);
-                MediaMergeMetadata? outputMetadata = container is "mkv" or "webm" ? plan.Metadata : null;
-                MediaMerger.Merge(inputs, container, output, ct, outputMetadata);
+                MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata);
                 output.Flush(flushToDisk: true);
                 length = output.Length;
-                MediaMerger.Validate(output, length, expected, ct, outputMetadata);
+                MediaMerger.Validate(output, length, expected, ct, merged.Metadata);
                 output.Position = 0;
                 sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             }
