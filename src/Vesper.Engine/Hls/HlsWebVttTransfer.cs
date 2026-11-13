@@ -10,6 +10,7 @@ internal sealed record HlsWebVttPlan
 {
     public int Version { get; init; } = 1;
     public string Type { get; init; } = "hls-webvtt";
+    public string OutputFormat { get; init; } = "vtt";
 
     public string ToJson() => JsonSerializer.Serialize(this);
 
@@ -28,7 +29,8 @@ internal sealed record HlsWebVttPlan
                 || type.ValueKind != JsonValueKind.String
                 || type.GetString() != "hls-webvtt") return false;
             HlsWebVttPlan? parsed = JsonSerializer.Deserialize<HlsWebVttPlan>(json, new JsonSerializerOptions { MaxDepth = 8 });
-            if (parsed is not { Version: 1, Type: "hls-webvtt" }) return false;
+            if (parsed is not { Version: 1, Type: "hls-webvtt" }
+                || parsed.OutputFormat is not ("vtt" or "srt")) return false;
             plan = parsed;
             return true;
         }
@@ -55,7 +57,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
 
     internal async Task<RunOutcome> RunAsync(CancellationToken ct)
     {
-        if (!HlsWebVttPlan.TryParse(Job.MediaPlanJson, out _))
+        if (!HlsWebVttPlan.TryParse(Job.MediaPlanJson, out HlsWebVttPlan plan))
             return NeedsAttention("subtitle-plan", "The saved HLS subtitle plan is invalid. Saved data was kept.");
 
         string fingerprint = Fingerprint(Job.MediaPlanJson!);
@@ -94,6 +96,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
                 return NeedsAttention("subtitle-timeline", "The HLS subtitle playlist has an invalid duration.");
 
             byte[] output = await DownloadAndAssembleAsync(media, ct).ConfigureAwait(false);
+            if (plan.OutputFormat == "srt") output = WebVtt.ToSubRip(output);
             if (output.Length == 0 || output.LongLength > MaxOutputBytes)
                 return NeedsAttention("subtitle-size", "The assembled subtitle file exceeds the supported size.");
             EnsureSpace(output.LongLength);
@@ -352,6 +355,30 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
 
     private static class WebVtt
     {
+        internal static byte[] ToSubRip(byte[] bytes)
+        {
+            ParsedWebVtt parsed = Parse(bytes);
+            var output = new StringBuilder();
+            int number = 0;
+            foreach (Cue cue in parsed.Cues.OrderBy(cue => cue.StartTicks).ThenBy(cue => cue.Order))
+            {
+                string[] lines = cue.Block.Split('\n');
+                int timestampLine = Array.FindIndex(lines, line => line.Contains("-->", StringComparison.Ordinal));
+                if (timestampLine < 0) throw new MediaContainerException("A WebVTT cue lost its timestamps.");
+                string[] text = lines[(timestampLine + 1)..];
+                if (text.Length == 0) continue;
+
+                output.Append(++number).Append('\n')
+                    .Append(FormatSubRipTime(cue.StartTicks)).Append(" --> ")
+                    .Append(FormatSubRipTime(cue.EndTicks)).Append('\n');
+                foreach (string line in text) output.Append(line).Append('\n');
+                output.Append('\n');
+            }
+
+            if (number == 0) throw new MediaContainerException("The HLS subtitle playlist contains no cues to convert to SubRip.");
+            return new UTF8Encoding(false).GetBytes(output.ToString());
+        }
+
         internal static ParsedWebVtt Parse(byte[] bytes)
         {
             string text;
@@ -410,6 +437,15 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
                 }
             }
             return new ParsedWebVtt(metadata, styles, cues, mpegTimestamp, localTicks);
+        }
+
+        private static string FormatSubRipTime(long ticks)
+        {
+            long hours = ticks / TimeSpan.TicksPerHour;
+            int minutes = (int)(ticks / TimeSpan.TicksPerMinute % 60);
+            int seconds = (int)(ticks / TimeSpan.TicksPerSecond % 60);
+            int milliseconds = (int)(ticks % TimeSpan.TicksPerSecond / TimeSpan.TicksPerMillisecond);
+            return FormattableString.Invariant($"{hours:00}:{minutes:00}:{seconds:00},{milliseconds:000}");
         }
 
         internal static string FormatCue(Cue cue, long start, long end)

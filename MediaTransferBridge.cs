@@ -395,7 +395,7 @@ internal static class MediaTransferBridge
                 string language = Vesper.MediaResolver.Utilities.TextUtil.NormalizeLang(subtitle.Language);
                 bool segmented = string.Equals(subtitle.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase);
                 if (!IsDirectSubtitle(subtitle) && !segmented) continue;
-                string format = segmented ? "vtt" : subtitle.Format.ToLowerInvariant();
+                string format = segmented ? "srt" : subtitle.Format.ToLowerInvariant();
                 string fileName = FileNames.Sanitize($"{Path.GetFileNameWithoutExtension(choice.FileName)}.{language}.{format}");
                 expanded.Add(choice with
                 {
@@ -407,7 +407,12 @@ internal static class MediaTransferBridge
                     Quality = $"Subtitle · {language}",
                     ThumbnailUrl = null,
                     ExpiresAt = null,
-                    MediaPlanJson = segmented ? JsonSerializer.Serialize(new { Version = 1, Type = "hls-webvtt" }) : null,
+                    MediaPlanJson = segmented ? JsonSerializer.Serialize(new
+                    {
+                        Version = 1,
+                        Type = "hls-webvtt",
+                        OutputFormat = "srt"
+                    }) : null,
                     FormatId = segmented ? $"subtitle:{language}" : null,
                     Output = MediaOutput.Original,
                     ConvertedVideoQuality = null,
