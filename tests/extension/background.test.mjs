@@ -15,7 +15,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       remove: async key => { delete data[key]; }
     };
   };
-  let onMessage, onCreated, onChanged, onHeaders, onMedia, onAlarm, onContextClicked;
+  let onMessage, onCreated, onChanged, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked;
   const sent = [];
   const actions = [];
   const cookieLookups = [];
@@ -32,11 +32,17 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
         actions.push('native');
         sent.push(message);
         const reply = nativeReplies[message.type];
-        cb((typeof reply === 'function' ? reply(message) : reply)
-          ?? { ok: false, code: 'host-error', message: 'no reply' });
+        const response = typeof reply === 'function' ? reply(message) : reply;
+        const fallback = { ok: false, code: 'host-error', message: 'no reply' };
+        if (response && typeof response.then === 'function') response.then(value => cb(value ?? fallback), () => cb(fallback));
+        else cb(response ?? fallback);
       }
     },
-    webRequest: { onResponseStarted: { addListener: fn => { onMedia = fn; } }, onHeadersReceived: { addListener: fn => { onHeaders = fn; } } },
+    webRequest: {
+      onResponseStarted: { addListener: fn => { onMedia = fn; } },
+      onHeadersReceived: { addListener: fn => { onHeaders = fn; } },
+      onBeforeRedirect: { addListener: fn => { onRedirect = fn; } }
+    },
     tabs: { onUpdated: event, onRemoved: event, query: async () => [] },
     contextMenus: { create: noop, removeAll: async () => {}, onClicked: { addListener: fn => { onContextClicked = fn; } } },
     alarms: {
@@ -88,7 +94,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent, actions, cookieLookups, badges, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onMedia, onContextClicked, ports,
+  return { describe: context.__describe, sent, actions, cookieLookups, badges, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
     advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
     message: (msg, sender = {}) => new Promise(resolve => onMessage(msg, sender, resolve)) };
@@ -159,12 +165,20 @@ const activeDownload = () => ({
 const started = { ok: true, results: [{ status: 'started', transferReady: true }] };
 const transfer = state => ({ ok: true, data: { state } });
 
-function observe(app, file, { method = 'GET', type = 'main_frame', contentType = 'application/zip', attachment = true } = {}) {
+function observe(app, file, { method = 'GET', type = 'main_frame', contentType = 'application/zip', attachment = true, requestId = 'download-request' } = {}) {
   const headers = { 'Content-Length': String(file.fileSize), ETag: '"version-1"' };
   if (contentType) headers['Content-Type'] = contentType;
   if (attachment) headers['Content-Disposition'] = 'attachment; filename="archive.zip"';
-  return app.onHeaders({ url: file.finalUrl || file.url, method, type, statusCode: 200,
+  return app.onHeaders({ url: file.finalUrl || file.url, requestId, method, type, statusCode: 200,
     responseHeaders: Object.entries(headers).map(([name, value]) => ({ name, value })) });
+}
+
+async function waitFor(condition, message) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (condition()) return;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.ok(condition(), message);
 }
 
 test('automatic handoff verifies the response before pausing Chrome and accepts before monitoring', async () => {
@@ -237,6 +251,174 @@ test('a download is picked up when Chrome reports its response after the downloa
   assert.equal(file.paused, true);
 });
 
+test('a redirected API attachment matches when Chrome creates the item with finalUrl already set', async () => {
+  const originalUrl = 'https://arena.example/api/chat/chat-1/workspace/workspace-1/download';
+  const finalUrl = 'https://arena.example/api/files/file-1/download';
+  const file = { ...activeDownload(), url: originalUrl, finalUrl, fileSize: -1, totalBytes: -1 };
+  let finishSubmit;
+  const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
+  const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('failed') },
+    { download: file, signInPermission: true, prefs: { useSignIn: true } });
+
+  app.onRedirect({ requestId: 'arena-request', url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.sessionData.vesperDownloadCapture, undefined,
+    'an unassociated redirect should stay in memory');
+  await app.onCreated(file);
+  await waitFor(() => app.sessionData.vesperDownloadCapture?.chains?.length === 1,
+    'the matched download should make the redirect chain eligible for recovery');
+  assert.equal(app.sessionData.vesperDownloadCapture.awaiting.length, 1);
+
+  app.onHeaders({ url: finalUrl, requestId: 'arena-request', method: 'GET', type: 'other', statusCode: 200,
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/zip' },
+      { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' }
+    ] });
+
+  await waitFor(() => app.sessionData.vesperDownloadCapture.awaiting.length === 0,
+    'the final response should match the pending original URL');
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false,
+    'an unknown length and missing ETag are not enough to prove the file');
+  assert.equal(file.paused, false);
+
+  file.totalBytes = 1000;
+  const changed = app.onChanged({ id: file.id, totalBytes: { current: 1000 } });
+  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'),
+    'Chrome size evidence should let VESPER attempt the handoff');
+  const request = app.sent.find(message => message.type === 'browser-submit');
+  assert.equal(request.items[0].cookie, 'session=test-value');
+  assert.equal(request.authorized, true);
+  assert.deepEqual(app.cookieLookups, [finalUrl]);
+  assert.equal(file.paused, false, 'Chrome must continue until native readiness is confirmed');
+
+  finishSubmit({ ok: true, results: [{ status: 'started', transferReady: false }] });
+  await changed;
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.ok(!JSON.stringify(await app.local.get('browserDownloads')).includes('test-value'));
+  assert.ok(!JSON.stringify(app.sessionData).includes('test-value'));
+});
+
+test('a redirected response waits for Chrome finalUrl before retrying the native handoff', async () => {
+  const originalUrl = 'https://arena.example/api/chat/chat-4/workspace/workspace-4/download';
+  const finalUrl = 'https://arena.example/api/files/file-4/download';
+  const file = { ...activeDownload(), url: originalUrl, finalUrl: undefined, fileSize: -1, totalBytes: -1 };
+  let finishSubmit;
+  const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
+  const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('active') },
+    { download: file, signInPermission: true, prefs: { useSignIn: true } });
+  await app.onCreated(file);
+  app.onRedirect({ requestId: 'arena-late-final', url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
+  await waitFor(() => app.sessionData.vesperDownloadCapture.chains?.length === 1);
+
+  app.onHeaders({ url: finalUrl, requestId: 'arena-late-final', method: 'GET', type: 'other', statusCode: 200,
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/zip' },
+      { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' }
+    ] });
+  await waitFor(() => app.sessionData.vesperDownloadCapture.responses?.length === 1);
+  assert.equal(app.sessionData.vesperDownloadCapture.awaiting.length, 1,
+    'keep the pending item while Chrome still reports the original URL');
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+
+  file.finalUrl = finalUrl;
+  await app.onChanged({ id: file.id, finalUrl: { current: finalUrl } });
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false,
+    'the final URL alone is not proof of a complete transferable file');
+  assert.equal(file.paused, false);
+
+  file.totalBytes = 1000;
+  const changed = app.onChanged({ id: file.id, totalBytes: { current: 1000 } });
+  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'));
+  const request = app.sent.find(message => message.type === 'browser-submit');
+  assert.equal(request.items[0].cookie, 'session=test-value');
+  assert.equal(request.authorized, true);
+  assert.equal(file.paused, false, 'Chrome must continue while VESPER checks readiness');
+
+  finishSubmit(started);
+  await changed;
+  assert.equal(file.paused, true);
+  assert.ok(app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'accept'));
+  assert.equal(app.actions.includes('cancel'), false);
+});
+
+test('an authenticated API handoff wakes VESPER before waiting for native readiness', async () => {
+  const url = 'https://arena.example/api/chat/chat-2/workspace/workspace-2/download';
+  const file = { ...activeDownload(), url, finalUrl: url };
+  let finishSubmit;
+  const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
+  const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('active') },
+    { download: file, activity: true, signInPermission: true, prefs: { useSignIn: true } });
+  await observe(app, file, { requestId: 'arena-direct' });
+
+  const created = app.onCreated(file);
+  await waitFor(() => app.ports.length === 1 && app.sent.some(message => message.type === 'browser-submit'),
+    'the activity port and native request should start independently');
+  assert.equal(app.ports[0].posted[0].operation, 'connect');
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
+  const request = app.sent.find(message => message.type === 'browser-submit');
+  assert.equal(request.authorized, true);
+  assert.equal(request.items[0].cookie, 'session=test-value');
+  assert.deepEqual(app.cookieLookups, [url]);
+
+  finishSubmit(started);
+  await created;
+  assert.equal(file.paused, true);
+  assert.ok(app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'accept'));
+  assert.equal(app.actions.includes('cancel'), false);
+});
+
+test('a POST redirect hop or 401/407 challenge prevents replaying an API attachment', async () => {
+  const cases = [
+    { name: 'POST redirect', method: 'POST', redirect: true },
+    { name: '401 retry', method: 'GET', statusCode: 401, challenge: true },
+    { name: '407 proxy retry', method: 'GET', statusCode: 407, challenge: true }
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const originalUrl = `https://arena.example/api/chat/chat-${index}/workspace/workspace-${index}/download`;
+    const finalUrl = scenario.redirect ? `https://arena.example/api/files/file-${index}/download` : originalUrl;
+    const requestId = `arena-nonreplay-${index}`;
+    const file = { ...activeDownload(), url: originalUrl, finalUrl: undefined, fileSize: -1, totalBytes: -1 };
+    const app = load({}, { download: file, signInPermission: true, prefs: { useSignIn: true } });
+    await app.onCreated(file);
+
+    if (scenario.redirect) {
+      app.onRedirect({ requestId, url: originalUrl, redirectUrl: finalUrl, method: scenario.method });
+      file.finalUrl = finalUrl;
+    } else {
+      app.onHeaders({ url: originalUrl, requestId, method: 'GET', type: 'other', statusCode: scenario.statusCode, responseHeaders: [] });
+    }
+    file.totalBytes = 1000;
+    app.onHeaders({ url: finalUrl, requestId, method: 'GET', type: 'other', statusCode: 200,
+      responseHeaders: [
+        { name: 'Content-Type', value: 'application/zip' },
+        { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' },
+        { name: 'Content-Length', value: '1000' }
+      ] });
+    await waitFor(() => app.sessionData.vesperDownloadCapture.awaiting.length === 0,
+      'the response should settle the matching pending Chrome download');
+    await app.onChanged({ id: file.id, totalBytes: { current: 1000 } });
+
+    assert.equal(app.sent.some(message => message.type === 'browser-submit'), false, scenario.name);
+    assert.equal(app.cookieLookups.length, 0, scenario.name);
+    assert.equal(file.paused, false, scenario.name);
+  }
+});
+
+test('automatic API interception off leaves Chrome as the only download owner', async () => {
+  const file = { ...activeDownload(), url: 'https://arena.example/api/chat/chat-3/workspace/workspace-3/download' };
+  const app = load({ 'browser-submit': started }, { download: file, activity: true, prefs: { intercept: false, useSignIn: true }, signInPermission: true });
+  await observe(app, file, { requestId: 'arena-disabled' });
+  await app.onCreated(file);
+
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+  assert.equal(app.cookieLookups.length, 0);
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.ports.length, 0);
+});
+
 test('a pending Chrome capture survives a service worker restart', async () => {
   const file = activeDownload();
   const sessionData = {};
@@ -251,6 +433,92 @@ test('a pending Chrome capture survives a service worker restart', async () => {
 
   assert.equal(workerAfterRestart.sent[0].type, 'browser-submit');
   assert.equal(file.paused, true);
+});
+
+test('a redirect chain survives service worker restart until the final attachment response', async () => {
+  const originalUrl = 'https://arena.example/api/chat/chat-5/workspace/workspace-5/download';
+  const finalUrl = 'https://arena.example/api/files/file-5/download';
+  const requestId = 'arena-worker-restart';
+  const file = { ...activeDownload(), url: originalUrl, finalUrl: undefined, fileSize: -1, totalBytes: -1 };
+  const sessionData = {};
+  const downloadHistory = [];
+  const firstWorker = load({}, { download: file, sessionData, downloadHistory });
+  await firstWorker.onCreated(file);
+  firstWorker.onRedirect({ requestId, url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
+  await waitFor(() => sessionData.vesperDownloadCapture.chains?.length === 1);
+
+  const nextWorker = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, sessionData, downloadHistory, signInPermission: true, prefs: { useSignIn: true } });
+  file.finalUrl = finalUrl;
+  file.totalBytes = 1000;
+  nextWorker.onHeaders({ url: finalUrl, requestId, method: 'GET', type: 'other', statusCode: 200,
+    responseHeaders: [
+      { name: 'Content-Type', value: 'application/zip' },
+      { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' }
+    ] });
+  await waitFor(() => nextWorker.sent.some(message => message.type === 'browser-submit'));
+
+  const request = nextWorker.sent.find(message => message.type === 'browser-submit');
+  assert.equal(request.items[0].cookie, 'session=test-value');
+  assert.equal(request.authorized, true);
+  assert.equal(file.paused, true);
+  assert.equal(file.state, 'in_progress');
+  assert.equal(nextWorker.actions.includes('cancel'), false);
+});
+
+test('unrelated page redirects stay in memory instead of session storage', async () => {
+  const sessionData = {};
+  const app = load({}, { sessionData });
+  const originalUrl = 'https://private.example/chat/42?share=private-value';
+  const finalUrl = 'https://private.example/home';
+  app.onRedirect({ requestId: 'ordinary-navigation', url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(sessionData.vesperDownloadCapture, undefined);
+  assert.ok(!JSON.stringify(sessionData).includes(originalUrl));
+  assert.ok(!JSON.stringify(sessionData).includes(finalUrl));
+});
+
+test('POST, 401, and 407 replay markers survive restart without persisting their URLs', async () => {
+  const cases = [
+    { kind: 'post', statusCode: 0 },
+    { kind: 'challenge', statusCode: 401 },
+    { kind: 'challenge', statusCode: 407 }
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const originalUrl = `https://private.example/api/download/${index}`;
+    const finalUrl = scenario.kind === 'post' ? `https://cdn.example/file/${index}` : originalUrl;
+    const requestId = `opaque-request-${index}`;
+    const sessionData = {};
+    const firstWorker = load({}, { sessionData });
+    if (scenario.kind === 'post') {
+      firstWorker.onRedirect({ requestId, url: originalUrl, redirectUrl: finalUrl, method: 'POST' });
+    } else {
+      firstWorker.onHeaders({ url: originalUrl, requestId, method: 'GET', type: 'other',
+        statusCode: scenario.statusCode, responseHeaders: [] });
+    }
+    await waitFor(() => sessionData.vesperDownloadCapture?.blocked?.length === 1);
+    assert.equal(sessionData.vesperDownloadCapture.chains?.length || 0, 0);
+    assert.ok(!JSON.stringify(sessionData).includes(originalUrl));
+    assert.ok(!JSON.stringify(sessionData).includes(finalUrl));
+
+    const file = { ...activeDownload(), url: originalUrl, finalUrl, fileSize: -1, totalBytes: -1 };
+    const nextWorker = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+      { download: file, sessionData });
+    await nextWorker.onCreated(file);
+    file.totalBytes = 1000;
+    nextWorker.onHeaders({ url: finalUrl, requestId, method: 'GET', type: 'other', statusCode: 200,
+      responseHeaders: [
+        { name: 'Content-Type', value: 'application/zip' },
+        { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' },
+        { name: 'Content-Length', value: '1000' }
+      ] });
+    await waitFor(() => nextWorker.sessionData.vesperDownloadCapture.responses?.length === 1);
+    await nextWorker.onChanged({ id: file.id, totalBytes: { current: 1000 } });
+
+    assert.equal(nextWorker.sent.some(message => message.type === 'browser-submit'), false, scenario.kind);
+    assert.equal(file.paused, false, scenario.kind);
+  }
 });
 
 test('recent response evidence survives a service worker restart before download capture', async () => {

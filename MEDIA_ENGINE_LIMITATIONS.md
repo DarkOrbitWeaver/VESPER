@@ -27,6 +27,7 @@ Current scope on `main`, 2026-11-13. See the [live compatibility matrix](MEDIA_E
 ## Browser and recovery boundaries
 
 - The extension can keep Chrome-owned transfers when Chrome's network connection is required. Native helper registration does not enable the extension; Chrome approval remains a separate action.
+- Automatic Chrome handoff replays only observed, safe GET downloads with identity encoding and enough size or strong-ETag evidence for VESPER to verify the response. Redirects are correlated to the original and final URL; Chrome is paused only after VESPER confirms transfer readiness. The optional **Use site sign-in** permission reads cookies for the requested URL only. Request bodies and browser Authorization headers are not captured, so POST or bearer-only downloads stay in Chrome. Completed files are listed only when Chrome and local-file safety checks pass.
 - The current UI test environment exposes no native Chrome browser, so live Chrome interception/native messaging and live YouTube/Instagram/TikTok journeys remain unverified. The manual workflow matrix records the exact checks to perform; extension unit tests do not prove live-site behavior.
 - The extension's optional cookie permission defaults off. If the user enables **Use site sign-in**, credentials remain scoped to the consented source origin.
 - Recovered media merges require the same provider identity, track roles, format IDs, sizes, and codecs. If a refreshed source cannot prove that identity, VESPER keeps partial data and asks for a new link or user action.
