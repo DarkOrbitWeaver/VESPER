@@ -336,8 +336,18 @@ public sealed class MediaMergeTests
         {
             Subtitles = [subtitle with { Format = "hls-webvtt" }]
         }, preferences);
-        Assert.Null(segmented.Choice);
-        Assert.Contains("segmented transport", segmented.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(segmented.Error);
+        MediaDownloadChoice segmentedJob = Assert.Single(MediaTransferBridge.ExpandSubtitleChoices([segmented.Choice!]).Skip(1));
+        Assert.Equal(JobKind.Hls, segmentedJob.Kind);
+        Assert.Equal("One.en.vtt", segmentedJob.FileName);
+        Assert.True(HlsWebVttPlan.TryParse(segmentedJob.MediaPlanJson, out _));
+
+        var unsupported = MediaTransferBridge.Prepare(item with
+        {
+            Subtitles = [subtitle with { Format = "imsc1" }]
+        }, preferences);
+        Assert.Null(unsupported.Choice);
+        Assert.Contains("transport or format", unsupported.Error, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

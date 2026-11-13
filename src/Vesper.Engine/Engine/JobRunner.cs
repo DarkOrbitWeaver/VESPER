@@ -29,7 +29,9 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         {
             return Job.Kind switch
             {
-                JobKind.Hls => await new HlsTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
+                JobKind.Hls => HlsWebVttPlan.TryParse(Job.MediaPlanJson, out _)
+                    ? await new HlsWebVttTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false)
+                    : await new HlsTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
                 JobKind.Dash => await new DashTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
                 JobKind.Merge => await new MergeTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
                 JobKind.Http => await TransferAsync(ct).ConfigureAwait(false),

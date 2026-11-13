@@ -197,8 +197,8 @@ internal static class MediaTransferBridge
         IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
         if (subtitles.Count != selection.Subtitles.Count)
             return (null, "A selected subtitle link failed source validation.");
-        if (subtitles.Any(subtitle => !IsDirectSubtitle(subtitle)))
-            return (null, "This subtitle uses segmented transport that VESPER can't save as a sidecar yet.");
+        if (subtitles.Any(subtitle => !IsSupportedSubtitle(subtitle)))
+            return (null, "This subtitle uses a transport or format that VESPER can't save as a sidecar yet.");
 
         if (selection.NeedsMuxing)
         {
@@ -264,8 +264,8 @@ internal static class MediaTransferBridge
         IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
         if (subtitles.Count != selection.Subtitles.Count)
             return (null, "A selected subtitle link failed source validation.");
-        if (subtitles.Any(subtitle => !IsDirectSubtitle(subtitle)))
-            return (null, "This subtitle uses segmented transport that VESPER can't save as a sidecar yet.");
+        if (subtitles.Any(subtitle => !IsSupportedSubtitle(subtitle)))
+            return (null, "This subtitle uses a transport or format that VESPER can't save as a sidecar yet.");
         if (clipStartSeconds is not null && (tracks.Count != 2
             || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
@@ -381,6 +381,9 @@ internal static class MediaTransferBridge
     internal static bool IsDirectSubtitle(SubtitleTrack track) =>
         track.Format.ToLowerInvariant() is "vtt" or "srt" or "ttml";
 
+    private static bool IsSupportedSubtitle(SubtitleTrack track) => IsDirectSubtitle(track)
+        || string.Equals(track.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase);
+
     internal static IReadOnlyList<MediaDownloadChoice> ExpandSubtitleChoices(IEnumerable<MediaDownloadChoice> choices)
     {
         var expanded = new List<MediaDownloadChoice>();
@@ -389,22 +392,23 @@ internal static class MediaTransferBridge
             expanded.Add(choice with { SubtitleTracks = null });
             foreach (SubtitleTrack subtitle in choice.SubtitleTracks ?? [])
             {
-                if (!IsDirectSubtitle(subtitle)) continue;
                 string language = Vesper.MediaResolver.Utilities.TextUtil.NormalizeLang(subtitle.Language);
-                string fileName = FileNames.Sanitize(
-                    $"{Path.GetFileNameWithoutExtension(choice.FileName)}.{language}.{subtitle.Format.ToLowerInvariant()}");
+                bool segmented = string.Equals(subtitle.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase);
+                if (!IsDirectSubtitle(subtitle) && !segmented) continue;
+                string format = segmented ? "vtt" : subtitle.Format.ToLowerInvariant();
+                string fileName = FileNames.Sanitize($"{Path.GetFileNameWithoutExtension(choice.FileName)}.{language}.{format}");
                 expanded.Add(choice with
                 {
                     Url = subtitle.Url.AbsoluteUri,
                     FileName = fileName,
-                    Kind = JobKind.Http,
+                    Kind = segmented ? JobKind.Hls : JobKind.Http,
                     Provider = null,
                     MediaId = null,
                     Quality = $"Subtitle · {language}",
                     ThumbnailUrl = null,
                     ExpiresAt = null,
-                    MediaPlanJson = null,
-                    FormatId = null,
+                    MediaPlanJson = segmented ? JsonSerializer.Serialize(new { Version = 1, Type = "hls-webvtt" }) : null,
+                    FormatId = segmented ? $"subtitle:{language}" : null,
                     Output = MediaOutput.Original,
                     ConvertedVideoQuality = null,
                     ConvertedAudioCodec = null,

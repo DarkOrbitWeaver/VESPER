@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -26,6 +27,90 @@ public class HlsTests
         using var h = new Harness();
         JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, "/hls/enc/index.m3u8"), JobState.Completed);
         Assert.Equal(FaultServer.HlsExpected(), await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
+    public async Task WebVtt_rendition_merges_segments_and_maps_timestamps_to_one_sidecar()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\ns0.vtt\n#EXTINF:5,\ns1.vtt\n#EXT-X-ENDLIST\n";
+        server.HlsPlaylists["/hls/subtitles/index.m3u8"] = playlist;
+        server.HlsFiles["/hls/subtitles/s0.vtt"] = Encoding.UTF8.GetBytes(
+            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000\n\nopening\n00:00:01.000 --> 00:00:03.000\nOpening\n\nshared\n00:00:02.000 --> 00:00:04.000 align:start\nShared\n");
+        server.HlsFiles["/hls/subtitles/s1.vtt"] = Encoding.UTF8.GetBytes(
+            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:1350000\n\nnext\n00:00:01.000 --> 00:00:02.000\nLater\n");
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/hls/subtitles/index.m3u8"), FileName: "captions.en.vtt",
+            Kind: JobKind.Hls, MediaPlanJson: new HlsWebVttPlan().ToJson()));
+
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        string saved = await File.ReadAllTextAsync(done.FinalPath!);
+        Assert.StartsWith("WEBVTT\n", saved);
+        Assert.Contains("00:00:01.000 --> 00:00:03.000", saved);
+        Assert.Contains("00:00:02.000 --> 00:00:04.000 align:start", saved);
+        Assert.Contains("00:00:06.000 --> 00:00:07.000", saved);
+        Assert.EndsWith(".vtt", done.FinalPath);
+    }
+
+    [Fact]
+    public async Task WebVtt_rendition_rejects_live_playlists_without_publishing_partial_output()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/subtitles-live/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\ns0.vtt\n";
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/hls/subtitles-live/index.m3u8"), FileName: "captions.en.vtt",
+            Kind: JobKind.Hls, MediaPlanJson: new HlsWebVttPlan().ToJson()));
+
+        JobSnapshot stopped = await h.WaitAsync(added.JobId, state => state.State == JobState.NeedsAttention);
+        Assert.Equal("subtitle-live", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task WebVtt_rendition_rejects_malformed_timestamp_maps()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/subtitles-invalid/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\ns0.vtt\n#EXT-X-ENDLIST\n";
+        server.HlsFiles["/hls/subtitles-invalid/s0.vtt"] = Encoding.UTF8.GetBytes(
+            "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:invalid,MPEGTS:900000\n\n00:00:01.000 --> 00:00:02.000\nText\n");
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/hls/subtitles-invalid/index.m3u8"), FileName: "captions.en.vtt",
+            Kind: JobKind.Hls, MediaPlanJson: new HlsWebVttPlan().ToJson()));
+
+        JobSnapshot stopped = await h.WaitAsync(added.JobId, state => state.State == JobState.NeedsAttention);
+        Assert.Equal("subtitle-invalid", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task WebVtt_completed_output_recovers_without_fetching_the_playlist_again()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/subtitles-recovery/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\ns0.vtt\n#EXT-X-ENDLIST\n";
+        server.HlsFiles["/hls/subtitles-recovery/s0.vtt"] = Encoding.UTF8.GetBytes("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nSaved\n");
+        var crashed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var h = new Harness(point =>
+        {
+            if (point == "finalize.afterFlush")
+            {
+                crashed.TrySetResult();
+                throw new FailpointCrash(point);
+            }
+        });
+        var added = h.Engine.Add(new AddRequest(server.Url("/hls/subtitles-recovery/index.m3u8"), FileName: "captions.en.vtt",
+            Kind: JobKind.Hls, MediaPlanJson: new HlsWebVttPlan().ToJson()));
+        await crashed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        h.Restart();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Contains("Saved", await File.ReadAllTextAsync(done.FinalPath!));
+        Assert.Equal(1, server.Hits("/hls/subtitles-recovery/index.m3u8"));
+        Assert.Equal(1, server.Hits("/hls/subtitles-recovery/s0.vtt"));
     }
 
     [Fact]
