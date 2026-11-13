@@ -12,7 +12,8 @@ internal static class MatroskaMuxer
 {
     private const int SeekHeadReserve = 160;
 
-    public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output, bool webm, CancellationToken ct)
+    public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output, bool webm,
+        CancellationToken ct, MediaMergeMetadata? metadata = null)
     {
         if (inputs.Count is < 1 or > 8) throw new MediaContainerException("A Matroska output needs between one and eight tracks.");
         long origin = output.Position;
@@ -65,6 +66,7 @@ internal static class MatroskaMuxer
         UInt(info, 0x2AD7B1, 1_000_000);
         Str(info, 0x4D80, "VESPER");
         Str(info, 0x5741, "VESPER");
+        if (metadata?.Title is { Length: > 0 } title) Str(info, 0x7BA9, title);
         Float(info, 0x4489, durationMs);
         Master(output, WebmDemuxer.IdInfo, info.ToArray());
 
@@ -72,6 +74,20 @@ internal static class MatroskaMuxer
         var tracks = new MemoryStream();
         for (int ti = 0; ti < inputs.Count; ti++) Master(tracks, 0xAE, TrackEntry(inputs[ti].Track, ti + 1, webm));
         Master(output, WebmDemuxer.IdTracks, tracks.ToArray());
+
+        long tagsPos = -1;
+        if (metadata is { } tagMetadata && (tagMetadata.Uploader is { Length: > 0 } || tagMetadata.Description is { Length: > 0 }))
+        {
+            tagsPos = output.Position - segData;
+            Master(output, WebmDemuxer.IdTags, Tags(tagMetadata));
+        }
+
+        long chaptersPos = -1;
+        if (metadata?.Chapters is { Count: > 0 } chapters)
+        {
+            chaptersPos = output.Position - segData;
+            Master(output, WebmDemuxer.IdChapters, Chapters(chapters));
+        }
 
         // ---- clusters (k-way merge in decode order)
         var next = new int[inputs.Count];
@@ -147,6 +163,8 @@ internal static class MatroskaMuxer
         var seek = new MemoryStream();
         SeekEntry(seek, WebmDemuxer.IdInfo, infoPos);
         SeekEntry(seek, WebmDemuxer.IdTracks, tracksPos);
+        if (tagsPos >= 0) SeekEntry(seek, WebmDemuxer.IdTags, tagsPos);
+        if (chaptersPos >= 0) SeekEntry(seek, WebmDemuxer.IdChapters, chaptersPos);
         if (cues.Count > 0) SeekEntry(seek, WebmDemuxer.IdCues, cuesPos);
         var seekHead = new MemoryStream();
         Master(seekHead, WebmDemuxer.IdSeekHead, seek.ToArray());
@@ -158,6 +176,46 @@ internal static class MatroskaMuxer
         Size8(output, end - segData);
         output.Position = end;
         return end - origin;
+    }
+
+    private static byte[] Tags(MediaMergeMetadata metadata)
+    {
+        var tag = new MemoryStream();
+        Master(tag, 0x63C0, []); // Empty Targets applies these values to the whole file.
+        if (metadata.Uploader is { Length: > 0 } uploader) WriteSimpleTag(tag, "ARTIST", uploader);
+        if (metadata.Description is { Length: > 0 } description) WriteSimpleTag(tag, "COMMENT", description);
+        var tags = new MemoryStream();
+        Master(tags, 0x7373, tag.ToArray());
+        return tags.ToArray();
+    }
+
+    private static void WriteSimpleTag(Stream tag, string name, string value)
+    {
+        var simple = new MemoryStream();
+        Str(simple, 0x45A3, name);
+        Str(simple, 0x4487, value);
+        Master(tag, 0x67C8, simple.ToArray());
+    }
+
+    private static byte[] Chapters(IReadOnlyList<MediaMergeChapter> chapters)
+    {
+        var edition = new MemoryStream();
+        UInt(edition, 0x45DB, 1); // Default edition.
+        for (int i = 0; i < chapters.Count; i++)
+        {
+            MediaMergeChapter chapter = chapters[i];
+            var atom = new MemoryStream();
+            UInt(atom, 0x73C4, (ulong)i + 1);
+            UInt(atom, 0x91, checked((ulong)chapter.Start.Ticks * 100));
+            if (chapter.End is { } end) UInt(atom, 0x92, checked((ulong)end.Ticks * 100));
+            var display = new MemoryStream();
+            Str(display, 0x85, chapter.Title);
+            Master(atom, 0x80, display.ToArray());
+            Master(edition, 0xB6, atom.ToArray());
+        }
+        var container = new MemoryStream();
+        Master(container, 0x45B9, edition.ToArray());
+        return container.ToArray();
     }
 
     private static long ToNs(long ticks, uint timescale) => (long)((Int128)ticks * 1_000_000_000 / timescale);
@@ -336,13 +394,14 @@ internal static class MediaMerger
         };
     }
 
-    public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container, Stream output, CancellationToken ct)
+    public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
+        Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null)
     {
         long bytes = container switch
         {
             "mp4" or "m4a" => Mp4Muxer.Write(inputs, output, ct),
-            "webm" => MatroskaMuxer.Write(inputs, output, webm: true, ct),
-            "mkv" => MatroskaMuxer.Write(inputs, output, webm: false, ct),
+            "webm" => MatroskaMuxer.Write(inputs, output, webm: true, ct, metadata),
+            "mkv" => MatroskaMuxer.Write(inputs, output, webm: false, ct, metadata),
             _ => throw new MediaContainerException($"The output container '{container}' is not supported.")
         };
         return new MergeResult(container, bytes, inputs.Select(i => i.Track.Codec).ToArray(),
@@ -350,7 +409,8 @@ internal static class MediaMerger
     }
 
     /// <summary>Re-reads a finished output and proves it carries exactly the expected tracks and samples.</summary>
-    public static void Validate(Stream output, long length, IReadOnlyList<DemuxedTrack> expected, CancellationToken ct)
+    public static void Validate(Stream output, long length, IReadOnlyList<DemuxedTrack> expected, CancellationToken ct,
+        MediaMergeMetadata? expectedMetadata = null)
     {
         List<DemuxedTrack> got = Demux(output, length, ct);
         if (got.Count != expected.Count)
@@ -365,6 +425,15 @@ internal static class MediaMerger
             double tolerance = Math.Max(0.5, e.DurationSeconds * 0.01);
             if (Math.Abs(g.DurationSeconds - e.DurationSeconds) > tolerance)
                 throw new MediaContainerException($"Merged {e.Kind.ToString().ToLowerInvariant()} duration {g.DurationSeconds:0.##}s differs from the source {e.DurationSeconds:0.##}s.");
+        }
+        if (expectedMetadata is not null)
+        {
+            if (!WebmDemuxer.LooksLikeMatroska(output, length))
+                throw new MediaContainerException("The selected output container cannot store this media metadata.");
+            MediaMergeMetadata actual = WebmDemuxer.ReadMetadata(output, length);
+            if (actual.Title != expectedMetadata.Title || actual.Uploader != expectedMetadata.Uploader
+                || actual.Description != expectedMetadata.Description || !actual.Chapters.SequenceEqual(expectedMetadata.Chapters))
+                throw new MediaContainerException("The merged file did not retain the selected title, tags and chapters.");
         }
     }
 }

@@ -115,7 +115,7 @@ public sealed partial class DownloadEngine
                 && j.State is not (JobState.Completed or JobState.Cancelled)
                 && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
                 && j.Output == request.Output
-                && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || j.MediaPlanJson == request.MediaPlanJson));
+                && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || SameRequestPlan(j, request)));
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
@@ -160,6 +160,14 @@ public sealed partial class DownloadEngine
     {
         normalized = text.Trim().Replace(" ", "").ToLowerInvariant();
         return normalized.Length == 64 && normalized.All(Uri.IsHexDigit);
+    }
+
+    private bool SameRequestPlan(DownloadJob existing, AddRequest request)
+    {
+        if (request.Kind != JobKind.Merge) return existing.MediaPlanJson == request.MediaPlanJson;
+        return MediaMergePlan.TryParse(existing.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan previous, out _)
+            && MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan next, out _)
+            && previous.Fingerprint == next.Fingerprint;
     }
 
     // ---- run control ------------------------------------------------------------------------------------------------

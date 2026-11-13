@@ -16,6 +16,17 @@ public sealed record MergeTrack(string Role, string FormatId, string Url, long S
 /// <summary>Plan for a segmented rendition. HLS resolves a static playlist at run time; DASH has explicit fMP4 parts.</summary>
 public sealed record MergeMediaSource(string Protocol, string? PlaylistUrl = null, DashDownloadPlan? Dash = null);
 
+public sealed record MediaMergeChapter(string Title, TimeSpan Start, TimeSpan? End = null);
+
+public sealed record MediaMergeMetadata
+{
+    public string? Title { get; init; }
+    public string? Uploader { get; init; }
+    public string? Description { get; init; }
+    public TimeSpan? Duration { get; init; }
+    public IReadOnlyList<MediaMergeChapter> Chapters { get; init; } = [];
+}
+
 /// <summary>
 /// Immutable plan for a native remux job (separate video + audio, or a single track normalised into a clean container).
 /// Contains no cookies, authorization headers or keys.
@@ -32,6 +43,8 @@ public sealed record MediaMergePlan
     public required IReadOnlyList<MergeTrack> Tracks { get; init; }
     public bool RequireAudio { get; init; } = true;
     public bool RequireVideo { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public MediaMergeMetadata? Metadata { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public MediaTimeRange? ClipRange { get; init; }
 
@@ -98,6 +111,7 @@ public sealed record MediaMergePlan
             if (value is null || value.Version is not (1 or 2) || !Outputs.Contains(value.OutputContainer)
                 || value.Tracks is not { Count: >= 1 and <= 4 }
                 || (value.Provider?.Length ?? 0) > 80 || (value.MediaId?.Length ?? 0) > 256) return false;
+            if (value.Metadata is { } metadata && !ValidMetadata(metadata)) return false;
             bool segmented = value.Tracks.Any(track => track?.Source is not null);
             if (value.ClipRange is { IsValid: false } || value.ClipRange is not null && !segmented) return false;
             if (value.ClipRange is not null && value.Tracks.Any(track => track.Source?.Dash?.Fragments.Any(fragment => fragment.DurationSeconds is null) == true)) return false;
@@ -141,5 +155,26 @@ public sealed record MediaMergePlan
             || dash.RequireAudio != (track.Role == "audio")
             || dash.RequireVideo != (track.Role == "video")) return false;
         return DashDownloadPlan.TryParse(JsonSerializer.Serialize(dash), allowPrivate, out _, out _);
+    }
+
+    private static bool ValidMetadata(MediaMergeMetadata metadata)
+    {
+        if ((metadata.Title?.Length ?? 0) > 512 || (metadata.Uploader?.Length ?? 0) > 256
+            || (metadata.Description?.Length ?? 0) > 8192 || metadata.Chapters is not { Count: <= 200 }
+            || metadata.Duration is { } duration && (duration <= TimeSpan.Zero || duration > TimeSpan.FromDays(365))) return false;
+        TimeSpan previousStart = TimeSpan.MinValue;
+        TimeSpan? previousEnd = null;
+        foreach (MediaMergeChapter? chapter in metadata.Chapters)
+        {
+            if (chapter is null || string.IsNullOrWhiteSpace(chapter.Title) || chapter.Title.Length > 256
+                || chapter.Start < TimeSpan.Zero || chapter.Start > TimeSpan.FromDays(365) || chapter.Start <= previousStart
+                || metadata.Duration is { } mediaDuration && chapter.Start >= mediaDuration
+                || chapter.End is { } end && (end <= chapter.Start || end > TimeSpan.FromDays(365)
+                    || metadata.Duration is { } boundedDuration && end > boundedDuration)) return false;
+            if (previousEnd is { } prior && chapter.Start < prior) return false;
+            previousStart = chapter.Start;
+            previousEnd = chapter.End;
+        }
+        return true;
     }
 }

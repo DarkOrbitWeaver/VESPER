@@ -314,6 +314,7 @@ internal static class MediaTransferBridge
             OutputContainer = container,
             RequireAudio = tracks.Any(t => t.HasAudio),
             RequireVideo = tracks.Any(t => t.HasVideo),
+            Metadata = MergeMetadata(item, includeChapters: clipStartSeconds is null),
             ClipRange = clipStartSeconds is double start ? new MediaTimeRange(start, clipEndSeconds!.Value) : null,
             Tracks = mergeTracks
         };
@@ -322,6 +323,54 @@ internal static class MediaTransferBridge
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
             merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles), null);
+    }
+
+    private static MediaMergeMetadata? MergeMetadata(MediaItem item, bool includeChapters)
+    {
+        var metadata = new MediaMergeMetadata
+        {
+            Title = LimitMetadata(item.Title, 512),
+            Uploader = LimitMetadata(item.Uploader, 256),
+            Description = LimitMetadata(item.Description, 8192),
+            Duration = item.Duration is { } duration && duration > TimeSpan.Zero && duration <= TimeSpan.FromDays(365)
+                ? duration : null
+        };
+        if (includeChapters && item.Chapters.Count is > 0 and <= 200)
+        {
+            var chapters = item.Chapters.Select(chapter =>
+                new MediaMergeChapter(LimitMetadata(chapter.Title, 256) ?? "", chapter.Start, chapter.End)).ToArray();
+            if (ValidChapters(chapters, metadata.Duration)) metadata = metadata with { Chapters = chapters };
+        }
+        return metadata.Title is null && metadata.Uploader is null && metadata.Description is null && metadata.Chapters.Count == 0
+            ? null : metadata;
+    }
+
+    private static bool ValidChapters(IReadOnlyList<MediaMergeChapter> chapters, TimeSpan? duration)
+    {
+        TimeSpan previousStart = TimeSpan.MinValue;
+        TimeSpan? previousEnd = null;
+        foreach (MediaMergeChapter chapter in chapters)
+        {
+            if (chapter.Title.Length == 0 || chapter.Start < TimeSpan.Zero || chapter.Start <= previousStart
+                || chapter.Start > TimeSpan.FromDays(365)
+                || duration is { } mediaDuration && chapter.Start >= mediaDuration
+                || chapter.End is { } end && (end <= chapter.Start || end > TimeSpan.FromDays(365))
+                || duration is { } endDuration && chapter.End is { } chapterEnd && chapterEnd > endDuration
+                || previousEnd is { } priorEnd && chapter.Start < priorEnd) return false;
+            previousStart = chapter.Start;
+            previousEnd = chapter.End;
+        }
+        return true;
+    }
+
+    private static string? LimitMetadata(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        string trimmed = value.Trim();
+        if (trimmed.Length <= maxLength) return trimmed;
+        string limited = trimmed[..maxLength];
+        if (char.IsHighSurrogate(limited[^1])) limited = limited[..^1];
+        return limited;
     }
 
     private static IReadOnlyList<SubtitleTrack> ValidatedSubtitles(FormatSelection selection, DownloadPlan plan) =>
