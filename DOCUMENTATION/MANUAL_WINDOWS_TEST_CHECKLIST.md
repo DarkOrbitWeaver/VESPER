@@ -2,6 +2,8 @@
 
 Automated tests cover some of these behaviors, but they do not replace the manual checks below. Record the Windows, Chrome, and VESPER versions with each run.
 
+The standalone First Flight Studio timeline or manifest was not present with the supplied source assets. Verify the requested sequence beats below on Windows; an original-keyframe comparison is not available.
+
 - [ ] `dotnet restore` + Release build on Windows 11 with .NET 10.
 - [ ] Form has real Windows caption, usable minimize/maximize/resize, no custom titlebar.
 - [ ] Default v8.3 clean light surface shows list; footer always 30 logical pixels.
