@@ -13,6 +13,24 @@ internal sealed partial class BrowserBridgeHandler
     private readonly Dictionary<Guid, MediaSession> _mediaSessions = [];
     private readonly object _mediaSessionsLock = new();
 
+    internal static string MapResolverError(MediaErrorCode? code) => code switch
+    {
+        MediaErrorCode.NoDownloadableMedia => "no-media",
+        MediaErrorCode.VideoUnavailable => "unavailable",
+        MediaErrorCode.DrmProtected => "protected",
+        MediaErrorCode.RateLimited => "rate-limited",
+        MediaErrorCode.LoginRequired or MediaErrorCode.AuthorizationRequired => "sign-in",
+        MediaErrorCode.SourceExpired or MediaErrorCode.SourceChanged => "source-expired",
+        MediaErrorCode.BlockedBySecurityPolicy or MediaErrorCode.RegionRestricted => "blocked",
+        MediaErrorCode.NetworkFailure => "network",
+        MediaErrorCode.BrowserContextRequired => "browser-context",
+        MediaErrorCode.UnsupportedSite or MediaErrorCode.UnsupportedManifest or MediaErrorCode.LiveStreamNotSupported
+            or MediaErrorCode.NoMatchingFormat or MediaErrorCode.ResponseTooLarge => "unsupported",
+        MediaErrorCode.InvalidInput => "invalid",
+        MediaErrorCode.InternalError => "resolver-error",
+        _ => "unavailable"
+    };
+
     private static BrowserDiscoveryMessage MediaHints(BridgeRequest request, Uri page) => new()
     {
         Schema = BrowserDiscoveryMessage.CurrentSchema,
@@ -38,16 +56,7 @@ internal sealed partial class BrowserBridgeHandler
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
-            string code = error?.Code switch
-            {
-                MediaErrorCode.DrmProtected => "protected",
-                MediaErrorCode.RateLimited => "rate-limited",
-                MediaErrorCode.LoginRequired or MediaErrorCode.AuthorizationRequired => "sign-in",
-                MediaErrorCode.SourceExpired => "source-expired",
-                MediaErrorCode.BlockedBySecurityPolicy or MediaErrorCode.RegionRestricted => "blocked",
-                MediaErrorCode.NetworkFailure => "network",
-                _ => "unavailable"
-            };
+            string code = MapResolverError(error?.Code);
             var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
             return error?.RetryAt is { } retryAt ? failure with { Data = new { retryAt } } : failure;
         }

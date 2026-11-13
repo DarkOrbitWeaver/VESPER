@@ -7,7 +7,7 @@ globalThis.VesperCompanion = (() => {
   const CELL = 80, COLUMNS = 10, SIZE = 44, FOOT_Y = 66 * SIZE / CELL;
   const clips = {
     perch_three_quarter: [1, 1, 0], perch_side: [2, 1, 0],
-    hover_reaction: [3, 8, 50], takeoff: [23, 10, 50], flight_cycle: [33, 10, 82],
+    hover_reaction: [3, 8, 50], click_flutter: [11, 12, 34], takeoff: [23, 10, 50], flight_cycle: [33, 10, 82],
     bank_left: [43, 7, 86], bank_right: [50, 7, 86], approach: [57, 9, 84],
     touchdown: [66, 9, 78], wing_settle: [75, 8, 85], sent_acknowledgement: [83, 8, 82],
     fullscreen_arrive: [91, 7, 86], fullscreen_depart: [98, 7, 84],
@@ -44,7 +44,7 @@ globalThis.VesperCompanion = (() => {
         this.canvas.hidden = false;
         this.button.classList.add('companion-ready');
         this.resetPose();
-        if (this.pickerOpen && !this.still) this.moveToPerch();
+        if (!this.still && this.visible) this.moveToPerch(this.perch?.fullscreen ? 'fullscreen_arrive' : 'approach');
       };
       this.atlas.src = atlasUrl;
     }
@@ -74,13 +74,16 @@ globalThis.VesperCompanion = (() => {
       if (this.visible === visible) return;
       this.visible = visible;
       this.resetPose();
-      if (visible && this.pickerOpen && !this.still) this.moveToPerch();
+      if (visible && !this.still) this.moveToPerch(this.perch?.fullscreen ? 'fullscreen_arrive' : 'approach');
     }
 
-    setPickerOpen(open, acknowledged = false) {
+    setPickerOpen(open, acknowledged = false, clicked = false) {
       if (this.pickerOpen === open) return;
       this.pickerOpen = open;
-      this.moveToPerch(acknowledged ? 'sent_acknowledgement' : undefined);
+      if (acknowledged) return this.moveToPerch('sent_acknowledgement');
+      if (open && clicked && this.visible && this.ready && !this.still) {
+        this.play('click_flutter', 'reacting', false, () => this.moveToPerch());
+      } else this.moveToPerch();
     }
 
     pointerMove(x, y) {
@@ -114,7 +117,7 @@ globalThis.VesperCompanion = (() => {
         arc: Math.min(55, 12 + distance * .065, Math.max(4, Math.min(y, this.y) - 3))
       };
       this.walk = null;
-      this.play(clip || (this.mode === 'perched' ? 'takeoff' : x < this.x ? 'bank_left' : 'bank_right'), 'flying');
+      this.play(clip || (['perched', 'reacting'].includes(this.mode) ? 'takeoff' : x < this.x ? 'bank_left' : 'bank_right'), 'flying');
     }
 
     position(x, y) {
