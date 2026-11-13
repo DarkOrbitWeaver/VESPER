@@ -148,7 +148,7 @@
   }
 
   function pageForPlayer(el) {
-    return cardPage(el)?.page || (activePreview?.player === el ? activePreview.page : pageAddress());
+    return cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
   }
 
   function selectPlayer() {
