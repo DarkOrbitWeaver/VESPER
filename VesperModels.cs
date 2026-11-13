@@ -37,8 +37,11 @@ internal sealed class DownloadItem
     public string RateCap { get; set; } = "Unlimited";
     public DateTime CreatedUtc { get; private set; } = DateTime.UtcNow;
     public long SizeBytes { get; private set; }
+    private string _searchAddress = "";
 
-    public static DownloadItem From(JobSnapshot s)
+    public static DownloadItem From(JobSnapshot s) => From(s, PublicSearchAddress(s));
+
+    private static DownloadItem From(JobSnapshot s, string searchAddress)
     {
         string extension = Path.GetExtension(s.FileName).TrimStart('.').ToUpperInvariant();
         return new DownloadItem
@@ -51,16 +54,19 @@ internal sealed class DownloadItem
             Percent = s.State == JobState.Completed || s.ProgressBytes == 0 ? null : s.Fraction is double f ? (int)Math.Floor(f * 100) : null,
             Transfer = TransferText(s), Eta = s.Eta is { } eta ? Formatting.Eta(eta)
                 : s.EstimatingEta && !s.WaitingForData ? "Estimating…" : "",
-            Detail = s.Message, RateCap = Formatting.RateLimit(s.SpeedLimitBytes)
+            Detail = s.Message, RateCap = Formatting.RateLimit(s.SpeedLimitBytes), _searchAddress = searchAddress
         };
     }
 
     /// <summary>Refreshes this row in place so the grid keeps its references and only repaints.</summary>
     public void UpdateFrom(JobSnapshot s)
     {
-        DownloadItem n = From(s);
+        string searchAddress = Snapshot is not null && Snapshot.SourceUrl == s.SourceUrl
+            && Snapshot.OriginalPageUrl == s.OriginalPageUrl ? _searchAddress : PublicSearchAddress(s);
+        DownloadItem n = From(s, searchAddress);
         (Snapshot, Name, Extension, FileType, Size, SizeBytes, SourceUrl, Destination, Status, Percent, Transfer, Eta, Detail, RateCap)
             = (n.Snapshot, n.Name, n.Extension, n.FileType, n.Size, n.SizeBytes, n.SourceUrl, n.Destination, n.Status, n.Percent, n.Transfer, n.Eta, n.Detail, n.RateCap);
+        _searchAddress = n._searchAddress;
     }
 
     public bool MatchesSearch(string term)
@@ -75,13 +81,18 @@ internal sealed class DownloadItem
             || Contains(snapshot.Reason))
             return true;
 
-        string page = snapshot.OriginalPageUrl ?? snapshot.SourceUrl;
-        if (!Uri.TryCreate(page, UriKind.Absolute, out Uri? uri)) return false;
-
-        // Signed query strings can contain credentials. Search only the public host and path.
-        return Contains(uri.Host) || Contains(uri.AbsolutePath);
+        return Contains(_searchAddress);
 
         bool Contains(string? value) => value?.Contains(term, StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static string PublicSearchAddress(JobSnapshot snapshot)
+    {
+        string page = snapshot.OriginalPageUrl ?? snapshot.SourceUrl;
+        if (!Uri.TryCreate(page, UriKind.Absolute, out Uri? uri)) return "";
+
+        // Signed query strings can contain credentials. Search only the public host and path.
+        return uri.Host + uri.AbsolutePath;
     }
 
     public void UpdateFromBrowser(string profile, BrowserActiveFile file)

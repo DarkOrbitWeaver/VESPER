@@ -31,6 +31,28 @@ public sealed class DownloadGridTests
     }
 
     [Fact]
+    public void SearchAddressChangesWhenAJobSourceIsRefreshed()
+    {
+        DownloadItem item = DownloadItem.From(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "installer.exe",
+            SourceUrl = "https://old.example.test/file?token=old-secret",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "installer.exe",
+            SourceUrl = "https://new.example.test/files/installer.exe?token=new-secret",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        Assert.False(item.MatchesSearch("old.example.test"));
+        Assert.True(item.MatchesSearch("new.example.test"));
+        Assert.False(item.MatchesSearch("new-secret"));
+    }
+
+    [Fact]
     public void RevealScrollsToAnExistingRow()
     {
         using var grid = new DownloadGrid { Size = new Size(640, 300) };
