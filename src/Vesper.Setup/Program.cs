@@ -8,6 +8,7 @@ namespace Vesper.Setup;
 internal static class Program
 {
     private const string AppMutex = @"Local\VESPER.SingleInstance";
+    private const uint SpiGetClientAreaAnimation = 0x1042;
 
     [STAThread]
     private static void Main(string[] args)
@@ -62,8 +63,17 @@ internal static class Program
         }
     }
 
-    internal static bool MotionEnabled => !SystemInformation.HighContrast
-        && (!SystemParametersInfo(0x1042, 0, out bool enabled, 0) || enabled);
+    internal static bool MotionEnabled
+    {
+        get
+        {
+            bool readAnimationSetting = SystemParametersInfo(SpiGetClientAreaAnimation, 0, out bool animationsEnabled, 0);
+            return MotionEnabledFor(SystemInformation.HighContrast, readAnimationSetting, animationsEnabled);
+        }
+    }
+
+    internal static bool MotionEnabledFor(bool highContrast, bool animationSettingRead, bool animationsEnabled) =>
+        !highContrast && animationSettingRead && animationsEnabled;
 
     [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
