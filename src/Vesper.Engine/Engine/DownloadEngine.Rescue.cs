@@ -167,7 +167,7 @@ public sealed partial class DownloadEngine
         {
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
-            job.SourceUrl = uri.AbsoluteUri;
+            ChangeSourceUrlLocked(job, uri.AbsoluteUri);
             job.RescueMode = decision.Mode;
 
             if (decision.Mode is RescueMode.R1 or RescueMode.R1b && probe is not null)
@@ -194,6 +194,7 @@ public sealed partial class DownloadEngine
             }
 
             job.State = JobState.Queued;
+            AddDuplicateCandidateLocked(job);
             job.Reason = "";
             job.Message = "";
             job.RetryCount = 0;

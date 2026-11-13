@@ -159,11 +159,14 @@ public sealed partial class DownloadEngine
 
             foreach (DownloadJob job in _jobs.Values.ToList())
             {
+                bool wasCandidate = IsDuplicateCandidate(job);
+                string previousSourceUrl = job.SourceUrl;
                 if (job.BrowserProof is { AwaitingConfirmation: true } && (job.State == JobState.Queued || JobStates.IsActive(job.State)))
                 {
                     job.State = JobState.Cancelled;
                     job.Reason = BrowserFallbackOutcome.Reason;
                     job.Message = BrowserFallbackOutcome.Message;
+                    ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
                     SaveLocked(job);
                     continue;
                 }
@@ -184,6 +187,7 @@ public sealed partial class DownloadEngine
                         FinishPublication(job, recovering: true);
                         break;
                 }
+                ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             }
         }
     }
@@ -295,6 +299,7 @@ public sealed partial class DownloadEngine
                 if (_jobs.ContainsKey(job.Id)) continue;
                 job.QueueOrder = order++;
                 _jobs[job.Id] = job;
+                AddDuplicateCandidateLocked(job);
                 SaveLocked(job);
                 Log(job.Id, "manifest-imported", job.FileName);
             }

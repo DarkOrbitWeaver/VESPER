@@ -86,10 +86,11 @@ public sealed partial class DownloadEngine
             retained = job.Extents.TotalBytes;
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
-            job.SourceUrl = replacement.Url;
+            ChangeSourceUrlLocked(job, replacement.Url);
             job.MediaState = nextState;
             job.MediaExpiresAt = replacement.ExpiresAt;
             job.State = JobState.Queued;
+            AddDuplicateCandidateLocked(job);
             job.Reason = "";
             job.Message = "Source refreshed; continuing at the next live sequence.";
             job.RetryCount = 0;
@@ -124,10 +125,11 @@ public sealed partial class DownloadEngine
             if (!current.CanContinueWith(next, out var why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             job.MediaPlanJson = next.ToJson();
-            job.SourceUrl = next.Tracks[0].Url;
+            ChangeSourceUrlLocked(job, next.Tracks[0].Url);
             job.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
+            AddDuplicateCandidateLocked(job);
             SaveLocked(job);
             Changed(job);
         }

@@ -31,6 +31,9 @@ public sealed partial class DownloadEngine : IDisposable
     private volatile bool _crashed;
     private bool _disposed;
     private bool _wasActive;
+    private readonly Dictionary<DuplicateKey, List<DownloadJob>> _duplicateCandidates = [];
+
+    private readonly record struct DuplicateKey(string Url, MediaOutput Output);
 
     /// <summary>Raised after any durable or visible change of one job (add, state change, rename…).</summary>
     public event Action<JobSnapshot>? JobChanged;
@@ -53,7 +56,11 @@ public sealed partial class DownloadEngine : IDisposable
             _http = http;
             _retry = new RetryPolicy(options.Retry);
             GlobalLimiter.SetRate(options.GlobalLimitBytesPerSecond);
-            foreach (DownloadJob job in store.LoadAll()) _jobs[job.Id] = job;
+            foreach (DownloadJob job in store.LoadAll())
+            {
+                _jobs[job.Id] = job;
+                AddDuplicateCandidateLocked(job);
+            }
         }
         catch
         {
@@ -135,6 +142,55 @@ public sealed partial class DownloadEngine : IDisposable
 
     private void Changed(DownloadJob job) => _outbox.Enqueue(SnapshotLocked(job));
 
+    private static bool IsDuplicateCandidate(DownloadJob job) =>
+        job.Kind != JobKind.BrowserFile && job.State is not (JobState.Completed or JobState.Cancelled);
+
+    private static bool TryGetDuplicateKey(DownloadJob job, out DuplicateKey key)
+    {
+        if (Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? uri))
+        {
+            key = new DuplicateKey(UrlPolicy.Normalize(uri), job.Output);
+            return true;
+        }
+
+        key = default;
+        return false;
+    }
+
+    private void AddDuplicateCandidateLocked(DownloadJob job)
+    {
+        if (!IsDuplicateCandidate(job) || !TryGetDuplicateKey(job, out DuplicateKey key)) return;
+        if (!_duplicateCandidates.TryGetValue(key, out List<DownloadJob>? candidates))
+            _duplicateCandidates.Add(key, candidates = []);
+        if (!candidates.Contains(job)) candidates.Add(job);
+    }
+
+    private void RemoveDuplicateCandidateLocked(DownloadJob job, string sourceUrl)
+    {
+        if (!Uri.TryCreate(sourceUrl, UriKind.Absolute, out Uri? uri)) return;
+        var key = new DuplicateKey(UrlPolicy.Normalize(uri), job.Output);
+        if (!_duplicateCandidates.TryGetValue(key, out List<DownloadJob>? candidates)) return;
+        candidates.Remove(job);
+        if (candidates.Count == 0) _duplicateCandidates.Remove(key);
+    }
+
+    private void ChangeSourceUrlLocked(DownloadJob job, string sourceUrl)
+    {
+        RemoveDuplicateCandidateLocked(job, job.SourceUrl);
+        job.SourceUrl = sourceUrl;
+        AddDuplicateCandidateLocked(job);
+    }
+
+    private void ReconcileDuplicateCandidateLocked(DownloadJob job, bool wasCandidate, string previousSourceUrl)
+    {
+        bool isCandidate = IsDuplicateCandidate(job);
+        bool sourceChanged = !string.Equals(previousSourceUrl, job.SourceUrl, StringComparison.Ordinal);
+        if (wasCandidate && (!isCandidate || sourceChanged))
+            RemoveDuplicateCandidateLocked(job, previousSourceUrl);
+        if (isCandidate && (!wasCandidate || sourceChanged))
+            AddDuplicateCandidateLocked(job);
+    }
+
     /// <summary>Raises queued change events outside every lock so handlers may call back into the engine.</summary>
     private void FlushOutbox()
     {
@@ -177,7 +233,10 @@ public sealed partial class DownloadEngine : IDisposable
     {
         lock (_lock)
         {
+            bool wasCandidate = IsDuplicateCandidate(job);
+            string previousSourceUrl = job.SourceUrl;
             mutate(job);
+            ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             SaveLocked(job);
             Changed(job);
         }
@@ -309,7 +368,10 @@ public sealed partial class DownloadEngine : IDisposable
                 bool progressed = job.Extents.TotalBytes > session.CommittedAtStart;
                 if (session.Intent == StopIntent.BrowserFallback && outcome.State != JobState.Completed)
                     outcome = BrowserFallbackOutcome;
+                bool wasCandidate = IsDuplicateCandidate(job);
+                string previousSourceUrl = job.SourceUrl;
                 ApplyOutcome(job, outcome, progressed);
+                ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
                 SaveLocked(job);
                 Changed(job);
                 Log(job.Id, "run-ended", $"{job.State} {job.Reason} {outcome.Message}");

@@ -111,11 +111,27 @@ public sealed partial class DownloadEngine
                 return new AddResult(AddStatus.AlreadySubmitted, accepted, "This request was already accepted.");
 
             string normalized = UrlPolicy.Normalize(uri);
-            DownloadJob? existing = _jobs.Values.FirstOrDefault(j => j.Kind != JobKind.BrowserFile
-                && j.State is not (JobState.Completed or JobState.Cancelled)
-                && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
-                && j.Output == request.Output
-                && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || SameRequestPlan(j, request)));
+            var duplicateKey = new DuplicateKey(normalized, request.Output);
+            DownloadJob? existing = null;
+            if (_duplicateCandidates.TryGetValue(duplicateKey, out List<DownloadJob>? candidates))
+            {
+                for (int i = 0; i < candidates.Count;)
+                {
+                    DownloadJob candidate = candidates[i];
+                    if (candidate.State is JobState.Completed or JobState.Cancelled)
+                    {
+                        candidates.RemoveAt(i);
+                        continue;
+                    }
+
+                    if (existing is null && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge)
+                        || SameRequestPlan(candidate, request)))
+                        existing = candidate;
+                    i++;
+                }
+
+                if (candidates.Count == 0) _duplicateCandidates.Remove(duplicateKey);
+            }
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
@@ -143,6 +159,7 @@ public sealed partial class DownloadEngine
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.
             _jobs[id] = job;
+            AddDuplicateCandidateLocked(job);
             if (request.Secrets is { Count: > 0 })
             {
                 Uri origin = new UriBuilder(uri) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
@@ -215,6 +232,7 @@ public sealed partial class DownloadEngine
             {
                 job.MediaState = stopState;
                 job.State = JobState.Queued;
+                AddDuplicateCandidateLocked(job);
                 job.NextRetryUtc = null;
                 job.Message = "Finishing the recording";
                 SaveLocked(job);
@@ -239,6 +257,7 @@ public sealed partial class DownloadEngine
             if (job.BrowserProof is { AwaitingConfirmation: true }
                 || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
             job.State = JobState.Queued;
+            AddDuplicateCandidateLocked(job);
             job.NextRetryUtc = null;
             job.RetryCount = 0;
             job.Message = "";
@@ -340,6 +359,7 @@ public sealed partial class DownloadEngine
 
             string? retained = job.State != JobState.Completed && File.Exists(job.PartialPath) ? job.PartialPath : null;
             _store.Delete(id);
+            RemoveDuplicateCandidateLocked(job, job.SourceUrl);
             _jobs.Remove(id);
             _credentials.Remove(id);
             _missing.Remove(id);
@@ -415,6 +435,7 @@ public sealed partial class DownloadEngine
             job.TotalBytes = job.PieceMapJson is not null && PieceMap.TryParse(job.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
             (job.ETag, job.LastModified, job.Identity, job.AcceptsRanges, job.NonResumable) = (null, null, IdentityLevel.None, false, false);
             (job.State, job.Reason, job.Message, job.RetryCount, job.MediaState, job.RescueCandidate) = (JobState.Queued, "", "", 0, null, false);
+            AddDuplicateCandidateLocked(job);
             ClearPendingPublication(job);
             SaveLocked(job);
             Log(id, "restart", "Partial data discarded at the user's request.");
@@ -446,7 +467,10 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return;
+            bool wasCandidate = IsDuplicateCandidate(job);
+            string previousSourceUrl = job.SourceUrl;
             mutate(job);
+            ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             if (markMissing is true) _missing.Add(id);
             if (markMissing is false) _missing.Remove(id);
             SaveLocked(job);
