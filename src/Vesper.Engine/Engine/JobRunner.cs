@@ -41,6 +41,13 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         catch (OperationCanceledException) when (session.Intent != StopIntent.None)
         {
             await SettleAsync();
+            if (session.Intent == StopIntent.LiveStop)
+            {
+                if (!HlsTransfer.TryRequestLiveStop(Job.MediaState, out string stopState))
+                    return RunOutcome.NeedsAttention("live-empty", "No complete live segment is available to keep.");
+                engine.UpdateJob(Job, job => job.MediaState = stopState);
+                return new RunOutcome(JobState.Queued, "live-stop", "Finishing the saved recording.");
+            }
             return session.Intent switch
             {
                 StopIntent.Pause => new RunOutcome(JobState.Paused, "", ""),

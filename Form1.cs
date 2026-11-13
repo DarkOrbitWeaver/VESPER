@@ -837,6 +837,7 @@ public partial class Form1 : Form
         Add("Locate file…", VesperIcon.Folder, s => _actions?.Locate(s));
         Add("Pause", VesperIcon.Pause, s => _engine?.Pause(s.Id));
         Add("Resume", VesperIcon.Play, s => _engine?.Resume(s.Id));
+        Add("Stop and keep", VesperIcon.Check, s => { _engine?.StopAndKeepLive(s.Id); });
         Add("Cancel download", VesperIcon.Close, _ => { });
         Add("Start now", VesperIcon.Play, s => _engine?.StartNow(s.Id));
         Add("Replace link…", VesperIcon.Link, s => _actions?.ReplaceLink(s));
@@ -938,6 +939,7 @@ public partial class Form1 : Form
                 "Locate file…" => s.State == JobState.Completed && s.FileMissing,
                 "Pause" => s.State is JobState.Resolving or JobState.Downloading or JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry,
                 "Resume" => s.State is JobState.Paused or JobState.Failed or JobState.NeedsAttention or JobState.Cancelled,
+                "Stop and keep" => s.IsLiveRecording && s.State is not (JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting),
                 "Start now" => s.State is JobState.Queued or JobState.Paused or JobState.WaitingForRetry or JobState.WaitingForNetwork,
                 "Replace link…" => s.State is JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.Queued or JobState.WaitingForRetry,
                 "Resume anyway…" => s.State == JobState.NeedsAttention && s.Reason == "no-validator",

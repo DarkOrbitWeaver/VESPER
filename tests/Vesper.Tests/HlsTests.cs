@@ -167,15 +167,176 @@ public class HlsTests
     }
 
     [Fact]
-    public async Task Protected_and_live_streams_are_refused_with_an_honest_reason()
+    public async Task Protected_streams_are_refused_and_live_recordings_can_be_stopped_and_kept()
     {
         await using var server = new FaultServer(); await server.StartAsync();
         using var h = new Harness();
         JobSnapshot drm = await h.WaitAsync(AddHls(h, server, "/hls/drm/index.m3u8"), s => s.State == JobState.NeedsAttention);
         Assert.Equal("drm", drm.Reason);
-        JobSnapshot live = await h.WaitAsync(AddHls(h, server, "/hls/live/index.m3u8"), s => s.State == JobState.NeedsAttention);
-        Assert.Equal("live", live.Reason);
         Assert.Equal(0, drm.CommittedBytes);
+
+        Guid id = AddHls(h, server, "/hls/live/index.m3u8");
+        byte[] expected = FaultServer.HlsExpected();
+        JobSnapshot recording = await h.WaitAsync(id, s => s.IsLiveRecording && s.State == JobState.Downloading
+            && s.CommittedBytes == expected.Length);
+        Assert.Null(recording.Fraction);
+        Assert.StartsWith("Recording live", recording.Message);
+        Assert.True(h.Engine.StopAndKeepLive(id));
+        JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("live-stopped", saved.Reason);
+        Assert.Equal(expected, await File.ReadAllBytesAsync(saved.FinalPath!));
+    }
+
+    [Fact]
+    public async Task LiveHls_RestartsAtTheNextSequenceAndAcceptsKeyRotation()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/live-recovery/index.m3u8";
+        byte[] keyA = FaultServer.HlsKey;
+        byte[] keyB = Payloads.Make(16, 78);
+        server.HlsFiles["/hls/live-recovery/key-a.bin"] = keyA;
+        server.HlsFiles["/hls/live-recovery/key-b.bin"] = keyB;
+
+        byte[] Encrypt(byte[] bytes, byte[] key, long sequence)
+        {
+            var iv = new byte[16];
+            for (int i = 0; i < 8; i++) iv[15 - i] = (byte)(sequence >> (8 * i));
+            using var aes = System.Security.Cryptography.Aes.Create();
+            aes.Key = key;
+            return aes.EncryptCbc(bytes, iv, System.Security.Cryptography.PaddingMode.PKCS7);
+        }
+
+        server.HlsFiles["/hls/live-recovery/s40.ts"] = Encrypt(FaultServer.HlsSegment(0), keyA, 40);
+        server.HlsFiles["/hls/live-recovery/s41.ts"] = Encrypt(FaultServer.HlsSegment(1), keyB, 41);
+        string first = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:40",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key-a.bin\"", "#EXTINF:1,", "s40.ts", "");
+        string expanded = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:40",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key-a.bin\"", "#EXTINF:1,", "s40.ts",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key-b.bin\"", "#EXTINF:1,", "s41.ts", "");
+        server.HlsPlaylists[path] = first;
+
+        var crashed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        int commits = 0;
+        using var h = new Harness(point =>
+        {
+            if (point == "checkpoint.afterCommit" && Interlocked.Increment(ref commits) == 1)
+            {
+                crashed.TrySetResult(true);
+                throw new FailpointCrash(point);
+            }
+        });
+        Guid id = AddHls(h, server, path);
+        await crashed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        server.HlsPlaylists[path] = expanded;
+        h.Restart();
+
+        JobSnapshot resumed = await h.WaitAsync(id, job => job.State == JobState.Downloading
+            && job.IsLiveRecording && job.CommittedBytes > FaultServer.HlsSegment(0).Length);
+        Assert.True(h.Engine.StopAndKeepLive(id));
+        JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("live-stopped", saved.Reason);
+        byte[] expected = [.. FaultServer.HlsSegment(0), .. FaultServer.HlsSegment(1)];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(saved.FinalPath!));
+        Assert.Equal(1, server.Hits("/hls/live-recovery/s40.ts"));
+        Assert.Equal(1, server.Hits("/hls/live-recovery/s41.ts"));
+        Assert.Equal(1, server.Hits("/hls/live-recovery/key-a.bin"));
+        Assert.Equal(1, server.Hits("/hls/live-recovery/key-b.bin"));
+        Assert.True(resumed.IsLiveRecording);
+    }
+
+    [Fact]
+    public async Task LiveHls_MissingSequencesAreReportedAndCanSaveThePlayablePrefix()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/live-gap/index.m3u8";
+        server.HlsFiles["/hls/live-gap/s70.ts"] = FaultServer.HlsSegment(0);
+        server.HlsFiles["/hls/live-gap/s72.ts"] = FaultServer.HlsSegment(2);
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:70",
+            "#EXTINF:1,", "s70.ts", "");
+        using var h = new Harness();
+        Guid id = AddHls(h, server, path);
+        JobSnapshot recording = await h.WaitAsync(id, job => job.IsLiveRecording && job.CommittedBytes > 0);
+
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:72",
+            "#EXTINF:1,", "s72.ts", "");
+        JobSnapshot gap = await h.WaitAsync(id, job => job.State == JobState.NeedsAttention);
+        Assert.Equal("live-gap", gap.Reason);
+        Assert.Equal(recording.CommittedBytes, gap.CommittedBytes);
+        Assert.Equal(0, server.Hits("/hls/live-gap/s72.ts"));
+
+        Assert.True(h.Engine.StopAndKeepLive(id));
+        JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal("live-gaps", saved.Reason);
+        Assert.Equal(FaultServer.HlsSegment(0), await File.ReadAllBytesAsync(saved.FinalPath!));
+    }
+
+    [Fact]
+    public async Task LiveHls_ChangedKeyAtTheSameAddressIsRejectedAfterResume()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/live-key-change/index.m3u8";
+        const string keyPath = "/hls/live-key-change/key.bin";
+        byte[] keyA = FaultServer.HlsKey;
+        byte[] keyB = Payloads.Make(16, 79);
+        server.HlsFiles[keyPath] = keyA;
+
+        byte[] Encrypt(byte[] bytes, byte[] key, long sequence)
+        {
+            var iv = new byte[16];
+            for (int i = 0; i < 8; i++) iv[15 - i] = (byte)(sequence >> (8 * i));
+            using var aes = System.Security.Cryptography.Aes.Create();
+            aes.Key = key;
+            return aes.EncryptCbc(bytes, iv, System.Security.Cryptography.PaddingMode.PKCS7);
+        }
+
+        server.HlsFiles["/hls/live-key-change/s90.ts"] = Encrypt(FaultServer.HlsSegment(0), keyA, 90);
+        server.HlsFiles["/hls/live-key-change/s91.ts"] = Encrypt(FaultServer.HlsSegment(1), keyB, 91);
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:90",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"", "#EXTINF:1,", "s90.ts", "");
+        using var h = new Harness();
+        Guid id = AddHls(h, server, path);
+        JobSnapshot recording = await h.WaitAsync(id, job => job.IsLiveRecording && job.CommittedBytes > 0);
+        h.Engine.Pause(id);
+        await h.WaitForStateAsync(id, JobState.Paused);
+
+        server.HlsFiles[keyPath] = keyB;
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:90",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"", "#EXTINF:1,", "s90.ts",
+            "#EXTINF:1,", "s91.ts", "");
+        h.Engine.Resume(id);
+        JobSnapshot refused = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+
+        Assert.Equal("key-changed", refused.Reason);
+        Assert.Equal(recording.CommittedBytes, refused.CommittedBytes);
+        Assert.Equal(1, server.Hits("/hls/live-key-change/s90.ts"));
+        Assert.Equal(1, server.Hits("/hls/live-key-change/s91.ts"));
+        Assert.True(h.Engine.StopAndKeepLive(id));
+        JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(FaultServer.HlsSegment(0), await File.ReadAllBytesAsync(saved.FinalPath!));
+    }
+
+    [Fact]
+    public async Task LiveHls_EndListFinalizesWithoutAStopRequest()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/live-end/index.m3u8";
+        server.HlsFiles["/hls/live-end/s80.ts"] = FaultServer.HlsSegment(0);
+        server.HlsFiles["/hls/live-end/s81.ts"] = FaultServer.HlsSegment(1);
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:80",
+            "#EXTINF:1,", "s80.ts", "");
+        using var h = new Harness();
+        Guid id = AddHls(h, server, path);
+        await h.WaitAsync(id, job => job.IsLiveRecording && job.CommittedBytes > 0);
+
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:1", "#EXT-X-MEDIA-SEQUENCE:80",
+            "#EXTINF:1,", "s80.ts", "#EXTINF:1,", "s81.ts", "#EXT-X-ENDLIST", "");
+        JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("", saved.Reason);
+        byte[] expected = [.. FaultServer.HlsSegment(0), .. FaultServer.HlsSegment(1)];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(saved.FinalPath!));
     }
 
     [Fact]

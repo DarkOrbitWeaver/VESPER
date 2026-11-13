@@ -14,17 +14,33 @@ public sealed partial class DownloadEngine
     public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(replacement);
+        string? liveState = null;
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
-            if (job.Kind != JobKind.Http) return Rejected("Streaming sources require a compatible fragment plan. Saved data was kept; resolve a separate copy.");
-            if (string.IsNullOrEmpty(job.MediaProvider) || string.IsNullOrEmpty(job.MediaId) || string.IsNullOrEmpty(job.MediaFormatId))
+            if (job.Kind == JobKind.Hls && HlsTransfer.IsLiveState(job.MediaState))
+            {
+                if (_sessions.ContainsKey(id)) return Rejected("Pause the live recording before refreshing its source.");
+                if (string.IsNullOrEmpty(job.MediaProvider) || string.IsNullOrEmpty(job.MediaId) || string.IsNullOrEmpty(job.MediaFormatId))
+                    return Rejected("This live recording has no stable provider, media and format identity. Saved data was kept.");
+                if (job.MediaProvider != replacement.Provider || job.MediaId != replacement.MediaId || job.MediaFormatId != replacement.FormatId)
+                    return Rejected("The newly resolved provider, media identity or selected format differs. Saved segments were kept.");
+                if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+                if (job.State is JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting or JobState.Suspect)
+                    return Rejected("This live recording can no longer be resumed.");
+                liveState = job.MediaState;
+            }
+            else if (job.Kind != JobKind.Http)
+                return Rejected("Streaming sources require a compatible fragment plan. Saved data was kept; resolve a separate copy.");
+            else if (string.IsNullOrEmpty(job.MediaProvider) || string.IsNullOrEmpty(job.MediaId) || string.IsNullOrEmpty(job.MediaFormatId))
                 return Rejected("This older job does not have enough source identity for automatic re-resolution. Use ordinary Rescue with a trusted identity.");
-            if (job.MediaProvider != replacement.Provider || job.MediaId != replacement.MediaId || job.MediaFormatId != replacement.FormatId)
+            else if (job.MediaProvider != replacement.Provider || job.MediaId != replacement.MediaId || job.MediaFormatId != replacement.FormatId)
                 return Rejected("The newly resolved provider, media identity or selected format differs. Restart as a separate copy; no bytes were changed.");
-            if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+            else if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
         }
         ct.ThrowIfCancellationRequested();
+        if (liveState is not null)
+            return await RefreshLiveHlsSourceAsync(id, replacement, liveState, ct).ConfigureAwait(false);
         var result = await ReplaceLinkAsync(id, replacement.Url, ct: ct).ConfigureAwait(false);
         if (result.Accepted)
         {
@@ -36,6 +52,55 @@ public sealed partial class DownloadEngine
             FlushOutbox();
         }
         return result;
+    }
+
+    private async Task<RescueResult> RefreshLiveHlsSourceAsync(Guid id, ResolvedMediaSource replacement,
+        string savedState, CancellationToken ct)
+    {
+        DownloadJob job;
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls
+                || _sessions.ContainsKey(id) || current.MediaState != savedState)
+                return Rejected("The live recording changed before its replacement could be checked. Saved data was kept.");
+            job = current;
+        }
+        string? nextState;
+        string? error;
+        using (var session = new JobSession(this, job))
+        {
+            try { (nextState, error) = await HlsTransfer.PrepareLiveRefreshAsync(this, session, _http, savedState, replacement.Url, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) when (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException)
+            { return Rejected("The refreshed live playlist could not be reached: " + ErrorClassifier.Describe(ex)); }
+        }
+        if (nextState is null) return Rejected(error ?? "The refreshed live playlist could not continue the saved recording.");
+
+        long retained;
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls || _sessions.ContainsKey(id)
+                || current.MediaState != savedState || !HlsTransfer.IsLiveState(current.MediaState))
+                return Rejected("The live recording changed while its replacement was being checked. Saved data was kept.");
+            job = current;
+            retained = job.Extents.TotalBytes;
+            string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
+            job.SourceUrl = replacement.Url;
+            job.MediaState = nextState;
+            job.MediaExpiresAt = replacement.ExpiresAt;
+            job.State = JobState.Queued;
+            job.Reason = "";
+            job.Message = "Source refreshed; continuing at the next live sequence.";
+            job.RetryCount = 0;
+            job.NextRetryUtc = null;
+            SaveLocked(job);
+            Changed(job);
+        }
+        FlushOutbox();
+        ScheduleNext();
+        return new RescueResult(true, RescueMode.None,
+            "The provider, media and format identity matches, and the refreshed playlist still covers the next sequence. Saved segments were kept.", retained);
     }
 
     /// <summary>

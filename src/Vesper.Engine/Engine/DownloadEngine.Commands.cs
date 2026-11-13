@@ -182,6 +182,43 @@ public sealed partial class DownloadEngine
         FlushOutbox();
     }
 
+    /// <summary>Stops an HLS live capture at its last committed segment and keeps the playable recording.</summary>
+    public bool StopAndKeepLive(Guid id)
+    {
+        bool queued = false;
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job)
+                || job.State is JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting or JobState.Suspect
+                || !HlsTransfer.TryRequestLiveStop(job.MediaState, out string stopState))
+                return false;
+
+            if (_sessions.TryGetValue(id, out JobSession? session))
+            {
+                if (session.Intent != StopIntent.None) return false;
+                session.Intent = StopIntent.LiveStop;
+                job.MediaState = stopState;
+                job.Message = "Finishing the recording";
+                SaveLocked(job);
+                Changed(job);
+                session.Cts.Cancel();
+            }
+            else
+            {
+                job.MediaState = stopState;
+                job.State = JobState.Queued;
+                job.NextRetryUtc = null;
+                job.Message = "Finishing the recording";
+                SaveLocked(job);
+                Changed(job);
+                queued = true;
+            }
+        }
+        if (queued) ScheduleNext();
+        FlushOutbox();
+        return true;
+    }
+
     public void Resume(Guid id) => Requeue(id, startNow: false);
 
     public void StartNow(Guid id) => Requeue(id, startNow: true);

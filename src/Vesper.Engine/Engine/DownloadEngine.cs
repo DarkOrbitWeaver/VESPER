@@ -127,6 +127,7 @@ public sealed partial class DownloadEngine : IDisposable
             Priority = job.Priority, SpeedLimitBytes = job.SpeedLimitBytes, QueueOrder = job.QueueOrder,
             CreatedUtc = job.CreatedUtc, CompletedUtc = job.CompletedUtc, NextRetryUtc = job.NextRetryUtc, RetryCount = job.RetryCount,
             FileMissing = _missing.Contains(job.Id), Identity = job.Identity, AcceptsRanges = job.AcceptsRanges,
+            IsLiveRecording = job.State != JobState.Completed && HlsTransfer.IsLiveState(job.MediaState),
             ContentType = job.ContentType, Category = job.Category, Rescue = job.RescueMode,
             HasExpectedHash = job.ExpectedSha256 is not null, HasPieceMap = job.PieceMapJson is not null, Sha256Verified = job.Sha256Verified
         };
