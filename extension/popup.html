@@ -20,12 +20,13 @@
       </select>
     </label>
     <label class="setting"><span>Butterfly motion</span>
-      <select id="motion">
-        <option value="system">System</option>
-        <option value="animate">Animate</option>
-        <option value="still">Still</option>
+      <select id="motion" aria-describedby="motion-hint">
+        <option value="system">Follow system</option>
+        <option value="animate">Always animate</option>
+        <option value="still">No animation</option>
       </select>
     </label>
+    <small id="motion-hint" class="hint">Follow system respects your reduced-motion setting.</small>
     <label class="setting"><span>When Chrome sends a file</span>
       <select id="handoff">
         <option value="download">Download now</option>
