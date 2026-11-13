@@ -149,6 +149,99 @@ internal static class WebmDemuxer
         return result;
     }
 
+    internal static MediaMergeMetadata ReadMetadata(Stream s, long length)
+    {
+        var r = new Reader(s, length);
+        var (id, size, headerLength) = r.Header(0);
+        if (id != IdEbml || size < 0 || size > 4096) throw Bad("the EBML header is missing");
+        long segmentHeaderPos = headerLength + size;
+        var segment = r.Header(segmentHeaderPos);
+        if (segment.Id != IdSegment) throw Bad("the segment is missing");
+        long segmentStart = segmentHeaderPos + segment.HeaderLength;
+        long segmentEnd = segment.Size < 0 ? length : Math.Min(length, segmentStart + segment.Size);
+        string? title = null, uploader = null, description = null;
+        var chapters = new List<MediaMergeChapter>();
+        long pos = segmentStart;
+        while (pos < segmentEnd)
+        {
+            var element = r.Header(pos);
+            long dataStart = pos + element.HeaderLength;
+            if (element.Size < 0)
+            {
+                if (element.Id == IdCluster) break;
+                throw Bad("an element of unknown size is not supported here");
+            }
+            if (dataStart + element.Size > segmentEnd) throw Bad("an element is truncated");
+            if (element.Id is IdInfo or IdTags or IdChapters)
+            {
+                if (element.Size > 1 << 20) throw Bad("the metadata element is too large");
+                byte[] data = r.Read(dataStart, (int)element.Size);
+                if (element.Id == IdInfo)
+                {
+                    foreach (var child in Elements(data, 0, data.Length))
+                        if (child.Id == 0x7BA9) title = Text(data, child, 512);
+                }
+                else if (element.Id == IdTags) ReadTags(data, ref uploader, ref description);
+                else ReadChapters(data, chapters);
+            }
+            pos = dataStart + element.Size;
+        }
+        return new MediaMergeMetadata { Title = title, Uploader = uploader, Description = description, Chapters = chapters };
+    }
+
+    private static void ReadTags(byte[] data, ref string? uploader, ref string? description)
+    {
+        foreach (var tag in Elements(data, 0, data.Length).Where(element => element.Id == 0x7373))
+        foreach (var child in Elements(data, tag.Start, tag.Start + tag.Length).Where(element => element.Id == 0x67C8))
+        {
+            string? name = null, value = null;
+            foreach (var field in Elements(data, child.Start, child.Start + child.Length))
+            {
+                if (field.Id == 0x45A3) name = Text(data, field, 32);
+                else if (field.Id == 0x4487) value = Text(data, field, 8192);
+            }
+            if (name is null || value is null) continue;
+            if (name.Equals("ARTIST", StringComparison.OrdinalIgnoreCase)) uploader = value;
+            else if (name.Equals("COMMENT", StringComparison.OrdinalIgnoreCase)) description = value;
+        }
+    }
+
+    private static void ReadChapters(byte[] data, List<MediaMergeChapter> chapters)
+    {
+        foreach (var edition in Elements(data, 0, data.Length).Where(element => element.Id == 0x45B9))
+        foreach (var atom in Elements(data, edition.Start, edition.Start + edition.Length).Where(element => element.Id == 0xB6))
+        {
+            ulong start = 0, end = 0;
+            bool hasStart = false, hasEnd = false;
+            string? title = null;
+            foreach (var field in Elements(data, atom.Start, atom.Start + atom.Length))
+            {
+                if (field.Id == 0x91) { start = UInt(data, field.Start, field.Length); hasStart = true; }
+                else if (field.Id == 0x92) { end = UInt(data, field.Start, field.Length); hasEnd = true; }
+                else if (field.Id == 0x80)
+                    foreach (var display in Elements(data, field.Start, field.Start + field.Length))
+                        if (display.Id == 0x85) { title = Text(data, display, 256); break; }
+            }
+            if (!hasStart || title is null) throw Bad("a chapter is incomplete");
+            chapters.Add(new MediaMergeChapter(title, FromNanoseconds(start), hasEnd ? FromNanoseconds(end) : null));
+            if (chapters.Count > 200) throw Bad("there are too many chapters");
+        }
+    }
+
+    private static TimeSpan FromNanoseconds(ulong nanoseconds)
+    {
+        if (nanoseconds > (ulong)TimeSpan.FromDays(365).Ticks * 100) throw Bad("a chapter timestamp is out of range");
+        return TimeSpan.FromTicks(checked((long)((nanoseconds + 50) / 100)));
+    }
+
+    private static string Text(byte[] data, Element element, int maxLength)
+    {
+        if (element.Length > maxLength * 4) throw Bad("a metadata string is too long");
+        string value = Encoding.UTF8.GetString(data, element.Start, element.Length).TrimEnd('\0');
+        if (value.Length > maxLength) throw Bad("a metadata string is too long");
+        return value;
+    }
+
     private static long ReadCluster(Reader r, long start, long end, bool unknownSize, Dictionary<ulong, DemuxedTrack> tracks, ref int total)
     {
         long clusterTime = 0;

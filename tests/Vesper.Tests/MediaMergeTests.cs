@@ -84,6 +84,42 @@ public sealed class MediaMergeTests
     }
 
     [Fact]
+    public void MatroskaMerge_RetainsTitleTagsAndChapters()
+    {
+        var videoStream = new MemoryStream(Fixture("video-only.mp4"));
+        var audioStream = new MemoryStream(Fixture("muxed.webm"));
+        DemuxedTrack video = Track(videoStream, TrackKind.Video), audio = Track(audioStream, TrackKind.Audio);
+        double duration = Math.Min(video.DurationSeconds, audio.DurationSeconds);
+        Assert.True(duration > 0.1, $"fixture duration was {duration:0.###} seconds");
+        TimeSpan mediaDuration = TimeSpan.FromSeconds(duration);
+        TimeSpan end = TimeSpan.FromSeconds(duration * 0.8);
+        TimeSpan middle = TimeSpan.FromTicks(end.Ticks / 2);
+        var metadata = new MediaMergeMetadata
+        {
+            Title = "A short film",
+            Uploader = "VESPER test channel",
+            Description = "A native chapter metadata check.",
+            Duration = mediaDuration,
+            Chapters =
+            [
+                new MediaMergeChapter("Opening", TimeSpan.Zero, middle),
+                new MediaMergeChapter("Ending", middle, end)
+            ]
+        };
+        var output = new MemoryStream();
+
+        MergeResult result = MediaMerger.Merge([(video, videoStream), (audio, audioStream)], "mkv", output, default, metadata);
+        MediaMerger.Validate(output, output.Length, [video, audio], default, metadata);
+        MediaMergeMetadata stored = WebmDemuxer.ReadMetadata(output, output.Length);
+
+        Assert.Equal("mkv", result.Container);
+        Assert.Equal(metadata.Title, stored.Title);
+        Assert.Equal(metadata.Uploader, stored.Uploader);
+        Assert.Equal(metadata.Description, stored.Description);
+        Assert.Equal(metadata.Chapters, stored.Chapters);
+    }
+
+    [Fact]
     public void H264WithOpus_GoesToMatroska_NeverMislabelledAsMp4OrWebm()
     {
         var vs = new MemoryStream(Fixture("video-only.mp4"));
@@ -157,11 +193,22 @@ public sealed class MediaMergeTests
         var original = Plan("https://cdn.example.com");
         var refreshed = original with { Tracks = original.Tracks.Select(t => t with { Url = t.Url.Replace("sig=1", "sig=2") }).ToArray() };
         Assert.True(original.CanContinueWith(refreshed, out _));
+        Assert.True(original.CanContinueWith(original with
+        {
+            Metadata = new MediaMergeMetadata { Title = "Updated title" }
+        }, out _));
         Assert.False(original.CanContinueWith(Plan("https://cdn.example.com", videoSize: 101), out _));
         Assert.False(Plan("https://cdn.example.com", identity: null).CanContinueWith(Plan("https://cdn.example.com", identity: null), out _));
         Assert.True(MediaMergePlan.TryParse(original.ToJson(), allowPrivate: false, out _, out _));
         Assert.False(MediaMergePlan.TryParse(Plan("http://127.0.0.1:9").ToJson(), allowPrivate: false, out _, out _));
         Assert.False(MediaMergePlan.TryParse((original with { OutputContainer = "m4a" }).ToJson(), false, out _, out _));
+        Assert.False(MediaMergePlan.TryParse((original with
+        {
+            Metadata = new MediaMergeMetadata
+            {
+                Chapters = [new MediaMergeChapter("Bad chapter", TimeSpan.FromSeconds(-1))]
+            }
+        }).ToJson(), false, out _, out _));
         Assert.False(MediaMergePlan.TryParse((original with { Tracks = [.. original.Tracks, .. original.Tracks, .. original.Tracks] }).ToJson(), false, out _, out _));
     }
 
@@ -183,7 +230,10 @@ public sealed class MediaMergeTests
         var item = new MediaItem
         {
             SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "hls", MediaId = "one", Title = "One",
-            Duration = TimeSpan.FromSeconds(6), Representations = [video, audio, commentary],
+            Description = "A test description.", Uploader = "Test channel", Duration = TimeSpan.FromSeconds(6),
+            Chapters = [new Chapter("Start", TimeSpan.Zero, TimeSpan.FromSeconds(3)),
+                new Chapter("Finish", TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(6))],
+            Representations = [video, audio, commentary],
             AudioTracks = [new AudioTrack("main", "en", "Main", true), new AudioTrack("commentary", "en", "Commentary")]
         };
 
@@ -198,6 +248,10 @@ public sealed class MediaMergeTests
         Assert.Collection(plan.Tracks,
             track => Assert.Equal("hls", track.Source?.Protocol),
             track => Assert.Equal("hls", track.Source?.Protocol));
+        Assert.Equal("One", plan.Metadata?.Title);
+        Assert.Equal("Test channel", plan.Metadata?.Uploader);
+        Assert.Equal("A test description.", plan.Metadata?.Description);
+        Assert.Equal(2, plan.Metadata?.Chapters.Count);
 
         var selectedTrack = MediaTransferBridge.Prepare(item,
             FormatPreferences.BestQuality with { AudioTrackId = "commentary" });
@@ -210,6 +264,7 @@ public sealed class MediaMergeTests
         Assert.Null(clipped.Error);
         Assert.True(MediaMergePlan.TryParse(clipped.Choice?.MediaPlanJson, false, out MediaMergePlan clippedPlan, out error), error);
         Assert.Equal(new MediaTimeRange(1.1, 2.2), clippedPlan.ClipRange);
+        Assert.Empty(clippedPlan.Metadata!.Chapters);
         Assert.True(MediaTransferBridge.SupportsSegmentClip(clipped.Choice!));
     }
 
@@ -347,6 +402,46 @@ public sealed class MediaMergeTests
         }
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
         Assert.Contains(server.RangeHeaders, r => r.StartsWith("/m/audio.m4a ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task MergeJob_EmbedsMetadataAndChaptersInMatroska()
+    {
+        await using var server = new FaultServer();
+        server.Extra["/m/video.mp4"] = Fixture("video-only.mp4");
+        server.Extra["/m/audio.webm"] = Fixture("muxed.webm");
+        await server.StartAsync();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Provider = "test", MediaId = "chaptered", OutputContainer = "mkv", RequireVideo = true,
+            Metadata = new MediaMergeMetadata
+            {
+                Title = "Chaptered sample", Uploader = "VESPER", Description = "Saved through a resumable merge job.",
+                Chapters = [new MediaMergeChapter("Beginning", TimeSpan.Zero)]
+            },
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), server.Extra["/m/video.mp4"].Length, "mp4", "h264", "v-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.webm"), server.Extra["/m/audio.webm"].Length, "webm", "opus", "a-id")
+            ]
+        };
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "chaptered.mkv", Kind: JobKind.Merge,
+            MediaPlanJson: plan.ToJson(), MediaProvider: "test", MediaId: "chaptered"));
+        Assert.True(added.Ok, added.Message);
+        AddResult duplicate = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "chaptered.mkv", Kind: JobKind.Merge,
+            MediaPlanJson: (plan with { Metadata = plan.Metadata with { Title = "Updated title" } }).ToJson(),
+            MediaProvider: "test", MediaId: "chaptered"));
+        Assert.Equal(AddStatus.Duplicate, duplicate.Status);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId, snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, done.State);
+        using var output = File.OpenRead(done.FinalPath!);
+        MediaMergeMetadata stored = WebmDemuxer.ReadMetadata(output, output.Length);
+        Assert.Equal("Chaptered sample", stored.Title);
+        Assert.Equal("VESPER", stored.Uploader);
+        Assert.Equal("Saved through a resumable merge job.", stored.Description);
+        Assert.Equal([new MediaMergeChapter("Beginning", TimeSpan.Zero)], stored.Chapters);
     }
 
     [Fact]
