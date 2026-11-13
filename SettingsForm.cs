@@ -135,9 +135,13 @@ internal sealed class SettingsForm : VesperPopupForm
         return button;
     }
 
-    private VesperChoice Choice(string[] options, int selected, int width)
+    private VesperChoice Choice(string[] options, int selected, int width, string accessibleName)
     {
-        var control = new VesperChoice { Width = width, Height = 33 };
+        var control = new VesperChoice
+        {
+            Width = width, Height = 33,
+            AccessibleName = accessibleName
+        };
         control.SetItems(options);
         control.SelectedIndex = Math.Clamp(selected, 0, options.Length - 1);
         control.ApplyPalette(_colors);
@@ -277,7 +281,7 @@ internal sealed class SettingsForm : VesperPopupForm
         concurrencyNote.SetBounds(25, 133, 260, 22);
         int[] counts = [1, 2, 3, 4, 5, 6, 8];
         var concurrency = Choice(["1", "2", "3", "4", "5", "6", "8"],
-            Math.Max(0, Array.IndexOf(counts, _draft.ConcurrentTransfers)), 126);
+            Math.Max(0, Array.IndexOf(counts, _draft.ConcurrentTransfers)), 126, "Simultaneous downloads");
         concurrency.SetBounds(404, 109, 126, 33);
         concurrency.SelectedIndexChanged += (_, _) => _draft.ConcurrentTransfers = int.Parse(concurrency.SelectedText);
         var separator1 = Divider(169);
@@ -340,7 +344,7 @@ internal sealed class SettingsForm : VesperPopupForm
         if (_presets.Count >= 8) return;
         var caption = Label($"Preset {_presets.Count + 1}", 8, muted: true);
         var (frame, value) = Input(kb.ToString(), 105);
-        var unit = Choice(["KB/s", "MB/s"], 0, 83);
+        var unit = Choice(["KB/s", "MB/s"], 0, 83, $"{caption.Text} unit");
         var remove = Button("", 31, symbol: VesperIcon.Close);
         remove.AccessibleName = "Remove bandwidth preset";
         var row = new PresetRow(caption, frame, value, unit, remove);
@@ -386,7 +390,8 @@ internal sealed class SettingsForm : VesperPopupForm
         var connNote = Label("Downloads a file in parts when supported. Four is a good default.", 8, muted: true);
         connNote.SetBounds(25, 133, 360, 20);
         int[] counts = [1, 2, 3, 4, 6, 8];
-        var connections = Choice(["1", "2", "3", "4", "6", "8"], Math.Max(0, Array.IndexOf(counts, _draft.MaxConnectionsPerJob)), 126);
+        var connections = Choice(["1", "2", "3", "4", "6", "8"],
+            Math.Max(0, Array.IndexOf(counts, _draft.MaxConnectionsPerJob)), 126, "Download connections");
         connections.SetBounds(404, 109, 126, 33);
         connections.SelectedIndexChanged += (_, _) => _draft.MaxConnectionsPerJob = int.Parse(connections.SelectedText);
         var separator1 = Divider(169);
@@ -409,7 +414,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var proxyNote = Label("Most people can leave this on Direct. Use a proxy only if needed.", 8, muted: true);
         proxyNote.SetBounds(25, 328, 360, 20);
         int proxyIndex = _draft.ProxyMode switch { "System" => 1, "Custom" => 2, _ => 0 };
-        var proxy = Choice(["Direct", "System", "Custom"], proxyIndex, 126);
+        var proxy = Choice(["Direct", "System", "Custom"], proxyIndex, 126, "Proxy mode");
         proxy.SetBounds(404, 304, 126, 33);
         (_proxyFrame, _proxyAddress) = Input(_draft.ProxyAddress, 505);
         _proxyFrame.Location = new Point(25, 356);
@@ -479,7 +484,8 @@ internal sealed class SettingsForm : VesperPopupForm
         var sep1 = Divider(265);
         var handoff = Label("When the butterfly captures a download", 9, bold: true);
         handoff.SetBounds(25, 283, 320, 22);
-        var action = Choice(["Ask me", "Download now", "Add to queue"], (int)_draft.BrowserAction, 190);
+        var action = Choice(["Ask me", "Download now", "Add to queue"], (int)_draft.BrowserAction, 190,
+            "When the browser captures a download");
         action.SetBounds(335, 281, 190, 33);
         action.SelectedIndexChanged += (_, _) => _draft.BrowserAction = (BrowserAction)action.SelectedIndex;
         var handoffNote = Label("Choose what VESPER should do after the browser extension sends a file.", 8.5F, muted: true);
@@ -535,7 +541,7 @@ internal sealed class SettingsForm : VesperPopupForm
         theme.SetBounds(25, 107, 240, 23);
         var themeNote = Label("Match your preferred light or dark palette.", 8, muted: true);
         themeNote.SetBounds(25, 134, 245, 29);
-        var themeChoice = Choice(["System", "Light", "Dark"], (int)_draft.Theme, 184);
+        var themeChoice = Choice(["System", "Light", "Dark"], (int)_draft.Theme, 184, "Color theme");
         themeChoice.SetBounds(346, 112, 184, 33);
         themeChoice.SelectedIndexChanged += (_, _) => _draft.Theme = (ThemeChoice)themeChoice.SelectedIndex;
         var separator1 = Divider(184);
@@ -545,7 +551,8 @@ internal sealed class SettingsForm : VesperPopupForm
         var densityNote = Label("Gallery shows media thumbnails. Compact is the default.", 8, muted: true);
         densityNote.SetBounds(25, 226, 260, 35);
         var densityChoice = Choice(["Compact · 46 px (default)", "Extra compact · 34 px", "Comfortable · 58 px", "Gallery · 84 px"],
-            _draft.Density switch { Density.ExtraCompact => 1, Density.Comfortable => 2, Density.Gallery => 3, _ => 0 }, 204);
+            _draft.Density switch { Density.ExtraCompact => 1, Density.Comfortable => 2, Density.Gallery => 3, _ => 0 }, 204,
+            "Download row height");
         densityChoice.SetBounds(326, 207, 204, 33);
         densityChoice.SelectedIndexChanged += (_, _) => _draft.Density = densityChoice.SelectedIndex switch
         { 1 => Density.ExtraCompact, 2 => Density.Comfortable, 3 => Density.Gallery, _ => Density.Compact };
