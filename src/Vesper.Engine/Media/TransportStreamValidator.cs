@@ -1,6 +1,15 @@
 using System.Buffers.Binary;
+using System.Text;
 
 namespace Vesper.Engine;
+
+internal sealed record TransportStreamInfo(int Pid, byte StreamType, string Language)
+{
+    internal bool IsAudio => StreamType is 0x03 or 0x04 or 0x0f or 0x11 or 0x81 or 0x87;
+    internal bool IsVideo => StreamType is 0x01 or 0x02 or 0x10 or 0x1b or 0x24;
+}
+
+internal sealed record TransportPes(TransportStreamInfo Stream, byte[] Data);
 
 /// <summary>
 /// Bounded single-program MPEG-TS structural validation: 188-byte packets, clear payloads, CRC-checked PAT/PMT,
@@ -16,8 +25,13 @@ internal sealed class TransportStreamValidator
     }
     private readonly Section _pat = new(), _pmt = new();
     private int? _program, _pmtPid;
-    private readonly Dictionary<int, bool> _media = []; // PID -> is audio
+    private readonly Dictionary<int, TransportStreamInfo> _media = [];
     private readonly HashSet<int> _observed = [];
+    private readonly Dictionary<int, MemoryStream> _pendingPes = [];
+    private readonly Action<TransportPes>? _onPes;
+    private long _pendingPesBytes;
+
+    internal TransportStreamValidator(Action<TransportPes>? onPes = null) => _onPes = onPes;
 
     internal void Validate(ReadOnlySpan<byte> bytes)
     {
@@ -41,23 +55,74 @@ internal sealed class TransportStreamValidator
             var payload = packet[offset..];
             if (pid == 0) Feed(_pat, payload, start, isPat: true);
             else if (pid == _pmtPid) Feed(_pmt, payload, start, isPat: false);
-            else if (_media.ContainsKey(pid) && start)
+            else if (_media.TryGetValue(pid, out TransportStreamInfo? stream))
             {
-                if (payload.Length < 6 || payload[0] != 0 || payload[1] != 0 || payload[2] != 1)
-                    throw Bad("A declared media PID does not begin with a complete PES header.");
-                int streamId = payload[3];
-                if (streamId is not (>= 0xc0 and <= 0xef) && streamId != 0xbd)
-                    throw Bad("Unsupported elementary-stream identifier.");
-                _observed.Add(pid);
+                if (start)
+                {
+                    if (_onPes is null) ValidatePesStart(payload);
+                    else
+                    {
+                        FinishPes(pid, stream);
+                        _pendingPes[pid] = new MemoryStream();
+                        AppendPes(_pendingPes[pid], payload);
+                    }
+                    _observed.Add(pid);
+                }
+                else if (_onPes is not null && _pendingPes.TryGetValue(pid, out MemoryStream? pes)) AppendPes(pes, payload);
             }
         }
     }
 
     internal void Finish(bool requireAudio = false, bool requireVideo = false)
     {
+        foreach (var pair in _pendingPes.ToArray()) FinishPes(pair.Key, _media[pair.Key]);
         if (_media.Count == 0 || _media.Keys.Any(pid => !_observed.Contains(pid))
-            || (requireAudio && !_media.Any(p => p.Value)) || (requireVideo && !_media.Any(p => !p.Value)))
+            || (requireAudio && !_media.Values.Any(stream => stream.IsAudio))
+            || (requireVideo && !_media.Values.Any(stream => stream.IsVideo)))
             throw Bad("The transport output is missing required program tables, audio/video tracks or elementary media data.");
+    }
+
+    private static void ValidatePesStart(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < 6 || payload[0] != 0 || payload[1] != 0 || payload[2] != 1)
+            throw Bad("A declared media PID does not begin with a complete PES header.");
+        ValidateStreamId(payload[3]);
+    }
+
+    private void FinishPes(int pid, TransportStreamInfo stream)
+    {
+        if (!_pendingPes.Remove(pid, out MemoryStream? pes)) return;
+        using (pes)
+        {
+            byte[] data = pes.ToArray();
+            _pendingPesBytes -= pes.Length;
+            if (data.Length < 9 || data[0] != 0 || data[1] != 0 || data[2] != 1)
+                throw Bad("A declared media PID does not contain a complete PES header.");
+            ValidateStreamId(data[3]);
+            int packetLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(4));
+            if (packetLength > 0)
+            {
+                int expected = 6 + packetLength;
+                if (data.Length < expected) throw Bad("A PES packet ended before its declared length.");
+                if (data.Length > expected) Array.Resize(ref data, expected);
+            }
+            if (data.Length < 9 + data[8]) throw Bad("A PES optional header is truncated.");
+            _onPes?.Invoke(new TransportPes(stream, data));
+        }
+    }
+
+    private static void ValidateStreamId(int streamId)
+    {
+        if (streamId is not (>= 0xc0 and <= 0xef) && streamId != 0xbd)
+            throw Bad("Unsupported elementary-stream identifier.");
+    }
+
+    private void AppendPes(MemoryStream pes, ReadOnlySpan<byte> payload)
+    {
+        if (pes.Length > 16 * 1024 * 1024 - payload.Length || _pendingPesBytes > 32 * 1024 * 1024 - payload.Length)
+            throw Bad("Buffered PES data exceeds the supported size limit.");
+        pes.Write(payload);
+        _pendingPesBytes += payload.Length;
     }
 
     private void Feed(Section state, ReadOnlySpan<byte> data, bool starts, bool isPat)
@@ -129,22 +194,49 @@ internal sealed class TransportStreamValidator
         int offset = 12 + (((s[10] & 0x0f) << 8) | s[11]);
         int end = s.Length - 4;
         if (offset > end) throw Bad("Program descriptors exceed the program table.");
-        var media = new Dictionary<int, bool>();
+        var media = new Dictionary<int, TransportStreamInfo>();
         while (offset < end)
         {
             if (end - offset < 5) throw Bad("Truncated elementary-stream entry.");
             int type = s[offset], pid = ((s[offset + 1] & 0x1f) << 8) | s[offset + 2];
             int descriptors = ((s[offset + 3] & 0x0f) << 8) | s[offset + 4];
-            offset += 5 + descriptors;
-            if (offset > end) throw Bad("Elementary descriptors exceed the program table.");
+            int descriptorStart = offset + 5, descriptorEnd = descriptorStart + descriptors;
+            if (descriptorEnd > end) throw Bad("Elementary descriptors exceed the program table.");
             bool video = type is 0x01 or 0x02 or 0x10 or 0x1b or 0x24;
             bool audio = type is 0x03 or 0x04 or 0x0f or 0x11 or 0x81 or 0x87;
-            if ((video || audio) && (!media.TryAdd(pid, audio) || pid is 0 or 0x1fff)) throw Bad("Invalid or duplicate elementary PID.");
+            if (video || audio)
+            {
+                string language = ReadLanguage(s.Slice(descriptorStart, descriptors));
+                if (!media.TryAdd(pid, new TransportStreamInfo(pid, (byte)type, language)) || pid is 0 or 0x1fff)
+                    throw Bad("Invalid or duplicate elementary PID.");
+            }
+            offset = descriptorEnd;
         }
-        if (_media.Count > 0 && (_media.Count != media.Count || _media.Any(p => !media.TryGetValue(p.Key, out bool audio) || audio != p.Value)))
+        if (_media.Count > 0 && (_media.Count != media.Count || _media.Any(p =>
+            !media.TryGetValue(p.Key, out TransportStreamInfo? stream) || stream.StreamType != p.Value.StreamType)))
             throw Bad("Track layout changed; concatenation would need remuxing.");
         if (media.Count is < 1 or > 16) throw Bad("No supported media or excessive track count in the program table.");
         foreach (var pair in media) _media[pair.Key] = pair.Value;
+    }
+
+    private static string ReadLanguage(ReadOnlySpan<byte> descriptors)
+    {
+        int offset = 0;
+        while (offset < descriptors.Length)
+        {
+            if (descriptors.Length - offset < 2) throw Bad("Truncated program descriptor.");
+            int tag = descriptors[offset], length = descriptors[offset + 1];
+            offset += 2;
+            if (length > descriptors.Length - offset) throw Bad("Program descriptor exceeds its table.");
+            if (tag == 0x0a && length >= 4)
+            {
+                ReadOnlySpan<byte> code = descriptors.Slice(offset, 3);
+                if (code.ToArray().All(b => b is >= (byte)'A' and <= (byte)'Z' or >= (byte)'a' and <= (byte)'z'))
+                    return Encoding.ASCII.GetString(code).ToLowerInvariant();
+            }
+            offset += length;
+        }
+        return "und";
     }
 
     private static uint Crc(ReadOnlySpan<byte> bytes)
