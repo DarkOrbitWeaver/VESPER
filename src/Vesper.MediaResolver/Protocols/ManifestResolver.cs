@@ -66,8 +66,8 @@ public sealed class ManifestResolver
         HlsMediaPlaylist? probe = null;
         try
         {
-            var first = master.Variants[0].Url;
-            var pr = (await _http.GetStringAsync(first, ctx, ct, _o.MaxManifestBytes).ConfigureAwait(false)).EnsureSuccess();
+            var variant = SelectProbeVariant(master);
+            var pr = (await _http.GetStringAsync(variant.Url, ctx, ct, _o.MaxManifestBytes).ConfigureAwait(false)).EnsureSuccess();
             probe = HlsParser.Parse(pr.Content, pr.FinalUrl, _o.MaxSegmentsPerRepresentation * 2).Media;
             if (probe is not null) GuardMedia(probe);
         }
@@ -77,6 +77,29 @@ public sealed class ManifestResolver
         }
 
         return HlsRepresentationBuilder.FromMaster(master, url, ctx, probe);
+    }
+
+    private static HlsVariant SelectProbeVariant(HlsMasterPlaylist master)
+    {
+        // Keep the liveness probe aligned with the engine's default muxed variant.
+        var externalAudioGroups = master.Renditions
+            .Where(r => r.Type == "AUDIO" && r.Url is not null)
+            .Select(r => r.GroupId)
+            .ToHashSet(StringComparer.Ordinal);
+        var usable = master.Variants.Where(variant =>
+        {
+            bool audioOnly = variant.Height is null && variant.Codecs is { } codecs
+                && !codecs.Contains("avc", StringComparison.OrdinalIgnoreCase)
+                && !codecs.Contains("hvc", StringComparison.OrdinalIgnoreCase)
+                && !codecs.Contains("hev", StringComparison.OrdinalIgnoreCase)
+                && !codecs.Contains("vp0", StringComparison.OrdinalIgnoreCase)
+                && !codecs.Contains("av01", StringComparison.OrdinalIgnoreCase);
+            return variant.AudioGroup is null || !externalAudioGroups.Contains(variant.AudioGroup) || audioOnly;
+        }).ToList();
+
+        return usable.Count > 0
+            ? usable.MaxBy(variant => variant.Bandwidth)!
+            : master.Variants[0];
     }
 
     private static void GuardMedia(HlsMediaPlaylist p)
