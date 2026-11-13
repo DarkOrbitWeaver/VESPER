@@ -6,6 +6,8 @@ const RESPONSE_LIFETIME = 60_000;
 const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
 const responses = new Map();
 const awaitingResponses = new Map();
+const requestChains = new Map();
+const blockedRequests = new Map();
 const browserOperations = new Map();
 let recordWrites = Promise.resolve();
 let captureWrites = Promise.resolve();
@@ -35,6 +37,16 @@ const captureStateReady = chrome.storage.session.get(CAPTURE_STATE_KEY).then(({ 
         && /^https?:\/\//i.test(waiting.url) && Number.isFinite(waiting.seen)
         && now >= waiting.seen && now - waiting.seen <= RESPONSE_LIFETIME)
       awaitingResponses.set(id, waiting);
+  for (const [id, chain] of Array.isArray(saved?.chains) ? saved.chains : [])
+    if (typeof id === 'string' && id.length > 0 && id.length <= 128
+        && /^https?:\/\//i.test(chain?.originalUrl || '') && /^https?:\/\//i.test(chain?.currentUrl || '')
+        && typeof chain.replayable === 'boolean' && Number.isFinite(chain.seen)
+        && now >= chain.seen && now - chain.seen <= RESPONSE_LIFETIME && requestChains.size < MAX_BROWSER_RECORDS)
+      requestChains.set(id, { ...chain, persisted: true });
+  for (const [id, seen] of Array.isArray(saved?.blocked) ? saved.blocked : [])
+    if (typeof id === 'string' && id.length > 0 && id.length <= 128 && Number.isFinite(seen)
+        && now >= seen && now - seen <= RESPONSE_LIFETIME && blockedRequests.size < MAX_BROWSER_RECORDS)
+      blockedRequests.set(id, seen);
 }).catch(() => {});
 
 function saveCaptureState() {
@@ -43,9 +55,15 @@ function saveCaptureState() {
     if (now < response.seen || now - response.seen > RESPONSE_LIFETIME) responses.delete(url);
   for (const [id, waiting] of awaitingResponses)
     if (now < waiting.seen || now - waiting.seen > RESPONSE_LIFETIME) awaitingResponses.delete(id);
+  for (const [id, chain] of requestChains)
+    if (now < chain.seen || now - chain.seen > RESPONSE_LIFETIME) requestChains.delete(id);
+  for (const [id, seen] of blockedRequests)
+    if (now < seen || now - seen > RESPONSE_LIFETIME) blockedRequests.delete(id);
   while (responses.size > MAX_BROWSER_RECORDS) responses.delete(responses.keys().next().value);
   while (awaitingResponses.size > MAX_BROWSER_RECORDS) awaitingResponses.delete(awaitingResponses.keys().next().value);
-  const state = { responses: [...responses], awaiting: [...awaitingResponses] };
+  while (requestChains.size > MAX_BROWSER_RECORDS) requestChains.delete(requestChains.keys().next().value);
+  const chains = [...requestChains].filter(([, chain]) => chain.persisted && chain.replayable);
+  const state = { responses: [...responses], awaiting: [...awaitingResponses], chains, blocked: [...blockedRequests] };
   const write = captureWrites.then(() => chrome.storage.session.set({ [CAPTURE_STATE_KEY]: state }));
   captureWrites = write.catch(() => {});
   return write;
@@ -57,10 +75,63 @@ function rememberWaitingResponse(item, url) {
   return saveCaptureState();
 }
 
+function updateRequestChain(requestId, url, method, statusCode) {
+  if (typeof requestId !== 'string' || !requestId || typeof url !== 'string') return null;
+  const now = Date.now();
+  for (const [key, chain] of requestChains)
+    if (now < chain.seen || now - chain.seen > RESPONSE_LIFETIME) requestChains.delete(key);
+  for (const [key, seen] of blockedRequests)
+    if (now < seen || now - seen > RESPONSE_LIFETIME) blockedRequests.delete(key);
+  let chain = requestChains.get(requestId);
+  if (!chain) chain = { originalUrl: url, currentUrl: url, replayable: !blockedRequests.has(requestId), persisted: false, seen: now };
+  else if (chain.currentUrl !== url) chain.replayable = false;
+  chain.currentUrl = url;
+  if (method !== 'GET' || statusCode === 401 || statusCode === 407) {
+    chain.replayable = false;
+    chain.persisted = false;
+    blockedRequests.set(requestId, now);
+  }
+  chain.seen = now;
+  requestChains.delete(requestId);
+  requestChains.set(requestId, chain);
+  while (requestChains.size > MAX_BROWSER_RECORDS) requestChains.delete(requestChains.keys().next().value);
+  return chain;
+}
+
+function requestChainIsRelevant(chain) {
+  return [...awaitingResponses.values()].some(entry => entry.url === chain.originalUrl || entry.url === chain.currentUrl)
+    || responses.has(chain.originalUrl) || responses.has(chain.currentUrl);
+}
+
+async function persistRequestChainsForDownload(item) {
+  let changed = false;
+  for (const chain of requestChains.values()) {
+    if (chain.replayable && chain.originalUrl === item?.url && !chain.persisted) {
+      chain.persisted = true;
+      changed = true;
+    }
+  }
+  if (changed) await saveCaptureState();
+}
+
+function rememberRequestRedirect(details) {
+  const chain = updateRequestChain(details.requestId, details.url, details.method);
+  if (chain && typeof details.redirectUrl === 'string') {
+    chain.currentUrl = details.redirectUrl;
+    chain.seen = Date.now();
+    if (chain.replayable && requestChainIsRelevant(chain)) chain.persisted = true;
+    if (chain.persisted || !chain.replayable) return saveCaptureState();
+  }
+  return Promise.resolve();
+}
+
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
 async function observeDownloadResponse(details) {
-  await captureStateReady;
-  if (details.statusCode !== 200 && details.statusCode !== 206) return;
+  const chain = updateRequestChain(details.requestId, details.url, details.method, details.statusCode);
+  if (details.statusCode !== 200 && details.statusCode !== 206) {
+    if (details.statusCode === 401 || details.statusCode === 407) await saveCaptureState();
+    return;
+  }
   const header = name => details.responseHeaders?.find(h => h.name.toLowerCase() === name)?.value;
   const mime = mimeType(header('content-type'));
   const attachment = /^attachment\b/i.test(header('content-disposition')?.trim() || '');
@@ -73,25 +144,39 @@ async function observeDownloadResponse(details) {
   const fileResponse = ['main_frame', 'sub_frame', 'other'].includes(details.type)
     && mime !== 'text/html' && mime !== 'application/xhtml+xml' && (mime || length !== undefined || etag);
   if (!attachment && !fileResponse && mime !== 'application/octet-stream') return;
+  if (chain?.replayable) chain.persisted = true;
   const old = responses.get(details.url);
   const conflicts = old && Date.now() - old.seen <= RESPONSE_LIFETIME
     && (!old.replay || old.etag && etag && old.etag !== etag
         || old.length !== undefined && length !== undefined && old.length !== length);
   responses.delete(details.url);
-  responses.set(details.url, { seen: Date.now(), replay: details.method === 'GET' && (!encoding || encoding === 'identity') && !conflicts,
+  responses.set(details.url, { seen: Date.now(), replay: !!chain?.replayable
+      && details.method === 'GET' && (!encoding || encoding === 'identity') && !conflicts,
     length, etag, contentType: mime });
-  const waiting = [...awaitingResponses.values()].filter(entry => entry.url === details.url);
-  for (const entry of waiting) awaitingResponses.delete(entry.id);
-  await saveCaptureState();
+  const waiting = chain ? [...awaitingResponses.values()].filter(entry =>
+    entry.url === chain.originalUrl || entry.url === chain.currentUrl) : [];
+  const captured = [];
   for (const entry of waiting) {
-    void getChromeDownload(entry.id).then(item => {
-      if (item?.startTime === entry.startTime && browserUrl(item) === details.url) return captureChromeDownload(item);
-    }).catch(() => {});
+    const item = await getChromeDownload(entry.id).catch(() => null);
+    if (item?.startTime === entry.startTime && item.url === chain.originalUrl
+        && (entry.url === item.url || entry.url === browserUrl(item)) && browserUrl(item) === details.url
+        && chain.currentUrl === details.url) {
+      awaitingResponses.delete(entry.id);
+      captured.push(item);
+    }
   }
+  await saveCaptureState();
+  for (const item of captured) void captureChromeDownload(item).catch(() => {});
 }
 
-chrome.webRequest.onHeadersReceived.addListener(details => { void observeDownloadResponse(details).catch(() => {}); },
+chrome.webRequest.onHeadersReceived.addListener(details => {
+  void captureStateReady.then(() => observeDownloadResponse(details)).catch(() => {});
+},
   { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame', 'other', 'xmlhttprequest', 'media'] }, ['responseHeaders']);
+chrome.webRequest.onBeforeRedirect.addListener(details => {
+  void captureStateReady.then(() => rememberRequestRedirect(details)).catch(() => {});
+},
+  { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame', 'other', 'xmlhttprequest', 'media'] });
 
 function recentResponse(url) {
   const observed = responses.get(url);
@@ -417,6 +502,7 @@ async function wakeChromeActivity(startDesktop = true) {
 
 async function captureChromeDownload(item) {
   await captureStateReady;
+  await persistRequestChainsForDownload(item);
   if (item?.state === 'complete') {
     if (awaitingResponses.delete(item.id)) await saveCaptureState();
     await inBrowserOrder(item.id, async () => {
@@ -438,7 +524,11 @@ async function captureChromeDownload(item) {
 }
 
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {}); });
-chrome.downloads.onCreated.addListener(item => captureChromeDownload(item).then(() => wakeChromeActivity()).catch(() => {}));
+chrome.downloads.onCreated.addListener(item => {
+  const wake = wakeChromeActivity().catch(() => {});
+  const capture = captureChromeDownload(item).catch(() => {});
+  return Promise.all([wake, capture]).then(() => wakeChromeActivity().catch(() => {}));
+});
 chrome.downloads.onChanged.addListener(async change => {
   try {
     if (change.paused?.current === false && change.state?.current !== 'complete') {
