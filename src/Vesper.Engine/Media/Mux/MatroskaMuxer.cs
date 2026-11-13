@@ -90,7 +90,7 @@ internal static class MatroskaMuxer
         }
 
         long attachmentsPos = -1;
-        if (!webm && thumbnail is not null)
+        if (thumbnail is not null)
         {
             attachmentsPos = output.Position - segData;
             Master(output, WebmDemuxer.IdAttachments, Attachments(thumbnail));
@@ -431,8 +431,8 @@ internal static class MediaMerger
     public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
         Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
-        if (thumbnail is not null && container is not ("mkv" or "mp4" or "m4a"))
-            throw new MediaContainerException("Cover images are supported only in MP4/M4A and Matroska output.");
+        if (thumbnail is not null && container is not ("mp4" or "m4a" or "webm" or "mkv"))
+            throw new MediaContainerException("Cover images are supported only in MP4, M4A, WebM, or Matroska output.");
         long bytes;
         MediaMergeMetadata? writtenMetadata;
         switch (container)
