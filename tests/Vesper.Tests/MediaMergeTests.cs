@@ -214,6 +214,46 @@ public sealed class MediaMergeTests
     }
 
     [Fact]
+    public void MediaTransferBridge_QueuesDirectSubtitlesAsSeparateHttpFiles()
+    {
+        var stream = new MediaRepresentation
+        {
+            Id = "muxed", Url = new Uri("https://cdn.example.com/video.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac"
+        };
+        var subtitle = new SubtitleTrack(new Uri("https://cdn.example.com/captions/en.vtt"), "en", "English", "vtt");
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "test", MediaId = "one",
+            Title = "One", Representations = [stream], Subtitles = [subtitle]
+        };
+        FormatPreferences preferences = FormatPreferences.BestQuality with { SubtitleLanguages = ["en"] };
+
+        var prepared = MediaTransferBridge.Prepare(item, preferences);
+        var exact = MediaTransferBridge.Prepare(item, preferences, stream);
+        Assert.Null(prepared.Error);
+        Assert.Null(exact.Error);
+        MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice!])];
+
+        Assert.Single(exact.Choice!.SubtitleTracks!);
+        Assert.Equal(2, jobs.Length);
+        Assert.Equal(JobKind.Http, jobs[1].Kind);
+        Assert.Equal(subtitle.Url.AbsoluteUri, jobs[1].Url);
+        Assert.Equal("One.en.vtt", jobs[1].FileName);
+        Assert.Equal("Subtitle · en", jobs[1].Quality);
+        Assert.Null(jobs[1].Provider);
+        Assert.Null(jobs[1].MediaPlanJson);
+        Assert.Null(jobs[1].SubtitleTracks);
+
+        var segmented = MediaTransferBridge.Prepare(item with
+        {
+            Subtitles = [subtitle with { Format = "hls-webvtt" }]
+        }, preferences);
+        Assert.Null(segmented.Choice);
+        Assert.Contains("segmented transport", segmented.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void MediaTransferBridge_PreparesSeparateDashRenditionsAsOneNativeMerge()
     {
         var video = new MediaRepresentation
