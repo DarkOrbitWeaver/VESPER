@@ -189,6 +189,61 @@ internal static class WebmDemuxer
         return new MediaMergeMetadata { Title = title, Uploader = uploader, Description = description, Chapters = chapters };
     }
 
+    internal static MediaThumbnail? ReadThumbnail(Stream s, long length)
+    {
+        var r = new Reader(s, length);
+        var (id, size, headerLength) = r.Header(0);
+        if (id != IdEbml || size < 0 || size > 4096) throw Bad("the EBML header is missing");
+        long segmentHeaderPos = headerLength + size;
+        var segment = r.Header(segmentHeaderPos);
+        if (segment.Id != IdSegment) throw Bad("the segment is missing");
+        long segmentStart = segmentHeaderPos + segment.HeaderLength;
+        long segmentEnd = segment.Size < 0 ? length : Math.Min(length, segmentStart + segment.Size);
+        long pos = segmentStart;
+        MediaThumbnail? found = null;
+        while (pos < segmentEnd)
+        {
+            var element = r.Header(pos);
+            long dataStart = pos + element.HeaderLength;
+            if (element.Size < 0)
+            {
+                if (element.Id == IdCluster) break;
+                throw Bad("an element of unknown size is not supported here");
+            }
+            if (dataStart + element.Size > segmentEnd) throw Bad("an element is truncated");
+            if (element.Id == IdAttachments)
+            {
+                if (element.Size > MediaThumbnail.MaxBytes + 16 * 1024)
+                    throw Bad("the attachment list is too large");
+                byte[] data = r.Read(dataStart, (int)element.Size);
+                foreach (var file in Elements(data, 0, data.Length).Where(child => child.Id == 0x61A7))
+                {
+                    string? name = null, mediaType = null;
+                    byte[]? image = null;
+                    foreach (var field in Elements(data, file.Start, file.Start + file.Length))
+                    {
+                        if (field.Id == 0x466E) name = Text(data, field, 128);
+                        else if (field.Id == 0x4660) mediaType = Text(data, field, 64);
+                        else if (field.Id == 0x465C)
+                        {
+                            if (field.Length > MediaThumbnail.MaxBytes) throw Bad("the cover image is too large");
+                            image = data.AsSpan(field.Start, field.Length).ToArray();
+                        }
+                    }
+                    if (mediaType is not ("image/jpeg" or "image/png")) continue;
+                    if (name is null || image is null || found is not null)
+                        throw Bad("the cover image attachment is incomplete or ambiguous");
+                    MediaThumbnail? thumbnail = MediaThumbnail.TryCreate(image);
+                    if (thumbnail is null || thumbnail.MediaType != mediaType || thumbnail.FileName != name)
+                        throw Bad("the cover image attachment is invalid");
+                    found = thumbnail;
+                }
+            }
+            pos = dataStart + element.Size;
+        }
+        return found;
+    }
+
     private static void ReadTags(byte[] data, ref string? uploader, ref string? description)
     {
         foreach (var tag in Elements(data, 0, data.Length).Where(element => element.Id == 0x7373))

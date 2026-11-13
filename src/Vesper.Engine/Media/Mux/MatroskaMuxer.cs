@@ -13,7 +13,7 @@ internal static class MatroskaMuxer
     private const int SeekHeadReserve = 160;
 
     public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output, bool webm,
-        CancellationToken ct, MediaMergeMetadata? metadata = null)
+        CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
         if (inputs.Count is < 1 or > 8) throw new MediaContainerException("A Matroska output needs between one and eight tracks.");
         long origin = output.Position;
@@ -87,6 +87,13 @@ internal static class MatroskaMuxer
         {
             chaptersPos = output.Position - segData;
             Master(output, WebmDemuxer.IdChapters, Chapters(chapters));
+        }
+
+        long attachmentsPos = -1;
+        if (!webm && thumbnail is not null)
+        {
+            attachmentsPos = output.Position - segData;
+            Master(output, WebmDemuxer.IdAttachments, Attachments(thumbnail));
         }
 
         // ---- clusters (k-way merge in decode order)
@@ -165,6 +172,7 @@ internal static class MatroskaMuxer
         SeekEntry(seek, WebmDemuxer.IdTracks, tracksPos);
         if (tagsPos >= 0) SeekEntry(seek, WebmDemuxer.IdTags, tagsPos);
         if (chaptersPos >= 0) SeekEntry(seek, WebmDemuxer.IdChapters, chaptersPos);
+        if (attachmentsPos >= 0) SeekEntry(seek, WebmDemuxer.IdAttachments, attachmentsPos);
         if (cues.Count > 0) SeekEntry(seek, WebmDemuxer.IdCues, cuesPos);
         var seekHead = new MemoryStream();
         Master(seekHead, WebmDemuxer.IdSeekHead, seek.ToArray());
@@ -176,6 +184,19 @@ internal static class MatroskaMuxer
         Size8(output, end - segData);
         output.Position = end;
         return end - origin;
+    }
+
+    private static byte[] Attachments(MediaThumbnail thumbnail)
+    {
+        var file = new MemoryStream();
+        Str(file, 0x467E, "Cover image");
+        Str(file, 0x466E, thumbnail.FileName);
+        Str(file, 0x4660, thumbnail.MediaType);
+        Bin(file, 0x465C, thumbnail.Data);
+        UInt(file, 0x46AE, 1);
+        var attachments = new MemoryStream();
+        Master(attachments, 0x61A7, file.ToArray());
+        return attachments.ToArray();
     }
 
     private static byte[] Tags(MediaMergeMetadata metadata)
@@ -362,7 +383,7 @@ internal static class MatroskaMuxer
 }
 
 internal sealed record MergeResult(string Container, long Bytes, IReadOnlyList<string> Codecs, double DurationSeconds,
-    MediaMergeMetadata? Metadata = null);
+    MediaMergeMetadata? Metadata = null, string? ThumbnailSha256 = null);
 
 /// <summary>
 /// Remux orchestration: demux sources, choose a container that can legally carry every codec, write, and re-read
@@ -396,8 +417,10 @@ internal static class MediaMerger
     }
 
     public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
-        Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null)
+        Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
+        if (thumbnail is not null && container != "mkv")
+            throw new MediaContainerException("Cover images are only supported in Matroska output.");
         long bytes;
         MediaMergeMetadata? writtenMetadata;
         switch (container)
@@ -408,19 +431,19 @@ internal static class MediaMerger
                 break;
             case "webm":
             case "mkv":
-                bytes = MatroskaMuxer.Write(inputs, output, webm: container == "webm", ct, metadata);
+                bytes = MatroskaMuxer.Write(inputs, output, webm: container == "webm", ct, metadata, thumbnail);
                 writtenMetadata = metadata;
                 break;
             default:
                 throw new MediaContainerException($"The output container '{container}' is not supported.");
         }
         return new MergeResult(container, bytes, inputs.Select(i => i.Track.Codec).ToArray(),
-            inputs.Max(i => i.Track.DurationSeconds), writtenMetadata);
+            inputs.Max(i => i.Track.DurationSeconds), writtenMetadata, thumbnail?.Sha256);
     }
 
     /// <summary>Re-reads a finished output and proves it carries exactly the expected tracks and samples.</summary>
     public static void Validate(Stream output, long length, IReadOnlyList<DemuxedTrack> expected, CancellationToken ct,
-        MediaMergeMetadata? expectedMetadata = null)
+        MediaMergeMetadata? expectedMetadata = null, string? expectedThumbnailSha256 = null)
     {
         List<DemuxedTrack> got = Demux(output, length, ct);
         if (got.Count != expected.Count)
@@ -443,6 +466,12 @@ internal static class MediaMerger
             if (actual.Title != expectedMetadata.Title || actual.Uploader != expectedMetadata.Uploader
                 || actual.Description != expectedMetadata.Description || !actual.Chapters.SequenceEqual(expectedMetadata.Chapters))
                 throw new MediaContainerException("The merged file did not retain the selected title, tags and chapters.");
+        }
+        if (expectedThumbnailSha256 is not null)
+        {
+            MediaThumbnail? thumbnail = WebmDemuxer.ReadThumbnail(output, length);
+            if (thumbnail?.Sha256 != expectedThumbnailSha256)
+                throw new MediaContainerException("The merged file did not retain the selected cover image.");
         }
     }
 }
