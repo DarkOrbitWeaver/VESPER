@@ -220,8 +220,10 @@ function moveChromeDownload(id, mode, automatic = false) {
       await armBrowserRecovery();
       if (record.resumeChrome) await chrome.downloads.pause(id);
       const paused = await getChromeDownload(id);
-      if (sameDownload(paused, record) && canMove(paused) && paused.paused && browserUrl(paused) === browserUrl(item)
-          && (await transferCommand(record.transferId, 'accept')).ok) {
+      const canAccept = sameDownload(paused, record) && canMove(paused) && paused.paused
+        && browserUrl(paused) === browserUrl(item);
+      const accepted = canAccept ? await transferCommand(record.transferId, 'accept') : null;
+      if (canAccept && accepted?.ok && ['active', 'complete'].includes(accepted.data?.state)) {
         record.stage = 'parked';
         await writeBrowserRecord(id, record);
         watchChromeDownload(id, record);

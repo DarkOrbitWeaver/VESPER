@@ -338,6 +338,21 @@ test('an unknown abandon state keeps a paused Chrome download parked', async () 
   assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'parked');
 });
 
+test('Chrome resumes when an ok acceptance reply reports a failed VESPER transfer', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer('failed') },
+    { download: file, prefs: { intercept: false } });
+  await observe(app, file);
+
+  const result = await app.message({ type: 'move-download', downloadId: file.id });
+
+  assert.equal(result.chromePaused, false);
+  assert.equal(file.paused, false);
+  assert.ok(app.actions.includes('resume'));
+  assert.deepEqual(app.sent.filter(message => message.type === 'browser-transfer').map(message => message.operation),
+    ['accept', 'abandon']);
+});
+
 test('a browser watch that reaches its timeout is rearmed', async () => {
   const file = activeDownload();
   let app;
