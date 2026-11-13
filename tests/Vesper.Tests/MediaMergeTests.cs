@@ -354,8 +354,9 @@ public sealed class MediaMergeTests
         Assert.Null(segmented.Error);
         MediaDownloadChoice segmentedJob = Assert.Single(MediaTransferBridge.ExpandSubtitleChoices([segmented.Choice!]).Skip(1));
         Assert.Equal(JobKind.Hls, segmentedJob.Kind);
-        Assert.Equal("One.en.vtt", segmentedJob.FileName);
-        Assert.True(HlsWebVttPlan.TryParse(segmentedJob.MediaPlanJson, out _));
+        Assert.Equal("One.en.srt", segmentedJob.FileName);
+        Assert.True(HlsWebVttPlan.TryParse(segmentedJob.MediaPlanJson, out HlsWebVttPlan subtitlePlan));
+        Assert.Equal("srt", subtitlePlan.OutputFormat);
 
         var unsupported = MediaTransferBridge.Prepare(item with
         {

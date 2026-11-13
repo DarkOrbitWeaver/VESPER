@@ -1,6 +1,8 @@
 using System.Text.Json;
 using System.Text;
+using VESPER;
 using Vesper.Engine;
+using Vesper.MediaResolver.Models;
 
 namespace Vesper.Tests;
 
@@ -50,6 +52,52 @@ public class HlsTests
         Assert.Contains("00:00:02.000 --> 00:00:04.000 align:start", saved);
         Assert.Contains("00:00:06.000 --> 00:00:07.000", saved);
         Assert.EndsWith(".vtt", done.FinalPath);
+    }
+
+    [Fact]
+    public void HlsWebVtt_subtitle_choices_use_a_valid_srt_output_plan()
+    {
+        var subtitle = new SubtitleTrack(new Uri("https://cdn.example/captions/index.m3u8"), "en", "English", "hls-webvtt");
+        var video = new MediaDownloadChoice("https://cdn.example/video.mkv", "video.mkv", JobKind.Merge, null, null,
+            SubtitleTracks: [subtitle]);
+
+        MediaDownloadChoice choice = Assert.Single(MediaTransferBridge.ExpandSubtitleChoices([video]).Skip(1));
+        Assert.Equal("video.en.srt", choice.FileName);
+        Assert.Equal(JobKind.Hls, choice.Kind);
+        Assert.True(HlsWebVttPlan.TryParse(choice.MediaPlanJson, out HlsWebVttPlan plan));
+        Assert.Equal("srt", plan.OutputFormat);
+        Assert.False(HlsWebVttPlan.TryParse(new HlsWebVttPlan { OutputFormat = "ass" }.ToJson(), out _));
+        Assert.True(HlsWebVttPlan.TryParse("{\"Version\":1,\"Type\":\"hls-webvtt\"}", out HlsWebVttPlan legacyPlan));
+        Assert.Equal("vtt", legacyPlan.OutputFormat);
+
+        SubtitleTrack directSubtitle = subtitle with
+        {
+            Url = new Uri("https://cdn.example/captions/en.vtt"),
+            Format = "vtt"
+        };
+        MediaDownloadChoice direct = Assert.Single(MediaTransferBridge.ExpandSubtitleChoices(
+            [video with { SubtitleTracks = [directSubtitle] }]).Skip(1));
+        Assert.Equal("video.en.vtt", direct.FileName);
+        Assert.Equal(JobKind.Http, direct.Kind);
+        Assert.Null(direct.MediaPlanJson);
+    }
+
+    [Fact]
+    public async Task WebVtt_rendition_converts_to_srt_with_shifted_timing_and_multiline_text()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/subtitles-srt/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\ns0.vtt\n#EXT-X-ENDLIST\n";
+        server.HlsFiles["/hls/subtitles-srt/s0.vtt"] = Encoding.UTF8.GetBytes(
+            "WEBVTT\n\nopening\n00:00:02.125 --> 00:00:03.500 align:start\nFirst line\nSecond line &amp; text\n");
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/hls/subtitles-srt/index.m3u8"), FileName: "captions.en.srt",
+            Kind: JobKind.Hls, MediaPlanJson: new HlsWebVttPlan { OutputFormat = "srt" }.ToJson()));
+
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        string saved = (await File.ReadAllTextAsync(done.FinalPath!)).Replace("\r\n", "\n", StringComparison.Ordinal);
+        Assert.Equal("1\n00:00:02,125 --> 00:00:03,500\nFirst line\nSecond line &amp; text\n\n", saved);
+        Assert.EndsWith(".srt", done.FinalPath);
     }
 
     [Fact]
