@@ -115,7 +115,7 @@ public sealed partial class DownloadEngine
                 && j.State is not (JobState.Completed or JobState.Cancelled)
                 && Uri.TryCreate(j.SourceUrl, UriKind.Absolute, out Uri? other) && UrlPolicy.Normalize(other) == normalized
                 && j.Output == request.Output
-                && (request.Kind is not (JobKind.Dash or JobKind.Merge) || j.MediaPlanJson == request.MediaPlanJson));
+                && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || j.MediaPlanJson == request.MediaPlanJson));
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
@@ -138,7 +138,7 @@ public sealed partial class DownloadEngine
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
-                MediaPlanJson = request.Kind is JobKind.Dash or JobKind.Merge ? request.MediaPlanJson : null,
+                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.

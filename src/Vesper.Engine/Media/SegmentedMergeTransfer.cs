@@ -13,8 +13,10 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     private const long MaxPartBytes = 64L * 1024 * 1024;
     private DownloadJob Job => session.Job;
 
-    private sealed record Part(string Url, long? Offset, long? Length, HlsKey? Key, long Sequence, bool Initialization);
-    private sealed record PreparedTrack(MergeTrack Track, IReadOnlyList<Part> Parts, bool Fragmented, string SourceFingerprint);
+    private sealed record Part(string Url, long? Offset, long? Length, HlsKey? Key, long Sequence,
+        bool Initialization, double? DurationSeconds = null, double? StartSeconds = null);
+    private sealed record PreparedTrack(MergeTrack Track, IReadOnlyList<Part> Parts, bool Fragmented,
+        string SourceFingerprint, double? ActualStartSeconds = null, double? ActualEndSeconds = null);
     private sealed record Cursor(int Version, string Fingerprint, string Phase, int Track = 0, int Next = 0,
         long Offset = 0, string PrefixHash = "", int[]? CompletedParts = null, long[]? PartLengths = null,
         string?[]? SourceFingerprints = null, long MuxLength = 0, string? MuxSha256 = null,
@@ -38,7 +40,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         {
             tracks = new PreparedTrack[plan.Tracks.Count];
             for (int i = 0; i < tracks.Length; i++)
-                tracks[i] = await PrepareTrackAsync(plan.Tracks[i], ct).ConfigureAwait(false);
+                tracks[i] = await PrepareTrackAsync(plan.Tracks[i], plan.ClipRange, ct).ConfigureAwait(false);
         }
         catch (MediaContainerException ex) { return RunOutcome.NeedsAttention("invalid-container", ex.Message + " Saved data was kept."); }
 
@@ -135,7 +137,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         catch (JsonException) { return null; }
     }
 
-    private async Task<PreparedTrack> PrepareTrackAsync(MergeTrack track, CancellationToken ct)
+    private async Task<PreparedTrack> PrepareTrackAsync(MergeTrack track, MediaTimeRange? clipRange, CancellationToken ct)
     {
         MergeMediaSource source = track.Source ?? throw new MediaContainerException("A rendition source is missing.");
         if (source.Protocol == "dash" && source.Dash is { } dash)
@@ -145,8 +147,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 new(dash.Initialization.Url, dash.Initialization.Offset, dash.Initialization.Length, null, 0, true)
             };
             dashParts.AddRange(dash.Fragments.Select(fragment => new Part(fragment.Url, fragment.Offset, fragment.Length,
-                null, 0, false)));
-            return new PreparedTrack(track, dashParts, Fragmented: true, dash.Fingerprint);
+                null, 0, false, fragment.DurationSeconds, fragment.StartSeconds)));
+            return SelectClip(new PreparedTrack(track, dashParts, Fragmented: true, dash.Fingerprint), clipRange);
         }
         if (source.Protocol != "hls" || source.PlaylistUrl is not { } playlistUrl)
             throw new MediaContainerException("The selected segmented source is unsupported.");
@@ -171,10 +173,25 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (media.Segments[0].Map is { } map)
             hlsParts.Add(new Part(map.Uri, map.Offset, map.Length, map.Key, media.Segments[0].Sequence, Initialization: true));
         foreach (HlsSegment segment in media.Segments)
-            hlsParts.Add(new Part(segment.Uri, segment.RangeOffset, segment.RangeLength, segment.Key, segment.Sequence, false));
+            hlsParts.Add(new Part(segment.Uri, segment.RangeOffset, segment.RangeLength, segment.Key,
+                segment.Sequence, false, segment.Duration));
         byte[] fingerprintBytes = JsonSerializer.SerializeToUtf8Bytes(new { Base = baseUri.AbsoluteUri, media.Segments });
         string identity = Convert.ToHexString(SHA256.HashData(fingerprintBytes));
-        return new PreparedTrack(track, hlsParts, fragmented, identity);
+        return SelectClip(new PreparedTrack(track, hlsParts, fragmented, identity), clipRange);
+    }
+
+    private static PreparedTrack SelectClip(PreparedTrack track, MediaTimeRange? range)
+    {
+        if (range is null) return track;
+        Part[] media = [.. track.Parts.Where(part => !part.Initialization)];
+        double[] durations = media.Select(part => part.DurationSeconds ?? double.NaN).ToArray();
+        double?[] starts = [.. media.Select(part => part.StartSeconds)];
+        if (!range.TrySelect(durations, starts, out int first, out int count, out double actualStart, out double actualEnd))
+            throw new MediaContainerException("The requested time range is outside the supported segment timeline.");
+        var selected = media.Skip(first).Take(count);
+        Part[] parts = track.Parts.FirstOrDefault(part => part.Initialization) is { } init
+            ? [init, .. selected] : [.. selected];
+        return track with { Parts = parts, ActualStartSeconds = actualStart, ActualEndSeconds = actualEnd };
     }
 
     private async Task<(string Text, Uri Base)> FetchPlaylistAsync(string url, CancellationToken ct)
@@ -317,6 +334,19 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             }
             samples.Flush(flushToDisk: true);
             if (inputs.Count == 2) ValidateTimeline(inputs);
+            if (plan.ClipRange is not null)
+            {
+                double actualStart = tracks.Min(track => track.ActualStartSeconds ?? 0);
+                double actualEnd = tracks.Max(track => track.ActualEndSeconds ?? 0);
+                string range = MediaTimeRange.Describe(actualStart, actualEnd);
+                engine.UpdateJob(Job, job =>
+                {
+                    string quality = job.MediaQuality ?? "Media";
+                    int priorRange = quality.IndexOf(" · Segment-aligned ", StringComparison.Ordinal);
+                    if (priorRange >= 0) quality = quality[..priorRange];
+                    job.MediaQuality = quality + " · " + range;
+                });
+            }
             long outputPayloadBytes = inputs.Sum(input => input.Track.PayloadBytes);
             EnsureSpace(outputPayloadBytes + (1 << 20));
             string? container = MediaMerger.ChooseContainer(inputs.Select(input => input.Track).ToList(), plan.OutputContainer);

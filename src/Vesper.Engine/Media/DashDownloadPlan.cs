@@ -1,11 +1,14 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Vesper.Engine;
 
 /// <summary>One bounded HTTP object or exact byte range. Contains no cookies or authorization headers.</summary>
-public sealed record DashFragment(string Url, long? Offset = null, long? Length = null);
+public sealed record DashFragment(string Url, long? Offset = null, long? Length = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? DurationSeconds = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? StartSeconds = null);
 
 /// <summary>
 /// Immutable transfer identity, stored separately from the small transactional cursor. Only clear fragmented MP4
@@ -21,6 +24,8 @@ public sealed record DashDownloadPlan
     public required IReadOnlyList<DashFragment> Fragments { get; init; }
     public bool RequireAudio { get; init; } = true;
     public bool RequireVideo { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public MediaTimeRange? ClipRange { get; init; }
 
     public string ToJson() => JsonSerializer.Serialize(this);
     internal string Fingerprint => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(ToJson())));
@@ -43,8 +48,12 @@ public sealed record DashDownloadPlan
                 UrlPolicy.EnsureAllowed(uri, allowPrivate);
                 if ((part.Offset is null) != (part.Length is null) || part.Offset < 0 || part.Length <= 0
                     || part.Length > DashTransfer.MaxObjectBytes
-                    || (part.Offset is long start && part.Length is long length && start > long.MaxValue - length)) return false;
+                    || (part.Offset is long start && part.Length is long length && start > long.MaxValue - length)
+                    || part.DurationSeconds is double duration && (!double.IsFinite(duration) || duration <= 0 || duration > 31_536_000)
+                    || part.StartSeconds is double startTime && (!double.IsFinite(startTime) || startTime < 0)) return false;
             }
+            if (value.ClipRange is { IsValid: false }
+                || value.ClipRange is not null && value.Fragments.Any(fragment => fragment.DurationSeconds is null)) return false;
             plan = value;
             error = "";
             return true;

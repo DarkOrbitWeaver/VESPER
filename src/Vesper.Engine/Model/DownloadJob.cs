@@ -123,7 +123,7 @@ public sealed class DownloadJob
     /// <summary>HLS cursor etc. Committed in the same transaction as the extents.</summary>
     public string? MediaState { get; set; }
 
-    /// <summary>Versioned immutable fragment plan. No cookies, keys or authorization headers.</summary>
+    /// <summary>Versioned media plan or selected clip range. No cookies, keys or authorization headers.</summary>
     public string? MediaPlanJson { get; set; }
 
     /// <summary>Incremented by every durable checkpoint; also written to the recovery manifest.</summary>

@@ -42,6 +42,13 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     {
         if (!PathSafety.TryResolveFolder(Job.DestinationFolder, create: true, out _, out string folderError))
             return RunOutcome.NeedsAttention("destination", folderError + " Saved data was kept.");
+        MediaTimeRange? clipRange = null;
+        if (Job.MediaPlanJson is not null)
+        {
+            if (!MediaTimeRange.TryParse(Job.MediaPlanJson, out MediaTimeRange parsedRange))
+                return RunOutcome.NeedsAttention("clip-range", "The saved HLS time range is invalid. Saved data was kept.");
+            clipRange = parsedRange;
+        }
         Cursor? cursor = ReadCursor();
         if (Job.MediaState is not null && cursor is null)
             return RunOutcome.NeedsAttention("cursor", "The saved streaming cursor is invalid. Saved data was kept.");
@@ -70,6 +77,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         playlistUrl = baseUri.AbsoluteUri;
         HlsMedia media = HlsParser.ParseMedia(text, baseUri, allowTimelineChanges: true);
         if (media.Unsupported is { } reason) return RunOutcome.NeedsAttention(media.UnsupportedReasonCode, reason);
+        if (clipRange is not null && !media.IsVod)
+            return RunOutcome.NeedsAttention("clip-live", "Time-range extraction is available for completed HLS playlists, not live recordings.");
         if (cursor?.Mode == LiveMode || !media.IsVod)
             return await RunLiveAsync(playlistUrl, media, cursor, ct).ConfigureAwait(false);
         if (media.Segments.Count == 0) return RunOutcome.Failed("empty", "The playlist contains no media segments.");
@@ -77,10 +86,29 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             return RunOutcome.NeedsAttention("unsupported", "Discontinuous or missing media requires processing that is not supported.");
         if (media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
             return RunOutcome.NeedsAttention("unsupported", "Initialization URI, byte range or encryption changes part-way. A remux is required; saved data was kept.");
-        string planHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(media.Segments))));
+        byte[] planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(media.Segments)
+            : JsonSerializer.SerializeToUtf8Bytes(new { media.Segments, Clip = clipRange });
+        string planHash = Convert.ToHexString(SHA256.HashData(planBytes));
+        IReadOnlyList<HlsSegment> segments = media.Segments;
+        double actualStart = 0, actualEnd = 0;
+        if (clipRange is not null)
+        {
+            double[] durations = [.. media.Segments.Select(segment => segment.Duration)];
+            if (!clipRange.TrySelect(durations, out int first, out int count, out actualStart, out actualEnd))
+                return RunOutcome.NeedsAttention("clip-range", "The requested HLS time range is outside the available segment timeline.");
+            segments = media.Segments.Skip(first).Take(count).ToArray();
+            string range = MediaTimeRange.Describe(actualStart, actualEnd);
+            engine.UpdateJob(Job, job =>
+            {
+                string quality = job.MediaQuality ?? "HLS";
+                int priorRange = quality.IndexOf(" · Segment-aligned ", StringComparison.Ordinal);
+                if (priorRange >= 0) quality = quality[..priorRange];
+                job.MediaQuality = quality + " · " + range;
+            });
+        }
         int next = cursor?.Next ?? 0;
         long offset = Job.Extents.ContiguousFromZero();
-        if (next < 0 || next > media.Segments.Count || (next == 0) != (offset == 0) || Job.Extents.TotalBytes != offset)
+        if (next < 0 || next > segments.Count || (next == 0) != (offset == 0) || Job.Extents.TotalBytes != offset)
             return RunOutcome.NeedsAttention("cursor", "Saved progress no longer matches the playlist. Saved data was kept.");
         bool fragmented = media.Segments[0].Map is not null;
         SetOutputName(fragmented ? ".mp4" : ".ts");
@@ -110,10 +138,10 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             }
             session.SetPhase(JobState.Downloading);
             DateTime lastMessage = DateTime.MinValue;
-            for (int i = next; i < media.Segments.Count; i++)
+            for (int i = next; i < segments.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                HlsSegment segment = media.Segments[i];
+                HlsSegment segment = segments[i];
                 byte[]? initialization = null;
                 if (i == 0 && segment.Map is { } map)
                 {
@@ -153,7 +181,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 if (DateTime.UtcNow - lastMessage > TimeSpan.FromSeconds(1))
                 {
                     lastMessage = DateTime.UtcNow;
-                    engine.UpdateJob(Job, j => j.Message = $"Segment {i + 1} of {media.Segments.Count}");
+                    engine.UpdateJob(Job, j => j.Message = $"Segment {i + 1} of {segments.Count}");
                 }
             }
             mp4?.Finish(requireAudio: Job.MediaProvider is not null, requireVideo: false);
