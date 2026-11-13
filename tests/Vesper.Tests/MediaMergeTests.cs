@@ -120,6 +120,38 @@ public sealed class MediaMergeTests
     }
 
     [Fact]
+    public void Mp4Merge_Retains3GppMetadataAndChapterMarkers()
+    {
+        var videoStream = new MemoryStream(Fixture("video-only.mp4"));
+        var audioStream = new MemoryStream(AacFmp4());
+        DemuxedTrack video = Track(videoStream, TrackKind.Video), audio = Track(audioStream, TrackKind.Audio);
+        double duration = Math.Min(video.DurationSeconds, audio.DurationSeconds);
+        var metadata = new MediaMergeMetadata
+        {
+            Title = "MP4 chapter sample",
+            Uploader = "VESPER uploader",
+            Description = "Stored as 3GPP metadata.",
+            Duration = TimeSpan.FromSeconds(duration),
+            Chapters =
+            [
+                new MediaMergeChapter("Opening", TimeSpan.Zero),
+                new MediaMergeChapter("Next", TimeSpan.FromSeconds(duration / 2))
+            ]
+        };
+        var output = new MemoryStream();
+
+        MergeResult result = MediaMerger.Merge([(video, videoStream), (audio, audioStream)], "mp4", output, default, metadata);
+        MediaMerger.Validate(output, output.Length, [video, audio], default, result.Metadata);
+        MediaMergeMetadata stored = Mp4Demuxer.ReadMetadata(output, output.Length);
+
+        Assert.Equal("MP4 chapter sample", stored.Title);
+        Assert.Equal("VESPER uploader", stored.Uploader);
+        Assert.Equal("Stored as 3GPP metadata.", stored.Description);
+        Assert.Equal(result.Metadata!.Chapters, stored.Chapters);
+        Assert.Equal(2, MediaMerger.Demux(output, output.Length, default).Count);
+    }
+
+    [Fact]
     public void H264WithOpus_GoesToMatroska_NeverMislabelledAsMp4OrWebm()
     {
         var vs = new MemoryStream(Fixture("video-only.mp4"));
@@ -384,6 +416,11 @@ public sealed class MediaMergeTests
         var plan = new MediaMergePlan
         {
             Provider = "test", MediaId = "m1", OutputContainer = "mp4", RequireVideo = true,
+            Metadata = new MediaMergeMetadata
+            {
+                Title = "Merged sample", Uploader = "VESPER", Description = "Saved through the merge job.",
+                Chapters = [new MediaMergeChapter("Start", TimeSpan.Zero)]
+            },
             Tracks =
             [
                 new MergeTrack("video", "v1", server.Url("/m/video.mp4"), server.Extra["/m/video.mp4"].Length, "mp4", "h264", "v-id"),
@@ -399,6 +436,11 @@ public sealed class MediaMergeTests
         {
             var tracks = MediaMerger.Demux(fs, fs.Length, default);
             Assert.Equal([TrackKind.Video, TrackKind.Audio], tracks.Select(t => t.Kind));
+            MediaMergeMetadata metadata = Mp4Demuxer.ReadMetadata(fs, fs.Length);
+            Assert.Equal("Merged sample", metadata.Title);
+            Assert.Equal("VESPER", metadata.Uploader);
+            Assert.Equal("Saved through the merge job.", metadata.Description);
+            Assert.Equal("Start", Assert.Single(metadata.Chapters).Title);
         }
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
         Assert.Contains(server.RangeHeaders, r => r.StartsWith("/m/audio.m4a ", StringComparison.Ordinal));

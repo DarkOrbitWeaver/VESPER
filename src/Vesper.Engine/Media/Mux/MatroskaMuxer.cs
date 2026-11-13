@@ -361,7 +361,8 @@ internal static class MatroskaMuxer
     }
 }
 
-internal sealed record MergeResult(string Container, long Bytes, IReadOnlyList<string> Codecs, double DurationSeconds);
+internal sealed record MergeResult(string Container, long Bytes, IReadOnlyList<string> Codecs, double DurationSeconds,
+    MediaMergeMetadata? Metadata = null);
 
 /// <summary>
 /// Remux orchestration: demux sources, choose a container that can legally carry every codec, write, and re-read
@@ -397,15 +398,24 @@ internal static class MediaMerger
     public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
         Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null)
     {
-        long bytes = container switch
+        long bytes;
+        MediaMergeMetadata? writtenMetadata;
+        switch (container)
         {
-            "mp4" or "m4a" => Mp4Muxer.Write(inputs, output, ct),
-            "webm" => MatroskaMuxer.Write(inputs, output, webm: true, ct, metadata),
-            "mkv" => MatroskaMuxer.Write(inputs, output, webm: false, ct, metadata),
-            _ => throw new MediaContainerException($"The output container '{container}' is not supported.")
-        };
+            case "mp4":
+            case "m4a":
+                bytes = Mp4Muxer.Write(inputs, output, ct, metadata, out writtenMetadata);
+                break;
+            case "webm":
+            case "mkv":
+                bytes = MatroskaMuxer.Write(inputs, output, webm: container == "webm", ct, metadata);
+                writtenMetadata = metadata;
+                break;
+            default:
+                throw new MediaContainerException($"The output container '{container}' is not supported.");
+        }
         return new MergeResult(container, bytes, inputs.Select(i => i.Track.Codec).ToArray(),
-            inputs.Max(i => i.Track.DurationSeconds));
+            inputs.Max(i => i.Track.DurationSeconds), writtenMetadata);
     }
 
     /// <summary>Re-reads a finished output and proves it carries exactly the expected tracks and samples.</summary>
@@ -428,9 +438,8 @@ internal static class MediaMerger
         }
         if (expectedMetadata is not null)
         {
-            if (!WebmDemuxer.LooksLikeMatroska(output, length))
-                throw new MediaContainerException("The selected output container cannot store this media metadata.");
-            MediaMergeMetadata actual = WebmDemuxer.ReadMetadata(output, length);
+            MediaMergeMetadata actual = WebmDemuxer.LooksLikeMatroska(output, length)
+                ? WebmDemuxer.ReadMetadata(output, length) : Mp4Demuxer.ReadMetadata(output, length);
             if (actual.Title != expectedMetadata.Title || actual.Uploader != expectedMetadata.Uploader
                 || actual.Description != expectedMetadata.Description || !actual.Chapters.SequenceEqual(expectedMetadata.Chapters))
                 throw new MediaContainerException("The merged file did not retain the selected title, tags and chapters.");

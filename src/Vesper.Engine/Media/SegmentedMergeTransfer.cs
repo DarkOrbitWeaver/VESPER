@@ -355,11 +355,10 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     $"The downloaded codecs ({string.Join(", ", inputs.Select(input => input.Track.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Saved data was kept.");
             using (var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
             {
-                MediaMergeMetadata? outputMetadata = container is "mkv" or "webm" ? plan.Metadata : null;
-                MediaMerger.Merge(inputs, container, output, ct, outputMetadata);
+                MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata);
                 output.Flush(flushToDisk: true);
                 length = output.Length;
-                MediaMerger.Validate(output, length, inputs.Select(input => input.Track).ToList(), ct, outputMetadata);
+                MediaMerger.Validate(output, length, inputs.Select(input => input.Track).ToList(), ct, merged.Metadata);
                 output.Position = 0;
                 sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             }

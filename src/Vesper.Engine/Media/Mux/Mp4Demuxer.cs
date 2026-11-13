@@ -187,6 +187,177 @@ internal static class Mp4Demuxer
         return result;
     }
 
+    internal static MediaMergeMetadata ReadMetadata(Stream s, long length)
+    {
+        byte[]? moov = null;
+        long pos = 0;
+        Span<byte> header = stackalloc byte[16];
+        while (pos < length)
+        {
+            if (length - pos < 8) throw Bad("a top-level box header is truncated");
+            MuxIo.ReadExact(s, pos, header[..8]);
+            ulong size = BinaryPrimitives.ReadUInt32BigEndian(header);
+            string type = MuxIo.FourCc(header[4..8]);
+            int headerLength = 8;
+            if (size == 1)
+            {
+                if (length - pos < 16) throw Bad("a 64-bit top-level box header is truncated");
+                MuxIo.ReadExact(s, pos + 8, header[8..16]);
+                size = BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
+                headerLength = 16;
+            }
+            else if (size == 0) size = (ulong)(length - pos);
+            if (size < (ulong)headerLength || size > (ulong)(length - pos)) throw Bad($"box '{type}' has an invalid size");
+            if (type == "moov")
+            {
+                moov = MuxIo.Load(s, pos + headerLength, (long)size - headerLength, MaxMoovBytes, "movie header");
+                break;
+            }
+            pos += (long)size;
+        }
+        if (moov is null) throw Bad("no movie header was found");
+
+        string? title = null, uploader = null, description = null;
+        uint chapterTrackId = 0;
+        var tracks = new List<(uint Id, string Handler, int Start, int End)>();
+        foreach (var child in Children(moov, 0, moov.Length))
+        {
+            if (child.Type == "udta")
+            {
+                foreach (var value in Children(moov, child.Start, child.End))
+                {
+                    if (value.Type == "titl") title = Read3GppText(moov, value, 512);
+                    else if (value.Type == "dscp") description = Read3GppText(moov, value, 8192);
+                    else if (value.Type == "auth") uploader = Read3GppText(moov, value, 256);
+                }
+            }
+            else if (child.Type == "trak")
+            {
+                var tkhd = Find(moov, child.Start, child.End, "tkhd") ?? throw Bad("a track has no header");
+                int version = moov[tkhd.Start];
+                uint id = U32(moov, tkhd.Start + (version == 1 ? 20 : 12), tkhd.End);
+                var mdia = Find(moov, child.Start, child.End, "mdia") ?? throw Bad("a track has no media box");
+                var hdlr = Find(moov, mdia.Start, mdia.End, "hdlr") ?? throw Bad("a track has no handler");
+                string handler = MuxIo.FourCc(moov.AsSpan(hdlr.Start + 8, 4));
+                tracks.Add((id, handler, child.Start, child.End));
+                if ((handler is "vide" or "soun") && Find(moov, child.Start, child.End, "tref") is { } tref
+                    && Find(moov, tref.Start, tref.End, "chap") is { } chap)
+                {
+                    if (chap.End - chap.Start < 4) throw Bad("a chapter track reference is truncated");
+                    chapterTrackId = U32(moov, chap.Start, chap.End);
+                }
+            }
+        }
+
+        if (chapterTrackId != 0 && !tracks.Any(track => track.Id == chapterTrackId && track.Handler == "text"))
+            throw Bad("a chapter track reference does not name a text track");
+        IReadOnlyList<MediaMergeChapter> chapters = chapterTrackId == 0 ? [] : ReadChapterTrack(s, length, moov,
+            tracks.First(track => track.Id == chapterTrackId && track.Handler == "text"));
+        return new MediaMergeMetadata { Title = title, Uploader = uploader, Description = description, Chapters = chapters };
+    }
+
+    private static string Read3GppText(byte[] moov, (string Type, int Start, int End) box, int maxLength)
+    {
+        if (box.End - box.Start < 6 || U32(moov, box.Start, box.End) != 0) throw Bad("a 3GPP text metadata box is malformed");
+        int start = box.Start + 6, end = box.End;
+        if (end > start && moov[end - 1] == 0) end--;
+        if (end - start > maxLength * 4) throw Bad("a metadata string is too long");
+        try
+        {
+            string value = new UTF8Encoding(false, true).GetString(moov, start, end - start);
+            if (value.Length > maxLength) throw Bad("a metadata string is too long");
+            return value;
+        }
+        catch (DecoderFallbackException) { throw Bad("a metadata string is not valid UTF-8"); }
+    }
+
+    private static IReadOnlyList<MediaMergeChapter> ReadChapterTrack(Stream s, long length, byte[] moov,
+        (uint Id, string Handler, int Start, int End) chapterTrack)
+    {
+        if (chapterTrack.Handler != "text") throw Bad("a chapter track is not a text track");
+        var mdia = Find(moov, chapterTrack.Start, chapterTrack.End, "mdia") ?? throw Bad("a chapter track has no media box");
+        var mdhd = Find(moov, mdia.Start, mdia.End, "mdhd") ?? throw Bad("a chapter track has no media header");
+        uint timescale = U32(moov, mdhd.Start + (moov[mdhd.Start] == 1 ? 20 : 12), mdhd.End);
+        if (timescale == 0) throw Bad("a chapter track timescale is zero");
+        var minf = Find(moov, mdia.Start, mdia.End, "minf") ?? throw Bad("a chapter track has no media information");
+        var stbl = Find(moov, minf.Start, minf.End, "stbl") ?? throw Bad("a chapter track has no sample table");
+        var stsd = Find(moov, stbl.Start, stbl.End, "stsd") ?? throw Bad("a chapter track has no sample description");
+        if (U32(moov, stsd.Start + 4, stsd.End) != 1) throw Bad("a chapter track has an invalid sample description count");
+        int entryStart = stsd.Start + 8;
+        uint entrySize = U32(moov, entryStart, stsd.End);
+        if (entrySize < 16 || entryStart + entrySize > stsd.End || MuxIo.FourCc(moov.AsSpan(entryStart + 4, 4)) != "tx3g")
+            throw Bad("a chapter track does not use timed text samples");
+
+        var stsz = Find(moov, stbl.Start, stbl.End, "stsz") ?? throw Bad("a chapter track has no sample sizes");
+        uint fixedSize = U32(moov, stsz.Start + 4, stsz.End), count = U32(moov, stsz.Start + 8, stsz.End);
+        if (count is 0 or > 402) throw Bad("a chapter track has an invalid sample count");
+        var sizes = new int[count];
+        for (int i = 0; i < sizes.Length; i++)
+        {
+            uint size = fixedSize != 0 ? fixedSize : U32(moov, stsz.Start + 12 + i * 4, stsz.End);
+            if (size is < 2 or > 2050) throw Bad("a chapter text sample has an invalid size");
+            sizes[i] = (int)size;
+        }
+
+        var stts = Find(moov, stbl.Start, stbl.End, "stts") ?? throw Bad("a chapter track has no sample times");
+        uint entries = U32(moov, stts.Start + 4, stts.End);
+        var durations = new uint[count];
+        int sampleIndex = 0, timePos = stts.Start + 8;
+        for (uint entry = 0; entry < entries; entry++, timePos += 8)
+        {
+            uint runCount = U32(moov, timePos, stts.End), runDuration = U32(moov, timePos + 4, stts.End);
+            for (uint i = 0; i < runCount; i++)
+            {
+                if (sampleIndex >= durations.Length) throw Bad("a chapter time table has too many samples");
+                durations[sampleIndex++] = runDuration;
+            }
+        }
+        if (sampleIndex != durations.Length) throw Bad("a chapter time table does not cover every sample");
+
+        var stsc = Find(moov, stbl.Start, stbl.End, "stsc") ?? throw Bad("a chapter track has no sample-to-chunk table");
+        if (U32(moov, stsc.Start + 4, stsc.End) != 1 || U32(moov, stsc.Start + 8, stsc.End) != 1
+            || U32(moov, stsc.Start + 12, stsc.End) != count || U32(moov, stsc.Start + 16, stsc.End) != 1)
+            throw Bad("a chapter track uses an unsupported chunk layout");
+        long chunkOffset;
+        if (Find(moov, stbl.Start, stbl.End, "stco") is { } stco)
+        {
+            if (U32(moov, stco.Start + 4, stco.End) != 1) throw Bad("a chapter track has an invalid chunk offset count");
+            chunkOffset = U32(moov, stco.Start + 8, stco.End);
+        }
+        else if (Find(moov, stbl.Start, stbl.End, "co64") is { } co64)
+        {
+            if (U32(moov, co64.Start + 4, co64.End) != 1) throw Bad("a chapter track has an invalid chunk offset count");
+            ulong offset = U64(moov, co64.Start + 8, co64.End);
+            if (offset > long.MaxValue) throw Bad("a chapter chunk offset is out of range");
+            chunkOffset = (long)offset;
+        }
+        else throw Bad("a chapter track has no chunk offset");
+
+        var chapters = new List<MediaMergeChapter>();
+        long payloadOffset = chunkOffset;
+        ulong timestamp = 0;
+        for (int i = 0; i < sizes.Length; i++)
+        {
+            if (payloadOffset < 0 || payloadOffset > length - sizes[i]) throw Bad("a chapter sample points outside the file");
+            byte[] sample = MuxIo.Load(s, payloadOffset, sizes[i], 2050, "chapter text sample");
+            ushort textLength = U16(sample, 0, sample.Length);
+            if (textLength > sample.Length - 2) throw Bad("a chapter text length exceeds its sample");
+            if (textLength > 0)
+            {
+                string title;
+                try { title = new UTF8Encoding(false, true).GetString(sample, 2, textLength); }
+                catch (DecoderFallbackException) { throw Bad("a chapter title is not valid UTF-8"); }
+                if (title.Length > 256) throw Bad("a chapter title is too long");
+                long startTicks = checked((long)((Int128)timestamp * TimeSpan.TicksPerSecond / timescale));
+                long endTicks = checked((long)((Int128)(timestamp + durations[i]) * TimeSpan.TicksPerSecond / timescale));
+                chapters.Add(new MediaMergeChapter(title, TimeSpan.FromTicks(startTicks), TimeSpan.FromTicks(endTicks)));
+            }
+            timestamp += durations[i];
+            payloadOffset += sizes[i];
+        }
+        return chapters;
+    }
+
     // ------------------------------------------------------------------------------------------------ boxes
 
     private static MediaContainerException Bad(string why) => new($"Invalid MP4: {why}.");

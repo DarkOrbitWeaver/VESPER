@@ -39,6 +39,9 @@ internal static class Mp4Muxer
 {
     private const uint MovieTimescale = 1000;
 
+    private sealed record ChapterSample(byte[] Data, uint Duration);
+    private sealed record ChapterTrackData(IReadOnlyList<MediaMergeChapter> Chapters, IReadOnlyList<ChapterSample> Samples, long PayloadBytes);
+
     private sealed class Chunk
     {
         public int Track, First, Count;
@@ -46,12 +49,17 @@ internal static class Mp4Muxer
         public double Start;
     }
 
-    public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output, CancellationToken ct)
+    public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output,
+        CancellationToken ct, MediaMergeMetadata? metadata, out MediaMergeMetadata? writtenMetadata)
     {
         if (inputs.Count is < 1 or > 8) throw new MediaContainerException("An MP4 output needs between one and eight tracks.");
         foreach (var (t, _) in inputs)
             if (t.Mp4SampleEntry is null || t.SourceContainer != "mp4" || t.HasLacing || t.Samples.Count == 0)
                 throw new MediaContainerException($"The {t.Codec} track cannot be written to MP4 without conversion.");
+
+        ulong movieDuration = inputs.Max(input => ToMovie(MediaDuration(input.Track) - Math.Max(0, input.Track.EditMediaTime), input.Track.Timescale));
+        ChapterTrackData chapterTrack = BuildChapterTrack(metadata?.Chapters ?? [], movieDuration);
+        writtenMetadata = metadata is null ? null : metadata with { Chapters = chapterTrack.Chapters };
 
         var chunks = new List<Chunk>();
         for (int ti = 0; ti < inputs.Count; ti++)
@@ -72,16 +80,17 @@ internal static class Mp4Muxer
             }
         }
         chunks = chunks.OrderBy(c => c.Start).ThenBy(c => c.Track).ToList();
-        long payload = 0;
-        foreach (var c in chunks) { c.Offset = payload; payload += c.Bytes; }
+        long mediaPayload = 0;
+        foreach (var c in chunks) { c.Offset = mediaPayload; mediaPayload += c.Bytes; }
+        long payload = checked(mediaPayload + chapterTrack.PayloadBytes);
 
         byte[] ftyp = BuildFtyp(inputs.Select(i => i.Track).ToList());
         int mdatHeader = payload + 8 > uint.MaxValue ? 16 : 8;
-        byte[] moov = BuildMoov(inputs, chunks, 0, co64: false);
+        byte[] moov = BuildMoov(inputs, chunks, 0, false, mediaPayload, chapterTrack, writtenMetadata);
         bool co64 = ftyp.Length + moov.Length + mdatHeader + payload > uint.MaxValue;
-        if (co64) moov = BuildMoov(inputs, chunks, 0, co64: true);
+        if (co64) moov = BuildMoov(inputs, chunks, 0, true, mediaPayload, chapterTrack, writtenMetadata);
         long baseOffset = ftyp.Length + moov.Length + mdatHeader;
-        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64);
+        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64, mediaPayload, chapterTrack, writtenMetadata);
         if (final.Length != moov.Length) throw new InvalidOperationException("MP4 header size changed between passes.");
 
         output.Write(ftyp);
@@ -118,6 +127,7 @@ internal static class Mp4Muxer
                     i = j;
                 }
             }
+            foreach (ChapterSample sample in chapterTrack.Samples) output.Write(sample.Data);
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }
         return baseOffset + payload;
@@ -155,9 +165,96 @@ internal static class Mp4Muxer
         return sum;
     }
 
+    private static ChapterTrackData BuildChapterTrack(IReadOnlyList<MediaMergeChapter> chapters, ulong movieDuration)
+    {
+        if (chapters.Count == 0 || movieDuration == 0 || movieDuration > uint.MaxValue)
+            return new ChapterTrackData([], [], 0);
+
+        var marks = new List<(MediaMergeChapter Chapter, uint Start)>();
+        foreach (MediaMergeChapter chapter in chapters)
+        {
+            ulong start = ToMovie(chapter.Start.Ticks, TimeSpan.TicksPerSecond);
+            if (start >= movieDuration || marks.Count > 0 && start <= marks[^1].Start) continue;
+            marks.Add((chapter, (uint)start));
+        }
+        if (marks.Count == 0) return new ChapterTrackData([], [], 0);
+
+        var samples = new List<ChapterSample>();
+        var written = new List<MediaMergeChapter>(marks.Count);
+        uint cursor = 0;
+        for (int i = 0; i < marks.Count; i++)
+        {
+            (MediaMergeChapter chapter, uint start) = marks[i];
+            uint next = i + 1 < marks.Count ? marks[i + 1].Start : (uint)movieDuration;
+            ulong requestedEnd = chapter.End is { } end ? ToMovie(end.Ticks, TimeSpan.TicksPerSecond) : next;
+            uint endTime = (uint)Math.Min(movieDuration, Math.Min(requestedEnd, next));
+            if (endTime <= start) continue;
+            if (start > cursor) samples.Add(new ChapterSample(TextSample(""), start - cursor));
+            samples.Add(new ChapterSample(TextSample(chapter.Title), endTime - start));
+            written.Add(new MediaMergeChapter(chapter.Title, FromMovie(start), FromMovie(endTime)));
+            cursor = endTime;
+        }
+        if (written.Count == 0) return new ChapterTrackData([], [], 0);
+        if (cursor < movieDuration) samples.Add(new ChapterSample(TextSample(""), (uint)movieDuration - cursor));
+        return new ChapterTrackData(written, samples, samples.Sum(sample => (long)sample.Data.Length));
+    }
+
+    private static byte[] TextSample(string text)
+    {
+        byte[] utf8 = Encoding.UTF8.GetBytes(text);
+        if (utf8.Length > 2048) throw new MediaContainerException("A chapter title is too long for an MP4 chapter track.");
+        var data = new byte[utf8.Length + 2];
+        BinaryPrimitives.WriteUInt16BigEndian(data, (ushort)utf8.Length);
+        utf8.CopyTo(data, 2);
+        return data;
+    }
+
+    private static TimeSpan FromMovie(uint ticks) => TimeSpan.FromTicks((long)ticks * TimeSpan.TicksPerMillisecond);
+
+    private static byte[] ChapterSampleEntry()
+    {
+        var w = new BoxWriter();
+        int entry = w.Begin("tx3g");
+        w.Zero(6); w.U16(1);               // SampleEntry header
+        w.U32(0); w.U8(0); w.U8(0);       // Display flags and justification
+        w.Zero(4);                          // Background color
+        w.Zero(8);                          // Default text box
+        w.U16(0); w.U16(0); w.U16(1); w.U8(0); w.U8(12);
+        w.U8(0xFF); w.U8(0xFF); w.U8(0xFF); w.U8(0xFF); // Default style
+        int fonts = w.Begin("ftab");
+        w.U16(1); w.U16(1); w.U8(5); w.Ascii("Serif");
+        w.End(fonts);
+        w.End(entry);
+        return w.ToArray();
+    }
+
+    private static byte[] UserData(MediaMergeMetadata metadata)
+    {
+        var w = new BoxWriter();
+        int udta = w.Begin("udta");
+        if (metadata.Title is { Length: > 0 } title) Write3GppText(w, "titl", title);
+        if (metadata.Description is { Length: > 0 } description) Write3GppText(w, "dscp", description);
+        if (metadata.Uploader is { Length: > 0 } uploader) Write3GppText(w, "auth", uploader);
+        w.End(udta);
+        return w.ToArray();
+    }
+
+    private static void Write3GppText(BoxWriter w, string type, string value)
+    {
+        int box = w.Begin(type);
+        w.U32(0);                         // FullBox version and flags
+        w.U16(PackLanguage("und"));
+        w.Bytes(Encoding.UTF8.GetBytes(value));
+        w.U8(0);
+        w.End(box);
+    }
+
     private static ulong ToMovie(long ticks, uint timescale) => ticks <= 0 ? 0 : (ulong)(((Int128)ticks * MovieTimescale + timescale / 2) / timescale);
 
-    private static byte[] BuildMoov(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, List<Chunk> chunks, long baseOffset, bool co64)
+    private static ulong ToMovie(long ticks, long timescale) => ticks <= 0 ? 0 : (ulong)(((Int128)ticks * MovieTimescale + timescale / 2) / timescale);
+
+    private static byte[] BuildMoov(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, List<Chunk> chunks,
+        long baseOffset, bool co64, long mediaPayload, ChapterTrackData chapterTrack, MediaMergeMetadata? metadata)
     {
         var w = new BoxWriter();
         int moov = w.Begin("moov");
@@ -174,7 +271,8 @@ internal static class Mp4Muxer
         int mvhd = w.BeginFull("mvhd", (byte)(v1 ? 1 : 0), 0);
         if (v1) { w.U64(0); w.U64(0); w.U32(MovieTimescale); w.U64(movieDuration); }
         else { w.U32(0); w.U32(0); w.U32(MovieTimescale); w.U32((uint)movieDuration); }
-        w.U32(0x00010000); w.U16(0x0100); w.Zero(10); w.Matrix(); w.Zero(24); w.U32((uint)inputs.Count + 1);
+        w.U32(0x00010000); w.U16(0x0100); w.Zero(10); w.Matrix(); w.Zero(24);
+        w.U32((uint)inputs.Count + (chapterTrack.Samples.Count > 0 ? 2u : 1u));
         w.End(mvhd);
 
         for (int ti = 0; ti < inputs.Count; ti++)
@@ -192,6 +290,13 @@ internal static class Mp4Muxer
             w.Matrix();
             w.U32(video ? (uint)t.Width << 16 : 0); w.U32(video ? (uint)t.Height << 16 : 0);
             w.End(tkhd);
+
+            if (ti == 0 && chapterTrack.Samples.Count > 0)
+            {
+                int tref = w.Begin("tref");
+                int chap = w.Begin("chap"); w.U32((uint)inputs.Count + 1); w.End(chap);
+                w.End(tref);
+            }
 
             if (t.EditMediaTime > 0)
             {
@@ -234,8 +339,59 @@ internal static class Mp4Muxer
             w.End(mdia);
             w.End(trak);
         }
+        if (chapterTrack.Samples.Count > 0)
+            WriteChapterTrack(w, chapterTrack, (uint)inputs.Count + 1, movieDuration, baseOffset + mediaPayload, co64);
+        if (metadata is { } values && (values.Title is { Length: > 0 } || values.Uploader is { Length: > 0 }
+            || values.Description is { Length: > 0 })) w.Bytes(UserData(values));
         w.End(moov);
         return w.ToArray();
+    }
+
+    private static void WriteChapterTrack(BoxWriter w, ChapterTrackData data, uint trackId, ulong duration,
+        long chunkOffset, bool co64)
+    {
+        int trak = w.Begin("trak");
+        int tkhd = w.BeginFull("tkhd", 0, 0x000002); // Disabled marker track, linked from the primary track.
+        w.U32(0); w.U32(0); w.U32(trackId); w.U32(0); w.U32((uint)duration);
+        w.Zero(8); w.U16(0); w.U16(0); w.U16(0); w.U16(0); w.Matrix(); w.U32(0); w.U32(0);
+        w.End(tkhd);
+
+        int mdia = w.Begin("mdia");
+        int mdhd = w.BeginFull("mdhd", 0, 0);
+        w.U32(0); w.U32(0); w.U32(MovieTimescale); w.U32((uint)duration);
+        w.U16(PackLanguage("und")); w.U16(0);
+        w.End(mdhd);
+        int hdlr = w.BeginFull("hdlr", 0, 0);
+        w.U32(0); w.Ascii("text"); w.Zero(12); w.Ascii("ChapterHandler"); w.U8(0);
+        w.End(hdlr);
+
+        int minf = w.Begin("minf");
+        int nmhd = w.BeginFull("nmhd", 0, 0); w.End(nmhd);
+        int dinf = w.Begin("dinf");
+        int dref = w.BeginFull("dref", 0, 0); w.U32(1);
+        int url = w.BeginFull("url ", 0, 1); w.End(url);
+        w.End(dref); w.End(dinf);
+
+        int stbl = w.Begin("stbl");
+        int stsd = w.BeginFull("stsd", 0, 0); w.U32(1); w.Bytes(ChapterSampleEntry()); w.End(stsd);
+        var runs = new List<(uint Count, uint Duration)>();
+        foreach (ChapterSample sample in data.Samples)
+        {
+            if (runs.Count > 0 && runs[^1].Duration == sample.Duration)
+                runs[^1] = (runs[^1].Count + 1, sample.Duration);
+            else runs.Add((1, sample.Duration));
+        }
+        int stts = w.BeginFull("stts", 0, 0); w.U32((uint)runs.Count);
+        foreach (var run in runs) { w.U32(run.Count); w.U32(run.Duration); }
+        w.End(stts);
+        int stsc = w.BeginFull("stsc", 0, 0); w.U32(1); w.U32(1); w.U32((uint)data.Samples.Count); w.U32(1); w.End(stsc);
+        int stsz = w.BeginFull("stsz", 0, 0); w.U32(0); w.U32((uint)data.Samples.Count);
+        foreach (ChapterSample sample in data.Samples) w.U32((uint)sample.Data.Length);
+        w.End(stsz);
+        int offsets = w.BeginFull(co64 ? "co64" : "stco", 0, 0); w.U32(1);
+        if (co64) w.U64((ulong)chunkOffset); else w.U32((uint)chunkOffset);
+        w.End(offsets);
+        w.End(stbl); w.End(minf); w.End(mdia); w.End(trak);
     }
 
     private static void WriteTables(BoxWriter w, DemuxedTrack t, List<Chunk> chunks, long baseOffset, bool co64)
