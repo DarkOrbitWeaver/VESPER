@@ -106,6 +106,41 @@ public class HlsParserTests
     }
 
     [Fact]
+    public async Task Master_ProbeUsesTheSameHighestMuxedVariantAsTheEngine()
+    {
+        const string master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nhigh.m3u8\n";
+        const string live = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg.ts\n";
+        const string vod = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg.ts\n#EXT-X-ENDLIST\n";
+        var h = new FakeHttpHandler()
+            .Add(MasterUrl.AbsoluteUri, master, HlsMime)
+            .Add("https://cdn.example.com/hls/low.m3u8", live, HlsMime)
+            .Add("https://cdn.example.com/hls/high.m3u8", vod, HlsMime);
+
+        var result = await Manifests(h).ResolveAsync(MasterUrl, MediaRequestContext.Empty, CancellationToken.None);
+
+        Assert.Equal("https://cdn.example.com/hls/high.m3u8", h.Requests[1].Url.AbsoluteUri);
+        Assert.Equal(2, result.Representations.Count);
+    }
+
+    [Fact]
+    public async Task Master_ProbeRejectsTheEngineSelectedVariantWhenItIsLive()
+    {
+        const string master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nhigh.m3u8\n";
+        const string vod = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg.ts\n#EXT-X-ENDLIST\n";
+        const string live = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg.ts\n";
+        var h = new FakeHttpHandler()
+            .Add(MasterUrl.AbsoluteUri, master, HlsMime)
+            .Add("https://cdn.example.com/hls/low.m3u8", vod, HlsMime)
+            .Add("https://cdn.example.com/hls/high.m3u8", live, HlsMime);
+
+        var ex = await Assert.ThrowsAsync<MediaResolverException>(() =>
+            Manifests(h).ResolveAsync(MasterUrl, MediaRequestContext.Empty, CancellationToken.None));
+
+        Assert.Equal(MediaErrorCode.LiveStreamNotSupported, ex.Error.Code);
+        Assert.Equal("https://cdn.example.com/hls/high.m3u8", h.Requests[1].Url.AbsoluteUri);
+    }
+
+    [Fact]
     public async Task FairPlayKeyFormat_IsReportedAsDrm()
     {
         const string drm = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\",KEYFORMAT=\"com.apple.streamingkeydelivery\"\n#EXTINF:6,\nseg.ts\n#EXT-X-ENDLIST\n";
