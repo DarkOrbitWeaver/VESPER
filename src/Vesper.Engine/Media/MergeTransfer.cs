@@ -232,11 +232,14 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     return RunOutcome.NeedsAttention("unsupported-container",
                         $"The downloaded codecs ({string.Join(", ", expected.Select(t => t.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Nothing was published; saved data was kept.");
                 EnsureSpace(plan.TotalBytes + (1 << 20));
+                MediaThumbnail? thumbnail = container == "mkv"
+                    ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
+                    : null;
                 using var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20);
-                MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata);
+                MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                 output.Flush(flushToDisk: true);
                 length = output.Length;
-                MediaMerger.Validate(output, length, expected, ct, merged.Metadata);
+                MediaMerger.Validate(output, length, expected, ct, merged.Metadata, merged.ThumbnailSha256);
                 output.Position = 0;
                 sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             }

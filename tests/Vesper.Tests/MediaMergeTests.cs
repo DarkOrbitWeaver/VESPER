@@ -31,6 +31,8 @@ public sealed class MediaMergeTests
 
     private static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
     private static byte[] AacFmp4() => [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
+    private static byte[] TinyPng() => Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=");
 
     private static DemuxedTrack Track(Stream s, TrackKind kind) => MediaMerger.Demux(s, s.Length, default).First(t => t.Kind == kind);
 
@@ -117,6 +119,19 @@ public sealed class MediaMergeTests
         Assert.Equal(metadata.Uploader, stored.Uploader);
         Assert.Equal(metadata.Description, stored.Description);
         Assert.Equal(metadata.Chapters, stored.Chapters);
+    }
+
+    [Fact]
+    public void ThumbnailValidation_RequiresBoundedWellFormedImage()
+    {
+        byte[] png = TinyPng();
+        MediaThumbnail thumbnail = Assert.IsType<MediaThumbnail>(MediaThumbnail.TryCreate(png));
+
+        Assert.Equal("image/png", thumbnail.MediaType);
+        Assert.Equal("cover.png", thumbnail.FileName);
+        Assert.Equal(Payloads.Sha256(png), thumbnail.Sha256);
+        Assert.Null(MediaThumbnail.TryCreate(png[..^1]));
+        Assert.Null(MediaThumbnail.TryCreate(Payloads.Make(MediaThumbnail.MaxBytes + 1, 12)));
     }
 
     [Fact]
@@ -462,6 +477,7 @@ public sealed class MediaMergeTests
         await using var server = new FaultServer();
         server.Extra["/m/video.mp4"] = Fixture("video-only.mp4");
         server.Extra["/m/audio.webm"] = Fixture("muxed.webm");
+        server.Extra["/m/cover.png"] = TinyPng();
         await server.StartAsync();
         using var h = new Harness();
         var plan = new MediaMergePlan
@@ -479,7 +495,8 @@ public sealed class MediaMergeTests
             ]
         };
         AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "chaptered.mkv", Kind: JobKind.Merge,
-            MediaPlanJson: plan.ToJson(), MediaProvider: "test", MediaId: "chaptered"));
+            MediaPlanJson: plan.ToJson(), MediaProvider: "test", MediaId: "chaptered",
+            MediaThumbnailUrl: server.Url("/m/cover.png")));
         Assert.True(added.Ok, added.Message);
         AddResult duplicate = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "chaptered.mkv", Kind: JobKind.Merge,
             MediaPlanJson: (plan with { Metadata = plan.Metadata with { Title = "Updated title" } }).ToJson(),
@@ -494,6 +511,21 @@ public sealed class MediaMergeTests
         Assert.Equal("VESPER", stored.Uploader);
         Assert.Equal("Saved through a resumable merge job.", stored.Description);
         Assert.Equal([new MediaMergeChapter("Beginning", TimeSpan.Zero)], stored.Chapters);
+        Assert.Equal(Payloads.Sha256(TinyPng()), Assert.IsType<MediaThumbnail>(WebmDemuxer.ReadThumbnail(output, output.Length)).Sha256);
+        FaultServer.ObservedHeaders thumbnailRequest = Assert.Single(server.RequestsFor("/m/cover.png"));
+        Assert.Null(thumbnailRequest.Cookie);
+        Assert.Null(thumbnailRequest.Authorization);
+        Assert.Null(thumbnailRequest.Referer);
+
+        MediaMergePlan noCoverPlan = plan with { MediaId = "chaptered-no-cover" };
+        AddResult noCoverAdded = h.Engine.Add(new AddRequest(noCoverPlan.Tracks[0].Url, FileName: "chaptered-no-cover.mkv",
+            Kind: JobKind.Merge, MediaPlanJson: noCoverPlan.ToJson(), MediaThumbnailUrl: server.Url("/notfound")));
+        Assert.True(noCoverAdded.Ok, noCoverAdded.Message);
+        JobSnapshot noCoverDone = await h.WaitAsync(noCoverAdded.JobId,
+            snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, noCoverDone.State);
+        using var noCoverOutput = File.OpenRead(noCoverDone.FinalPath!);
+        Assert.Null(WebmDemuxer.ReadThumbnail(noCoverOutput, noCoverOutput.Length));
     }
 
     [Fact]
