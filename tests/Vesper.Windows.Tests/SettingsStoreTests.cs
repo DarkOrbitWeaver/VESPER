@@ -44,6 +44,14 @@ public sealed class SettingsStoreTests : IDisposable
     }
 
     [Fact]
+    public void FilenameTemplateSurvivesSettingsSaveAndReload()
+    {
+        Assert.Null(SettingsStore.Save(new VesperPreferences { FileNameTemplate = "{name} - {host}" }, _root));
+
+        Assert.Equal("{name} - {host}", SettingsStore.Load(_root).FileNameTemplate);
+    }
+
+    [Fact]
     public void CorruptSettingsAreKeptInNumberedBackups()
     {
         string path = Path.Combine(_root, "settings.json");

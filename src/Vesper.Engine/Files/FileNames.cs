@@ -54,6 +54,66 @@ public static class FileNames
         return Sanitize(segment.TrimEnd('/'), fallback);
     }
 
+    public static bool TryValidateTemplate(string? template, out string error)
+    {
+        error = "";
+        if (string.IsNullOrWhiteSpace(template)) return true;
+        if (template.Length > 200)
+        {
+            error = "Keep the filename template under 200 characters.";
+            return false;
+        }
+
+        bool hasName = false;
+        for (int i = 0; i < template.Length; i++)
+        {
+            if (template[i] == '}')
+            {
+                error = "A closing brace needs a matching opening brace.";
+                return false;
+            }
+            if (template[i] != '{') continue;
+
+            int close = template.IndexOf('}', i + 1);
+            if (close < 0)
+            {
+                error = "A template value is missing its closing brace.";
+                return false;
+            }
+
+            string token = template[(i + 1)..close];
+            if (token.Equals("name", StringComparison.OrdinalIgnoreCase)) hasName = true;
+            else if (!token.Equals("host", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "Use {name} and {host} only.";
+                return false;
+            }
+            i = close;
+        }
+
+        if (!hasName)
+        {
+            error = "Include {name} so the downloaded file keeps its title.";
+            return false;
+        }
+        return true;
+    }
+
+    public static string ApplyTemplate(string? fileName, string? template, Uri source)
+    {
+        string safeName = Sanitize(fileName);
+        if (string.IsNullOrWhiteSpace(template) || !TryValidateTemplate(template, out _)) return safeName;
+
+        string extension = Path.GetExtension(safeName);
+        string stem = extension.Length > 0 ? safeName[..^extension.Length] : safeName;
+        string host = Sanitize(source.IdnHost, "");
+        string formatted = template
+            .Replace("{name}", stem, StringComparison.OrdinalIgnoreCase)
+            .Replace("{host}", host, StringComparison.OrdinalIgnoreCase);
+        if (extension.Length > 0) formatted += extension;
+        return Sanitize(formatted, safeName);
+    }
+
     /// <summary>Adds an extension from the Content-Type when the name has none.</summary>
     public static string WithExtensionFor(string name, string? contentType)
     {

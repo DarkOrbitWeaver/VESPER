@@ -127,7 +127,8 @@ public sealed partial class DownloadEngine
             UrlPolicy.TryParse(page, out Uri parsedPage, out _))
             originalPage = parsedPage.AbsoluteUri;
 
-        string name = request.FileName is { Length: > 0 } ? FileNames.Sanitize(request.FileName) : FileNames.FromUrl(uri);
+        string suggestedName = request.FileName is { Length: > 0 } ? FileNames.Sanitize(request.FileName) : FileNames.FromUrl(uri);
+        string name = FileNames.ApplyTemplate(suggestedName, Options.FileNameTemplate, uri);
         string category = FileNames.CategoryFor(name);
         string baseFolder = request.DestinationFolder ?? Options.DefaultFolder;
         string folderText = request.DestinationFolder is null && Options.CategorySubfolders ? Path.Combine(baseFolder, category) : baseFolder;

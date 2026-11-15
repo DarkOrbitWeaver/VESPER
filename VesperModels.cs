@@ -180,6 +180,7 @@ internal sealed class VesperPreferences
     public bool HideMissingCompleted { get; set; }
     public bool CategoryFolders { get; set; }
     public string DefaultFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+    public string FileNameTemplate { get; set; } = "";
     public int ConcurrentTransfers { get; set; } = 3;
     public int GlobalRateLimitKbs { get; set; }
     public int PerTransferRateLimitKbs { get; set; }

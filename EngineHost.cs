@@ -80,6 +80,7 @@ internal static class EngineHost
         options.MaxConnectionsPerJob = Math.Clamp(p.MaxConnectionsPerJob, 1, 8);
         options.GlobalLimitBytesPerSecond = p.GlobalRateLimitKbs * 1000L;
         options.CategorySubfolders = p.CategoryFolders;
+        options.FileNameTemplate = p.FileNameTemplate;
         options.PreventSleepWhileActive = p.PreventSleep;
         options.Schedule = TimeOnly.TryParse(p.ScheduleStart, out TimeOnly start) && TimeOnly.TryParse(p.ScheduleEnd, out TimeOnly end)
             ? new SchedulePolicy(p.ScheduleEnabled, start, end) : SchedulePolicy.Always;

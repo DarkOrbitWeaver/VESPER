@@ -341,8 +341,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             j.ContentType ??= HttpFacts.ContentType(r);
             if (!j.NameLocked && fresh)
             {
-                string name = FileNames.Sanitize(HttpFacts.SuggestedFileName(r), j.FileName);
-                j.FileName = FileNames.WithExtensionFor(name, j.ContentType);
+                string? suggestedName = HttpFacts.SuggestedFileName(r);
+                Uri source = new(j.SourceUrl);
+                string name = suggestedName is null ? FileNames.FromUrl(source)
+                    : FileNames.Sanitize(suggestedName, j.FileName);
+                name = FileNames.WithExtensionFor(name, j.ContentType);
+                j.FileName = FileNames.ApplyTemplate(name, _o.FileNameTemplate, source);
                 j.Category = FileNames.CategoryFor(j.FileName);
             }
             j.State = JobState.Downloading;
