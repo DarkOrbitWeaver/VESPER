@@ -69,8 +69,8 @@ public sealed record MediaMergePlan
     }
 
     /// <summary>
-    /// Identity of the bytes being assembled. URLs are deliberately excluded: only a replacement that matches every
-    /// role, format id, size, codec and provider identity may reuse committed bytes.
+    /// Direct-file URLs are excluded so signed links can rotate. Segmented source URLs stay in the fingerprint
+    /// because their cursor is bound to the exact playlist or fragment map.
     /// </summary>
     internal string Fingerprint
     {
@@ -97,12 +97,16 @@ public sealed record MediaMergePlan
     {
         if (Tracks.Any(t => string.IsNullOrEmpty(t.Identity)))
         {
-            why = "The original plan has no byte-level identity for every track, so saved data cannot be continued from a new link.";
+            why = IsSegmented || replacement.IsSegmented
+                ? "The selected HLS/DASH tracks have no byte-level identity for every rendition. Saved segments were kept; open the source page and add a new download."
+                : "The original plan has no byte-level identity for every track, so saved data cannot be continued from a new link.";
             return false;
         }
         if (replacement.Fingerprint != Fingerprint)
         {
-            why = "The newly resolved representation differs (format, size or encoding identity). Saved data was kept; restart as a separate copy.";
+            why = IsSegmented || replacement.IsSegmented
+                ? "The HLS playlist or DASH fragment map changed. Saved segments were kept because VESPER cannot yet verify the refreshed parts against them; open the source page and add a new download."
+                : "The newly resolved representation differs (format, size or encoding identity). Saved data was kept; restart as a separate copy.";
             return false;
         }
         why = "";

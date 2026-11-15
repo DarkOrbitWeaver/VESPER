@@ -29,6 +29,23 @@ public sealed class MediaRefreshTests
         ]
     };
 
+    private static MediaMergePlan StaticHlsPlan(string token)
+    {
+        MergeTrack Track(string role, string container, string codec)
+        {
+            string url = $"https://cdn.example.com/{role}.m3u8?token={token}";
+            return new MergeTrack(role, role + "-format", url, 0, container, codec,
+                Source: new MergeMediaSource("hls", PlaylistUrl: url));
+        }
+
+        return new MediaMergePlan
+        {
+            Version = 2, Provider = "youtube", MediaId = "fixture-video", OutputContainer = "mp4",
+            RequireAudio = true, RequireVideo = true,
+            Tracks = [Track("video", "mp4", "h264"), Track("audio", "m4a", "aac")]
+        };
+    }
+
     private static void AssertSecretNotOnDisk(Harness harness, string secret)
     {
         foreach (string path in Directory.GetFiles(harness.Data, "*", SearchOption.AllDirectories))
@@ -264,6 +281,25 @@ public sealed class MediaRefreshTests
         using var wave = File.OpenRead(done.FinalPath!);
         var result = WaveAudio.Read(wave);
         Assert.InRange(Math.Abs(result.Duration - .5), 0, .02);
+    }
+
+    [Fact]
+    public void SegmentedRefreshExplainsWhyChangedPlaylistsCannotReuseSavedParts()
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = StaticHlsPlan("old-signature");
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "fixture.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        MediaMergePlan refreshedPlan = StaticHlsPlan("new-signature");
+        RescueResult refreshed = h.Engine.RefreshMergePlan(added.JobId, refreshedPlan.ToJson());
+
+        Assert.False(refreshed.Accepted);
+        Assert.Contains("HLS/DASH", refreshed.Message);
+        Assert.Contains("Saved segments were kept", refreshed.Message);
+        Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
     }
 
     [Fact]
