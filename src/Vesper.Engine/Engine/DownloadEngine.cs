@@ -14,6 +14,7 @@ public sealed partial class DownloadEngine : IDisposable
 {
     public EngineOptions Options { get; }
     internal RateLimiter GlobalLimiter { get; } = new();
+    private readonly SemaphoreSlim _segmentBufferSlots = new(3, 3);
 
     private readonly JobStore _store;
     private readonly HttpTransport _http;
@@ -83,6 +84,18 @@ public sealed partial class DownloadEngine : IDisposable
 
     public bool RecoveredFromCorruptDatabase => _store.RecoveredFromCorruption;
     public string? CorruptDatabaseBackup => _store.CorruptBackupPath;
+
+    internal async ValueTask<IDisposable> AcquireSegmentBufferAsync(CancellationToken ct)
+    {
+        await _segmentBufferSlots.WaitAsync(ct).ConfigureAwait(false);
+        return new SemaphoreRelease(_segmentBufferSlots);
+    }
+
+    private sealed class SemaphoreRelease(SemaphoreSlim semaphore) : IDisposable
+    {
+        private SemaphoreSlim? _semaphore = semaphore;
+        public void Dispose() => Interlocked.Exchange(ref _semaphore, null)?.Release();
+    }
 
     // ---- snapshots ---------------------------------------------------------------------------------------------
 

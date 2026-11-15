@@ -89,6 +89,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     ct.ThrowIfCancellationRequested();
                     Part part = prepared.Parts[pi];
                     long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
+                    using IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
                     byte[] data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct).ConfigureAwait(false);
                     if (part.Key is { } key)
                     {
@@ -277,6 +278,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     ct.ThrowIfCancellationRequested();
                     Part part = track.Parts[partIndex];
                     long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
+                    using IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
                     byte[] data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct).ConfigureAwait(false);
                     if (part.Key is { } key)
                     {
