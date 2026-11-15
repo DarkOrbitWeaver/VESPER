@@ -73,8 +73,7 @@ internal sealed class RescueForm : VesperPopupForm
         {
             Text = "Refresh original media link", AutoSize = true, Location = new Point(322, 163),
             LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
-            Font = new Font("Segoe UI", 8.5F), Visible = job.Kind == JobKind.Http
-                && job.OriginalPageUrl is not null && job.MediaId is not null && job.MediaFormatId is not null
+            Font = new Font("Segoe UI", 8.5F), Visible = MediaSourceRescue.CanRefresh(job)
         };
         _refreshSource.LinkClicked += async (_, _) => await RefreshSourceAsync();
         FormClosing += (_, _) => _lifetime.Cancel();
@@ -224,26 +223,13 @@ internal sealed class RescueForm : VesperPopupForm
 
     private async Task RefreshSourceAsync()
     {
-        if (!Uri.TryCreate(_job.OriginalPageUrl, UriKind.Absolute, out var page)) return;
+        if (!MediaSourceRescue.CanRefresh(_job)) return;
         CancellationToken token = _lifetime.Token;
         SetBusy(true);
-        Show("Resolving the original page and checking the selected format…", error: false);
+        Show("Resolving the original page and checking the selected formats…", error: false);
         try
         {
-            using var resolver = new DefaultMediaResolver(EngineHost.MediaNetwork(options: _engine.Options));
-            var discovery = await Task.Run(() => resolver.ResolveAsync(new MediaDiscoveryRequest
-            { Url = page, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token), token);
-            if (IsDisposed || token.IsCancellationRequested) return;
-            if (discovery.Item is not { } item)
-            { Show(discovery.Error?.UserMessage ?? "The original page could not be resolved. Saved data was kept.", true); return; }
-            var format = item.Representations.FirstOrDefault(r => r.Id == _job.MediaFormatId);
-            if (format is null || format.Protocol != StreamProtocol.Http || format.Context.HasCredentials
-                || format.Context.Origin is not null || format.Context.AcceptLanguage is not null)
-            { Show("The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.", true); return; }
-            if (item.MediaId is null)
-            { Show("The source does not expose a verifiable media identity. Saved data was kept.", true); return; }
-            var result = await _engine.RefreshMediaSourceAsync(_job.Id, new ResolvedMediaSource(item.Provider,
-                item.MediaId, format.Id, format.Url.AbsoluteUri, format.ExpiresAt), token);
+            RescueResult result = await MediaSourceRescue.RefreshAsync(_engine, _job, EngineHost.MediaNetwork(options: _engine.Options), token);
             if (IsDisposed || token.IsCancellationRequested) return;
             Show(result.Message, !result.Accepted);
             if (result.Accepted) { _replace.Visible = false; _refreshSource.Visible = false; _cancel.Text = "Done"; }

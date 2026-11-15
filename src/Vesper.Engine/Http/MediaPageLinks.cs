@@ -26,9 +26,11 @@ public static class MediaPageLinks
             site = "YouTube";
             return true;
         }
-        if (Domain(host, "tiktok.com") &&
-            (path.Contains("/video/", StringComparison.OrdinalIgnoreCase)
-             || path.StartsWith("/t/", StringComparison.OrdinalIgnoreCase)))
+        string[] tikTokPath = path.Trim('/').Split('/');
+        bool tikTokWatch = tikTokPath is [var user, "video", var id] && user.StartsWith('@')
+            && id.Length > 0 && id.All(char.IsAsciiDigit);
+        if (host is ("tiktok.com" or "www.tiktok.com" or "m.tiktok.com") && (tikTokWatch || path.StartsWith("/t/", StringComparison.Ordinal))
+            || host is ("vm.tiktok.com" or "vt.tiktok.com") && path.Length > 1)
         {
             site = "TikTok";
             return true;

@@ -240,9 +240,12 @@ public sealed class Mp3MetadataWriterTests
         server.Extra["/music/cover.png"] = cover;
         await server.StartAsync();
         int hit = 0;
+        using var crashed = new ManualResetEventSlim();
         using var harness = new Harness(name =>
         {
-            if (name == failpoint && Interlocked.Increment(ref hit) == 1) throw new FailpointCrash(name);
+            if (name != failpoint || Interlocked.Increment(ref hit) != 1) return;
+            crashed.Set();
+            throw new FailpointCrash(name);
         });
         var metadata = new MediaMergeMetadata
         {
@@ -258,8 +261,8 @@ public sealed class Mp3MetadataWriterTests
         Assert.Equal("renamed.mp3", renamed.FileName);
         Assert.Contains("extension was kept", renamed.Message, StringComparison.OrdinalIgnoreCase);
 
-        await harness.WaitAsync(added.JobId, job => job.State == JobState.Finalizing, 15);
-        await Task.Delay(300);
+        // Wait for the crash itself, not for a wall-clock guess at when it happens.
+        Assert.True(crashed.Wait(TimeSpan.FromSeconds(15)), "The publication did not reach the failpoint.");
         harness.Restart();
 
         JobSnapshot done = await harness.WaitAsync(added.JobId,

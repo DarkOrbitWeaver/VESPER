@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace VESPER;
 
-internal enum MediaOutputPreference { Original, CompatibleVideo, M4a }
+internal enum MediaOutputPreference { Original, CompatibleVideo, M4a, Opus, Wav }
 
 /// <summary>Single-stream transfer handoff, including durable non-secret source provenance.</summary>
 internal sealed record MediaDownloadChoice(
@@ -14,18 +14,23 @@ internal sealed record MediaDownloadChoice(
     string? Quality = null, string? ThumbnailUrl = null, DateTimeOffset? ExpiresAt = null,
     string? MediaPlanJson = null, string? FormatId = null, MediaOutput Output = MediaOutput.Original,
     string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null,
-    IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null)
+    IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null,
+    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null)
 {
     public string DisplayContainer => Output switch
     {
         MediaOutput.Mp4 => "MP4",
         MediaOutput.M4a => "M4A",
+        MediaOutput.Opus => "Opus",
+        MediaOutput.Wav => "WAV",
         _ => Kind == JobKind.Hls ? "HLS" : Path.GetExtension(FileName).TrimStart('.').ToUpperInvariant()
     };
     public string DisplayDetail => Output switch
     {
-        MediaOutput.M4a => $"AAC · Converts from {ConvertedAudioCodec}",
-        MediaOutput.Mp4 => $"{ConvertedVideoQuality}H.264 + AAC · Converts if supported",
+        MediaOutput.Opus => "Opus · copied without re-encoding",
+        MediaOutput.Wav => "WAV · decoded PCM (does not improve source quality)",
+        MediaOutput.M4a => $"M4A · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
+        MediaOutput.Mp4 => $"MP4 · {ConvertedVideoQuality}converted so it plays everywhere",
         _ => MediaTransferBridge.DisplayQuality(Quality ?? "Available source")
     };
 }
@@ -37,7 +42,6 @@ internal sealed record MediaDownloadChoice(
 /// </summary>
 internal static class MediaTransferBridge
 {
-    private const int HighQualitySourceAacKbps = 192;
 
     internal static string DisplayQuality(string quality) => quality
         .Replace("+ separate audio (merge required)", "+ audio", StringComparison.OrdinalIgnoreCase)
@@ -48,10 +52,25 @@ internal static class MediaTransferBridge
         && (r.Protocol == StreamProtocol.Http || r.Protocol == StreamProtocol.Hls && r.Segments?.HasDiscontinuities != true
             || r.Protocol == StreamProtocol.Dash && r.Segments is { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
                && r.Container is "mp4" or "m4a")
-        && !r.Context.HasCredentials
+        && CanCarryContext(r.Context)
         && r.Context.Origin is null
         && r.Context.AcceptLanguage is null
         && (r.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) == 0;
+
+    private static bool CanCarryContext(MediaRequestContext context) =>
+        context.SensitiveHeaders.All(h => h.Key == "Authorization")
+        && context.Origin is null && context.AcceptLanguage is null;
+
+    // Only this destination's allowed credentials enter the engine. Its redirect walker narrows
+    // them further to the initial origin; secrets never enter a plan, database or recovery manifest.
+    private static IReadOnlyDictionary<string, string>? TransferSecrets(MediaRequestContext context, Uri target)
+    {
+        if (!context.MayForwardCredentialsTo(target)) return null;
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (context.CookieHeader is { } cookie) headers["Cookie"] = cookie;
+        foreach (var header in context.SensitiveHeaders) headers[header.Key] = header.Value;
+        return headers.Count == 0 ? null : headers;
+    }
 
     internal static MediaItem PlayableOnly(MediaItem item)
     {
@@ -72,6 +91,8 @@ internal static class MediaTransferBridge
             || clipStartSeconds is double start && (!double.IsFinite(start) || start < 0)
             || clipEndSeconds is double end && (!double.IsFinite(end) || end <= (clipStartSeconds ?? 0) || end > 31_536_000))
             return (null, "Enter a valid start and end time.");
+        if (exact is null && output is MediaOutputPreference.Opus or MediaOutputPreference.Wav)
+            return PrepareAudioOutput(item, prefs, output, clipStartSeconds, clipEndSeconds);
         if (exact is not null || output == MediaOutputPreference.Original)
             return PrepareSource(item, prefs, exact, out _, clipStartSeconds, clipEndSeconds);
         bool audioOnly = prefs.Mode == QualityMode.AudioOnly || item.Representations.All(r => !r.HasVideo);
@@ -97,7 +118,8 @@ internal static class MediaTransferBridge
             clipStartSeconds, clipEndSeconds);
         if (original.Choice is { } choice && CanConvert(choice)
             && source is { HasAudio: true, Video: { VideoCodec: not null, Hdr: HdrKind.Sdr, Height: null or <= 2304, Width: null or <= 4096 } video }
-            && (source.Audio ?? video).AudioCodec is not null)
+            && (source.Audio ?? video).AudioCodec is not null
+            && CodecCapabilities.Current.CanDecode(video.VideoCodec) && CodecCapabilities.Current.CanDecode((source.Audio ?? video).AudioCodec))
         {
             string? videoQuality = video.Height is int height
                 ? video.FrameRate is > 30.5 ? $"{height}p {Math.Round(video.FrameRate.Value)} fps · " : $"{height}p · "
@@ -105,6 +127,35 @@ internal static class MediaTransferBridge
             return (choice with { Output = MediaOutput.Mp4, ConvertedVideoQuality = videoQuality }, null);
         }
         return original;
+    }
+
+    private static (MediaDownloadChoice? Choice, string? Error) PrepareAudioOutput(MediaItem item, FormatPreferences prefs,
+        MediaOutputPreference output, double? start, double? end)
+    {
+        bool opus = output == MediaOutputPreference.Opus;
+        var pool = item with { Representations = item.Representations.Where(r => r.Content == StreamContent.AudioOnly
+            && r.Container is ("mp4" or "m4a" or "webm" or "mkv")
+            && (opus ? r.AudioCodec == "opus" : OperatingSystem.IsWindows() && CodecCapabilities.Current.CanDecode(r.AudioCodec))).ToArray() };
+        var planned = PrepareSource(pool, prefs with { Mode = QualityMode.AudioOnly }, null, out _);
+        if (planned.Choice is not { } choice)
+            return (null, opus ? "This source has no supported native Opus track to copy." : "WAV requires a source audio track and a Windows decoder for its codec.");
+        if (choice.Kind is not (JobKind.Http or JobKind.Merge))
+            return (null, "This output currently requires a complete MP4 or WebM audio source.");
+        if (opus && start is not null) return (null, "Opus clipping is not available; choose WAV for an exact audio clip.");
+        string? plan = choice.MediaPlanJson;
+        if (start is double first)
+        {
+            var range = new MediaTimeRange(first, end!.Value);
+            if (choice.Kind == JobKind.Merge)
+            {
+                var merge = JsonSerializer.Deserialize<MediaMergePlan>(plan ?? "null");
+                if (merge is null) return (null, "The audio source plan is invalid.");
+                plan = (merge with { OutputRange = range }).ToJson();
+            }
+            else plan = JsonSerializer.Serialize(range);
+        }
+        return (choice with { Output = opus ? MediaOutput.Opus : MediaOutput.Wav, MediaPlanJson = plan,
+            MediaMetadataJson = choice.Kind == JobKind.Http ? SerializeAudioMetadata(item) : null }, null);
     }
 
     private static (MediaDownloadChoice? Choice, string? Error) PrepareM4a(MediaItem item, FormatPreferences prefs,
@@ -118,12 +169,13 @@ internal static class MediaTransferBridge
             return (choice with { FileName = Path.ChangeExtension(choice.FileName, ".m4a") }, null);
 
         string? codec = audio.AudioCodec;
-        bool canEncode = codec is not null && CanConvert(choice)
+        // Only offer a conversion this PC can actually perform (VES-033); otherwise fall back to a native copy.
+        bool canEncode = codec is not null && CanConvert(choice) && CodecCapabilities.Current.CanDecode(codec)
             && audio.AudioChannels is null or 1 or 2 && audio.AudioSampleRate is null or 44100 or 48000;
 
-        // Keep high-bitrate AAC at its source quality, or use available native AAC if encoding is unavailable.
+        // A native AAC stream is copied, never re-encoded: no generation loss, no converter, no wait.
+        // Re-encoding Opus to AAC cannot add quality, so it only happens when there is no native AAC at all.
         MediaRepresentation[] nativeAac = item.Representations.Where(candidate => IsNativeAac(candidate)
-            && (!canEncode || candidate.BitrateKbps >= HighQualitySourceAacKbps)
             && (candidate.AudioChannels ?? 2) == (audio.AudioChannels ?? 2)
             && candidate.IsDefaultAudio == audio.IsDefaultAudio && candidate.IsAudioDescription == audio.IsAudioDescription
             && candidate.AudioTrackId == audio.AudioTrackId
@@ -133,7 +185,12 @@ internal static class MediaTransferBridge
             return (sourceAac with { FileName = Path.ChangeExtension(sourceAac.FileName, ".m4a") }, null);
 
         if (canEncode && codec is not null)
-            return (choice with { Output = MediaOutput.M4a, ConvertedAudioCodec = codec.ToUpperInvariant() }, null);
+        {
+            // A merge job keeps its tags in the plan. A direct file needs them here, or the converted M4A has none.
+            string? tags = choice.MediaMetadataJson
+                ?? (choice.Kind == JobKind.Http && choice.Provider is not null ? SerializeAudioMetadata(item) : null);
+            return (choice with { Output = MediaOutput.M4a, ConvertedAudioCodec = codec.ToUpperInvariant(), MediaMetadataJson = tags }, null);
+        }
 
         return original;
     }
@@ -220,8 +277,7 @@ internal static class MediaTransferBridge
             (plan.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) != 0)
             return (null, "This format requires audio/video processing that VESPER doesn't support yet.");
         TransferStep step = plan.Steps[0];
-        if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash) || step.Context.HasCredentials
-            || step.Context.Origin is not null || step.Context.AcceptLanguage is not null)
+        if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash) || !CanCarryContext(step.Context))
             return (null, "This source needs an unsupported transfer method or request context.");
         if (step.Protocol == StreamProtocol.Hls && step.Segments is not null &&
             !step.Url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
@@ -255,7 +311,7 @@ internal static class MediaTransferBridge
             step.Context.Referer, step.Context.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
             item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
-            SubtitleTracks: subtitles,
+            SubtitleTracks: subtitles, Secrets: TransferSecrets(step.Context, step.Url),
             MediaMetadataJson: step.Protocol == StreamProtocol.Http && item.Kind == MediaKind.Audio
                 && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
                     ? SerializeAudioMetadata(item) : null), null);
@@ -275,8 +331,10 @@ internal static class MediaTransferBridge
             || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
         MediaRequestContext ctx = tracks[0].Context;
-        if (tracks.Any(t => t.Context.HasCredentials || t.Context.Origin is not null || t.Context.AcceptLanguage is not null
-            || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer))
+        if (tracks.Any(t => TransferSecrets(t.Context, t.Url) is not null || !CanCarryContext(t.Context)
+            || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer
+            || t.Context.CookieHeader != ctx.CookieHeader
+            || !t.Context.SensitiveHeaders.OrderBy(h => h.Key).SequenceEqual(ctx.SensitiveHeaders.OrderBy(h => h.Key))))
             return (null, "These streams need different request contexts, which a single merge job cannot carry.");
         if (tracks.Any(t => t.Container is null || t.Protocol == StreamProtocol.Http && t.FileSize is not > 0
             || t.Protocol == StreamProtocol.Hls && t.Container is not ("mp4" or "m4a" or "ts")
@@ -327,7 +385,8 @@ internal static class MediaTransferBridge
         string summary = DisplayQuality(selection.Summary);
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
-            merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles), null);
+            merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles,
+            Secrets: TransferSecrets(ctx, tracks[0].Url)), null);
     }
 
     private static MediaMergeMetadata? MergeMetadata(MediaItem item, bool includeChapters)
@@ -431,6 +490,7 @@ internal static class MediaTransferBridge
                 string fileName = FileNames.Sanitize($"{Path.GetFileNameWithoutExtension(choice.FileName)}.{language}.{format}");
                 expanded.Add(choice with
                 {
+                    Secrets = null, // A subtitle URL must never inherit the media origin's credentials.
                     Url = subtitle.Url.AbsoluteUri,
                     FileName = fileName,
                     Kind = segmented ? JobKind.Hls : JobKind.Http,
@@ -459,6 +519,7 @@ internal static class MediaTransferBridge
 
     internal static bool SupportsSegmentClip(MediaDownloadChoice choice)
     {
+        if (choice.Output == MediaOutput.Wav) return true;
         if (choice.Kind == JobKind.Hls) return true;
         if (choice.MediaPlanJson is null) return false;
         try

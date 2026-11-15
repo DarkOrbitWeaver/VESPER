@@ -116,10 +116,12 @@ public sealed class DiscoveryReliabilityTests
     public async Task Cache_DoesNotRetainAdapterIssuedSessionCookies()
     {
         const string url = "https://www.tiktok.com/@fixtureuser/video/7234567890123456789";
-        var handler = new FakeHttpHandler().Add(url, Fixture.Load("tiktok_page.html"), headers: new() { ["Set-Cookie"] = "sid=secret; HttpOnly" });
+        string page = Fixture.Load("tiktok_page.html").Replace("v16.tiktokcdn-fixture.example", "v16-webapp-prime.us.tiktok.com", StringComparison.Ordinal);
+        var handler = new FakeHttpHandler().Add(url, page, headers: new() { ["Set-Cookie"] = "tt_chain_token=secret; Domain=.tiktok.com; Path=/; Secure; HttpOnly" });
         using var resolver = new DefaultMediaResolver(handler: handler);
+        var first = await resolver.ResolveAsync(new() { Url = new(url) }, CancellationToken.None);
         await resolver.ResolveAsync(new() { Url = new(url) }, CancellationToken.None);
-        await resolver.ResolveAsync(new() { Url = new(url) }, CancellationToken.None);
+        Assert.Equal("tt_chain_token=secret", first.Item!.Representations[0].Context.CookieHeader);
         Assert.Equal(2, handler.Requests.Count);
     }
 

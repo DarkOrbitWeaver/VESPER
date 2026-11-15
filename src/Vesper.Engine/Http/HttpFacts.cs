@@ -20,6 +20,10 @@ public static class HttpFacts
 
     public static string? ContentType(HttpResponseMessage response) => response.Content.Headers.ContentType?.MediaType;
 
+    /// <summary>True when the server says it honours byte ranges, so a length can be confirmed after the fact.</summary>
+    public static bool AcceptsRanges(HttpResponseMessage response) =>
+        response.Headers.AcceptRanges.Any(r => r.Equals("bytes", StringComparison.OrdinalIgnoreCase));
+
     public static bool IsHtml(HttpResponseMessage response) =>
         ContentType(response) is "text/html" or "application/xhtml+xml";
 

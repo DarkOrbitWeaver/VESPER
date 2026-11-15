@@ -221,8 +221,21 @@ public sealed class DownloadGrid : ScrollableControl
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
-        // ScrollableControl raises OnScroll when the offset really changes.
+        int before = AutoScrollPosition.Y;
         base.OnMouseWheel(e);
+        if (AutoScrollPosition.Y != before) { Invalidate(); LoadVisiblePosters(); }
+    }
+
+    // ScrollableControl scrolls by blitting the client pixels (ScrollWindowEx) and invalidating only the newly
+    // exposed strip. That moves the fixed header into the body and rows under the header, and OnPaint only
+    // repaints the strip, so the stale copies stay on screen: the "duplicate Name/Activity/Transfer/Size"
+    // artifacts. After any scroll message the whole client area is repainted from the back buffer.
+    private const int WM_HSCROLL = 0x0114, WM_VSCROLL = 0x0115, WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg is WM_HSCROLL or WM_VSCROLL or WM_MOUSEWHEEL or WM_MOUSEHWHEEL) Invalidate();
     }
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -328,6 +341,10 @@ public sealed class DownloadGrid : ScrollableControl
     {
         base.OnPaint(e);
         Graphics g = e.Graphics;
+        // Paint in client coordinates even if the scroll offset leaked into the transform.
+        g.ResetTransform();
+        g.ResetClip();
+        g.SetClip(e.ClipRectangle);
         using (var background = new SolidBrush(_palette.Surface))
             g.FillRectangle(background, e.ClipRectangle);
         int scrolled = -AutoScrollPosition.Y;
@@ -342,7 +359,14 @@ public sealed class DownloadGrid : ScrollableControl
             for (int i = first; i < last; i++) PaintRow(g, i);
             g.Restore(original);
         }
-        if (e.ClipRectangle.Top < _headerHeight) PaintHeader(g);
+        // The header sits over the rows and is painted last, whenever any part of it is dirty.
+        if (e.ClipRectangle.Top < _headerHeight)
+        {
+            var original = g.Save();
+            g.SetClip(new Rectangle(0, 0, Math.Max(1, ClientSize.Width), _headerHeight), CombineMode.Intersect);
+            PaintHeader(g);
+            g.Restore(original);
+        }
         if (_items.Count == 0)
         {
             var text = new Rectangle(20, _headerHeight + Math.Max(40, (Height - _headerHeight) / 3), Width - 40, 50);
@@ -405,6 +429,7 @@ public sealed class DownloadGrid : ScrollableControl
     {
         DownloadItem item = _items[index];
         Rectangle row = RowRectangle(index);
+        if (row.Bottom <= _headerHeight) return;              // fully hidden under the header
         bool isChecked = _checked.Contains(item.Id);
         Color color = isChecked && !_palette.HighContrast
             ? _palette.Selection

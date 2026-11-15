@@ -70,6 +70,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             await SettleAsync();
             return RunOutcome.NeedsAttention("blocked", ex.Message);
         }
+        catch (ProxyConfigurationException ex)
+        {
+            return RunOutcome.NeedsAttention("proxy", ex.Message);
+        }
         catch (RedirectException ex)
         {
             await SettleAsync();
@@ -259,7 +263,9 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         if (code == 200)
         {
             RejectHtml(r);
-            bool decoded = !HttpFacts.IsIdentityEncoded(r);
+            // A .tar.gz served with "Content-Encoding: gzip" is the file itself, not a transport encoding.
+            // Decoding it would save a tar under a .tar.gz name. Chromium leaves such files alone, and so do we.
+            bool decoded = !HttpFacts.IsIdentityEncoded(r) && !IsSelfCompressed(r, Job.FileName);
             long? length = decoded ? null : r.Content.Headers.ContentLength;
             if (fresh) return new FirstResult(r, 0, Ranged: false, Replay: false, decoded, length);
 
@@ -314,13 +320,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             {
                 j.ETag = HttpFacts.StrongEtag(r);
                 j.LastModified = HttpFacts.LastModified(r);
+                // RFC 9110 13.1.5: a Last-Modified date may be used in If-Range only when it is strong, which means
+                // the server's Date is at least one second later. Otherwise two versions could share the date.
+                bool strongDate = j.LastModified is { } modified
+                    && (r.Headers.Date is not { } date || date - modified >= TimeSpan.FromSeconds(1));
                 j.Identity = j.ETag is not null ? IdentityLevel.StrongEtag
-                    : j.LastModified is not null ? IdentityLevel.LastModified : IdentityLevel.None;
+                    : j.LastModified is not null && strongDate ? IdentityLevel.LastModified : IdentityLevel.None;
                 j.TotalBytes = first.Total;
                 j.NonResumable = first.Decoded;
             }
             j.TotalBytes ??= first.Total;
-            j.AcceptsRanges = first.Ranged || (j.AcceptsRanges && first.Replay);
+            j.AcceptsRanges = first.Ranged || HttpFacts.AcceptsRanges(first.Response) || (j.AcceptsRanges && first.Replay);
             j.ContentType ??= HttpFacts.ContentType(r);
             if (!j.NameLocked && fresh)
             {
@@ -375,7 +385,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         async Task WorkerAsync(bool takesFirst)
         {
             session.AddConnection();
-            HttpResponseMessage? open = takesFirst ? first.Response : null;
+            HttpResponseMessage? open = takesFirst ? firstResponse : null;
             try
             {
                 while (!workersCts.IsCancellationRequested)
@@ -401,8 +411,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
 
         // The first connection may wait for a free host slot; extra ones are only opened if a slot is free right now.
-        await hostGate.WaitAsync(ct).ConfigureAwait(false);
-        firstResponse = null;   // ownership passes to the first worker
+        if (!hostGate.Wait(0))
+        {
+            firstResponse?.Dispose();
+            firstResponse = null;
+            await hostGate.WaitAsync(ct).ConfigureAwait(false);
+        }
         workers.Add(Task.Run(() => WorkerAsync(takesFirst: true), CancellationToken.None));
 
         long lastChange = Stopwatch.GetTimestamp();
@@ -542,11 +556,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         try
         {
             await using Stream body = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             while (true)
             {
                 long remaining = board.Remaining(segment);
                 if (remaining <= 0) return;
-                int read = await ReadAsync(body, buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct).ConfigureAwait(false);
+                int read = await ReadAsync(body, buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), stall, ct).ConfigureAwait(false);
                 if (read == 0) return;                                    // server ended early; the caller reconnects
 
                 int n = board.ClaimChunk(segment, read);                  // the span may have been split while we were reading
@@ -576,10 +591,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         {
             await using Stream raw = await first.Response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             await using Stream body = first.Decoded ? Decode(raw, first.Response) : raw;
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
             while (true)
             {
-                int read = await ReadAsync(body, buffer, ct).ConfigureAwait(false);
+                int read = await ReadAsync(body, buffer, stall, ct).ConfigureAwait(false);
                 if (read == 0) break;
                 int skip = 0;
 
@@ -604,13 +620,65 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             if (!first.Decoded && first.Total is long expected && offset != expected)
                 throw new TransientNetworkException($"The connection closed after {Formatting.Bytes(offset)} of {Formatting.Bytes(expected)}.");
 
-            if (Job.TotalBytes is null) engine.UpdateJob(Job, j => j.TotalBytes = offset);   // unknown length: the stream's end defines it
+            if (Job.TotalBytes is null)
+            {
+                // The stream's end defined the total. A reset that looks like a clean close would otherwise
+                // publish a silently short file, so confirm the length when the server allows it.
+                await VerifyUnknownLengthAsync(offset, ct).ConfigureAwait(false);
+                engine.UpdateJob(Job, j => j.TotalBytes = offset);
+            }
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
             ArrayPool<byte>.Shared.Return(local);
         }
+    }
+
+    /// <summary>True when the saved file is already a compressed archive, so a Content-Encoding header describes the file.</summary>
+    private static bool IsSelfCompressed(HttpResponseMessage response, string fileName)
+    {
+        string ext = Path.GetExtension(fileName).ToLowerInvariant();
+        if (ext is ".gz" or ".tgz" or ".br" or ".zz" or ".zst" or ".bz2" or ".xz" or ".7z" or ".zip" or ".rar") return true;
+        return HttpFacts.ContentType(response)?.ToLowerInvariant() is
+            "application/gzip" or "application/x-gzip" or "application/x-bzip2" or "application/zstd"
+            or "application/x-7z-compressed" or "application/zip" or "application/x-rar-compressed";
+    }
+
+    /// <summary>
+    /// The body ended without a stated length. Ask for one byte past what we hold: a 416 whose range is
+    /// exactly our offset, or a 206 whose total matches, proves the file is complete. A larger total means
+    /// the connection closed early. When the server cannot answer, the file is kept but marked unverified.
+    /// </summary>
+    private async Task VerifyUnknownLengthAsync(long offset, CancellationToken ct)
+    {
+        if (!Job.AcceptsRanges || Job.NonResumable) return;
+        try
+        {
+            using HttpResponseMessage probe = await http.SendAsync(_url, BuildSpec(offset, null), ct).ConfigureAwait(false);
+            if ((int)probe.StatusCode == 416)
+            {
+                RangeCheck check = HttpFacts.CheckRangeResponse(probe, offset, null);
+                if (check.IsValid || check.Total == offset) return;   // the server agrees the file ends here
+            }
+            else if ((int)probe.StatusCode == 206)
+            {
+                RangeCheck check = HttpFacts.CheckRangeResponse(probe, offset, null);
+                if (check.Total is long total && total == offset) return;
+                if (check.Total is long longer && longer > offset)
+                    throw new TransientNetworkException(
+                        $"The connection closed after {Formatting.Bytes(offset)} of {Formatting.Bytes(longer)}.");
+            }
+        }
+        catch (Exception ex) when (ex is TransientNetworkException or RedirectException or HttpRequestException or IOException)
+        {
+            // The probe itself failed; fall through and mark the file unverified rather than lose it.
+        }
+        engine.UpdateJob(Job, j =>
+        {
+            j.Reason = "unverified-length";
+            j.Message = "Finished, but the server didn't state the size, so VESPER can't prove it's complete.";
+        });
     }
 
     private static Stream Decode(Stream body, HttpResponseMessage response)
@@ -625,9 +693,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         };
     }
 
-    private async ValueTask<int> ReadAsync(Stream body, Memory<byte> buffer, CancellationToken ct)
+    // One stall timer per stream, re-armed before each read. A stall abandons the stream, so the timer never
+    // needs resetting. (A linked CTS per 128 KiB read cost thousands of allocations a second on fast links.)
+    private async ValueTask<int> ReadAsync(Stream body, Memory<byte> buffer, CancellationTokenSource stall, CancellationToken ct)
     {
-        using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
         stall.CancelAfter(_o.StallTimeout);
         try { return await body.ReadAsync(buffer, stall.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)

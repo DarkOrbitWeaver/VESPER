@@ -3,14 +3,17 @@
 .EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0
 .EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0 -PortableOnly
 .NOTES     Output: release\setup-<version>\VESPER-Setup.exe and release\VESPER-<version>.zip.
-           The executables are NOT code-signed. Windows SmartScreen may warn on first run.
+           Signing requires VESPER_SIGN_CERT_SHA1 (Windows certificate store). Use -AllowUnsigned only for development.
            The setup is self-contained. The ZIP is a portable app payload; use -SelfContained to bundle
            the .NET runtime in that payload as well.
 #>
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.2",
     [switch]$SkipTests,
+    [string]$SigningCertificateThumbprint = $env:VESPER_SIGN_CERT_SHA1,
+    [uri]$TimestampServer = 'https://timestamp.digicert.com',
+    [switch]$AllowUnsigned,
     [switch]$SelfContained,
     [switch]$PortableOnly,
     [ValidatePattern('^10\.0\.[0-9]+$')][string]$RuntimeVersion
@@ -23,6 +26,21 @@ function Run($label, [scriptblock]$block) {
     Write-Host "==> $label" -ForegroundColor Green
     & $block
     if ($LASTEXITCODE -ne 0) { throw "$label failed (exit code $LASTEXITCODE)" }
+}
+
+if (-not $PSBoundParameters.ContainsKey('Version')) {
+    [xml]$props = Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw
+    $Version = [string]$props.Project.PropertyGroup.Version
+}
+if (-not $SigningCertificateThumbprint -and -not $AllowUnsigned) {
+    throw 'A release needs an Authenticode certificate. Set VESPER_SIGN_CERT_SHA1, or explicitly use -AllowUnsigned for local development.'
+}
+if ($TimestampServer.Scheme -ne 'https') { throw 'The signing timestamp service must use HTTPS.' }
+function Sign-ReleaseFile([string]$path) {
+    if (-not $SigningCertificateThumbprint) { Write-Warning "Unsigned development binary: $path"; return }
+    $tool = Get-Command signtool.exe -ErrorAction Stop
+    Run "Sign $path" { & $tool.Source sign /sha1 $SigningCertificateThumbprint /fd SHA256 /tr $TimestampServer.AbsoluteUri /td SHA256 $path }
+    Run "Verify signature $path" { & $tool.Source verify /pa $path }
 }
 
 if (-not $SkipTests) {
@@ -48,8 +66,17 @@ if ($RuntimeVersion) { $runtimeArgs += "-p:RuntimeFrameworkVersion=$RuntimeVersi
 Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
 Run "Publish native-messaging host" { dotnet publish src/Vesper.NativeHost/Vesper.NativeHost.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
 
+Sign-ReleaseFile (Join-Path $out 'VESPER.exe')
+Sign-ReleaseFile (Join-Path $out 'vesper-host.exe')
+
 Write-Host "==> Extension" -ForegroundColor Green
 Copy-Item (Join-Path $root "extension") (Join-Path $out "extension") -Recurse -Force
+$manifestFile = Join-Path $out 'extension/manifest.json'
+$extensionManifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
+$extensionManifest.version = ($Version -split '-')[0]
+$extensionManifest | Add-Member -NotePropertyName version_name -NotePropertyValue $Version -Force
+$extensionManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+
 if (-not $PortableOnly) {
     Write-Host "==> Build offline First Flight setup"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -76,6 +103,7 @@ if (-not $PortableOnly) {
                 -p:EnableCompressionInSingleFile=true "-p:SetupPayload=$payloadPath" "-p:SetupManifest=$manifestPath" @runtimeArgs
         }
         $setupExe = Join-Path $setupOut 'VESPER-Setup.exe'
+        Sign-ReleaseFile $setupExe
         "$((Get-FileHash -LiteralPath $setupExe).Hash)  VESPER-Setup.exe" | Set-Content -LiteralPath (Join-Path $setupOut 'SHA256SUMS.txt')
         Write-Host "Setup: $setupExe"
     }
@@ -95,5 +123,5 @@ Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" } | Set-Content (Join-Path $out "SHA256SUMS.txt")
 Compress-Archive -Path "$out\*" -DestinationPath $zip
 Write-Host "Done: $zip" -ForegroundColor Green
-if (-not $PortableOnly) { Write-Host "First Flight setup is unsigned: $(Join-Path $setupOut 'VESPER-Setup.exe')" }
+if (-not $PortableOnly) { Write-Host "First Flight: $(Join-Path $setupOut 'VESPER-Setup.exe')" }
 else { Write-Host "Portable ZIP only. It does not register VESPER's browser helper." }

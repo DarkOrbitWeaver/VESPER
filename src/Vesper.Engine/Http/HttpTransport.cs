@@ -24,6 +24,9 @@ public sealed class RedirectException(string message) : Exception(message);
 /// <summary>A network failure worth retrying (stall, timeout, reset).</summary>
 public sealed class TransientNetworkException(string message, Exception? inner = null) : Exception(message, inner);
 
+/// <summary>The configured proxy cannot be used. This is a settings problem, not a network problem, so it is never retried.</summary>
+public sealed class ProxyConfigurationException(string message) : Exception(message);
+
 /// <summary>
 /// The only place that talks to the network. Wraps HttpClient/SocketsHttpHandler with:
 /// manual redirects (loop detection, no https→http, re-validation per hop),
@@ -38,6 +41,7 @@ internal sealed class HttpTransport : IDisposable
     private readonly HttpClient _client;
     private readonly OriginAwareProxy? _originAwareProxy;
     private readonly bool _validateProxyDns;
+    private readonly string? _proxyError;
 
     public HttpTransport(EngineOptions options)
     {
@@ -64,9 +68,14 @@ internal sealed class HttpTransport : IDisposable
                 handler.UseProxy = true;
                 proxy = HttpClient.DefaultProxy;
                 break;
-            case ProxyMode.Custom when Uri.TryCreate(options.ProxyAddress, UriKind.Absolute, out Uri? customProxy):
+            case ProxyMode.Custom when IsUsableProxy(options.ProxyAddress, out Uri? customProxy):
                 proxy = new WebProxy(customProxy);
                 handler.UseProxy = true;
+                break;
+            case ProxyMode.Custom:
+                // A mistyped proxy must not quietly become the system proxy or a direct connection.
+                _proxyError = "The custom proxy address is invalid. Fix it in Settings, Network.";
+                handler.UseProxy = false;
                 break;
         }
         if (handler.UseProxy)
@@ -80,9 +89,18 @@ internal sealed class HttpTransport : IDisposable
         _client = new HttpClient(handler, disposeHandler: true) { Timeout = Timeout.InfiniteTimeSpan };
     }
 
+    private static bool IsUsableProxy(string? address, out Uri? proxy)
+    {
+        proxy = null;
+        return !string.IsNullOrWhiteSpace(address)
+            && Uri.TryCreate(address.Trim(), UriKind.Absolute, out proxy)
+            && proxy.Scheme is "http" or "https" && !string.IsNullOrEmpty(proxy.Host);
+    }
+
     /// <summary>Follows redirects and returns the final response with headers read, body unread.</summary>
     public async Task<HttpResponseMessage> SendAsync(Uri url, RequestSpec spec, CancellationToken ct)
     {
+        if (_proxyError is not null) throw new ProxyConfigurationException(_proxyError);
         var visited = new HashSet<string>(StringComparer.Ordinal);
         Uri current = url;
         Uri? credentialOrigin = null;
@@ -226,33 +244,18 @@ internal sealed class HttpTransport : IDisposable
     /// Resolves and connects ourselves so that the address actually used is the address that was checked,
     /// closing the DNS-rebinding gap between validation and connection.
     /// </summary>
+    // Addresses are tried with a short stagger (RFC 8305 Happy Eyeballs): a black-holed IPv6 route no longer
+    // eats the whole connect budget while a working IPv4 route sits untried. At most two attempts in flight.
     private async ValueTask<Stream> ConnectValidatedAsync(SocketsHttpConnectionContext context, CancellationToken ct)
     {
         string host = context.DnsEndPoint.Host;
-        IPAddress[] addresses = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
-        Exception? last = null;
+        IPAddress[] resolved = _options.ResolveHost is { } resolveHost
+            ? await resolveHost(host, ct).ConfigureAwait(false)
+            : await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+        IPAddress[] allowed = resolved.Where(a => _options.AllowPrivateNetworks || UrlPolicy.IsPublicAddress(a)).ToArray();
+        if (allowed.Length == 0) throw new BlockedAddressException(host);
 
-        foreach (IPAddress address in addresses)
-        {
-            if (!_options.AllowPrivateNetworks && !UrlPolicy.IsPublicAddress(address))
-            {
-                last = new BlockedAddressException(host);
-                continue;
-            }
-            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(new IPEndPoint(address, context.DnsEndPoint.Port), ct).ConfigureAwait(false);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch (Exception ex)
-            {
-                socket.Dispose();
-                if (ct.IsCancellationRequested) throw;
-                last = ex;
-            }
-        }
-        throw last ?? new SocketException((int)SocketError.HostNotFound);
+        return await NetworkConnector.ConnectAsync(allowed, context.DnsEndPoint.Port, ct).ConfigureAwait(false);
     }
 
     public void Dispose() => _client.Dispose();

@@ -11,10 +11,13 @@ public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType)
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
     IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
     Guid? MediaSession = null, int? FormatChoice = null, BrowserTransferProof? BrowserProof = null,
-    string? TransferId = null, string? Operation = null, BrowserCompletedFile? CompletedFile = null,
-    BrowserActivity? Activity = null);
+    string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
+    MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
+    IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false);
 
-public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null);
+/// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
+public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
+    string? TransferReason = null);
 
 public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, string Message,
     IReadOnlyList<BridgeResult>? Results = null, object? Data = null, string? AppVersion = null)
@@ -99,8 +102,8 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "probe" or "submit" or "media-picker" or "media-options" or "media-select"
-                or "browser-submit" or "browser-transfer" or "browser-completed" or "browser-activity"))
+            if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-select"
+                or "browser-submit" or "browser-transfer" or "browser-activity"))
             { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
@@ -111,14 +114,25 @@ public static class BridgeProtocol
             string? probeUrl = null;
             Guid? mediaSession = null;
             int? formatChoice = null;
+            MediaTimeRange? clip = null;
+            string? audioTrack = null;
+            List<string>? subtitleLanguages = null;
+            bool autoSubtitles = false;
+            BridgeItem? mediaAuth = null;
             BrowserTransferProof? browserProof = null;
-            BrowserCompletedFile? completedFile = null;
             BrowserActivity? activity = null;
             string? transferId = null, operation = null;
             if (type is "probe" or "media-picker" or "media-options")
             {
                 probeUrl = Str(root, "url");
                 if (!UrlPolicy.TryParse(probeUrl, out _, out error)) return false;
+                if (type is ("media-picker" or "media-options") && root.TryGetProperty("mediaAuth", out var auth))
+                {
+                    bool authorized = root.TryGetProperty("authorized", out var consent) && consent.ValueKind == JsonValueKind.True;
+                    if (!authorized || !TryItem(auth, authorized, out mediaAuth, out error)
+                        || mediaAuth is null || mediaAuth.Url != probeUrl || mediaAuth.Kind != "http")
+                    { error = "Invalid media authorization context."; return false; }
+                }
                 if (type is ("media-picker" or "media-options") && root.TryGetProperty("candidates", out JsonElement candidates))
                 {
                     if (candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 25)
@@ -144,10 +158,38 @@ public static class BridgeProtocol
                     || !root.TryGetProperty("formatChoice", out var choice) || choice.ValueKind != JsonValueKind.Number
                     || !choice.TryGetInt32(out int index) || index is < 0 or >= 64)
                 { error = "Invalid media selection."; return false; }
+                audioTrack = Str(root, "audioTrack");
+                if (audioTrack is { Length: > 256 } || audioTrack?.Any(char.IsControl) == true)
+                { error = "Invalid audio track."; return false; }
+                if (root.TryGetProperty("subtitles", out var subtitles))
+                {
+                    if (subtitles.ValueKind != JsonValueKind.Array || subtitles.GetArrayLength() > 25)
+                    { error = "Invalid subtitle selection."; return false; }
+                    subtitleLanguages = [];
+                    foreach (var language in subtitles.EnumerateArray())
+                    {
+                        if (language.ValueKind != JsonValueKind.String || language.GetString() is not { Length: > 0 and <= 35 } tag
+                            || tag.Any(c => !char.IsAsciiLetterOrDigit(c) && c is not ('-' or '_')))
+                        { error = "Invalid subtitle language."; return false; }
+                        if (!subtitleLanguages.Contains(tag)) subtitleLanguages.Add(tag);
+                    }
+                }
+                autoSubtitles = root.TryGetProperty("includeAutoSubtitles", out var auto) && auto.ValueKind == JsonValueKind.True;
                 mediaSession = session;
                 formatChoice = index;
+                // "Download part": optional start/end in seconds, checked again by the planner.
+                if (root.TryGetProperty("range", out JsonElement range) && range.ValueKind != JsonValueKind.Null)
+                {
+                    if (range.ValueKind != JsonValueKind.Object
+                        || !range.TryGetProperty("start", out JsonElement startValue) || startValue.ValueKind != JsonValueKind.Number
+                        || !range.TryGetProperty("end", out JsonElement endValue) || endValue.ValueKind != JsonValueKind.Number
+                        || !startValue.TryGetDouble(out double start) || !endValue.TryGetDouble(out double end)
+                        || !double.IsFinite(start) || !double.IsFinite(end) || start < 0 || end <= start || end > 31_536_000)
+                    { error = "Invalid time range."; return false; }
+                    clip = new MediaTimeRange(start, end);
+                }
             }
-            else if (type is "submit" or "browser-submit")
+            else if (type is "submit" or "batch-review" or "browser-submit")
             {
                 if (!root.TryGetProperty("items", out JsonElement array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() is 0 or > MaxItems)
                 { error = $"Provide between 1 and {MaxItems} items."; return false; }
@@ -176,17 +218,6 @@ public static class BridgeProtocol
                 if (!IsRequestId(transferId) || operation is not ("accept" or "abandon" or "status" or "watch"))
                 { error = "Invalid browser transfer."; return false; }
             }
-            else if (type == "browser-completed")
-            {
-                string? path = Str(root, "path"), origin = Str(root, "origin");
-                transferId = Str(root, "transferId");
-                if (path is not { Length: > 0 and <= 4096 } || path.Any(char.IsControl)
-                    || !TryLength(root, "length", out long? length) || length is null
-                    || (transferId is not null && !IsRequestId(transferId))
-                    || (origin is not null && (origin.Length > 512 || !UrlPolicy.TryParse(origin, out _, out _))))
-                { error = "Invalid completed browser download."; return false; }
-                completedFile = new BrowserCompletedFile(path, length.Value, origin);
-            }
             else if (type == "browser-activity")
             {
                 operation = Str(root, "operation");
@@ -197,7 +228,7 @@ public static class BridgeProtocol
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
             string? pageTitle = type is ("media-picker" or "media-options") && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
-                confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, completedFile, activity);
+                confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth, audioTrack, subtitleLanguages, autoSubtitles);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)

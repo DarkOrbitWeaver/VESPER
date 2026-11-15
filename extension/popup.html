@@ -40,10 +40,18 @@
         <option value="chrome">Keep Chrome’s connection</option>
       </select>
     </label>
+    <p id="first-run" class="hint" hidden>VESPER takes over safe downloads; Chrome keeps the rest. You can turn capture off below.</p>
     <label class="check"><input type="checkbox" id="intercept"><span>Capture downloads automatically</span></label>
     <label class="check"><input type="checkbox" id="signin" disabled><span>Use site sign-in <small id="signin-access">Chrome permission required.</small></span></label>
+    <p id="versions" class="hint"></p>
+    <section id="recent" hidden aria-labelledby="recent-title">
+      <h2 id="recent-title">Recent downloads</h2>
+      <ul id="decisions"></ul>
+      <p id="recent-result" class="result" role="status"></p>
+    </section>
   </main>
   <script src="theme.js"></script>
+  <script src="capture-reasons.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

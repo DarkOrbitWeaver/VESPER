@@ -14,7 +14,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\NetworkConnector.cs" Link="Http\NetworkConnector.cs" />
     <Compile Include="..\Shared\OriginAwareProxy.cs" Link="Core\OriginAwareProxy.cs" />
+    <Compile Include="..\Shared\NetworkAddressPolicy.cs" Link="Security\NetworkAddressPolicy.cs" />
+    <Compile Include="..\Shared\FileNameRules.cs" Link="Security\FileNameRules.cs" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Tests" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />
   </ItemGroup>

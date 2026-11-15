@@ -8,8 +8,9 @@ namespace VESPER;
 
 internal sealed partial class BrowserBridgeHandler
 {
-    private sealed record MediaSession(DateTimeOffset Expires, MediaDownloadChoice[] Choices);
-    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container);
+    private sealed record ChoiceRecipe(FormatPreferences Preferences, MediaRepresentation? Exact, MediaOutputPreference Output);
+    private sealed record MediaSession(DateTimeOffset Expires, MediaDownloadChoice[] Choices, MediaItem Item, ChoiceRecipe[] Recipes);
+    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container, bool CanClip);
     private readonly Dictionary<Guid, MediaSession> _mediaSessions = [];
     private readonly object _mediaSessionsLock = new();
 
@@ -35,10 +36,19 @@ internal sealed partial class BrowserBridgeHandler
     {
         Schema = BrowserDiscoveryMessage.CurrentSchema,
         PageUrl = page.AbsoluteUri,
-        Title = request.PageTitle,
+        Title = request.PageTitle, UserAgent = request.MediaAuth?.UserAgent,
+        Authorization = MediaAuthorization(request, page),
         Candidates = (request.Candidates ?? []).Select(h => new BrowserMediaCandidate
         { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network" }).ToList()
     };
+
+    private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page) =>
+        request.MediaAuth is not { } auth ? null : new BrowserAuthorization
+        {
+            Origin = page.GetLeftPart(UriPartial.Authority), ConsentGranted = true,
+            CookieHeader = auth.Cookie, AllowedHosts = [page.Host],
+            Headers = auth.Authorization is { } value ? new() { ["Authorization"] = value } : null
+        };
 
     private async Task<BridgeResponse> MediaOptionsAsync(BridgeRequest request, CancellationToken ct)
     {
@@ -68,6 +78,17 @@ internal sealed partial class BrowserBridgeHandler
     {
         var playable = PlayableOnly(item);
         var jobs = new List<MediaDownloadChoice>();
+        var recipes = new List<ChoiceRecipe>();
+        ChoiceRecipe? recipe = null;
+        var problems = new List<string>();
+        (MediaDownloadChoice? Choice, string? Error) Plan(FormatPreferences preferences, MediaRepresentation? exact = null,
+            MediaOutputPreference output = MediaOutputPreference.Original)
+        {
+            recipe = new ChoiceRecipe(preferences, exact, output);
+            var planned = Prepare(playable, preferences, exact, output);
+            if (planned.Error is { } error && !problems.Contains(error)) problems.Add(error);
+            return planned;
+        }
         var presets = new List<BrowserOption>();
         var originalPresets = new List<BrowserOption>();
         var exact = new List<BrowserOption>();
@@ -84,8 +105,9 @@ internal sealed partial class BrowserBridgeHandler
                 cacheBytes += bytes;
                 index = jobs.Count;
                 jobs.Add(job);
+                recipes.Add(recipe ?? new ChoiceRecipe(FormatPreferences.BestQuality, null, MediaOutputPreference.Original));
             }
-            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer);
+            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer, SupportsSegmentClip(job));
         }
         void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
         {
@@ -102,16 +124,28 @@ internal sealed partial class BrowserBridgeHandler
         {
             foreach (var (label, preference) in quality)
             {
-                Offer(Prepare(playable, preference, output: MediaOutputPreference.CompatibleVideo).Choice, label, presets);
-                Offer(Prepare(playable, preference).Choice, label, originalPresets);
+                Offer(Plan(preference, output: MediaOutputPreference.CompatibleVideo).Choice, label, presets);
+                Offer(Plan(preference).Choice, label, originalPresets);
             }
         }
-        MediaDownloadChoice? sourceAudio = Prepare(playable, FormatPreferences.AudioOnly).Choice;
+        MediaDownloadChoice? sourceAudio = Plan(FormatPreferences.AudioOnly).Choice;
         Offer(sourceAudio, "Audio only", presets);
         Offer(sourceAudio, "Audio only", originalPresets);
-        MediaDownloadChoice? alternate = Prepare(playable, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice;
+        MediaDownloadChoice? alternate = Plan(FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice;
         BrowserOption? audioM4a = alternate != sourceAudio && presets.Any(c => c.Label == "Audio only")
             ? OptionFor(alternate, "Audio only") : null;
+
+        var audioOutputs = new List<object>();
+        void AudioOutput(MediaOutputPreference output, string label)
+        {
+            var planned = Plan(FormatPreferences.AudioOnly, output: output).Choice;
+            if (planned is null || output == MediaOutputPreference.M4a && planned.DisplayContainer != "M4A") return;
+            if (OptionFor(planned, "Audio only") is { } option) audioOutputs.Add(new { label, choice = option });
+        }
+        AudioOutput(MediaOutputPreference.M4a, "M4A — plays everywhere");
+        AudioOutput(MediaOutputPreference.Original, "Original audio");
+        AudioOutput(MediaOutputPreference.Opus, "Opus — copied, no re-encoding");
+        AudioOutput(MediaOutputPreference.Wav, "WAV — decoded PCM");
 
         foreach (var format in playable.Representations.OrderByDescending(r => r.Height ?? 0)
                      .ThenByDescending(r => r.FrameRate ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).Take(56))
@@ -121,11 +155,13 @@ internal sealed partial class BrowserBridgeHandler
                 format.FrameRate is > 30.5 ? $"{Math.Round(format.FrameRate.Value)} fps" : null,
                 (format.VideoCodec ?? format.AudioCodec)?.ToUpperInvariant(),
                 format.BitrateKbps is int bitrate ? $"{bitrate} kbps" : null };
-            Offer(Prepare(playable, FormatPreferences.BestQuality, format).Choice,
+            Offer(Plan(FormatPreferences.BestQuality, format).Choice,
                 string.Join(" · ", parts.Where(part => part is not null)), exact);
         }
 
-        if (jobs.Count == 0) return BridgeResponse.Fail(requestId, "unavailable", "No compatible formats are available for this media.");
+        if (jobs.Count == 0) return BridgeResponse.Fail(requestId, "unavailable", playable.Representations.Count == 0
+            ? "The page supplied metadata but no supported clear media address. Play the video and refresh formats; sign-in, DRM or a changed provider response may prevent access."
+            : problems.FirstOrDefault() ?? "All source addresses have expired. Refresh the page and try again.");
         if (presets.Count == 0)
         {
             if (originalPresets.Count > 0) presets.AddRange(originalPresets);
@@ -142,32 +178,57 @@ internal sealed partial class BrowserBridgeHandler
             foreach (Guid expired in _mediaSessions.Where(entry => entry.Value.Expires <= now).Select(entry => entry.Key).ToArray())
                 _mediaSessions.Remove(expired);
             if (_mediaSessions.Count >= 6) _mediaSessions.Remove(_mediaSessions.MinBy(entry => entry.Value.Expires).Key);
-            _mediaSessions[session] = new MediaSession(now.AddMinutes(5), jobs.ToArray());
+            _mediaSessions[session] = new MediaSession(now.AddMinutes(5), jobs.ToArray(), playable, recipes.ToArray());
         }
         return BridgeResponse.Success(requestId, data: new
         {
             mediaSession = session.ToString("N"), item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
-            choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, more = exact
+            choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,
+            audioTracks = item.AudioTracks.Select((track, index) => new { track.Id,
+                label = (track.Name ?? track.Language ?? "Audio") + (track.IsDefault ? " · original" : "") + " · " + (index + 1) }),
+            subtitleOptions = item.Subtitles.Select(track => new { track.Language, label = track.Name ?? track.Language, auto = track.IsAutoGenerated }).Distinct()
         });
     }
 
     private BridgeResponse SelectBrowserMedia(BridgeRequest request)
     {
         MediaDownloadChoice? job = null;
+        MediaItem? item = null;
+        ChoiceRecipe? how = null;
         lock (_mediaSessionsLock)
         {
             if (request.MediaSession is Guid id && request.FormatChoice is int index
                 && _mediaSessions.TryGetValue(id, out var session) && session.Expires > DateTimeOffset.UtcNow
                 && index >= 0 && index < session.Choices.Length)
+            {
                 job = session.Choices[index];
+                item = session.Item;
+                how = index < session.Recipes.Length ? session.Recipes[index] : null;
+            }
         }
         if (job is null || job.ExpiresAt is { } expires && expires <= DateTimeOffset.UtcNow)
             return BridgeResponse.Fail(request.Id, "expired-selection", "These formats have expired. Refresh them to try again.");
-        BridgeResult result = QueueMedia(job, request.Mode == "queue", request.Id);
-        return result.JobId is not null
-            ? BridgeResponse.Success(request.Id, results: [result])
-            : BridgeResponse.Fail(request.Id, "rejected", result.Message);
+        if (request.Clip is not null || request.AudioTrackId is not null || request.SubtitleLanguages is not null)
+        {
+            if (item is null || how is null || request.Clip is not null && !SupportsSegmentClip(job))
+                return BridgeResponse.Fail(request.Id, "invalid", "This format can't use the requested selection.");
+            if (request.AudioTrackId is { } track && !item.AudioTracks.Any(t => t.Id == track)
+                && !item.Representations.Any(r => r.AudioTrackId == track))
+                return BridgeResponse.Fail(request.Id, "invalid", "The selected audio track is no longer available.");
+            if (request.SubtitleLanguages?.Any(language => !item.Subtitles.Any(s => s.Language == language)) == true)
+                return BridgeResponse.Fail(request.Id, "invalid", "A selected subtitle language is no longer available.");
+            var preferences = how.Preferences with { AudioTrackId = request.AudioTrackId,
+                SubtitleLanguages = request.SubtitleLanguages ?? [], IncludeAutoSubtitles = request.IncludeAutoSubtitles };
+            var planned = Prepare(item, preferences, how.Exact, how.Output, request.Clip?.StartSeconds, request.Clip?.EndSeconds);
+            if (planned.Choice is null) return BridgeResponse.Fail(request.Id, "invalid", planned.Error ?? "This selection cannot be downloaded.");
+            job = planned.Choice;
+        }
+        var jobs = ExpandSubtitleChoices([job]);
+        var results = jobs.Select((choice, index) => QueueMedia(choice, request.Mode == "queue", $"{request.Id}:{index}")).ToArray();
+        return results.Any(result => result.JobId is not null)
+            ? BridgeResponse.Success(request.Id, results: results)
+            : BridgeResponse.Fail(request.Id, "rejected", results[0].Message);
     }
 
     internal BridgeResult QueueMedia(MediaDownloadChoice job, bool queue, string requestId)
@@ -178,7 +239,7 @@ internal sealed partial class BrowserBridgeHandler
             MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
             MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
             MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId, Output: job.Output,
-            MediaMetadataJson: job.MediaMetadataJson));
+            MediaMetadataJson: job.MediaMetadataJson, Secrets: job.Secrets));
         string status = added.Status switch
         {
             AddStatus.Added => queue ? "queued" : "started",

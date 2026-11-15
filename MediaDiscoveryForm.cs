@@ -76,6 +76,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private bool _truncated;
     private bool _hasMetadata;
     private bool _canChooseM4a;
+    private MediaOutputPreference[] _audioOutputOptions = [MediaOutputPreference.M4a, MediaOutputPreference.Original];
     private bool _arranging;
     private int _presetIndex;
     private CancellationTokenSource? _attempt;
@@ -129,10 +130,10 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _source = L($"{_url.Host} · Media source", 8.5f, muted: true);
         _status = L("Looking for available media. This may take a moment.", 9, muted: true);
         _status.TextAlign = ContentAlignment.TopLeft;
-        _status.AutoEllipsis = false;
+        _status.AutoEllipsis = true;      // the height is measured below; this is the safety net
         _notice = L("", 8.5f, muted: true);
         _notice.TextAlign = ContentAlignment.TopLeft;
-        _notice.AutoEllipsis = false;
+        _notice.AutoEllipsis = true;
         _canvas.Controls.AddRange([_title, _source, _status, _notice]);
 
         _viewPage = B("View original", 128, symbol: VesperIcon.Link, quiet: true);
@@ -143,13 +144,13 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _qualityLabel = L("Quality", 9, bold: true);
         _quality = new VesperChoice { AccessibleName = "Playlist quality", Symbol = VesperIcon.Quality };
         _quality.ApplyPalette(_colors);
-        _quality.SetItems("Best available with audio", "Balanced", "Smallest suitable", "Audio only");
+        _quality.SetItems("Best", "Balanced", "Smallest", "Audio only");
         _outputChoice = new VesperChoice { AccessibleName = "Output format preference" };
         _outputChoice.ApplyPalette(_colors);
-        _outputChoice.SetItems("Compatible", "Original");
+        _outputChoice.SetItems("Plays everywhere (MP4)", "Original (best quality)");
         _audioOutputChoice = new VesperChoice { AccessibleName = "Audio output format" };
         _audioOutputChoice.ApplyPalette(_colors);
-        _audioOutputChoice.SetItems("M4A (AAC)", "Original audio");
+        _audioOutputChoice.SetItems("M4A — plays everywhere", "Original audio");
         _audioTrack = new VesperChoice { AccessibleName = "Audio track" };
         _audioTrack.ApplyPalette(_colors);
         _audioTrack.SelectedIndexChanged += (_, _) =>
@@ -209,12 +210,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _audioTrack, _subtitleChoice, _customLabel, _customFormat]);
         _clipCheck = new CheckBox
         {
-            Text = "Time range", AccessibleName = "Download a time range", AutoSize = false,
+            Text = "Download part", AccessibleName = "Download only part of the media", AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft, BackColor = _colors.Surface, ForeColor = _colors.Text,
             Font = new Font("Segoe UI", 9), Visible = false
         };
-        _clipStartLabel = L("From", 8.5f, muted: true);
-        _clipEndLabel = L("To", 8.5f, muted: true);
+        _clipStartLabel = L("Start", 8.5f, muted: true);
+        _clipEndLabel = L("End", 8.5f, muted: true);
         _clipStart = ClipTimeBox("Clip start time");
         _clipEnd = ClipTimeBox("Clip end time");
         _canvas.Controls.AddRange([_clipCheck, _clipStartLabel, _clipStart, _clipEndLabel, _clipEnd]);
@@ -225,7 +226,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         (string Title, VesperIcon Icon)[] presets =
         [
             ("Best quality", VesperIcon.Crown), ("Balanced", VesperIcon.Quality), ("Smallest", VesperIcon.Leaf),
-            ("Audio only", VesperIcon.Audio), ("More formats", VesperIcon.Layers)
+            ("Audio only", VesperIcon.Audio), ("More formats…", VesperIcon.Layers)
         ];
         for (int i = 0; i < presets.Length; i++)
         {
@@ -331,7 +332,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         Text = text, AutoSize = false,
         ForeColor = muted ? _colors.Muted : _colors.Text,
-        Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
+        Font = UiKit.Text(size, bold ? FontStyle.Bold : FontStyle.Regular),
         TextAlign = ContentAlignment.MiddleLeft
     };
 
@@ -342,17 +343,37 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         return button;
     }
 
+    // Text blocks get the height their words need (up to four lines) instead of a fixed box; everything
+    // below them moves down by the same amount and the dialog grows to match.
+    private int _statusExtra, _noticeExtra;
+
+    private int ExtraLines(Label label, int widthPx, int fixedLogicalHeight)
+    {
+        if (string.IsNullOrEmpty(label.Text) || widthPx <= 0) return 0;
+        Size need = TextRenderer.MeasureText(label.Text, label.Font, new Size(widthPx, int.MaxValue),
+            TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+        int capped = Math.Min(need.Height, label.Font.Height * 4);
+        int neededLogical = (int)Math.Ceiling(capped * 96d / DeviceDpi) + 4;
+        return Math.Max(0, neededLogical - fixedLogicalHeight);
+    }
+
     private void LayoutBody()
     {
         if (_arranging || _body.ClientSize.Width < S(150)) return;
         _arranging = true;
         try
         {
-            _canvas.Height = S(BodyHeight());
             int width = _canvas.ClientSize.Width;
             int margin = S(24), contentWidth = Math.Max(1, width - 2 * margin);
+            bool hasPlaylist = _state == ViewState.Ready && _item?.Related is not null;
+            _statusExtra = ExtraLines(_status, contentWidth - (hasPlaylist ? S(172) : 0), _state == ViewState.Unavailable ? 57 : 34);
+            _noticeExtra = ExtraLines(_notice, contentWidth, 40);
+            _canvas.Height = S(BodyHeight());
+            width = _canvas.ClientSize.Width;
+            contentWidth = Math.Max(1, width - 2 * margin);
+            int shift = 0;
             void Place(Control control, int x, int y, int w, int h) =>
-                control.SetBounds(x, S(y), Math.Max(1, w), S(h));
+                control.SetBounds(x, S(y + shift), Math.Max(1, w), S(h));
 
             int posterWidth = S(width < S(480) ? 104 : 132);
             int textLeft = margin + posterWidth + S(17);
@@ -365,8 +386,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
             bool playlist = _state == ViewState.Ready && _item?.Related is not null;
             int statusWidth = contentWidth - (playlist ? S(172) : 0);
-            Place(_status, margin, 153, statusWidth, _state == ViewState.Unavailable ? 57 : 34);
+            Place(_status, margin, 153, statusWidth, (_state == ViewState.Unavailable ? 57 : 34) + _statusExtra);
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
+            shift = _statusExtra;                       // everything below the status text moves down with it
             int outputWidth = Math.Min(S(132), contentWidth / 2);
             Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
@@ -410,7 +432,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 ViewState.Unavailable => 213,
                 _ => 191
             };
-            Place(_notice, margin, noticeY, contentWidth, 40);
+            Place(_notice, margin, noticeY, contentWidth, 40 + _noticeExtra);
         }
         finally { _arranging = false; }
     }
@@ -429,7 +451,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private bool IsExactFormat => _state == ViewState.Ready && _presetIndex == 4;
 
-    private int BodyHeight() => _state switch
+    private int BodyHeight() => _statusExtra + _noticeExtra + _state switch
     {
         ViewState.Ready => IsExactFormat ? (_clipCheck.Visible ? 541 : 510)
             : _clipCheck.Visible ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448,
@@ -687,8 +709,17 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         }).ToArray();
         _customFormat.SetItems(options);
         MediaDownloadChoice? sourceAudio = Prepare(_item, FormatPreferences.AudioOnly).Choice;
-        _canChooseM4a = Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice is { } m4a
-            && m4a != sourceAudio;
+        var audioOutputs = new List<(MediaOutputPreference Output, string Label)>();
+        if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice is { DisplayContainer: "M4A" })
+            audioOutputs.Add((MediaOutputPreference.M4a, "M4A — plays everywhere"));
+        audioOutputs.Add((MediaOutputPreference.Original, "Original audio"));
+        if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Opus).Choice is not null)
+            audioOutputs.Add((MediaOutputPreference.Opus, "Opus — copied, no re-encoding"));
+        if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Wav).Choice is not null)
+            audioOutputs.Add((MediaOutputPreference.Wav, "WAV — decoded PCM"));
+        _audioOutputOptions = audioOutputs.Select(o => o.Output).ToArray();
+        _audioOutputChoice.SetItems(audioOutputs.Select(o => o.Label).ToArray());
+        _canChooseM4a = audioOutputs.Count > 1;
         _status.Text = $"{_playableFormats.Count} format{(_playableFormats.Count == 1 ? "" : "s")} available.";
         RefreshPresets(_item);
         _notice.Text = "";
@@ -701,8 +732,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private MediaOutputPreference OutputPreference(FormatPreferences prefs)
     {
         if (AudioOutputApplies(prefs))
-            return _audioOutputChoice.SelectedIndex == 0 && (_state == ViewState.Collection || _canChooseM4a)
-                ? MediaOutputPreference.M4a : MediaOutputPreference.Original;
+            return _audioOutputOptions.ElementAtOrDefault(Math.Max(0, _audioOutputChoice.SelectedIndex));
         return _outputChoice.SelectedIndex == 0 ? MediaOutputPreference.CompatibleVideo : MediaOutputPreference.Original;
     }
 
@@ -781,7 +811,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 : IsExactFormat ? choice.DisplayDetail : "";
             if (_clipCheck.Checked)
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
-                    + "Uses complete HLS/DASH segments; the saved format shows the actual boundaries.";
+                    + "May start a few seconds early: it cuts at the nearest segment.";
             if (choice.SubtitleTracks is { Count: > 0 } subtitles)
             {
                 string subtitleNotice = subtitles.Any(subtitle => string.Equals(subtitle.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase))
@@ -907,7 +937,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             .ThenBy(track => track.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(track => track.Id, StringComparer.Ordinal)
             .ToArray();
-        string[] labels = _audioTrackOptions.Select(AudioTrackLabel).ToArray();
+        string[] labels = AudioTrackLabels(_audioTrackOptions);
         var duplicateLabels = labels.GroupBy(label => label, StringComparer.OrdinalIgnoreCase)
             .Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
         for (int i = 0; i < labels.Length; i++)
@@ -932,22 +962,51 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _subtitleLanguages.Items.Add(SubtitleTrackLabel(subtitle));
         _subtitleLanguages.EndUpdate();
         int rows = Math.Max(1, Math.Min(7, _subtitleTrackOptions.Length));
-        int width = Math.Max(S(220), _subtitleChoice.Width);
+        int longest = 0;
+        foreach (object entry in _subtitleLanguages.Items)
+            longest = Math.Max(longest, TextRenderer.MeasureText(entry.ToString(), _subtitleLanguages.Font, Size.Empty,
+                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine).Width);
+        int screenWidth = Screen.FromControl(this).WorkingArea.Width - S(40);
+        int width = Math.Min(screenWidth, Math.Max(Math.Max(S(220), _subtitleChoice.Width), longest + S(56)));
         _subtitleLanguages.Size = new Size(width, S(rows * 25 + 6));
         _subtitleHost.Size = _subtitleLanguages.Size;
         UpdateSubtitleSummary();
     }
 
-    private static string AudioTrackLabel(AudioTrack track)
+    // Only the facts that actually differ between the tracks go into the labels. Five English AAC stereo
+    // tracks used to read "Audio: English · en · 2 ch · AAC · default" five times and get cut off.
+    private static string[] AudioTrackLabels(AudioTrack[] tracks)
     {
-        string label = track.Name ?? track.Language ?? "Audio track";
-        var details = new List<string>();
-        if (track.Language is { Length: > 0 } language && !string.Equals(label, language, StringComparison.OrdinalIgnoreCase))
-            details.Add(language);
-        if (track.Channels is { } channels) details.Add($"{channels} ch");
-        if (track.Codec is { Length: > 0 } codec) details.Add(codec.ToUpperInvariant());
-        if (track.IsDefault) details.Add("default");
-        return "Audio: " + (details.Count == 0 ? label : label + " · " + string.Join(" · ", details));
+        bool differentChannels = tracks.Select(t => t.Channels).Distinct().Count() > 1;
+        bool differentCodecs = tracks.Select(t => t.Codec?.ToLowerInvariant()).Distinct().Count() > 1;
+        var labels = new string[tracks.Length];
+        for (int i = 0; i < tracks.Length; i++)
+        {
+            AudioTrack track = tracks[i];
+            string name = TextUtil.Clip(track.Name ?? "", 60);
+            string language = track.Language is { Length: > 0 } code ? TextUtil.NormalizeLang(code) : "";
+            string label = name.Length > 0 ? name : language.Length > 0 ? language : $"Track {i + 1}";
+            var details = new List<string>();
+            if (language.Length > 0 && !string.Equals(label, language, StringComparison.OrdinalIgnoreCase)
+                && !label.Contains(language, StringComparison.OrdinalIgnoreCase)) details.Add(language);
+            if (differentChannels && track.Channels is { } channels) details.Add(channels == 1 ? "mono" : channels == 2 ? "stereo" : $"{channels} channels");
+            if (differentCodecs && track.Codec is { Length: > 0 } codec) details.Add(codec.ToUpperInvariant());
+            if (track.IsDefault) details.Add("original");
+            labels[i] = details.Count == 0 ? label : label + " · " + string.Join(" · ", details);
+        }
+        // Still identical? Number them rather than show the same words twice.
+        for (int i = 0; i < labels.Length; i++)
+        {
+            int same = 0;
+            for (int j = 0; j < labels.Length; j++) if (labels[j] == labels[i]) same++;
+            if (same > 1)
+            {
+                int n = 0;
+                string text = labels[i];
+                for (int j = 0; j < labels.Length; j++) if (labels[j] == text) labels[j] = $"{text} ({++n})";
+            }
+        }
+        return labels;
     }
 
     private static string SubtitleTrackLabel(SubtitleTrack track)

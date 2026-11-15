@@ -89,6 +89,43 @@ public class FileNameTests
     [InlineData("")] [InlineData("..")] [InlineData("...")] [InlineData("   ")]
     public void Empty_or_dot_names_fall_back(string raw) => Assert.Equal("download", FileNames.Sanitize(raw));
 
+    // VES-001: a server-chosen name must not hide its real extension or carry invisible characters.
+    [Theory]
+    [InlineData("Invoice\u202Egpj.exe", "Invoicegpj.exe")]            // right-to-left override would display "Invoiceexe.jpg"
+    [InlineData("a\u2066b\u2069c.txt", "abc.txt")]                   // bidi isolates
+    [InlineData("re\u200Bport\uFEFF.pdf", "report.pdf")]            // zero-width space, byte order mark
+    [InlineData("line\u2028break\u2029.txt", "linebreak.txt")]      // line and paragraph separators
+    [InlineData("soft\u00ADhyphen.txt", "softhyphen.txt")]
+    [InlineData("tag\U000E0041.txt", "tag.txt")]                     // language tag character outside the BMP
+    [InlineData("tab\there\u0007.txt", "tabhere.txt")]
+    public void Hidden_and_direction_changing_characters_are_removed(string raw, string expected) =>
+        Assert.Equal(expected, FileNames.Sanitize(raw));
+
+    // Windows rules apply on every platform, so Linux test runs check what Windows users get.
+    [Theory]
+    [InlineData("a<b>c\"d|e?f*g.txt", "a_b_c_d_e_f_g.txt")]
+    [InlineData("caf\u00E9 \U0001F3B5 mix.mp3", "caf\u00E9 \U0001F3B5 mix.mp3")]   // real text and emoji survive
+    public void Windows_invalid_characters_are_replaced_on_every_platform(string raw, string expected) =>
+        Assert.Equal(expected, FileNames.Sanitize(raw));
+
+    [Fact]
+    public void Long_names_are_never_cut_in_the_middle_of_an_emoji()
+    {
+        string name = FileNames.Sanitize(new string('a', 145) + string.Concat(Enumerable.Repeat("\U0001F3B5", 10)) + ".mp3");
+        Assert.True(name.Length <= 150);
+        Assert.EndsWith(".mp3", name);
+        Assert.DoesNotContain('\uFFFD', name);
+        for (int i = 0; i < name.Length; i++)
+            if (char.IsHighSurrogate(name[i])) Assert.True(i + 1 < name.Length && char.IsLowSurrogate(name[i + 1]));
+    }
+
+    [Fact]
+    public void A_lone_surrogate_cannot_reach_a_file_name()
+    {
+        string name = FileNames.Sanitize("bad\uD83Cname.txt");
+        Assert.DoesNotContain(name, char.IsSurrogate);
+    }
+
     [Fact]
     public void Very_long_names_keep_their_extension()
     {
@@ -118,6 +155,40 @@ public class UrlPolicyTests
     [InlineData("fc00::1", false)] [InlineData("::ffff:10.0.0.1", false)] [InlineData("8.8.8.8", true)] [InlineData("2606:4700:4700::1111", true)]
     public void Address_classification(string address, bool isPublic) =>
         Assert.Equal(isPublic, UrlPolicy.IsPublicAddress(IPAddress.Parse(address)));
+
+    // VES-001: IPv6 forms that wrap an IPv4 address are judged by the address inside them.
+    [Theory]
+    [InlineData("64:ff9b::7f00:1", false)]          // NAT64 -> 127.0.0.1
+    [InlineData("64:ff9b::a00:1", false)]           // NAT64 -> 10.0.0.1
+    [InlineData("64:ff9b::c0a8:101", false)]        // NAT64 -> 192.168.1.1
+    [InlineData("64:ff9b::808:808", true)]          // NAT64 -> 8.8.8.8, how an IPv6-only network reaches the IPv4 internet
+    [InlineData("64:ff9b:1::a00:1", false)]         // local-use NAT64
+    [InlineData("2002:7f00:1::1", false)]           // 6to4 -> 127.0.0.1
+    [InlineData("2002:c0a8:101::1", false)]         // 6to4 -> 192.168.1.1
+    [InlineData("2002:808:808::1", true)]           // 6to4 -> 8.8.8.8
+    [InlineData("2001:0:4136:e378:8000:63bf:3fff:fdd2", false)]   // Teredo
+    [InlineData("::ffff:0:7f00:1", false)]          // IPv4-translated -> 127.0.0.1
+    [InlineData("::7f00:1", false)]                 // IPv4-compatible -> 127.0.0.1
+    [InlineData("::", false)] [InlineData("fec0::1", false)] [InlineData("ff02::1", false)]
+    [InlineData("2001:db8::1", false)] [InlineData("100::1", false)]
+    [InlineData("0.0.0.0", false)] [InlineData("198.18.0.1", false)] [InlineData("198.19.255.255", false)]
+    [InlineData("192.0.0.8", false)] [InlineData("192.0.2.1", false)] [InlineData("198.51.100.7", false)]
+    [InlineData("203.0.113.9", false)] [InlineData("192.88.99.1", false)] [InlineData("224.0.0.1", false)]
+    [InlineData("255.255.255.255", false)] [InlineData("172.32.0.1", true)] [InlineData("100.128.0.1", true)]
+    [InlineData("198.20.0.1", true)] [InlineData("1.1.1.1", true)] [InlineData("2a00:1450:4001:81b::200e", true)]
+    public void Tunnelled_and_reserved_addresses_are_not_public(string address, bool isPublic) =>
+        Assert.Equal(isPublic, UrlPolicy.IsPublicAddress(IPAddress.Parse(address)));
+
+    [Theory]
+    [InlineData("http://[64:ff9b::7f00:1]/admin")]
+    [InlineData("http://[2002:7f00:1::1]/admin")]
+    [InlineData("http://198.18.0.1/file.zip")]
+    public void Links_to_disguised_private_addresses_are_blocked_before_connecting(string url)
+    {
+        Assert.True(UrlPolicy.TryParse(url, out Uri uri, out _));
+        Assert.Throws<BlockedAddressException>(() => UrlPolicy.EnsureAllowed(uri, allowPrivate: false));
+        UrlPolicy.EnsureAllowed(uri, allowPrivate: true);   // the user's "allow private networks" choice still works
+    }
 
     [Fact]
     public void Private_targets_are_blocked_unless_allowed()
@@ -620,6 +691,8 @@ public class MediaPageLinkTests
     }
 
     [Theory]
+    [InlineData("https://v16-webapp-prime.us.tiktok.com/video/tos/useast2a/encoded/?signature=fixture")]
+    [InlineData("https://www.tiktok.com/aweme/v1/play/?video_id=fixture")]
     [InlineData("https://cdn.example.com/movie.mp4")]
     [InlineData("https://download.example.com/download?id=1")]
     [InlineData("https://www.youtube.com/assets/video.mp4")]

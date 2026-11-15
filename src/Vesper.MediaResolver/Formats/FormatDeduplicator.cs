@@ -11,6 +11,7 @@ public static class FormatDeduplicator
 {
     private readonly record struct FormatKey(
         StreamContent Content,
+        string? DeliveryId,
         int? Width,
         int? Height,
         int? FrameRate,
@@ -58,7 +59,7 @@ public static class FormatDeduplicator
         int? frameRate = r.FrameRate is { } fps ? (int)Math.Round(fps) : null;
         int? audioBitrate = r.Content == StreamContent.AudioOnly ? (r.BitrateKbps ?? 0) / 16 : null;
         var requirements = r.Requirements & ~(ProcessingRequirement.HlsSegmentAssembly | ProcessingRequirement.DashSegmentAssembly);
-        return new(r.Content, r.Width, r.Height, frameRate, r.Hdr, r.VideoCodec, r.AudioCodec, r.Container,
+        return new(r.Content, r.DeliveryId, r.Width, r.Height, frameRate, r.Hdr, r.VideoCodec, r.AudioCodec, r.Container,
             r.AudioLanguage, r.AudioChannels, r.AudioSampleRate, r.AudioTrackId, r.IsDefaultAudio,
             r.IsAudioDescription, r.IsDrc, r.AudioGroupId, r.AudioUnverified, r.ContentIdentity,
             requirements, r.Context, audioBitrate);

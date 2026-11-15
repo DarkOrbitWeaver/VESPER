@@ -289,11 +289,12 @@ public class SiteAdapterTests
         Assert.Equal(3, c.TotalCount);
         Assert.Equal("Fixture Album", c.Title);
         Assert.All(c.Entries, e => Assert.NotNull(e.Resolved));
-        Assert.Equal("Fixture Album", c.Entries[0].Resolved!.Album);
-        Assert.Equal("Fixture Band", c.Entries[0].Resolved.Artist);
-        Assert.Equal("Fixture Band", c.Entries[0].Resolved.AlbumArtist);
-        Assert.Equal(1, c.Entries[0].Resolved.TrackNumber);
-        Assert.Equal("2024-03-12", c.Entries[0].Resolved.ReleaseDate);
+        MediaItem firstTrack = Assert.IsType<MediaItem>(c.Entries[0].Resolved);
+        Assert.Equal("Fixture Album", firstTrack.Album);
+        Assert.Equal("Fixture Band", firstTrack.Artist);
+        Assert.Equal("Fixture Band", firstTrack.AlbumArtist);
+        Assert.Equal(1, firstTrack.TrackNumber);
+        Assert.Equal("2024-03-12", firstTrack.ReleaseDate);
         Assert.Equal("https://fixtureband.bandcamp.com/track/song-two", c.Entries[1].Url.AbsoluteUri);
     }
 
@@ -535,7 +536,7 @@ public class SiteAdapterTests
     private const string TikTokUrl = "https://www.tiktok.com/@fixtureuser/video/7234567890123456789";
 
     [Fact]
-    public async Task TikTok_ReturnsQualitiesAndScopesSessionCookiesToTikTokHosts()
+    public async Task TikTok_ReturnsQualitiesWithoutLeakingHostOnlyCookiesToCdn()
     {
         var h = new FakeHttpHandler().Add(TikTokUrl, Fixture.Load("tiktok_page.html"), "text/html",
             headers: new() { ["Set-Cookie"] = "tt_chain_token=abc; Path=/; HttpOnly" });
@@ -549,9 +550,9 @@ public class SiteAdapterTests
         Assert.Equal(3, item.Representations.Count);
         Assert.Contains(item.Representations, r => r.VideoCodec == "h265" && r.Height == 1280 && r.FileSize == 2800000);
         var ctx = item.Representations[0].Context;
-        Assert.Equal("tt_chain_token=abc", ctx.CookieHeader);
-        Assert.Contains("tiktok.com", ctx.CredentialHosts);
-        Assert.Equal(new Uri("https://www.tiktok.com/"), ctx.CredentialOrigin);
+        Assert.Null(ctx.CookieHeader);
+        Assert.Equal(item.Representations[0].Url.Host, Assert.Single(ctx.CredentialHosts));
+        Assert.Equal(item.Representations[0].Url.GetLeftPart(UriPartial.Authority), ctx.CredentialOrigin!.GetLeftPart(UriPartial.Authority));
         Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://evil.example.net/")));
     }
 
@@ -573,4 +574,32 @@ public class SiteAdapterTests
         var priv = new FakeHttpHandler().Add(TikTokUrl, page("{\"statusCode\":10222}"));
         Assert.Equal(MediaErrorCode.LoginRequired, (await Resolve(priv, TikTokUrl)).Error!.Code);
     }
+    [Fact]
+    public async Task TikTok_ObjectAddressesPreserveSignedMirrorsAndByteVc1Codec()
+    {
+        const string body = """
+        <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"statusCode":0,"itemInfo":{"itemStruct":{"id":"7234567890123456789","desc":"Fixture","video":{"duration":22,"width":576,"height":1024,"bitrateInfo":[{"GearName":"hd","CodecType":"h265_hvc1","PlayAddr":{"DataSize":"400577","Width":1080,"Height":1920,"UrlList":["https://v16.tiktokcdn.com/a?signature=a%2Bb&expire=4102444800","https://v19.tiktokcdn.com/a?signature=c%2Fd&expire=4102444800"]}}],"playAddr":{"UrlList":["https://www.tiktok.com/aweme/v1/play/?video_id=123"]}}}}}}}</script>
+        """;
+        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body), TikTokUrl);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(3, result.Item!.Representations.Count);
+        Assert.Equal("h265", result.Item.Representations[0].VideoCodec);
+        Assert.Equal(400577, result.Item.Representations[0].FileSize);
+        Assert.Contains("signature=a%2Bb", result.Item.Representations[0].Url.AbsoluteUri);
+    }
+
+    [Theory]
+    [InlineData("session=fixture; Domain=.tiktok.com; Path=/; Secure", "session=fixture")]
+    [InlineData("session=fixture; Path=/; Secure", null)]
+    [InlineData("session=fixture; Domain=.tiktok.com; Path=/account; Secure", null)]
+    public async Task TikTok_AnonymousSessionHonorsCookieDomainAndPath(string setCookie, string? expected)
+    {
+        const string media = "https://v16-webapp-prime.us.tiktok.com/video/tos/fixture/?signature=fixture";
+        string body = "<script id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\">{\"__DEFAULT_SCOPE__\":{\"webapp.video-detail\":{\"statusCode\":0,\"itemInfo\":{\"itemStruct\":{\"id\":\"1\",\"video\":{\"playAddr\":\"" + media + "\"}}}}}}</script>";
+        var h = new FakeHttpHandler().Add(TikTokUrl, body, headers: new() { ["Set-Cookie"] = setCookie });
+        var result = await Resolve(h, TikTokUrl);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(expected, Assert.Single(result.Item!.Representations).Context.CookieHeader);
+    }
+
 }

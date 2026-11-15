@@ -58,8 +58,8 @@ function changePending(change) {
   return write;
 }
 
-async function submit(items, mode, { authorized = false } = {}) {
-  const request = envelope('submit', { mode: mode || 'ask', items, authorized });
+async function submit(items, mode, { authorized = false, review = false } = {}) {
+  const request = envelope(review ? 'batch-review' : 'submit', { mode: mode || 'ask', items, authorized });
   await changePending(pending => {
     pending[request.id] = { request: { ...request, authorized: false, items: items.map(stripSecrets) },
       at: Date.now() };
@@ -96,7 +96,49 @@ async function updateBadge() {
   await chrome.action.setBadgeText({ text: count ? '!' : '' });
 }
 
-async function withSignIn(items) {
+// Hosts are the same site when they are equal or one is a parent domain of the other, over the same scheme.
+// Without the public-suffix list this is deliberately narrow: sibling subdomains count as different sites.
+// That can only withhold a cookie, never add one.
+function isSameSite(targetUrl, initiatorUrl) {
+  try {
+    const target = new URL(targetUrl), initiator = new URL(initiatorUrl);
+    if (target.protocol !== initiator.protocol) return false;
+    const a = target.hostname, b = initiator.hostname;
+    return a === b || b.includes('.') && a.endsWith('.' + b) || a.includes('.') && b.endsWith('.' + a);
+  } catch { return false; }
+}
+
+// Only the cookies Chrome itself would attach. Every caller is something the user started at the top level
+// (a clicked link, a download Chrome already began), so Lax cookies go along. SameSite=Strict cookies are for
+// requests that come from the cookie's own site, so a link on another site never gets them.
+async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = {}) {
+  let storeId;
+  if (frame && chrome.cookies.getAllCookieStores) {
+    const stores = await chrome.cookies.getAllCookieStores();
+    storeId = stores.find(store => store.tabIds.includes(frame.tabId))?.id;
+    if (!storeId) return []; // Never read another profile's cookies when a frame was supplied.
+  }
+  const query = { url, ...(storeId ? { storeId } : {}) };
+  const cookies = await chrome.cookies.getAll(query);
+  if (frame && chrome.cookies.getPartitionKey) {
+    try {
+      const { partitionKey } = await chrome.cookies.getPartitionKey(frame);
+      if (partitionKey?.topLevelSite)
+        cookies.push(...await chrome.cookies.getAll({ ...query, partitionKey }));
+    } catch { /* Detached frames cannot authorize a partition. Unpartitioned cookies remain scoped. */ }
+  }
+  const fromSameSite = isSameSite(url, initiatorUrl);
+  const seen = new Set();
+  return cookies.filter(cookie => {
+    if (cookie.sameSite === 'strict' && !fromSameSite) return false;
+    if (cookie.sameSite !== 'no_restriction' && !fromSameSite && !userGesture) return false;
+    const key = JSON.stringify([cookie.name, cookie.domain, cookie.path, cookie.partitionKey]);
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
+
+async function withSignIn(items, context = {}) {
   const safe = items.map(stripSecrets);
   const prefs = await settings();
   if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] })))
@@ -105,7 +147,7 @@ async function withSignIn(items) {
   for (const item of safe) {
     let cookie;
     try {
-      const matches = await chrome.cookies.getAll({ url: item.url });
+      const matches = await signInCookies(item.url, item.referer, context);
       const header = matches.map(c => `${c.name}=${c.value}`).join('; ');
       if (header && header.length <= 8192 && !/[\r\n\0]/.test(header)) cookie = header;
     } catch { /* access can be revoked while the download is being sent */ }
@@ -188,18 +230,52 @@ function inTabOrder(tabId, work) {
   return write.finally(() => { if (sourceWrites.get(tabId) === write) sourceWrites.delete(tabId); });
 }
 
-async function tabState(tabId) {
-  const key = `tab:${tabId}`;
-  const stored = (await chrome.storage.session.get(key))[key];
-  return stored || { sources: [], unsupported: null, title: '', duration: null, poster: '' };
+// The worker is woken for every media response on a busy video site. Keep each tab's state in memory and
+// write it back at most once a second, and only when something actually changed.
+const tabStates = new Map();
+const tabStateWrites = new Map();
+const tabFlushTimers = new Map();
+const tabBadgeCounts = new Map();
+
+function forgetTab(tabId) {
+  clearTimeout(tabFlushTimers.get(tabId));
+  tabFlushTimers.delete(tabId);
+  tabStates.delete(tabId);
+  tabStateWrites.delete(tabId);
+  tabBadgeCounts.delete(tabId);
 }
 
-async function saveTabState(tabId, state) {
+async function tabState(tabId) {
+  if (tabStates.has(tabId)) return tabStates.get(tabId);
+  const key = `tab:${tabId}`;
+  const stored = (await chrome.storage.session.get(key))[key];
+  const state = stored || { sources: [], unsupported: null, title: '', duration: null, poster: '' };
+  tabStates.set(tabId, state);
+  return state;
+}
+
+async function saveTabState(tabId, state, { force = false } = {}) {
   state.sources = state.sources.slice(-MAX_SOURCES);
+  tabStates.set(tabId, state);
+  const now = Date.now();
+  const lastWrite = tabStateWrites.get(tabId) || 0;
+  if (!force && now - lastWrite < 1000) {
+    if (!tabFlushTimers.has(tabId)) tabFlushTimers.set(tabId, setTimeout(() => {
+      tabFlushTimers.delete(tabId);
+      void inTabOrder(tabId, async () => {
+        const current = tabStates.get(tabId);
+        if (current) await saveTabState(tabId, current, { force: true });
+      }).catch(() => {});
+    }, Math.max(1, 1000 - (now - lastWrite))));
+    return;
+  }            // the in-memory copy is current; storage catches up later
+  tabStateWrites.set(tabId, now);
   await chrome.storage.session.set({ [`tab:${tabId}`]: state });
-  if (state.sources.length) {
+  const count = state.sources.length;
+  if (count && tabBadgeCounts.get(tabId) !== count) {      // the badge only changes when the count does
+    tabBadgeCounts.set(tabId, count);
     await chrome.action.setBadgeBackgroundColor({ tabId, color: '#3D694B' });
-    await chrome.action.setBadgeText({ tabId, text: String(Math.min(state.sources.length, 9)) });
+    await chrome.action.setBadgeText({ tabId, text: String(Math.min(count, 9)) });
   }
 }
 
@@ -255,7 +331,7 @@ function rememberSourceSelections(sources, context) {
 }
 
 // Narrow listeners: only media requests, plus playlist-looking URLs. The worker sleeps otherwise.
-chrome.webRequest.onResponseStarted.addListener((details) => {
+const observeMediaResponse = (details) => {
   if (details.method !== 'GET' || ![200, 206].includes(details.statusCode)) return;
   const header = (name) => details.responseHeaders?.find((h) => h.name.toLowerCase() === name)?.value;
   const type = header('content-type') || '';
@@ -269,11 +345,21 @@ chrome.webRequest.onResponseStarted.addListener((details) => {
     complete: !isPlaylist && (details.statusCode === 200 || Number.isSafeInteger(bytes) && bytes > 0),
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
   }).catch(() => {});
-}, { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] }, ['responseHeaders']);
+ };
+chrome.webRequest.onResponseStarted.addListener(observeMediaResponse,
+  { urls: ['http://*/*', 'https://*/*'], types: ['media'] }, ['responseHeaders']);
+chrome.webRequest.onResponseStarted.addListener(observeMediaResponse, {
+  urls: ['*://*/*.m3u8*', '*://*/*.mpd*', '*://*/*.mp4*', '*://*/*.webm*', '*://*/*.m4a*',
+    '*://*/*.mp3*', '*://*/*.opus*', '*://*/*.flac*', '*://*.googlevideo.com/videoplayback*',
+    '*://*.tiktok.com/video/*', '*://*.tiktokcdn.com/*', '*://*.tiktokcdn-us.com/*',
+    '*://*.vimeocdn.com/*', '*://*.fbcdn.net/*', '*://*.cdninstagram.com/*'],
+  types: ['xmlhttprequest', 'other']
+}, ['responseHeaders']);
 
 chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === 'loading' && change.url) {
     void inTabOrder(tabId, async () => {
+      forgetTab(tabId);                        // the page is gone; its sources go with it
       await chrome.storage.session.remove(`tab:${tabId}`);
       await clearBrowserChoicesForTab(tabId);
       await chrome.action.setBadgeText({ tabId, text: '' });
@@ -281,9 +367,20 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   }
 });
 chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
+  forgetTab(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
   await clearBrowserChoicesForTab(tabId);
 }).catch(() => {}));
+
+async function mediaAuthorization(pageUrl, sender) {
+  const frame = Number.isInteger(sender?.tab?.id) ? {
+    tabId: sender.tab.id, frameId: sender.frameId ?? 0,
+    ...(sender.documentId ? { documentId: sender.documentId } : {})
+  } : undefined;
+  const enriched = await withSignIn([{ url: pageUrl, referer: sender?.url || pageUrl,
+    userAgent: navigator.userAgent }], { frame, userGesture: false });
+  return enriched.authorized ? { authorized: true, mediaAuth: enriched.items[0] } : {};
+}
 
 async function playerOptions(message, sender) {
   const page = mediaPage(message, sender);
@@ -336,7 +433,7 @@ async function playerOptions(message, sender) {
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
-      const reply = await nativeRequest(envelope('media-options', { url: page.href, pageTitle: title,
+      const reply = await nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: title,
         candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
       if (reply.ok || !complete || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
     }
@@ -396,7 +493,7 @@ async function selectMediaSource(message, sender) {
   const { route } = await settings();
   if (route === 'chrome')
     return { ok: false, code: 'chrome-format', message: 'Chrome has not exposed a complete file for this player.' };
-  return nativeRequest(envelope('media-options', { url: page.href, pageTitle: selection.title,
+  return nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: selection.title,
     candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }
 
@@ -467,10 +564,47 @@ async function describe(url, durationSeconds) {
 
 // ---------------------------------------------------------------- messages from the popup and content scripts
 
+// Content scripts run inside web pages, and a page that breaks out of its sandbox can forge their messages.
+// They get only what the in-page picker needs. Everything that reads other tabs, moves Chrome downloads or
+// submits links is reserved for VESPER's own pages (the popup and the Chrome downloads page).
+const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
+const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select']);
+const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello', 'chrome-downloads', 'move-download',
+  'native-picker', 'describe', 'retry', 'submit']);
+
+function commandsFor(sender) {
+  if (!sender || sender.id !== chrome.runtime.id) return null;
+  const url = typeof sender.url === 'string' ? sender.url : '';
+  if (url.startsWith(EXTENSION_PAGES)) return PAGE_COMMANDS;        // the transfers page lives in a tab, so sender.tab says nothing
+  if (sender.tab && /^https?:\/\//i.test(url)) return CONTENT_COMMANDS;
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!commandsFor(sender)?.has(message?.type)) {
+    sendResponse({ ok: false, code: 'forbidden', message: 'This page can’t ask VESPER for that.' });
+    return false;
+  }
   (async () => {
     await recoverChromeCaptures();
     switch (message.type) {
+      case 'smart-submit': {
+        const page = mediaPage({}, sender);
+        if (!page || !Array.isArray(message.items) || message.items.length < 1 || message.items.length > 50)
+          return { ok: false, code: 'invalid', message: 'Select between 1 and 50 files.' };
+        const unique = new Set();
+        const safe = [];
+        for (const item of message.items) {
+          const url = VesperPlayerSource.http(item?.url);
+          if (!url || unique.has(url.href)) continue;
+          unique.add(url.href);
+          safe.push({ url: url.href, referer: page.href, userAgent: navigator.userAgent });
+        }
+        if (!safe.length) return { ok: false, code: 'invalid', message: 'No reusable file addresses were selected.' };
+        // Untrusted content can propose links, never skip the native confirmation or choose a disk path.
+        const signed = await withSignIn(safe, { frame: { tabId: sender.tab.id, frameId: sender.frameId ?? 0 }, userGesture: true });
+        return submit(signed.items, 'ask', { authorized: signed.authorized, review: true });
+      }
       case 'media-element': {
         // Older open tabs may still send these. Only observed responses belong in the network cache.
         return { ok: true };
@@ -488,11 +622,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'browser-media-select': return selectBrowserFile(message, sender);
       case 'media-select': {
         const { mediaSession, formatChoice, mode } = message;
+        const audioTrack = typeof message.audioTrack === 'string' && message.audioTrack.length <= 256 ? message.audioTrack : undefined;
+        const subtitles = Array.isArray(message.subtitles) && message.subtitles.length <= 25
+          && message.subtitles.every(language => typeof language === 'string' && /^[a-z0-9_-]{1,35}$/i.test(language)) ? message.subtitles : undefined;
+        const includeAutoSubtitles = message.includeAutoSubtitles === true;
         if (!/^[a-f0-9]{32}$/i.test(mediaSession || '') || !Number.isInteger(formatChoice) || formatChoice < 0 ||
             formatChoice >= 64 || !['queue', 'download'].includes(mode))
           return { ok: false, code: 'invalid', message: 'Choose an available format.' };
+        // "Download part": start and end in seconds, validated again by VESPER's planner.
+        let range;
+        if (message.range) {
+          const { start, end } = message.range;
+          if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end > 31_536_000)
+            return { ok: false, code: 'invalid', message: 'Enter a start time before the end time.' };
+          range = { start, end };
+        }
+        const suffix = range ? `-${Math.round(range.start * 1000).toString(36)}-${Math.round(range.end * 1000).toString(36)}` : '';
+        let intentSuffix = '';
+        if (audioTrack || subtitles?.length || includeAutoSubtitles) {
+          const bytes = new TextEncoder().encode(JSON.stringify([audioTrack || null, [...(subtitles || [])].sort(), includeAutoSubtitles]));
+          const digest = await crypto.subtle.digest('SHA-256', bytes);
+          intentSuffix = '-' + [...new Uint8Array(digest)].slice(0, 16).map(byte => byte.toString(16).padStart(2, '0')).join('');
+        }
         return nativeRequest(envelope('media-select', {
-          id: `${mediaSession}-${formatChoice}-${mode}`, mediaSession, formatChoice, mode
+          id: `${mediaSession}-${formatChoice}-${mode}${suffix}${intentSuffix}`,
+          mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles
         }), 25000);
       }
       case 'native-picker': {
@@ -504,7 +658,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // No cookies or hidden credentials are sent by this command. The native resolver
         // validates and probes each supplied media hint before it can be selected.
         return nativeRequest(envelope('media-picker', {
-          url: pageUrl, pageTitle: message.title || state.title || '',
+          ...await mediaAuthorization(pageUrl, sender), url: pageUrl, pageTitle: message.title || state.title || '',
           candidates: []
         }));
       }
@@ -526,6 +680,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
+  chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER…', contexts: ['page', 'link', 'selection'] });
   chrome.contextMenus.create({ id: 'vesper-link', title: 'Download link with VESPER', contexts: ['link'] });
   chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
   chrome.contextMenus.create({ id: 'vesper-active-downloads', title: 'Move an active Chrome download…', contexts: ['action'] });
@@ -541,7 +696,24 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
     return;
   }
+  if (info.menuItemId === 'vesper-smart') {
+    try { await chrome.tabs.sendMessage(tab.id, { type: 'vesper-smart-select' }, { frameId: info.frameId ?? 0 }); }
+    catch { flash(tab?.id, { ok: false }); }
+    return;
+  }
   const url = info.menuItemId === 'vesper-link' ? info.linkUrl : info.srcUrl;
+  if (info.menuItemId === 'vesper-media' && url && !/^https?:/i.test(url)) {
+    // A blob: or data: source is made by the page itself (an MSE player). VESPER cannot fetch it, but it
+    // can resolve the page's real stream. Open the media picker for this page instead of failing silently.
+    const pageUrl = tab?.url;
+    if (pageUrl && /^https?:/i.test(pageUrl)) {
+      const reply = await nativeRequest(envelope('media-picker', { ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }), url: pageUrl, pageTitle: '', candidates: [] }));
+      flash(tab?.id, reply.ok ? { ok: true } : reply);
+    } else {
+      flash(tab?.id, { ok: false, message: 'This page cannot be inspected.' });
+    }
+    return;
+  }
   if (!url || !/^https?:/i.test(url)) {
     if (info.menuItemId === 'vesper-media') flash(tab?.id, { ok: false });
     return;      // blob: and data: URLs cannot be fetched by another program
@@ -558,7 +730,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     } catch { flash(tab?.id, { ok: false }); }
     return;
   }
-  const { items, authorized } = await withSignIn([{ url, referer: tab?.url, userAgent: navigator.userAgent }]);
+  // The frame that holds the link is the real initiator; an embedded frame can be another site than the tab.
+  const { items, authorized } = await withSignIn([{ url, referer: info.frameUrl || info.pageUrl || tab?.url, userAgent: navigator.userAgent }],
+    { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined });
   const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
   flash(tab?.id, reply);
 });

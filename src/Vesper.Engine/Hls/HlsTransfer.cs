@@ -15,6 +15,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
 {
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
     private const long MaxSegmentBytes = 64L * 1024 * 1024; // Bound buffering until streaming decryption is available.
+    private const int PrefetchSegments = 3;                   // segments in flight ahead of the one being committed
     private const string LiveMode = "live-hls";
     private sealed record Cursor(string Playlist, int Next, string? PlanHash = null, long Offset = 0,
         string? PrefixHash = null, int InitLength = 0, Mp4Progress? Progress = null,
@@ -138,6 +139,22 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             }
             session.SetPhase(JobState.Downloading);
             DateTime lastMessage = DateTime.MinValue;
+            // Fetch a few segments ahead so round trips overlap, but decrypt, validate and commit strictly in order:
+            // the checkpoint cursor stays a contiguous prefix exactly as before.
+            using var prefetchLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var prefetched = new Queue<(int Index, Task<byte[]> Data)>();
+            int fetchNext = next;
+            void Prefetch()
+            {
+                while (prefetched.Count < PrefetchSegments && fetchNext < segments.Count)
+                {
+                    HlsSegment ahead = segments[fetchNext];
+                    prefetched.Enqueue((fetchNext, FetchSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength, prefetchLifetime.Token)));
+                    fetchNext++;
+                }
+            }
+            try
+            {
             for (int i = next; i < segments.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -155,7 +172,11 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     mp4 = FragmentedMp4.Open(initialization);
                     initLength = initialization.Length;
                 }
-                byte[] data = await FetchSegmentAsync(segment.Uri, segment.RangeOffset, segment.RangeLength, ct).ConfigureAwait(false);
+                Prefetch();
+                (int fetchedIndex, Task<byte[]> fetched) = prefetched.Dequeue();
+                if (fetchedIndex != i) throw new InvalidOperationException("HLS prefetch order was lost.");
+                byte[] data = await fetched.ConfigureAwait(false);
+                Prefetch();
                 if (segment.Key is { } key) data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
                 if (fragmented) mp4!.ValidateFragment(data);
                 else transport!.Validate(data);
@@ -182,6 +203,17 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 {
                     lastMessage = DateTime.UtcNow;
                     engine.UpdateJob(Job, j => j.Message = $"Segment {i + 1} of {segments.Count}");
+                }
+            }
+            }
+            finally
+            {
+                // A failure or pause must not leave faulted fetches unobserved.
+                prefetchLifetime.Cancel();
+                foreach ((_, Task<byte[]> pending) in prefetched)
+                {
+                    try { await pending.ConfigureAwait(false); }
+                    catch (Exception) { /* Preserve the original transfer error. */ }
                 }
             }
             mp4?.Finish(requireAudio: Job.MediaProvider is not null, requireVideo: false);

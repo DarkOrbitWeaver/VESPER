@@ -17,6 +17,8 @@ public sealed record HttpTextResponse(
     IReadOnlyList<string> Cookies,
     bool IsText = true)
 {
+    [System.Text.Json.Serialization.JsonIgnore]
+    public CookieContainer SessionCookies { get; init; } = new();
     public bool IsSuccess => StatusCode is >= 200 and < 300;
 
     /// <summary>Returns this response or throws a typed <see cref="MediaResolverException"/> for non-2xx statuses.</summary>
@@ -94,27 +96,7 @@ public sealed class SecureHttpClient : IDisposable
         if (allowed.Length == 0)
             throw new MediaResolverException(MediaErrors.Blocked($"Host '{host}' resolves only to non-public addresses"));
 
-        Exception? last = null;
-        foreach (var ip in allowed)
-        {
-            var socket = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(new IPEndPoint(ip, ctx.DnsEndPoint.Port), ct).ConfigureAwait(false);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch (Exception ex) when (ex is SocketException)
-            {
-                socket.Dispose();
-                last = ex;
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
-        }
-        throw last ?? new SocketException((int)SocketError.HostUnreachable);
+        return await NetworkConnector.ConnectAsync(allowed, ctx.DnsEndPoint.Port, ct).ConfigureAwait(false);
     }
 
     // ---- public API -------------------------------------------------------------------------------------------
@@ -135,12 +117,17 @@ public sealed class SecureHttpClient : IDisposable
             ? raw.Select(NameValuePart).Where(c => c.Length > 0).ToList()
             : new List<string>();
 
+        var sessionCookies = new CookieContainer();
+        if (raw is not null)
+            foreach (string header in raw)
+                try { sessionCookies.SetCookies(final, header); } catch (CookieException) { }
+
         if (status < 400 && ctype is not null && !IsTextual(ctype))
-            return new HttpTextResponse(final, status, "", ctype, cookies, IsText: false);
+            return new HttpTextResponse(final, status, "", ctype, cookies, IsText: false) { SessionCookies = sessionCookies };
 
         int limit = status >= 400 ? _o.MaxErrorBodyBytes : maxBytes ?? _o.MaxPageBytes;
         string body = await ReadLimitedAsync(resp, limit, ct).ConfigureAwait(false);
-        return new HttpTextResponse(final, status, body, ctype, cookies);
+        return new HttpTextResponse(final, status, body, ctype, cookies) { SessionCookies = sessionCookies };
     }
 
     /// <summary>

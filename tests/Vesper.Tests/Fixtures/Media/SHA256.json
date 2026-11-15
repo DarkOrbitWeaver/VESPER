@@ -74,5 +74,9 @@
   "quiet-track.webm": {
     "bytes": 777,
     "sha256": "440833a4ef42336111c83cb2d7bc1ce2af97203afc47d5fddf8cf1dfa42ce044"
+  },
+  "quiet-track-aac.m4a": {
+    "bytes": 870,
+    "sha256": "80434e04f972b90bfaeb95a1796e7199af3ed17c1449ad432bc2b48ff088390f"
   }
 }

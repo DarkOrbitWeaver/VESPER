@@ -124,6 +124,7 @@ internal static class NativeHostSetup
     /// <summary>Remove only browser registration; never touch downloads, settings or history.</summary>
     public static string? Unregister()
     {
+        if (!IsRegistered) return "The current browser helper belongs to a different VESPER copy; nothing was changed.";
         try
         {
             foreach (string subKey in BrowserKeys) Registry.CurrentUser.DeleteSubKeyTree(subKey, throwOnMissingSubKey: false);

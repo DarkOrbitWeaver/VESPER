@@ -1,4 +1,5 @@
 using System.Text;
+using Vesper.Shared;
 
 namespace Vesper.Engine;
 
@@ -10,14 +11,6 @@ public static class FileNames
 {
     private const int MaxLength = 150;
 
-    private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-        "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"
-    };
-
     public static string Sanitize(string? raw, string fallback = "download")
     {
         if (string.IsNullOrWhiteSpace(raw)) return fallback;
@@ -26,12 +19,13 @@ public static class FileNames
         string name = raw.Replace('\\', '/');
         name = name[(name.LastIndexOf('/') + 1)..];
 
+        // Windows rules on every platform; a lone surrogate comes out of EnumerateRunes as U+FFFD.
         var builder = new StringBuilder(name.Length);
-        char[] invalid = Path.GetInvalidFileNameChars();
-        foreach (char c in name)
+        foreach (Rune rune in name.EnumerateRunes())
         {
-            if (char.IsControl(c)) continue;
-            builder.Append(c == ':' || Array.IndexOf(invalid, c) >= 0 ? '_' : c);   // ':' would create an alternate data stream
+            if (FileNameRules.IsHidden(rune)) continue;         // control codes, zero-width marks, bidi overrides
+            if (FileNameRules.IsWindowsInvalid(rune)) builder.Append('_');
+            else builder.Append(rune.ToString());
         }
 
         name = builder.ToString().Trim().TrimEnd('.', ' ');
@@ -39,13 +33,15 @@ public static class FileNames
 
         int firstDot = name.IndexOf('.');
         string firstSegment = firstDot < 0 ? name : name[..firstDot];
-        if (ReservedDeviceNames.Contains(firstSegment.Trim())) name = "_" + name;
+        if (FileNameRules.IsReservedStem(firstSegment)) name = "_" + name;
 
         if (name.Length > MaxLength)
         {
             string ext = Path.GetExtension(name);
             if (ext.Length > 16) ext = ext[..16];
-            name = name[..(MaxLength - ext.Length)].TrimEnd('.', ' ') + ext;
+            string stem = name[..(MaxLength - ext.Length)];
+            if (char.IsHighSurrogate(stem[^1])) stem = stem[..^1];   // dont cut an emoji in half
+            name = stem.TrimEnd('.', ' ') + ext;
         }
         return name;
     }

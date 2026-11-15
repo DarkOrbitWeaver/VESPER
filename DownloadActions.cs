@@ -9,9 +9,13 @@ namespace VESPER;
 /// </summary>
 internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine, Func<VesperPreferences> preferences)
 {
+    // Anything Windows can execute, open with a handler that runs code, or mount as a disk image.
     private static readonly HashSet<string> RunnableExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".scr", ".com", ".lnk", ".hta", ".jar", ".reg", ".msix", ".appx"
+        ".exe", ".msi", ".msp", ".mst", ".bat", ".cmd", ".ps1", ".psm1", ".psd1", ".vbs", ".vbe", ".js", ".jse",
+        ".wsf", ".wsh", ".scr", ".com", ".lnk", ".hta", ".jar", ".reg", ".msix", ".appx", ".appinstaller",
+        ".application", ".appref-ms", ".url", ".scf", ".cpl", ".chm", ".pif", ".xll", ".one", ".library-ms",
+        ".search-ms", ".settingcontent-ms", ".iso", ".img", ".vhd", ".vhdx"
     };
 
     private VesperPalette Colors => UiKit.Palette(preferences());

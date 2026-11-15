@@ -159,8 +159,8 @@ internal sealed class SettingsForm : VesperPopupForm
         page.Controls.AddRange([heading, intro, divider]);
         page.Resize += (_, _) =>
         {
-            intro.Width = Math.Max(200, page.ClientSize.Width - 50);
-            divider.Width = Math.Max(200, page.ClientSize.Width - 50);
+            intro.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 50);
+            divider.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 50);
         };
         _pages.Add(key, page);
         _content.Controls.Add(page);
@@ -253,7 +253,7 @@ internal sealed class SettingsForm : VesperPopupForm
         });
         var previewSound = Button("Preview sound", 140, symbol: VesperIcon.Audio);
         previewSound.SetBounds(257, 437, 140, 29);
-        sound.Width = previewSound.Left - sound.Left - 8;
+        sound.Width = Math.Max(UiKit.Scale(this, 120), previewSound.Left - sound.Left - UiKit.Scale(this, 8));
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
         var clipboard = Check("Offer to download links I copy", 25, 475, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
         var tray = Check("Keep VESPER in the tray when I close the window", 25, 503, _draft.CloseToTray, v => _draft.CloseToTray = v);
@@ -265,8 +265,8 @@ internal sealed class SettingsForm : VesperPopupForm
         {
             int right = page.ClientSize.Width - 25;
             browse.Left = Math.Max(308, right - browse.Width);
-            frame.Width = Math.Max(180, browse.Left - 34);
-            int noteWidth = Math.Max(210, right - 45);
+            frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
+            int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
             categoryNote.Width = missingNote.Width = collisions.Width = noteWidth;
         }
         page.Resize += (_, _) => Layout();
@@ -312,9 +312,9 @@ internal sealed class SettingsForm : VesperPopupForm
             presetHeading, presetDescription, _presetArea, _addPreset]);
         void Layout()
         {
-            concurrency.Left = Math.Max(292, page.ClientSize.Width - 25 - concurrency.Width);
-            globalNote.Width = Math.Max(200, page.ClientSize.Width - 70);
-            unit.Width = Math.Max(160, page.ClientSize.Width - 204);
+            concurrency.Left = Math.Max(UiKit.Scale(this, 292), page.ClientSize.Width - 25 - concurrency.Width);
+            globalNote.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 70);
+            unit.Width = Math.Max(UiKit.Scale(this, 160), page.ClientSize.Width - 204);
             bool showLimit = _globalEnabled.Checked;
             _globalFrame.Visible = unit.Visible = showLimit;
             int offset = showLimit ? 0 : -44;
@@ -440,14 +440,14 @@ internal sealed class SettingsForm : VesperPopupForm
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
-            connections.Left = Math.Max(292, right - connections.Width);
-            connNote.Width = Math.Max(200, connections.Left - connNote.Left - 8);
-            proxy.Left = Math.Max(292, right - proxy.Width);
-            proxyNote.Width = Math.Max(200, proxy.Left - proxyNote.Left - 8);
-            _proxyFrame.Width = Math.Max(200, right - 25);
-            scheduleNote.Width = Math.Max(200, right - 45);
-            scheduleHint.Width = Math.Max(120, right - scheduleHint.Left);
-            privateNote.Width = Math.Max(200, right - 45);
+            connections.Left = Math.Max(UiKit.Scale(this, 292), right - connections.Width);
+            connNote.Width = Math.Max(UiKit.Scale(this, 200), connections.Left - connNote.Left - 8);
+            proxy.Left = Math.Max(UiKit.Scale(this, 292), right - proxy.Width);
+            proxyNote.Width = Math.Max(UiKit.Scale(this, 200), proxy.Left - proxyNote.Left - 8);
+            _proxyFrame.Width = Math.Max(UiKit.Scale(this, 200), right - 25);
+            scheduleNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
+            scheduleHint.Width = Math.Max(UiKit.Scale(this, 120), right - scheduleHint.Left);
+            privateNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -466,6 +466,16 @@ internal sealed class SettingsForm : VesperPopupForm
     private void BuildBrowser()
     {
         var page = Page("Browser", "The browser butterfly sends supported downloads to VESPER.");
+        // About: which build is this? Two clicks away, as support asks for it.
+        var about = Label("VESPER " + Vesper.Shared.BuildInfo.Version(typeof(SettingsForm).Assembly)
+            + " · " + (Environment.Is64BitProcess ? "64-bit" : "32-bit") + " · .NET " + Environment.Version.ToString(2), 8.5F, muted: true);
+        about.Name = "aboutBuild";
+        about.AccessibleName = "About VESPER";
+        page.Controls.Add(about);
+        about.SetBounds(25, 594, 505, 40);
+        about.AutoEllipsis = true;
+        page.AutoScrollMinSize = new Size(0, 650);
+        page.Resize += (_, _) => about.Width = Math.Max(120, page.ClientSize.Width - 50);
         var heading = Label("Browser downloads", 10, bold: true);
         heading.SetBounds(25, 109, 390, 25);
         var note = Label("VESPER works without an extension. Install the browser add-on to capture downloads while browsing.", 8.5F, muted: true);
@@ -514,27 +524,66 @@ internal sealed class SettingsForm : VesperPopupForm
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
             { VesperMessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         };
-        var repair = Button("Repair helper", 131, symbol: VesperIcon.Refresh);
+        var repair = Button(NativeHostSetup.IsRegistered ? "Repair helper" : "Connect Chrome", 131, symbol: VesperIcon.Refresh);
         repair.SetBounds(213, 448, 131, 34);
         repair.Enabled = NativeHostSetup.HostPresent;
         repair.Click += (_, _) =>
         {
+            if (!NativeHostSetup.IsRegistered && VesperMessageBox.Show(this,
+                "Register this copy of VESPER as the browser helper for your Windows account? This changes only your per-user browser connection.",
+                "Connect Chrome", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             string? error = NativeHostSetup.Register();
             if (error is not null) VesperMessageBox.Show(this, error, "Repair browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             Refresh();
+        };
+        var disconnect = Button("Disconnect helper", 160, symbol: VesperIcon.Close);
+        disconnect.SetBounds(354, 448, 160, 34);
+        disconnect.Enabled = NativeHostSetup.IsRegistered;
+        disconnect.Click += (_, _) =>
+        {
+            if (VesperMessageBox.Show(this, "Disconnect this VESPER copy from your browser? Downloads and history will be kept.",
+                "Disconnect helper", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            string? problem = NativeHostSetup.Unregister();
+            if (problem is not null) VesperMessageBox.Show(this, problem, "Browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Refresh(); disconnect.Enabled = NativeHostSetup.IsRegistered;
+        };
+        var updates = Button("Check for updates", 182, symbol: VesperIcon.Refresh);
+        updates.SetBounds(25, 539, 182, 34);
+        updates.Click += async (_, _) =>
+        {
+            updates.Enabled = false;
+            try
+            {
+                var release = await ReleaseCheck.LatestAsync(EngineHost.MediaNetwork());
+                if (IsDisposed) return;
+                string installed = Vesper.Shared.BuildInfo.Number(typeof(SettingsForm).Assembly);
+                string message = release.Tag == "v" + installed || release.Tag == installed
+                    ? "This version matches the latest published release. Open its release notes?"
+                    : $"Installed: {installed}\nLatest published release: {release.Tag}\n\nOpen the release page? VESPER will not download or run an update automatically.";
+                if (VesperMessageBox.Show(this, message, "VESPER updates", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(release.Url) { UseShellExecute = true });
+            }
+            catch (Exception ex) when (ex is System.Net.Http.HttpRequestException or IOException or OperationCanceledException
+                or Vesper.MediaResolver.Models.MediaResolverException or System.Text.Json.JsonException
+                or System.ComponentModel.Win32Exception or InvalidOperationException)
+            {
+                if (!IsDisposed) VesperMessageBox.Show(this, "The update check did not complete. No software was changed. " + ex.Message,
+                    "VESPER updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            finally { if (!IsDisposed) updates.Enabled = true; }
         };
         var developerTip = Label("For unpacked Chrome builds: chrome://extensions → Developer mode → Load unpacked.", 8, muted: true);
         developerTip.SetBounds(25, 489, 505, 33);
 
         page.Controls.AddRange([heading, note, statusTitle, status, sep1, handoff, action,
-            handoffNote, sep2, extensionTitle, extensionNote, open, repair, developerTip]);
+            handoffNote, sep2, extensionTitle, extensionNote, open, repair, disconnect, updates, developerTip]);
         page.Resize += (_, _) =>
         {
             int right = page.ClientSize.Width - 25;
             action.Left = Math.Max(315, right - action.Width);
             foreach (Label l in new[] { note, status, handoffNote, extensionNote, developerTip })
-                l.Width = Math.Max(180, right - 25);
-            handoff.Width = Math.Max(180, action.Left - 36);
+                l.Width = Math.Max(UiKit.Scale(this, 180), right - 25);
+            handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
         };
         Refresh();
     }
@@ -573,10 +622,10 @@ internal sealed class SettingsForm : VesperPopupForm
         {
             int right = page.ClientSize.Width - 25;
             themeChoice.Left = Math.Max(300, right - themeChoice.Width);
-            densityChoice.Left = Math.Max(282, right - densityChoice.Width);
-            int leftWidth = Math.Max(160, densityChoice.Left - 40);
+            densityChoice.Left = Math.Max(UiKit.Scale(this, 282), right - densityChoice.Width);
+            int leftWidth = Math.Max(UiKit.Scale(this, 160), densityChoice.Left - 40);
             themeNote.Width = densityNote.Width = leftWidth;
-            botanicalNote.Width = Math.Max(225, page.ClientSize.Width - 70);
+            botanicalNote.Width = Math.Max(UiKit.Scale(this, 225), page.ClientSize.Width - 70);
         }
         page.Resize += (_, _) => Layout();
         Layout();

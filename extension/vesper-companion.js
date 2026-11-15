@@ -56,11 +56,17 @@ globalThis.VesperCompanion = (() => {
       if (this.pickerOpen && !still) this.moveToPerch();
     }
 
-    setPerch(x, y, faceLeft, fullscreen) {
+    // continuous=true means the player moved (scroll, resize): stay attached, do not fly.
+    // A discrete change (new player, fullscreen) flies or walks as before.
+    setPerch(x, y, faceLeft, fullscreen, { continuous = false } = {}) {
       const previous = this.perch;
       if (previous?.x === x && previous.y === y && previous.faceLeft === faceLeft && previous.fullscreen === fullscreen) return;
       this.perch = { x, y, faceLeft, fullscreen };
       if (!previous || !this.visible || !this.ready || this.still) return this.resetPose();
+      if (continuous && !this.flight && !this.walk) {
+        this.position(this.x + (x - previous.x), this.y + (y - previous.y));
+        return;
+      }
       clearTimeout(this.retargetTimer);
       const transition = previous.fullscreen === fullscreen ? undefined : fullscreen ? 'fullscreen_arrive' : 'fullscreen_depart';
       // Let rapid scroll and reel changes settle before selecting a new landing point.
@@ -74,8 +80,36 @@ globalThis.VesperCompanion = (() => {
       if (this.visible === visible) return;
       this.visible = visible;
       this.resetPose();
-      if (visible && !this.still) this.moveToPerch(this.perch?.fullscreen ? 'fullscreen_arrive' : 'approach');
+      if (!visible || this.still) return;
+      if (this.perch?.fullscreen) return this.moveToPerch('fullscreen_arrive');
+      this.arrive();
     }
+
+    // A real fly-in from above the corner instead of an 'approach' played in place.
+    arrive() {
+      if (!this.perch || !this.ready) return;
+      this.position(this.perch.x + (this.perch.faceLeft ? 48 : -48), Math.max(-40, this.perch.y - 48));
+      this.moveToPerch('approach');
+    }
+
+    // Rare, budgeted life when the user is not watching content: at most 3 per page, 40-90 s apart,
+    // only while the video is paused, the tab visible and the pointer idle. Zero timers otherwise.
+    scheduleIdle(context) {
+      clearTimeout(this.idleTimer);
+      this.idleCount ??= 0;
+      if (this.still || this.idleCount >= 3) return;
+      this.idleTimer = setTimeout(() => {
+        this.idleTimer = 0;
+        if (this.visible && this.mode === 'perched' && !this.pickerOpen && context.paused() && !document.hidden
+            && context.mostlyVisible() && context.pointerIdle(8000)) {
+          this.idleCount++;
+          this.react('wing_settle');
+        }
+        this.scheduleIdle(context);
+      }, 40_000 + Math.random() * 50_000);
+    }
+
+    stopIdle() { clearTimeout(this.idleTimer); this.idleTimer = 0; }
 
     setPickerOpen(open, acknowledged = false, clicked = false) {
       if (this.pickerOpen === open) return;

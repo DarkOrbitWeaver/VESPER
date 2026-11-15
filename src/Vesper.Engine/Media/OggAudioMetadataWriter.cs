@@ -83,6 +83,34 @@ internal static class OggAudioMetadataWriter
         }
     }
 
+    internal static byte[] OpusComments(MediaMergeMetadata? metadata, MediaThumbnail? cover)
+    {
+        byte[] empty = new byte[16];
+        "OpusTags"u8.CopyTo(empty);
+        if (!TryUpdateComments(Codec.Opus, empty, metadata ?? new MediaMergeMetadata(), cover, out byte[] comments))
+            throw new MediaContainerException("The Opus metadata is invalid.");
+        return comments;
+    }
+
+    internal static void ValidateOpus(Stream source, int packetCount, long granule)
+    {
+        if (!TryReadHeaders(source, out var header) || header.Codec != Codec.Opus)
+            throw new MediaContainerException("The Opus output has invalid headers.");
+        uint sequence = header.LastSequence + 1;
+        int packets = 0; long previous = 0; bool ended = false;
+        Page? page;
+        while ((page = ReadPage(source)) is not null)
+        {
+            if (ended || page.Serial != header.Serial || page.Sequence != sequence++ || (page.Flags & 3) != 0
+                || page.Granule < previous || page.Lacing.Length == 0 || page.Lacing[^1] == 255)
+                throw new MediaContainerException("The Opus page timeline is invalid.");
+            packets += page.Lacing.Count(lace => lace < 255);
+            previous = page.Granule; ended = (page.Flags & 4) != 0;
+        }
+        if (!ended || packets != packetCount || previous != granule)
+            throw new MediaContainerException("The Opus output lost packets or its final granule position.");
+    }
+
     private static bool TryReadHeaders(Stream source, out Header header)
     {
         header = null!;
@@ -347,7 +375,7 @@ internal static class OggAudioMetadataWriter
         return true;
     }
 
-    private static async Task<uint> WriteHeaderPacketAsync(Stream output, byte[] packet, uint serial,
+    internal static async Task<uint> WriteHeaderPacketAsync(Stream output, byte[] packet, uint serial,
         uint sequence, bool first, CancellationToken ct)
     {
         if (packet.Length == 0 || packet.Length > MaxHeaderPacketBytes) throw new IOException("An Ogg header packet has an unsupported size.");
@@ -428,7 +456,7 @@ internal static class OggAudioMetadataWriter
             lacing, 27 + segmentCount, bodyLength);
     }
 
-    private static void WriteChecksum(byte[] page)
+    internal static void WriteChecksum(byte[] page)
     {
         page.AsSpan(22, 4).Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(page.AsSpan(22, 4), OggCrc(page));
