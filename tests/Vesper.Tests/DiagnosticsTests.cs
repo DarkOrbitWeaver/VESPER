@@ -14,6 +14,7 @@ public sealed class DiagnosticsTests
             "Authorization: Bearer HEADER-SECRET",
             "Proxy-Authorization: Basic PROXY-SECRET",
             "Cookie: sessionid=COOKIE-SECRET; theme=green",
+            "{\"Cookie\":\"JSON-COOKIE-SECRET\",\"Authorization\":\"JSON-AUTH-SECRET\"}",
             "api_key=ASSIGNMENT-SECRET",
             $"destination: {profile}\\Downloads\\private name.mp4");
 
@@ -25,7 +26,7 @@ public sealed class DiagnosticsTests
         Assert.Contains("Cookie: [redacted]", scrubbed);
         Assert.Contains("api_key=[redacted]", scrubbed);
         Assert.Contains("%USERPROFILE%\\Downloads\\private name.mp4", scrubbed);
-        foreach (string secret in new[] { "URL-PASSWORD", "URL-SECRET", "URL-SIGNATURE", "HEADER-SECRET", "PROXY-SECRET", "COOKIE-SECRET", "ASSIGNMENT-SECRET", profile })
+        foreach (string secret in new[] { "URL-PASSWORD", "URL-SECRET", "URL-SIGNATURE", "HEADER-SECRET", "PROXY-SECRET", "COOKIE-SECRET", "JSON-COOKIE-SECRET", "JSON-AUTH-SECRET", "ASSIGNMENT-SECRET", profile })
             Assert.DoesNotContain(secret, scrubbed, StringComparison.OrdinalIgnoreCase);
     }
 

@@ -545,7 +545,7 @@ public sealed partial class DownloadEngine
 public static class Diagnostics
 {
     private static readonly Regex UrlPattern = new("""https?://[^\s<>"']+""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    private static readonly Regex HeaderPattern = new("""\b(?<name>Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*[:=]\s*[^\r\n]*""",
+    private static readonly Regex HeaderPattern = new("""\b(?<name>Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*["']?\s*[:=]\s*["']?[^\r\n]*""",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     private static readonly Regex SecretAssignmentPattern = new("""(?<key>\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token)|api[_-]?key|client[_-]?secret|password|secret|signature|sig|token)\b\s*["']?\s*[:=]\s*["']?)(?<value>[^&;\s,"'<>]+)""",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
