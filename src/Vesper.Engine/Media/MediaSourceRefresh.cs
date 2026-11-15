@@ -1,15 +1,18 @@
+using System.Text.Json.Serialization;
+
 namespace Vesper.Engine;
 
 /// <summary>A newly resolved plain-file URL, not permission to append a different representation.</summary>
 public sealed record ResolvedMediaSource(string Provider, string MediaId, string FormatId, string Url,
-    DateTimeOffset? ExpiresAt = null);
+    DateTimeOffset? ExpiresAt = null,
+    [property: JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null);
 
 public sealed partial class DownloadEngine
 {
     /// <summary>
-    /// Explicit source re-resolution for HTTP media. Requires exact provider/media/format identities, then delegates
-    /// byte identity to Rescue (strong same-resource validators or a trusted full/piece digest). A matching format ID
-    /// alone is never proof that bytes match. Streaming refresh needs plan-level verification and is refused here.
+    /// Explicit source re-resolution for HTTP media and a saved live-HLS recording. Requires exact provider/media/format
+    /// identities; direct files then delegate byte identity to Rescue, while live HLS checks the next sequence. Optional
+    /// request credentials are memory-only and scoped to the replacement origin.
     /// </summary>
     public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default)
     {
@@ -39,9 +42,11 @@ public sealed partial class DownloadEngine
             else if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
         }
         ct.ThrowIfCancellationRequested();
+        if (!TryCreateReplacementCredentials(replacement, out RequestCredentials? credentials, out string credentialError))
+            return Rejected(credentialError);
         if (liveState is not null)
-            return await RefreshLiveHlsSourceAsync(id, replacement, liveState, ct).ConfigureAwait(false);
-        var result = await ReplaceLinkAsync(id, replacement.Url, ct: ct).ConfigureAwait(false);
+            return await RefreshLiveHlsSourceAsync(id, replacement, liveState, credentials, ct).ConfigureAwait(false);
+        var result = await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials).ConfigureAwait(false);
         if (result.Accepted)
         {
             lock (_lock)
@@ -54,8 +59,33 @@ public sealed partial class DownloadEngine
         return result;
     }
 
+    private static bool TryCreateReplacementCredentials(ResolvedMediaSource replacement,
+        out RequestCredentials? credentials, out string error)
+    {
+        credentials = null;
+        error = "";
+        if (replacement.Secrets is not { Count: > 0 } supplied) return true;
+        if (!UrlPolicy.TryParse(replacement.Url, out Uri uri, out _))
+        { error = "Credentials were supplied for an invalid refreshed link."; return false; }
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach ((string name, string value) in supplied)
+        {
+            string canonical = name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ? "Cookie"
+                : name.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ? "Authorization" : "";
+            if (canonical.Length == 0 || headers.ContainsKey(canonical) || string.IsNullOrEmpty(value) || value.Length > 8192
+                || value.Any(char.IsControl))
+            { error = "The refreshed link contains credentials VESPER cannot safely use."; return false; }
+            headers[canonical] = value;
+        }
+
+        var origin = new UriBuilder(uri) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
+        credentials = new RequestCredentials(origin, headers);
+        return true;
+    }
+
     private async Task<RescueResult> RefreshLiveHlsSourceAsync(Guid id, ResolvedMediaSource replacement,
-        string savedState, CancellationToken ct)
+        string savedState, RequestCredentials? credentials, CancellationToken ct)
     {
         DownloadJob job;
         lock (_lock)
@@ -69,7 +99,8 @@ public sealed partial class DownloadEngine
         string? error;
         using (var session = new JobSession(this, job))
         {
-            try { (nextState, error) = await HlsTransfer.PrepareLiveRefreshAsync(this, session, _http, savedState, replacement.Url, ct).ConfigureAwait(false); }
+            try { (nextState, error) = await HlsTransfer.PrepareLiveRefreshAsync(this, session, _http, savedState,
+                replacement.Url, credentials, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) when (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException)
             { return Rejected("The refreshed live playlist could not be reached: " + ErrorClassifier.Describe(ex)); }
@@ -87,6 +118,10 @@ public sealed partial class DownloadEngine
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
             ChangeSourceUrlLocked(job, replacement.Url);
+            if (credentials is not null) _credentials[job.Id] = credentials;
+            else if (_credentials.TryGetValue(job.Id, out RequestCredentials? prior)
+                && Uri.TryCreate(replacement.Url, UriKind.Absolute, out Uri? replacementUri)
+                && !UrlPolicy.IsSameOrigin(prior.Origin, replacementUri)) _credentials.Remove(job.Id);
             job.MediaState = nextState;
             job.MediaExpiresAt = replacement.ExpiresAt;
             job.State = JobState.Queued;

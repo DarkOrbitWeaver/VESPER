@@ -602,4 +602,28 @@ public class SiteAdapterTests
         Assert.Equal(expected, Assert.Single(result.Item!.Representations).Context.CookieHeader);
     }
 
+    [Fact]
+    public async Task TikTok_NextDataPlayerLayoutIsParsed()
+    {
+        const string body = """
+        <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"statusCode":0,"itemInfo":{"itemStruct":{"id":"7234567890123456789","desc":"Next layout","video":{"duration":9,"playAddr":"https://v16.tiktokcdn.com/video.mp4?signature=abc"}}}}}}</script>
+        """;
+        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body), TikTokUrl);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal("Next layout", result.Item!.Title);
+        Assert.Equal(TimeSpan.FromSeconds(9), result.Item.Duration);
+        Assert.Equal("https://v16.tiktokcdn.com/video.mp4?signature=abc", Assert.Single(result.Item.Representations).Url.AbsoluteUri);
+    }
+
+    [Theory]
+    [InlineData(10204, MediaErrorCode.RegionRestricted)]
+    [InlineData(10222, MediaErrorCode.LoginRequired)]
+    [InlineData(10223, MediaErrorCode.LoginRequired)]
+    public async Task TikTok_StatusCodesAreTyped(int status, MediaErrorCode expected)
+    {
+        string body = "<script id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\">{\"__DEFAULT_SCOPE__\":{\"webapp.video-detail\":{\"statusCode\":" + status + ",\"statusMsg\":\"fixture\"}}}</script>";
+        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body), TikTokUrl);
+        Assert.Equal(expected, result.Error!.Code);
+    }
+
 }

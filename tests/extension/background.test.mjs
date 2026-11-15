@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
-  cookies = [{ name: 'session', value: 'test-value' }] } = {}) {
+  localData = {}, cookies = [{ name: 'session', value: 'test-value' }] } = {}) {
   const listeners = [];
   const noop = () => {};
   const event = { addListener: (fn) => listeners.push(fn) };
@@ -24,7 +24,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const badges = [];
   const alarms = new Map();
   const ports = [];
-  const local = storage();
+  const local = storage(localData);
   if (download && !downloadHistory.some(item => item.id === download.id)) downloadHistory.push(download);
   const chrome = {
     runtime: {
@@ -97,6 +97,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, actions, cookieLookups, badges, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
+    localData,
     advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
     // Chrome always stamps the sender. A bare call models VESPER's own page; a sender with a tab models a content script.
@@ -213,6 +214,34 @@ test('automatic queued results without transfer readiness leave Chrome running',
   assert.equal(file.paused, false);
   assert.equal(app.sent[0].mode, 'queue');
   assert.equal(app.sent[1].operation, 'abandon');
+});
+
+test('a temporary native error retries the same Chrome transfer identity after a delay', async () => {
+  const file = activeDownload();
+  const ids = [];
+  let attempts = 0;
+  const app = load({
+    'browser-submit': message => {
+      ids.push(message.id);
+      return attempts++ === 0 ? { ok: false, code: 'host-error', message: 'Temporary disconnect.' } : started;
+    },
+    'browser-transfer': transfer('active')
+  }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(file.paused, false);
+  assert.equal(ids.length, 1);
+  const failed = (await app.local.get('browserDownloads')).browserDownloads[file.id];
+  assert.equal(failed.stage, 'attempted');
+  assert.ok(failed.retryAt > Date.now());
+
+  app.advanceTime(61_000);
+  await app.recover();
+
+  assert.equal(ids.length, 2);
+  assert.equal(ids[1], ids[0]);
+  assert.equal(file.paused, true);
 });
 
 test('automatic handoff includes extensionless files and starts them by default', async () => {
@@ -1127,6 +1156,84 @@ test('messages from another extension or without a browser-stamped sender are re
 
 // ---------------------------------------------------------------- sign-in cookies follow SameSite (VES-003)
 
+const mediaOptionsReply = { ok: true, data: { title: 'Example video', choices: [{ index: 0, label: '720p' }] } };
+const videoPage = 'https://www.youtube.com/watch?v=EK3tCffac5k';
+const videoSender = { tab: { id: 17, url: videoPage }, url: videoPage, frameId: 0, documentId: 'doc-17' };
+const videoOptionsMessage = (pageUrl, extra = {}) => ({
+  type: 'media-options', pageUrl, playerPageUrl: pageUrl, playerUrl: '', generation: 1,
+  mediaChangedAt: 0, playerPlaying: false, ...extra
+});
+
+test('video format prefetch is off by default and limited to supported pages', async () => {
+  const app = load({ 'media-options': mediaOptionsReply });
+  const disabled = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  assert.equal(disabled.data.prefetchSkipped, true);
+  assert.equal(app.sent.length, 0);
+
+  const enabled = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
+  const unsupportedPage = 'https://example.com/article';
+  const skipped = await enabled.message(videoOptionsMessage(unsupportedPage, { prefetch: true }), {
+    tab: { id: 17, url: unsupportedPage }, url: unsupportedPage, frameId: 0, documentId: 'doc-17'
+  });
+  assert.equal(skipped.data.prefetchSkipped, true);
+  assert.equal(enabled.sent.length, 0);
+});
+
+test('prepared formats are reused by the click and expire quickly', async () => {
+  const app = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
+  const prefetched = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  assert.equal(prefetched.ok, true);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
+
+  const click = await app.message(videoOptionsMessage(videoPage), videoSender);
+  assert.deepEqual(click.data.choices, mediaOptionsReply.data.choices);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
+
+  app.advanceTime(31_000);
+  await app.message(videoOptionsMessage(videoPage), videoSender);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 2);
+});
+
+test('generic player prefetch requires a media URL observed by Chrome', async () => {
+  const app = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
+  const pageUrl = 'https://example.com/watch';
+  const mediaUrl = 'https://media.example/video.mp4';
+  const sender = { tab: { id: 22, url: pageUrl }, url: pageUrl, frameId: 0, documentId: 'doc-22' };
+  await app.onMedia({ url: mediaUrl, method: 'GET', type: 'media', statusCode: 200, tabId: 22, frameId: 0, documentId: 'doc-22',
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }, { name: 'Content-Length', value: '1000' }] });
+
+  await app.message(videoOptionsMessage(pageUrl, { playerUrl: mediaUrl, prefetch: true }), sender);
+  const request = app.sent.find(message => message.type === 'media-options');
+  assert.equal(request.candidates[0].url, mediaUrl);
+});
+
+test('unconfirmed signed submissions stay in session storage and expire', async () => {
+  const url = 'https://cdn.example/video.mp4?sig=short-lived-token';
+  const app = load({ submit: { ok: false, code: 'host-error', message: 'VESPER did not answer.' } });
+  await app.message({ type: 'submit', pageUrl: 'https://example/page', items: [{ url }] });
+
+  assert.equal((await app.local.get('pending')).pending, undefined);
+  assert.ok(JSON.stringify(app.sessionData.pending).includes(url));
+  const id = app.sent[0].id;
+  assert.equal(app.sessionData.pending[id].request.authorized, false);
+
+  app.advanceTime(31 * 60_000);
+  await app.message({ type: 'tab-state', tabId: 1 });
+  assert.deepEqual(app.sessionData.pending, {});
+});
+
+test('legacy persistent pending entries migrate without cookie headers', async () => {
+  const url = 'https://cdn.example/video.mp4?sig=legacy-token';
+  const localData = { pending: { old: { at: Date.now(), request: { id: 'old', authorized: true, items: [{ url, cookie: 'sid=secret' }] } } } };
+  const app = load({}, { localData });
+  await app.evaluate('pendingReady');
+
+  assert.equal((await app.local.get('pending')).pending, undefined);
+  assert.equal(app.sessionData.pending.old.request.authorized, false);
+  assert.equal(app.sessionData.pending.old.request.items[0].cookie, undefined);
+  assert.equal(app.sessionData.pending.old.request.items[0].url, url);
+});
+
 const cookieJar = [
   { name: 'strict', value: 's', sameSite: 'strict' }, { name: 'lax', value: 'l', sameSite: 'lax' },
   { name: 'none', value: 'n', sameSite: 'no_restriction' }, { name: 'plain', value: 'p', sameSite: 'unspecified' }
@@ -1137,7 +1244,7 @@ const withoutStrict = 'lax=l; none=n; plain=p';
 test('a link on another site never carries SameSite=Strict cookies to VESPER', async () => {
   const cases = [
     [{ pageUrl: 'https://bank.example/home' }, everyCookie],                       // same site
-    [{ pageUrl: 'https://www.bank.example/home' }, everyCookie],                   // a subdomain of the same site
+    [{ pageUrl: 'https://www.bank.example/home' }, withoutStrict],                 // exact-host fallback withholds across subdomains
     [{ pageUrl: 'https://forum.example/thread' }, withoutStrict],                  // another site
     [{ pageUrl: 'https://evilbank.example/' }, withoutStrict],                     // look-alike host
     [{ pageUrl: 'https://bank.example.evil.test/' }, withoutStrict],
@@ -1157,6 +1264,12 @@ test('a link on another site never carries SameSite=Strict cookies to VESPER', a
 test('sibling subdomains are treated as different sites, which can only withhold a cookie', async () => {
   const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
   await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://alice.pages.example/file.zip', pageUrl: 'https://mallory.pages.example/' }, undefined);
+  assert.equal(app.sent[0].items[0].cookie, withoutStrict);
+});
+
+test('public-suffix tenant hosts do not receive each other’s Strict cookies', async () => {
+  const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
+  await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://user.github.io/export.zip', pageUrl: 'https://github.io/' }, undefined);
   assert.equal(app.sent[0].items[0].cookie, withoutStrict);
 });
 

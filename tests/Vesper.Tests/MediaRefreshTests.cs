@@ -1,4 +1,6 @@
+using System.Text.Json;
 using Vesper.Engine;
+using Vesper.MediaResolver.Models;
 
 namespace Vesper.Tests;
 
@@ -30,6 +32,80 @@ public sealed class MediaRefreshTests
         Assert.True(result.Accepted, result.Message); Assert.Equal(RescueMode.R0, result.Mode);
         var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!)); Assert.Equal("muxed-720", done.MediaFormatId);
+    }
+
+    [Fact]
+    public async Task RefreshedMediaCookiesAreScopedToTheNewOriginAndNeverSerialized()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"), MediaProvider: "fixture",
+            MediaId: "video", MediaFormatId: "720", ExpectedSha256: Payloads.Sha256(server.V1)));
+        await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+
+        const string cookie = "session=refresh-secret";
+        var replacement = new ResolvedMediaSource("fixture", "video", "720", server.Url("/authenticated-refresh"),
+            DateTimeOffset.UtcNow.AddMinutes(5), new Dictionary<string, string> { ["Cookie"] = cookie });
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://example.test/video"), Provider = "fixture", MediaId = "video",
+            Representations = [new MediaRepresentation
+            {
+                Id = "720", Url = new Uri(server.Url("/authenticated-refresh")),
+                Context = new MediaRequestContext
+                {
+                    CookieHeader = cookie, CredentialOrigin = new Uri(server.BaseUrl), CredentialHosts = ["127.0.0.1"]
+                }
+            }]
+        };
+        RescueResult result = await VESPER.MediaSourceRescue.RefreshDirectAsync(h.Engine, h.Engine.Snapshot(added.JobId)!, item, CancellationToken.None);
+        Assert.True(result.Accepted, result.Message);
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.NotEmpty(server.RequestsFor("/authenticated-refresh"));
+        Assert.All(server.RequestsFor("/authenticated-refresh"), request => Assert.Equal(cookie, request.Cookie));
+        Assert.DoesNotContain(cookie, JsonSerializer.Serialize(replacement), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RefreshDoesNotForwardCookiesToAHostOutsideTheResolverContext()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"), MediaProvider: "fixture",
+            MediaId: "video", MediaFormatId: "720", ExpectedSha256: Payloads.Sha256(server.V1)));
+        JobSnapshot job = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://example.test/video"), Provider = "fixture", MediaId = "video",
+            Representations = [new MediaRepresentation
+            {
+                Id = "720", Url = new Uri(server.Url("/authenticated-refresh")),
+                Context = new MediaRequestContext
+                {
+                    CookieHeader = "session=not-authorized", CredentialOrigin = new Uri("https://example.test/"),
+                    CredentialHosts = ["example.test"]
+                }
+            }]
+        };
+
+        RescueResult result = await VESPER.MediaSourceRescue.RefreshDirectAsync(h.Engine, job, item, CancellationToken.None);
+        Assert.False(result.Accepted);
+        Assert.Contains("not authorized", result.Message);
+        Assert.Equal(0, server.Hits("/authenticated-refresh"));
+    }
+
+    [Fact]
+    public async Task RefreshedMediaReportsWhenTheServerRequiresSignIn()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"), MediaProvider: "fixture",
+            MediaId: "video", MediaFormatId: "720", ExpectedSha256: Payloads.Sha256(server.V1)));
+        await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+
+        RescueResult result = await h.Engine.RefreshMediaSourceAsync(added.JobId,
+            new("fixture", "video", "720", server.Url("/authenticated-refresh"), DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.False(result.Accepted);
+        Assert.Contains("requires sign-in", result.Message);
+        Assert.Equal(server.Url("/expires-after-truncate"), h.Engine.Snapshot(added.JobId)!.SourceUrl);
     }
 
     [Fact]
@@ -75,8 +151,14 @@ public sealed class MediaRefreshTests
         Assert.Equal(server.Url(oldPath), h.Engine.Snapshot(added.JobId)!.SourceUrl);
 
         server.HlsPlaylists[newPath] = LivePlaylist(100, "s100.ts", "s101.ts");
-        RescueResult refreshed = await h.Engine.RefreshMediaSourceAsync(added.JobId,
-            new("fixture", "live-one", "transport-stream", server.Url(newPath), DateTimeOffset.UtcNow.AddMinutes(5)));
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://example.test/live"), Provider = "fixture", MediaId = "live-one",
+            Representations = [new MediaRepresentation
+            { Id = "transport-stream", Url = new Uri(server.Url(newPath)), Protocol = Vesper.MediaResolver.Models.StreamProtocol.Hls }]
+        };
+        RescueResult refreshed = await VESPER.MediaSourceRescue.RefreshLiveHlsAsync(
+            h.Engine, h.Engine.Snapshot(added.JobId)!, item, CancellationToken.None);
         Assert.True(refreshed.Accepted, refreshed.Message);
         Assert.Equal(RescueMode.None, refreshed.Mode);
 

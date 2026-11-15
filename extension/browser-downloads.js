@@ -2,7 +2,9 @@
 
 const RECOVERY_ALARM = 'vesper-chrome-downloads';
 const MAX_BROWSER_RECORDS = 128;
-const RESPONSE_LIFETIME = 60_000;
+const RESPONSE_LIFETIME = 5 * 60_000;
+const AUTOMATIC_RETRY_DELAY = 60_000;
+const MAX_CAPTURE_ATTEMPTS = 3;
 const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
 const DECISIONS_KEY = 'vesperCaptureDecisions';
 const MAX_DECISIONS = 20;
@@ -279,7 +281,9 @@ async function recoverUncapturedChromeDownloads() {
     readBrowserRecords()
   ]);
   const recoverable = items.filter(item => canMove(item) && !item.paused && !startedByVesper(item)
-    && !browserOperations.has(item.id) && !sameDownload(item, records[item.id] || {}));
+    && !browserOperations.has(item.id)
+    && (!sameDownload(item, records[item.id] || {})
+      || records[item.id]?.stage === 'attempted' && (records[item.id].retryAt || 0) <= Date.now()));
   await Promise.allSettled(recoverable.map(item => captureChromeDownload(item)));
 }
 
@@ -342,9 +346,15 @@ function moveChromeDownload(id, mode, automatic = false) {
     }
     const previous = await browserRecord(item);
     if (previous?.stage === 'parked' || previous?.stage === 'parking') return { ok: true, chromePaused: item.paused };
-    if (automatic && previous) return chromeKeeps();
+    if (previous?.stage === 'done') return chromeKeeps('VESPER already has this download.');
+    if (automatic && previous && previous.stage !== 'attempted') return chromeKeeps();
+    if (automatic && previous?.stage === 'attempted' && Date.now() < (previous.retryAt || 0)) return chromeKeeps();
 
-    const record = { startTime: item.startTime, transferId: crypto.randomUUID(), stage: 'attempted' };
+    const record = previous?.stage === 'attempted'
+      ? { ...previous }
+      : { startTime: item.startTime, transferId: crypto.randomUUID(), stage: 'attempted', attempts: 0 };
+    delete record.retryAt;
+    record.attempts = (record.attempts || 0) + 1;
     if (!(await writeBrowserRecord(id, record))) return chromeKeeps();
     const { items, authorized } = await withSignIn([{
       url: browserUrl(item), fileName: chromeFileName(item),
@@ -354,7 +364,25 @@ function moveChromeDownload(id, mode, automatic = false) {
     const result = reply.results?.[0];
     if (!reply.ok || result?.transferReady !== true) {
       // A delayed reply cannot publish a tentative download. Release the job if the helper answered.
-      if (reply.ok) await transferCommand(record.transferId, 'abandon');
+      if (reply.ok) {
+        const stopped = await transferCommand(record.transferId, 'abandon').catch(() => null);
+        if (stopped?.ok && stopped.data?.state === 'failed') record.transferId = crypto.randomUUID();
+        else if (stopped?.ok && stopped.data?.state === 'complete') {
+          record.stage = 'done';
+          await writeBrowserRecord(id, record);
+          await note(handoffOutcome(reply, result, authorized));
+          return chromeKeeps();
+        }
+      }
+      if (record.attempts >= MAX_CAPTURE_ATTEMPTS) {
+        record.stage = 'stand-down';
+        delete record.retryAt;
+        await writeBrowserRecord(id, record);
+      } else {
+        record.retryAt = Date.now() + AUTOMATIC_RETRY_DELAY;
+        await writeBrowserRecord(id, record);
+        await armBrowserRecovery();
+      }
       await note(handoffOutcome(reply, result, authorized));
       return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
     }

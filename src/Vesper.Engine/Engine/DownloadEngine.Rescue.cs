@@ -25,6 +25,12 @@ public static class RescueEvaluator
     {
         if (!probe.RangeOk)
         {
+            if (probe.Status == 401)
+                return Reject("The refreshed link requires sign-in. Open the source in your authorized browser and refresh it; saved data was kept.");
+            if (probe.Status == 403)
+                return Reject("The server refused the refreshed link (HTTP 403). It may be expired, private or require sign-in; refresh it in your authorized browser. Saved data was kept.");
+            if (probe.Status == 407)
+                return Reject("The configured proxy requires authentication (HTTP 407). Fix the proxy settings; saved data was kept.");
             return Reject(probe.Status == 200
                 ? "The new link does not support resuming, so the saved data cannot be continued from it."
                 : $"The new link did not give a usable answer (HTTP {probe.Status}).");
@@ -77,7 +83,11 @@ public sealed partial class DownloadEngine
     /// Replace Link / Rescue. One ranged request to the new link is evaluated BEFORE anything changes.
     /// If it is not accepted, the job (including its partial data) is left exactly as it was.
     /// </summary>
-    public async Task<RescueResult> ReplaceLinkAsync(Guid id, string newUrl, RescueInput? input = null, CancellationToken ct = default)
+    public Task<RescueResult> ReplaceLinkAsync(Guid id, string newUrl, RescueInput? input = null, CancellationToken ct = default) =>
+        ReplaceLinkCoreAsync(id, newUrl, input, ct, null);
+
+    private async Task<RescueResult> ReplaceLinkCoreAsync(Guid id, string newUrl, RescueInput? input, CancellationToken ct,
+        RequestCredentials? replacementCredentials)
     {
         DownloadJob? job;
         Task? stopping = null;
@@ -112,13 +122,13 @@ public sealed partial class DownloadEngine
         long retained = job.Extents.TotalBytes;
         if (retained == 0)
         {
-            ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null);
+            ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null, replacementCredentials);
             return new RescueResult(true, RescueMode.None, "Link replaced. Nothing had been saved yet, so nothing needed validating.", 0);
         }
 
         long offset = job.Extents.Gaps(job.TotalBytes ?? long.MaxValue).Select(g => g.Start).DefaultIfEmpty(0).First();
         ProbeFacts probe;
-        try { probe = await ProbeAsync(job, uri, offset, ct).ConfigureAwait(false); }
+        try { probe = await ProbeAsync(job, uri, offset, ct, replacementCredentials).ConfigureAwait(false); }
         catch (Exception ex) when (ex is not OperationCanceledException && (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException))
         {
             return Rejected("The new link could not be reached: " + ErrorClassifier.Describe(ex));
@@ -143,15 +153,16 @@ public sealed partial class DownloadEngine
             catch (LocalStorageException ex) { return Rejected("The saved data could not be read for verification: " + ex.Message); }
         }
 
-        ApplyRescue(job, uri, decision, probe, sha, pieces, verified);
+        ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials);
         long keep = verified?.TotalBytes ?? retained;
         string message = decision.Message + (decision.Mode == RescueMode.R1b ? $" {Formatting.Bytes(keep)} of verified data kept." : "");
         return new RescueResult(true, decision.Mode, message, keep, refetch);
     }
 
-    private async Task<ProbeFacts> ProbeAsync(DownloadJob job, Uri uri, long offset, CancellationToken ct)
+    private async Task<ProbeFacts> ProbeAsync(DownloadJob job, Uri uri, long offset, CancellationToken ct,
+        RequestCredentials? replacementCredentials = null)
     {
-        RequestCredentials? credentials = CredentialsFor(job.Id);
+        RequestCredentials? credentials = replacementCredentials ?? CredentialsFor(job.Id);
         var spec = new RequestSpec(offset, null, Referer: job.Referer, UserAgent: job.UserAgent,
             Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? job.SourceUrl);
         using HttpResponseMessage response = await _http.SendAsync(uri, spec, ct).ConfigureAwait(false);
@@ -161,13 +172,17 @@ public sealed partial class DownloadEngine
         return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response), HttpFacts.IsIdentityEncoded(response));
     }
 
-    private void ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces, ExtentSet? verified)
+    private void ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
+        ExtentSet? verified, RequestCredentials? replacementCredentials = null)
     {
         lock (_lock)
         {
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
             ChangeSourceUrlLocked(job, uri.AbsoluteUri);
+            if (replacementCredentials is not null) _credentials[job.Id] = replacementCredentials;
+            else if (_credentials.TryGetValue(job.Id, out RequestCredentials? prior)
+                && !UrlPolicy.IsSameOrigin(prior.Origin, uri)) _credentials.Remove(job.Id);
             job.RescueMode = decision.Mode;
 
             if (decision.Mode is RescueMode.R1 or RescueMode.R1b && probe is not null)

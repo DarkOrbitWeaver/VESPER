@@ -88,7 +88,78 @@ public sealed class EngineReliabilityTests
 
         Assert.Equal("", done.Reason);                     // the probe confirmed the length
         Assert.Equal(server.V1, File.ReadAllBytes(done.FinalPath!));
-        Assert.True(server.RangeHeaders.Any(r => r.Contains("bytes=")), "the confirmation probe was sent");
+        Assert.Contains(server.RangeHeaders, r => r.Contains($"bytes={server.V1.Length}-{server.V1.Length}"));
+    }
+
+    [Fact]
+    public async Task A_short_body_proven_by_the_range_probe_is_never_published()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/unknown-length-short"), FileName: "short.bin"));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot result = await h.WaitAsync(added.JobId, job =>
+            job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.Equal(JobState.NeedsAttention, result.State);
+        Assert.Equal("truncated", result.Reason);
+        Assert.Null(result.FinalPath);
+        Assert.False(File.Exists(Path.Combine(h.Downloads, "short.bin")));
+        Assert.Contains(server.RangeHeaders, r => r.Contains($"bytes={server.V1.Length / 2}-{server.V1.Length / 2}"));
+    }
+
+    [Fact]
+    public async Task A_body_without_a_verifiable_length_is_kept_unpublished()
+    {
+        await using var server = new CloseDelimitedServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/close-delimited"), FileName: "chunked.bin"));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot result = await h.WaitAsync(added.JobId, job =>
+            job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.Equal(JobState.NeedsAttention, result.State);
+        Assert.Equal("unverified-length", result.Reason);
+        Assert.Null(result.FinalPath);
+        Assert.False(File.Exists(Path.Combine(h.Downloads, "chunked.bin")));
+        Assert.Equal(server.Body, File.ReadAllBytes(result.PartialPath));
+    }
+
+    [Theory]
+    [InlineData("/html-attachment")]
+    [InlineData("/mislabeled-html")]
+    public async Task An_html_error_page_is_not_published_as_an_archive(string path)
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url(path), FileName: "export.zip"));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot result = await h.WaitAsync(added.JobId, job =>
+            job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.Equal(JobState.NeedsAttention, result.State);
+        Assert.Equal("html", result.Reason);
+        Assert.Null(result.FinalPath);
+        Assert.False(File.Exists(Path.Combine(h.Downloads, "export.zip")));
+    }
+
+    [Fact]
+    public async Task A_requested_html_document_remains_downloadable()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/html"), FileName: "page.html"));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Contains("Please sign in", await File.ReadAllTextAsync(done.FinalPath!));
     }
 
     // ---- VES-014: a file that is already compressed is stored as-is --------------------------------------
@@ -165,6 +236,8 @@ public sealed class MediaSourceRescueTests
         { Kind = JobKind.Merge, OriginalPageUrl = "https://www.youtube.com/watch?v=a", MediaId = "a", MediaFormatId = "137+140" }));
         Assert.False(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Merge, OriginalPageUrl = "https://x/", MediaId = "a" }));
         Assert.False(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Hls, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
+        Assert.True(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot
+        { Kind = JobKind.Hls, IsLiveRecording = true, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
     }
 
     [Fact]

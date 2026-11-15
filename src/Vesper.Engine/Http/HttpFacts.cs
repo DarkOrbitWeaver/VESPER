@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Text;
 
 namespace Vesper.Engine;
 
@@ -18,6 +19,11 @@ public static class HttpFacts
     public static bool IsIdentityEncoded(HttpResponseMessage response) =>
         response.Content.Headers.ContentEncoding.All(e => e.Equals("identity", StringComparison.OrdinalIgnoreCase));
 
+    public static bool HasCompleteBodyFraming(HttpResponseMessage response) =>
+        response.Content.Headers.ContentLength is >= 0
+        || response.Headers.TransferEncodingChunked == true
+        || response.Version.Major >= 2;
+
     public static string? ContentType(HttpResponseMessage response) => response.Content.Headers.ContentType?.MediaType;
 
     /// <summary>True when the server says it honours byte ranges, so a length can be confirmed after the fact.</summary>
@@ -26,6 +32,26 @@ public static class HttpFacts
 
     public static bool IsHtml(HttpResponseMessage response) =>
         ContentType(response) is "text/html" or "application/xhtml+xml";
+
+    public static bool IsHtmlFileName(string? fileName) => Path.GetExtension(fileName ?? "").ToLowerInvariant()
+        is ".html" or ".htm" or ".xhtml" or ".php" or ".asp" or ".aspx";
+
+    public static bool LooksLikeHtml(ReadOnlySpan<byte> prefix)
+    {
+        if (prefix.Length >= 3 && prefix[0] == 0xEF && prefix[1] == 0xBB && prefix[2] == 0xBF) prefix = prefix[3..];
+        string text = Encoding.UTF8.GetString(prefix).TrimStart('\uFEFF', '\0', ' ', '\t', '\r', '\n');
+        for (int i = 0; i < 4 && text.StartsWith("<!--", StringComparison.Ordinal); i++)
+        {
+            int end = text.IndexOf("-->", StringComparison.Ordinal);
+            if (end < 0) return false;
+            text = text[(end + 3)..].TrimStart();
+        }
+        return text.StartsWith("<!doctype html", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("<html", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("<head", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("<body", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("<meta", StringComparison.OrdinalIgnoreCase);
+    }
 
     public static bool IsAttachment(HttpResponseMessage response) =>
         response.Content.Headers.ContentDisposition?.DispositionType?.Equals("attachment", StringComparison.OrdinalIgnoreCase) == true;
@@ -53,6 +79,7 @@ public static class HttpFacts
         if (range.From.Value != requestedStart) return RangeCheck.Fail("wrong-start", $"The server returned bytes from {range.From} instead of {requestedStart}.");
         if (range.To.Value < range.From.Value) return RangeCheck.Fail("bad-range", "Invalid Content-Range.");
         if (requestedEndInclusive is long end && range.To.Value > end) return RangeCheck.Fail("too-long", "The server returned more bytes than requested.");
+        if (range.Length is long total && range.To.Value >= total) return RangeCheck.Fail("bad-total", "Content-Range extends past the stated file size.");
         long length = range.To.Value - range.From.Value + 1;
         if (response.Content.Headers.ContentLength is long declared && declared != length)
             return RangeCheck.Fail("length-mismatch", "Content-Length disagrees with Content-Range.");

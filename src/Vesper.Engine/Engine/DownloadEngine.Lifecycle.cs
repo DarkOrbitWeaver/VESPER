@@ -23,6 +23,8 @@ public sealed partial class DownloadEngine
 
         if (file.Length != total) file.Truncate(total);     // stale tail from an older, longer file never ships
         file.Flush();
+        if (!HttpFacts.IsHtmlFileName(job.FileName) && LooksLikeHtmlFile(file, total))
+            return RunOutcome.NeedsAttention("html", "The server sent a web page instead of the selected file. Saved data was kept; nothing was published.");
         UpdateJob(job, j => { j.TotalBytes = total; j.State = JobState.Finalizing; j.Message = ""; ClearPendingPublication(j); });
         Failpoint("finalize.afterFlush");
 
@@ -84,6 +86,14 @@ public sealed partial class DownloadEngine
             offset += read;
         }
         return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
+    private static bool LooksLikeHtmlFile(PartialFile file, long length)
+    {
+        if (length <= 0) return false;
+        Span<byte> prefix = stackalloc byte[4096];
+        int count = file.Read(prefix[..(int)Math.Min(prefix.Length, length)], 0);
+        return HttpFacts.LooksLikeHtml(prefix[..count]);
     }
 
     /// <summary>

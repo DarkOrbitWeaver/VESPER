@@ -37,38 +37,20 @@ internal sealed class TikTokAdapter : AdapterBase
         JsonElement? item = null;
         try
         {
-            foreach (var tag in HtmlScanner.Scan(page.Content))
-            {
-                if (tag.IsClosing || tag.Name != "script") continue;
-                string? id = tag.Attr("id");
-                if (id is not ("__UNIVERSAL_DATA_FOR_REHYDRATION__" or "SIGI_STATE")) continue;
-                var parsed = JsonExt.TryParse(tag.Body);
-                if (parsed is null) continue;
-                JsonElement? found = null;
-                if (id == "__UNIVERSAL_DATA_FOR_REHYDRATION__")
-                {
-                    var detail = parsed.RootElement.P("__DEFAULT_SCOPE__").P("webapp.video-detail");
-                    int code = detail.P("statusCode").Int() ?? 0;
-                    if (code != 0)
-                    {
-                        parsed.Dispose();
-                        return Fail(code == 10222 ? MediaErrors.LoginRequired("TikTok: private video")
-                            : MediaErrors.Unavailable($"TikTok statusCode {code}"));
-                    }
-                    found = detail.P("itemInfo").P("itemStruct");
-                }
-                else
-                {
-                    string? wanted = page.FinalUrl.AbsolutePath.Split('/').LastOrDefault(IsDigits);
-                    if (wanted is not null) found = parsed.RootElement.P("ItemModule").P(wanted);
-                }
-                if (found is not null) { state = parsed; item = found; break; }
-                parsed.Dispose();
-            }
+            string? videoId = VideoId(page.FinalUrl) ?? VideoId(request.Url);
+            var found = FindPlayerState(page.Content, videoId);
+            state = found.Document;
+            item = found.Item;
+            if (found.Status is 10222 or 10223)
+                return Fail(MediaErrors.LoginRequired("TikTok: private video"));
+            if (found.Status == 10204)
+                return Fail(MediaErrors.Region($"TikTok statusCode 10204: {found.Message} (not available from this network or region)"));
+            if (found.Status != 0)
+                return Fail(MediaErrors.Unavailable($"TikTok statusCode {found.Status}: {found.Message}"));
             if (item is null)
                 return Fail(page.Content.Contains("captcha", StringComparison.OrdinalIgnoreCase)
                     ? MediaErrors.BrowserContext("TikTok returned a verification page. Complete verification in your browser; VESPER does not bypass it.")
-                    : MediaErrors.SourceChanged("TikTok did not supply player state for this video. Refresh the page or update VESPER."));
+                    : MediaErrors.SourceChanged($"TikTok player state was not found{(found.Layout is null ? "" : $" in {found.Layout}")}. Refresh the page or update VESPER."));
             var s = item;
             if (s.P("imagePost") is not null)
                 return Fail(MediaErrors.NoMedia("This TikTok post is a photo slideshow, not a video", browserMayHelp: false));
@@ -143,6 +125,64 @@ internal sealed class TikTokAdapter : AdapterBase
     }
 
     private static Uri? Address(JsonElement? address) => Addresses(address).FirstOrDefault();
+
+    private static (JsonDocument? Document, JsonElement? Item, int Status, string? Message, string? Layout)
+        FindPlayerState(string html, string? videoId)
+    {
+        var scripts = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var tag in HtmlScanner.Scan(html))
+        {
+            if (tag.IsClosing || tag.Name != "script") continue;
+            string? id = tag.Attr("id");
+            if (id is "__UNIVERSAL_DATA_FOR_REHYDRATION__" or "SIGI_STATE" or "__NEXT_DATA__")
+                scripts.TryAdd(id, tag.Body ?? string.Empty);
+        }
+
+        foreach (var (layout, id) in new[]
+        {
+            ("universal", "__UNIVERSAL_DATA_FOR_REHYDRATION__"),
+            ("sigi", "SIGI_STATE"),
+            ("next", "__NEXT_DATA__")
+        })
+        {
+            if (!scripts.TryGetValue(id, out string? json) || JsonExt.TryParse(json) is not { } document) continue;
+            var found = FindItem(document.RootElement, layout, videoId);
+            if (found.Item is not null || found.Status != 0)
+                return (document, found.Item, found.Status, found.Message, layout);
+            document.Dispose();
+        }
+        return (null, null, 0, null, null);
+    }
+
+    private static (JsonElement? Item, int Status, string? Message) FindItem(JsonElement root, string layout, string? videoId)
+    {
+        if (layout == "universal")
+        {
+            var scope = root.P("__DEFAULT_SCOPE__");
+            var detail = scope.P("webapp.video-detail") ?? scope.P("webapp.reflow.video.detail");
+            return (detail.P("itemInfo").P("itemStruct"), detail.P("statusCode").Int() ?? 0, detail.P("statusMsg").Str());
+        }
+
+        if (layout == "sigi")
+        {
+            var module = root.P("ItemModule");
+            JsonElement? item = videoId is not null ? module.P(videoId) : null;
+            item ??= videoId is null ? module.Props().Select(p => (JsonElement?)p.Value).FirstOrDefault() : null;
+            return (item, root.P("VideoPage").P("statusCode").Int() ?? 0, root.P("VideoPage").P("statusMsg").Str());
+        }
+
+        var props = root.P("props").P("pageProps");
+        return (props.P("itemInfo").P("itemStruct"), props.P("statusCode").Int() ?? 0, props.P("statusMsg").Str());
+    }
+
+    private static string? VideoId(Uri url)
+    {
+        string path = url.AbsolutePath;
+        int at = path.IndexOf("/video/", StringComparison.Ordinal);
+        if (at < 0) return null;
+        string id = path[(at + 7)..].Trim('/');
+        return id.Length is > 0 and <= 32 && id.All(char.IsAsciiDigit) ? id : null;
+    }
 
     private static IEnumerable<Uri> Addresses(JsonElement? address)
     {

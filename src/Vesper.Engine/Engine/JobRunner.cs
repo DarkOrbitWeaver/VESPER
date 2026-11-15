@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Net;
 using System.Net.Http;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
@@ -304,10 +305,16 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
     private void RejectHtml(HttpResponseMessage r)
     {
-        if (!HttpFacts.IsHtml(r) || HttpFacts.IsAttachment(r)) return;
-        string ext = Path.GetExtension(Job.FileName).ToLowerInvariant();
-        if (ext is ".html" or ".htm" or ".xhtml" or ".php" or ".asp" or ".aspx" || Job.ContentType is "text/html") return;
+        if (!HttpFacts.IsHtml(r) || HttpFacts.IsHtmlFileName(Job.FileName)
+            || HttpFacts.IsHtmlFileName(HttpFacts.SuggestedFileName(r))) return;
         throw Stop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of a file (a sign-in, error or captive-portal page). Nothing was saved from it."));
+    }
+
+    private void RejectHtmlBody(ReadOnlySpan<byte> prefix, HttpResponseMessage response)
+    {
+        if (HttpFacts.IsHtmlFileName(Job.FileName) || HttpFacts.IsHtmlFileName(HttpFacts.SuggestedFileName(response))) return;
+        if (HttpFacts.LooksLikeHtml(prefix))
+            throw Stop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of the selected file. Nothing was published."));
     }
 
     private void CaptureMetadata(FirstResult first)
@@ -557,6 +564,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         {
             await using Stream body = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            bool checkedBody = segment.Next != 0;
             while (true)
             {
                 long remaining = board.Remaining(segment);
@@ -566,6 +574,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
                 int n = board.ClaimChunk(segment, read);                  // the span may have been split while we were reading
                 if (n <= 0) return;
+                if (!checkedBody)
+                {
+                    RejectHtmlBody(buffer.AsSpan(0, n), response);
+                    checkedBody = true;
+                }
                 await session.Limiter.AcquireAsync(n, ct).ConfigureAwait(false);
                 await engine.GlobalLimiter.AcquireAsync(n, ct).ConfigureAwait(false);
                 await session.WriteAsync(buffer.AsMemory(0, n), segment.Next, report, ct).ConfigureAwait(false);
@@ -592,11 +605,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             await using Stream raw = await first.Response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             await using Stream body = first.Decoded ? Decode(raw, first.Response) : raw;
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            bool checkedBody = false;
 
             while (true)
             {
                 int read = await ReadAsync(body, buffer, stall, ct).ConfigureAwait(false);
                 if (read == 0) break;
+                if (!checkedBody)
+                {
+                    RejectHtmlBody(buffer.AsSpan(0, read), first.Response);
+                    checkedBody = true;
+                }
                 int skip = 0;
 
                 if (offset < prefix)
@@ -622,9 +641,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
             if (Job.TotalBytes is null)
             {
-                // The stream's end defined the total. A reset that looks like a clean close would otherwise
-                // publish a silently short file, so confirm the length when the server allows it.
-                await VerifyUnknownLengthAsync(offset, ct).ConfigureAwait(false);
+                // Trust explicit HTTP framing when ranges are unavailable. If ranges exist, probe the
+                // boundary as well: a cleanly framed but short response can still be a truncated file.
+                bool framed = HttpFacts.HasCompleteBodyFraming(first.Response);
+                if (!framed || Job.AcceptsRanges && !first.Decoded)
+                    await VerifyUnknownLengthAsync(offset, ct).ConfigureAwait(false);
                 engine.UpdateJob(Job, j => j.TotalBytes = offset);
             }
         }
@@ -652,34 +673,40 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     /// </summary>
     private async Task VerifyUnknownLengthAsync(long offset, CancellationToken ct)
     {
-        if (!Job.AcceptsRanges || Job.NonResumable) return;
-        try
+        if (!Job.AcceptsRanges || Job.NonResumable) throw UnverifiedLength();
+
+        // Ask for one byte only. Requesting offset- could make the server send the entire missing tail.
+        using HttpResponseMessage probe = await http.SendAsync(_url, BuildSpec(offset, offset), ct).ConfigureAwait(false);
+        if (probe.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
         {
-            using HttpResponseMessage probe = await http.SendAsync(_url, BuildSpec(offset, null), ct).ConfigureAwait(false);
-            if ((int)probe.StatusCode == 416)
-            {
-                RangeCheck check = HttpFacts.CheckRangeResponse(probe, offset, null);
-                if (check.IsValid || check.Total == offset) return;   // the server agrees the file ends here
-            }
-            else if ((int)probe.StatusCode == 206)
-            {
-                RangeCheck check = HttpFacts.CheckRangeResponse(probe, offset, null);
-                if (check.Total is long total && total == offset) return;
-                if (check.Total is long longer && longer > offset)
-                    throw new TransientNetworkException(
-                        $"The connection closed after {Formatting.Bytes(offset)} of {Formatting.Bytes(longer)}.");
-            }
+            var range = probe.Content.Headers.ContentRange;
+            if (range is not { Unit: "bytes", From: null, To: null, Length: long total })
+                throw UnverifiedLength();
+
+            RequireSameRepresentation(probe, total, fresh: false);
+            if (total == offset) return;
+            if (total > offset) throw TruncatedLength(offset, total);
+            throw Changed($"the server now reports {Formatting.Bytes(total)} instead of the saved {Formatting.Bytes(offset)}");
         }
-        catch (Exception ex) when (ex is TransientNetworkException or RedirectException or HttpRequestException or IOException)
+
+        if (probe.StatusCode == HttpStatusCode.PartialContent)
         {
-            // The probe itself failed; fall through and mark the file unverified rather than lose it.
+            RangeCheck check = HttpFacts.CheckRangeResponse(probe, offset, offset);
+            if (!check.IsValid || check.Total is not long total) throw UnverifiedLength();
+            RequireSameRepresentation(probe, total, fresh: false);
+            if (total > offset) throw TruncatedLength(offset, total);
+            if (total < offset) throw Changed($"the server now reports {Formatting.Bytes(total)} instead of the saved {Formatting.Bytes(offset)}");
         }
-        engine.UpdateJob(Job, j =>
-        {
-            j.Reason = "unverified-length";
-            j.Message = "Finished, but the server didn't state the size, so VESPER can't prove it's complete.";
-        });
+
+        if (probe.StatusCode != HttpStatusCode.OK) throw StatusStop(probe);
+        throw UnverifiedLength();
     }
+
+    private static RunnerStop UnverifiedLength() => Stop(RunOutcome.NeedsAttention("unverified-length",
+        "The server did not state the file size and VESPER could not confirm the last byte. Saved data was kept; nothing was published."));
+
+    private static RunnerStop TruncatedLength(long offset, long total) => Stop(RunOutcome.NeedsAttention("truncated",
+        $"The connection closed after {Formatting.Bytes(offset)}, but the server reports {Formatting.Bytes(total)}. Saved data was kept; nothing was published."));
 
     private static Stream Decode(Stream body, HttpResponseMessage response)
     {

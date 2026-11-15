@@ -16,8 +16,8 @@ internal static class MediaSourceRescue
     private static readonly Dictionary<Guid, DateTime> LastAutomaticAttempt = [];
 
     public static bool CanRefresh(JobSnapshot job) =>
-        job.Kind is JobKind.Http or JobKind.Merge && job.OriginalPageUrl is not null && job.MediaId is not null
-        && job.MediaFormatId is not null;
+        (job.Kind is JobKind.Http or JobKind.Merge || job.Kind == JobKind.Hls && job.IsLiveRecording)
+        && job.OriginalPageUrl is not null && job.MediaId is not null && job.MediaFormatId is not null;
 
     /// <summary>One automatic attempt per job per hour; the Rescue window can always try again by hand.</summary>
     public static bool ShouldTryAutomatically(JobSnapshot job)
@@ -46,18 +46,65 @@ internal static class MediaSourceRescue
             return new RescueResult(false, RescueMode.None, "The source does not expose a verifiable media identity. Saved data was kept.", 0);
 
         if (job.Kind == JobKind.Http) return await RefreshDirectAsync(engine, job, item, ct);
+        if (job.Kind == JobKind.Hls) return await RefreshLiveHlsAsync(engine, job, item, ct);
         return RefreshMerge(engine, job, item);
     }
 
-    private static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
+    internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
     {
         MediaRepresentation? format = item.Representations.FirstOrDefault(r => r.Id == job.MediaFormatId);
-        if (format is null || format.Protocol != StreamProtocol.Http || format.Context.HasCredentials
-            || format.Context.Origin is not null || format.Context.AcceptLanguage is not null)
+        if (format is null || format.Protocol != StreamProtocol.Http)
             return new RescueResult(false, RescueMode.None,
                 "The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.", 0);
+        if (!TryRefreshCredentials(format, out IReadOnlyDictionary<string, string>? secrets, out string? error))
+            return new RescueResult(false, RescueMode.None, error!, 0);
         return await engine.RefreshMediaSourceAsync(job.Id, new ResolvedMediaSource(item.Provider,
-            item.MediaId!, format.Id, format.Url.AbsoluteUri, format.ExpiresAt), ct);
+            item.MediaId!, format.Id, format.Url.AbsoluteUri, format.ExpiresAt, secrets), ct);
+    }
+
+    internal static async Task<RescueResult> RefreshLiveHlsAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
+    {
+        MediaRepresentation? format = item.Representations.FirstOrDefault(r => r.Id == job.MediaFormatId);
+        if (format is null || format.Protocol != StreamProtocol.Hls)
+            return new RescueResult(false, RescueMode.None,
+                "The exact live stream format or its required request context is unavailable. Saved data was kept.", 0);
+        if (!TryRefreshCredentials(format, out IReadOnlyDictionary<string, string>? secrets, out string? error))
+            return new RescueResult(false, RescueMode.None, error!, 0);
+        return await engine.RefreshMediaSourceAsync(job.Id, new ResolvedMediaSource(item.Provider,
+            item.MediaId!, format.Id, format.Url.AbsoluteUri, format.ExpiresAt, secrets), ct);
+    }
+
+    private static bool TryRefreshCredentials(MediaRepresentation format, out IReadOnlyDictionary<string, string>? secrets, out string? error)
+    {
+        secrets = null;
+        error = null;
+        if (format.Context.Origin is not null || format.Context.AcceptLanguage is not null
+            || format.Context.SensitiveHeaders.Keys.Any(name => !name.Equals("Cookie", StringComparison.OrdinalIgnoreCase)
+                && !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
+        {
+            error = "The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.";
+            return false;
+        }
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<string, string> header in format.Context.HeadersFor(format.Url))
+        {
+            string? name = header.Key.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ? "Cookie"
+                : header.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ? "Authorization" : null;
+            if (name is not null && !headers.TryAdd(name, header.Value))
+            {
+                error = "The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.";
+                return false;
+            }
+        }
+        if (format.Context.HasCredentials && headers.Count == 0)
+        {
+            error = "The refreshed link requires credentials that are not authorized for that media host. Saved data was kept.";
+            return false;
+        }
+
+        if (headers.Count > 0) secrets = headers;
+        return true;
     }
 
     // A merge job's format id is "videoId+audioId" (or one id for audio only). Restrict the item to exactly
