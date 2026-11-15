@@ -214,6 +214,31 @@ public sealed class SettingsAccessibilityTests
         });
     }
 
+    [Fact]
+    public void Filename_template_setting_reaches_the_running_engine()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "vesper-template-settings-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using var engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(root, "data"),
+                DefaultFolder = root
+            });
+            var current = new VesperPreferences();
+            Form1.CopyPreferences(new VesperPreferences { FileNameTemplate = "{name} - {host}" }, current);
+
+            EngineHost.Apply(engine, current);
+
+            Assert.Equal("{name} - {host}", engine.Options.FileNameTemplate);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static IEnumerable<Control> Descendants(Control parent)
     {
         foreach (Control child in parent.Controls)
