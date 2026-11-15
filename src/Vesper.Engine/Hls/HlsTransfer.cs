@@ -11,7 +11,8 @@ namespace Vesper.Engine;
 /// Output is MPEG-TS (concatenated TS is valid) or fragmented MP4 (init segment + fragments). Separate audio
 /// renditions would need a muxer and are refused rather than faked.
 /// </summary>
-internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
+internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, HttpTransport http,
+    RequestCredentials? credentialOverride = null)
 {
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
     private const long MaxSegmentBytes = 64L * 1024 * 1024; // Bound buffering until streaming decryption is available.
@@ -499,7 +500,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
 
     internal static async Task<(string? MediaState, string? Error)> PrepareLiveRefreshAsync(
         DownloadEngine engine, JobSession session, HttpTransport http, string savedState, string replacementUrl,
-        CancellationToken ct)
+        RequestCredentials? credentials, CancellationToken ct)
     {
         Cursor? cursor = ParseCursor(savedState);
         DownloadJob job = session.Job;
@@ -511,7 +512,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         try { UrlPolicy.EnsureAllowed(replacement, engine.Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return (null, ex.Message); }
 
-        var transfer = new HlsTransfer(engine, session, http);
+        var transfer = new HlsTransfer(engine, session, http, credentials);
         string playlistUrl;
         HlsMedia media;
         try
@@ -784,7 +785,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
 
     private RequestSpec Spec(long? start, long? end)
     {
-        RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+        RequestCredentials? credentials = credentialOverride ?? engine.CredentialsFor(Job.Id);
         return new RequestSpec(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent,
             Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
     }

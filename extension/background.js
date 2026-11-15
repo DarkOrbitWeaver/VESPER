@@ -44,14 +44,53 @@ async function settings() {
 
 // ---------------------------------------------------------------- submission (durable and idempotent)
 
-// A submission is written down BEFORE it is sent and erased only after VESPER acknowledged it. If the browser
-// restarts mid-flight the popup shows it as unconfirmed; resending reuses the same id, which VESPER de-duplicates.
+// Pending signed URLs are short-lived and kept in session storage only.
+const PENDING_TTL_MS = 30 * 60_000;
+const MAX_PENDING = 50;
 let pendingWrites = Promise.resolve();
+
+function prunePending(pending) {
+  const now = Date.now();
+  for (const [id, entry] of Object.entries(pending)) {
+    if (!Number.isFinite(entry?.at) || entry.at > now + 60_000 || now - entry.at > PENDING_TTL_MS
+        || !Array.isArray(entry.request?.items)) delete pending[id];
+  }
+  while (Object.keys(pending).length > MAX_PENDING) {
+    const oldest = Object.entries(pending).sort((a, b) => a[1].at - b[1].at)[0]?.[0];
+    if (oldest === undefined) break;
+    delete pending[oldest];
+  }
+  return pending;
+}
+
+// Move pre-update entries out of persistent storage and remove any stored cookie headers.
+const pendingReady = (async () => {
+  const [legacy, session] = await Promise.all([
+    chrome.storage.local.get('pending'), chrome.storage.session.get('pending')
+  ]);
+  const pending = prunePending({ ...(legacy.pending || {}), ...(session.pending || {}) });
+  for (const entry of Object.values(pending)) {
+    entry.request.authorized = false;
+    entry.request.items = entry.request.items.map(stripSecrets);
+  }
+  await chrome.storage.session.set({ pending });
+  await chrome.storage.local.remove('pending');
+})();
+
+function readPending() {
+  return pendingReady.then(async () => {
+    const pending = (await chrome.storage.session.get('pending')).pending || {};
+    const previousCount = Object.keys(pending).length;
+    prunePending(pending);
+    if (Object.keys(pending).length !== previousCount) await chrome.storage.session.set({ pending });
+    return pending;
+  });
+}
 function changePending(change) {
   const write = pendingWrites.then(async () => {
-    const { pending = {} } = await chrome.storage.local.get('pending');
+    const pending = await readPending();
     change(pending);
-    await chrome.storage.local.set({ pending });
+    await chrome.storage.session.set({ pending: prunePending(pending) });
     await updateBadge();
   });
   pendingWrites = write.catch(() => {});
@@ -75,10 +114,13 @@ async function sendSubmission(request) {
   return reply;
 }
 
-const stripSecrets = (item) => { const { cookie, authorization, ...safe } = item; return safe; };   // secrets are never stored
+function stripSecrets(item) {
+  const { cookie, authorization, ...safe } = item;
+  return safe;
+}
 
 async function retryPending(id) {
-  const { pending = {} } = await chrome.storage.local.get('pending');
+  const pending = await readPending();
   const entry = pending[id];
   if (!entry) return { ok: false, code: 'gone', message: 'That request is no longer pending.' };
   if (entry.chromeDownloadId !== undefined) {
@@ -90,21 +132,18 @@ async function retryPending(id) {
 }
 
 async function updateBadge() {
-  const { pending = {} } = await chrome.storage.local.get('pending');
+  const pending = await readPending();
   const count = Object.keys(pending).length;
   await chrome.action.setBadgeBackgroundColor({ color: '#B25247' });
   await chrome.action.setBadgeText({ text: count ? '!' : '' });
 }
 
-// Hosts are the same site when they are equal or one is a parent domain of the other, over the same scheme.
-// Without the public-suffix list this is deliberately narrow: sibling subdomains count as different sites.
-// That can only withhold a cookie, never add one.
+// Without a public-suffix list, only an exact host match is treated as same-site.
+// This may withhold some valid cookies, but it cannot send Strict cookies across uncertain site boundaries.
 function isSameSite(targetUrl, initiatorUrl) {
   try {
     const target = new URL(targetUrl), initiator = new URL(initiatorUrl);
-    if (target.protocol !== initiator.protocol) return false;
-    const a = target.hostname, b = initiator.hostname;
-    return a === b || b.includes('.') && a.endsWith('.' + b) || a.includes('.') && b.endsWith('.' + a);
+    return target.protocol === initiator.protocol && target.hostname === initiator.hostname;
   } catch { return false; }
 }
 
@@ -236,6 +275,11 @@ const tabStates = new Map();
 const tabStateWrites = new Map();
 const tabFlushTimers = new Map();
 const tabBadgeCounts = new Map();
+const mediaPrefetchCache = new Map();
+const mediaPrefetchAt = new Map();
+const MEDIA_PREFETCH_TTL = 30_000;
+const MEDIA_PREFETCH_COOLDOWN = 15_000;
+const MEDIA_PREFETCH_LIMIT = 32;
 
 function forgetTab(tabId) {
   clearTimeout(tabFlushTimers.get(tabId));
@@ -243,6 +287,33 @@ function forgetTab(tabId) {
   tabStates.delete(tabId);
   tabStateWrites.delete(tabId);
   tabBadgeCounts.delete(tabId);
+}
+
+function clearMediaPrefetch(tabId) {
+  mediaPrefetchAt.delete(tabId);
+  for (const [key, entry] of mediaPrefetchCache)
+    if (entry.tab === tabId) mediaPrefetchCache.delete(key);
+}
+
+function cachedMediaOptions(key) {
+  const now = Date.now();
+  for (const [cacheKey, entry] of mediaPrefetchCache)
+    if (entry.expires <= now) mediaPrefetchCache.delete(cacheKey);
+  return mediaPrefetchCache.get(key)?.reply;
+}
+
+function rememberMediaOptions(key, tab, reply) {
+  if (!reply?.ok || (!reply.data?.choices?.length && !reply.data?.sourceChoices?.length)) return;
+  while (mediaPrefetchCache.size >= MEDIA_PREFETCH_LIMIT)
+    mediaPrefetchCache.delete(mediaPrefetchCache.keys().next().value);
+  mediaPrefetchCache.set(key, { tab, reply, expires: Date.now() + MEDIA_PREFETCH_TTL });
+}
+
+function supportsMediaPrefetch(page) {
+  const host = page.hostname.toLowerCase();
+  return ['youtube.com', 'youtube-nocookie.com', 'youtu.be', 'tiktok.com', 'instagram.com',
+    'vimeo.com', 'dailymotion.com', 'bilibili.com', 'reddit.com', 'redd.it']
+    .some(domain => host === domain || host.endsWith('.' + domain));
 }
 
 async function tabState(tabId) {
@@ -360,6 +431,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === 'loading' && change.url) {
     void inTabOrder(tabId, async () => {
       forgetTab(tabId);                        // the page is gone; its sources go with it
+      clearMediaPrefetch(tabId);
       await chrome.storage.session.remove(`tab:${tabId}`);
       await clearBrowserChoicesForTab(tabId);
       await chrome.action.setBadgeText({ tabId, text: '' });
@@ -368,6 +440,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 });
 chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
   forgetTab(tabId);
+  clearMediaPrefetch(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
   await clearBrowserChoicesForTab(tabId);
 }).catch(() => {}));
@@ -394,7 +467,14 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route].join('|');
+  const cached = cachedMediaOptions(lookupKey);
+  if (cached) return cached;
+  const prefetch = message.prefetch === true;
   if (mediaLookups.has(lookupKey)) return mediaLookups.get(lookupKey);
+  if (prefetch) {
+    const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats');
+    if (!prefetchFormats) return { ok: true, data: { prefetchSkipped: true } };
+  }
   const task = (async () => {
     const state = await tabState(tab);
     const now = Date.now();
@@ -419,6 +499,14 @@ async function playerOptions(message, sender) {
             && !possibleManifests.some(item => item.url === evidence.url))
           possibleManifests.push(evidence);
       }
+    }
+    if (prefetch) {
+      if (!supportsMediaPrefetch(page) && !matching && !matchedManifest && possibleManifests.length === 0)
+        return { ok: true, data: { prefetchSkipped: true } };
+      const lastPrefetch = mediaPrefetchAt.get(tab);
+      if (lastPrefetch !== undefined && now - lastPrefetch < MEDIA_PREFETCH_COOLDOWN)
+        return { ok: true, data: { prefetchSkipped: true } };
+      mediaPrefetchAt.set(tab, now);
     }
     if (route !== 'chrome' && possibleManifests.length > 0) {
       const sources = possibleManifests.sort((a, b) => b.seen - a.seen);
@@ -451,7 +539,11 @@ async function playerOptions(message, sender) {
       detail: 'Saves with Chrome', container }] } };
   })();
   mediaLookups.set(lookupKey, task);
-  try { return await task; }
+  try {
+    const reply = await task;
+    rememberMediaOptions(lookupKey, tab, reply);
+    return reply;
+  }
   finally { mediaLookups.delete(lookupKey); }
 }
 
@@ -611,7 +703,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'tab-state': {
         const state = await tabState(message.tabId ?? sender.tab?.id);
-        const { pending = {} } = await chrome.storage.local.get('pending');
+        const pending = await readPending();
         return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => ({ id, at: p.at, count: p.request.items.length })) };
       }
       case 'hello': return nativeRequest(envelope('hello'), 20000);

@@ -10,6 +10,8 @@ async function init() {
   $('handoff').value = prefs.handoff;
   $('route').value = prefs.route === 'chrome' ? 'chrome' : 'auto';
   $('intercept').checked = prefs.intercept;
+  const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats').catch(() => ({}));
+  $('prefetch').checked = prefetchFormats;
   // Say what capture does the first time, in plain words.
   const { vesperSeen } = await chrome.storage.local.get('vesperSeen').catch(() => ({}));
   $('first-run').hidden = !!vesperSeen;
@@ -20,6 +22,15 @@ async function init() {
   $('handoff').onchange = () => chrome.storage.sync.set({ handoff: $('handoff').value });
   $('route').onchange = () => chrome.storage.sync.set({ route: $('route').value });
   $('intercept').onchange = () => chrome.storage.sync.set({ intercept: $('intercept').checked });
+  $('prefetch').onchange = async () => {
+    const enabled = $('prefetch').checked;
+    await chrome.storage.local.set({ prefetchFormats: enabled });
+    if (enabled) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+      if (tab?.id !== undefined)
+        await chrome.tabs.sendMessage(tab.id, { type: 'vesper-prefetch' }).catch(() => {});
+    }
+  };
 
   const signIn = $('signin');
   const access = $('signin-access');

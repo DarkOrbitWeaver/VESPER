@@ -21,6 +21,7 @@
   const still = () => motionMode === 'still' || (motionMode === 'system' && reducedMotion.matches);
   const protectedVideos = new WeakSet();
   const playback = new WeakMap();
+  const prefetchedPlayers = new WeakMap();
   let generation = 0;
   const observed = new Set();
   const intersecting = new WeakMap();
@@ -220,10 +221,34 @@
     }
   }
 
+  function prefetchPlayer(el) {
+    if (!alive() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
+        || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
+    const src = playerSource(el);
+    const targetPage = pageForPlayer(el);
+    const identity = VesperPlayerSource.identity(targetPage);
+    if (!identity) return;
+    const binding = playback.get(el);
+    const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
+    const key = `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
+    if (prefetchedPlayers.get(el) === key) return;
+    prefetchedPlayers.set(el, key);
+    const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
+    void send({ type: 'media-options', prefetch: true, pageUrl: targetPage,
+      mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
+      playerPlaying: !el.paused && !el.ended, playerPageUrl: targetPage,
+      playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
+    }).then(reply => {
+      if (reply?.data?.prefetchSkipped && prefetchedPlayers.get(el) === key) prefetchedPlayers.delete(el);
+    });
+  }
+
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
   for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
     consider(e.target);
     if (type === 'playing') handlePlayerPlaying(e.target);
+    if (e.target === video) prefetchPlayer(e.target);
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
     if (!alive()) return;
@@ -949,6 +974,15 @@
   document.addEventListener('pointerdown', (e) => {
     if (alive() && panel?.classList.contains('show') && !e.composedPath().includes(host)) closePanel();
   }, { capture: true, passive: true, signal });
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (sender?.id !== chrome.runtime.id || message?.type !== 'vesper-prefetch') return false;
+    syncPage();
+    if (video) {
+      prefetchedPlayers.delete(video);
+      prefetchPlayer(video);
+    }
+    return false;
+  });
   window.addEventListener('pagehide', e => { if (e.persisted) companion?.setVisible(false); else retire(); }, { signal });
   window.addEventListener('pageshow', selectPlayer, { signal });
   reducedMotion.addEventListener('change', applyMotion, { signal });

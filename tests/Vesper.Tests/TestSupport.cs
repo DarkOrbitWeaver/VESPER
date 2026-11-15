@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
+using System.Net;
 using System.Security.Cryptography;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -110,6 +112,10 @@ internal sealed class FaultServer : IAsyncDisposable
                 else if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
                 else res.StatusCode = 403;
                 break;
+            case "/authenticated-refresh":
+                if (ctx.Request.Headers.Cookie == "session=refresh-secret") await Serve(ctx, V1, "\"p1\"", Modified);
+                else res.StatusCode = 401;
+                break;
             case "/changes-after-truncate":
                 if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
                 else await Serve(ctx, V2, "\"p2\"", Modified);
@@ -129,7 +135,19 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/notfound": res.StatusCode = 404; break;
             case "/html":
                 res.ContentType = "text/html";
-                await res.WriteAsync("<html>Please sign in to the hotel Wi-Fi</html>");
+                const string htmlPage = "<html>Please sign in to the hotel Wi-Fi</html>";
+                res.ContentLength = htmlPage.Length;
+                await res.WriteAsync(htmlPage);
+                break;
+            case "/html-attachment":
+                res.ContentType = "text/html";
+                res.Headers["Content-Disposition"] = "attachment; filename=\"export.zip\"";
+                await res.WriteAsync("<!DOCTYPE html><html>Please sign in to download.</html>");
+                break;
+            case "/mislabeled-html":
+                res.ContentType = "application/octet-stream";
+                res.Headers["Content-Disposition"] = "attachment; filename=\"export.zip\"";
+                await res.WriteAsync("<!DOCTYPE html><html>Export unavailable.</html>");
                 break;
             case "/gzip":
                 res.Headers.ContentEncoding = "gzip";
@@ -141,17 +159,10 @@ internal sealed class FaultServer : IAsyncDisposable
                 }
                 break;
             case "/unknown-length": // no Content-Length, but ranges are honoured, so the length can be confirmed
-                res.Headers.AcceptRanges = "bytes";
-                res.ContentType = "application/octet-stream";
-                if (ctx.Request.Headers.TryGetValue("Range", out var unknownRange)
-                    && TryParseRange(unknownRange.ToString(), V1.Length, out long us, out long ue))
-                {
-                    res.StatusCode = 206;
-                    res.Headers.ContentRange = $"bytes {us}-{ue}/{V1.Length}";
-                    res.ContentLength = ue - us + 1;
-                    await res.Body.WriteAsync(V1.AsMemory((int)us, (int)(ue - us + 1)));
-                }
-                else await res.Body.WriteAsync(V1);
+                await ServeUnknownLength(ctx, V1, V1.Length);
+                break;
+            case "/unknown-length-short": // closes cleanly early, then a range probe proves bytes are missing
+                await ServeUnknownLength(ctx, V1, V1.Length / 2);
                 break;
             case "/chunked": // no Content-Length: the server streams until it is done
                 res.ContentType = "application/octet-stream";
@@ -308,6 +319,47 @@ internal sealed class FaultServer : IAsyncDisposable
         if (truncate is not null) ctx.Abort();   // the connection dies mid-body
     }
 
+    private static async Task ServeUnknownLength(HttpContext ctx, byte[] data, int initialLength)
+    {
+        HttpResponse response = ctx.Response;
+        const string etag = "\"unknown-1\"";
+        response.Headers.AcceptRanges = "bytes";
+        response.Headers.ETag = etag;
+        response.ContentType = "application/octet-stream";
+
+        if (ctx.Request.Headers.TryGetValue("Range", out var header))
+        {
+            if (TryParseRange(header.ToString(), data.Length, out long start, out long end))
+            {
+                if (start > 0)
+                {
+                    string? ifRange = ctx.Request.Headers["If-Range"].FirstOrDefault();
+                    if (ifRange is not null && ifRange != etag)
+                    {
+                        await response.Body.WriteAsync(data.AsMemory(0, initialLength));
+                        return;
+                    }
+
+                    response.StatusCode = 206;
+                    response.Headers.ContentRange = $"bytes {start}-{end}/{data.Length}";
+                    response.ContentLength = end - start + 1;
+                    await response.Body.WriteAsync(data.AsMemory((int)start, (int)(end - start + 1)));
+                    return;
+                }
+
+                // Ignore the initial range-at-zero request so the client sees an unknown-length body.
+            }
+            else
+            {
+                response.StatusCode = 416;
+                response.Headers["Content-Range"] = $"bytes */{data.Length}";
+                return;
+            }
+        }
+
+        await response.Body.WriteAsync(data.AsMemory(0, initialLength));
+    }
+
     private static bool TryParseRange(string header, long total, out long start, out long end)
     {
         start = end = 0;
@@ -322,6 +374,61 @@ internal sealed class FaultServer : IAsyncDisposable
     {
         await _app.StopAsync();
         await _app.DisposeAsync();
+    }
+}
+
+internal sealed class CloseDelimitedServer : IAsyncDisposable
+{
+    private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+    private readonly CancellationTokenSource _stop = new();
+    private Task? _serve;
+
+    public byte[] Body { get; } = Payloads.Make(64 * 1024, 77);
+    public string BaseUrl { get; private set; } = "";
+    public string Url(string path) => BaseUrl + path;
+
+    public Task StartAsync()
+    {
+        _listener.Start();
+        int port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+        BaseUrl = $"http://127.0.0.1:{port}";
+        _serve = ServeAsync(_stop.Token);
+        return Task.CompletedTask;
+    }
+
+    private async Task ServeAsync(CancellationToken ct)
+    {
+        try
+        {
+            using TcpClient client = await _listener.AcceptTcpClientAsync(ct);
+            await using NetworkStream stream = client.GetStream();
+            var request = new List<byte>(1024);
+            byte[] next = new byte[1];
+            while (request.Count < 32 * 1024)
+            {
+                if (await stream.ReadAsync(next, ct) == 0) return;
+                request.Add(next[0]);
+                int count = request.Count;
+                if (count >= 4 && request[count - 4] == '\r' && request[count - 3] == '\n'
+                    && request[count - 2] == '\r' && request[count - 1] == '\n') break;
+            }
+
+            byte[] headers = System.Text.Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nETag: \"close-1\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+            await stream.WriteAsync(headers, ct);
+            await stream.WriteAsync(Body, ct);
+            await stream.FlushAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (SocketException) when (ct.IsCancellationRequested) { }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _stop.Cancel();
+        _listener.Stop();
+        if (_serve is not null) await _serve;
+        _stop.Dispose();
     }
 }
 

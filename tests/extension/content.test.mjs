@@ -44,7 +44,7 @@ test('System motion follows the reduced-motion preference and explicit choices o
         return () => {};
       }
     },
-    chrome: { runtime: { id: 'vesper-test' } }
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
   });
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testMotion = {
     still, applyMotion, setTargets: (nextHost, nextCompanion) => { host = nextHost; companion = nextCompanion; }
@@ -96,7 +96,7 @@ test('an orphaned content script disconnects observers and storage listeners on 
     ResizeObserver: class { disconnect() { disconnected++; } },
     IntersectionObserver: class { disconnect() { disconnected++; } },
     chrome: {
-      runtime: { get id() { return live ? 'vesper-test' : undefined; } },
+      runtime: { get id() { return live ? 'vesper-test' : undefined; }, onMessage: { addListener() {} } },
       storage: { sync: { get: async defaults => defaults }, onChanged: {
         addListener() {},
         removeListener() { unsubscribed++; throw new Error('Extension context invalidated.'); }
@@ -145,7 +145,7 @@ test('a feed player uses the unique page linked from its card', async () => {
     ResizeObserver: class { disconnect() {} },
     IntersectionObserver: class { disconnect() {} unobserve() {} },
     chrome: {
-      runtime: { id: 'vesper-test' },
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} } },
       storage: {
         sync: { get: async defaults => defaults },
         onChanged: { addListener() {}, removeListener() {} }
@@ -205,7 +205,7 @@ test('a feed preview that starts after the pointer settles uses its linked page'
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
     chrome: {
-      runtime: { id: 'vesper-test' },
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} } },
       storage: {
         sync: { get: async defaults => defaults },
         onChanged: { addListener() {}, removeListener() {} }
