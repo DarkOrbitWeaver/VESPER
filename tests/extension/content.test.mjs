@@ -94,6 +94,38 @@ test('System motion follows the reduced-motion preference and explicit choices o
   assert.equal(stillModes.at(-1), true);
 });
 
+test('the context-menu picker reports when its frame has no video player', async () => {
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
+  const window = new EventTarget();
+  const motion = Object.assign(new EventTarget(), { matches: false });
+  let messageListener;
+  const context = vm.createContext({
+    window, document, AbortController, URL, location: { href: 'https://example.test/page' },
+    matchMedia: () => motion,
+    ResizeObserver: class { observe() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
+    VesperTheme: {
+      available: () => true,
+      contextGone: () => false,
+      watchPreference: () => () => {}
+    },
+    chrome: {
+      runtime: { id: 'vesper-test', onMessage: { addListener: fn => { messageListener = fn; } } },
+      storage: { sync: { get: async defaults => defaults }, onChanged: { addListener() {}, removeListener() {} } }
+    }
+  });
+  vm.runInContext(source('theme'), context);
+  vm.runInContext(source('player-source'), context);
+  vm.runInContext(source('content'), context);
+  await Promise.resolve();
+
+  let reply;
+  messageListener({ type: 'vesper-open-picker' }, { id: 'vesper-test' }, value => { reply = value; });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.code, 'no-player');
+});
+
 test('an orphaned content script disconnects observers and storage listeners on the next page event', async () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();

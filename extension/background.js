@@ -927,6 +927,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
   if (info.menuItemId === 'vesper-page-media') {
+    if (Number.isSafeInteger(tab?.id)) {
+      try {
+        const opened = await chrome.tabs.sendMessage(tab.id, { type: 'vesper-open-picker' }, { frameId: info.frameId ?? 0 });
+        if (opened?.ok) return;
+      } catch { /* Use the native page resolver when this frame has no VESPER player. */ }
+    }
     const pageUrl = contextPageUrl(info, tab);
     if (pageUrl) {
       const reply = await nativeRequest(envelope('media-picker', {
