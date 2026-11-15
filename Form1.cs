@@ -453,7 +453,9 @@ public partial class Form1 : Form
 
     protected override void OnDragEnter(DragEventArgs drgevent)
     {
-        drgevent.Effect = drgevent.Data?.GetDataPresent(DataFormats.Text) == true || drgevent.Data?.GetDataPresent(DataFormats.UnicodeText) == true
+        drgevent.Effect = drgevent.Data?.GetDataPresent(DataFormats.Text) == true
+            || drgevent.Data?.GetDataPresent(DataFormats.UnicodeText) == true
+            || UrlShortcutPaths(drgevent.Data).Length > 0
             ? DragDropEffects.Copy : DragDropEffects.None;
         base.OnDragEnter(drgevent);
     }
@@ -461,8 +463,75 @@ public partial class Form1 : Form
     protected override void OnDragDrop(DragEventArgs drgevent)
     {
         base.OnDragDrop(drgevent);
+        string[] shortcuts = UrlShortcutPaths(drgevent.Data);
+        if (shortcuts.Length > 0)
+        {
+            BeginInvoke((Action)(() => _ = AddUrlShortcutsAsync(shortcuts)));
+            return;
+        }
         string? text = drgevent.Data?.GetData(DataFormats.UnicodeText) as string ?? drgevent.Data?.GetData(DataFormats.Text) as string;
         if (!string.IsNullOrWhiteSpace(text)) BeginInvoke(() => AddDownload(text));
+    }
+
+    private async Task AddUrlShortcutsAsync(string[] paths)
+    {
+        try
+        {
+            string[] urls = await Task.Run(() => paths.Select(ReadInternetShortcut).OfType<string>().ToArray());
+            if (IsDisposed) return;
+            if (urls.Length > 0)
+                AddDownload(string.Join(Environment.NewLine, urls));
+            else
+                VesperMessageBox.Show(this, "The dropped .url file did not contain a valid web link.",
+                    "Can't add link", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or System.Security.SecurityException)
+        {
+            if (!IsDisposed)
+                VesperMessageBox.Show(this, "The dropped .url file couldn't be read.",
+                    "Can't add link", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private static string[] UrlShortcutPaths(IDataObject? data)
+    {
+        if (data?.GetDataPresent(DataFormats.FileDrop) != true) return [];
+        try
+        {
+            return data.GetData(DataFormats.FileDrop) is string[] files
+                ? files.Where(file => !string.IsNullOrWhiteSpace(file)
+                    && Path.GetExtension(file).Equals(".url", StringComparison.OrdinalIgnoreCase)).Take(50).ToArray()
+                : [];
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.ExternalException or ArgumentException or InvalidCastException)
+        {
+            return [];
+        }
+    }
+
+    internal static string? ReadInternetShortcut(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        try
+        {
+            if (!Path.GetExtension(path).Equals(".url", StringComparison.OrdinalIgnoreCase)) return null;
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length is <= 0 or > 32 * 1024) return null;
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
+            for (int lineNumber = 0; lineNumber < 64 && reader.ReadLine() is { } line; lineNumber++)
+            {
+                if (!line.StartsWith("URL=", StringComparison.OrdinalIgnoreCase)) continue;
+                string candidate = line[4..].Trim();
+                return Vesper.Engine.UrlPolicy.TryParse(candidate, out Uri url, out _) ? url.AbsoluteUri : null;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or System.Security.SecurityException)
+        {
+        }
+        return null;
     }
 
     // ---- layout (unchanged structure) -------------------------------------------------------------------------------
