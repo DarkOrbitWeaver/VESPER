@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -143,14 +144,15 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             // Fetch a few segments ahead so round trips overlap, but decrypt, validate and commit strictly in order:
             // the checkpoint cursor stays a contiguous prefix exactly as before.
             using var prefetchLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var prefetched = new Queue<(int Index, Task<(byte[] Data, IDisposable Lease)> Data)>();
+            var prefetched = new Queue<(int Index, Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> Data)>();
             int fetchNext = next;
             void Prefetch()
             {
                 while (prefetched.Count < PrefetchSegments && fetchNext < segments.Count)
                 {
                     HlsSegment ahead = segments[fetchNext];
-                    prefetched.Enqueue((fetchNext, FetchBufferedSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength, prefetchLifetime.Token)));
+                    prefetched.Enqueue((fetchNext, FetchBufferedSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength,
+                        ahead.Key is not null, prefetchLifetime.Token)));
                     fetchNext++;
                 }
             }
@@ -160,28 +162,44 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             {
                 ct.ThrowIfCancellationRequested();
                 HlsSegment segment = segments[i];
-                byte[]? initialization = null;
-                if (i == 0 && segment.Map is { } map)
+                HlsMap? map = i == 0 ? segment.Map : null;
+                using SegmentBufferLease? initializationLease = map is { } mapToFetch
+                    ? await engine.AcquireSegmentBufferAsync(SegmentBufferLimiter.Reservation(
+                        8 * 1024 * 1024, mapToFetch.Length, mapToFetch.Key is null ? 1 : 2), ct).ConfigureAwait(false)
+                    : null;
+                ReadOnlyMemory<byte>? initialization = null;
+                if (map is { } initializationMap)
                 {
-                    initialization = await FetchSegmentAsync(map.Uri, map.Offset, map.Length, ct).ConfigureAwait(false);
-                    if (map.Key is { } mapKey)
+                    initialization = await FetchSegmentAsync(initializationMap.Uri, initializationMap.Offset,
+                        initializationMap.Length, 8 * 1024 * 1024, initializationLease!,
+                        initializationMap.Key is null ? 1 : 2, ct).ConfigureAwait(false);
+                    if (initializationMap.Key is { } mapKey)
                     {
                         if (mapKey.Iv is null) throw new MediaContainerException("Encrypted initialization requires an explicit IV.");
-                        initialization = await DecryptAsync(initialization, mapKey, segment.Sequence, keys, ct).ConfigureAwait(false);
+                        initialization = await DecryptAsync(initialization.Value, mapKey, segment.Sequence, keys, ct).ConfigureAwait(false);
                     }
-                    if (initialization.Length > 8 * 1024 * 1024) throw new MediaContainerException("Initialization exceeds the supported size limit.");
-                    mp4 = FragmentedMp4.Open(initialization);
-                    initLength = initialization.Length;
+                    if (initialization.Value.Length > 8 * 1024 * 1024) throw new MediaContainerException("Initialization exceeds the supported size limit.");
+                    mp4 = FragmentedMp4.Open(initialization.Value.Span);
+                    initLength = initialization.Value.Length;
                 }
                 Prefetch();
-                (int fetchedIndex, Task<(byte[] Data, IDisposable Lease)> fetched) = prefetched.Dequeue();
+                (int fetchedIndex, Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> Data) queued = prefetched.Dequeue();
+                int fetchedIndex = queued.fetchedIndex;
+                Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> fetched = queued.Data;
                 if (fetchedIndex != i) throw new InvalidOperationException("HLS prefetch order was lost.");
-                (byte[] data, IDisposable lease) = await fetched.ConfigureAwait(false);
+                var fetchedData = await fetched.ConfigureAwait(false);
+                fetched = null!;
+                ReadOnlyMemory<byte> data = fetchedData.Data;
+                SegmentBufferLease lease = fetchedData.Lease;
+                fetchedData = default;
                 using IDisposable segmentBuffer = lease;
                 Prefetch();
-                if (segment.Key is { } key) data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
-                if (fragmented) mp4!.ValidateFragment(data);
-                else transport!.Validate(data);
+                if (segment.Key is { } key)
+                {
+                    data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
+                }
+                if (fragmented) mp4!.ValidateFragment(data.Span);
+                else transport!.Validate(data.Span);
                 int totalLength = checked((initialization?.Length ?? 0) + data.Length);
                 string? root = Path.GetPathRoot(Job.PartialPath);
                 if (root is not null && new DriveInfo(root) is { IsReady: true } drive
@@ -191,11 +209,11 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 await engine.GlobalLimiter.AcquireAsync(totalLength, ct).ConfigureAwait(false);
                 if (initialization is not null)
                 {
-                    await session.WriteAsync(initialization, offset, report: false, ct).ConfigureAwait(false);
-                    hash.AppendData(initialization);
+                    await session.WriteAsync(initialization.Value, offset, report: false, ct).ConfigureAwait(false);
+                    hash.AppendData(initialization.Value.Span);
                 }
                 await session.WriteAsync(data, offset + (initialization?.Length ?? 0), report: false, ct).ConfigureAwait(false);
-                hash.AppendData(data);
+                hash.AppendData(data.Span);
                 long end = checked(offset + totalLength);
                 session.Report(new ByteRange(offset, end), JsonSerializer.Serialize(new Cursor(playlistUrl, i + 1,
                     planHash, end, Convert.ToHexString(hash.GetCurrentHash()), initLength, mp4?.Snapshot())));
@@ -212,15 +230,16 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             {
                 // A failure or pause must not leave faulted fetches unobserved.
                 prefetchLifetime.Cancel();
-                foreach ((_, Task<(byte[] Data, IDisposable Lease)> pending) in prefetched)
+                foreach ((_, Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> pending) in prefetched)
                 {
                     try
                     {
-                        (_, IDisposable lease) = await pending.ConfigureAwait(false);
+                        (_, SegmentBufferLease lease) = await pending.ConfigureAwait(false);
                         lease.Dispose();
                     }
                     catch (Exception) { /* Preserve the original transfer error. */ }
                 }
+                prefetched.Clear();
             }
             mp4?.Finish(requireAudio: Job.MediaProvider is not null, requireVideo: false);
             transport?.Finish(requireAudio: Job.MediaProvider is not null);
@@ -361,27 +380,38 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     if (segment.Sequence == long.MaxValue)
                         return RunOutcome.NeedsAttention("live-sequence", "The live media sequence number overflowed. Saved data was kept.");
 
-                    byte[]? initialization = null;
+                    HlsMap? map = offset == 0 && cursor.Container == "mp4" ? segment.Map : null;
+                    using SegmentBufferLease? initializationLease = map is { } mapToFetch
+                        ? await engine.AcquireSegmentBufferAsync(SegmentBufferLimiter.Reservation(
+                            8 * 1024 * 1024, mapToFetch.Length, mapToFetch.Key is null ? 1 : 2), ct).ConfigureAwait(false)
+                        : null;
+                    ReadOnlyMemory<byte>? initialization = null;
                     if (offset == 0 && cursor.Container == "mp4")
                     {
-                        if (segment.Map is not { } map)
+                        if (map is not { } initializationMap)
                             return RunOutcome.NeedsAttention("live-layout", "The live MP4 playlist has no initialization segment.");
-                        initialization = await FetchSegmentAsync(map.Uri, map.Offset, map.Length, ct).ConfigureAwait(false);
-                        if (map.Key is { } mapKey)
+                        initialization = await FetchSegmentAsync(initializationMap.Uri, initializationMap.Offset,
+                            initializationMap.Length, 8 * 1024 * 1024, initializationLease!,
+                            initializationMap.Key is null ? 1 : 2, ct).ConfigureAwait(false);
+                        if (initializationMap.Key is { } mapKey)
                         {
                             if (mapKey.Iv is null) return RunOutcome.NeedsAttention("key", "Encrypted initialization requires an explicit AES IV.");
-                            initialization = await DecryptLiveAsync(initialization, mapKey, segment.Sequence, keys, keyFingerprints, ct).ConfigureAwait(false);
+                            initialization = await DecryptLiveAsync(initialization.Value, mapKey, segment.Sequence, keys, keyFingerprints, ct).ConfigureAwait(false);
                         }
-                        if (initialization.Length is < 8 or > 8 * 1024 * 1024)
+                        if (initialization.Value.Length is < 8 or > 8 * 1024 * 1024)
                             throw new MediaContainerException("The live initialization segment is empty or too large.");
-                        mp4 = FragmentedMp4.Open(initialization);
+                        mp4 = FragmentedMp4.Open(initialization.Value.Span);
                     }
 
-                    byte[] data = await FetchSegmentAsync(segment.Uri, segment.RangeOffset, segment.RangeLength, ct).ConfigureAwait(false);
+                    (ReadOnlyMemory<byte> data, SegmentBufferLease mediaLease) = await FetchBufferedSegmentAsync(
+                        segment.Uri, segment.RangeOffset, segment.RangeLength, segment.Key is not null, ct).ConfigureAwait(false);
+                    using SegmentBufferLease segmentLease = mediaLease;
                     if (segment.Key is { } key)
+                    {
                         data = await DecryptLiveAsync(data, key, segment.Sequence, keys, keyFingerprints, ct).ConfigureAwait(false);
-                    if (cursor.Container == "ts") transport!.Validate(data);
-                    else mp4!.ValidateFragment(data);
+                    }
+                    if (cursor.Container == "ts") transport!.Validate(data.Span);
+                    else mp4!.ValidateFragment(data.Span);
 
                     int partLength = checked((initialization?.Length ?? 0) + data.Length);
                     EnsureLiveSpace(partLength);
@@ -390,12 +420,12 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     long start = offset;
                     if (initialization is not null)
                     {
-                        initLength = initialization.Length;
-                        await session.WriteAsync(initialization, offset, report: false, ct).ConfigureAwait(false);
-                        hash.AppendData(initialization);
+                        initLength = initialization.Value.Length;
+                        await session.WriteAsync(initialization.Value, offset, report: false, ct).ConfigureAwait(false);
+                        hash.AppendData(initialization.Value.Span);
                     }
                     await session.WriteAsync(data, offset + (initialization?.Length ?? 0), report: false, ct).ConfigureAwait(false);
-                    hash.AppendData(data);
+                    hash.AppendData(data.Span);
                     offset = checked(offset + partLength);
                     nextSequence = segment.Sequence + 1;
                     lastDiscontinuity = segment.DiscontinuitySequence;
@@ -564,7 +594,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         return (JsonSerializer.Serialize(updated), null);
     }
 
-    private async Task<byte[]> DecryptLiveAsync(byte[] data, HlsKey key, long sequence,
+    private async Task<ReadOnlyMemory<byte>> DecryptLiveAsync(ReadOnlyMemory<byte> data, HlsKey key, long sequence,
         Dictionary<string, byte[]> keys, Dictionary<string, string> fingerprints, CancellationToken ct)
     {
         if (key.Uri is null || !UrlPolicy.TryParse(key.Uri, out Uri keyUri, out _))
@@ -573,7 +603,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         {
             using HttpResponseMessage response = await http.SendAsync(keyUri, Spec(null, null), ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode) throw StatusStop(response);
-            material = await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false);
+            material = (await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false)).ToArray();
             if (material.Length != 16)
             {
                 CryptographicOperations.ZeroMemory(material);
@@ -600,7 +630,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         byte[] iv = key.Iv ?? SequenceIv(sequence);
         using Aes aes = Aes.Create();
         aes.Key = material;
-        try { return aes.DecryptCbc(data, iv, PaddingMode.PKCS7); }
+        try { return aes.DecryptCbc(data.Span, iv, PaddingMode.PKCS7); }
         catch (CryptographicException)
         { throw new RunnerStop(RunOutcome.NeedsAttention("decrypt", "A live segment could not be decrypted with its supplied key.")); }
     }
@@ -685,15 +715,16 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (!UrlPolicy.TryParse(url, out Uri uri, out string error)) throw new RunnerStop(RunOutcome.NeedsLink("bad-url", error));
         using HttpResponseMessage response = await http.SendAsync(uri, Spec(null, null), ct).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw StatusStop(response);
-        byte[] body = await ReadBoundedAsync(response, MaxPlaylistBytes, ct).ConfigureAwait(false);
-        return (System.Text.Encoding.UTF8.GetString(body), response.RequestMessage?.RequestUri ?? uri);
+        ReadOnlyMemory<byte> body = await ReadBoundedAsync(response, MaxPlaylistBytes, ct).ConfigureAwait(false);
+        return (System.Text.Encoding.UTF8.GetString(body.Span), response.RequestMessage?.RequestUri ?? uri);
     }
 
-    private async Task<byte[]> FetchSegmentAsync(string url, long? offset, long? length, CancellationToken ct)
+    private async Task<ReadOnlyMemory<byte>> FetchSegmentAsync(string url, long? offset, long? length, long limit,
+        SegmentBufferLease lease, int copies, CancellationToken ct)
     {
         if (!UrlPolicy.TryParse(url, out Uri uri, out string error))
             throw new RunnerStop(RunOutcome.NeedsAttention("bad-url", error));
-        if (offset is not null && (length is not long count || count <= 0 || offset.Value < 0 || count > MaxSegmentBytes || offset.Value > long.MaxValue - count))
+        if (offset is not null && (length is not long count || count <= 0 || offset.Value < 0 || count > limit || offset.Value > long.MaxValue - count))
             throw new RunnerStop(RunOutcome.NeedsAttention("invalid-range", "The playlist contains an invalid or oversized byte range."));
         long? end = offset is long start && length is long size ? start + size - 1 : null;
         using HttpResponseMessage response = await http.SendAsync(uri, Spec(offset, end), ct).ConfigureAwait(false);
@@ -710,19 +741,21 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         else if (code == 206)
             throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
         if (HlsLooksLikeHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
-        byte[] bytes = await ReadBoundedAsync(response, MaxSegmentBytes, ct).ConfigureAwait(false);
-        if (length is long expected && bytes.LongLength != expected)
+        ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, limit, ct, lease, copies).ConfigureAwait(false);
+        if (length is long expected && bytes.Length != expected)
             throw new TransientNetworkException("The HLS byte-range response was incomplete.");
         return bytes;
     }
 
-    private async Task<(byte[] Data, IDisposable Lease)> FetchBufferedSegmentAsync(
-        string url, long? offset, long? length, CancellationToken ct)
+    private async Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> FetchBufferedSegmentAsync(
+        string url, long? offset, long? length, bool encrypted, CancellationToken ct)
     {
-        IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
+        int copies = encrypted ? 2 : 1;
+        SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+            SegmentBufferLimiter.Reservation(MaxSegmentBytes, length, copies), ct).ConfigureAwait(false);
         try
         {
-            byte[] data = await FetchSegmentAsync(url, offset, length, ct).ConfigureAwait(false);
+            ReadOnlyMemory<byte> data = await FetchSegmentAsync(url, offset, length, MaxSegmentBytes, lease, copies, ct).ConfigureAwait(false);
             return (data, lease);
         }
         catch
@@ -734,35 +767,43 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
 
     private static bool HlsLooksLikeHtml(HttpResponseMessage r) => HttpFacts.IsHtml(r);
 
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct)
+    private async Task<ReadOnlyMemory<byte>> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct,
+        SegmentBufferLease? lease = null, int copies = 1)
     {
         if (response.Content.Headers.ContentLength > limit) throw new RunnerStop(RunOutcome.NeedsAttention("too-large", "A playlist or segment is unreasonably large."));
         using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
         stall.CancelAfter(engine.Options.StallTimeout);
         try
         {
-            await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             long? knownLength = response.Content.Headers.ContentLength;
-            using var buffer = new MemoryStream(knownLength is > 0 ? (int)knownLength.Value : 64 * 1024);
-            var chunk = new byte[64 * 1024];
-            int read;
-            while ((read = await body.ReadAsync(chunk, stall.Token).ConfigureAwait(false)) > 0)
+            if (lease is not null && knownLength is long declaredCapacity)
+                lease.Resize(SegmentBufferLimiter.Reservation(limit, declaredCapacity, copies));
+            await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
+            int initialCapacity = knownLength is > 0 ? checked((int)knownLength.Value) : (int)Math.Min(64 * 1024, limit);
+            using var buffer = new MemoryStream(initialCapacity);
+            byte[] chunk = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
             {
-                stall.CancelAfter(engine.Options.StallTimeout);
-                if (buffer.Length + read > limit) throw new RunnerStop(RunOutcome.NeedsAttention("too-large", "A playlist or segment is unreasonably large."));
-                buffer.Write(chunk, 0, read);
+                int read;
+                while ((read = await body.ReadAsync(chunk.AsMemory(), stall.Token).ConfigureAwait(false)) > 0)
+                {
+                    stall.CancelAfter(engine.Options.StallTimeout);
+                    if (buffer.Length + read > limit) throw new RunnerStop(RunOutcome.NeedsAttention("too-large", "A playlist or segment is unreasonably large."));
+                    buffer.Write(chunk, 0, read);
+                }
             }
+            finally { ArrayPool<byte>.Shared.Return(chunk); }
             if (response.Content.Headers.ContentLength is long declared && buffer.Length != declared)
                 throw new TransientNetworkException("A segment ended early.");
-            if (buffer.TryGetBuffer(out var complete) && complete.Array is { } array && complete.Count == array.Length)
-                return array; // common Content-Length path avoids another full-segment allocation
-            return buffer.ToArray();
+            if (lease is not null) lease.Resize(SegmentBufferLimiter.CapacityReservation(buffer.Capacity, copies));
+            return new ReadOnlyMemory<byte>(buffer.GetBuffer(), 0, checked((int)buffer.Length));
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         { throw new TransientNetworkException("The HLS response stalled."); }
     }
 
-    private async Task<byte[]> DecryptAsync(byte[] data, HlsKey key, long sequence, Dictionary<string, byte[]> cache, CancellationToken ct)
+    private async Task<ReadOnlyMemory<byte>> DecryptAsync(ReadOnlyMemory<byte> data, HlsKey key, long sequence,
+        Dictionary<string, byte[]> cache, CancellationToken ct)
     {
         if (key.Uri is null) throw new RunnerStop(RunOutcome.NeedsAttention("key", "An encrypted stream has no key address."));
         if (!cache.TryGetValue(key.Uri, out byte[]? material))
@@ -771,7 +812,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 throw new RunnerStop(RunOutcome.NeedsAttention("key", "The HLS key address is invalid or not permitted."));
             using HttpResponseMessage response = await http.SendAsync(keyUri, Spec(null, null), ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode) throw StatusStop(response);
-            material = await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false);
+            material = (await ReadBoundedAsync(response, 64, ct).ConfigureAwait(false)).ToArray();
             if (material.Length != 16) throw new RunnerStop(RunOutcome.NeedsAttention("key", "The stream's key is not a valid AES-128 key."));
             if (cache.Count >= 32)
             {
@@ -783,7 +824,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         byte[] iv = key.Iv ?? SequenceIv(sequence);
         using Aes aes = Aes.Create();
         aes.Key = material;
-        try { return aes.DecryptCbc(data, iv, PaddingMode.PKCS7); }
+        try { return aes.DecryptCbc(data.Span, iv, PaddingMode.PKCS7); }
         catch (CryptographicException) { throw new RunnerStop(RunOutcome.NeedsAttention("decrypt", "A segment could not be decrypted with the supplied key.")); }
     }
 
