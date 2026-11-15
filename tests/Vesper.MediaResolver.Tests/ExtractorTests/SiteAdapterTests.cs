@@ -94,6 +94,19 @@ public class SiteAdapterTests
     }
 
     [Fact]
+    public async Task Instagram_DoesNotTreatLookalikeHostAsItsLoginPage()
+    {
+        const string lookalike = "https://evilinstagram.com/accounts/login/";
+        var h = new FakeHttpHandler()
+            .AddRedirect(InstagramPage, lookalike)
+            .Add(lookalike, "<html>{\"login_required\":true}</html>");
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        Assert.Equal(MediaErrorCode.BrowserContextRequired, result.Error!.Code);
+    }
+
+    [Fact]
     public async Task Instagram_PageTitleAloneDoesNotBecomeAPlayableMediaResult()
     {
         var h = new FakeHttpHandler().Add(InstagramPage, "<html><title>Title only</title></html>");
