@@ -5,6 +5,7 @@ public sealed class JobSnapshot
 {
     public Guid Id { get; init; }
     public JobKind Kind { get; init; }
+    public MediaOutput Output { get; init; }
     public string FileName { get; init; } = "";
     public string SourceUrl { get; init; } = "";
     public string? OriginalPageUrl { get; init; }
