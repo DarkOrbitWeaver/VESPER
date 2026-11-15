@@ -25,7 +25,9 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const tabMessages = [];
   const alarms = new Map();
   const ports = [];
-  const local = storage(localData);
+  // Sign-in fixtures model a user who also approved the test site's exact host.
+  const localSeed = { ...(prefs.useSignIn ? { signInHosts: ['example.com'] } : {}), ...localData };
+  const local = storage(localSeed);
   if (download && !downloadHistory.some(item => item.id === download.id)) downloadHistory.push(download);
   const chrome = {
     runtime: {
@@ -105,7 +107,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
-    localData,
+    localData: localSeed,
     install: () => onInstalled(),
     advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
@@ -304,7 +306,7 @@ test('a redirected API attachment matches when Chrome creates the item with fina
   let finishSubmit;
   const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
   const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('failed') },
-    { download: file, signInPermission: true, prefs: { useSignIn: true } });
+    { download: file, signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: ['arena.example'] } });
 
   app.onRedirect({ requestId: 'arena-request', url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
   await new Promise(resolve => setImmediate(resolve));
@@ -352,7 +354,7 @@ test('a redirected response waits for Chrome finalUrl before retrying the native
   let finishSubmit;
   const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
   const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('active') },
-    { download: file, signInPermission: true, prefs: { useSignIn: true } });
+    { download: file, signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: ['arena.example'] } });
   await app.onCreated(file);
   app.onRedirect({ requestId: 'arena-late-final', url: originalUrl, redirectUrl: finalUrl, method: 'GET' });
   await waitFor(() => app.sessionData.vesperDownloadCapture.chains?.length === 1);
@@ -394,7 +396,7 @@ test('an authenticated API handoff wakes VESPER before waiting for native readin
   let finishSubmit;
   const pendingSubmit = new Promise(resolve => { finishSubmit = resolve; });
   const app = load({ 'browser-submit': () => pendingSubmit, 'browser-transfer': transfer('active') },
-    { download: file, activity: true, signInPermission: true, prefs: { useSignIn: true } });
+    { download: file, activity: true, signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: ['arena.example'] } });
   await observe(app, file, { requestId: 'arena-direct' });
 
   const created = app.onCreated(file);
@@ -494,7 +496,8 @@ test('a redirect chain survives service worker restart until the final attachmen
   await waitFor(() => sessionData.vesperDownloadCapture.chains?.length === 1);
 
   const nextWorker = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
-    { download: file, sessionData, downloadHistory, signInPermission: true, prefs: { useSignIn: true } });
+    { download: file, sessionData, downloadHistory, signInPermission: true, prefs: { useSignIn: true },
+      localData: { signInHosts: ['arena.example'] } });
   file.finalUrl = finalUrl;
   file.totalBytes = 1000;
   nextWorker.onHeaders({ url: finalUrl, requestId, method: 'GET', type: 'other', statusCode: 200,
@@ -1249,6 +1252,31 @@ test('site cookies are omitted unless sign-in is explicitly enabled', async () =
   assert.equal(app.sent[0].authorized, false);
 });
 
+test('site sign-in requires exact HTTPS host approval', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, {
+    download: file, signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: [] }
+  });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(app.cookieLookups.length, 0);
+  assert.equal(app.sent[0].authorized, false);
+
+  const approved = load({ submit: { ok: true } }, {
+    signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: ['example.com'] }
+  });
+  const result = await approved.message({ type: 'submit', items: [
+    { url: 'https://example.com/file.zip' },
+    { url: 'https://cdn.example.com/file.zip' },
+    { url: 'http://example.com/file.zip' }
+  ] });
+  assert.equal(result.ok, true);
+  assert.equal(approved.sent[0].items[0].cookie, 'session=test-value');
+  assert.equal(approved.sent[0].items[1].cookie, undefined);
+  assert.equal(approved.sent[0].items[2].cookie, undefined);
+  assert.deepEqual(approved.cookieLookups, ['https://example.com/file.zip']);
+});
+
 test('explicit sign-in retries reacquire cookies and stored requests omit credentials', async () => {
   const file = activeDownload();
   const replies = { 'browser-submit': { ok: false, code: 'host-error' }, 'browser-transfer': transfer('active') };
@@ -1419,7 +1447,8 @@ test('a link on another site never carries SameSite=Strict cookies to VESPER', a
     [{}, withoutStrict]                                                            // unknown origin is treated as another site
   ];
   for (const [where, expected] of cases) {
-    const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
+    const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
+      localData: { signInHosts: ['bank.example'] }, cookies: cookieJar });
     await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://bank.example/export.csv', ...where }, undefined);
     assert.equal(app.sent[0].items[0].cookie, expected, JSON.stringify(where));
     assert.equal(app.sent[0].authorized, true);
@@ -1427,13 +1456,15 @@ test('a link on another site never carries SameSite=Strict cookies to VESPER', a
 });
 
 test('sibling subdomains are treated as different sites, which can only withhold a cookie', async () => {
-  const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
+  const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
+    localData: { signInHosts: ['alice.pages.example'] }, cookies: cookieJar });
   await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://alice.pages.example/file.zip', pageUrl: 'https://mallory.pages.example/' }, undefined);
   assert.equal(app.sent[0].items[0].cookie, withoutStrict);
 });
 
 test('public-suffix tenant hosts do not receive each other’s Strict cookies', async () => {
-  const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
+  const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
+    localData: { signInHosts: ['user.github.io'] }, cookies: cookieJar });
   await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://user.github.io/export.zip', pageUrl: 'https://github.io/' }, undefined);
   assert.equal(app.sent[0].items[0].cookie, withoutStrict);
 });
@@ -1442,7 +1473,8 @@ test('an automatic handoff sends only the cookies Chrome would send for that dow
   for (const [referrer, expected] of [['https://files.example/list', everyCookie], ['https://other.example/', withoutStrict], [undefined, withoutStrict]]) {
     const file = { ...activeDownload(), url: 'https://files.example/archive.zip', referrer };
     const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
-      { download: file, signInPermission: true, prefs: { useSignIn: true }, cookies: cookieJar });
+      { download: file, signInPermission: true, prefs: { useSignIn: true },
+        localData: { signInHosts: ['files.example'] }, cookies: cookieJar });
     await observe(app, file);
     await app.onCreated(file);
     assert.equal(app.sent[0].items[0].cookie, expected, String(referrer));
@@ -1678,6 +1710,7 @@ test('right-clicking an ordinary page control opens discovery without replaying 
   const frameUrl = 'https://player.example/embed';
   const app = load({ 'media-picker': { ok: true } }, {
     prefs: { useSignIn: true }, signInPermission: true,
+    localData: { signInHosts: ['player.example'] },
     cookies: [{ name: 'session', value: 'authorized', sameSite: 'lax' }]
   });
   const tab = { id: 9, url: 'https://video.example/watch' };

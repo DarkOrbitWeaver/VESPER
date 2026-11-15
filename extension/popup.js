@@ -34,11 +34,57 @@ async function init() {
 
   const signIn = $('signin');
   const access = $('signin-access');
+  const siteSignIn = $('signin-site');
+  const siteHostLabel = $('signin-host');
+  const siteHint = $('signin-site-hint');
   const cookies = { permissions: ['cookies'] };
   const hasAccess = () => chrome.permissions.contains(cookies).catch(() => false);
+  function httpsHost(value) {
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' && !url.username && !url.password ? url.hostname.toLowerCase() : null;
+    } catch { return null; }
+  }
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  const siteHost = httpsHost(activeTab?.url);
+  siteHostLabel.textContent = siteHost || 'this HTTPS site';
+  siteSignIn.disabled = !siteHost;
+  if (siteHost) {
+    try {
+      const { signInHosts = [] } = await chrome.storage.local.get('signInHosts');
+      siteSignIn.checked = Array.isArray(signInHosts) && signInHosts.includes(siteHost);
+    } catch {
+      siteHint.textContent = 'Couldn’t read this site’s sign-in setting.';
+    }
+  } else {
+    siteHint.textContent = 'Site sign-in is available on HTTPS pages.';
+  }
+  siteSignIn.onchange = async () => {
+    if (!siteHost) return;
+    siteSignIn.disabled = true;
+    try {
+      const { signInHosts = [] } = await chrome.storage.local.get('signInHosts');
+      const hosts = new Set(Array.isArray(signInHosts)
+        ? signInHosts.filter(host => typeof host === 'string' && host.length <= 253).slice(0, 50) : []);
+      if (siteSignIn.checked && !hosts.has(siteHost) && hosts.size >= 50) {
+        siteSignIn.checked = false;
+        siteHint.textContent = 'Remove an approved host before adding another.';
+        return;
+      }
+      if (siteSignIn.checked) hosts.add(siteHost);
+      else hosts.delete(siteHost);
+      await chrome.storage.local.set({ signInHosts: [...hosts].slice(0, 50) });
+      siteHint.textContent = 'Only this exact host is approved. This also requires the setting above.';
+    } catch {
+      siteSignIn.checked = !siteSignIn.checked;
+      siteHint.textContent = 'Couldn’t save this site’s sign-in setting.';
+    } finally {
+      siteSignIn.disabled = !siteHost;
+    }
+  };
   function showAccess(allowed) {
     signIn.checked = prefs.useSignIn && allowed;
-    access.textContent = allowed ? 'Access granted in Chrome.' : 'Chrome permission required.';
+    access.textContent = allowed ? 'Only hosts approved below can use cookies.' : 'Chrome permission required.';
   }
   chrome.permissions.onRemoved.addListener(removed => {
     if (removed.permissions?.includes('cookies')) showAccess(false);
@@ -93,7 +139,7 @@ const RECENT_ACTIONS = {
   'sign-in': { label: 'Use my sign-in', run: async (prefs, signIn) => {
     signIn.checked = true;
     await signIn.onchange();
-    return prefs.useSignIn ? 'Sign-in is on. Start the download again.' : 'Chrome didn’t grant access, so nothing changed.';
+    return prefs.useSignIn ? 'Sign-in is on. Approve this HTTPS site above, then start again.' : 'Chrome didn’t grant access, so nothing changed.';
   } },
   'download-now': { label: 'Download now instead', run: async () => {
     await chrome.storage.sync.set({ handoff: 'download' });

@@ -185,8 +185,20 @@ async function withSignIn(items, context = {}) {
   const prefs = await settings();
   if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] })))
     return { items: safe, authorized: false };
+  const { signInHosts = [] } = await chrome.storage.local.get('signInHosts').catch(() => ({}));
+  const approvedHosts = new Set(Array.isArray(signInHosts)
+    ? signInHosts.filter(host => typeof host === 'string' && host.length <= 253).slice(0, 50).map(host => host.toLowerCase()) : []);
   const enriched = [];
   for (const item of safe) {
+    let targetHost;
+    try {
+      const target = new URL(item.url);
+      if (target.protocol === 'https:' && !target.username && !target.password) targetHost = target.hostname.toLowerCase();
+    } catch { /* invalid URLs receive no browser credentials */ }
+    if (!targetHost || !approvedHosts.has(targetHost)) {
+      enriched.push(item);
+      continue;
+    }
     let cookie;
     try {
       const matches = await signInCookies(item.url, item.referer, context);
