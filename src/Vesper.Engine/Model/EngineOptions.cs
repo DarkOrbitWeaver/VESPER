@@ -47,6 +47,7 @@ public sealed class EngineOptions
     public int MaxConnectionsPerHost { get; set; } = 8;
     public long GlobalLimitBytesPerSecond { get; set; }
     public bool CategorySubfolders { get; set; }
+    public string FileNameTemplate { get; set; } = "";
     public SchedulePolicy Schedule { get; set; } = SchedulePolicy.Always;
     public bool PreventSleepWhileActive { get; set; }
 

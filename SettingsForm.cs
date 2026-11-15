@@ -37,6 +37,7 @@ internal sealed class SettingsForm : VesperPopupForm
     private VesperInputFrame _scheduleEndFrame = null!;
     private TextBox _proxyAddress = null!;
     private VesperInputFrame _proxyFrame = null!;
+    private TextBox _fileNameTemplate = null!;
 
     public VesperPreferences Result => _draft.Clone();
     public SettingsForm() : this(new VesperPreferences()) { }
@@ -246,33 +247,65 @@ internal sealed class SettingsForm : VesperPopupForm
         var categoryNote = Label("Organize future files into Music, Video, Archives and other folders.", 8, muted: true);
         categoryNote.SetBounds(45, 265, 470, 23);
         var separator2 = Divider(305);
-        var missing = Check("Hide missing completed files", 25, 324, _draft.HideMissingCompleted, v => _draft.HideMissingCompleted = v);
+        var templateHeading = Label("Optional filename template", 9, bold: true);
+        templateHeading.SetBounds(25, 317, 400, 22);
+        var templateNote = Label("Use {name} for the title and {host} for the source site. The extension stays at the end.", 8, muted: true);
+        templateNote.SetBounds(25, 342, 500, 20);
+        var (templateFrame, templateInput) = Input(_draft.FileNameTemplate, 500);
+        templateFrame.SetBounds(25, 371, 500, 34);
+        templateInput.AccessibleName = "Filename template";
+        _fileNameTemplate = templateInput;
+        var templatePreview = Label("", 8, muted: true);
+        templatePreview.SetBounds(25, 408, 500, 22);
+        void UpdateTemplatePreview()
+        {
+            _draft.FileNameTemplate = templateInput.Text;
+            if (string.IsNullOrWhiteSpace(templateInput.Text))
+            {
+                templatePreview.Text = "Preview: Coastal walk.mp4 (template off)";
+            }
+            else if (!FileNames.TryValidateTemplate(templateInput.Text, out string problem))
+            {
+                templatePreview.Text = "Template issue: " + problem;
+            }
+            else
+            {
+                templatePreview.Text = "Preview: " + FileNames.ApplyTemplate("Coastal walk.mp4", templateInput.Text,
+                    new Uri("https://media.example/"));
+            }
+        }
+        templateInput.TextChanged += (_, _) => UpdateTemplatePreview();
+        UpdateTemplatePreview();
+        var separator3 = Divider(444);
+        var missing = Check("Hide missing completed files", 25, 461, _draft.HideMissingCompleted, v => _draft.HideMissingCompleted = v);
         var missingNote = Label("Only completed records are hidden. Paused and recoverable entries stay visible.", 8, muted: true);
-        missingNote.SetBounds(45, 353, 470, 37);
-        var separator3 = Divider(398);
-        var notify = Check("Show a notification when a download finishes", 25, 410, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);
-        var sound = Check("Play completion sound", 25, 438, _draft.PlayCompletionSound, v =>
+        missingNote.SetBounds(45, 490, 470, 37);
+        var separator4 = Divider(535);
+        var notify = Check("Show a notification when a download finishes", 25, 547, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);
+        var sound = Check("Play completion sound", 25, 575, _draft.PlayCompletionSound, v =>
         {
             _draft.PlayCompletionSound = v;
             if (!v) VesperSounds.Stop();
         });
         var previewSound = Button("Preview sound", 140, symbol: VesperIcon.Audio);
-        previewSound.SetBounds(257, 437, 140, 29);
+        previewSound.SetBounds(257, 574, 140, 29);
         sound.Width = Math.Max(UiKit.Scale(this, 120), previewSound.Left - sound.Left - UiKit.Scale(this, 8));
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
-        var clipboard = Check("Offer to download links I copy", 25, 475, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
-        var tray = Check("Keep VESPER in the tray when I close the window", 25, 503, _draft.CloseToTray, v => _draft.CloseToTray = v);
+        var clipboard = Check("Offer to download links I copy", 25, 612, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
+        var tray = Check("Keep VESPER in the tray when I close the window", 25, 640, _draft.CloseToTray, v => _draft.CloseToTray = v);
         var collisions = Label("Existing files are never overwritten: a number is added to the new file's name instead.", 8, muted: true);
-        collisions.SetBounds(25, 533, 490, 23);
+        collisions.SetBounds(25, 670, 490, 23);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
-            separator2, missing, missingNote, separator3, notify, sound, previewSound, clipboard, tray, collisions]);
+            separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
+            separator4, notify, sound, previewSound, clipboard, tray, collisions]);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
             browse.Left = Math.Max(308, right - browse.Width);
             frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
             int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
-            categoryNote.Width = missingNote.Width = collisions.Width = noteWidth;
+            categoryNote.Width = missingNote.Width = collisions.Width = templateNote.Width = templatePreview.Width = noteWidth;
+            templateFrame.Width = Math.Max(UiKit.Scale(this, 180), right - 50);
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -681,6 +714,16 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void Save()
     {
+        if (!FileNames.TryValidateTemplate(_draft.FileNameTemplate, out string templateProblem))
+        {
+            ShowPage("Downloads");
+            _fileNameTemplate.Focus();
+            VesperMessageBox.Show(this, templateProblem, "Invalid filename template",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        _draft.FileNameTemplate = _draft.FileNameTemplate.Trim();
+
         if (_globalEnabled.Checked)
         {
             if (!int.TryParse(_globalInput.Text.Trim(), out int limit) || limit is < 1 or > 10000000)
