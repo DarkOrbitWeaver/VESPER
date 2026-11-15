@@ -181,7 +181,7 @@ async function observeDownloadResponse(details) {
     }
   }
   await saveCaptureState();
-  for (const item of captured) void captureChromeDownload(item).catch(() => {});
+  for (const item of captured) void captureChromeDownloadSafely(item);
 }
 
 // Only document and attachment requests can sit behind a Chrome download. Listening for every XHR and
@@ -284,7 +284,7 @@ async function recoverUncapturedChromeDownloads() {
     && !browserOperations.has(item.id)
     && (!sameDownload(item, records[item.id] || {})
       || records[item.id]?.stage === 'attempted' && (records[item.id].retryAt || 0) <= Date.now()));
-  await Promise.allSettled(recoverable.map(item => captureChromeDownload(item)));
+  await Promise.allSettled(recoverable.map(item => captureChromeDownloadSafely(item)));
 }
 
 function recoverChromeCaptures() {
@@ -615,13 +615,24 @@ async function captureChromeDownload(item) {
   if (wanted) await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
 }
 
+async function captureChromeDownloadSafely(item) {
+  try { await captureChromeDownload(item); }
+  catch {
+    if (!canMove(item) || item.incognito || item.paused) return;
+    try {
+      const prefs = await settings();
+      if (prefs.intercept && prefs.route !== 'chrome') await noteDecision(item, 'capture-error');
+    } catch { /* Chrome still owns the file if the extension cannot save its explanation. */ }
+  }
+}
+
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {});
   if (alarm.name === SOURCE_EXPIRY_ALARM) return pruneObservedSources().catch(() => {});
 });
 chrome.downloads.onCreated.addListener(item => {
   const wake = wakeChromeActivity().catch(() => {});
-  const capture = captureChromeDownload(item).catch(() => {});
+  const capture = captureChromeDownloadSafely(item);
   return Promise.all([wake, capture]).then(() => wakeChromeActivity().catch(() => {}));
 });
 chrome.downloads.onChanged.addListener(async change => {
@@ -633,7 +644,7 @@ chrome.downloads.onChanged.addListener(async change => {
       });
     } else if (change.state?.current === 'complete' || ['safe', 'deepScannedSafe'].includes(change.danger?.current)
         || change.finalUrl || change.totalBytes || change.fileSize) {
-      await captureChromeDownload(await getChromeDownload(change.id));
+      await captureChromeDownloadSafely(await getChromeDownload(change.id));
     }
   } catch { /* The existing Chrome file or its recovery record is still available. */ }
   await wakeChromeActivity().catch(() => {});

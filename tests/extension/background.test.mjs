@@ -6,6 +6,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
+  failDownloadSearch = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value' }], playerPicker = false } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
@@ -65,11 +66,14 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     downloads: {
       onCreated: { addListener: fn => { onCreated = fn; } },
       onChanged: { addListener: fn => { onChanged = fn; } },
-      search: async ({ id, state, startedAfter, startedBefore, limit }) => downloadHistory
-        .filter(item => (id === undefined || item.id === id) && (state === undefined || item.state === state)
-          && (startedAfter === undefined || Date.parse(item.startTime) >= Date.parse(startedAfter))
-          && (startedBefore === undefined || Date.parse(item.startTime) <= Date.parse(startedBefore)))
-        .slice(0, limit || downloadHistory.length).map(item => ({ ...item })),
+      search: async ({ id, state, startedAfter, startedBefore, limit }) => {
+        if (failDownloadSearch) throw new Error('Chrome download search failed.');
+        return downloadHistory
+          .filter(item => (id === undefined || item.id === id) && (state === undefined || item.state === state)
+            && (startedAfter === undefined || Date.parse(item.startTime) >= Date.parse(startedAfter))
+            && (startedBefore === undefined || Date.parse(item.startTime) <= Date.parse(startedBefore)))
+          .slice(0, limit || downloadHistory.length).map(item => ({ ...item }));
+      },
       download: async ({ url }) => {
         actions.push('chrome-start');
         const id = Math.max(0, ...downloadHistory.map(item => item.id)) + 1;
@@ -1585,6 +1589,19 @@ test('each way a handoff can fail is recorded with its own reason and leaves Chr
     assert.equal(app.actions.includes('pause'), false);
     assert.equal(decisions(app).length, 1);
   }
+});
+
+test('an unexpected automatic capture error is explained without changing Chrome ownership', async () => {
+  const file = activeDownload();
+  const app = load({}, { download: file, failDownloadSearch: true });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(outcomeOf(app), 'capture-error');
+  assert.deepEqual(Object.keys(decisions(app)[0]).sort(), ['at', 'id', 'name', 'outcome', 'site']);
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('pause'), false);
+  assert.equal(app.sent.length, 0);
 });
 
 test('downloads VESPER must not repeat are explained without contacting VESPER', async () => {
