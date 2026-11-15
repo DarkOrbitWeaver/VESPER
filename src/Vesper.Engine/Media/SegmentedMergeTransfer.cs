@@ -89,8 +89,11 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     ct.ThrowIfCancellationRequested();
                     Part part = prepared.Parts[pi];
                     long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
-                    using IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
-                    byte[] data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct).ConfigureAwait(false);
+                    int copies = part.Key is null ? 1 : 2;
+                    using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+                        SegmentBufferLimiter.Reservation(limit, part.Length, copies), ct).ConfigureAwait(false);
+                    ReadOnlyMemory<byte> data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct,
+                        lease, copies).ConfigureAwait(false);
                     if (part.Key is { } key)
                     {
                         if (part.Initialization && key.Iv is null)
@@ -101,11 +104,11 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
                     await engine.GlobalLimiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
                     await session.WriteAsync(data, offset, report: false, ct).ConfigureAwait(false);
-                    hash.AppendData(data);
+                    hash.AppendData(data.Span);
                     long start = offset;
                     offset = checked(offset + data.Length);
                     completed[ti] = pi + 1;
-                    lengths.Add(data.LongLength);
+                    lengths.Add(data.Length);
                     int savedTrack = ti, savedNext = pi + 1;
                     if (savedNext == prepared.Parts.Count) { savedTrack++; savedNext = 0; }
                     var saved = new Cursor(2, fingerprint, "download", savedTrack, savedNext, offset,
@@ -278,15 +281,18 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     ct.ThrowIfCancellationRequested();
                     Part part = track.Parts[partIndex];
                     long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
-                    using IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
-                    byte[] data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct).ConfigureAwait(false);
+                    int copies = part.Key is null ? 1 : 2;
+                    using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+                        SegmentBufferLimiter.Reservation(limit, part.Length, copies), ct).ConfigureAwait(false);
+                    ReadOnlyMemory<byte> data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct,
+                        lease, copies).ConfigureAwait(false);
                     if (part.Key is { } key)
                     {
                         if (part.Initialization && key.Iv is null)
                             return (false, null, "The refreshed HLS initialization uses an implicit IV. Saved data was kept.");
                         data = await DecryptAsync(data, key, part.Sequence, keys, ct).ConfigureAwait(false);
                     }
-                    if (data.LongLength != lengths[lengthIndex])
+                    if (data.Length != lengths[lengthIndex])
                         return (false, null, "A refreshed HLS/DASH part has a different length from the saved bytes. Saved data was kept.");
 
                     await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
@@ -296,7 +302,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     {
                         int count = Math.Min(savedBuffer.Length, data.Length - compared);
                         int read = file.Read(savedBuffer.AsSpan(0, count), fileOffset + compared);
-                        if (read != count || !data.AsSpan(compared, count).SequenceEqual(savedBuffer.AsSpan(0, count)))
+                        if (read != count || !data.Span.Slice(compared, count).SequenceEqual(savedBuffer.AsSpan(0, count)))
                             return (false, null, "A refreshed HLS/DASH part differs from the saved bytes. Saved data was kept.");
                         compared += count;
                     }
@@ -386,13 +392,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (!UrlPolicy.TryParse(url, out Uri requested, out string error))
             throw new RunnerStop(RunOutcome.NeedsAttention("bad-url", error));
         Uri finalUri = requested;
-        byte[] bytes = await FetchPartAsync(url, null, null, MaxPlaylistBytes, ct, uri => finalUri = uri).ConfigureAwait(false);
+        ReadOnlyMemory<byte> bytes = await FetchPartAsync(url, null, null, MaxPlaylistBytes, ct,
+            finalUri: uri => finalUri = uri).ConfigureAwait(false);
         if (bytes.Length > MaxPlaylistBytes) throw new RunnerStop(NeedsAttention("too-large", "An HLS playlist is too large."));
-        return (System.Text.Encoding.UTF8.GetString(bytes), finalUri);
+        return (System.Text.Encoding.UTF8.GetString(bytes.Span), finalUri);
     }
 
-    private async Task<byte[]> FetchPartAsync(string url, long? offset, long? length, long limit, CancellationToken ct,
-        Action<Uri>? finalUri = null)
+    private async Task<ReadOnlyMemory<byte>> FetchPartAsync(string url, long? offset, long? length, long limit,
+        CancellationToken ct, SegmentBufferLease? lease = null, int copies = 1, Action<Uri>? finalUri = null)
     {
         if (!UrlPolicy.TryParse(url, out Uri uri, out string error))
             throw new RunnerStop(RunOutcome.NeedsAttention("bad-url", error));
@@ -421,13 +428,16 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
             if (response.Content.Headers.ContentLength > limit)
                 throw new RunnerStop(NeedsAttention("too-large", "A rendition segment exceeds the supported size limit."));
+            if (lease is not null && response.Content.Headers.ContentLength is long declaredCapacity)
+                lease.Resize(SegmentBufferLimiter.Reservation(limit, declaredCapacity, copies));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stall.CancelAfter(engine.Options.StallTimeout);
             try
             {
                 await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
-                using var result = new MemoryStream(response.Content.Headers.ContentLength is > 0 and <= int.MaxValue
-                    ? (int)response.Content.Headers.ContentLength.Value : 64 * 1024);
+                int initialCapacity = response.Content.Headers.ContentLength is > 0 and <= int.MaxValue
+                    ? (int)response.Content.Headers.ContentLength.Value : (int)Math.Min(64 * 1024, limit);
+                using var result = new MemoryStream(initialCapacity);
                 byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
                 try
                 {
@@ -445,9 +455,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 if (response.Content.Headers.ContentLength is long declared && result.Length != declared
                     || length is long expected && result.Length != expected)
                     throw new TransientNetworkException("A rendition object ended before its declared size.");
-                if (result.TryGetBuffer(out ArraySegment<byte> complete) && complete.Array is { } array && complete.Count == array.Length)
-                    return array;
-                return result.ToArray();
+                if (lease is not null) lease.Resize(SegmentBufferLimiter.CapacityReservation(result.Capacity, copies));
+                return new ReadOnlyMemory<byte>(result.GetBuffer(), 0, checked((int)result.Length));
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             { throw new TransientNetworkException("A rendition response stalled."); }
@@ -455,15 +464,16 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         finally { session.RemoveConnection(); }
     }
 
-    private async Task<byte[]> DecryptAsync(byte[] data, HlsKey key, long sequence, HlsKeyCache cache, CancellationToken ct)
+    private async Task<ReadOnlyMemory<byte>> DecryptAsync(ReadOnlyMemory<byte> data, HlsKey key, long sequence,
+        HlsKeyCache cache, CancellationToken ct)
     {
         if (key.Uri is null) throw new RunnerStop(NeedsAttention("key", "An encrypted HLS rendition has no key address."));
         byte[] material = await cache.GetAsync(key.Uri,
-            (url, offset, length, limit, token) => FetchPartAsync(url, offset, length, limit, token), ct).ConfigureAwait(false);
+            async (url, offset, length, limit, token) => (await FetchPartAsync(url, offset, length, limit, token).ConfigureAwait(false)).ToArray(), ct).ConfigureAwait(false);
         byte[] iv = key.Iv ?? SequenceIv(sequence);
         using Aes aes = Aes.Create();
         aes.Key = material;
-        try { return aes.DecryptCbc(data, iv, PaddingMode.PKCS7); }
+        try { return aes.DecryptCbc(data.Span, iv, PaddingMode.PKCS7); }
         catch (CryptographicException)
         { throw new RunnerStop(NeedsAttention("decrypt", "A rendition segment could not be decrypted with its supplied key.")); }
     }

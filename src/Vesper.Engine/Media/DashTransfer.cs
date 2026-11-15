@@ -68,7 +68,9 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             }
             else
             {
-                ReadOnlyMemory<byte> init = await FetchAsync(plan.Initialization, MaxInitBytes, ct).ConfigureAwait(false);
+                using SegmentBufferLease initLease = await engine.AcquireSegmentBufferAsync(
+                    SegmentBufferLimiter.Reservation(MaxInitBytes, plan.Initialization.Length), ct).ConfigureAwait(false);
+                ReadOnlyMemory<byte> init = await FetchAsync(plan.Initialization, MaxInitBytes, initLease, ct).ConfigureAwait(false);
                 mp4 = FragmentedMp4.Open(init.Span);
                 initLength = init.Length;
                 if ((plan.RequireAudio && !mp4.HasAudio) || (plan.RequireVideo && !mp4.HasVideo))
@@ -80,7 +82,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             }
             session.SetPhase(JobState.Downloading);
             using var prefetch = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var pending = new Queue<Task<(ReadOnlyMemory<byte> Data, IDisposable Lease)>>();
+            var pending = new Queue<Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)>>();
             int fetchNext = next;
             void Fill()
             {
@@ -93,7 +95,12 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             {
                 ct.ThrowIfCancellationRequested();
                 Fill();
-                (ReadOnlyMemory<byte> fragment, IDisposable lease) = await pending.Dequeue().ConfigureAwait(false);
+                Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> fetchTask = pending.Dequeue();
+                var fetched = await fetchTask.ConfigureAwait(false);
+                fetchTask = null!;
+                ReadOnlyMemory<byte> fragment = fetched.Data;
+                SegmentBufferLease lease = fetched.Lease;
+                fetched = default;
                 using IDisposable segmentBuffer = lease;
                 Fill();
                 mp4.ValidateFragment(fragment.Span);
@@ -112,15 +119,17 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             finally
             {
                 prefetch.Cancel();
-                foreach (var fetch in pending)
+                foreach (Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> fetch in pending)
                 {
                     try
                     {
-                        (_, IDisposable lease) = await fetch.ConfigureAwait(false);
-                        lease.Dispose();
+                        var fetched = await fetch.ConfigureAwait(false);
+                        fetched.Lease.Dispose();
+                        fetched = default;
                     }
                     catch (Exception) { }
                 }
+                pending.Clear();
             }
             mp4.Finish(plan.RequireAudio, plan.RequireVideo);
         }
@@ -149,7 +158,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space. Saved data was kept."));
     }
 
-    private async Task<ReadOnlyMemory<byte>> FetchAsync(DashFragment part, long limit, CancellationToken ct)
+    private async Task<ReadOnlyMemory<byte>> FetchAsync(DashFragment part, long limit, SegmentBufferLease lease, CancellationToken ct)
     {
         if (!UrlPolicy.TryParse(part.Url, out var uri, out _)) throw new RunnerStop(Stop("Invalid fragment URL."));
         long? end = part.Offset is long start && part.Length is long size ? checked(start + size - 1) : null;
@@ -177,6 +186,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             else if (status != 200) throw new RunnerStop(Stop("The server returned an unsolicited partial fragment."));
             long? declared = response.Content.Headers.ContentLength;
             if (declared > limit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
+            if (declared is long known) lease.Resize(SegmentBufferLimiter.Reservation(limit, known));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stall.CancelAfter(engine.Options.StallTimeout);
             try
@@ -199,8 +209,9 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 if ((declared is long expected && body.Length != expected) || (part.Length is long rangeLength && body.Length != rangeLength))
                     throw new TransientNetworkException("The DASH object ended before its declared size.");
                 if (body.Length == 0) throw new RunnerStop(Stop("The fragment was empty."));
-                // MemoryStream disposal does not invalidate its managed buffer. Avoid an extra full-object copy.
-                return body.GetBuffer().AsMemory(0, checked((int)body.Length));
+                ReadOnlyMemory<byte> data = body.GetBuffer().AsMemory(0, checked((int)body.Length));
+                lease.Resize(SegmentBufferLimiter.CapacityReservation(body.Capacity));
+                return data;
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             { throw new TransientNetworkException("The DASH object stalled."); }
@@ -208,13 +219,14 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
         finally { session.RemoveConnection(); }
     }
 
-    private async Task<(ReadOnlyMemory<byte> Data, IDisposable Lease)> FetchBufferedAsync(
+    private async Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> FetchBufferedAsync(
         DashFragment part, long limit, CancellationToken ct)
     {
-        IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
+        SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+            SegmentBufferLimiter.Reservation(limit, part.Length), ct).ConfigureAwait(false);
         try
         {
-            ReadOnlyMemory<byte> data = await FetchAsync(part, limit, ct).ConfigureAwait(false);
+            ReadOnlyMemory<byte> data = await FetchAsync(part, limit, lease, ct).ConfigureAwait(false);
             return (data, lease);
         }
         catch

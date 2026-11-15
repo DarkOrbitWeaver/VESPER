@@ -167,7 +167,9 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         {
             ct.ThrowIfCancellationRequested();
             HlsSegment segment = media.Segments[i];
-            byte[] bytes = await FetchSegmentAsync(segment, ct).ConfigureAwait(false);
+            using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+                SegmentBufferLimiter.Reservation(MaxSegmentBytes, segment.RangeLength, copies: 2), ct).ConfigureAwait(false);
+            byte[] bytes = await FetchSegmentAsync(segment, lease, ct).ConfigureAwait(false);
             downloaded = checked(downloaded + bytes.LongLength);
             if (downloaded > MaxSourceBytes)
                 throw new MediaContainerException("The HLS subtitle segments exceed the supported download size.");
@@ -240,7 +242,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         return (text, response.RequestMessage?.RequestUri ?? uri);
     }
 
-    private async Task<byte[]> FetchSegmentAsync(HlsSegment segment, CancellationToken ct)
+    private async Task<byte[]> FetchSegmentAsync(HlsSegment segment, SegmentBufferLease lease, CancellationToken ct)
     {
         if (!UrlPolicy.TryParse(segment.Uri, out Uri uri, out string error))
             throw new RunnerStop(NeedsAttention("subtitle-url", error));
@@ -264,13 +266,14 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         else if (status == 206) throw new RunnerStop(NeedsAttention("subtitle-range", "The server returned only part of a subtitle segment."));
         if (!HttpFacts.IsIdentityEncoded(response)) throw new RunnerStop(NeedsAttention("subtitle-encoding", "The server compressed an HLS subtitle segment."));
         if (HttpFacts.IsHtml(response)) throw new RunnerStop(NeedsAttention("subtitle-html", "The server sent a web page instead of a subtitle segment."));
-        byte[] bytes = await ReadBoundedAsync(response, MaxSegmentBytes, ct).ConfigureAwait(false);
+        byte[] bytes = await ReadBoundedAsync(response, MaxSegmentBytes, ct, lease, copies: 2).ConfigureAwait(false);
         if (segment.RangeLength is long expected && bytes.LongLength != expected)
             throw new TransientNetworkException("An HLS subtitle byte-range response was incomplete.");
         return bytes;
     }
 
-    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct)
+    private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct,
+        SegmentBufferLease? lease = null, int copies = 1)
     {
         if (response.Content.Headers.ContentLength > limit)
             throw new RunnerStop(NeedsAttention("subtitle-size", "An HLS subtitle playlist or segment is unreasonably large."));
@@ -278,8 +281,10 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         stall.CancelAfter(engine.Options.StallTimeout);
         try
         {
-            await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             long? declaredLength = response.Content.Headers.ContentLength;
+            if (lease is not null && declaredLength is long known)
+                lease.Resize(SegmentBufferLimiter.Reservation(limit, known, copies));
+            await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             using var buffer = new MemoryStream(declaredLength is > 0 and <= int.MaxValue
                 ? (int)declaredLength.Value : 16 * 1024);
             byte[] chunk = new byte[16 * 1024];
@@ -293,6 +298,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
             }
             if (response.Content.Headers.ContentLength is long declared && buffer.Length != declared)
                 throw new TransientNetworkException("An HLS subtitle response ended early.");
+            if (lease is not null) lease.Resize(SegmentBufferLimiter.CapacityReservation(buffer.Capacity, copies));
             return buffer.ToArray();
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
