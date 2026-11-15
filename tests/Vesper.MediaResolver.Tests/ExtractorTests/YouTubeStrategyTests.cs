@@ -38,7 +38,7 @@ public sealed class YouTubeStrategyTests
     [Fact]
     public async Task VisionOsStrategy_UsesPageSessionValues_AndVerifiesBytesBeforeOffering()
     {
-        var h = new FakeHttpHandler().Add(Watch, PageHtml).Add(Api, ApiOk, "application/json").AddMedia(Media(137), "video/mp4", 64);
+        var h = new FakeHttpHandler().Add(Watch, PageHtml).Add(Api, ApiOk, "application/json").AddMedia(Media(137), "video/mp4", 4_000_000);
         var res = await Resolve(h);
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
         var item = res.Item!;
@@ -71,6 +71,35 @@ public sealed class YouTubeStrategyTests
         Assert.False(res.IsSuccess);
         Assert.Equal(MediaErrorCode.AuthorizationRequired, res.Error!.Code);
         Assert.Contains("HTTP 403", res.Error.Diagnostic);
+    }
+
+    [Fact]
+    public async Task IgnoredRangeResponse_IsNotAcceptedAsPlayable()
+    {
+        var h = new FakeHttpHandler().Add(Watch, PageHtml).Add(Api, ApiOk, "application/json")
+            .AddIgnoringRange(Media(137), new string('x', 64));
+
+        var res = await Resolve(h);
+
+        Assert.False(res.IsSuccess);
+        Assert.Equal(MediaErrorCode.BrowserContextRequired, res.Error!.Code);
+        Assert.Contains("HTTP 200", res.Error.Diagnostic);
+        Assert.Contains("byte probe", res.Error.Diagnostic);
+    }
+
+    [Fact]
+    public async Task ProfileRequiringPoToken_IsNotTriedAsADirectDownloadStrategy()
+    {
+        var h = new FakeHttpHandler().Add(Watch, PageHtml).Add(Api, ApiOk, "application/json").AddMedia(Media(137), "video/mp4", 64);
+        using var resolver = new DefaultMediaResolver(new ResolverOptions { YouTubeClients = ["ios"] }, h);
+
+        var res = await resolver.ResolveAsync(new() { Url = new(Watch) }, CancellationToken.None);
+
+        Assert.False(res.IsSuccess);
+        Assert.Equal(MediaErrorCode.BrowserContextRequired, res.Error!.Code);
+        Assert.Contains("proof-of-origin token", res.Error.Diagnostic);
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsolutePath.Contains("/youtubei/v1/player", StringComparison.Ordinal));
+        Assert.DoesNotContain(h.Requests, request => request.Url.Host.EndsWith("googlevideo.com", StringComparison.Ordinal));
     }
 
     [Fact]

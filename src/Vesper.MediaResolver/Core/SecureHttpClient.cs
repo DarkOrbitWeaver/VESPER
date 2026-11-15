@@ -31,6 +31,8 @@ public sealed record ProbeResult(Uri FinalUrl, int StatusCode, string? ContentTy
     public bool IsSuccess => StatusCode is 200 or 206;
 }
 
+public sealed record MediaRangeProbeResult(int StatusCode, bool IsValid, string Detail);
+
 /// <summary>
 /// The only component that touches the network. It enforces:
 /// http/https only, no credentials in URLs, manual redirect following with per-hop validation (loops, downgrades, private hosts),
@@ -179,16 +181,47 @@ public sealed class SecureHttpClient : IDisposable
         return new HttpTextResponse(resp.RequestMessage?.RequestUri ?? url, status, body, resp.Content.Headers.ContentType?.MediaType, []);
     }
 
-    /// <summary>
-    /// Requests exactly one byte at <paramref name="offset"/> and returns the HTTP status. Used to prove that a media URL
-    /// serves data beyond its first bytes (some clients' URLs are cut off after ~1 MiB without a proof-of-origin token).
-    /// </summary>
-    public async Task<int> ProbeRangeAsync(Uri url, MediaRequestContext? ctx, long offset, CancellationToken ct)
+    /// <summary>Requests and verifies exactly one byte at the requested offset.</summary>
+    public async Task<MediaRangeProbeResult> ProbeExactRangeAsync(Uri url, MediaRequestContext? ctx, long offset, CancellationToken ct)
     {
+        if (offset < 0) throw new ArgumentOutOfRangeException(nameof(offset));
         using var resp = await SendAsync(HttpMethod.Get, url, ctx, ct,
             req => req.Headers.Range = new RangeHeaderValue(offset, offset)).ConfigureAwait(false);
-        return (int)resp.StatusCode;
+        int status = (int)resp.StatusCode;
+        if (status != (int)HttpStatusCode.PartialContent)
+            return new(status, false, $"HTTP {status}; a one-byte 206 response was required");
+        if (resp.Content.Headers.ContentEncoding.Any(encoding => !encoding.Equals("identity", StringComparison.OrdinalIgnoreCase)))
+            return new(status, false, "the server encoded the ranged representation");
+        ContentRangeHeaderValue? range = resp.Content.Headers.ContentRange;
+        if (range is null || !range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
+            || range.From != offset || range.To != offset || range.Length is long total && total <= offset)
+            return new(status, false, "Content-Range did not identify the requested byte");
+        if (resp.Content.Headers.ContentLength is long declared && declared != 1)
+            return new(status, false, $"Content-Length was {declared}, expected one byte");
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(_o.RequestTimeout);
+        try
+        {
+            await using Stream body = await resp.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+            byte[] sample = new byte[2];
+            int read = await body.ReadAsync(sample.AsMemory(0, resp.Content.Headers.ContentLength == 1 ? 1 : 2), timeout.Token).ConfigureAwait(false);
+            if (read == 0) return new(status, false, "the ranged body contained no byte");
+            if (read > 1) return new(status, false, "the ranged body contained more than one byte");
+            if (resp.Content.Headers.ContentLength is null
+                && await body.ReadAsync(sample.AsMemory(1, 1), timeout.Token).ConfigureAwait(false) != 0)
+                return new(status, false, "the ranged body contained more than one byte");
+            return new(status, true, $"HTTP 206, bytes {range.From}-{range.To}{(range.Length is long size ? $"/{size}" : "")}; one byte verified");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        { throw new MediaResolverException(MediaErrors.Network("Timed out reading the one-byte media range")); }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        { throw new MediaResolverException(MediaErrors.Network("Could not read the one-byte media range")); }
     }
+
+    /// <summary>Status-only compatibility wrapper. Use <see cref="ProbeExactRangeAsync"/> when validating a media source.</summary>
+    public async Task<int> ProbeRangeAsync(Uri url, MediaRequestContext? ctx, long offset, CancellationToken ct) =>
+        (await ProbeExactRangeAsync(url, ctx, offset, ct).ConfigureAwait(false)).StatusCode;
 
     /// <summary>HEAD first; if the server refuses, a 1-byte ranged GET. The body is never downloaded.</summary>
     public async Task<ProbeResult> ProbeAsync(Uri url, MediaRequestContext? ctx, CancellationToken ct)

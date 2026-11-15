@@ -7,7 +7,8 @@ namespace Vesper.MediaResolver.Tests.TestSupport;
 /// <summary>In-memory HTTP server for offline tests. Unknown URLs answer 404. Records every request (including headers).</summary>
 public sealed class FakeHttpHandler : HttpMessageHandler
 {
-    public sealed record Route(int Status, string Body, string ContentType, IReadOnlyDictionary<string, string>? Headers = null, string? Redirect = null);
+    public sealed record Route(int Status, string Body, string ContentType, IReadOnlyDictionary<string, string>? Headers = null,
+        string? Redirect = null, IReadOnlyDictionary<string, string>? ContentHeaders = null, bool IgnoreRange = false);
 
     public sealed record Recorded(HttpMethod Method, Uri Url, IReadOnlyDictionary<string, string> Headers, string? Body);
 
@@ -19,11 +20,15 @@ public sealed class FakeHttpHandler : HttpMessageHandler
 
     public int Count(string urlContains) => Requests.Count(r => r.Url.AbsoluteUri.Contains(urlContains, StringComparison.Ordinal));
 
-    public FakeHttpHandler Add(string url, string body, string contentType = "text/html", int status = 200, Dictionary<string, string>? headers = null)
+    public FakeHttpHandler Add(string url, string body, string contentType = "text/html", int status = 200,
+        Dictionary<string, string>? headers = null, Dictionary<string, string>? contentHeaders = null, bool ignoreRange = false)
     {
-        _routes[new Uri(url).AbsoluteUri] = new Route(status, body, contentType, headers);
+        _routes[new Uri(url).AbsoluteUri] = new Route(status, body, contentType, headers, ContentHeaders: contentHeaders, IgnoreRange: ignoreRange);
         return this;
     }
+
+    public FakeHttpHandler AddIgnoringRange(string url, string body, string contentType = "video/mp4") =>
+        Add(url, body, contentType, ignoreRange: true);
 
     public FakeHttpHandler AddFile(string url, string fixture, string contentType = "application/json") =>
         Add(url, Fixture.Load(fixture), contentType);
@@ -64,17 +69,38 @@ public sealed class FakeHttpHandler : HttpMessageHandler
             resp.Content = new ByteArrayContent([]);
             resp.Content.Headers.ContentLength = bytes.Length;
         }
-        else if (request.Headers.Range is not null && r.Status == 200)
+        else if (request.Headers.Range is not null && r.Status == 200 && !r.IgnoreRange)
         {
-            resp.StatusCode = HttpStatusCode.PartialContent;
-            resp.Content = new ByteArrayContent(bytes.Take(1).ToArray());
-            resp.Content.Headers.ContentRange = new ContentRangeHeaderValue(0, 0, bytes.Length);
+            var range = request.Headers.Range.Ranges.SingleOrDefault();
+            long start = range?.From ?? 0;
+            long end = range?.To ?? bytes.Length - 1;
+            if (start < 0 || start >= bytes.Length || end < start)
+            {
+                resp.StatusCode = HttpStatusCode.RequestedRangeNotSatisfiable;
+                resp.Content = new ByteArrayContent([]);
+                resp.Content.Headers.ContentRange = new ContentRangeHeaderValue(bytes.Length);
+            }
+            else
+            {
+                int first = checked((int)start);
+                int count = checked((int)(Math.Min(end, bytes.Length - 1) - start + 1));
+                resp.StatusCode = HttpStatusCode.PartialContent;
+                resp.Content = new ByteArrayContent(bytes.AsSpan(first, count).ToArray());
+                resp.Content.Headers.ContentRange = new ContentRangeHeaderValue(start, start + count - 1, bytes.Length);
+            }
         }
         else
         {
             resp.Content = new ByteArrayContent(bytes);
         }
         resp.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(r.ContentType);
+        if (r.ContentHeaders is not null)
+            foreach (var kv in r.ContentHeaders)
+            {
+                resp.Content.Headers.Remove(kv.Key);
+                if (kv.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) && kv.Value.Length == 0) continue;
+                resp.Content.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
+            }
         if (r.Headers is not null)
             foreach (var kv in r.Headers) resp.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
         return resp;
