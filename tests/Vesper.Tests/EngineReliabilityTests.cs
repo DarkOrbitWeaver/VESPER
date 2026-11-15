@@ -291,8 +291,7 @@ public sealed class MediaSourceRescueTests
     [Fact]
     public async Task A_refreshed_merge_plan_continues_the_saved_tracks_when_the_formats_still_match()
     {
-        TimeOnly now = TimeOnly.FromDateTime(DateTime.Now);
-        using var h = new Harness(tweak: o => o.Schedule = new SchedulePolicy(true, now.AddHours(1), now.AddHours(2)));   // nothing starts
+        using var h = new Harness(tweak: o => o.MaxConcurrentJobs = 0);
         var video = Rep("137", true, "mp4", "h264");
         var audio = Rep("140", false, "m4a", "aac");
         (VESPER.MediaDownloadChoice? first, string? error) = VESPER.MediaTransferBridge.Prepare(Item(video, audio),
@@ -320,14 +319,37 @@ public sealed class MediaSourceRescueTests
         // Same ids but a different file size: the engine's identity check refuses it.
         RescueResult changed = await InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, Item(video with { FileSize = 6_000_000 }, audio));
         Assert.False(changed.Accepted);
-        await Task.CompletedTask;
     }
 
-    private static async Task<RescueResult> InvokeRefreshMerge(DownloadEngine engine, JobSnapshot job, Vesper.MediaResolver.Models.MediaItem item)
+    [Fact]
+    public async Task Automatic_refresh_skips_segmented_merges_that_need_saved_part_verification()
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        var video = Rep("137", true, "mp4", "h264");
+        var audio = Rep("140", false, "m4a", "aac");
+        (VESPER.MediaDownloadChoice? choice, string? error) = VESPER.MediaTransferBridge.Prepare(Item(video, audio),
+            Vesper.MediaResolver.Formats.FormatPreferences.BestQuality);
+        Assert.NotNull(choice);
+        AddResult added = h.Engine.Add(new AddRequest(choice!.Url, FileName: choice.FileName, StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "youtube", MediaId: "fixture", MediaFormatId: choice.FormatId,
+            MediaPlanJson: choice.MediaPlanJson, OriginalPageUrl: "https://www.youtube.com/watch?v=fixture"));
+        Assert.True(added.Ok, added.Message);
+
+        var segmentedItem = Item(video with { Protocol = Vesper.MediaResolver.Models.StreamProtocol.Hls },
+            audio with { Protocol = Vesper.MediaResolver.Models.StreamProtocol.Hls });
+        RescueResult result = await InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, segmentedItem, automatic: true);
+
+        Assert.False(result.Accepted);
+        Assert.Contains("Automatic refresh was skipped", result.Message);
+        Assert.Equal(choice.Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+    }
+
+    private static async Task<RescueResult> InvokeRefreshMerge(DownloadEngine engine, JobSnapshot job,
+        Vesper.MediaResolver.Models.MediaItem item, bool automatic = false)
     {
         var method = typeof(VESPER.MediaSourceRescue).GetMethod("RefreshMergeAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
-        var operation = (Task<RescueResult>)method.Invoke(null, [engine, job, item, CancellationToken.None])!;
+        var operation = (Task<RescueResult>)method.Invoke(null, [engine, job, item, CancellationToken.None, automatic])!;
         return await operation;
     }
 }

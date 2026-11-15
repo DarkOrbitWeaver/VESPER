@@ -16,11 +16,11 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     private sealed record Part(string Url, long? Offset, long? Length, HlsKey? Key, long Sequence,
         bool Initialization, double? DurationSeconds = null, double? StartSeconds = null);
     private sealed record PreparedTrack(MergeTrack Track, IReadOnlyList<Part> Parts, bool Fragmented,
-        string SourceFingerprint, double? ActualStartSeconds = null, double? ActualEndSeconds = null);
-    private sealed record Cursor(int Version, string Fingerprint, string Phase, int Track = 0, int Next = 0,
+        string SourceFingerprint, string SourceShapeFingerprint, double? ActualStartSeconds = null, double? ActualEndSeconds = null);
+    internal sealed record Cursor(int Version, string Fingerprint, string Phase, int Track = 0, int Next = 0,
         long Offset = 0, string PrefixHash = "", int[]? CompletedParts = null, long[]? PartLengths = null,
         string?[]? SourceFingerprints = null, long MuxLength = 0, string? MuxSha256 = null,
-        string[]? KeyFingerprints = null);
+        string[]? KeyFingerprints = null, string?[]? SourceShapeFingerprints = null);
 
     internal async Task<RunOutcome> RunAsync(MediaMergePlan plan, CancellationToken ct)
     {
@@ -32,7 +32,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         Cursor? cursor = ReadCursor();
         if (Job.MediaState is not null && cursor is null) return Stop("The saved segmented merge cursor is invalid.");
         if (cursor is { Phase: "muxed" }) return await FinalizeMergedAsync(cursor, fingerprint, ct).ConfigureAwait(false);
-        if (cursor is not null && (cursor.Version != 1 || cursor.Fingerprint != fingerprint || cursor.Phase != "download"))
+        if (cursor is not null && (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.Phase != "download"))
             return Stop("The saved data belongs to a different rendition plan. Restart as a separate copy.");
 
         PreparedTrack[] tracks;
@@ -107,10 +107,11 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     lengths.Add(data.LongLength);
                     int savedTrack = ti, savedNext = pi + 1;
                     if (savedNext == prepared.Parts.Count) { savedTrack++; savedNext = 0; }
-                    var saved = new Cursor(1, fingerprint, "download", savedTrack, savedNext, offset,
+                    var saved = new Cursor(2, fingerprint, "download", savedTrack, savedNext, offset,
                         Convert.ToHexString(hash.GetCurrentHash()), (int[])completed.Clone(), [.. lengths],
                         tracks.Select(track => (string?)track.SourceFingerprint).ToArray(),
-                        KeyFingerprints: keys.Fingerprints.ToArray());
+                        KeyFingerprints: keys.Fingerprints.ToArray(),
+                        SourceShapeFingerprints: tracks.Select(track => (string?)track.SourceShapeFingerprint).ToArray());
                     session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
                     await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
                     engine.UpdateJob(Job, job => job.Message = $"Track {ti + 1} of {tracks.Length}, segment {pi + 1} of {prepared.Parts.Count}");
@@ -137,6 +138,189 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         catch (JsonException) { return null; }
     }
 
+    internal static string HlsShapeFingerprint(HlsMedia media) => Hash(JsonSerializer.SerializeToUtf8Bytes(new
+    {
+        media.IsVod,
+        media.MediaSequence,
+        media.DiscontinuitySequence,
+        media.TargetDuration,
+        media.PlaylistType,
+        Segments = media.Segments.Select(segment => new
+        {
+            segment.Sequence,
+            segment.Duration,
+            segment.RangeLength,
+            segment.RangeOffset,
+            segment.DiscontinuityBefore,
+            segment.IsGap,
+            segment.DiscontinuitySequence,
+            KeyIv = segment.Key?.Iv is { } keyIv ? Convert.ToHexString(keyIv) : null,
+            Map = segment.Map is { } map ? new
+            {
+                map.Length,
+                map.Offset,
+                KeyIv = map.Key?.Iv is { } mapIv ? Convert.ToHexString(mapIv) : null
+            } : null
+        })
+    }));
+
+    private static string DashShapeFingerprint(DashDownloadPlan plan) => Hash(JsonSerializer.SerializeToUtf8Bytes(new
+    {
+        plan.Version,
+        plan.RepresentationId,
+        plan.Provider,
+        plan.MediaId,
+        plan.RequireAudio,
+        plan.RequireVideo,
+        plan.ClipRange,
+        Initialization = DashFragmentShape(plan.Initialization),
+        Fragments = plan.Fragments.Select(DashFragmentShape)
+    }));
+
+    private static object DashFragmentShape(DashFragment fragment) => new
+    {
+        fragment.Offset,
+        fragment.Length,
+        fragment.DurationSeconds,
+        fragment.StartSeconds
+    };
+
+    private static string Hash(ReadOnlySpan<byte> data) => Convert.ToHexString(SHA256.HashData(data));
+
+    internal async Task<(bool Valid, string? RebasedCursor, string Message)> VerifyCommittedPrefixAsync(
+        MediaMergePlan currentPlan, MediaMergePlan replacementPlan, CancellationToken ct)
+    {
+        PreparedTrack[] tracks;
+        try
+        {
+            tracks = new PreparedTrack[replacementPlan.Tracks.Count];
+            for (int i = 0; i < tracks.Length; i++)
+                tracks[i] = await PrepareTrackAsync(replacementPlan.Tracks[i], replacementPlan.ClipRange, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (RunnerStop ex) { return (false, null, ex.Outcome.Message + " Saved data was kept."); }
+        catch (MediaContainerException ex) { return (false, null, ex.Message + " Saved data was kept."); }
+        catch (Exception ex) when (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException)
+        { return (false, null, "The refreshed playlist or fragment list could not be checked: " + ErrorClassifier.Describe(ex) + ". Saved data was kept."); }
+
+        if (Job.MediaState is null)
+            return Job.Extents.IsEmpty ? (true, null, "")
+                : (false, null, "The saved segmented data has no matching cursor. Saved data was kept.");
+
+        Cursor? cursor = ReadCursor();
+        if (cursor is not { Phase: "download" } || cursor.Version is not (1 or 2)
+            || cursor.Fingerprint != currentPlan.Fingerprint)
+            return (false, null, "The saved segmented cursor does not match the current plan. Saved data was kept.");
+        string?[]? oldShapes = cursor.SourceShapeFingerprints;
+        if (cursor.Version == 2 && (oldShapes is null || oldShapes.Length != tracks.Length))
+            return (false, null, "The saved segment timeline fingerprints are invalid. Saved data was kept.");
+        if (tracks.Sum(track => (long)track.Parts.Count) > 100_000
+            || cursor.CompletedParts is not { } completed || completed.Length != tracks.Length
+            || cursor.PartLengths is not { } lengths || cursor.SourceFingerprints is not { } oldFingerprints
+            || oldFingerprints.Length != tracks.Length || oldFingerprints.Any(fingerprint => fingerprint is not { Length: 64 } || !fingerprint.All(Uri.IsHexDigit))
+            || cursor.Track < 0 || cursor.Track > tracks.Length || cursor.Next < 0
+            || (cursor.Track == tracks.Length && cursor.Next != 0) || cursor.Offset < 0
+            || cursor.PrefixHash is not { Length: 64 } || !cursor.PrefixHash.All(Uri.IsHexDigit))
+            return (false, null, "The saved segment cursor does not match the committed file. Saved data was kept.");
+
+        if (replacementPlan.ClipRange is not null)
+        {
+            for (int i = 0; i < tracks.Length; i++)
+            {
+                if (tracks[i].Track.Source?.Protocol != "hls") continue;
+                string? savedShape = cursor.Version == 2 ? oldShapes![i] : cursor.SourceFingerprints[i];
+                string currentShape = cursor.Version == 2 ? tracks[i].SourceShapeFingerprint : tracks[i].SourceFingerprint;
+                if (savedShape != currentShape)
+                    return (false, null, "The clipped HLS playlist timeline changed, so VESPER cannot verify that saved parts still match the requested time range. Saved data was kept.");
+            }
+        }
+
+        long completedPartCount = 0;
+        for (int i = 0; i < tracks.Length; i++)
+        {
+            if (completed[i] < 0 || completed[i] > tracks[i].Parts.Count)
+                return (false, null, "The refreshed part list does not line up with the saved segment cursor. Saved data was kept.");
+            int expected = i < cursor.Track ? tracks[i].Parts.Count : i == cursor.Track ? cursor.Next : 0;
+            if (completed[i] != expected
+                || (i == cursor.Track && cursor.Track < tracks.Length && cursor.Next >= tracks[i].Parts.Count))
+                return (false, null, "The refreshed part list does not line up with the saved segment cursor. Saved data was kept.");
+            completedPartCount += completed[i];
+        }
+        if (completedPartCount != lengths.Length || !LengthsMatch(lengths, cursor.Offset)
+            || Job.Extents.TotalBytes != cursor.Offset || Job.Extents.ContiguousFromZero() != cursor.Offset
+            || cursor.Offset > 0 && !Job.Extents.Covers(0, cursor.Offset))
+            return (false, null, "The saved segment cursor does not match the committed file. Saved data was kept.");
+
+        using (var savedKeys = new HlsKeyCache(cursor.KeyFingerprints))
+            if (!savedKeys.Valid) return (false, null, "The saved HLS key fingerprints are invalid. Saved data was kept.");
+
+        using PartialFile file = session.OpenFile();
+        if (file.Length < cursor.Offset)
+            return (false, null, "The saved segment file is shorter than its cursor. Saved data was kept.");
+        using var prefixHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        try { MediaPartialIntegrity.HashPrefix(file, cursor.Offset, prefixHash, ct); }
+        catch (MediaContainerException ex) { return (false, null, ex.Message + " Saved data was kept."); }
+        if (!Convert.ToHexString(prefixHash.GetCurrentHash()).Equals(cursor.PrefixHash, StringComparison.Ordinal))
+            return (false, null, "The saved segment prefix failed SHA-256 validation. Saved data was kept.");
+
+        using var keys = new HlsKeyCache(null);
+        long fileOffset = 0;
+        int lengthIndex = 0;
+        byte[] savedBuffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            for (int trackIndex = 0; trackIndex < tracks.Length; trackIndex++)
+            {
+                PreparedTrack track = tracks[trackIndex];
+                for (int partIndex = 0; partIndex < completed[trackIndex]; partIndex++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    Part part = track.Parts[partIndex];
+                    long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
+                    byte[] data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct).ConfigureAwait(false);
+                    if (part.Key is { } key)
+                    {
+                        if (part.Initialization && key.Iv is null)
+                            return (false, null, "The refreshed HLS initialization uses an implicit IV. Saved data was kept.");
+                        data = await DecryptAsync(data, key, part.Sequence, keys, ct).ConfigureAwait(false);
+                    }
+                    if (data.LongLength != lengths[lengthIndex])
+                        return (false, null, "A refreshed HLS/DASH part has a different length from the saved bytes. Saved data was kept.");
+
+                    await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
+                    await engine.GlobalLimiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
+                    int compared = 0;
+                    while (compared < data.Length)
+                    {
+                        int count = Math.Min(savedBuffer.Length, data.Length - compared);
+                        int read = file.Read(savedBuffer.AsSpan(0, count), fileOffset + compared);
+                        if (read != count || !data.AsSpan(compared, count).SequenceEqual(savedBuffer.AsSpan(0, count)))
+                            return (false, null, "A refreshed HLS/DASH part differs from the saved bytes. Saved data was kept.");
+                        compared += count;
+                    }
+                    fileOffset += data.Length;
+                    lengthIndex++;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (RunnerStop ex) { return (false, null, ex.Outcome.Message + " Saved data was kept."); }
+        catch (MediaContainerException ex) { return (false, null, ex.Message + " Saved data was kept."); }
+        catch (Exception ex) when (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException)
+        { return (false, null, "A saved segment could not be rechecked against the refreshed source: " + ErrorClassifier.Describe(ex) + ". Saved data was kept."); }
+        finally { ArrayPool<byte>.Shared.Return(savedBuffer); }
+
+        Cursor rebased = cursor with
+        {
+            Version = 2,
+            Fingerprint = replacementPlan.Fingerprint,
+            SourceFingerprints = tracks.Select(track => (string?)track.SourceFingerprint).ToArray(),
+            KeyFingerprints = keys.Fingerprints.ToArray(),
+            SourceShapeFingerprints = tracks.Select(track => (string?)track.SourceShapeFingerprint).ToArray()
+        };
+        return (true, JsonSerializer.Serialize(rebased), "");
+    }
+
     private async Task<PreparedTrack> PrepareTrackAsync(MergeTrack track, MediaTimeRange? clipRange, CancellationToken ct)
     {
         MergeMediaSource source = track.Source ?? throw new MediaContainerException("A rendition source is missing.");
@@ -148,7 +332,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             };
             dashParts.AddRange(dash.Fragments.Select(fragment => new Part(fragment.Url, fragment.Offset, fragment.Length,
                 null, 0, false, fragment.DurationSeconds, fragment.StartSeconds)));
-            return SelectClip(new PreparedTrack(track, dashParts, Fragmented: true, dash.Fingerprint), clipRange);
+            return SelectClip(new PreparedTrack(track, dashParts, Fragmented: true, dash.Fingerprint,
+                DashShapeFingerprint(dash)), clipRange);
         }
         if (source.Protocol != "hls" || source.PlaylistUrl is not { } playlistUrl)
             throw new MediaContainerException("The selected segmented source is unsupported.");
@@ -177,7 +362,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 segment.Sequence, false, segment.Duration));
         byte[] fingerprintBytes = JsonSerializer.SerializeToUtf8Bytes(new { Base = baseUri.AbsoluteUri, media.Segments });
         string identity = Convert.ToHexString(SHA256.HashData(fingerprintBytes));
-        return SelectClip(new PreparedTrack(track, hlsParts, fragmented, identity), clipRange);
+        return SelectClip(new PreparedTrack(track, hlsParts, fragmented, identity, HlsShapeFingerprint(media)), clipRange);
     }
 
     private static PreparedTrack SelectClip(PreparedTrack track, MediaTimeRange? range)
@@ -444,9 +629,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             || fingerprints.Length != tracks.Length || cursor.Track < 0 || cursor.Track > tracks.Length || cursor.Next < 0
             || (cursor.Track == tracks.Length && cursor.Next != 0))
             return false;
+        string?[]? shapes = cursor.SourceShapeFingerprints;
+        if (cursor.Version == 2 && (shapes is null || shapes.Length != tracks.Length))
+            return false;
         for (int i = 0; i < tracks.Length; i++)
         {
             if (fingerprints[i] != tracks[i].SourceFingerprint || completed[i] < 0 || completed[i] > tracks[i].Parts.Count)
+                return false;
+            if (cursor.Version == 2 && shapes![i] != tracks[i].SourceShapeFingerprint)
                 return false;
             int expected = i < cursor.Track ? tracks[i].Parts.Count : i == cursor.Track ? cursor.Next : 0;
             if (completed[i] != expected || (i == cursor.Track && cursor.Track < tracks.Length && cursor.Next > tracks[i].Parts.Count))
@@ -502,7 +692,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
     private async Task<RunOutcome> FinalizeMergedAsync(Cursor cursor, string fingerprint, CancellationToken ct)
     {
-        if (cursor.Version != 1 || cursor.Fingerprint != fingerprint || cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 })
+        if (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 })
             return Stop("The merged output cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged output is missing.");
         using (var stream = new FileStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))

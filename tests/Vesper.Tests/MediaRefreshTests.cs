@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Vesper.Engine;
@@ -44,6 +45,139 @@ public sealed class MediaRefreshTests
             RequireAudio = true, RequireVideo = true,
             Tracks = [Track("video", "mp4", "h264"), Track("audio", "m4a", "aac")]
         };
+    }
+
+    private static MediaMergePlan StaticFmp4HlsPlan(FaultServer server, string token, byte[] initialization,
+        byte[][] fragments, double segmentDuration = 1)
+    {
+        MergeTrack Track(string role, string container, string codec)
+        {
+            string root = $"/hls/segmented-refresh-{token}/{role}";
+            string playlistPath = root + "/index.m3u8";
+            string durationText = segmentDuration.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+            string playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+                + $"#EXT-X-MAP:URI=\"init.mp4?sig={token}\"\n"
+                + string.Concat(Enumerable.Range(1, fragments.Length)
+                    .Select(index => $"#EXTINF:{durationText},\npart-{index}.m4s?sig={token}\n"))
+                + "#EXT-X-ENDLIST\n";
+            server.HlsPlaylists[playlistPath] = playlist;
+            server.HlsFiles[root + "/init.mp4"] = initialization;
+            for (int i = 0; i < fragments.Length; i++) server.HlsFiles[root + $"/part-{i + 1}.m4s"] = fragments[i];
+            string url = server.Url(playlistPath) + "?sig=" + token;
+            return new MergeTrack(role, role + "-format", url, 0, container, codec,
+                Source: new MergeMediaSource("hls", PlaylistUrl: url));
+        }
+
+        return new MediaMergePlan
+        {
+            Version = 2, Provider = "fixture", MediaId = "segmented-media", OutputContainer = "mp4",
+            RequireAudio = true, RequireVideo = true,
+            Tracks = [Track("video", "mp4", "h264"), Track("audio", "m4a", "aac")]
+        };
+    }
+
+    private static string HlsShape(FaultServer server, MergeTrack track)
+    {
+        Uri playlistUrl = new(track.Source!.PlaylistUrl!);
+        HlsMedia media = HlsParser.ParseMedia(server.HlsPlaylists[playlistUrl.AbsolutePath], playlistUrl);
+        return SegmentedMergeTransfer.HlsShapeFingerprint(media);
+    }
+
+    private static MediaMergePlan StaticEncryptedHlsPlan(FaultServer server, string token, byte[] initialization,
+        byte[][] encryptedFragments)
+    {
+        MergeTrack Track(string role, string container, string codec)
+        {
+            string root = $"/hls/encrypted-refresh-{token}/{role}";
+            string playlistPath = root + "/index.m3u8";
+            string playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+                + $"#EXT-X-MAP:URI=\"init.mp4?sig={token}\"\n"
+                + $"#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin?sig={token}\",IV=0x{Convert.ToHexString(FaultServer.HlsIv)}\n"
+                + string.Concat(Enumerable.Range(1, encryptedFragments.Length)
+                    .Select(index => $"#EXTINF:1,\npart-{index}.m4s?sig={token}\n"))
+                + "#EXT-X-ENDLIST\n";
+            server.HlsPlaylists[playlistPath] = playlist;
+            server.HlsFiles[root + "/init.mp4"] = initialization;
+            server.HlsFiles[root + "/key.bin"] = FaultServer.HlsKey;
+            for (int i = 0; i < encryptedFragments.Length; i++)
+                server.HlsFiles[root + $"/part-{i + 1}.m4s"] = encryptedFragments[i];
+            string url = server.Url(playlistPath) + "?sig=" + token;
+            return new MergeTrack(role, role + "-format", url, 0, container, codec,
+                Source: new MergeMediaSource("hls", PlaylistUrl: url));
+        }
+
+        return new MediaMergePlan
+        {
+            Version = 2, Provider = "fixture", MediaId = "encrypted-media", OutputContainer = "mp4",
+            RequireAudio = true, RequireVideo = true,
+            Tracks = [Track("video", "mp4", "h264"), Track("audio", "m4a", "aac")]
+        };
+    }
+
+    private static MediaMergePlan StaticDashPlan(FaultServer server, string token, byte[] initialization, byte[][] fragments)
+    {
+        MergeTrack Track(string role, string container, string codec)
+        {
+            string root = $"/dash/segmented-refresh-{token}/{role}";
+            string Url(string name) => server.Url(root + "/" + name + "?sig=" + token);
+            server.Extra[root + "/init.mp4"] = initialization;
+            var dash = new DashDownloadPlan
+            {
+                Provider = "fixture", MediaId = "segmented-media", RepresentationId = role + "-format",
+                Initialization = new DashFragment(Url("init.mp4")),
+                Fragments = Enumerable.Range(0, fragments.Length).Select(index =>
+                {
+                    string name = $"part-{index + 1}.m4s";
+                    server.Extra[root + "/" + name] = fragments[index];
+                    return new DashFragment(Url(name), DurationSeconds: 1, StartSeconds: index);
+                }).ToArray(),
+                RequireAudio = role == "audio", RequireVideo = role == "video"
+            };
+            string mediaUrl = server.Url($"/manifest-{role}.mpd?sig={token}");
+            return new MergeTrack(role, dash.RepresentationId, mediaUrl, 0, container, codec,
+                Source: new MergeMediaSource("dash", Dash: dash));
+        }
+
+        return new MediaMergePlan
+        {
+            Version = 2, Provider = "fixture", MediaId = "segmented-media", OutputContainer = "mp4",
+            RequireAudio = true, RequireVideo = true,
+            Tracks = [Track("video", "mp4", "h264"), Track("audio", "m4a", "aac")]
+        };
+    }
+
+    private static void SeedSegmentedInitialization(Harness harness, Guid id, MediaMergePlan plan, byte[] initialization) =>
+        SeedSegmentedParts(harness, id, plan, 1, initialization);
+
+    private static void SeedSegmentedParts(Harness harness, Guid id, MediaMergePlan plan, int completedVideoParts,
+        params byte[][] committedParts) =>
+        SeedSegmentedParts(harness, id, plan, completedVideoParts, null, committedParts);
+
+    private static void SeedSegmentedParts(Harness harness, Guid id, MediaMergePlan plan, int completedVideoParts,
+        string?[]? shapeFingerprints, params byte[][] committedParts)
+    {
+        Assert.Equal(completedVideoParts, committedParts.Length);
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(harness.Engine)!;
+        DownloadJob job = jobs[id];
+        byte[] prefix = [.. committedParts.SelectMany(part => part)];
+        File.WriteAllBytes(job.PartialPath, prefix);
+        var extents = new ExtentSet();
+        extents.Add(new Vesper.Engine.ByteRange(0, prefix.LongLength));
+        int version = shapeFingerprints is null ? 1 : 2;
+        var cursor = new SegmentedMergeTransfer.Cursor(version, plan.Fingerprint, "download", Track: 0, Next: completedVideoParts,
+            Offset: prefix.LongLength, PrefixHash: Payloads.Sha256(prefix),
+            CompletedParts: [completedVideoParts, 0], PartLengths: committedParts.Select(part => (long)part.Length).ToArray(),
+            SourceFingerprints: [new string('A', 64), new string('B', 64)], SourceShapeFingerprints: shapeFingerprints);
+        harness.Engine.UpdateJob(job, current => { current.Extents = extents; current.MediaState = JsonSerializer.Serialize(cursor); });
+    }
+
+    private static byte[] EncryptHlsSegment(byte[] data)
+    {
+        using Aes aes = Aes.Create();
+        aes.Key = FaultServer.HlsKey;
+        return aes.EncryptCbc(data, FaultServer.HlsIv, PaddingMode.PKCS7);
     }
 
     private static void AssertSecretNotOnDisk(Harness harness, string secret)
@@ -300,6 +434,153 @@ public sealed class MediaRefreshTests
         Assert.Contains("HLS/DASH", refreshed.Message);
         Assert.Contains("Saved segments were kept", refreshed.Message);
         Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+    }
+
+    [Fact]
+    public async Task SegmentedRefreshRechecksCommittedPartsBeforeRebasingTheCursor()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[][] fragments = [MediaFixture("av-1.m4s"), MediaFixture("av-2.m4s"), MediaFixture("av-3.m4s")];
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = StaticFmp4HlsPlan(server, "old", initialization, fragments);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "segmented-refresh.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        SeedSegmentedInitialization(h, added.JobId, oldPlan, initialization);
+
+        MediaMergePlan refreshedPlan = StaticFmp4HlsPlan(server, "new", initialization, fragments);
+        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson());
+        Assert.True(refreshed.Accepted, refreshed.Message);
+        Assert.Equal(refreshedPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.Equal(1, server.Hits("/hls/segmented-refresh-new/video/init.mp4"));
+    }
+
+    [Fact]
+    public async Task SegmentedHlsClipRefreshRequiresTheSameSavedTimeline()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[][] fragments = [MediaFixture("av-1.m4s"), MediaFixture("av-2.m4s"), MediaFixture("av-3.m4s")];
+        await server.StartAsync();
+        MediaMergePlan oldPlan = StaticFmp4HlsPlan(server, "clip-old", initialization, fragments) with
+        { ClipRange = new MediaTimeRange(.25, .75) };
+        string[] savedShapes = oldPlan.Tracks.Select(track => HlsShape(server, track)).ToArray();
+
+        using var matching = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        AddResult matchingAdded = matching.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "clip-match.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(matchingAdded.Ok, matchingAdded.Message);
+        SeedSegmentedParts(matching, matchingAdded.JobId, oldPlan, 1, savedShapes, initialization);
+        MediaMergePlan sameTimeline = StaticFmp4HlsPlan(server, "clip-fresh", initialization, fragments);
+        RescueResult accepted = await matching.Engine.RefreshMergePlanAsync(matchingAdded.JobId, sameTimeline.ToJson());
+        Assert.True(accepted.Accepted, accepted.Message);
+
+        using var changed = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        AddResult changedAdded = changed.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "clip-changed.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(changedAdded.Ok, changedAdded.Message);
+        SeedSegmentedParts(changed, changedAdded.JobId, oldPlan, 1, savedShapes, initialization);
+        MediaMergePlan changedTimeline = StaticFmp4HlsPlan(server, "clip-changed", initialization, fragments, segmentDuration: .5);
+
+        RescueResult refused = await changed.Engine.RefreshMergePlanAsync(changedAdded.JobId, changedTimeline.ToJson());
+        Assert.False(refused.Accepted);
+        Assert.Contains("clipped HLS playlist timeline changed", refused.Message);
+        Assert.Equal(oldPlan.Tracks[0].Url, changed.Engine.Snapshot(changedAdded.JobId)!.SourceUrl);
+        Assert.Equal(initialization, await File.ReadAllBytesAsync(changed.Engine.Snapshot(changedAdded.JobId)!.PartialPath));
+    }
+
+    [Fact]
+    public async Task SegmentedRefreshRefusesWhenACommittedPartDiffers()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[] changedInitialization = [.. initialization];
+        changedInitialization[^1] ^= 0x5A;
+        byte[][] fragments = [MediaFixture("av-1.m4s"), MediaFixture("av-2.m4s"), MediaFixture("av-3.m4s")];
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = StaticFmp4HlsPlan(server, "old", initialization, fragments);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "segmented-mismatch.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        SeedSegmentedInitialization(h, added.JobId, oldPlan, initialization);
+
+        MediaMergePlan changedPlan = StaticFmp4HlsPlan(server, "changed", changedInitialization, fragments);
+        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, changedPlan.ToJson());
+
+        Assert.False(refreshed.Accepted);
+        Assert.Contains("differs from the saved bytes", refreshed.Message);
+        Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+        Assert.Equal(initialization, await File.ReadAllBytesAsync(h.Engine.Snapshot(added.JobId)!.PartialPath));
+    }
+
+    [Fact]
+    public async Task SegmentedRefreshDecryptsEncryptedHlsPartsBeforeReusingThem()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[] firstPlainPart = MediaFixture("av-1.m4s");
+        byte[][] encryptedParts = [
+            EncryptHlsSegment(firstPlainPart),
+            EncryptHlsSegment(MediaFixture("av-2.m4s")),
+            EncryptHlsSegment(MediaFixture("av-3.m4s"))
+        ];
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = StaticEncryptedHlsPlan(server, "old", initialization, encryptedParts);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "encrypted-refresh.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        SeedSegmentedParts(h, added.JobId, oldPlan, 2, initialization, firstPlainPart);
+
+        MediaMergePlan refreshedPlan = StaticEncryptedHlsPlan(server, "new", initialization, encryptedParts);
+        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson());
+        Assert.True(refreshed.Accepted, refreshed.Message);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.Equal(1, server.Hits("/hls/encrypted-refresh-new/video/part-1.m4s"));
+    }
+
+    [Fact]
+    public async Task SegmentedDashRefreshRechecksCommittedPartsBeforeRebasingTheCursor()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[][] fragments = [MediaFixture("av-1.m4s"), MediaFixture("av-2.m4s"), MediaFixture("av-3.m4s")];
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = StaticDashPlan(server, "old", initialization, fragments);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "dash-refresh.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        SeedSegmentedInitialization(h, added.JobId, oldPlan, initialization);
+
+        MediaMergePlan refreshedPlan = StaticDashPlan(server, "new", initialization, fragments);
+        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson());
+        Assert.True(refreshed.Accepted, refreshed.Message);
+        Assert.Equal(refreshedPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.Equal(1, server.Hits("/dash/segmented-refresh-new/video/init.mp4"));
     }
 
     [Fact]

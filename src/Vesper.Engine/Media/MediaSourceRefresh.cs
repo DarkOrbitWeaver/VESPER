@@ -286,12 +286,140 @@ public sealed partial class DownloadEngine
             "The provider, media and format identity matches, and the refreshed playlist still covers the next sequence. Saved segments were kept.", retained);
     }
 
-    /// <summary>
-    /// Replacement links for an interrupted merge job (for example after signed URLs expired). Accepted only when every
-    /// track of the new plan is byte-identical by provider evidence (same role, format id, exact size, codec and
-    /// encoding identity such as YouTube itag + last-modified + content length). Then only the URLs change and the
-    /// committed bytes are continued; otherwise nothing on disk changes and the user is told to start a separate copy.
-    /// </summary>
+    /// <summary>Refresh direct plans by identity and segmented plans by checking their saved parts.</summary>
+    public async Task<RescueResult> RefreshMergePlanAsync(Guid id, string replacementPlanJson,
+        DateTimeOffset? expiresAt = null, CancellationToken ct = default)
+    {
+        bool parsed = false;
+        bool segmented = false;
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
+            if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan current, out _)
+                && MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan next, out _))
+            {
+                parsed = true;
+                segmented = current.IsSegmented || next.IsSegmented;
+            }
+        }
+
+        ct.ThrowIfCancellationRequested();
+        if (!parsed || !segmented) return RefreshMergePlan(id, replacementPlanJson, expiresAt);
+        return await RefreshSegmentedMergePlanAsync(id, replacementPlanJson, expiresAt, ct).ConfigureAwait(false);
+    }
+
+    private async Task<RescueResult> RefreshSegmentedMergePlanAsync(Guid id, string replacementPlanJson,
+        DateTimeOffset? expiresAt, CancellationToken ct)
+    {
+        DownloadJob snapshot;
+        string savedPlanJson;
+        MediaMergePlan current;
+        MediaMergePlan next;
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
+            if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
+            if (job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
+                or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
+                return Rejected("This merge job is not in a resumable state.");
+            if (!MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out current, out _))
+                return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
+            if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out next, out string parseError))
+                return Rejected(parseError);
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
+            if (!CanRebaseSegmentedPlan(current, next, out string shapeError)) return Rejected(shapeError);
+            if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+            savedPlanJson = job.MediaPlanJson!;
+            snapshot = job;
+        }
+
+        string? rebasedCursor;
+        try
+        {
+            using var session = new JobSession(this, snapshot);
+            var transfer = new SegmentedMergeTransfer(this, session, _http);
+            (bool valid, rebasedCursor, string message) = await transfer.VerifyCommittedPrefixAsync(current, next, ct)
+                .ConfigureAwait(false);
+            if (!valid) return Rejected(message);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex) when (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex)
+            || ex is RedirectException or IOException or UnauthorizedAccessException or MediaContainerException)
+        {
+            return Rejected("The refreshed HLS/DASH source could not be checked against saved parts: "
+                + ErrorClassifier.Describe(ex) + ". Saved data was kept.");
+        }
+
+        ct.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, snapshot)
+                || _sessions.ContainsKey(id) || job.MediaPlanJson != savedPlanJson
+                || job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
+                    or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
+                return Rejected("The merge job changed while its refreshed parts were being checked. Saved data was kept.");
+            if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The refreshed source expired before it could be installed.");
+
+            job.MediaPlanJson = next.ToJson();
+            job.MediaState = rebasedCursor;
+            ChangeSourceUrlLocked(job, next.Tracks[0].Url);
+            job.MediaExpiresAt = expiresAt;
+            _credentials.Remove(id);
+            if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
+                (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
+            AddDuplicateCandidateLocked(job);
+            SaveLocked(job);
+            Changed(job);
+        }
+        FlushOutbox();
+        ScheduleNext();
+        return new RescueResult(true, RescueMode.R0,
+            "The refreshed HLS/DASH source matches every saved part byte-for-byte. Download continues.", 0);
+    }
+
+    private static bool CanRebaseSegmentedPlan(MediaMergePlan current, MediaMergePlan next, out string error)
+    {
+        error = "The refreshed HLS/DASH formats or timelines differ. Saved data was kept; start a separate copy.";
+        if (!current.IsSegmented || !next.IsSegmented || current.Version != next.Version
+            || current.Provider != next.Provider || current.MediaId != next.MediaId
+            || current.OutputContainer != next.OutputContainer || current.RequireAudio != next.RequireAudio
+            || current.RequireVideo != next.RequireVideo || current.ClipRange != next.ClipRange
+            || current.OutputRange != next.OutputRange || current.Tracks.Count != next.Tracks.Count)
+            return false;
+
+        for (int i = 0; i < current.Tracks.Count; i++)
+        {
+            MergeTrack oldTrack = current.Tracks[i], newTrack = next.Tracks[i];
+            MergeMediaSource oldSource = oldTrack.Source!, newSource = newTrack.Source!;
+            if (oldTrack.Role != newTrack.Role || oldTrack.FormatId != newTrack.FormatId || oldTrack.Size != newTrack.Size
+                || oldTrack.Container != newTrack.Container || oldTrack.Codec != newTrack.Codec || oldTrack.Language != newTrack.Language
+                || oldTrack.Identity != newTrack.Identity || oldSource.Protocol != newSource.Protocol)
+                return false;
+
+            if (oldSource.Protocol == "dash")
+            {
+                if (oldSource.Dash is not { } oldDash || newSource.Dash is not { } newDash
+                    || oldDash.RepresentationId != newDash.RepresentationId || oldDash.Provider != newDash.Provider
+                    || oldDash.MediaId != newDash.MediaId || oldDash.RequireAudio != newDash.RequireAudio
+                    || oldDash.RequireVideo != newDash.RequireVideo || oldDash.ClipRange != newDash.ClipRange
+                    || !SameFragmentShape(oldDash.Initialization, newDash.Initialization)
+                    || oldDash.Fragments.Count != newDash.Fragments.Count
+                    || oldDash.Fragments.Where((fragment, index) => !SameFragmentShape(fragment, newDash.Fragments[index])).Any())
+                    return false;
+            }
+        }
+
+        error = "";
+        return true;
+    }
+
+    private static bool SameFragmentShape(DashFragment first, DashFragment second) =>
+        first.Offset == second.Offset && first.Length == second.Length
+        && first.DurationSeconds == second.DurationSeconds && first.StartSeconds == second.StartSeconds;
+
+    /// <summary>Synchronous direct-track refresh. Segmented plans must use RefreshMergePlanAsync to compare saved parts.</summary>
     public RescueResult RefreshMergePlan(Guid id, string replacementPlanJson, DateTimeOffset? expiresAt = null)
     {
         lock (_lock)
