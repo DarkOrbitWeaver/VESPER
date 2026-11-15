@@ -20,6 +20,14 @@ test('the Butterfly motion picker explains its motion choices', () => {
   assert.match(popup, /<small id="motion-hint" class="hint">Follow system respects your reduced-motion setting\.<\/small>/);
 });
 
+test('browser sign-in settings require approval for the current HTTPS host', () => {
+  const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
+  assert.match(popup, /Use sign-in cookies/);
+  assert.match(popup, /id="signin-site" disabled/);
+  assert.match(popup, /id="signin-host"/);
+  assert.match(popup, /Only this exact host is approved\. This also requires the setting above\./);
+});
+
 test('the media picker wraps long metadata and keeps horizontal overflow inside its bounds', () => {
   const content = source('content');
   assert.match(content, /\.panel\{[^}]*overflow-x:hidden;overflow-y:auto/);
