@@ -216,6 +216,16 @@ internal sealed partial class YouTubeAdapter : AdapterBase
     private async Task<Attempt> TryClientAsync(YouTubeClientProfile profile, string videoId, YtPageConfig cfg, CancellationToken ct)
     {
         var attempt = new Attempt(profile.Key);
+        string? unavailable = profile.NeedsPlayerJs ? "the player JavaScript transform" :
+            profile.HttpsNeedsPoToken ? "a proof-of-origin token" : null;
+        if (unavailable is not null)
+        {
+            attempt.Error = MediaErrors.BrowserContext(
+                $"The '{profile.Key}' YouTube profile requires {unavailable}, which VESPER does not generate.");
+            attempt.Summary = $"skipped ({unavailable} unavailable)";
+            return attempt;
+        }
+
         HttpTextResponse resp;
         try
         {
@@ -279,14 +289,12 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         Task? manifest = null;
         if (!attempt.Reps.Any(r => r.Content == StreamContent.VideoAndAudio) && U(streamingData.P("hlsManifestUrl").Str()) is { } hlsUrl)
             manifest = TryAddManifestAsync(hlsUrl, ctx, "yt-hls-", hls, [], [], [], ct);
-        var (ok, detail) = await verify.ConfigureAwait(false);
+        var (ok, detail, error) = await verify.ConfigureAwait(false);
         if (manifest is not null) await manifest.ConfigureAwait(false);
         attempt.Summary = $"{attempt.Reps.Count} formats{(hls.Count > 0 ? $" + {hls.Count} HLS" : "")}, {detail}";
         if (!ok)
         {
-            attempt.Error = new MediaError(MediaErrorCode.AuthorizationRequired,
-                "YouTube listed formats but refused to serve them beyond the first bytes. VESPER does not manufacture proof-of-origin tokens.",
-                $"{attempt.Key}: {detail}", true, true, false);
+            attempt.Error = error ?? MediaErrors.SourceChanged($"{attempt.Key}: could not verify a complete byte range; {detail}");
             attempt.Reps = [];
             return;
         }
@@ -323,20 +331,35 @@ internal sealed partial class YouTubeAdapter : AdapterBase
     /// <summary>
     /// One 1-byte range request near the end of a representation: proves the media is served past the first bytes.
     /// </summary>
-    private async Task<(bool Ok, string Detail)> VerifyAccessAsync(List<MediaRepresentation> reps, CancellationToken ct)
+    private async Task<(bool Ok, string Detail, MediaError? Error)> VerifyAccessAsync(List<MediaRepresentation> reps, CancellationToken ct)
     {
         var target = reps.Where(r => r.FileSize is > 1_500_000).OrderBy(r => r.FileSize).FirstOrDefault()
                      ?? reps.OrderBy(r => r.FileSize ?? long.MaxValue).First();
         long offset = target.FileSize is long size && size > 1 ? size - 1 : 0;
         try
         {
-            int status = await Http.ProbeRangeAsync(target.Url, target.Context, offset, ct).ConfigureAwait(false);
-            return (status is 206 or 200, $"byte probe {target.Id}@{offset} -> HTTP {status}");
+            MediaRangeProbeResult result = await Http.ProbeExactRangeAsync(target.Url, target.Context, offset, ct).ConfigureAwait(false);
+            string detail = $"byte probe {target.Id}@{offset}: {result.Detail}";
+            return result.IsValid ? (true, detail, null) : (false, detail, RangeFailure(result));
         }
         catch (MediaResolverException ex)
         {
-            return (false, $"byte probe {target.Id} failed ({ex.Error.Code})");
+            return (false, $"byte probe {target.Id} failed ({ex.Error.Code})", ex.Error);
         }
+    }
+
+    private static MediaError RangeFailure(MediaRangeProbeResult result)
+    {
+        string detail = $"YouTube's media server did not verify the requested byte range: {result.Detail}";
+        return result.StatusCode switch
+        {
+            401 => MediaErrors.LoginRequired(detail),
+            403 => MediaErrors.AuthRequired(detail),
+            404 or 410 => MediaErrors.Expired(detail),
+            408 or >= 500 => MediaErrors.Network(detail),
+            429 => MediaErrors.RateLimited(detail),
+            _ => MediaErrors.BrowserContext(detail)
+        };
     }
 
     private static MediaError? Playability(JsonElement root, out string status, out string reason)
