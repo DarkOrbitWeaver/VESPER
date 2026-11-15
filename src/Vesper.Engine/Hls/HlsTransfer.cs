@@ -143,14 +143,14 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             // Fetch a few segments ahead so round trips overlap, but decrypt, validate and commit strictly in order:
             // the checkpoint cursor stays a contiguous prefix exactly as before.
             using var prefetchLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var prefetched = new Queue<(int Index, Task<byte[]> Data)>();
+            var prefetched = new Queue<(int Index, Task<(byte[] Data, IDisposable Lease)> Data)>();
             int fetchNext = next;
             void Prefetch()
             {
                 while (prefetched.Count < PrefetchSegments && fetchNext < segments.Count)
                 {
                     HlsSegment ahead = segments[fetchNext];
-                    prefetched.Enqueue((fetchNext, FetchSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength, prefetchLifetime.Token)));
+                    prefetched.Enqueue((fetchNext, FetchBufferedSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength, prefetchLifetime.Token)));
                     fetchNext++;
                 }
             }
@@ -174,9 +174,10 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     initLength = initialization.Length;
                 }
                 Prefetch();
-                (int fetchedIndex, Task<byte[]> fetched) = prefetched.Dequeue();
+                (int fetchedIndex, Task<(byte[] Data, IDisposable Lease)> fetched) = prefetched.Dequeue();
                 if (fetchedIndex != i) throw new InvalidOperationException("HLS prefetch order was lost.");
-                byte[] data = await fetched.ConfigureAwait(false);
+                (byte[] data, IDisposable lease) = await fetched.ConfigureAwait(false);
+                using IDisposable segmentBuffer = lease;
                 Prefetch();
                 if (segment.Key is { } key) data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
                 if (fragmented) mp4!.ValidateFragment(data);
@@ -211,9 +212,13 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             {
                 // A failure or pause must not leave faulted fetches unobserved.
                 prefetchLifetime.Cancel();
-                foreach ((_, Task<byte[]> pending) in prefetched)
+                foreach ((_, Task<(byte[] Data, IDisposable Lease)> pending) in prefetched)
                 {
-                    try { await pending.ConfigureAwait(false); }
+                    try
+                    {
+                        (_, IDisposable lease) = await pending.ConfigureAwait(false);
+                        lease.Dispose();
+                    }
                     catch (Exception) { /* Preserve the original transfer error. */ }
                 }
             }
@@ -709,6 +714,22 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (length is long expected && bytes.LongLength != expected)
             throw new TransientNetworkException("The HLS byte-range response was incomplete.");
         return bytes;
+    }
+
+    private async Task<(byte[] Data, IDisposable Lease)> FetchBufferedSegmentAsync(
+        string url, long? offset, long? length, CancellationToken ct)
+    {
+        IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
+        try
+        {
+            byte[] data = await FetchSegmentAsync(url, offset, length, ct).ConfigureAwait(false);
+            return (data, lease);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
     }
 
     private static bool HlsLooksLikeHtml(HttpResponseMessage r) => HttpFacts.IsHtml(r);

@@ -340,6 +340,29 @@ public sealed class DashTransferTests
         var clock = System.Diagnostics.Stopwatch.StartNew(); h.Engine.Pause(id);
         var paused = await h.WaitForStateAsync(id, JobState.Paused);
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(2)); Assert.Null(paused.FinalPath);
+
+        server.SlowFirst = false;
+        Guid next = Add(h, server, suffix: "?after-cancel=1");
+        var completed = await h.WaitForStateAsync(next, JobState.Completed);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(completed.FinalPath!));
+    }
+
+    [Fact]
+    public async Task ConcurrentDashJobsShareThreePrefetchBuffers()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.FragmentDelayMs = 60;
+        using var h = new Harness(tweak: options =>
+        {
+            options.MaxConcurrentJobs = 3;
+            options.MaxJobsPerHost = 3;
+        });
+        Guid[] ids = [Add(h, server, suffix: "?job=1"), Add(h, server, suffix: "?job=2"), Add(h, server, suffix: "?job=3")];
+
+        var completed = await Task.WhenAll(ids.Select(id => h.WaitForStateAsync(id, JobState.Completed)));
+
+        Assert.InRange(server.MaxActiveFragmentRequests, 2, 3);
+        foreach (var job in completed) Assert.Equal(Expected, await File.ReadAllBytesAsync(job.FinalPath!));
     }
 
     [Fact]
@@ -396,8 +419,12 @@ public sealed class DashTransferTests
         private readonly WebApplication _app;
         private readonly ConcurrentDictionary<string, int> _hits = new();
         private readonly Dictionary<string, byte[]> _objects = new();
+        private int _activeFragmentRequests;
+        private int _maxActiveFragmentRequests;
         private string _base = "";
         internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst;
+        internal int FragmentDelayMs;
+        internal int MaxActiveFragmentRequests => Volatile.Read(ref _maxActiveFragmentRequests);
         internal TaskCompletionSource FirstFragmentStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal string Url(string path) => _base + path;
         internal int Hits(string path) => _hits.GetValueOrDefault(path);
@@ -429,11 +456,34 @@ public sealed class DashTransferTests
             string path = context.Request.Path.Value!; _hits.AddOrUpdate(path, 1, (_, n) => n + 1);
             if (path == "/av-2.m4s" && ExpireSecond) { context.Response.StatusCode = 403; return; }
             if (!_objects.TryGetValue(path, out var data)) { context.Response.StatusCode = 404; return; }
-            if (path == "/av-1.m4s")
+            bool isFragment = path.EndsWith(".m4s", StringComparison.Ordinal);
+            if (isFragment)
             {
-                FirstFragmentStarted.TrySetResult();
-                if (SlowFirst) { try { await Task.Delay(20_000, context.RequestAborted); } catch (OperationCanceledException) { return; } }
-                if (InvalidFragment) data = Encoding.UTF8.GetBytes("not a media container");
+                int active = Interlocked.Increment(ref _activeFragmentRequests);
+                int currentMax;
+                while (active > (currentMax = Volatile.Read(ref _maxActiveFragmentRequests))
+                    && Interlocked.CompareExchange(ref _maxActiveFragmentRequests, active, currentMax) != currentMax) { }
+                try
+                {
+                    if (path == "/av-1.m4s")
+                    {
+                        FirstFragmentStarted.TrySetResult();
+                        if (SlowFirst) { try { await Task.Delay(20_000, context.RequestAborted); } catch (OperationCanceledException) { return; } }
+                        if (InvalidFragment) data = Encoding.UTF8.GetBytes("not a media container");
+                    }
+                    if (FragmentDelayMs > 0 && !(path == "/av-1.m4s" && SlowFirst))
+                        await Task.Delay(FragmentDelayMs, context.RequestAborted);
+                    int fragmentStart = 0, fragmentEnd = data.Length - 1;
+                    if (!IgnoreRanges && context.Request.Headers.Range.ToString() is { Length: > 6 } fragmentRange)
+                    {
+                        var parts = fragmentRange[6..].Split('-'); fragmentStart = int.Parse(parts[0]); fragmentEnd = int.Parse(parts[1]);
+                        context.Response.StatusCode = 206; context.Response.Headers.ContentRange = $"bytes {fragmentStart}-{fragmentEnd}/{data.Length}";
+                    }
+                    context.Response.ContentType = "video/mp4"; context.Response.ContentLength = fragmentEnd - fragmentStart + 1;
+                    await context.Response.Body.WriteAsync(data.AsMemory(fragmentStart, fragmentEnd - fragmentStart + 1), context.RequestAborted);
+                }
+                finally { Interlocked.Decrement(ref _activeFragmentRequests); }
+                return;
             }
             int start = 0, end = data.Length - 1;
             if (!IgnoreRanges && context.Request.Headers.Range.ToString() is { Length: > 6 } range)

@@ -80,12 +80,12 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             }
             session.SetPhase(JobState.Downloading);
             using var prefetch = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var pending = new Queue<Task<ReadOnlyMemory<byte>>>();
+            var pending = new Queue<Task<(ReadOnlyMemory<byte> Data, IDisposable Lease)>>();
             int fetchNext = next;
             void Fill()
             {
                 while (pending.Count < 3 && fetchNext < fragments.Count)
-                    pending.Enqueue(FetchAsync(fragments[fetchNext++], MaxObjectBytes, prefetch.Token));
+                    pending.Enqueue(FetchBufferedAsync(fragments[fetchNext++], MaxObjectBytes, prefetch.Token));
             }
             try
             {
@@ -93,7 +93,8 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             {
                 ct.ThrowIfCancellationRequested();
                 Fill();
-                ReadOnlyMemory<byte> fragment = await pending.Dequeue().ConfigureAwait(false);
+                (ReadOnlyMemory<byte> fragment, IDisposable lease) = await pending.Dequeue().ConfigureAwait(false);
+                using IDisposable segmentBuffer = lease;
                 Fill();
                 mp4.ValidateFragment(fragment.Span);
                 EnsureSpace(fragment.Length);
@@ -112,7 +113,14 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             {
                 prefetch.Cancel();
                 foreach (var fetch in pending)
-                    try { await fetch.ConfigureAwait(false); } catch (Exception) { }
+                {
+                    try
+                    {
+                        (_, IDisposable lease) = await fetch.ConfigureAwait(false);
+                        lease.Dispose();
+                    }
+                    catch (Exception) { }
+                }
             }
             mp4.Finish(plan.RequireAudio, plan.RequireVideo);
         }
@@ -198,6 +206,22 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             { throw new TransientNetworkException("The DASH object stalled."); }
         }
         finally { session.RemoveConnection(); }
+    }
+
+    private async Task<(ReadOnlyMemory<byte> Data, IDisposable Lease)> FetchBufferedAsync(
+        DashFragment part, long limit, CancellationToken ct)
+    {
+        IDisposable lease = await engine.AcquireSegmentBufferAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ReadOnlyMemory<byte> data = await FetchAsync(part, limit, ct).ConfigureAwait(false);
+            return (data, lease);
+        }
+        catch
+        {
+            lease.Dispose();
+            throw;
+        }
     }
 
     private static RunOutcome Stop(string reason) => RunOutcome.NeedsAttention("dash-integrity", reason + " Saved data was kept.");
