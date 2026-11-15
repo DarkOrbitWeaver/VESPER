@@ -568,13 +568,13 @@ chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
   await clearBrowserChoicesForTab(tabId);
 }).catch(() => {}));
 
-async function mediaAuthorization(pageUrl, sender) {
+async function mediaAuthorization(pageUrl, sender, { userGesture = false } = {}) {
   const frame = Number.isInteger(sender?.tab?.id) ? {
     tabId: sender.tab.id, frameId: sender.frameId ?? 0,
     ...(sender.documentId ? { documentId: sender.documentId } : {})
   } : undefined;
   const enriched = await withSignIn([{ url: pageUrl, referer: sender?.url || pageUrl,
-    userAgent: navigator.userAgent }], { frame, userGesture: false });
+    userAgent: navigator.userAgent }], { frame, userGesture });
   return enriched.authorized ? { authorized: true, mediaAuth: enriched.items[0] } : {};
 }
 
@@ -896,9 +896,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ---------------------------------------------------------------- context menus (links, video, audio)
 
+function contextPageUrl(info, tab) {
+  if (Number.isInteger(info?.frameId) && info.frameId > 0 && /^https?:\/\//i.test(info.frameUrl || ''))
+    return info.frameUrl;
+  return /^https?:\/\//i.test(tab?.url || '') ? tab.url : null;
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER…', contexts: ['page', 'link', 'selection'] });
+  chrome.contextMenus.create({ id: 'vesper-page-media', title: 'Find video on this page with VESPER', contexts: ['page', 'frame'] });
   chrome.contextMenus.create({ id: 'vesper-link', title: 'Download link with VESPER', contexts: ['link'] });
   chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
   chrome.contextMenus.create({ id: 'vesper-active-downloads', title: 'Move an active Chrome download…', contexts: ['action'] });
@@ -919,13 +926,29 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     catch { flash(tab?.id, { ok: false }); }
     return;
   }
+  if (info.menuItemId === 'vesper-page-media') {
+    const pageUrl = contextPageUrl(info, tab);
+    if (pageUrl) {
+      const reply = await nativeRequest(envelope('media-picker', {
+        ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }, { userGesture: true }),
+        url: pageUrl, pageTitle: '', candidates: []
+      }));
+      flash(tab?.id, reply);
+    } else {
+      flash(tab?.id, { ok: false, message: 'This page cannot be inspected.' });
+    }
+    return;
+  }
   const url = info.menuItemId === 'vesper-link' ? info.linkUrl : info.srcUrl;
   if (info.menuItemId === 'vesper-media' && url && !/^https?:/i.test(url)) {
     // A blob: or data: source is made by the page itself (an MSE player). VESPER cannot fetch it, but it
     // can resolve the page's real stream. Open the media picker for this page instead of failing silently.
-    const pageUrl = tab?.url;
-    if (pageUrl && /^https?:/i.test(pageUrl)) {
-      const reply = await nativeRequest(envelope('media-picker', { ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }), url: pageUrl, pageTitle: '', candidates: [] }));
+    const pageUrl = contextPageUrl(info, tab);
+    if (pageUrl) {
+      const reply = await nativeRequest(envelope('media-picker', {
+        ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }, { userGesture: true }),
+        url: pageUrl, pageTitle: '', candidates: []
+      }));
       flash(tab?.id, reply.ok ? { ok: true } : reply);
     } else {
       flash(tab?.id, { ok: false, message: 'This page cannot be inspected.' });
