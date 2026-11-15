@@ -127,11 +127,14 @@ internal sealed class InstagramAdapter : AdapterBase
 
     private static bool IsLoginPage(Uri url, string body)
     {
-        if (url.Host.EndsWith("instagram.com", StringComparison.OrdinalIgnoreCase)
+        string host = url.IdnHost;
+        bool isInstagramHost = host.Equals("instagram.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".instagram.com", StringComparison.OrdinalIgnoreCase);
+        if (isInstagramHost
             && url.AbsolutePath.StartsWith("/accounts/login", StringComparison.OrdinalIgnoreCase))
             return true;
-        return body.Contains("login_required", StringComparison.OrdinalIgnoreCase)
-            || body.Contains("loginAndSignupPage", StringComparison.OrdinalIgnoreCase);
+        return isInstagramHost && (body.Contains("login_required", StringComparison.OrdinalIgnoreCase)
+            || body.Contains("loginAndSignupPage", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool Matches(Uri url) => InstagramTarget.TryParse(url, out _);
