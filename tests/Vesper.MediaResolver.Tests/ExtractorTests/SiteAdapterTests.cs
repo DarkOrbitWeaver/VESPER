@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Extractors;
 using Vesper.MediaResolver.Formats;
@@ -430,19 +431,78 @@ public class SiteAdapterTests
     [Fact]
     public async Task YouTube_MixWithCollectionIntent_IsASnapshotNeverAFixedPlaylist()
     {
-        var h = new FakeHttpHandler().AddFile("https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k", "youtube_mix.html", "text/html");
+        const string next = """
+            {"contents":{"twoColumnWatchNextResults":{"playlist":{"playlist":{"title":"Mix - Fixture","contents":[
+              {"playlistPanelVideoRenderer":{"videoId":"DDDDDDDDDDD","title":{"simpleText":"Related two"},"lengthText":{"simpleText":"1:01:01"}}},
+              {"playlistPanelVideoRenderer":{"videoId":"EEEEEEEEEEE","title":{"simpleText":"Related three"},"lengthText":{"simpleText":"2:03"}}}
+            ]}}}}}
+            """;
+        var h = new FakeHttpHandler()
+            .AddFile("https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k", "youtube_mix.html", "text/html")
+            .Add("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", next, "application/json");
         var res = await Resolve(h, MixUrl, CollectionIntent.CollectionOnly);
 
-        Assert.Equal(DiscoveryStatus.Partial, res.Status);
+        Assert.True(res.Status == DiscoveryStatus.Partial,
+            res.Error?.Diagnostic ?? string.Join("; ", res.Warnings.Select(w => w.Diagnostic)));
         var c = res.Collection!;
         Assert.True(c.IsDynamic);
         Assert.False(c.IsComplete);
         Assert.Null(c.TotalCount);
         Assert.Equal(CollectionKind.DynamicMix, c.Kind);
         Assert.Equal("Mix - Fixture", c.Title);
-        Assert.Equal(3, c.Entries.Count);
+        Assert.Equal(["EK3tCffac5k", "CCCCCCCCCCC", "DDDDDDDDDDD", "EEEEEEEEEEE"], c.Entries.Select(e => e.MediaId));
         Assert.Equal(TimeSpan.FromSeconds(3661), c.Entries[2].Duration);
+        Assert.Equal(TimeSpan.FromSeconds(123), c.Entries[3].Duration);
+        var requests = h.Requests.Where(r => r.Url.AbsolutePath.EndsWith("/next", StringComparison.Ordinal)).ToList();
+        Assert.Equal(2, requests.Count); // one page adds the fourth item; one terminal response confirms there are no more
+        Assert.All(requests, request =>
+        {
+            Assert.Equal(HttpMethod.Post, request.Method);
+            Assert.Equal("1", request.Headers["X-YouTube-Client-Name"]);
+        });
+        using var body = JsonDocument.Parse(requests[0].Body!);
+        Assert.Equal("RDEK3tCffac5k", body.RootElement.GetProperty("playlistId").GetString());
+        Assert.Equal("DDDDDDDDDDD", body.RootElement.GetProperty("videoId").GetString());
+        Assert.Equal(3, body.RootElement.GetProperty("index").GetInt32());
+        Assert.Equal("OAE%3D", body.RootElement.GetProperty("params").GetString());
         Assert.Contains(res.Warnings, w => w.Code == MediaErrorCode.PlaylistPartiallyResolved);
+    }
+
+    [Fact]
+    public async Task YouTube_MixContinuationFailureKeepsTheWatchPageSnapshot()
+    {
+        var h = new FakeHttpHandler()
+            .AddFile("https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k", "youtube_mix.html", "text/html");
+        var res = await Resolve(h, MixUrl, CollectionIntent.CollectionOnly);
+
+        Assert.Equal(DiscoveryStatus.Partial, res.Status);
+        Assert.Equal(3, res.Collection!.Entries.Count);
+        Assert.Contains(res.Warnings, warning => warning.Diagnostic.Contains("HTTP 404", StringComparison.Ordinal));
+        Assert.Contains(res.Warnings, warning => warning.Diagnostic.Contains("snapshot", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task YouTube_MixPagingStopsAtTheConfiguredPageLimit()
+    {
+        const string next = """
+            {"contents":{"twoColumnWatchNextResults":{"playlist":{"playlist":{"contents":[
+              {"playlistPanelVideoRenderer":{"videoId":"DDDDDDDDDDD"}},
+              {"playlistPanelVideoRenderer":{"videoId":"EEEEEEEEEEE"}}
+            ]}}}}}
+            """;
+        var h = new FakeHttpHandler()
+            .AddFile("https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k", "youtube_mix.html", "text/html")
+            .Add("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", next, "application/json");
+        using var resolver = new DefaultMediaResolver(new ResolverOptions { MaxCollectionPages = 1 }, h);
+        var res = await resolver.ResolveAsync(new()
+        {
+            Url = new(MixUrl), Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.CollectionOnly }
+        }, CancellationToken.None);
+
+        Assert.Equal(DiscoveryStatus.Partial, res.Status);
+        Assert.Equal(4, res.Collection!.Entries.Count);
+        Assert.Single(h.Requests, request => request.Url.AbsolutePath.EndsWith("/next", StringComparison.Ordinal));
+        Assert.Contains(res.Warnings, warning => warning.Diagnostic.Contains("configured page limit", StringComparison.Ordinal));
     }
 
     [Fact]

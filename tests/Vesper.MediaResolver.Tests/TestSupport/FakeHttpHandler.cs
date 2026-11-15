@@ -9,7 +9,7 @@ public sealed class FakeHttpHandler : HttpMessageHandler
 {
     public sealed record Route(int Status, string Body, string ContentType, IReadOnlyDictionary<string, string>? Headers = null, string? Redirect = null);
 
-    public sealed record Recorded(HttpMethod Method, Uri Url, IReadOnlyDictionary<string, string> Headers);
+    public sealed record Recorded(HttpMethod Method, Uri Url, IReadOnlyDictionary<string, string> Headers, string? Body);
 
     private readonly Dictionary<string, Route> _routes = new(StringComparer.Ordinal);
     private readonly object _lock = new();
@@ -39,10 +39,11 @@ public sealed class FakeHttpHandler : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        string? body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
         lock (_lock)
         {
             Requests.Add(new Recorded(request.Method, request.RequestUri!,
-                request.Headers.ToDictionary(h => h.Key, h => string.Join(",", h.Value), StringComparer.OrdinalIgnoreCase)));
+                request.Headers.ToDictionary(h => h.Key, h => string.Join(",", h.Value), StringComparer.OrdinalIgnoreCase), body));
         }
         if (Delay > TimeSpan.Zero) await Task.Delay(Delay, cancellationToken);
 
