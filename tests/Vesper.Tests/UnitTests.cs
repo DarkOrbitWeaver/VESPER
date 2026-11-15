@@ -680,6 +680,20 @@ public class JobStoreTests
     }
 }
 
+public class JobSnapshotTests
+{
+    [Fact]
+    public void Snapshot_preserves_the_selected_output_container()
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        AddResult added = harness.Engine.Add(new AddRequest("https://cdn.example.test/audio.mp3",
+            FileName: "audio.mp3", StartNow: false, MediaProvider: "test", Output: MediaOutput.Wav));
+
+        Assert.True(added.Ok, added.Message);
+        Assert.Equal(MediaOutput.Wav, harness.Engine.Snapshot(added.JobId)!.Output);
+    }
+}
+
 public class MediaPageLinkTests
 {
     [Theory]

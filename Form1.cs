@@ -20,6 +20,10 @@ public partial class Form1 : Form
     private ToolStripMenuItem _bandwidthMenu = null!;
     private ToolStripMenuItem _priorityMenu = null!;
     private readonly ToolTip _tooltips = new() { InitialDelay = 450, ReshowDelay = 100 };
+    private readonly System.Windows.Forms.Timer _diskForecastTimer = new() { Interval = 60_000 };
+    private Dictionary<string, long?> _availableDiskSpace = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _lastDiskProbeUtc = DateTime.MinValue;
+    private bool _diskProbeRunning;
 
     // Engine events arrive on worker threads. They are coalesced into one posted UI callback at a time.
     private readonly Dictionary<Guid, JobSnapshot> _inbox = [];
@@ -54,11 +58,15 @@ public partial class Form1 : Form
             _botanicalArt?.Dispose();
             _rowMenu.Dispose();
             _tooltips.Dispose();
+            _diskForecastTimer.Dispose();
         };
         _engine = engine;
         _startHidden = startHidden;
         _allowVisible = !startHidden;
         InitializeComponent();
+        _footerLabel.AutoEllipsis = true;
+        _footerLabel.AccessibleName = "Download and storage status";
+        _diskForecastTimer.Tick += (_, _) => _ = RefreshDiskSpaceAsync();
         Move += (_, _) => RememberNoticeMonitor();
         FormWindowState previousState = WindowState;
         Resize += (_, _) =>
@@ -737,6 +745,7 @@ public partial class Form1 : Form
         LayoutMast();
         _searchFrame.Invalidate();
         _footer.Invalidate(true);
+        UpdateFooter();
     }
 
     // ---- list -----------------------------------------------------------------------------------------------------
@@ -800,8 +809,65 @@ public partial class Form1 : Form
         if (attention > 0) parts.Add($"{attention} need attention");
         if (parts.Count == 0 && _items.Count > 0) parts.Add($"{_items.Count} download{(_items.Count == 1 ? "" : "s")}");
         if (speed > 0) parts.Add("↓ " + Formatting.Rate(speed));
+
+        JobSnapshot[] pending = _items.Values.Select(item => item.Snapshot).OfType<JobSnapshot>()
+            .Where(QueueDiskForecast.IsPending).ToArray();
+        if (_engine is not null && pending.Length > 0)
+        {
+            _diskForecastTimer.Start();
+            if (!_diskProbeRunning && DateTime.UtcNow - _lastDiskProbeUtc >= TimeSpan.FromMinutes(1))
+                _ = RefreshDiskSpaceAsync(pending);
+        }
+        else
+        {
+            _diskForecastTimer.Stop();
+            _availableDiskSpace.Clear();
+            _lastDiskProbeUtc = DateTime.MinValue;
+        }
+
+        IReadOnlyList<DiskForecastVolume> forecast = QueueDiskForecast.Calculate(pending, _availableDiskSpace,
+            _engine?.Options.FreeSpaceReserve ?? 0);
+        if (forecast.Count > 0) parts.Add(QueueDiskForecast.Summary(forecast));
+        string details = QueueDiskForecast.Details(forecast);
+        _footerLabel.AccessibleDescription = details;
+        _tooltips.SetToolTip(_footerLabel, details);
+        _footerLabel.ForeColor = forecast.Any(volume => volume.IsShort) ? _colors.ProgressRed
+            : forecast.Any(volume => volume.UnknownJobs > 0 || volume.AvailableBytes is null) ? _colors.ProgressAmber : _colors.Muted;
+
         string text = string.Join("    |    ", parts);
         if (_footerLabel.Text != text) _footerLabel.Text = text;
+    }
+
+    private async Task RefreshDiskSpaceAsync(JobSnapshot[]? pending = null)
+    {
+        if (_engine is null || _diskProbeRunning || IsDisposed) return;
+        pending ??= _items.Values.Select(item => item.Snapshot).OfType<JobSnapshot>()
+            .Where(QueueDiskForecast.IsPending).ToArray();
+        string[] roots = QueueDiskForecast.VolumeRoots(pending);
+        if (roots.Length == 0)
+        {
+            _lastDiskProbeUtc = DateTime.UtcNow;
+            return;
+        }
+
+        _diskProbeRunning = true;
+        try
+        {
+            IReadOnlyDictionary<string, long?> free = await Task.Run(() => QueueDiskForecast.ReadAvailable(roots));
+            if (!IsDisposed) _availableDiskSpace = new Dictionary<string, long?>(free, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or InvalidOperationException or System.Security.SecurityException)
+        {
+            _availableDiskSpace = roots.ToDictionary(root => root, _ => (long?)null, StringComparer.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            _diskProbeRunning = false;
+            _lastDiskProbeUtc = DateTime.UtcNow;
+        }
+
+        if (!IsDisposed) UpdateFooter();
     }
 
     private void UpdateSelectedTools()

@@ -124,7 +124,7 @@ public sealed partial class DownloadEngine : IDisposable
 
         return new JobSnapshot
         {
-            Id = job.Id, Kind = job.Kind, FileName = job.FileName, SourceUrl = job.SourceUrl, Destination = job.DestinationFolder,
+            Id = job.Id, Kind = job.Kind, Output = job.Output, FileName = job.FileName, SourceUrl = job.SourceUrl, Destination = job.DestinationFolder,
             OriginalPageUrl = job.OriginalPageUrl, MediaProvider = job.MediaProvider, MediaId = job.MediaId,
             MediaQuality = job.MediaQuality, MediaFormatId = job.MediaFormatId, MediaThumbnailUrl = job.MediaThumbnailUrl, MediaExpiresAt = job.MediaExpiresAt,
             PartialPath = job.PartialPath, FinalPath = job.FinalPath,

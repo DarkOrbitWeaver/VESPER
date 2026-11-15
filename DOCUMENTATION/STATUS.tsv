@@ -77,6 +77,6 @@ N-14	List import/export	Open engineering	No new user-facing JSON/CSV history mig
 N-15	Link/.url drag-and-drop	Implemented; Windows fixture	The desktop accepts dragged text URLs and reads .url shortcuts as bounded text (32 KiB, 64 lines), keeps only validated HTTP(S) links, and opens the normal Add Download review. It never launches or modifies the dropped file.
 N-16	Per-site rules	Open engineering	No new per-site output/folder/capture rule editor.
 N-17	Diagnostics bundle	Implemented; solution tests	Browser settings export only system/build metadata and scrubbed events; privacy, failed replacement preservation and the accessible settings action have solution coverage.
-N-18	Queue disk forecast	Partial	Per-job free-space safeguards retained; no aggregate queue forecast UI.
+N-18	Queue disk forecast	Implemented; solution tests	Accessible main-window footer and tooltip estimate known direct HTTP/original-container bytes by destination volume, subtract durable bytes, include the engine reserve and compare with bounded background free-space samples. Conversions, segmented/live media and unknown totals remain explicit unknowns; sampling covers up to 16 volumes at one-minute intervals while unfinished jobs exist.
 N-19	Podcast follow	Open engineering	No feed subscription/polling is added.
 N-20	Windows Share / manifest Open With	Open engineering	No Share target or new file associations.
