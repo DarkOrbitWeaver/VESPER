@@ -215,11 +215,12 @@ public sealed class EngineReliabilityTests
 /// <summary>VES-009: an expired merge job is re-planned for exactly the formats it started with.</summary>
 public sealed class MediaSourceRescueTests
 {
-    private static Vesper.MediaResolver.Models.MediaRepresentation Rep(string id, bool video, string container, string codec) => new()
+    private static Vesper.MediaResolver.Models.MediaRepresentation Rep(string id, bool video, string container, string codec,
+        Uri? url = null, Vesper.MediaResolver.Models.MediaRequestContext? context = null) => new()
     {
-        Id = id, Url = new Uri($"https://cdn.example.com/{id}"), Protocol = Vesper.MediaResolver.Models.StreamProtocol.Http,
+        Id = id, Url = url ?? new Uri($"https://cdn.example.com/{id}"), Protocol = Vesper.MediaResolver.Models.StreamProtocol.Http,
         Content = video ? Vesper.MediaResolver.Models.StreamContent.VideoOnly : Vesper.MediaResolver.Models.StreamContent.AudioOnly,
-        Container = container, VideoCodec = video ? codec : null, AudioCodec = video ? null : codec,
+        Container = container, VideoCodec = video ? codec : null, AudioCodec = video ? null : codec, Context = context ?? Vesper.MediaResolver.Models.MediaRequestContext.Empty,
         FileSize = video ? 5_000_000 : 300_000, ContentIdentity = id + "-identity", Height = video ? 1080 : null
     };
 
@@ -228,6 +229,40 @@ public sealed class MediaSourceRescueTests
         SourceUrl = new Uri("https://www.youtube.com/watch?v=fixture"), Provider = "youtube", MediaId = "fixture",
         Title = "Fixture", Representations = reps
     };
+
+    [Fact]
+    public void MergeBridgeCarriesMatchingCredentialsOnlyForSameOriginDirectTracks()
+    {
+        var context = new Vesper.MediaResolver.Models.MediaRequestContext
+        {
+            CookieHeader = "session=authorized",
+            CredentialOrigin = new Uri("https://example.com/"),
+            CredentialHosts = ["example.com"]
+        };
+        var sameOrigin = Item(
+            Rep("137", true, "mp4", "h264", new Uri("https://cdn.example.com/video"), context),
+            Rep("140", false, "m4a", "aac", new Uri("https://cdn.example.com/audio"), context));
+        var (choice, error) = VESPER.MediaTransferBridge.Prepare(sameOrigin,
+            Vesper.MediaResolver.Formats.FormatPreferences.BestQuality);
+
+        Assert.NotNull(choice);
+        Assert.Equal(JobKind.Merge, choice!.Kind);
+        Assert.Equal("session=authorized", choice.Secrets!["Cookie"]);
+
+        var differentPathCookies = Item(
+            Rep("137", true, "mp4", "h264", new Uri("https://cdn.example.com/video"), context),
+            Rep("140", false, "m4a", "aac", new Uri("https://cdn.example.com/audio"), context with { CookieHeader = "audio=other-path" }));
+        var (scoped, _) = VESPER.MediaTransferBridge.Prepare(differentPathCookies,
+            Vesper.MediaResolver.Formats.FormatPreferences.BestQuality);
+        Assert.NotEqual(JobKind.Merge, scoped?.Kind);
+
+        var crossOrigin = Item(
+            Rep("137", true, "mp4", "h264", new Uri("https://cdn.example.com/video"), context),
+            Rep("140", false, "m4a", "aac", new Uri("https://audio.example.com/audio"), context));
+        var (cross, _) = VESPER.MediaTransferBridge.Prepare(crossOrigin,
+            Vesper.MediaResolver.Formats.FormatPreferences.BestQuality);
+        Assert.NotEqual(JobKind.Merge, cross?.Kind);
+    }
 
     [Fact]
     public void Can_refresh_only_media_jobs_that_know_their_page_and_formats()
@@ -273,26 +308,27 @@ public sealed class MediaSourceRescueTests
 
         // Same formats, new signed links: accepted, the plan now points at the new URLs.
         var fresh = Item(video with { Url = new Uri("https://cdn.example.com/137?sig=new") }, audio with { Url = new Uri("https://cdn.example.com/140?sig=new") });
-        RescueResult accepted = InvokeRefreshMerge(h.Engine, job, fresh);
+        RescueResult accepted = await InvokeRefreshMerge(h.Engine, job, fresh);
         Assert.True(accepted.Accepted, accepted.Message);
         Assert.Contains("sig=new", h.Engine.Snapshot(added.JobId)!.SourceUrl);
 
         // A format that disappeared: refused, nothing changes.
-        RescueResult missing = InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, Item(video));
+        RescueResult missing = await InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, Item(video));
         Assert.False(missing.Accepted);
         Assert.Contains("same formats", missing.Message);
 
         // Same ids but a different file size: the engine's identity check refuses it.
-        RescueResult changed = InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, Item(video with { FileSize = 6_000_000 }, audio));
+        RescueResult changed = await InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, Item(video with { FileSize = 6_000_000 }, audio));
         Assert.False(changed.Accepted);
         await Task.CompletedTask;
     }
 
-    private static RescueResult InvokeRefreshMerge(DownloadEngine engine, JobSnapshot job, Vesper.MediaResolver.Models.MediaItem item)
+    private static async Task<RescueResult> InvokeRefreshMerge(DownloadEngine engine, JobSnapshot job, Vesper.MediaResolver.Models.MediaItem item)
     {
-        var method = typeof(VESPER.MediaSourceRescue).GetMethod("RefreshMerge",
+        var method = typeof(VESPER.MediaSourceRescue).GetMethod("RefreshMergeAsync",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
-        return (RescueResult)method.Invoke(null, [engine, job, item])!;
+        var operation = (Task<RescueResult>)method.Invoke(null, [engine, job, item, CancellationToken.None])!;
+        return await operation;
     }
 }
 

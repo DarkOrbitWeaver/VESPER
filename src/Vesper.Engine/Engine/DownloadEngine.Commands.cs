@@ -81,9 +81,17 @@ public sealed partial class DownloadEngine
         if (request.Kind == JobKind.Dash && (!DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out string planError)
             || request.Secrets is { Count: > 0 }))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan without persisted credentials is required.");
-        if (request.Kind == JobKind.Merge && (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out _)
-            || request.Secrets is { Count: > 0 } || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
-            return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid media merge plan without credentials or file checksums is required.");
+        RequestCredentials? mergeCredentials = null;
+        if (request.Kind == JobKind.Merge)
+        {
+            if (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan plan, out string mergeError))
+                return new AddResult(AddStatus.Invalid, Guid.Empty, mergeError);
+            if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null)
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "A media merge plan cannot use a file checksum or piece map.");
+            if (request.Secrets is { Count: > 0 }
+                && !TryCreateMergeCredentials(plan, uri, request.Secrets, out mergeCredentials, out string credentialError))
+                return new AddResult(AddStatus.Invalid, Guid.Empty, credentialError);
+        }
 
         if (request.Kind == JobKind.Http && request.Output == MediaOutput.Wav && request.MediaPlanJson is not null
             && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
@@ -182,7 +190,11 @@ public sealed partial class DownloadEngine
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.
             _jobs[id] = job;
             AddDuplicateCandidateLocked(job);
-            if (request.Secrets is { Count: > 0 })
+            if (request.Kind == JobKind.Merge)
+            {
+                if (mergeCredentials is not null) _credentials[id] = mergeCredentials;
+            }
+            else if (request.Secrets is { Count: > 0 })
             {
                 Uri origin = new UriBuilder(uri) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
                 _credentials[id] = new RequestCredentials(origin, new Dictionary<string, string>(request.Secrets));
