@@ -35,6 +35,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
 
     internal static readonly Uri PlayerEndpoint = new("https://www.youtube.com/youtubei/v1/player?prettyPrint=false");
     internal static readonly Uri BrowseEndpoint = new("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false");
+    internal static readonly Uri NextEndpoint = new("https://www.youtube.com/youtubei/v1/next?prettyPrint=false");
     internal const string DesktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
     /// <summary>
@@ -546,11 +547,12 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         var seen = new HashSet<string>(StringComparer.Ordinal);
         int limit = Math.Min(request.Options.MaxCollectionItems, Options.MaxCollectionItems);
         string rendererName = dynamicMix ? "playlistPanelVideoRenderer" : "playlistVideoRenderer";
+        JsonElement? mixPanel = null;
         if (dynamicMix)
         {
             // Only the watch-next playlist panel holds Mix entries; related-video lockups elsewhere on the page are not part of it.
-            var panel = root.FindAll("playlist", 8).FirstOrDefault(p => p.P("contents") is not null);
-            if (panel.ValueKind == JsonValueKind.Object) AddEntries(panel, rendererName, entries, seen, limit);
+            mixPanel = MixPanel(root);
+            if (mixPanel is { ValueKind: JsonValueKind.Object } panel) AddEntries(panel, rendererName, entries, seen, limit);
         }
         else AddEntries(root, rendererName, entries, seen, limit);
 
@@ -563,7 +565,49 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         if (dynamicMix)
         {
             complete = false;
+            int pages = 0;
+            bool pagingEnded = false;
+            while (mixPanel is { ValueKind: JsonValueKind.Object } panel && entries.Count < limit && pages < Options.MaxCollectionPages)
+            {
+                ct.ThrowIfCancellationRequested();
+                JsonElement? last = panel.P("contents").Items()
+                    .Select(item => item.P("playlistPanelVideoRenderer"))
+                    .LastOrDefault(renderer => renderer is { ValueKind: JsonValueKind.Object });
+                string? lastId = last.P("videoId").Str() ?? entries.LastOrDefault()?.MediaId;
+                if (lastId is null) { pagingEnded = true; break; }
+
+                JsonElement? watch = last.P("navigationEndpoint").P("watchEndpoint");
+                string videoId = watch.P("videoId").Str() ?? lastId;
+                long? watchIndex = NumL(watch.P("index"));
+                int index = watchIndex is > 0 and <= int.MaxValue ? (int)watchIndex.Value : entries.Count;
+                string parameters = watch.P("params").Str() ?? "OAE%3D";
+                using var next = await NextMixPageAsync(t.ListId, videoId, index, parameters, cfg, ct).ConfigureAwait(false);
+                pages++;
+                if (next.Doc is null)
+                {
+                    warnings.Add(MediaErrors.PartialPlaylist($"Further Mix entries could not be loaded ({next.Problem}); {entries.Count} entries are listed."));
+                    pagingEnded = true;
+                    break;
+                }
+
+                JsonElement? nextPanel = MixPanel(next.Doc.RootElement);
+                if (nextPanel is not { ValueKind: JsonValueKind.Object } nextMix)
+                {
+                    warnings.Add(MediaErrors.PartialPlaylist($"The Mix continuation returned no playlist (page structure change); {entries.Count} entries are listed."));
+                    pagingEnded = true;
+                    break;
+                }
+
+                int before = entries.Count;
+                AddEntries(nextMix, rendererName, entries, seen, limit);
+                if (entries.Count == before) { pagingEnded = true; break; }
+                mixPanel = nextMix.Clone();
+            }
             warnings.Add(MediaErrors.PartialPlaylist($"A Mix is generated per request; this is a snapshot of {entries.Count} entries, not a fixed playlist."));
+            if (entries.Count >= limit)
+                warnings.Add(MediaErrors.PartialPlaylist($"The Mix snapshot reached the configured item limit ({limit})."));
+            else if (!pagingEnded && pages >= Options.MaxCollectionPages)
+                warnings.Add(MediaErrors.PartialPlaylist($"Mix paging stopped after {pages} pages (configured page limit)."));
         }
         else
         {
@@ -668,6 +712,9 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             .Select(c => c.P("token").Str())
             .FirstOrDefault(s => s is { Length: > 8 and < 4096 });
 
+    private static JsonElement? MixPanel(JsonElement root) =>
+        root.FindAll("playlist", 8).FirstOrDefault(p => p.P("contents")?.ValueKind == JsonValueKind.Array);
+
     private sealed class BrowsePage(JsonDocument? doc, string problem) : IDisposable
     {
         public JsonDocument? Doc { get; } = doc;
@@ -689,6 +736,34 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         try
         {
             var resp = await Http.PostJsonAsync(BrowseEndpoint, body, new MediaRequestContext { UserAgent = DesktopUserAgent }, headers, ct).ConfigureAwait(false);
+            if (!resp.IsSuccess) return new BrowsePage(null, $"HTTP {resp.StatusCode}");
+            return JsonExt.TryParse(resp.Content) is { } doc ? new BrowsePage(doc, "") : new BrowsePage(null, "invalid JSON");
+        }
+        catch (MediaResolverException ex) { return new BrowsePage(null, ex.Error.Code.ToString()); }
+    }
+
+    private async Task<BrowsePage> NextMixPageAsync(string playlistId, string videoId, int index, string parameters,
+        YtPageConfig cfg, CancellationToken ct)
+    {
+        string version = cfg.WebClientVersion ?? YtPageConfig.DefaultWebClientVersion;
+        var client = new JsonObject { ["clientName"] = "WEB", ["clientVersion"] = version, ["hl"] = "en", ["gl"] = "US" };
+        if (cfg.VisitorData is not null) client["visitorData"] = cfg.VisitorData;
+        string body = new JsonObject
+        {
+            ["context"] = new JsonObject { ["client"] = client },
+            ["playlistId"] = playlistId,
+            ["videoId"] = videoId,
+            ["index"] = index,
+            ["params"] = parameters
+        }.ToJsonString();
+        var headers = new Dictionary<string, string>
+        {
+            ["X-YouTube-Client-Name"] = "1", ["X-YouTube-Client-Version"] = version, ["Origin"] = "https://www.youtube.com"
+        };
+        if (cfg.VisitorData is not null) headers["X-Goog-Visitor-Id"] = cfg.VisitorData;
+        try
+        {
+            var resp = await Http.PostJsonAsync(NextEndpoint, body, new MediaRequestContext { UserAgent = DesktopUserAgent }, headers, ct).ConfigureAwait(false);
             if (!resp.IsSuccess) return new BrowsePage(null, $"HTTP {resp.StatusCode}");
             return JsonExt.TryParse(resp.Content) is { } doc ? new BrowsePage(doc, "") : new BrowsePage(null, "invalid JSON");
         }
