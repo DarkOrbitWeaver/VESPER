@@ -59,25 +59,53 @@ public sealed partial class DownloadEngine
                 ready = true;
                 return (file, job.MediaThumbnailUrl is not null && cover is null ? "Saved without unavailable source artwork." : null);
             }
-            if (audio.Channels is not (1 or 2) || audio.SampleRate is not (44100 or 48000)
-                || video is { Width: < 16 or > 4096 } or { Height: < 16 or > 2304 } or { BitDepth: > 8 })
-                return (file, notice);
+            var remuxInputs = new List<(DemuxedTrack Track, Stream Source)>();
+            string? remuxContainer = null;
+            if (job.Output == MediaOutput.Mp4
+                && video is { Codec: "h264", SourceContainer: "mp4", Mp4SampleEntry: not null }
+                && audio is { Codec: "aac", SourceContainer: "mp4", Mp4SampleEntry: not null })
+            {
+                remuxContainer = "mp4";
+                remuxInputs.Add((video, source));
+                remuxInputs.Add((audio, source));
+            }
+            else if (job.Output == MediaOutput.M4a && video is null
+                && audio is { Codec: "aac", SourceContainer: "mp4", Mp4SampleEntry: not null })
+            {
+                remuxContainer = "m4a";
+                remuxInputs.Add((audio, source));
+            }
 
-            string extension = audio.SourceContainer == "webm" ? ".mkv" : ".mp4";
-            double totalSeconds = Math.Max(audio.DurationSeconds, video?.DurationSeconds ?? 0);
-            Action<double> progress = seconds =>
+            bool directRemux = Options.ConvertMedia is null && remuxContainer is not null
+                && MediaMerger.ChooseContainer(remuxInputs.Select(input => input.Track).ToArray(), remuxContainer) == remuxContainer;
+            if (directRemux)
+            {
+                using var remuxed = new FileStream(stage, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+                MediaMerger.Merge(remuxInputs, remuxContainer!, remuxed, ct);
+                remuxed.Flush(flushToDisk: true);
+            }
+            else
+            {
+                if (audio.Channels is not (1 or 2) || audio.SampleRate is not (44100 or 48000)
+                    || video is { Width: < 16 or > 4096 } or { Height: < 16 or > 2304 } or { BitDepth: > 8 })
+                    return (file, notice);
+
+                string extension = audio.SourceContainer == "webm" ? ".mkv" : ".mp4";
+                double totalSeconds = Math.Max(audio.DurationSeconds, video?.DurationSeconds ?? 0);
+                Action<double> progress = seconds =>
                 {
                     int percent = totalSeconds > 0 ? (int)Math.Clamp(seconds / totalSeconds * 100, 0, 99) : 0;
                     UpdateJob(job, j => j.Message = $"Converting {percent}% ({FormatClock(seconds)} of {FormatClock(totalSeconds)})");
                 };
-            if (Options.ConvertMedia is { } convert) convert(job.PartialPath, extension, stage, job.Output, ct);
-            else if (OperatingSystem.IsWindows())
-            {
-                if (video is not null && TryRemuxWithAac(job, source, video, extension, stage, ct) is { } copied)
-                    video = copied;
-                else WindowsMediaConverter.Convert(job.PartialPath, extension, stage, job.Output, ct, video, progress);
+                if (Options.ConvertMedia is { } convert) convert(job.PartialPath, extension, stage, job.Output, ct);
+                else if (OperatingSystem.IsWindows())
+                {
+                    if (video is not null && TryRemuxWithAac(job, source, video, extension, stage, ct) is { } copied)
+                        video = copied;
+                    else WindowsMediaConverter.Convert(job.PartialPath, extension, stage, job.Output, ct, video, progress);
+                }
+                else return (file, notice);
             }
-            else return (file, notice);
 
             ct.ThrowIfCancellationRequested();
             if (job.Output == MediaOutput.Wav)
