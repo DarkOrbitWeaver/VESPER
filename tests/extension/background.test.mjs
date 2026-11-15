@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
-  localData = {}, cookies = [{ name: 'session', value: 'test-value' }] } = {}) {
+  localData = {}, cookies = [{ name: 'session', value: 'test-value' }], playerPicker = false } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -22,6 +22,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const cookieLookups = [];
   const badges = [];
   const contextMenuItems = [];
+  const tabMessages = [];
   const alarms = new Map();
   const ports = [];
   const local = storage(localData);
@@ -45,7 +46,14 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       onHeadersReceived: { addListener: fn => { onHeaders = fn; } },
       onBeforeRedirect: { addListener: fn => { onRedirect = fn; } }
     },
-    tabs: { onUpdated: event, onRemoved: event, query: async () => [] },
+    tabs: {
+      onUpdated: event, onRemoved: event, query: async () => [],
+      sendMessage: async (tabId, message, options) => {
+        tabMessages.push({ tabId, message, options });
+        if (message.type === 'vesper-open-picker') return playerPicker ? { ok: true } : { ok: false, code: 'no-player' };
+        throw new Error('No receiver');
+      }
+    },
     contextMenus: { create: item => contextMenuItems.push(item), removeAll: async () => { contextMenuItems.length = 0; }, onClicked: { addListener: fn => { onContextClicked = fn; } } },
     alarms: {
       get: async name => alarms.get(name),
@@ -96,7 +104,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent, actions, cookieLookups, badges, contextMenuItems, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
+  return { describe: context.__describe, sent, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
     localData,
     install: () => onInstalled(),
     advanceTime: milliseconds => { now += milliseconds; },
@@ -1681,6 +1689,18 @@ test('right-clicking an ordinary page control opens discovery without replaying 
   assert.equal(app.sent[0].authorized, true);
   assert.equal(app.sent[0].mediaAuth.cookie, 'session=authorized');
   assert.equal(app.sent.some(message => message.type === 'submit'), false);
+  assert.equal(app.tabMessages[0].message.type, 'vesper-open-picker');
+});
+
+test('a page context action opens the existing player picker when the clicked frame has a player', async () => {
+  const app = load({}, { playerPicker: true });
+  const tab = { id: 11, url: 'https://video.example/watch' };
+
+  await app.onContextClicked({ menuItemId: 'vesper-page-media', pageUrl: tab.url, frameUrl: tab.url, frameId: 0 }, tab);
+
+  assert.equal(app.tabMessages[0].message.type, 'vesper-open-picker');
+  assert.equal(app.tabMessages[0].options.frameId, 0);
+  assert.equal(app.sent.length, 0);
 });
 
 test('the page-media action is registered for ordinary page and frame contexts', async () => {

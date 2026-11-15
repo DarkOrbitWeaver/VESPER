@@ -977,8 +977,19 @@
   document.addEventListener('pointerdown', (e) => {
     if (alive() && panel?.classList.contains('show') && !e.composedPath().includes(host)) closePanel();
   }, { capture: true, passive: true, signal });
-  chrome.runtime.onMessage.addListener((message, sender) => {
-    if (sender?.id !== chrome.runtime.id || message?.type !== 'vesper-prefetch') return false;
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (sender?.id !== chrome.runtime.id) return false;
+    if (message?.type === 'vesper-open-picker') {
+      syncPage();
+      if ((!video?.isConnected && activePreview?.player !== video) || !panel) {
+        sendResponse({ ok: false, code: 'no-player' });
+        return false;
+      }
+      void loadFormats();
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type !== 'vesper-prefetch') return false;
     syncPage();
     if (video) {
       prefetchedPlayers.delete(video);
