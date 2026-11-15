@@ -2,12 +2,32 @@
 (() => {
   'use strict';
   let panel, observer;
+  const LINK_SELECTOR = 'a[href],area[href],button[data-url],button[data-href],[data-download-url],[role=button][data-url]';
   const http = value => {
     try {
       const url = new URL(value, location.href);
       return /^https?:$/.test(url.protocol) && !url.username && !url.password ? url.href : null;
     } catch { return null; }
   };
+  function publisherChecksum(element, url) {
+    if (typeof element.getClientRects === 'function' && element.getClientRects().length === 0) return null;
+    let scope = element.parentElement;
+    for (let depth = 0; scope && depth < 3; depth++, scope = scope.parentElement) {
+      if (typeof scope.getClientRects === 'function' && scope.getClientRects().length === 0) continue;
+      const text = typeof scope.innerText === 'string' ? scope.innerText : '';
+      if (!text || text.length > 4096) continue;
+      const links = scope.querySelectorAll(LINK_SELECTOR);
+      let count = 0, onlyUrl;
+      for (const link of links) {
+        const target = http(link.getAttribute('href') || link.dataset.downloadUrl || link.dataset.url || link.dataset.href);
+        if (target) { count++; onlyUrl = target; if (count > 1) break; }
+      }
+      if (count !== 1 || onlyUrl !== url) continue;
+      const matches = [...text.matchAll(/\bsha[\s-]?256(?:sum)?\b(?:\s+checksum)?\s*(?::|=)?\s*([a-f\d]{64})(?![a-f\d])/gi)];
+      if (matches.length === 1) return matches[0][1].toUpperCase();
+    }
+    return null;
+  }
   function open() {
     if (panel) return;
     const host = document.createElement('div');
@@ -19,7 +39,7 @@
     section.setAttribute('role', 'dialog'); section.setAttribute('aria-modal', 'true'); section.setAttribute('aria-label', 'Smart Select files');
     const heading = document.createElement('h2'); heading.textContent = 'Smart Select';
     const help = document.createElement('p');
-    help.textContent = 'Select reusable file links. VESPER will ask you to review them on the desktop. For a button that creates a file, close this panel and click the original button; Chrome keeps POST and page-created downloads.';
+    help.textContent = 'Select reusable file links. VESPER will ask you to review them on the desktop. A clear SHA-256 beside one link may be offered there for approval. For a button that creates a file, close this panel and click the original button; Chrome keeps POST and page-created downloads.';
     const filter = document.createElement('input'); filter.type = 'search'; filter.placeholder = 'Filter by name, address or file type'; filter.setAttribute('aria-label', 'Filter files');
     const list = document.createElement('ul');
     const status = document.createElement('p'); status.setAttribute('role', 'status');
@@ -33,12 +53,12 @@
     function collect() {
       scheduled = false;
       const found = new Map();
-      for (const element of document.querySelectorAll('a[href],area[href],button[data-url],button[data-href],[data-download-url],[role=button][data-url]')) {
+      for (const element of document.querySelectorAll(LINK_SELECTOR)) {
         if (found.size >= 1000) break;
         const url = http(element.getAttribute('href') || element.dataset.downloadUrl || element.dataset.url || element.dataset.href);
         if (!url || found.has(url) || url.split('#')[0] === location.href.split('#')[0]) continue;
         const label = (element.textContent || element.getAttribute('aria-label') || new URL(url).pathname.split('/').pop() || 'File').trim().replace(/\s+/g, ' ').slice(0, 200);
-        found.set(url, { url, label });
+        found.set(url, { url, label, sha256: publisherChecksum(element, url) });
       }
       candidates = [...found.values()]; render();
     }
@@ -55,7 +75,9 @@
         const address = document.createElement('small');
         // Signed query strings are never copied into a label or tooltip.
         const url = new URL(candidate.url); address.textContent = url.host + url.pathname;
-        text.append(address); label.append(check, text); item.append(label); list.append(item);
+        text.append(address);
+        if (candidate.sha256) { const checksum = document.createElement('small'); checksum.textContent = 'Page SHA-256 available for desktop review'; text.append(checksum); }
+        label.append(check, text); item.append(label); list.append(item);
       }
       status.textContent = `${selected.size} selected · ${visible.length} matching links. Maximum 50 per review.`;
       review.disabled = selected.size === 0;
@@ -66,7 +88,10 @@
     review.addEventListener('click', async () => {
       review.disabled = true; status.textContent = 'Review the selected files in the VESPER desktop window…';
       try {
-        const reply = await chrome.runtime.sendMessage({ type: 'smart-submit', items: [...selected].map(url => ({ url })) });
+        const reply = await chrome.runtime.sendMessage({ type: 'smart-submit', items: [...selected].map(url => {
+          const candidate = candidates.find(item => item.url === url);
+          return { url, ...(candidate?.sha256 ? { sha256: candidate.sha256 } : {}) };
+        }) });
         if (reply?.ok) { finish(); return; }
         status.textContent = reply?.message || 'VESPER did not answer. No files were removed from Chrome.';
       } catch { status.textContent = 'The extension connection was closed. Refresh this page and try again.'; }

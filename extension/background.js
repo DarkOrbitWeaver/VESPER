@@ -828,7 +828,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const url = VesperPlayerSource.http(item?.url);
           if (!url || unique.has(url.href)) continue;
           unique.add(url.href);
-          safe.push({ url: url.href, referer: page.href, userAgent: navigator.userAgent });
+          const sha256 = typeof item?.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(item.sha256) ? item.sha256.toUpperCase() : undefined;
+          safe.push({ url: url.href, referer: page.href, userAgent: navigator.userAgent, ...(sha256 ? { sha256 } : {}) });
         }
         if (!safe.length) return { ok: false, code: 'invalid', message: 'No reusable file addresses were selected.' };
         // Untrusted content can propose links, never skip the native confirmation or choose a disk path.

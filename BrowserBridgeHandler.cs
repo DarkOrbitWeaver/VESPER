@@ -104,11 +104,13 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         string mode = request.Mode == "ask" ? preferences().BrowserAction.ToString().ToLowerInvariant() : request.Mode;
         if (request.Type == "browser-submit" && mode == "ask") mode = "download";
 
-        if (request.Type == "batch-review" || request.Items.Count > 1) mode = "ask";
         IReadOnlySet<int>? selected = null;
+        IReadOnlySet<int> trustedChecksums = new HashSet<int>();
         bool startNow = mode == "download";
         string? folder = null;
-        if (mode == "ask" && request.Items.Count > 1)
+        bool requiresReview = RequiresNativeReview(request);
+        if (requiresReview) mode = "ask";
+        if (requiresReview)
         {
             var reviewed = await ReviewBatchAsync(request, ct);
             if (reviewed.Outcome == QuickDownloadForm.Outcome.Cancel || reviewed.Selected.Count == 0)
@@ -116,6 +118,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             startNow = reviewed.Outcome == QuickDownloadForm.Outcome.Download;
             folder = reviewed.Folder;
             selected = reviewed.Selected;
+            trustedChecksums = reviewed.TrustedChecksums;
         }
         else if (mode == "ask")
         {
@@ -140,7 +143,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             }
 
             AddResult added = engine.Add(new AddRequest(item.Url, folder, item.FileName, startNow, item.Referer, item.UserAgent,
-                RequestId: $"{request.Id}:{i}", ExpectedSha256: item.Sha256,
+                RequestId: $"{request.Id}:{i}", ExpectedSha256: ConfirmedChecksum(item, i, trustedChecksums),
                 Kind: item.Kind == "hls" ? JobKind.Hls : JobKind.Http, Secrets: secrets, BrowserProof: request.BrowserProof));
 
             string status = added.Status switch
@@ -165,6 +168,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         bool allDuplicate = results.All(r => r.Status == "duplicate");
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
     }
+
+    internal static string? ConfirmedChecksum(BridgeItem item, int index, IReadOnlySet<int> confirmed) =>
+        confirmed.Contains(index) ? item.Sha256 : null;
+
+    internal static bool RequiresNativeReview(BridgeRequest request) => request.Type == "batch-review"
+        || request.Items.Count > 1 || request.Items.Any(item => item.Sha256 is not null);
 
     /// <summary>
     /// Waits until VESPER has really received the file's first response. When it has not, the second value says why
@@ -271,10 +280,11 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
     };
 
     /// <summary>Shows the compact Quick Download window on the UI thread and waits for the user's choice.</summary>
-    private async Task<(QuickDownloadForm.Outcome Outcome, string Folder, IReadOnlySet<int> Selected)> ReviewBatchAsync(
+    private async Task<(QuickDownloadForm.Outcome Outcome, string Folder, IReadOnlySet<int> Selected,
+        IReadOnlySet<int> TrustedChecksums)> ReviewBatchAsync(
         BridgeRequest request, CancellationToken ct)
     {
-        var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string, IReadOnlySet<int>)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string, IReadOnlySet<int>, IReadOnlySet<int>)>(TaskCreationOptions.RunContinuationsAsynchronously);
         owner.BeginInvoke(() =>
         {
             if (ct.IsCancellationRequested) { done.TrySetCanceled(ct); return; }
@@ -288,7 +298,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                         try { form.BeginInvoke(() => form.Close()); } catch (InvalidOperationException) { }
                 });
                 form.ShowDialog(owner);
-                done.TrySetResult((form.Result, form.Destination, form.SelectedIndices));
+                done.TrySetResult((form.Result, form.Destination, form.SelectedIndices, form.TrustedChecksumIndices));
             }
             catch (Exception ex) { done.TrySetException(ex); }
         });

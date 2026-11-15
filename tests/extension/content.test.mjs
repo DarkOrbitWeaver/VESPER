@@ -134,6 +134,40 @@ test('the context-menu picker reports when its frame has no video player', async
   assert.equal(reply.code, 'no-player');
 });
 
+test('Smart Select associates only one clearly labelled SHA-256 with its sole nearby file link', () => {
+  const smartSelect = readFileSync(new URL('../../extension/smart-select.js', import.meta.url), 'utf8')
+    .replace(/\}\)\(\);\s*$/, 'globalThis.__publisherChecksum = publisherChecksum;\n})();');
+  const context = vm.createContext({
+    URL,
+    location: { href: 'https://publisher.example/downloads/' },
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
+  });
+  vm.runInContext(smartSelect, context);
+
+  const url = 'https://cdn.example.test/archive.zip';
+  const checksum = 'a1'.repeat(32);
+  const link = { parentElement: null, dataset: {}, getAttribute: name => name === 'href' ? url : null };
+  const row = { parentElement: null, innerText: `archive.zip\nSHA-256: ${checksum}`, querySelectorAll: () => [link] };
+  link.parentElement = row;
+
+  assert.equal(context.__publisherChecksum(link, url), checksum.toUpperCase());
+  row.innerText = `archive.zip\nSHA-256 checksum = ${checksum}`;
+  assert.equal(context.__publisherChecksum(link, url), checksum.toUpperCase());
+  row.innerText = `archive.zip\nSHA-1: ${checksum}`;
+  assert.equal(context.__publisherChecksum(link, url), null);
+  row.innerText = `archive.zip\nSHA-256: ${checksum}\nSHA-256: ${checksum}`;
+  assert.equal(context.__publisherChecksum(link, url), null);
+  row.innerText = `archive.zip\nSHA-256: ${checksum}`;
+  row.querySelectorAll = () => [link, { dataset: {}, getAttribute: () => 'https://cdn.example.test/other.zip' }];
+  assert.equal(context.__publisherChecksum(link, url), null);
+  row.querySelectorAll = () => [link];
+  link.getClientRects = () => [];
+  assert.equal(context.__publisherChecksum(link, url), null);
+  link.getClientRects = () => [{}];
+  row.getClientRects = () => [];
+  assert.equal(context.__publisherChecksum(link, url), null);
+});
+
 test('an orphaned content script disconnects observers and storage listeners on the next page event', async () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();

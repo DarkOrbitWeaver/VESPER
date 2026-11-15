@@ -430,6 +430,17 @@ public class BridgeProtocolTests
         Assert.False(BridgeProtocol.TryParse(Msg($"\"type\":\"submit\",\"items\":[{{\"url\":\"{url}\"}}]"), out _, out _));
 
     [Fact]
+    public void Browser_checksum_proposals_are_validated_and_normalized()
+    {
+        string hash = new('A', 64);
+        string request = Msg($"\"type\":\"batch-review\",\"items\":[{{\"url\":\"https://example.com/file.zip\",\"sha256\":\"{hash}\"}}]");
+
+        Assert.True(BridgeProtocol.TryParse(request, out BridgeRequest parsed, out string error), error);
+        Assert.Equal(hash.ToLowerInvariant(), Assert.Single(parsed.Items).Sha256);
+        Assert.False(BridgeProtocol.TryParse(Msg("\"type\":\"batch-review\",\"items\":[{\"url\":\"https://example.com/file.zip\",\"sha256\":\"abc\"}]"), out _, out _));
+    }
+
+    [Fact]
     public void Browser_handoff_parses_the_response_proof_and_always_waits_for_confirmation()
     {
         string request = Msg("""
