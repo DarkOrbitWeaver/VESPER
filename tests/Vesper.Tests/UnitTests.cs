@@ -157,6 +157,7 @@ public class PathSafetyTests
 
             Assert.True(PathSafety.TryGetFullPath(tokenPath, out string full, out string error), error);
             Assert.Equal(Path.GetFullPath(Path.Combine(root, "Downloads")), full);
+            Assert.Equal(full, PathSafety.ForDisplay(tokenPath));
             Assert.False(Directory.Exists(full));
         }
         finally
