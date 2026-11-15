@@ -7,6 +7,27 @@ namespace Vesper.Windows.Tests;
 public sealed class SettingsAccessibilityTests
 {
     [Fact]
+    public void InternetShortcutDropReadsOnlyBoundedWebAddresses()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"vesper-{Guid.NewGuid():N}.url");
+        try
+        {
+            File.WriteAllText(path, "[InternetShortcut]\r\nURL=https://example.com/file.zip?token=short\r\n");
+            Assert.Equal("https://example.com/file.zip?token=short", Form1.ReadInternetShortcut(path));
+
+            File.WriteAllText(path, "[InternetShortcut]\r\nURL=javascript:alert(1)\r\n");
+            Assert.Null(Form1.ReadInternetShortcut(path));
+
+            File.WriteAllText(path, "URL=https://example.com/" + new string('a', 32 * 1024));
+            Assert.Null(Form1.ReadInternetShortcut(path));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void CheckboxPaintClearsTextLeftByAnEarlierCaption()
     {
         OnSta(() =>

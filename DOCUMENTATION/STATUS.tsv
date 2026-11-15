@@ -74,7 +74,7 @@ N-11	Publisher checksum discovery	Open engineering	Trusted checksum engine path 
 N-12	Mirror substitution	Partial	Existing identity-checked HTTP Rescue retained. No universal mirror selection UI or automatic TikTok mirror failover is added.
 N-13	Batch quality once	Partial	Existing collection preference flow retained. Native Smart Select reviews reusable file links, not a new media-collection quality planner.
 N-14	List import/export	Open engineering	No new user-facing JSON/CSV history migration.
-N-15	Link/.url drag-and-drop	Open engineering	No new desktop drag-and-drop integration.
+N-15	Link/.url drag-and-drop	Implemented; Windows fixture	The desktop accepts dragged text URLs and reads .url shortcuts as bounded text (32 KiB, 64 lines), keeps only validated HTTP(S) links, and opens the normal Add Download review. It never launches or modifies the dropped file.
 N-16	Per-site rules	Open engineering	No new per-site output/folder/capture rule editor.
 N-17	Diagnostics bundle	Open engineering	No new user-triggered diagnostics zip UI. Delivery archives contain source and reports, not user diagnostics.
 N-18	Queue disk forecast	Partial	Per-job free-space safeguards retained; no aggregate queue forecast UI.
