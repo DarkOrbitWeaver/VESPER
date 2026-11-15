@@ -45,7 +45,7 @@ Windows host, .NET SDK 11.0.100 targeting .NET 10, Node 24.21.0. Build/test arti
 - Explicit VESPER app build: `dotnet build VESPER.csproj --artifacts-path <temp> -p:EnableWindowsTargeting=true -p:RuntimeIdentifier=win-x64 --no-restore` succeeded with 0 warnings and 0 errors.
 - Extension JavaScript syntax checks passed; mocked extension suite: 105 passed, 0 failed. These mocks cover handoff races, prefetch, Instagram blob-player source choices, partial-range rejection, per-tab and global source-cache bounds, session URL expiry and picker overflow guards, but do not replace a real MV3 worker/Chrome run.
 - Focused unknown-length, truncated-body, HTML-response and credentialed-refresh tests pass. The full engine suite also covers recovery, HLS/DASH, converters, browser transfer and source identity.
-- No comparative throughput/conversion benchmark, installer execution, live Instagram/Vimeo/YouTube or Mix verification, visual Chrome review or real native-messaging run was performed. No performance claim is made.
+- The on-demand live runner attempted the small public YouTube fixture but failed on the first page request with `HttpRequestException` in this environment. That did not reach extraction, so it is not evidence of a YouTube site or adapter failure. No live Instagram, Vimeo or Mix verification, visual Chrome review or real native-messaging run was completed. No performance claim is made.
 
 ## Additional reliability work
 
