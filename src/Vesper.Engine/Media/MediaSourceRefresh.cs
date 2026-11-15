@@ -151,6 +151,7 @@ public sealed partial class DownloadEngine
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out next, out string parseError))
                 return Rejected(parseError);
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
             if (!current.CanContinueWith(next, out string why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             if (next.Tracks.Count == 0 || !UrlPolicy.TryParse(next.Tracks[0].Url, out Uri firstTrack, out _))
@@ -303,6 +304,7 @@ public sealed partial class DownloadEngine
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var next, out var error))
                 return Rejected(error);
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
             if (!current.CanContinueWith(next, out var why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             job.MediaPlanJson = next.ToJson();

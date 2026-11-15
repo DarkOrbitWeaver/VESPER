@@ -10,6 +10,9 @@ public sealed class MediaRefreshTests
     private static byte[] MediaFixture(string name) =>
         File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
 
+    private static byte[] FragmentedAudioFixture() =>
+        [.. MediaFixture("audio-init.mp4"), .. MediaFixture("audio-1.m4s")];
+
     private static MediaMergePlan AudioPlan(string url, byte[] audio) => new()
     {
         Provider = "fixture", MediaId = "audio", OutputContainer = "m4a",
@@ -233,6 +236,34 @@ public sealed class MediaRefreshTests
         Assert.All(server.RequestsFor("/fresh/audio"), request => Assert.Equal(cookie, request.Cookie));
         h.Engine.Dispose();
         AssertSecretNotOnDisk(h, cookie);
+    }
+
+    [WindowsFact]
+    public async Task MergeRefreshKeepsTheSavedWavTrimRange()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = FragmentedAudioFixture();
+        server.Extra["/old/audio"] = audio;
+        server.Extra["/fresh/audio"] = audio;
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = AudioPlan(server.Url("/old/audio"), audio) with
+        { OutputRange = new MediaTimeRange(.25, .75) };
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "trim.wav", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "audio", MediaFormatId: "audio-format",
+            MediaPlanJson: oldPlan.ToJson(), Output: MediaOutput.Wav));
+        Assert.True(added.Ok, added.Message);
+
+        MediaMergePlan freshPlan = AudioPlan(server.Url("/fresh/audio"), audio);
+        RescueResult refreshed = h.Engine.RefreshMergePlan(added.JobId, freshPlan.ToJson());
+        Assert.True(refreshed.Accepted, refreshed.Message);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        using var wave = File.OpenRead(done.FinalPath!);
+        var result = WaveAudio.Read(wave);
+        Assert.InRange(Math.Abs(result.Duration - .5), 0, .02);
     }
 
     [Fact]
