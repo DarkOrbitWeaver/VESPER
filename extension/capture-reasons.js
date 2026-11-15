@@ -23,6 +23,7 @@ const VesperCaptureReasons = {
   'not-ready': { text: 'VESPER couldn’t take over in time.', action: 'move' },
   'app-missing': { text: 'Chrome couldn’t find the VESPER app.', action: 'check-app' },
   'app-unavailable': { text: 'The VESPER app didn’t answer.', action: 'check-app' },
+  'capture-error': { text: 'VESPER couldn’t finish checking this download. Chrome kept it. Try moving it from the Transfers page.', action: 'move' },
   'duplicate': { text: 'VESPER already has this download.' },
   'refused': { text: 'VESPER can’t download from this address.' }
 };
