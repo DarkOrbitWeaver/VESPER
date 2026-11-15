@@ -161,6 +161,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
     private async Task<ReadOnlyMemory<byte>> FetchAsync(DashFragment part, long limit, SegmentBufferLease lease, CancellationToken ct)
     {
         if (!UrlPolicy.TryParse(part.Url, out var uri, out _)) throw new RunnerStop(Stop("Invalid fragment URL."));
+        long bodyLimit = part.Length ?? limit;
         long? end = part.Offset is long start && part.Length is long size ? checked(start + size - 1) : null;
         session.AddConnection();
         try
@@ -185,8 +186,8 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             }
             else if (status != 200) throw new RunnerStop(Stop("The server returned an unsolicited partial fragment."));
             long? declared = response.Content.Headers.ContentLength;
-            if (declared > limit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
-            if (declared is long known) lease.Resize(SegmentBufferLimiter.Reservation(limit, known));
+            if (declared > bodyLimit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
+            if (declared is long known) lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, known));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stall.CancelAfter(engine.Options.StallTimeout);
             try
@@ -200,7 +201,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                     {
                         int n = await stream.ReadAsync(buffer.AsMemory(), stall.Token).ConfigureAwait(false);
                         if (n == 0) break;
-                        if (body.Length + n > limit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
+                        if (body.Length + n > bodyLimit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
                         body.Write(buffer, 0, n);
                         stall.CancelAfter(engine.Options.StallTimeout);
                     }

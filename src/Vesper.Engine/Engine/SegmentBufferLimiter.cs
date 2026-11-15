@@ -26,13 +26,18 @@ internal sealed class SegmentBufferLimiter
     {
         if (maxCapacity <= 0 || copies <= 0) throw new ArgumentOutOfRangeException();
         if (knownCapacity is < 0) throw new ArgumentOutOfRangeException(nameof(knownCapacity));
-        long capacity = knownCapacity switch
-        {
-            > 0 => Math.Min(maxCapacity, Math.Max(knownCapacity.Value, Math.Min(maxCapacity, DefaultBufferCapacity))),
-            0 => Math.Min(maxCapacity, DefaultBufferCapacity),
-            _ => maxCapacity
-        };
+        if (knownCapacity is null) return CapacityReservation(maxCapacity, copies);
+        long wanted = Math.Max(knownCapacity.Value, Math.Min(maxCapacity, DefaultBufferCapacity));
+        long capacity = Math.Min(maxCapacity, DefaultBufferCapacity);
+        while (capacity < wanted && capacity < maxCapacity) capacity = Math.Min(maxCapacity, capacity * 2);
         return CapacityReservation(capacity, copies);
+    }
+
+    internal static long ContentLengthReservation(long maxCapacity, long contentLength, int copies = 1)
+    {
+        if (maxCapacity <= 0 || contentLength < 0 || contentLength > maxCapacity || copies <= 0)
+            throw new ArgumentOutOfRangeException();
+        return CapacityReservation(contentLength > 0 ? contentLength : Math.Min(maxCapacity, DefaultBufferCapacity), copies);
     }
 
     internal static long CapacityReservation(long capacity, int copies = 1)

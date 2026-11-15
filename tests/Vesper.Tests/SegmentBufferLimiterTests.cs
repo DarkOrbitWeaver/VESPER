@@ -60,6 +60,8 @@ public sealed class SegmentBufferLimiterTests
     {
         Assert.Equal(128L * 1024 * 1024, SegmentBufferLimiter.Reservation(64L * 1024 * 1024, null, copies: 2));
         Assert.Equal(128L * 1024, SegmentBufferLimiter.Reservation(64L * 1024 * 1024, 1, copies: 2));
+        Assert.Equal(256L * 1024, SegmentBufferLimiter.Reservation(64L * 1024 * 1024, 100L * 1024, copies: 2));
+        Assert.Equal(200L * 1024, SegmentBufferLimiter.ContentLengthReservation(64L * 1024 * 1024, 100L * 1024, copies: 2));
         Assert.Equal(128L * 1024, SegmentBufferLimiter.CapacityReservation(64L * 1024, copies: 2));
     }
 }
