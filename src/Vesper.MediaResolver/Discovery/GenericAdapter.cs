@@ -40,11 +40,15 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
 
     public bool CanHandle(Uri url) => true;
 
-    public async Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct)
+    public Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct) =>
+        ResolveAsync(request, null, ct);
+
+    internal async Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request,
+        IEnumerable<MediaCandidate>? additionalCandidates, CancellationToken ct, bool includeBrowserCandidates = true)
     {
         var browser = request.ValidatedBrowser;
         var candidates = new List<MediaCandidate>();
-        if (browser is not null) candidates.AddRange(browser.Candidates);
+        if (includeBrowserCandidates && browser is not null) candidates.AddRange(browser.Candidates);
 
         PageMetadata? meta = null;
         Uri pageUrl = request.Url;
@@ -87,6 +91,7 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
 
         var ctx = browser?.Context
             ?? (meta is not null ? new MediaRequestContext { Referer = UrlUtil.WithoutFragment(pageUrl).AbsoluteUri } : MediaRequestContext.Empty);
+        if (additionalCandidates is not null) candidates.AddRange(additionalCandidates);
 
         var outcome = await _svc.Candidates.ProcessAsync(candidates, ctx, ct).ConfigureAwait(false);
 

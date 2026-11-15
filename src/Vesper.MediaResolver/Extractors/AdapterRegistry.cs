@@ -15,6 +15,7 @@ public static class AdapterRegistry
         VimeoAdapter.Descriptor,
         DailymotionAdapter.Descriptor,
         RedditAdapter.Descriptor,
+        InstagramAdapter.Descriptor,
         InternetArchiveAdapter.Descriptor,
         BandcampAdapter.Descriptor,
         BilibiliAdapter.Descriptor,
