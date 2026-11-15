@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.ExceptionServices;
+using Vesper.Engine;
 using VESPER;
 
 namespace Vesper.Windows.Tests;
@@ -174,6 +175,42 @@ public sealed class SettingsAccessibilityTests
             VesperChoice theme = choices.Single(choice => choice.AccessibleName == "Color theme");
             theme.AccessibilityObject.Value = "Dark";
             Assert.Equal("Dark", theme.SelectedText);
+        });
+    }
+
+    [Fact]
+    public void Browser_settings_exposes_diagnostics_export_only_with_a_running_engine()
+    {
+        OnSta(() =>
+        {
+            using (var preview = new SettingsForm())
+            {
+                _ = preview.Handle;
+                VesperButton button = Descendants(preview).OfType<VesperButton>().Single(item => item.Name == "exportDiagnostics");
+                Assert.Equal("Export diagnostics bundle", button.AccessibleName);
+                Assert.False(button.Enabled);
+            }
+
+            string root = Path.Combine(Path.GetTempPath(), "vesper-settings-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                using var engine = DownloadEngine.Start(new EngineOptions
+                {
+                    DataDirectory = Path.Combine(root, "data"),
+                    DefaultFolder = root,
+                    MaxConcurrentJobs = 0
+                });
+                using var settings = new SettingsForm(new VesperPreferences(), engine);
+                _ = settings.Handle;
+                VesperButton button = Descendants(settings).OfType<VesperButton>().Single(item => item.Name == "exportDiagnostics");
+                Assert.True(button.Enabled);
+                Assert.Equal(AccessibleRole.PushButton, button.AccessibilityObject.Role);
+            }
+            finally
+            {
+                Directory.Delete(root, recursive: true);
+            }
         });
     }
 

@@ -898,7 +898,7 @@ public partial class Form1 : Form
     private void OpenSettings()
     {
         if (_engine is null) { PreviewSettingsRequested?.Invoke(); return; }
-        using var dialog = new SettingsForm(_prefs);
+        using var dialog = new SettingsForm(_prefs, _engine);
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         VesperPreferences updated = dialog.Result;

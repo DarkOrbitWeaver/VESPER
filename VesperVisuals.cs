@@ -235,6 +235,7 @@ public sealed class VesperButton : Button
     [DefaultValue(VesperIcon.None)] public VesperIcon Symbol { get; set; }
     public VesperButton()
     {
+        AccessibleRole = AccessibleRole.PushButton;
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
         Cursor = Cursors.Hand;

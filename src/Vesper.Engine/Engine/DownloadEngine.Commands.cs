@@ -1,5 +1,8 @@
+using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Vesper.Engine;
 
@@ -541,20 +544,28 @@ public sealed partial class DownloadEngine
 /// <summary>Redaction for anything that may be exported or shown in diagnostics.</summary>
 public static class Diagnostics
 {
+    private static readonly Regex UrlPattern = new("""https?://[^\s<>"']+""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex HeaderPattern = new("""\b(?<name>Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*[:=]\s*[^\r\n]*""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly Regex SecretAssignmentPattern = new("""(?<key>\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?(?:id|token)|api[_-]?key|client[_-]?secret|password|secret|signature|sig|token)\b\s*["']?\s*[:=]\s*["']?)(?<value>[^&;\s,"'<>]+)""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     public static string Scrub(string text)
     {
         if (string.IsNullOrEmpty(text)) return text;
-        var builder = new StringBuilder(text.Length);
-        foreach (string token in text.Split(' '))
-        {
-            string part = token;
-            if (part.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || part.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                part = UrlPolicy.Redact(part);
-            builder.Append(part).Append(' ');
-        }
+        string scrubbed = HeaderPattern.Replace(text, match => $"{match.Groups["name"].Value}: [redacted]");
+        scrubbed = SecretAssignmentPattern.Replace(scrubbed, match => $"{match.Groups["key"].Value}[redacted]");
+        scrubbed = UrlPattern.Replace(scrubbed, RedactUrl);
         string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string scrubbed = builder.ToString().TrimEnd();
         return profile.Length > 3 ? scrubbed.Replace(profile, "%USERPROFILE%", StringComparison.OrdinalIgnoreCase) : scrubbed;
+    }
+
+    private static string RedactUrl(Match match)
+    {
+        string value = match.Value;
+        int end = value.Length;
+        while (end > 0 && value[end - 1] is '.' or ',' or ';' or ':' or '!' or '?' or ')' or ']' or '}') end--;
+        return end == 0 ? value : UrlPolicy.Redact(value[..end]) + value[end..];
     }
 
     /// <summary>Writes a privacy-aware log: links lose their query strings, the profile path is abbreviated.</summary>
@@ -562,5 +573,51 @@ public static class Diagnostics
     {
         IReadOnlyList<string> lines = engine.ReadLog();
         File.WriteAllLines(path, lines.Select(Scrub));
+    }
+
+    /// <summary>Writes a local support archive with system metadata and the scrubbed event log only.</summary>
+    public static void ExportBundle(DownloadEngine engine, string path, string version)
+    {
+        ArgumentNullException.ThrowIfNull(engine);
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        string target = Path.GetFullPath(path);
+        string folder = Path.GetDirectoryName(target) ?? throw new IOException("The diagnostics destination has no parent folder.");
+        if (!Directory.Exists(folder)) throw new DirectoryNotFoundException("The diagnostics destination folder does not exist.");
+        string temporary = Path.Combine(folder, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (var archive = new ZipArchive(file, ZipArchiveMode.Create))
+            {
+                string[] system =
+                [
+                    $"VESPER version: {version}",
+                    $"Operating system: {RuntimeInformation.OSDescription}",
+                    $"Process architecture: {RuntimeInformation.ProcessArchitecture}",
+                    $".NET runtime: {Environment.Version}",
+                    $"Exported UTC: {DateTimeOffset.UtcNow:O}"
+                ];
+                AddText(archive, "system.txt", string.Join(Environment.NewLine, system));
+                AddText(archive, "events.txt", string.Join(Environment.NewLine, engine.ReadLog().Select(Scrub)));
+                AddText(archive, "contents.txt", "This archive contains system details and the scrubbed event log only. It excludes download files, settings, databases, cookies and authorization headers. Event details may include filenames; review before sharing.");
+            }
+            File.Move(temporary, target, overwrite: true);
+        }
+        catch
+        {
+            try { File.Delete(temporary); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            throw;
+        }
+    }
+
+    private static void AddText(ZipArchive archive, string name, string value)
+    {
+        ZipArchiveEntry entry = archive.CreateEntry(name, CompressionLevel.Fastest);
+        using Stream stream = entry.Open();
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+        writer.WriteLine(value);
     }
 }

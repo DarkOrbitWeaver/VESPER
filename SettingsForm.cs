@@ -16,6 +16,7 @@ internal sealed class SettingsForm : VesperPopupForm
     }
 
     private readonly VesperPreferences _draft;
+    private readonly DownloadEngine? _engine;
     private readonly VesperPalette _colors;
     private readonly Panel _content;
     private readonly Panel _sidebar;
@@ -40,9 +41,10 @@ internal sealed class SettingsForm : VesperPopupForm
     public VesperPreferences Result => _draft.Clone();
     public SettingsForm() : this(new VesperPreferences()) { }
 
-    public SettingsForm(VesperPreferences preferences)
+    public SettingsForm(VesperPreferences preferences, DownloadEngine? engine = null)
     {
         _draft = preferences.Clone();
+        _engine = engine;
         _colors = UiKit.Palette(_draft);
         VesperWindowChrome.Brand(this);
         Text = "VESPER Settings";
@@ -475,9 +477,9 @@ internal sealed class SettingsForm : VesperPopupForm
         about.Name = "aboutBuild";
         about.AccessibleName = "About VESPER";
         page.Controls.Add(about);
-        about.SetBounds(25, 594, 505, 40);
+        about.SetBounds(25, 704, 505, 30);
         about.AutoEllipsis = true;
-        page.AutoScrollMinSize = new Size(0, 650);
+        page.AutoScrollMinSize = new Size(0, 750);
         page.Resize += (_, _) => about.Width = Math.Max(120, page.ClientSize.Width - 50);
         var heading = Label("Browser downloads", 10, bold: true);
         heading.SetBounds(25, 109, 390, 25);
@@ -578,17 +580,60 @@ internal sealed class SettingsForm : VesperPopupForm
         var developerTip = Label("For unpacked Chrome builds: chrome://extensions → Developer mode → Load unpacked.", 8, muted: true);
         developerTip.SetBounds(25, 489, 505, 33);
 
+        var diagnosticsTitle = Label("Diagnostics", 9, bold: true);
+        diagnosticsTitle.SetBounds(25, 584, 300, 22);
+        var diagnosticsNote = Label(_engine is null
+            ? "Open Settings from the running VESPER window to export diagnostics."
+            : "Exports system details and the redacted event log. Event details can include filenames; review before sharing.", 8, muted: true);
+        diagnosticsNote.SetBounds(25, 608, 505, 34);
+        diagnosticsNote.AutoEllipsis = false;
+        var exportDiagnostics = Button("Export diagnostics bundle", 188, symbol: VesperIcon.Folder);
+        exportDiagnostics.Name = "exportDiagnostics";
+        exportDiagnostics.AccessibleName = "Export diagnostics bundle";
+        exportDiagnostics.SetBounds(25, 650, 188, 34);
+        exportDiagnostics.Enabled = _engine is not null;
+        exportDiagnostics.Click += (_, _) => ExportDiagnostics();
+
         page.Controls.AddRange([heading, note, statusTitle, status, sep1, handoff, action,
-            handoffNote, sep2, extensionTitle, extensionNote, open, repair, disconnect, updates, developerTip]);
+            handoffNote, sep2, extensionTitle, extensionNote, open, repair, disconnect, updates, developerTip,
+            diagnosticsTitle, diagnosticsNote, exportDiagnostics]);
         page.Resize += (_, _) =>
         {
             int right = page.ClientSize.Width - 25;
             action.Left = Math.Max(315, right - action.Width);
-            foreach (Label l in new[] { note, status, handoffNote, extensionNote, developerTip })
+            foreach (Label l in new[] { note, status, handoffNote, extensionNote, developerTip, diagnosticsNote })
                 l.Width = Math.Max(UiKit.Scale(this, 180), right - 25);
             handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
         };
         Refresh();
+    }
+
+    private void ExportDiagnostics()
+    {
+        if (_engine is null) return;
+        using var dialog = new SaveFileDialog
+        {
+            AddExtension = true,
+            DefaultExt = "zip",
+            FileName = $"VESPER-diagnostics-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip",
+            Filter = "Diagnostics archive (*.zip)|*.zip",
+            OverwritePrompt = true,
+            RestoreDirectory = true,
+            Title = "Export VESPER diagnostics"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            Diagnostics.ExportBundle(_engine, dialog.FileName, Vesper.Shared.BuildInfo.Version(typeof(SettingsForm).Assembly));
+            VesperMessageBox.Show(this, "The diagnostics archive was saved locally. It contains system details and a scrubbed event log; inspect it before sharing.",
+                "Diagnostics exported", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException
+            or NotSupportedException or System.Security.SecurityException)
+        {
+            VesperMessageBox.Show(this, "The diagnostics archive could not be saved. " + ex.Message,
+                "Diagnostics", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     private void BuildAppearance()
