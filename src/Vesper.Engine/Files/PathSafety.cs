@@ -73,9 +73,6 @@ public static class PathSafety
     }
     public static string ForDisplay(string path)
     {
-        string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return profile.Length > 0 && path.StartsWith(profile, StringComparison.OrdinalIgnoreCase)
-            ? "%USERPROFILE%" + path[profile.Length..]
-            : path;
+        return TryGetFullPath(path, out string full, out _) ? full : Environment.ExpandEnvironmentVariables(path);
     }
 }
