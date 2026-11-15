@@ -1,19 +1,54 @@
+using System.Diagnostics;
+using System.Runtime.Versioning;
 using System.Text;
 using Vesper.Engine;
+using Xunit.Abstractions;
 using Xunit;
 
 namespace Vesper.Tests;
 
 public sealed class MediaConversionTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public MediaConversionTests(ITestOutputHelper output) => _output = output;
+
     private static byte[] Audio()
     {
         string folder = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
         return [.. File.ReadAllBytes(Path.Combine(folder, "audio-init.mp4")), .. File.ReadAllBytes(Path.Combine(folder, "audio-1.m4s"))];
     }
 
-    [WindowsFact]
-    public async Task WindowsMediaFoundation_PreservesFragmentedAacInAnM4aOutput()
+    private static byte[] MuxedMp4()
+    {
+        using var videoSource = new MemoryStream(Fixture("video-only.mp4"));
+        using var audioSource = new MemoryStream(Audio());
+        DemuxedTrack video = Assert.Single(MediaMerger.Demux(videoSource, videoSource.Length, default));
+        DemuxedTrack audio = Assert.Single(MediaMerger.Demux(audioSource, audioSource.Length, default));
+        using var merged = new MemoryStream();
+        MediaMerger.Merge([(video, videoSource), (audio, audioSource)], "mp4", merged, default);
+        return merged.ToArray();
+    }
+
+    private static void AssertSameSamples(Stream source, DemuxedTrack expected, Stream output, DemuxedTrack actual)
+    {
+        Assert.Equal(expected.Codec, actual.Codec);
+        Assert.Equal(expected.PayloadBytes, actual.PayloadBytes);
+        Assert.Equal(expected.Samples.Count, actual.Samples.Count);
+        for (int i = 0; i < expected.Samples.Count; i++)
+        {
+            byte[] expectedSample = new byte[expected.Samples[i].Size];
+            byte[] actualSample = new byte[actual.Samples[i].Size];
+            source.Position = expected.Samples[i].Offset;
+            source.ReadExactly(expectedSample);
+            output.Position = actual.Samples[i].Offset;
+            output.ReadExactly(actualSample);
+            Assert.Equal(expectedSample, actualSample);
+        }
+    }
+
+    [Fact]
+    public async Task CompatibleFragmentedAacIsRemuxedToM4aWithoutReencoding()
     {
         await using var server = new FaultServer();
         byte[] sourceBytes = server.Extra["/audio.mp4"] = Audio();
@@ -47,6 +82,92 @@ public sealed class MediaConversionTests
         Assert.Equal(sourceAudio.SampleRate, outputAudio.SampleRate);
         Assert.NotEmpty(outputAudio.Samples);
         Assert.InRange(Math.Abs(outputAudio.DurationSeconds - sourceAudio.DurationSeconds), 0, 0.05);
+        AssertSameSamples(source, sourceAudio, output, outputAudio);
+    }
+
+    [Fact]
+    public async Task CompatibleH264AacMp4IsRemuxedWithoutReencoding()
+    {
+        await using var server = new FaultServer();
+        byte[] sourceBytes = server.Extra["/muxed.mp4"] = MuxedMp4();
+        await server.StartAsync();
+        using var harness = new Harness();
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/muxed.mp4"), FileName: "muxed.mp4",
+            MediaProvider: "fixture", Output: MediaOutput.Mp4));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal("muxed.mp4", done.FileName);
+        using var source = new MemoryStream(sourceBytes);
+        using var output = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> sourceTracks = MediaMerger.Demux(source, source.Length, default);
+        List<DemuxedTrack> outputTracks = MediaMerger.Demux(output, output.Length, default);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio], outputTracks.Select(track => track.Kind));
+        AssertSameSamples(source, sourceTracks[0], output, outputTracks[0]);
+        AssertSameSamples(source, sourceTracks[1], output, outputTracks[1]);
+    }
+
+    [WindowsFact]
+    public async Task WindowsMediaFoundationDecodesAacToWavWhenPcmIsRequested()
+    {
+        await using var server = new FaultServer();
+        byte[] sourceBytes = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = AddAudio(harness, server, MediaOutput.Wav);
+
+        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("audio.wav", done.FileName);
+        using var source = new MemoryStream(sourceBytes);
+        DemuxedTrack sourceAudio = Assert.Single(MediaMerger.Demux(source, source.Length, default));
+        using var wave = File.OpenRead(done.FinalPath!);
+        var info = WaveAudio.Read(wave);
+        Assert.Equal(sourceAudio.Channels, info.Channels);
+        Assert.Equal(sourceAudio.SampleRate, info.SampleRate);
+        Assert.InRange(Math.Abs(info.Duration - sourceAudio.DurationSeconds), 0, 0.05);
+    }
+
+    [WindowsFact]
+    [Trait("Category", "ConversionBenchmark")]
+    [SupportedOSPlatform("windows")]
+    public async Task MeasureSmallAacM4aRemuxAgainstMediaFoundationTranscoding()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await using var server = new FaultServer();
+        byte[] source = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+
+        async Task<double> Run(bool useMediaFoundation)
+        {
+            Action<string, string, string, MediaOutput, CancellationToken>? converter = useMediaFoundation
+                ? (path, extension, target, output, ct) => WindowsMediaConverter.Convert(path, extension, target, output, ct)
+                : null;
+            using var harness = new Harness(convertMedia: converter);
+            var timer = Stopwatch.StartNew();
+            Guid id = AddAudio(harness, server);
+            JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+            timer.Stop();
+            Assert.Equal("audio.m4a", done.FileName);
+            return timer.Elapsed.TotalMilliseconds;
+        }
+
+        var remuxTimes = new List<double>();
+        var transcodeTimes = new List<double>();
+        for (int run = 0; run < 10; run++)
+        {
+            bool useMediaFoundation = run % 2 != 0;
+            double elapsed = await Run(useMediaFoundation);
+            if (run < 2) continue;
+            (useMediaFoundation ? transcodeTimes : remuxTimes).Add(elapsed);
+        }
+
+        static double Median(List<double> values)
+        {
+            double[] sorted = values.Order().ToArray();
+            return sorted[sorted.Length / 2];
+        }
+        _output.WriteLine($"AAC M4A conversion: source-bytes={source.Length}; runs={remuxTimes.Count}; remux-p50-ms={Median(remuxTimes):0.###}; MediaFoundation-transcode-p50-ms={Median(transcodeTimes):0.###}");
     }
 
     [Fact]
@@ -104,10 +225,10 @@ public sealed class MediaConversionTests
         Assert.Equal(moved ? 1 : 2, conversions);
     }
 
-    private static Guid AddAudio(Harness h, FaultServer server)
+    private static Guid AddAudio(Harness h, FaultServer server, MediaOutput output = MediaOutput.M4a)
     {
         AddResult added = h.Engine.Add(new AddRequest(server.Url("/audio.mp4"), FileName: "audio.mp4",
-            MediaProvider: "fixture", Output: MediaOutput.M4a));
+            MediaProvider: "fixture", Output: output));
         Assert.True(added.Ok, added.Message);
         return added.JobId;
     }
