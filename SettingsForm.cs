@@ -1,3 +1,5 @@
+using Vesper.Engine;
+
 namespace VESPER;
 
 // Editing happens on a copy. Only Save applies the preferences to the running app.
@@ -233,7 +235,8 @@ internal sealed class SettingsForm : VesperPopupForm
         browse.Click += (_, _) =>
         {
             using var picker = new FolderBrowserDialog { Description = "Default folder for new downloads", UseDescriptionForTitle = true };
-            if (Directory.Exists(folder.Text)) picker.SelectedPath = folder.Text;
+            if (PathSafety.TryGetFullPath(folder.Text, out string selected, out _) && Directory.Exists(selected))
+                picker.SelectedPath = selected;
             if (picker.ShowDialog(this) == DialogResult.OK) folder.Text = picker.SelectedPath;
         };
         var separator1 = Divider(219);
@@ -661,13 +664,14 @@ internal sealed class SettingsForm : VesperPopupForm
             }
             values.Add((int)kb);
         }
-        if (string.IsNullOrWhiteSpace(_draft.DefaultFolder) || !Path.IsPathFullyQualified(_draft.DefaultFolder))
+        if (!PathSafety.TryGetFullPath(_draft.DefaultFolder, out string defaultFolder, out _))
         {
             ShowPage("Downloads");
             VesperMessageBox.Show(this, "Choose a valid absolute default folder path.", "Invalid folder",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
+        _draft.DefaultFolder = defaultFolder;
         if (_draft.ScheduleEnabled && (!TimeOnly.TryParse(_scheduleStart.Text, out _) || !TimeOnly.TryParse(_scheduleEnd.Text, out _)))
         {
             ShowPage("Network");

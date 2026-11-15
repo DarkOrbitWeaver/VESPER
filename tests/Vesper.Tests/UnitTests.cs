@@ -142,6 +142,39 @@ public class FileNameTests
     }
 }
 
+public class PathSafetyTests
+{
+    [Fact]
+    public void Destination_paths_expand_environment_variables_before_validation()
+    {
+        string variable = "VESPER_TEST_PATH_" + Guid.NewGuid().ToString("N");
+        string? previous = Environment.GetEnvironmentVariable(variable);
+        string root = Path.Combine(Path.GetTempPath(), "vesper-path-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, root);
+            string tokenPath = $"%{variable}%{Path.DirectorySeparatorChar}Downloads";
+
+            Assert.True(PathSafety.TryGetFullPath(tokenPath, out string full, out string error), error);
+            Assert.Equal(Path.GetFullPath(Path.Combine(root, "Downloads")), full);
+            Assert.False(Directory.Exists(full));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, previous);
+        }
+    }
+
+    [Fact]
+    public void Destination_paths_still_reject_parent_segments()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "..", "outside");
+
+        Assert.False(PathSafety.TryGetFullPath(path, out _, out string error));
+        Assert.Contains("cannot contain", error);
+    }
+}
+
 public class UrlPolicyTests
 {
     [Theory]
