@@ -7,6 +7,9 @@ importScripts('player-source.js');
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
 const MAX_SOURCES = 25;
+const MAX_TOTAL_SOURCES = 200;
+const SOURCE_TTL = 10 * 60_000;
+const SOURCE_EXPIRY_ALARM = 'vesper-media-sources';
 const DEFAULTS = {
   handoff: 'download',         // default = VESPER decides, download, queue
   route: 'auto',
@@ -280,6 +283,9 @@ const mediaPrefetchAt = new Map();
 const MEDIA_PREFETCH_TTL = 30_000;
 const MEDIA_PREFETCH_COOLDOWN = 15_000;
 const MEDIA_PREFETCH_LIMIT = 32;
+let sourceExpiryScheduled = false;
+let sourceStorageReady = null;
+let sourceBudgetWrites = Promise.resolve();
 
 function forgetTab(tabId) {
   clearTimeout(tabFlushTimers.get(tabId));
@@ -302,6 +308,94 @@ function cachedMediaOptions(key) {
   return mediaPrefetchCache.get(key)?.reply;
 }
 
+function pruneSourceList(sources, now = Date.now()) {
+  return (Array.isArray(sources) ? sources : [])
+    .filter(source => Number.isFinite(source.seen) && source.seen >= now - SOURCE_TTL && source.seen <= now + 1000)
+    .slice(-MAX_SOURCES);
+}
+
+async function loadObservedSources() {
+  const stored = await chrome.storage.session.get(null);
+  const now = Date.now();
+  for (const [key, value] of Object.entries(stored)) {
+    if (!/^tab:\d+$/.test(key)) continue;
+    const tabId = Number(key.slice(4));
+    if (!Number.isSafeInteger(tabId)) continue;
+    const state = tabStates.get(tabId) || (value && typeof value === 'object' ? value : null);
+    if (!state) continue;
+    state.sources = pruneSourceList(state.sources, now);
+    tabStates.set(tabId, state);
+  }
+  await enforceSourceBudget();
+}
+
+function ensureObservedSourcesLoaded() {
+  if (!sourceStorageReady)
+    sourceStorageReady = loadObservedSources().catch(error => {
+      sourceStorageReady = null;
+      throw error;
+    });
+  return sourceStorageReady;
+}
+
+function enforceSourceBudget() {
+  const work = sourceBudgetWrites.catch(() => {}).then(async () => {
+    const entries = [];
+    for (const [tabId, state] of tabStates)
+      for (const source of state.sources || []) entries.push({ tabId, source });
+    if (entries.length <= MAX_TOTAL_SOURCES) return;
+
+    entries.sort((a, b) => a.source.seen - b.source.seen);
+    const excess = entries.length - MAX_TOTAL_SOURCES;
+    const removed = new Map();
+    for (const { tabId, source } of entries.slice(0, excess)) {
+      if (!removed.has(tabId)) removed.set(tabId, new Set());
+      removed.get(tabId).add(source);
+    }
+
+    for (const [tabId, sources] of removed) await inTabOrder(tabId, async () => {
+      const state = await tabState(tabId, { skipSourceLoad: true });
+      const count = state.sources.length;
+      state.sources = state.sources.filter(source => !sources.has(source));
+      if (state.sources.length !== count) await saveTabState(tabId, state, { force: true });
+    });
+  });
+  sourceBudgetWrites = work.catch(() => {});
+  return work;
+}
+
+async function scheduleSourceExpiry() {
+  if (sourceExpiryScheduled) return;
+  const alarm = await chrome.alarms.get(SOURCE_EXPIRY_ALARM);
+  if (!alarm) await chrome.alarms.create(SOURCE_EXPIRY_ALARM, { delayInMinutes: SOURCE_TTL / 60_000 });
+  sourceExpiryScheduled = true;
+}
+
+async function pruneObservedSources() {
+  sourceExpiryScheduled = false;
+  const stored = await chrome.storage.session.get(null);
+  const now = Date.now();
+  for (const key of Object.keys(stored)) {
+    if (!key.startsWith('tab:') || !/^tab:\d+$/.test(key)) continue;
+    const tabId = Number(key.slice(4));
+    await inTabOrder(tabId, async () => {
+      const state = (await chrome.storage.session.get(key))[key];
+      if (!state || typeof state !== 'object') return;
+      state.sources = pruneSourceList(state.sources, now);
+      tabStates.set(tabId, state);
+      await chrome.storage.session.set({ [key]: state });
+    });
+  }
+  await enforceSourceBudget();
+  let nextExpiry = Infinity;
+  for (const state of tabStates.values())
+    for (const source of state.sources || []) nextExpiry = Math.min(nextExpiry, source.seen + SOURCE_TTL);
+  if (Number.isFinite(nextExpiry)) {
+    await chrome.alarms.create(SOURCE_EXPIRY_ALARM, { when: Math.max(Date.now() + 30_000, nextExpiry) });
+    sourceExpiryScheduled = true;
+  }
+}
+
 function rememberMediaOptions(key, tab, reply) {
   if (!reply?.ok || (!reply.data?.choices?.length && !reply.data?.sourceChoices?.length)) return;
   while (mediaPrefetchCache.size >= MEDIA_PREFETCH_LIMIT)
@@ -316,17 +410,29 @@ function supportsMediaPrefetch(page) {
     .some(domain => host === domain || host.endsWith('.' + domain));
 }
 
-async function tabState(tabId) {
-  if (tabStates.has(tabId)) return tabStates.get(tabId);
+function isWholeDirectSource(source) {
+  if (!source.wholeRepresentation || source.kind !== 'direct') return false;
+  const url = VesperPlayerSource.http(source.url);
+  if (!url || SEGMENT.test(url.href)
+      || ['range', 'sq', 'segment'].some(key => url.searchParams.has(key))) return false;
+  return /^(?:audio|video)\//i.test(source.mime || '') || DIRECT.test(url.href);
+}
+
+async function tabState(tabId, { skipSourceLoad = false } = {}) {
+  if (!skipSourceLoad) await ensureObservedSourcesLoaded();
   const key = `tab:${tabId}`;
-  const stored = (await chrome.storage.session.get(key))[key];
-  const state = stored || { sources: [], unsupported: null, title: '', duration: null, poster: '' };
+  const cached = tabStates.get(tabId);
+  const state = cached || (await chrome.storage.session.get(key))[key]
+    || { sources: [], unsupported: null, title: '', duration: null, poster: '' };
+  const previousCount = Array.isArray(state.sources) ? state.sources.length : 0;
+  state.sources = pruneSourceList(state.sources);
+  if (state.sources.length !== previousCount) await chrome.storage.session.set({ [key]: state });
   tabStates.set(tabId, state);
   return state;
 }
 
 async function saveTabState(tabId, state, { force = false } = {}) {
-  state.sources = state.sources.slice(-MAX_SOURCES);
+  state.sources = pruneSourceList(state.sources);
   tabStates.set(tabId, state);
   const now = Date.now();
   const lastWrite = tabStateWrites.get(tabId) || 0;
@@ -367,23 +473,29 @@ function isYouTubePage(page) {
 
 async function addSource(tabId, source) {
   if (tabId < 0 || !source.documentId || !VesperPlayerSource.http(source.url) || SEGMENT.test(source.url)) return;
+  await ensureObservedSourcesLoaded();
   await inTabOrder(tabId, async () => {
     const state = await tabState(tabId);
     const seen = source.seen ?? Date.now();
     const match = s => s.documentId === source.documentId && s.frameId === source.frameId && s.url === source.url;
     const previous = state.sources.find(match);
-    state.sources = state.sources.filter(s => !match(s) && s.seen >= seen - 10 * 60_000);
+    state.sources = state.sources.filter(s => !match(s));
     state.sources.push({ ...previous, ...source, seen });
     await saveTabState(tabId, state);
+    await scheduleSourceExpiry();
   });
+  await enforceSourceBudget();
 }
 
 function sourceLabel(source, index) {
   const url = new URL(source.url);
+  const label = source.kind === 'direct' ? `${typeName(source.mime)} stream ${index + 1}`
+    : `${source.kind.toUpperCase()} stream ${index + 1}`;
+  const size = Number.isSafeInteger(source.bytes) && source.bytes >= 524288 ? mb(source.bytes) : '';
   return {
     token: source.token,
-    label: `${source.kind.toUpperCase()} stream ${index + 1}`,
-    detail: url.hostname
+    label,
+    detail: [url.hostname, size].filter(Boolean).join(' · ')
   };
 }
 
@@ -407,13 +519,24 @@ const observeMediaResponse = (details) => {
   const header = (name) => details.responseHeaders?.find((h) => h.name.toLowerCase() === name)?.value;
   const type = header('content-type') || '';
   const range = header('content-range');
-  const bytes = range ? Number(range.split('/')[1]) : Number(header('content-length')) || null;
+  const rangeMatch = /^bytes\s+(\d+)-(\d+)\/(\d+)$/i.exec(range || '');
+  const rangeStart = rangeMatch ? Number(rangeMatch[1]) : null;
+  const rangeEnd = rangeMatch ? Number(rangeMatch[2]) : null;
+  const total = rangeMatch ? Number(rangeMatch[3]) : null;
+  const contentLength = header('content-length') === undefined ? null : Number(header('content-length'));
+  const bytes = Number.isSafeInteger(total) && total > 0 ? total
+    : Number.isSafeInteger(contentLength) && contentLength > 0 ? contentLength : null;
+  const fullRange = !!(details.statusCode === 206 && rangeMatch
+    && Number.isSafeInteger(rangeStart) && Number.isSafeInteger(rangeEnd) && Number.isSafeInteger(total)
+    && rangeStart === 0 && rangeEnd + 1 === total && total > 0
+    && (contentLength === null || Number.isSafeInteger(contentLength) && contentLength === total));
   const isPlaylist = /\.(m3u8|mpd)(\?|$)/i.test(details.url) || /mpegurl|dash\+xml/i.test(type);
   if (!isPlaylist && !(details.type === 'media' || DIRECT.test(details.url) || /^(?:audio|video)\//i.test(type))) return;
   return addSource(details.tabId, {
     url: details.url,
     kind: VesperPlayerSource.kind(details.url, type), mime: type.split(';')[0].trim().toLowerCase(), bytes,
-    complete: !isPlaylist && (details.statusCode === 200 || Number.isSafeInteger(bytes) && bytes > 0),
+    // This means headers describe the whole representation; VESPER still fetches and validates the URL itself.
+    wholeRepresentation: !isPlaylist && (details.statusCode === 200 || fullRange),
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
   }).catch(() => {});
  };
@@ -490,42 +613,45 @@ async function playerOptions(message, sender) {
       return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
     };
     const matchedManifest = manifest && observed(manifest);
-    const possibleManifests = [];
-    if (!manifest && source === null && message.playerPlaying === true && Number.isInteger(message.generation) && message.generation > 0
+    const possibleSources = [];
+    if (!matchedManifest && source === null && message.playerPlaying === true && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
-      const manifestCutoff = Math.max(now - 120_000, changedAt - 2000);
+      const sourceCutoff = Math.max(now - 15_000, changedAt - 15_000);
+      const sourceLimit = changedAt + 15_000;
       for (const evidence of state.sources) {
-        if (currentEvidence(evidence) && evidence.seen >= manifestCutoff && ['hls', 'dash'].includes(evidence.kind)
-            && !possibleManifests.some(item => item.url === evidence.url))
-          possibleManifests.push(evidence);
+        const recent = evidence.seen >= sourceCutoff && evidence.seen <= sourceLimit;
+        const isManifest = ['hls', 'dash'].includes(evidence.kind);
+        if (currentEvidence(evidence) && recent && (isManifest || isWholeDirectSource(evidence))
+            && !possibleSources.some(item => item.url === evidence.url))
+          possibleSources.push(evidence);
       }
     }
     if (prefetch) {
-      if (!supportsMediaPrefetch(page) && !matching && !matchedManifest && possibleManifests.length === 0)
+      if (!supportsMediaPrefetch(page) && !matching && !matchedManifest && possibleSources.length === 0)
         return { ok: true, data: { prefetchSkipped: true } };
       const lastPrefetch = mediaPrefetchAt.get(tab);
       if (lastPrefetch !== undefined && now - lastPrefetch < MEDIA_PREFETCH_COOLDOWN)
         return { ok: true, data: { prefetchSkipped: true } };
       mediaPrefetchAt.set(tab, now);
     }
-    if (route !== 'chrome' && possibleManifests.length > 0) {
-      const sources = possibleManifests.sort((a, b) => b.seen - a.seen);
+    if (route !== 'chrome' && possibleSources.length > 0) {
+      const sources = possibleSources.sort((a, b) => b.seen - a.seen);
       const sourceChoices = rememberSourceSelections(sources, { identity, tab, frame, documentId: sender.documentId,
         generation: message.generation, playerUrl: source?.href || message.playerUrl, title: binding ? message.title : undefined });
       return { ok: true, data: { title: binding ? message.title : undefined, sourceChoices } };
     }
     const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
       .filter(Boolean).map(candidate);
-    const complete = source && matching?.kind === 'direct' && matching.complete && /^(?:audio|video)\//.test(matching.mime)
+    const wholeRepresentation = source && matching?.kind === 'direct' && matching.wholeRepresentation && /^(?:audio|video)\//.test(matching.mime)
       && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
       const reply = await nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: title,
         candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
-      if (reply.ok || !complete || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
+      if (reply.ok || !wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
     }
-    if (!complete) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a complete file for this player.' };
+    if (!wholeRepresentation) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
     await browserChoicesReady;
     const token = crypto.randomUUID();
     const container = typeName(matching.mime);
@@ -584,7 +710,7 @@ async function selectMediaSource(message, sender) {
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   const { route } = await settings();
   if (route === 'chrome')
-    return { ok: false, code: 'chrome-format', message: 'Chrome has not exposed a complete file for this player.' };
+    return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
   return nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: selection.title,
     candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }

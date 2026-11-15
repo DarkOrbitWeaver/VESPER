@@ -12,7 +12,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
     return {
-      get: async key => structuredClone({ [key]: data[key] }),
+      get: async key => structuredClone(key === null ? data : { [key]: data[key] }),
       set: async values => Object.assign(data, structuredClone(values)),
       remove: async key => { delete data[key]; }
     };
@@ -100,6 +100,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     localData,
     advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
+    expireSources: () => { alarms.delete('vesper-media-sources'); return onAlarm({ name: 'vesper-media-sources' }); },
     // Chrome always stamps the sender. A bare call models VESPER's own page; a sender with a tab models a content script.
     message: (msg, sender = {}) => new Promise(resolve => onMessage(msg, {
       id: 'vesper-test', ...(sender.tab || sender.url ? { url: sender.tab?.url } : { url: 'chrome-extension://vesper-test/transfers.html' }), ...sender
@@ -781,6 +782,161 @@ test('a blob player must choose even a single inferred manifest before VESPER re
     pageUrl: page, generation: 3, playerUrl: message.playerUrl }, sender);
   assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
     ['https://cdn.example.com/video/playlist.m3u8']);
+});
+
+test('an Instagram blob player can choose a complete browser-observed video response', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://www.instagram.com/reel/abc123/';
+  const sender = { url: page, tab: { id: 19 }, frameId: 0, documentId: 'instagram-player' };
+  const changedAt = Date.now();
+  const mediaUrl = 'https://scontent.cdninstagram.com/v/t50.2886-16/video.mp4?signature=short-lived';
+  await app.onMedia({ url: mediaUrl, tabId: 19, frameId: 0, documentId: sender.documentId,
+    method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 100,
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+
+  const message = { type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 4, playerPlaying: true, mediaChangedAt: changedAt };
+  const options = await app.message(message, sender);
+  assert.equal(options.ok, true);
+  assert.equal(options.data.sourceChoices.length, 1);
+  assert.equal(JSON.stringify(options.data.sourceChoices).includes('signature='), false);
+  assert.match(options.data.sourceChoices[0].label, /MP4/);
+  assert.deepEqual(app.sent, []);
+
+  await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
+    pageUrl: page, generation: 4, playerUrl: message.playerUrl }, sender);
+  assert.equal(app.sent[0].candidates[0].url, mediaUrl);
+});
+
+test('an Instagram carousel with multiple observed videos requires the user to choose one', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://www.instagram.com/p/abc123/';
+  const sender = { url: page, tab: { id: 22 }, frameId: 0, documentId: 'instagram-carousel' };
+  const changedAt = Date.now();
+  const first = 'https://scontent.cdninstagram.com/v/t50.2886-16/first.mp4?sig=one';
+  const second = 'https://scontent.cdninstagram.com/v/t50.2886-16/second.mp4?sig=two';
+  for (const [url, size, seen] of [[first, 3_000_000, 100], [second, 1_000_000, 200]])
+    await app.onMedia({ url, tabId: 22, frameId: 0, documentId: sender.documentId, method: 'GET',
+      statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + seen,
+      responseHeaders: [
+        { name: 'Content-Type', value: 'video/mp4' },
+        { name: 'Content-Length', value: String(size) }
+      ] });
+
+  const message = { type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 7, playerPlaying: true, mediaChangedAt: changedAt };
+  const options = await app.message(message, sender);
+  assert.equal(options.data.sourceChoices.length, 2);
+  assert.match(options.data.sourceChoices[0].detail, /1\.0 MB/);
+  assert.match(options.data.sourceChoices[1].detail, /2\.9 MB/);
+  assert.deepEqual(app.sent, []);
+
+  await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[1].token,
+    pageUrl: page, generation: 7, playerUrl: message.playerUrl }, sender);
+  assert.equal(app.sent[0].candidates[0].url, first);
+});
+
+test('a late same-frame ad response is not correlated to the active Instagram player', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://www.instagram.com/reel/abc123/';
+  const sender = { url: page, tab: { id: 23 }, frameId: 0, documentId: 'instagram-active-player' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://scontent.cdninstagram.com/ads/ad.mp4?token=not-the-reel', tabId: 23,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 16_000, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+  app.advanceTime(16_000);
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 8, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.data?.sourceChoices, undefined);
+  assert.equal(app.sent[0].candidates.length, 0);
+});
+
+test('a late same-frame playlist response is not correlated to the active Instagram player', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://www.instagram.com/reel/abc123/';
+  const sender = { url: page, tab: { id: 25 }, frameId: 0, documentId: 'instagram-active-player' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://scontent.cdninstagram.com/ads/ad.m3u8', tabId: 25, frameId: 0,
+    documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 16_000,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  app.advanceTime(16_000);
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 9, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.data?.sourceChoices, undefined);
+  assert.equal(app.sent[0].candidates.length, 0);
+});
+
+test('a partial video range is not offered as a complete Instagram source', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://www.instagram.com/reel/abc123/';
+  const sender = { url: page, tab: { id: 20 }, frameId: 0, documentId: 'instagram-range-player' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://scontent.cdninstagram.com/v/t50.2886-16/video.mp4', tabId: 20,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 206, type: 'xmlhttprequest',
+    timeStamp: changedAt + 100, responseHeaders: [
+      { name: 'Content-Type', value: 'video/mp4' },
+      { name: 'Content-Range', value: 'bytes 0-999/5000' },
+      { name: 'Content-Length', value: '1000' }
+    ] });
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 5, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.sourceChoices, undefined);
+  assert.equal(app.sent[0].candidates.length, 0);
+
+  const completeApp = load({ 'media-options': { ok: true } });
+  const completeSender = { url: page, tab: { id: 21 }, frameId: 0, documentId: 'instagram-full-range-player' };
+  await completeApp.onMedia({ url: 'https://scontent.cdninstagram.com/v/t50.2886-16/video.mp4', tabId: 21,
+    frameId: 0, documentId: completeSender.documentId, method: 'GET', statusCode: 206, type: 'xmlhttprequest',
+    timeStamp: changedAt + 200, responseHeaders: [
+      { name: 'Content-Type', value: 'video/mp4' },
+      { name: 'Content-Range', value: 'bytes 0-4999/5000' },
+      { name: 'Content-Length', value: '5000' }
+    ] });
+  const full = await completeApp.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://www.instagram.com/player', generation: 6, playerPlaying: true, mediaChangedAt: changedAt }, completeSender);
+  assert.equal(full.data.sourceChoices.length, 1);
+});
+
+test('signed media response URLs are removed from session storage after their TTL', async () => {
+  const sessionData = {};
+  const app = load({}, { sessionData });
+  const mediaUrl = 'https://scontent.cdninstagram.com/video.mp4?signature=short-lived';
+  const seenAt = Date.now();
+  await app.onMedia({ url: mediaUrl, tabId: 24, frameId: 0, documentId: 'instagram-ttl', method: 'GET',
+    statusCode: 200, type: 'xmlhttprequest', timeStamp: seenAt,
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+  assert.equal(sessionData['tab:24'].sources[0].url, mediaUrl);
+
+  app.advanceTime(10 * 60_000 + 1000);
+  await app.expireSources();
+  assert.deepEqual(sessionData['tab:24'].sources, []);
+});
+
+test('observed media sources stay under a global session-storage budget', async () => {
+  const sessionData = {};
+  const now = Date.now();
+  for (let tabId = 1; tabId <= 9; tabId++) {
+    sessionData[`tab:${tabId}`] = { sources: Array.from({ length: 25 }, (_, index) => ({
+      url: `https://cdn.example.com/${tabId}/${index}.mp4`, kind: 'direct', mime: 'video/mp4',
+      documentId: `doc-${tabId}`, frameId: 0, seen: now - (225 - ((tabId - 1) * 25 + index)) * 1000
+    })) };
+  }
+  const app = load({}, { sessionData });
+  await app.onMedia({ url: 'https://cdn.example.com/newest.mp4', tabId: 10, frameId: 0, documentId: 'doc-10',
+    method: 'GET', statusCode: 200, type: 'media', timeStamp: now,
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+
+  const stored = Object.entries(sessionData).filter(([key]) => /^tab:\d+$/.test(key));
+  const sourceCount = stored.reduce((count, [, state]) => count + state.sources.length, 0);
+  assert.ok(sourceCount <= 200);
+  assert.equal(sessionData['tab:10'].sources.length, 1);
+  assert.equal(sessionData['tab:1'].sources.some(source => source.url.endsWith('/0.mp4')), false);
+  assert.ok(stored.every(([, state]) => state.sources.length <= 25));
 });
 
 test('an ambiguous blob player shows scoped stream choices before sending a candidate to VESPER', async () => {

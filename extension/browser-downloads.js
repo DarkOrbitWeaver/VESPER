@@ -615,7 +615,10 @@ async function captureChromeDownload(item) {
   if (wanted) await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
 }
 
-chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {}); });
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {});
+  if (alarm.name === SOURCE_EXPIRY_ALARM) return pruneObservedSources().catch(() => {});
+});
 chrome.downloads.onCreated.addListener(item => {
   const wake = wakeChromeActivity().catch(() => {});
   const capture = captureChromeDownload(item).catch(() => {});
