@@ -8,7 +8,6 @@ import { webcrypto } from 'node:crypto';
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   localData = {}, cookies = [{ name: 'session', value: 'test-value' }] } = {}) {
   const listeners = [];
-  const noop = () => {};
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
     return {
@@ -17,11 +16,12 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       remove: async key => { delete data[key]; }
     };
   };
-  let onMessage, onCreated, onChanged, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked;
+  let onMessage, onCreated, onChanged, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked, onInstalled;
   const sent = [];
   const actions = [];
   const cookieLookups = [];
   const badges = [];
+  const contextMenuItems = [];
   const alarms = new Map();
   const ports = [];
   const local = storage(localData);
@@ -29,7 +29,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const chrome = {
     runtime: {
       id: 'vesper-test',
-      onMessage: { addListener: fn => { onMessage = fn; } }, onInstalled: event, onStartup: event, lastError: undefined,
+      onMessage: { addListener: fn => { onMessage = fn; } }, onInstalled: { addListener: fn => { onInstalled = fn; } }, onStartup: event, lastError: undefined,
       sendNativeMessage: (host, message, cb) => {
         actions.push('native');
         sent.push(message);
@@ -46,7 +46,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       onBeforeRedirect: { addListener: fn => { onRedirect = fn; } }
     },
     tabs: { onUpdated: event, onRemoved: event, query: async () => [] },
-    contextMenus: { create: noop, removeAll: async () => {}, onClicked: { addListener: fn => { onContextClicked = fn; } } },
+    contextMenus: { create: item => contextMenuItems.push(item), removeAll: async () => { contextMenuItems.length = 0; }, onClicked: { addListener: fn => { onContextClicked = fn; } } },
     alarms: {
       get: async name => alarms.get(name),
       create: async (name, details) => alarms.set(name, details),
@@ -96,8 +96,9 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent, actions, cookieLookups, badges, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
+  return { describe: context.__describe, sent, actions, cookieLookups, badges, contextMenuItems, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
     localData,
+    install: () => onInstalled(),
     advanceTime: milliseconds => { now += milliseconds; },
     recover: () => { alarms.delete('vesper-chrome-downloads'); return onAlarm({ name: 'vesper-chrome-downloads' }); },
     expireSources: () => { alarms.delete('vesper-media-sources'); return onAlarm({ name: 'vesper-media-sources' }); },
@@ -1663,6 +1664,32 @@ test('right-clicking an ordinary video still downloads it directly', async () =>
   await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'https://cdn.example/clip.mp4', pageUrl: tab.url }, tab);
   assert.equal(app.sent[0].type, 'submit');
   assert.equal(app.sent[0].items[0].url, 'https://cdn.example/clip.mp4');
+});
+
+test('right-clicking an ordinary page control opens discovery without replaying the control', async () => {
+  const frameUrl = 'https://player.example/embed';
+  const app = load({ 'media-picker': { ok: true } }, {
+    prefs: { useSignIn: true }, signInPermission: true,
+    cookies: [{ name: 'session', value: 'authorized', sameSite: 'lax' }]
+  });
+  const tab = { id: 9, url: 'https://video.example/watch' };
+  await app.onContextClicked({ menuItemId: 'vesper-page-media', pageUrl: tab.url, frameUrl, frameId: 2 }, tab);
+
+  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent[0].type, 'media-picker');
+  assert.equal(app.sent[0].url, frameUrl);
+  assert.equal(app.sent[0].authorized, true);
+  assert.equal(app.sent[0].mediaAuth.cookie, 'session=authorized');
+  assert.equal(app.sent.some(message => message.type === 'submit'), false);
+});
+
+test('the page-media action is registered for ordinary page and frame contexts', async () => {
+  const app = load();
+  await app.install();
+  const item = app.contextMenuItems.find(menu => menu.id === 'vesper-page-media');
+
+  assert.equal(item.title, 'Find video on this page with VESPER');
+  assert.equal(Array.from(item.contexts).join(','), 'page,frame');
 });
 
 test('right-clicking a blob video on a page that cannot be inspected says so', async () => {
