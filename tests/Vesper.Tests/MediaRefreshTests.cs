@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Vesper.Engine;
 using Vesper.MediaResolver.Models;
@@ -6,6 +7,31 @@ namespace Vesper.Tests;
 
 public sealed class MediaRefreshTests
 {
+    private static byte[] MediaFixture(string name) =>
+        File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
+
+    private static MediaMergePlan AudioPlan(string url, byte[] audio) => new()
+    {
+        Provider = "fixture", MediaId = "audio", OutputContainer = "m4a",
+        Tracks = [new MergeTrack("audio", "audio-format", url, audio.Length, "m4a", "aac", "audio-bytes-v1")]
+    };
+
+    private static MediaMergePlan VideoAudioPlan(string videoUrl, byte[] video, string audioUrl, byte[] audio) => new()
+    {
+        Provider = "fixture", MediaId = "video-audio", OutputContainer = "mp4",
+        Tracks =
+        [
+            new MergeTrack("video", "video-format", videoUrl, video.Length, "mp4", "h264", "video-bytes-v1"),
+            new MergeTrack("audio", "audio-format", audioUrl, audio.Length, "m4a", "aac", "audio-bytes-v1")
+        ]
+    };
+
+    private static void AssertSecretNotOnDisk(Harness harness, string secret)
+    {
+        foreach (string path in Directory.GetFiles(harness.Data, "*", SearchOption.AllDirectories))
+            Assert.DoesNotContain(secret, Encoding.UTF8.GetString(File.ReadAllBytes(path)), StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData("different", "video", "muxed-720")]
     [InlineData("fixture", "different", "muxed-720")]
@@ -106,6 +132,131 @@ public sealed class MediaRefreshTests
         Assert.False(result.Accepted);
         Assert.Contains("requires sign-in", result.Message);
         Assert.Equal(server.Url("/expires-after-truncate"), h.Engine.Snapshot(added.JobId)!.SourceUrl);
+    }
+
+    [Fact]
+    public async Task CredentialedMergeDownloadsWithScopedCookiesWithoutPersistingThem()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = MediaFixture("quiet-track-aac.m4a");
+        const string cookie = "session=merge-secret";
+        server.AuthenticatedFiles["/private/audio"] = (cookie, audio);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = AudioPlan(server.Url("/private/audio"), audio);
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "private-audio.m4a", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "audio", MediaFormatId: "audio-format",
+            MediaPlanJson: plan.ToJson(), Secrets: new Dictionary<string, string> { ["Cookie"] = cookie }));
+        Assert.True(added.Ok, added.Message);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.NotEmpty(server.RequestsFor("/private/audio"));
+        Assert.All(server.RequestsFor("/private/audio"), request => Assert.Equal(cookie, request.Cookie));
+        h.Engine.Dispose();
+        AssertSecretNotOnDisk(h, cookie);
+    }
+
+    [Fact]
+    public async Task FailedCredentialedMergeRefreshKeepsTheOldPlanAndCredentials()
+    {
+        await using var server = new FaultServer();
+        byte[] video = MediaFixture("video-only.mp4");
+        byte[] audio = MediaFixture("quiet-track-aac.m4a");
+        const string oldCookie = "session=old-merge-secret";
+        const string freshCookie = "session=fresh-merge-secret";
+        server.AuthenticatedFiles["/old/video"] = (oldCookie, video);
+        server.AuthenticatedFiles["/old/audio"] = (oldCookie, audio);
+        server.AuthenticatedFiles["/fresh/video"] = (freshCookie, video);
+        server.AuthenticatedFiles["/fresh/audio"] = ("session=other-path", audio);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = VideoAudioPlan(server.Url("/old/video"), video, server.Url("/old/audio"), audio);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "private-video.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "video-audio", MediaFormatId: "video-format+audio-format",
+            MediaPlanJson: oldPlan.ToJson(), Secrets: new Dictionary<string, string> { ["Cookie"] = oldCookie }));
+        Assert.True(added.Ok, added.Message);
+
+        MediaMergePlan freshPlan = VideoAudioPlan(server.Url("/fresh/video"), video, server.Url("/fresh/audio"), audio);
+        RescueResult result = await h.Engine.RefreshMergePlanWithCredentialsAsync(added.JobId, freshPlan.ToJson(),
+            DateTimeOffset.UtcNow.AddMinutes(5), new Dictionary<string, string> { ["Cookie"] = freshCookie });
+
+        Assert.False(result.Accepted);
+        Assert.Contains("requires different sign-in access", result.Message);
+        Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+        Assert.Equal(freshCookie, Assert.Single(server.RequestsFor("/fresh/video")).Cookie);
+        Assert.Equal(freshCookie, Assert.Single(server.RequestsFor("/fresh/audio")).Cookie);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.All(server.RequestsFor("/old/video"), request => Assert.Equal(oldCookie, request.Cookie));
+        Assert.All(server.RequestsFor("/old/audio"), request => Assert.Equal(oldCookie, request.Cookie));
+        Assert.Single(server.RequestsFor("/fresh/video"));
+        Assert.Single(server.RequestsFor("/fresh/audio"));
+        h.Engine.Dispose();
+        AssertSecretNotOnDisk(h, oldCookie);
+        AssertSecretNotOnDisk(h, freshCookie);
+    }
+
+    [Fact]
+    public async Task CredentialedMergeRefreshProbesAndDownloadsWithFreshCredentials()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = MediaFixture("quiet-track-aac.m4a");
+        const string cookie = "session=refreshed-merge-secret";
+        server.AuthenticatedFiles["/fresh/audio"] = (cookie, audio);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan oldPlan = AudioPlan(server.Url("/old/audio"), audio);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "refreshed-audio.m4a", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "audio", MediaFormatId: "audio-format",
+            MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        MediaMergePlan freshPlan = AudioPlan(server.Url("/fresh/audio"), audio);
+        RescueResult refreshed = await h.Engine.RefreshMergePlanWithCredentialsAsync(added.JobId, freshPlan.ToJson(),
+            DateTimeOffset.UtcNow.AddMinutes(5), new Dictionary<string, string> { ["Cookie"] = cookie });
+        Assert.True(refreshed.Accepted, refreshed.Message);
+        Assert.Equal(freshPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
+        Assert.True(server.RequestsFor("/fresh/audio").Count >= 2); // one probe and at least one transfer range
+        Assert.All(server.RequestsFor("/fresh/audio"), request => Assert.Equal(cookie, request.Cookie));
+        h.Engine.Dispose();
+        AssertSecretNotOnDisk(h, cookie);
+    }
+
+    [Fact]
+    public async Task CredentialedMergeSecretsDoNotSurviveAnEngineRestart()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = MediaFixture("quiet-track-aac.m4a");
+        const string cookie = "session=restart-merge-secret";
+        server.AuthenticatedFiles["/private/audio"] = (cookie, audio);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = AudioPlan(server.Url("/private/audio"), audio);
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "restart-audio.m4a", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "audio", MediaFormatId: "audio-format",
+            MediaPlanJson: plan.ToJson(), Secrets: new Dictionary<string, string> { ["Cookie"] = cookie }));
+        Assert.True(added.Ok, added.Message);
+
+        h.Restart();
+        JobSnapshot needsLink = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.Contains("refused", needsLink.Message);
+        Assert.NotEmpty(server.RequestsFor("/private/audio"));
+        Assert.All(server.RequestsFor("/private/audio"), request => Assert.Null(request.Cookie));
+        h.Engine.Dispose();
+        AssertSecretNotOnDisk(h, cookie);
     }
 
     [Fact]

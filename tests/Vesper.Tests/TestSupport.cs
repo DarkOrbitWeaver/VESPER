@@ -53,6 +53,7 @@ internal sealed class FaultServer : IAsyncDisposable
     public ConcurrentDictionary<string, ConcurrentQueue<ObservedHeaders>> Requests { get; } = new();
     /// <summary>Additional range-capable payloads by path (merge-job tests register synthetic media here).</summary>
     public ConcurrentDictionary<string, byte[]> Extra { get; } = new();
+    public ConcurrentDictionary<string, (string Cookie, byte[] Data)> AuthenticatedFiles { get; } = new();
 
     public sealed record ObservedHeaders(string? Cookie, string? Authorization, string? Referer);
 
@@ -95,6 +96,16 @@ internal sealed class FaultServer : IAsyncDisposable
             return;
         }
         if (path.StartsWith("/hls/")) { await HandleHls(ctx, path); return; }
+        if (AuthenticatedFiles.TryGetValue(path, out var authenticated))
+        {
+            if (!string.Equals(ctx.Request.Headers.Cookie, authenticated.Cookie, StringComparison.Ordinal))
+            {
+                res.StatusCode = 401;
+                return;
+            }
+            await Serve(ctx, authenticated.Data, "\"x\"", Modified);
+            return;
+        }
         if (Extra.TryGetValue(path, out byte[]? extra)) { await Serve(ctx, extra, "\"x\"", Modified); return; }
 
         switch (path)

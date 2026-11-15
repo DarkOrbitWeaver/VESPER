@@ -1,4 +1,5 @@
 using Vesper.MediaResolver.Models;
+using Vesper.MediaResolver.Utilities;
 
 namespace Vesper.MediaResolver.Formats;
 
@@ -27,6 +28,40 @@ public static class MergeCapability
             || r.Protocol == StreamProtocol.Dash && r.Segments is { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
                && r.Container is "mp4" or "m4a");
 
+    private static bool IsNativeHttpTrack(MediaRepresentation r) =>
+        r.Protocol == StreamProtocol.Http && r.FileSize is > 0 && !r.FileSizeIsEstimate && !r.IsLive
+        && r.Container is "mp4" or "m4a" or "webm";
+
+    private static bool HasMatchingOriginCredentials(MediaRepresentation video, MediaRepresentation audio)
+    {
+        MediaRequestContext v = video.Context, a = audio.Context;
+        if (!v.HasCredentials || !a.HasCredentials || v.Origin is not null || a.Origin is not null
+            || v.AcceptLanguage is not null || a.AcceptLanguage is not null
+            || v.SensitiveHeaders.Keys.Any(name => !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase))
+            || a.SensitiveHeaders.Keys.Any(name => !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase))
+            || !string.Equals(UrlUtil.Origin(video.Url), UrlUtil.Origin(audio.Url), StringComparison.OrdinalIgnoreCase)
+            || !v.MayForwardCredentialsTo(video.Url) || !a.MayForwardCredentialsTo(audio.Url))
+            return false;
+
+        static Dictionary<string, string>? SecretHeaders(MediaRequestContext context, Uri url)
+        {
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, value) in context.HeadersFor(url))
+            {
+                if (!name.Equals("Cookie", StringComparison.OrdinalIgnoreCase)
+                    && !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!headers.TryAdd(name, value)) return null;
+            }
+            return headers;
+        }
+
+        Dictionary<string, string>? videoHeaders = SecretHeaders(v, video.Url);
+        Dictionary<string, string>? audioHeaders = SecretHeaders(a, audio.Url);
+        return videoHeaders is not null && audioHeaders is not null && videoHeaders.Count == audioHeaders.Count
+            && videoHeaders.All(pair => audioHeaders.TryGetValue(pair.Key, out string? value)
+                && string.Equals(value, pair.Value, StringComparison.Ordinal));
+    }
+
     private static bool HasSafeRequestContext(MediaRepresentation r) =>
         !r.Context.HasCredentials && r.Context.Origin is null && r.Context.AcceptLanguage is null;
 
@@ -51,7 +86,10 @@ public static class MergeCapability
             return MkvVideo.Contains(v) && MkvAudio.Contains(a) ? "mkv" : null;
         }
 
-        if (!IsNativeTrack(video) || !IsNativeTrack(audio)) return null;
+        if (!IsNativeHttpTrack(video) || !IsNativeHttpTrack(audio)) return null;
+        bool hasCredentials = video.Context.HasCredentials || audio.Context.HasCredentials;
+        if (hasCredentials ? !HasMatchingOriginCredentials(video, audio)
+            : !HasSafeRequestContext(video) || !HasSafeRequestContext(audio)) return null;
         bool videoMp4 = video.Container == "mp4", audioMp4 = audio.Container is "mp4" or "m4a";
         var options = new List<string>(3);
         if (videoMp4 && audioMp4 && Mp4Video.Contains(v) && Mp4Audio.Contains(a)) options.Add("mp4");

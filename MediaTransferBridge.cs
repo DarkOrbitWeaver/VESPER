@@ -72,6 +72,14 @@ internal static class MediaTransferBridge
         return headers.Count == 0 ? null : headers;
     }
 
+    private static bool SameSecretHeaders(IReadOnlyDictionary<string, string>? first, IReadOnlyDictionary<string, string>? second)
+    {
+        if ((first?.Count ?? 0) != (second?.Count ?? 0)) return false;
+        if (first is null) return true;
+        return first.All(pair => second!.TryGetValue(pair.Key, out string? value)
+            && string.Equals(value, pair.Value, StringComparison.Ordinal));
+    }
+
     internal static MediaItem PlayableOnly(MediaItem item)
     {
         var reps = item.Representations;
@@ -331,11 +339,18 @@ internal static class MediaTransferBridge
             || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
         MediaRequestContext ctx = tracks[0].Context;
-        if (tracks.Any(t => TransferSecrets(t.Context, t.Url) is not null || !CanCarryContext(t.Context)
+        if (tracks.Any(t => !CanCarryContext(t.Context)
             || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer
             || t.Context.CookieHeader != ctx.CookieHeader
             || !t.Context.SensitiveHeaders.OrderBy(h => h.Key).SequenceEqual(ctx.SensitiveHeaders.OrderBy(h => h.Key))))
             return (null, "These streams need different request contexts, which a single merge job cannot carry.");
+
+        IReadOnlyDictionary<string, string>? secrets = TransferSecrets(ctx, tracks[0].Url);
+        if (tracks.Any(track => !SameSecretHeaders(secrets, TransferSecrets(track.Context, track.Url))))
+            return (null, "These streams need different credential headers, which a single merge job cannot carry.");
+        if (secrets is not null && tracks.Any(track => track.Protocol != StreamProtocol.Http
+            || !UrlPolicy.IsSameOrigin(tracks[0].Url, track.Url)))
+            return (null, "Credentials are supported only for direct merge tracks on one exact origin.");
         if (tracks.Any(t => t.Container is null || t.Protocol == StreamProtocol.Http && t.FileSize is not > 0
             || t.Protocol == StreamProtocol.Hls && t.Container is not ("mp4" or "m4a" or "ts")
             || t.Protocol == StreamProtocol.Dash && t.Segments is not { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
@@ -386,7 +401,7 @@ internal static class MediaTransferBridge
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
             merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles,
-            Secrets: TransferSecrets(ctx, tracks[0].Url)), null);
+            Secrets: secrets), null);
     }
 
     private static MediaMergeMetadata? MergeMetadata(MediaItem item, bool includeChapters)

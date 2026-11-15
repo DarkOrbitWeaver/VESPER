@@ -47,7 +47,7 @@ internal static class MediaSourceRescue
 
         if (job.Kind == JobKind.Http) return await RefreshDirectAsync(engine, job, item, ct);
         if (job.Kind == JobKind.Hls) return await RefreshLiveHlsAsync(engine, job, item, ct);
-        return RefreshMerge(engine, job, item);
+        return await RefreshMergeAsync(engine, job, item, ct);
     }
 
     internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
@@ -109,7 +109,7 @@ internal static class MediaSourceRescue
 
     // A merge job's format id is "videoId+audioId" (or one id for audio only). Restrict the item to exactly
     // those formats and let the planner build the same plan again with fresh links.
-    private static RescueResult RefreshMerge(DownloadEngine engine, JobSnapshot job, MediaItem item)
+    private static async Task<RescueResult> RefreshMergeAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
     {
         string[] ids = job.MediaFormatId!.Split('+', StringSplitOptions.RemoveEmptyEntries);
         MediaRepresentation[] same = item.Representations.Where(r => ids.Contains(r.Id)).ToArray();
@@ -123,6 +123,9 @@ internal static class MediaSourceRescue
         if (choice is not { Kind: JobKind.Merge, MediaPlanJson: { } plan })
             return new RescueResult(false, RescueMode.None,
                 error ?? "The refreshed source cannot be planned the same way. Saved data was kept.", 0);
+        if (choice.Secrets is { Count: > 0 })
+            return await engine.RefreshMergePlanWithCredentialsAsync(job.Id, plan, choice.ExpiresAt, choice.Secrets, ct)
+                .ConfigureAwait(false);
         return engine.RefreshMergePlan(job.Id, plan, choice.ExpiresAt);
     }
 }
