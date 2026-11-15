@@ -27,6 +27,85 @@ public class SiteAdapterTests
         return await resolver.ResolveAsync(T.Req(url, intent, token), CancellationToken.None);
     }
 
+    // ---------------------------------------------------------------------------------------------- Instagram
+
+    private const string InstagramPage = "https://www.instagram.com/reel/FixtureCode/";
+
+    private static string InstagramEmbeddedPage(string first, string second)
+    {
+        var data = new
+        {
+            data = new
+            {
+                xig_polaris_media = new
+                {
+                    if_not_gated_logged_out = new
+                    {
+                        media_type = "VIDEO",
+                        video_duration = 12.5,
+                        video_versions = new[]
+                        {
+                            new { url = first, width = 720, height = 1280 },
+                            new { url = second, width = 1080, height = 1920 }
+                        }
+                    }
+                }
+            }
+        };
+        return "<html><head><title>Fixture Reel</title><meta property=\"og:image\" content=\"https://scontent.cdninstagram.com/thumb.jpg\"></head>"
+            + "<script data-sjs>" + JsonSerializer.Serialize(data) + "</script></html>";
+    }
+
+    [Fact]
+    public async Task Instagram_UsesEmbeddedWholeObjectChoicesThroughSharedValidation()
+    {
+        const string first = "https://scontent.cdninstagram.com/video-720.mp4?token=short";
+        const string second = "https://scontent.cdninstagram.com/video-1080.mp4?token=short";
+        var h = new FakeHttpHandler()
+            .Add(InstagramPage, InstagramEmbeddedPage(first, second))
+            .AddMedia(first, "video/mp4", 7200)
+            .AddMedia(second, "video/mp4", 10800);
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal("instagram", result.Item!.Provider);
+        Assert.Equal("FixtureCode", result.Item.MediaId);
+        Assert.Equal("Fixture Reel", result.Item.Title);
+        Assert.Equal(TimeSpan.FromSeconds(12.5), result.Item.Duration);
+        Assert.Equal([1280, 1920], result.Item.Representations.Select(format => format.Height).Order().ToArray());
+        Assert.All(h.Requests.Where(request => request.Url.Host == "scontent.cdninstagram.com"), request =>
+            Assert.Equal("https://www.instagram.com/", request.Headers["Referer"]));
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsolutePath.Contains("/api/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Instagram_LoginRedirectIsExplainedWithoutTryingPrivateEndpoints()
+    {
+        const string login = "https://www.instagram.com/accounts/login/?next=%2Freel%2FFixtureCode%2F";
+        var h = new FakeHttpHandler()
+            .AddRedirect(InstagramPage, login)
+            .Add(login, "<html>Sign in</html>");
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        Assert.Equal(MediaErrorCode.LoginRequired, result.Error!.Code);
+        Assert.Equal(2, h.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Instagram_PageTitleAloneDoesNotBecomeAPlayableMediaResult()
+    {
+        var h = new FakeHttpHandler().Add(InstagramPage, "<html><title>Title only</title></html>");
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(MediaErrorCode.BrowserContextRequired, result.Error!.Code);
+        Assert.Contains("no verified playable URL", result.Error.Diagnostic, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(h.Requests);
+    }
+
     // ---------------------------------------------------------------------------------------------- Vimeo
 
     [Fact]
