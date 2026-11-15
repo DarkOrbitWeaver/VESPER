@@ -157,7 +157,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
         browse.Click += (_, _) =>
         {
             using var chooser = new FolderBrowserDialog { Description = "Choose a folder for this download", UseDescriptionForTitle = true };
-            if (Directory.Exists(_destinationInput.Text)) chooser.SelectedPath = _destinationInput.Text;
+            if (Vesper.Engine.PathSafety.TryGetFullPath(_destinationInput.Text, out string selected, out _) && Directory.Exists(selected))
+                chooser.SelectedPath = selected;
             if (chooser.ShowDialog(this) == DialogResult.OK) _destinationInput.Text = chooser.SelectedPath;
         };
         var reset = new LinkLabel
@@ -450,14 +451,15 @@ internal sealed class AddDownloadForm : VesperPopupForm
         if (links.Length is < 1 or > 200 || !links.All(IsSupportedUrl)) return;
         string folder = _destinationInput.Text.Trim();
         if (!Vesper.Engine.PathSafety.TryResolveFolder(folder, create: false, out string resolved, out string folderProblem)
-            && !(folderProblem.Contains("does not exist") && Path.IsPathFullyQualified(folder)))
+            && !(folderProblem.Contains("does not exist", StringComparison.OrdinalIgnoreCase)
+                && Vesper.Engine.PathSafety.TryGetFullPath(folder, out resolved, out _)))
         {
             VesperMessageBox.Show(this, folderProblem, "Invalid destination",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         DownloadUrls = links.Select(link => new Uri(link).AbsoluteUri).ToArray();
-        Destination = folder;
+        Destination = resolved;
         QueueOnly = queueOnly;
         DialogResult = DialogResult.OK;
         Close();

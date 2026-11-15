@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Vesper.Engine;
 
 namespace VESPER;
 
@@ -29,7 +30,11 @@ internal static class SettingsStore
         if (!File.Exists(path)) return new VesperPreferences();
         try
         {
-            return JsonSerializer.Deserialize<VesperPreferences>(File.ReadAllText(path), Options) ?? new VesperPreferences();
+            VesperPreferences preferences = JsonSerializer.Deserialize<VesperPreferences>(File.ReadAllText(path), Options)
+                ?? new VesperPreferences();
+            if (PathSafety.TryGetFullPath(preferences.DefaultFolder, out string folder, out _))
+                preferences.DefaultFolder = folder;
+            return preferences;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {

@@ -74,7 +74,8 @@ internal static class EngineHost
     /// <summary>Settings that can change while jobs run.</summary>
     private static void ApplyLive(EngineOptions options, VesperPreferences p)
     {
-        options.DefaultFolder = p.DefaultFolder;
+        options.DefaultFolder = PathSafety.TryGetFullPath(p.DefaultFolder, out string folder, out _)
+            ? folder : p.DefaultFolder;
         options.MaxConcurrentJobs = Math.Max(1, p.ConcurrentTransfers);
         options.MaxConnectionsPerJob = Math.Clamp(p.MaxConnectionsPerJob, 1, 8);
         options.GlobalLimitBytesPerSecond = p.GlobalRateLimitKbs * 1000L;

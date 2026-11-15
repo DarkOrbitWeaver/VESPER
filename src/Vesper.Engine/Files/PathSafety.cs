@@ -14,17 +14,7 @@ public static class PathSafety
     /// </summary>
     public static bool TryResolveFolder(string? folder, bool create, out string full, out string error)
     {
-        full = "";
-        error = "";
-        if (string.IsNullOrWhiteSpace(folder)) { error = "Choose a destination folder."; return false; }
-        folder = Environment.ExpandEnvironmentVariables(folder.Trim());
-        if (!Path.IsPathFullyQualified(folder)) { error = "The destination must be a full path."; return false; }
-        if (folder.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains(".."))
-        { error = "The destination cannot contain '..'."; return false; }
-
-        try { full = Path.GetFullPath(folder); }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
-        { error = "The destination path is not valid."; return false; }
+        if (!TryGetFullPath(folder, out full, out error)) return false;
 
         string? root = Path.GetPathRoot(full);
         if (root is null || !Directory.Exists(root)) { error = $"The drive or share '{root}' is not available."; return false; }
@@ -37,6 +27,23 @@ public static class PathSafety
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             { error = "The destination folder could not be created: " + ex.Message; return false; }
         }
+        return true;
+    }
+
+    /// <summary>Expands environment variables and normalizes an absolute path without creating it.</summary>
+    public static bool TryGetFullPath(string? path, out string full, out string error)
+    {
+        full = "";
+        error = "";
+        if (string.IsNullOrWhiteSpace(path)) { error = "Choose a destination folder."; return false; }
+        path = Environment.ExpandEnvironmentVariables(path.Trim());
+        if (!Path.IsPathFullyQualified(path)) { error = "The destination must be a full path."; return false; }
+        if (path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains(".."))
+        { error = "The destination cannot contain '..'."; return false; }
+
+        try { full = Path.GetFullPath(path); }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        { error = "The destination path is not valid."; return false; }
         return true;
     }
 

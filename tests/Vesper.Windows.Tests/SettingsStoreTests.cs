@@ -24,6 +24,26 @@ public sealed class SettingsStoreTests : IDisposable
     }
 
     [Fact]
+    public void LoadExpandsEnvironmentVariablesInTheDefaultDownloadFolder()
+    {
+        string variable = "VESPER_TEST_FOLDER_" + Guid.NewGuid().ToString("N");
+        string? previous = Environment.GetEnvironmentVariable(variable);
+        string root = Path.Combine(_root, "expanded-root");
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, root);
+            string tokenPath = $"%{variable}%{Path.DirectorySeparatorChar}Downloads";
+            Assert.Null(SettingsStore.Save(new VesperPreferences { DefaultFolder = tokenPath }, _root));
+
+            Assert.Equal(Path.GetFullPath(Path.Combine(root, "Downloads")), SettingsStore.Load(_root).DefaultFolder);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(variable, previous);
+        }
+    }
+
+    [Fact]
     public void CorruptSettingsAreKeptInNumberedBackups()
     {
         string path = Path.Combine(_root, "settings.json");

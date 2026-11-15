@@ -19,7 +19,7 @@ internal sealed class QuickDownloadForm : VesperPopupForm
     private readonly long? _sizeBytes;
 
     public Outcome Result { get; private set; } = Outcome.Cancel;
-    public string Destination => _folder.Text.Trim();
+    public string Destination => PathSafety.TryGetFullPath(_folder.Text, out string full, out _) ? full : _folder.Text.Trim();
 
     public QuickDownloadForm(VesperPreferences preferences, string title, string detailLine, long? sizeBytes)
     {
@@ -59,7 +59,8 @@ internal sealed class QuickDownloadForm : VesperPopupForm
         browse.Click += (_, _) =>
         {
             using var picker = new FolderBrowserDialog { Description = "Folder for this download", UseDescriptionForTitle = true };
-            if (Directory.Exists(_folder.Text)) picker.SelectedPath = _folder.Text;
+            if (PathSafety.TryGetFullPath(_folder.Text, out string selected, out _) && Directory.Exists(selected))
+                picker.SelectedPath = selected;
             if (picker.ShowDialog(this) == DialogResult.OK) _folder.Text = picker.SelectedPath;
         };
         _warning = Label_("", 8.5F);
@@ -108,11 +109,11 @@ internal sealed class QuickDownloadForm : VesperPopupForm
     private void CheckSpace()
     {
         string message = "";
-        if (_sizeBytes is long size && Path.IsPathFullyQualified(_folder.Text))
+        if (_sizeBytes is long size && PathSafety.TryGetFullPath(_folder.Text, out string full, out _))
         {
             try
             {
-                string root = Path.GetPathRoot(Path.GetFullPath(_folder.Text)) ?? "";
+                string root = Path.GetPathRoot(full) ?? "";
                 long free = new DriveInfo(root).AvailableFreeSpace;
                 if (free < size) message = $"Not enough free space on {root}: {Formatting.Bytes(size)} needed, {Formatting.Bytes(free)} available.";
             }
@@ -139,7 +140,8 @@ internal sealed class QuickDownloadForm : VesperPopupForm
 
     private void Accept(Outcome outcome)
     {
-        if (!PathSafety.TryResolveFolder(_folder.Text, create: false, out _, out string problem) && !problem.Contains("does not exist"))
+        if (!PathSafety.TryResolveFolder(Destination, create: false, out _, out string problem)
+            && !problem.Contains("does not exist", StringComparison.OrdinalIgnoreCase))
         {
             SetWarning(problem);
             return;

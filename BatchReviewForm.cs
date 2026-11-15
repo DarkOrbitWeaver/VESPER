@@ -11,7 +11,7 @@ internal sealed class BatchReviewForm : VesperPopupForm
     private readonly VesperButton _queue = new() { Text = "Queue", AutoSize = true };
     private readonly Label _status = new() { AutoSize = true, Dock = DockStyle.Fill, UseMnemonic = false };
     public QuickDownloadForm.Outcome Result { get; private set; }
-    public string Destination => _folder.Text.Trim();
+    public string Destination => PathSafety.TryGetFullPath(_folder.Text, out string full, out _) ? full : _folder.Text.Trim();
     public IReadOnlySet<int> SelectedIndices => _files.CheckedIndices.Cast<int>().ToHashSet();
 
     public BatchReviewForm(VesperPreferences preferences, IReadOnlyList<BridgeItem> items)
@@ -51,7 +51,8 @@ internal sealed class BatchReviewForm : VesperPopupForm
         browse.Click += (_, _) =>
         {
             using var picker = new FolderBrowserDialog { Description = "Folder for selected files", UseDescriptionForTitle = true };
-            if (Directory.Exists(Destination)) picker.SelectedPath = Destination;
+            if (PathSafety.TryGetFullPath(Destination, out string selected, out _) && Directory.Exists(selected))
+                picker.SelectedPath = selected;
             if (picker.ShowDialog(this) == DialogResult.OK) _folder.Text = picker.SelectedPath;
         };
         destination.Controls.Add(browse, 2, 0); layout.Controls.Add(destination, 0, 2);
@@ -79,8 +80,9 @@ internal sealed class BatchReviewForm : VesperPopupForm
     private void Accept(QuickDownloadForm.Outcome outcome)
     {
         if (_files.CheckedItems.Count == 0) return;
-        if (!PathSafety.TryResolveFolder(Destination, create: true, out _, out string error))
+        if (!PathSafety.TryResolveFolder(Destination, create: true, out string resolved, out string error))
         { _status.Text = error; return; }
+        _folder.Text = resolved;
         Result = outcome; DialogResult = DialogResult.OK;
     }
 }
