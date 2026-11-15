@@ -70,7 +70,7 @@ USER-UI-CHROME	Visual picker and native messaging run	Partial; visual verificati
 N-08	Filename templates	Open engineering	No filename-template settings/preview implementation.
 N-09	Completion actions	Open engineering	No new sleep/shutdown/run actions or cancelable completion prompt.
 N-10	Metered networks	Open engineering	No INetworkCostManager/WinRT policy implementation.
-N-11	Publisher checksum discovery	Open engineering	Trusted checksum engine path exists; page-side checksum proposal/confirmation is not added.
+N-11	Publisher checksum discovery	Implemented; solution tests	Smart Select proposes only an unambiguous inline SHA-256 beside one file link; the bridge forces review, which displays the full value and page origin and defaults to not trusting it. Only explicitly approved hashes reach engine verification. Mismatches stay unpublished and are marked Suspect; sidecar files are not fetched.
 N-12	Mirror substitution	Partial	Existing identity-checked HTTP Rescue retained. No universal mirror selection UI or automatic TikTok mirror failover is added.
 N-13	Batch quality once	Partial	Existing collection preference flow retained. Native Smart Select reviews reusable file links, not a new media-collection quality planner.
 N-14	List import/export	Open engineering	No new user-facing JSON/CSV history migration.
