@@ -463,7 +463,12 @@ public sealed class VesperChoice : Control
         // Give the popup its width through its items. Setting MinimumSize on a
         // wider popup left a blank, non-highlighted strip at the right edge.
         int scale = Math.Max(96, DeviceDpi);
-        int desired = Math.Max(Width, (int)Math.Round(148 * scale / 96d));
+        // Wide enough for the longest label, so long track names are not cut off; never wider than the screen.
+        int longest = 0;
+        foreach (string text in _items)
+            longest = Math.Max(longest, TextRenderer.MeasureText(text, _menu.Font, Size.Empty, TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine).Width);
+        int screen = Screen.FromControl(this).WorkingArea.Width - (int)Math.Round(40 * scale / 96d);
+        int desired = Math.Min(screen, Math.Max(Width, Math.Max((int)Math.Round(148 * scale / 96d), longest + (int)Math.Round(36 * scale / 96d))));
         int optionWidth = Math.Max(100, desired - _menu.Padding.Horizontal - 2);
         int itemHeight = Math.Max(28, (int)Math.Round(33 * scale / 96d));
         foreach (ToolStripItem item in _menu.Items)

@@ -20,6 +20,7 @@ internal sealed class JobSession : IDisposable
     private string? _pendingMediaState;
     private long _writtenSinceCheckpoint;
     private long _lastCheckpointTicks = Stopwatch.GetTimestamp();
+    private long _lastManifestTicks;
     private long _runBytes;
     private int _connections;
 
@@ -75,8 +76,7 @@ internal sealed class JobSession : IDisposable
         _engine.Failpoint("write.afterWrite");
         if (report) Report(new ByteRange(offset, offset + data.Length));
 
-        if (report && (Volatile.Read(ref _writtenSinceCheckpoint) >= _engine.Options.CheckpointBytes
-            || Stopwatch.GetElapsedTime(Volatile.Read(ref _lastCheckpointTicks)) >= _engine.Options.CheckpointInterval))
+        if (report && CheckpointDue())
             await CheckpointAsync(force: false, ct).ConfigureAwait(false);
     }
 
@@ -84,9 +84,18 @@ internal sealed class JobSession : IDisposable
 
     public async ValueTask MaybeCheckpointAsync(CancellationToken ct)
     {
-        if (Volatile.Read(ref _writtenSinceCheckpoint) >= _engine.Options.CheckpointBytes
-            || Stopwatch.GetElapsedTime(Volatile.Read(ref _lastCheckpointTicks)) >= _engine.Options.CheckpointInterval)
+        if (CheckpointDue())
             await CheckpointAsync(force: false, ct).ConfigureAwait(false);
+    }
+
+    // Time-first: the 2 s timer already bounds the loss window, so the byte trigger only needs to stop a
+    // very fast link from checkpointing every few milliseconds. Scale it to about 4 s of transfer.
+    private bool CheckpointDue()
+    {
+        if (Stopwatch.GetElapsedTime(Volatile.Read(ref _lastCheckpointTicks)) >= _engine.Options.CheckpointInterval)
+            return true;
+        long threshold = Math.Max(_engine.Options.CheckpointBytes, (long)(SpeedBytesPerSecond * 4));
+        return Volatile.Read(ref _writtenSinceCheckpoint) >= threshold;
     }
 
     /// <summary>Marks a fully WRITTEN, already validated range as pending durability.</summary>
@@ -133,7 +142,13 @@ internal sealed class JobSession : IDisposable
                 _writtenSinceCheckpoint = _pending.TotalBytes;
             }
             Volatile.Write(ref _lastCheckpointTicks, Stopwatch.GetTimestamp());
-            _engine.WriteManifest(committed);
+            // The manifest is a temp-file write plus a rename, which sync folders and antivirus notice.
+            // The database commit above is the real checkpoint; the manifest only needs to be recent.
+            if (force || Stopwatch.GetElapsedTime(Volatile.Read(ref _lastManifestTicks)) >= TimeSpan.FromSeconds(10))
+            {
+                _engine.WriteManifest(committed);
+                Volatile.Write(ref _lastManifestTicks, Stopwatch.GetTimestamp());
+            }
         }
         finally
         {

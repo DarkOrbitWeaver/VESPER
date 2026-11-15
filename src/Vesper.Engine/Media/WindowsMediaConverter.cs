@@ -9,6 +9,8 @@ internal static class WindowsMediaConverter
 {
     private const uint AllStreams = 0xfffffffe, AnyStream = 0xfffffffe;
     private const uint EndOfStream = 2, StreamChanged = 0x30, StreamTick = 0x100;
+    private static readonly Guid EnableHardwareTransforms = new("a634a91c-822b-41b9-a494-4de4643612b0");
+    private static readonly Guid DisableThrottling = new("08b845d8-2b74-4afe-9d53-be16d2d5ae4f");
     private static readonly Guid OriginName = new("fc358288-3cb6-460c-a424-b6681260375a");
     private static readonly Guid AdvancedVideoProcessing = new("0f81da2c-b537-4672-a8b2-a681b17307a3");
     private static readonly Guid MajorType = new("48eba18e-f8c9-4687-bf11-0a74c9f96a8f");
@@ -29,6 +31,7 @@ internal static class WindowsMediaConverter
     private static readonly Guid NominalRange = new("c21b8ee5-b956-4071-8daf-325edf5cab11");
     private static readonly Guid Channels = new("37e48bf5-645e-4c5b-89de-ada9e29b696a");
     private static readonly Guid SampleRate = new("5faeeae7-0290-4c31-9e8a-c534f68d9dba");
+    private static readonly Guid BlockAlignment = new("322de230-9eeb-43bd-ab7a-ff412251541d");
     private static readonly Guid BitsPerSample = new("f2deb57f-40fa-4764-aa33-ed4f2d1ff669");
     private static readonly Guid AvgBytesPerSecond = new("1aab75c8-cfef-451c-ab95-ac034b8e1731");
 
@@ -38,24 +41,24 @@ internal static class WindowsMediaConverter
     private readonly record struct TrackWriter(uint Index, TrackFormat Format);
 
     public static void Convert(string source, string extension, string destination, MediaOutput output, CancellationToken ct,
-        DemuxedTrack? timing = null)
+        DemuxedTrack? timing = null, Action<double>? progress = null)
     {
         ct.ThrowIfCancellationRequested();
         Check(CoInitializeEx(IntPtr.Zero, 0), "initializing COM");
         try
         {
             Check(MFStartup(0x20070, 1), "starting Media Foundation"); // MFSTARTUP_NOSOCKET
-            try { Encode(source, extension, destination, output, timing, ct); }
+            try { Encode(source, extension, destination, output, timing, ct, progress); }
             finally { MFShutdown(); }
         }
         finally { CoUninitialize(); }
     }
 
     private static void Encode(string source, string extension, string destination, MediaOutput output, DemuxedTrack? timing,
-        CancellationToken ct)
+        CancellationToken ct, Action<double>? progress)
     {
         IByteStream? input = null, target = null;
-        IAttributes? settings = null;
+        IAttributes? settings = null, writerSettings = null;
         ISourceReader? reader = null;
         ISinkWriter? writer = null;
         try
@@ -63,14 +66,18 @@ internal static class WindowsMediaConverter
             Check(MFCreateFile(1, 0, 0, source, out input), "opening the source");
             if (input is not IAttributes attributes) throw new NotSupportedException("Windows could not identify the source container.");
             Check(attributes.SetString(OriginName, source + extension), "identifying the source container");
+            Check(MFCreateAttributes(out settings, 2), "creating decoder settings");
+            Check(settings.SetUINT32(EnableHardwareTransforms, 1), "enabling available hardware decoders");
             if (output == MediaOutput.Mp4)
             {
-                Check(MFCreateAttributes(out settings, 1), "creating decoder settings");
                 Check(settings.SetUINT32(AdvancedVideoProcessing, 1), "preserving the source display size");
             }
             Check(MFCreateSourceReaderFromByteStream(input, settings, out reader), "opening a decoder for the source container");
             Check(MFCreateFile(3, 1, 0, destination, out target), "creating the MP4 output");
-            Check(MFCreateSinkWriterFromURL(destination, target, IntPtr.Zero, out writer), "opening the MP4 writer");
+            Check(MFCreateAttributes(out writerSettings, 2), "creating encoder settings");
+            Check(writerSettings.SetUINT32(EnableHardwareTransforms, 1), "enabling available hardware encoders");
+            Check(writerSettings.SetUINT32(DisableThrottling, 1), "enabling offline conversion speed");
+            Check(MFCreateSinkWriterFromURL(destination, target, writerSettings, out writer), "opening the MP4 writer");
             Check(reader.SetStreamSelection(AllStreams, false), "selecting the source tracks");
 
             var indexes = new Dictionary<uint, TrackWriter>();
@@ -88,7 +95,7 @@ internal static class WindowsMediaConverter
                     }
                     if (major == Audio && !hasAudio)
                     {
-                        indexes.Add(i, AddTrack(reader, writer, i, type, video: false));
+                        indexes.Add(i, AddTrack(reader, writer, i, type, video: false, output: output));
                         hasAudio = true;
                     }
                 }
@@ -98,10 +105,16 @@ internal static class WindowsMediaConverter
                 throw new NotSupportedException("Windows could not open the selected audio and video tracks.");
 
             Check(writer.BeginWriting(), "starting conversion");
+            long lastReport = Environment.TickCount64;
             while (indexes.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
                 int result = reader.ReadSample(AnyStream, 0, out uint index, out uint flags, out long time, out ISample? sample);
+                if (progress is { } report && Environment.TickCount64 - lastReport >= 500)
+                {
+                    lastReport = Environment.TickCount64;
+                    report(time / 10_000_000d);      // 100 ns units
+                }
                 try
                 {
                     Check(result, "decoding a sample");
@@ -138,14 +151,15 @@ internal static class WindowsMediaConverter
             Release(reader);
             Release(input);
             Release(settings);
+            Release(writerSettings);
         }
     }
 
     private static TrackWriter AddTrack(ISourceReader reader, ISinkWriter writer, uint index, IMediaType native, bool video,
-        DemuxedTrack? timing = null)
+        DemuxedTrack? timing = null, MediaOutput output = MediaOutput.M4a)
     {
         Check(reader.SetStreamSelection(index, true), "enabling a source track");
-        Guid codec = video ? H264 : Aac;
+        Guid codec = video ? H264 : output == MediaOutput.Wav ? Pcm : Aac;
         Check(native.GetGUID(Subtype, out Guid sourceCodec), "identifying the source codec");
         if (!video && sourceCodec == codec)
         {
@@ -176,7 +190,7 @@ internal static class WindowsMediaConverter
             Check(reader.GetCurrentMediaType(index, out decoded), "reading decoded track properties");
             encoded = CreateType(video ? Video : Audio, codec);
             if (video) ConfigureVideo(native, decoded, encoded, timing);
-            else ConfigureAudio(decoded, encoded);
+            else ConfigureAudio(decoded, encoded, output);
             Check(writer.AddStream(encoded, out uint stream), "configuring the encoder");
             Check(writer.SetInputMediaType(stream, decoded, IntPtr.Zero), "connecting decoder and encoder");
             return new TrackWriter(stream, ReadFormat(decoded));
@@ -237,14 +251,15 @@ internal static class WindowsMediaConverter
         }
     }
 
-    private static void ConfigureAudio(IMediaType decoded, IMediaType encoded)
+    private static void ConfigureAudio(IMediaType decoded, IMediaType encoded, MediaOutput output)
     {
         Check(decoded.GetUINT32(Channels, out uint channels), "reading the audio channels");
         Check(decoded.GetUINT32(SampleRate, out uint rate), "reading the audio sample rate");
         Check(encoded.SetUINT32(Channels, channels), "preserving the audio channels");
         Check(encoded.SetUINT32(SampleRate, rate), "preserving the audio sample rate");
-        Check(encoded.SetUINT32(BitsPerSample, 16), "configuring the AAC encoder");
-        Check(encoded.SetUINT32(AvgBytesPerSecond, channels == 1 ? 16_000u : 24_000u), "setting the AAC bitrate");
+        Check(encoded.SetUINT32(BitsPerSample, 16), "configuring the audio output");
+        if (output == MediaOutput.Wav) Check(encoded.SetUINT32(BlockAlignment, channels * 2), "aligning PCM samples");
+        Check(encoded.SetUINT32(AvgBytesPerSecond, output == MediaOutput.Wav ? rate * channels * 2 : channels == 1 ? 16_000u : 24_000u), "setting the AAC bitrate");
     }
 
     private static IMediaType CreateType(Guid major, Guid codec)
@@ -280,7 +295,7 @@ internal static class WindowsMediaConverter
     [DllImport("mfreadwrite.dll", ExactSpelling = true)]
     private static extern int MFCreateSourceReaderFromByteStream(IByteStream stream, IAttributes? attributes, out ISourceReader reader);
     [DllImport("mfreadwrite.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
-    private static extern int MFCreateSinkWriterFromURL(string url, IByteStream stream, IntPtr attributes, out ISinkWriter writer);
+    private static extern int MFCreateSinkWriterFromURL(string url, IByteStream stream, IAttributes? attributes, out ISinkWriter writer);
 
     [ComImport, Guid("ad4c1b00-4bf7-422f-9175-756693d9130d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IByteStream { }

@@ -1,6 +1,6 @@
 # Media engine limits
 
-Current scope on `main`, 2026-11-13. See the [live compatibility matrix](MEDIA_ENGINE_COMPATIBILITY.md); provider behavior can change without notice.
+Current implementation package based on `2620e76`, updated 2026-11-15. See the [live compatibility matrix](MEDIA_ENGINE_COMPATIBILITY.md); provider behavior can change without notice.
 
 ## Transfer and media processing
 
@@ -27,9 +27,26 @@ Current scope on `main`, 2026-11-13. See the [live compatibility matrix](MEDIA_E
 ## Browser and recovery boundaries
 
 - The extension can keep Chrome-owned transfers when Chrome's network connection is required. Native helper registration does not enable the extension; Chrome approval remains a separate action.
-- Automatic Chrome handoff replays only observed, safe GET downloads with identity encoding and enough size or strong-ETag evidence for VESPER to verify the response. Redirects are correlated to the original and final URL; Chrome is paused only after VESPER confirms transfer readiness. The optional **Use site sign-in** permission reads cookies for the requested URL only. Request bodies and browser Authorization headers are not captured, so POST or bearer-only downloads stay in Chrome. Completed files are listed only when Chrome and local-file safety checks pass.
+- Automatic Chrome handoff replays only observed, safe GET downloads with identity encoding and enough size or strong-ETag evidence for VESPER to verify the response. Redirects are correlated to the original and final URL; Chrome is paused only after VESPER confirms transfer readiness. The optional **Use site sign-in** permission reads cookies for the requested URL only. Request bodies and browser Authorization headers are not captured, so POST or bearer-only downloads stay in Chrome. Chrome-completed files remain Chrome-owned and are never registered as VESPER jobs.
 - The current UI test environment exposes no native Chrome browser, so live Chrome interception/native messaging and live YouTube/Instagram/TikTok journeys remain unverified. The manual workflow matrix records the exact checks to perform; extension unit tests do not prove live-site behavior.
 - The extension's optional cookie permission defaults off. If the user enables **Use site sign-in**, credentials remain scoped to the consented source origin.
 - Recovered media merges require the same provider identity, track roles, format IDs, sizes, and codecs. If a refreshed source cannot prove that identity, VESPER keeps partial data and asks for a new link or user action.
 
 For current build status, automated results, measured performance, and Windows checks still pending, see [release status](DOCUMENTATION/RELEASE.md) and the [manual Windows workflow checklist](DOCUMENTATION/MANUAL_WINDOWS_TEST_CHECKLIST.md).
+
+## Conversion and metadata (current behaviour)
+
+- "M4A — plays everywhere" copies a native AAC stream when the source has one. Only when there is none is the best audio (usually Opus) decoded and re-encoded to AAC with Windows Media Foundation, and only when the PC has that decoder. Re-encoding cannot add quality.
+- "Plays everywhere (MP4)" re-encodes video with Media Foundation when the source codec cannot be copied into MP4; the offer is hidden when this PC lacks the decoder.
+- Converted M4A and MP4 files keep the discovered title, artist, album and cover. The converted samples are stream-copied, never re-encoded a second time. If tagging fails the valid untagged file is published with a note.
+- HLS VOD segments are fetched three at a time and committed in order; AES-128 segments are still decrypted whole in memory (bounded to 64 MiB per segment).
+- Time ranges ("Download part") are supported for segmented HLS/DASH sources and cut at segment boundaries. Native Opus packet-copy output is available for supported unlaced MP4/WebM audio. Windows decode-to-WAV output is offered for available source decoders; its PCM helper supports sample-exact clips and INFO tags. WAV clipping currently downloads and decodes the full source, uses RIFF (not RF64), and does not embed cover art. MP3/FLAC transcoding, indexed byte-range clips, embedded subtitle tracks and HLS discontinuity epochs remain unimplemented.
+
+## Package-specific validation and remaining boundaries
+
+- The supplied public TikTok example (`@skzxtvi/video/7707740473833573665`) was downloaded through the real native resolver/planner/engine on Linux: 400,577 bytes, AAC audio and 1080x1920 HEVC, native validation passed. This is not a Windows playback or Chrome integration result. Signed URLs and anonymous cookies were not bundled in reports.
+- TikTok media requests preserve per-response cookie Domain/Path/Secure/expiry rules, bind each resulting credential context to its media origin, and keep secrets in memory. Browser sign-in stays explicitly opt-in; frame-scoped CHIPS lookups use Chrome's own partition key. Unknown-originating-frame Chrome downloads do not gain guessed partition access.
+- The browser picker now carries audio-track, subtitle, output and range intent to the same planner as the desktop. Subtitle sidecars never inherit media credentials. Smart Select proposes bounded reusable links and always opens native batch review; URL-less POST/blob-generating buttons remain browser-owned.
+- Media Foundation sink throttling is disabled for offline conversion and eligible hardware MFTs are enabled. Actual hardware selection, drivers, WAV sink behavior and speed gains need Windows checks. No DXVA/D3D-device-manager implementation is claimed.
+- Both HLS and DASH prefetch three fragments and commit in order. Pending requests are canceled and drained when a transfer stops. Whole-object buffering/decryption limits remain; these are not streaming AES implementations.
+- See `DOCUMENTATION/IMPLEMENTATION-2026-11.md`, `DOCUMENTATION/STATUS.tsv`, and `DOCUMENTATION/LUNA-WINDOWS.md` for exact implemented, inherited, open and externally blocked work. This package is not complete closure of the audit backlog.

@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.Sockets;
 
 namespace Vesper.Engine;
 
@@ -65,28 +64,8 @@ public static class UrlPolicy
             throw new BlockedAddressException(host);
     }
 
-    public static bool IsPublicAddress(IPAddress address)
-    {
-        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-        if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any)) return false;
-
-        byte[] b = address.GetAddressBytes();
-        if (address.AddressFamily == AddressFamily.InterNetwork)
-        {
-            return !(b[0] == 0 || b[0] == 10
-                || (b[0] == 100 && b[1] is >= 64 and <= 127)       // carrier-grade NAT
-                || (b[0] == 169 && b[1] == 254)                    // link-local
-                || (b[0] == 172 && b[1] is >= 16 and <= 31)
-                || (b[0] == 192 && b[1] == 168)
-                || b[0] >= 224);                                   // multicast and reserved
-        }
-        if (address.AddressFamily == AddressFamily.InterNetworkV6)
-        {
-            return !(address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.IsIPv6Multicast
-                || (b[0] & 0xFE) == 0xFC);                         // unique local fc00::/7
-        }
-        return false;
-    }
+    /// <summary>Loopback, private, link-local and IPv6 forms that wrap a private IPv4 address are not public.</summary>
+    public static bool IsPublicAddress(IPAddress address) => Vesper.Shared.NetworkAddressPolicy.IsPublic(address);
 }
 
 public sealed class BlockedAddressException(string host)

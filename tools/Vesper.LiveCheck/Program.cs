@@ -120,7 +120,7 @@ async Task<Dictionary<string, object?>> RunAsync(string platform, string scenari
         Kind: choice.Kind, OriginalPageUrl: choice.OriginalPageUrl, MediaProvider: choice.Provider, MediaId: choice.MediaId,
         MediaQuality: choice.Quality, MediaThumbnailUrl: choice.ThumbnailUrl, MediaExpiresAt: choice.ExpiresAt,
         MediaPlanJson: choice.MediaPlanJson, MediaFormatId: choice.FormatId, Output: choice.Output,
-        MediaMetadataJson: choice.MediaMetadataJson));
+        MediaMetadataJson: choice.MediaMetadataJson, Secrets: choice.Secrets));
     if (!added.Ok)
     {
         row["download"] = "fail";

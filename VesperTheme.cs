@@ -76,6 +76,12 @@ internal static partial class UiKit
         return Path.Combine(AppContext.BaseDirectory, "Assets", name);
     }
     public static int Scale(Control control, int px) => (int)Math.Round(px * control.DeviceDpi / 96d);
+
+    // The design sizes assume Segoe UI 9 pt. Windows' Accessibility "Text size" slider grows the system
+    // message font, so every UI font is derived from it and grows with it.
+    private static readonly float TextRatio = Math.Clamp(SystemFonts.MessageBoxFont?.SizeInPoints / 9f ?? 1f, 1f, 2f);
+    public static Font Text(float designPoints, FontStyle style = FontStyle.Regular) =>
+        new("Segoe UI", designPoints * TextRatio, style);
     internal static bool IsSystemDark()
     {
         try
@@ -119,5 +125,5 @@ internal static partial class UiKit
         return b;
     }
     public static Label Label(string text, VesperPalette p, float size = 9, bool bold = false) =>
-        new() { Text=text, ForeColor=p.Text, BackColor=Color.Transparent, Font=new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular), AutoSize=true };
+        new() { Text=text, ForeColor=p.Text, BackColor=Color.Transparent, Font=Text(size, bold ? FontStyle.Bold : FontStyle.Regular), AutoSize=true };
 }

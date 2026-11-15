@@ -58,6 +58,13 @@ internal static class RecoveryManifest
             string partial = manifestPath[..^Extension.Length];
             long length = File.Exists(partial) ? new FileInfo(partial).Length : -1;
             if (length < 0) { problem = "partial file missing"; return false; }
+
+            // The checksum is unkeyed, so a planted manifest could name another folder or file.
+            // Only import one that describes the partial sitting next to it.
+            string here = Path.GetDirectoryName(Path.GetFullPath(manifestPath)) ?? "";
+            if (!string.Equals(Path.GetFullPath(body.Destination ?? ""), here, StringComparison.OrdinalIgnoreCase))
+            { problem = "the recovery file names a different folder"; return false; }
+            string fileName = FileNames.Sanitize(body.FileName);
             extents.ClampTo(length);   // never claim bytes the file cannot contain
             string? thumbnailUrl = UrlPolicy.TryParse(body.MediaThumbnailUrl, out Uri thumbnail, out _)
                 ? thumbnail.GetLeftPart(UriPartial.Path) : null;
@@ -68,8 +75,8 @@ internal static class RecoveryManifest
 
             job = new DownloadJob
             {
-                Id = body.JobId, Kind = Enum.IsDefined((JobKind)body.Kind) ? (JobKind)body.Kind : JobKind.Http, SourceUrl = body.Url, FileName = body.FileName, NameLocked = true,
-                DestinationFolder = body.Destination, PartialPath = partial, TotalBytes = body.Total, Extents = extents,
+                Id = body.JobId, Kind = Enum.IsDefined((JobKind)body.Kind) ? (JobKind)body.Kind : JobKind.Http, SourceUrl = body.Url, FileName = fileName, NameLocked = true,
+                DestinationFolder = here, PartialPath = partial, TotalBytes = body.Total, Extents = extents,
                 State = body.Kind == 0 ? JobState.NeedsLink : JobState.NeedsAttention, Reason = "restored",
                 Message = body.Kind == 0 ? "Restored from a recovery file. Provide the download link again to continue."
                     : "Streaming partial restored without a private transfer plan. Resolve a new copy; saved fragments were kept and must not be treated as an ordinary HTTP file.",

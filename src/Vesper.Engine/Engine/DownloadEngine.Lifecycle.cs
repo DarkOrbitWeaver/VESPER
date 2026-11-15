@@ -60,7 +60,7 @@ public sealed partial class DownloadEngine
         string? completionNotice = null;
         if (job.Output == MediaOutput.Original)
             (prepared, completionNotice) = await PrepareAudioMetadataAsync(job, ct).ConfigureAwait(false);
-        else prepared = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
+        else (prepared, completionNotice) = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
         if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
         if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path);
         ct.ThrowIfCancellationRequested();
@@ -96,7 +96,8 @@ public sealed partial class DownloadEngine
             return RunOutcome.NeedsAttention("destination", problem + " The finished file is waiting at " + PathSafety.ForDisplay(job.PartialPath));
 
         string source = prepared?.Path ?? job.PartialPath;
-        string fileName = prepared is not null && job.MediaMetadataJson is not null ? job.FileName : prepared?.FileName ?? job.FileName;
+        // A tagged original keeps its name. A converted file takes the new .m4a/.mp4 name, tags or not.
+        string fileName = prepared is not null && job.Output == MediaOutput.Original ? job.FileName : prepared?.FileName ?? job.FileName;
         WriteMarkOfTheWeb(job, source);
 
         for (int attempt = 0; attempt < 50; attempt++)
@@ -248,8 +249,10 @@ public sealed partial class DownloadEngine
         job.CompletedUtc ??= DateTime.UtcNow;
         job.RetryCount = 0;
         job.UnverifiedResumeApproved = false;
-        job.Reason = "";
-        job.Message = "";
+        string keptReason = job.Reason is "unverified-length" ? job.Reason : "";
+        string keptMessage = keptReason.Length > 0 ? job.Message : "";
+        job.Reason = keptReason;
+        job.Message = keptMessage;
         if (job.PendingConversionBytes is long bytes)
         {
             job.FileName = Path.GetFileName(target);
@@ -264,15 +267,16 @@ public sealed partial class DownloadEngine
             }
             else
             {
-                job.ContentType = job.Output == MediaOutput.M4a ? "audio/mp4" : "video/mp4";
-                job.MediaQuality = job.Output == MediaOutput.M4a ? "Audio AAC" : "H.264 + AAC";
+                job.ContentType = job.Output switch { MediaOutput.M4a => "audio/mp4", MediaOutput.Opus => "audio/ogg", MediaOutput.Wav => "audio/wav", _ => "video/mp4" };
+                job.MediaQuality = job.Output switch { MediaOutput.M4a => "Audio AAC", MediaOutput.Opus => "Opus · copied", MediaOutput.Wav => "PCM audio", _ => "H.264 + AAC" };
             }
             job.Category = FileNames.CategoryFor(job.FileName);
         }
         else if (job.Output != MediaOutput.Original)
         {
             job.Reason = "saved-original";
-            job.Message = "Saved the original format. Compatible output was unavailable.";
+            job.Message = $"Saved as {Path.GetExtension(job.FileName).TrimStart('.').ToUpperInvariant()}: this PC can't convert this audio or video. "
+                + "Installing Microsoft's free Web Media Extensions from the Store usually adds the missing decoder.";
         }
     }
 

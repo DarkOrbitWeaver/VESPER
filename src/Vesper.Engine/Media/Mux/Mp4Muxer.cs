@@ -262,8 +262,8 @@ internal static class Mp4Muxer
         if (metadata?.Album is { Length: > 0 } album) WriteTextTag(w, "\u00A9alb", album);
         if (metadata?.AlbumArtist is { Length: > 0 } albumArtist) WriteTextTag(w, "aART", albumArtist);
         if (metadata?.ReleaseDate is { Length: > 0 } releaseDate) WriteTextTag(w, "\u00A9day", releaseDate);
-        if (metadata?.TrackNumber is { } track) WriteNumberTag(w, "trkn", track);
-        if (metadata?.DiscNumber is { } disc) WriteNumberTag(w, "disk", disc);
+        if (metadata?.TrackNumber is { } track) WriteNumberTag(w, "trkn", track, 8);
+        if (metadata?.DiscNumber is { } disc) WriteNumberTag(w, "disk", disc, 6);   // the iTunes convention for disk
         if (thumbnail is not null) WriteCoverTag(w, thumbnail);
         w.End(list);
         w.End(meta);
@@ -280,24 +280,32 @@ internal static class Mp4Muxer
         w.End(tag);
     }
 
-    private static void WriteNumberTag(BoxWriter w, string type, int value)
+    private static void WriteNumberTag(BoxWriter w, string type, int value, int bytes)
     {
         int tag = w.Begin(type);
         int data = w.Begin("data");
         w.U32(0);
         w.U32(0);
-        w.U16(0);
-        w.U16((ushort)value);
-        w.U32(0);
+        w.U16(0);                   // reserved
+        w.U16((ushort)value);       // this track or disc
+        w.U16(0);                   // total (unknown)
+        if (bytes == 8) w.U16(0);   // trkn carries two more reserved bytes; disk does not
         w.End(data);
         w.End(tag);
     }
 
     private static void WriteCoverTag(BoxWriter w, MediaThumbnail thumbnail)
     {
+        // iTunes data types: 13 = JPEG, 14 = PNG. Anything else is not a cover we can write.
+        uint type = thumbnail.MediaType switch
+        {
+            "image/jpeg" => 13u,
+            "image/png" => 14u,
+            _ => throw new MediaContainerException($"Cover image type {thumbnail.MediaType} cannot be stored in MP4.")
+        };
         int tag = w.Begin("covr");
         int data = w.Begin("data");
-        w.U32(thumbnail.MediaType == "image/jpeg" ? 13u : 14u);
+        w.U32(type);
         w.U32(0);
         w.Bytes(thumbnail.Data);
         w.End(data);

@@ -379,7 +379,8 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             _ => 10
         };
         var errors = attempts.Where(a => a.Error is not null).Select(a => a.Error!).ToList();
-        if (errors.Count == 0) return MediaErrors.NoMedia($"No strategy produced formats for {videoId}");
+        if (errors.Count == 0) return MediaErrors.NoMedia($"No strategy produced formats for {videoId}")
+            with { UserMessage = "YouTube changed how it delivers videos, so VESPER can't read this one right now. Updating VESPER usually fixes this." };
         var best = errors.OrderBy(Rank).First();
         string trail = string.Join("; ", attempts.Select(a => $"{a.Key}: {a.Summary}"));
         return best with { Diagnostic = TextUtil.Clip($"{best.Diagnostic} | strategies: {trail}", 900) };

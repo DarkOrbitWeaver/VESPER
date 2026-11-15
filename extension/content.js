@@ -246,6 +246,21 @@
 
   // ------------------------------------------------------------ the butterfly
 
+  // "1:23", "01:23:45" or plain seconds -> seconds. Empty or nonsense -> null (the field's default applies).
+  function parseClock(text) {
+    const value = String(text || '').trim();
+    if (!value) return null;
+    if (/^\d+(\.\d+)?$/.test(value)) return Number(value);
+    const parts = value.split(':').map(Number);
+    if (parts.length > 3 || parts.some(part => !Number.isFinite(part) || part < 0)) return null;
+    return parts.reduce((total, part) => total * 60 + part, 0);
+  }
+  function clockText(seconds) {
+    const total = Math.max(0, Math.round(seconds));
+    const h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60;
+    return (h ? `${h}:${String(m).padStart(2, '0')}` : String(m)) + ':' + String(s).padStart(2, '0');
+  }
+
   function element(tag, className, text = '') {
     const el = document.createElement(tag);
     if (className) el.className = className;
@@ -267,7 +282,9 @@
           align-items:center;justify-content:center;cursor:pointer;padding:0;opacity:0;pointer-events:none;
           transition:opacity .18s ease;touch-action:manipulation}
         .fly[hidden]{display:none}.fly.show,.fly:focus-visible{opacity:1;pointer-events:auto}
-        .fly:focus-visible{outline:2px solid #a5cfa8;outline-offset:1px}
+        .fly canvas{transition:translate 160ms ease-out}.fly:hover canvas{translate:0 -2px}
+        @media (prefers-reduced-motion:reduce){.fly canvas{transition:none}.fly:hover canvas{translate:none}}
+        .fly:focus-visible{outline:2px solid #fffbee;outline-offset:2px;box-shadow:0 0 0 4px #1f3d2b;border-radius:8px}
         .fly canvas{width:100%;height:100%;pointer-events:none;filter:drop-shadow(0 1px 2px #0008)}
         .fly-fallback{display:grid;place-items:center;width:29px;height:29px;border-radius:7px;
           background:var(--green);color:#fffbee;font-size:19px;pointer-events:none}
@@ -288,6 +305,13 @@
         .t{font:600 14px/1.25 Georgia,serif;max-height:36px;overflow:hidden}.d{font-size:11px;color:var(--muted);margin-top:3px}
         .x{margin-left:auto;border:0;background:none;font-size:18px;color:var(--muted);cursor:pointer;align-self:flex-start;padding:0 2px}
         .output{display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
+        .clip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px 0;font-size:12px;color:var(--text)}
+        .clip[hidden],.clip .fields[hidden],.hint[hidden]{display:none}
+        .clip .fields{display:flex;align-items:center;gap:6px;margin-left:auto}
+        .clip .fields small{color:var(--muted);font-size:11px}
+        .clip input[type=text]{width:62px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px}
+        .clip input[type=checkbox]{accent-color:var(--green);margin:0}
+        small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
         .output[hidden]{display:none}
         .output select{border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
           color-scheme:inherit;padding:4px 6px;font:inherit;cursor:pointer}
@@ -308,7 +332,7 @@
         .link{border:0;background:none;color:var(--blue);text-decoration:underline;cursor:pointer;font-size:12.5px;padding:0}
     `;
     button = element('button', 'fly');
-    button.title = 'Find media with VESPER';
+    button.title = 'Find media with VESPER (Alt+Shift+V)';
     button.setAttribute('aria-label', button.title);
     button.setAttribute('aria-expanded', 'false');
     const fallback = element('span', 'fly-fallback', '↓');
@@ -375,6 +399,7 @@
       catch (error) { if (!VesperTheme.contextGone(error)) throw error; retire(); return; }
     }
     resize.observe(el);
+    companion?.scheduleIdle(idleContext);
     if (!listening) {
       listening = true;
       document.addEventListener('pointermove', onPointer, { passive: true, capture: true, signal });
@@ -387,6 +412,7 @@
 
   function detach() {
     listening = false;
+    companion?.stopIdle();
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
     closePanel();
@@ -406,7 +432,7 @@
     host?.remove(); host = root = button = panel = receipt = null; video = null;
   }
 
-  function place() {
+  function place(continuous = false) {
     if (!alive()) return;
     if (!video || !video.isConnected) {
       if (panelMedia && panel?.classList.contains('show')) { button.hidden = true; updateFlyVisibility(); return; }
@@ -419,7 +445,7 @@
     if (button.hidden) { perch = null; closePanel(); return; }
     perch = playerPerch(r, Boolean(fullscreen));
     const { x, y, faceLeft } = perch;
-    companion.setPerch(x, y, faceLeft, Boolean(fullscreen));
+    companion.setPerch(x, y, faceLeft, Boolean(fullscreen), { continuous });
     updateFlyVisibility();
     if (panel.classList.contains('show')) {
       const left = faceLeft ? x + FLY_SIZE - panel.offsetWidth : x;
@@ -451,7 +477,7 @@
     return { ...corners[0], y: rect.top + 8 };
   }
 
-  function schedule() { if (alive() && !frame) frame = requestAnimationFrame(() => { frame = 0; place(); }); }
+  function schedule() { if (alive() && !frame) frame = requestAnimationFrame(() => { frame = 0; place(true); }); }
 
   function updateFlyVisibility() {
     if (!button || !companion) return;
@@ -463,8 +489,22 @@
     companion.setVisible(show && !document.hidden);
   }
 
+  let pointerMovedAt = 0;
+  // What the butterfly needs to know before it may stir on its own (vesper-companion.js scheduleIdle).
+  const idleContext = {
+    paused: () => !video || video.paused || video.ended,
+    mostlyVisible: () => {
+      if (!video) return false;
+      const r = video.getBoundingClientRect();
+      const visible = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) * Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+      return visible >= r.width * r.height * 0.5;
+    },
+    pointerIdle: ms => Date.now() - pointerMovedAt >= ms
+  };
+
   function onPointer(e) {
     if (!alive()) return;
+    pointerMovedAt = Date.now();
     pointer = { x: e.clientX, y: e.clientY };
     if (e.target !== pointerTarget) {
       pointerTarget = e.target;
@@ -625,9 +665,10 @@
   function renderChoices(title, poster, seconds, formats, expanded = false, useOriginal = false, useM4a = true) {
     const request = panelRequest;
     const originalPresets = useOriginal ? formats.originalChoices : formats.choices;
-    const presets = useM4a && formats.audioM4a
-      ? originalPresets.map(c => c.label === 'Audio only' ? formats.audioM4a : c)
-      : originalPresets;
+    const selectedAudio = formats.audioOutputs?.find(entry => entry.choice.index === formats.selectedAudio)?.choice;
+    const audioChoice = selectedAudio || (useM4a ? formats.audioM4a : null);
+    const presets = audioChoice ? originalPresets.map(c => c.label === 'Audio only' ? audioChoice : c) : originalPresets;
+    const intent = formats.intent ||= { audioTrack: null, subtitles: [], includeAutoSubtitles: false };
     const moreFormats = formats.more || [];
     const all = expanded ? [...presets, ...moreFormats] : presets;
     const output = element('label', 'output', 'Output');
@@ -640,24 +681,26 @@
     function updateOutput(index) {
       const isPreset = index < presets.length;
       const audio = isPreset && choice.label === 'Audio only';
-      output.hidden = !isPreset || !(audio ? formats.audioM4a : formats.originalChoices?.length);
+      output.hidden = !isPreset || !(audio ? formats.audioOutputs?.length > 1 || formats.audioM4a : formats.originalChoices?.length);
       if (output.hidden) return;
       const kind = audio ? 'audio' : 'video';
       if (mode.dataset.kind !== kind) {
-        const labels = audio ? ['M4A (AAC)', 'Original audio'] : ['Compatible', 'Original'];
+        const labels = audio ? formats.audioOutputs?.map(entry => entry.label) || ['M4A — plays everywhere', 'Original audio'] : ['Plays everywhere (MP4)', 'Original (best quality)'];
         mode.replaceChildren(...labels.map(name => element('option', '', name)));
         mode.dataset.kind = kind;
       }
-      mode.selectedIndex = (audio ? !useM4a : useOriginal) ? 1 : 0;
+      mode.selectedIndex = audio && formats.audioOutputs ? Math.max(0, formats.audioOutputs.findIndex(entry => entry.choice.index === choice.index)) : (audio ? !useM4a : useOriginal) ? 1 : 0;
     }
     function select(index, focus) {
       choice = all[index];
+      if (pinned && presets.includes(choice)) { pinned.remove(); pinned = null; }
       for (const [i, option] of rows.entries()) {
         option.setAttribute('aria-checked', String(i === index));
         option.querySelector('.tick').textContent = i === index ? '✓' : '';
         option.tabIndex = i === index ? 0 : -1;
       }
       updateOutput(index);
+      refreshClip();
       if (focus) rows[index].focus();
     }
     for (const c of all) {
@@ -686,13 +729,13 @@
       rows.push(option);
       list.append(option);
     }
-    select(Math.max(0, all.indexOf(choice)), false);
     mode.onchange = () => {
       if (!mode.isConnected || output.hidden || !isCurrentRequest(request)) return;
       let original = useOriginal, m4a = useM4a;
       if (mode.dataset.kind === 'audio') {
         m4a = mode.selectedIndex === 0;
-        choice = m4a ? formats.audioM4a : originalPresets.find(c => c.label === 'Audio only');
+        choice = formats.audioOutputs?.[mode.selectedIndex]?.choice || (m4a ? formats.audioM4a : originalPresets.find(c => c.label === 'Audio only'));
+        formats.selectedAudio = choice?.index;
       } else {
         original = mode.selectedIndex === 1;
         const next = original ? formats.originalChoices : formats.choices;
@@ -701,13 +744,74 @@
       renderChoices(title, poster, seconds, formats, expanded, original, m4a);
       panel.querySelector('.output select')?.focus({ preventScroll: true });
     };
-    const body = [output, list];
-    if (!expanded && moreFormats.length) {
-      const more = element('button', 'vesper-button more', 'More formats ▾');
+    // A choice picked from the expanded list stays visible when the list collapses.
+    let pinned = null;
+    if (!expanded && moreFormats.includes(choice)) {
+      pinned = element('button', 'opt pinned');
+      pinned.setAttribute('aria-checked', 'true');
+      pinned.append(element('b', '', 'Selected: ' + choice.label));
+      pinned.onclick = () => {
+        if (isCurrentRequest(request)) renderChoices(title, poster, seconds, formats, true, useOriginal, useM4a);
+      };
+      list.prepend(pinned);
+    }
+    // "Download part": only for formats VESPER can cut (segmented HLS/DASH). Start/End as m:ss or seconds.
+    const clip = element('label', 'clip');
+    const clipBox = element('input');
+    clipBox.type = 'checkbox';
+    const clipFields = element('span', 'fields');
+    const startField = element('input'), endField = element('input');
+    for (const [field, name] of [[startField, 'Start'], [endField, 'End']]) {
+      field.type = 'text'; field.placeholder = name === 'Start' ? '0:00' : (seconds ? clockText(seconds) : '1:00');
+      field.setAttribute('aria-label', name); field.size = 7; field.inputMode = 'numeric';
+      clipFields.append(element('small', '', name), field);
+    }
+    clipFields.hidden = true;
+    clipBox.onchange = () => { clipFields.hidden = !clipBox.checked; clipNote.hidden = !clipBox.checked; };
+    clip.append(clipBox, element('span', '', 'Download part'), clipFields);
+    const clipNote = element('small', 'hint', 'May start a few seconds early: it cuts at the nearest segment.');
+    clipNote.hidden = true;
+    function clipRange() {
+      if (!clipBox.checked || clip.hidden) return undefined;
+      const start = parseClock(startField.value) ?? 0;
+      const end = parseClock(endField.value) ?? seconds ?? NaN;
+      return { start, end };
+    }
+    function refreshClip() {
+      const canClip = !!choice?.canClip;
+      clipNote.textContent = choice?.container === 'WAV' ? 'Exact sample boundaries. The entire source is downloaded and decoded.' : 'May start a few seconds early: it cuts at the nearest segment.';
+      clip.hidden = !canClip;
+      if (!canClip) { clipFields.hidden = true; clipNote.hidden = true; }
+    }
+    const body = [output, list, clip, clipNote];
+    if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {
+      const advanced = element('details');
+      advanced.append(element('summary', '', 'Language and subtitles'));
+      if (formats.audioTracks?.length > 1) {
+        const label = element('label', 'output', 'Audio track'), tracks = element('select');
+        const automatic = element('option', '', 'Original / automatic'); automatic.value = ''; tracks.append(automatic);
+        for (const track of formats.audioTracks) { const option = element('option', '', track.label); option.value = track.id; tracks.append(option); }
+        tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; };
+        label.append(tracks); advanced.append(label);
+      }
+      for (const subtitle of formats.subtitleOptions || []) {
+        const label = element('label', 'output'), check = element('input'); check.type = 'checkbox';
+        check.checked = intent.subtitles.includes(subtitle.language);
+        check.onchange = () => {
+          intent.subtitles = check.checked ? [...new Set([...intent.subtitles, subtitle.language])] : intent.subtitles.filter(language => language !== subtitle.language);
+          intent.includeAutoSubtitles = !!advanced.querySelector('input[data-auto=true]:checked');
+        };
+        check.dataset.auto = String(subtitle.auto); label.append(check, document.createTextNode(subtitle.label + (subtitle.auto ? ' (automatic)' : ''))); advanced.append(label);
+      }
+      body.push(advanced);
+    }
+    if (moreFormats.length) {
+      const more = element('button', 'vesper-button more', expanded ? 'Fewer formats ▴' : 'More formats ▾');
+      more.setAttribute('aria-expanded', String(expanded));
       more.onclick = () => {
         if (!isCurrentRequest(request)) return;
-        renderChoices(title, poster, seconds, formats, true, useOriginal, useM4a);
-        panel.querySelectorAll('.opt')[presets.length]?.focus();
+        renderChoices(title, poster, seconds, formats, !expanded, useOriginal, useM4a);
+        panel.querySelector('.more')?.focus({ preventScroll: true });
       };
       body.push(more);
     }
@@ -716,10 +820,11 @@
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
       action.onclick = () => {
-        if (action.isConnected) void deliver(title, poster, seconds, formats, choice.index, mode, request);
+        if (action.isConnected) void deliver(title, poster, seconds, formats, choice.index, mode, request, { ...intent, range: clipRange() });
       };
       footer.append(action);
     }
+    select(Math.max(0, all.indexOf(choice)), false);
     renderShell(title, poster, seconds, ...body, footer);
   }
 
@@ -758,7 +863,7 @@
     renderShell(title, poster, seconds, message);
   }
 
-  async function deliver(title, poster, seconds, formats, formatChoice, mode, request) {
+  async function deliver(title, poster, seconds, formats, formatChoice, mode, request, intent = {}) {
     if (!isCurrentRequest(request)) return;
     const sending = element('div', 'msg', formats.browserChoice ? 'Starting in Chrome…' : 'Sending to VESPER…');
     sending.setAttribute('role', 'status');
@@ -767,7 +872,7 @@
     if (hadFocus) close.focus({ preventScroll: true });
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
       pageUrl: panelMedia.pageUrl }
-      : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode });
+      : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent });
     if (!isCurrentRequest(request)) return;
     if (reply?.ok) {
       const status = reply.results?.[0]?.status;

@@ -1,19 +1,11 @@
 using System.Text;
+using Vesper.Shared;
 
 namespace Vesper.MediaResolver.Security;
 
 /// <summary>Turns untrusted titles into safe single-segment Windows file names (no traversal, no reserved names).</summary>
 public static class FileNameSanitizer
 {
-    private static readonly HashSet<string> Reserved = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
-    };
-
-    private const string InvalidChars = "<>:\"/\\|?*";
-
     public static string Sanitize(string? name, string fallback = "media", int maxLength = 120)
     {
         if (string.IsNullOrWhiteSpace(name)) return fallback;
@@ -22,12 +14,11 @@ public static class FileNameSanitizer
         catch (ArgumentException) { /* invalid surrogates: keep as-is, they are replaced below */ }
 
         var sb = new StringBuilder(Math.Min(name.Length, maxLength + 8));
-        foreach (char ch in name)
+        foreach (Rune rune in name.EnumerateRunes())
         {
-            if (ch < 32 || ch == 127 || InvalidChars.IndexOf(ch) >= 0) sb.Append('_');
-            else if (ch is >= '\u200B' and <= '\u200F' or >= '\u202A' and <= '\u202E' or >= '\u2066' and <= '\u2069' or '\uFEFF') continue; // zero-width / bidi tricks
-            else if (char.IsSurrogate(ch)) sb.Append(ch);
-            else sb.Append(ch);
+            if (FileNameRules.IsWindowsInvalid(rune)) sb.Append('_');
+            else if (FileNameRules.IsHidden(rune)) continue;    // zero-width / bidi tricks
+            else sb.Append(rune.ToString());
         }
 
         string s = sb.ToString().Trim().TrimEnd('.', ' ');
@@ -43,7 +34,7 @@ public static class FileNameSanitizer
 
         if (s.Length == 0 || s.All(c => c == '.' || c == '_' || c == ' ')) return fallback;
         string stem = s.Split('.')[0].Trim();
-        if (Reserved.Contains(stem)) s = "_" + s;
+        if (FileNameRules.IsReservedStem(stem)) s = "_" + s;
         return s;
     }
 

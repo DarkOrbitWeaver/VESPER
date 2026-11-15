@@ -85,17 +85,23 @@ public sealed partial class DownloadEngine
             || request.Secrets is { Count: > 0 } || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid media merge plan without credentials or file checksums is required.");
 
+        if (request.Kind == JobKind.Http && request.Output == MediaOutput.Wav && request.MediaPlanJson is not null
+            && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "The requested WAV range is invalid.");
         MediaMergeMetadata? mediaMetadata = null;
         if (request.MediaMetadataJson is not null)
         {
+            // An original file is tagged in its own format. A converted file becomes M4A/MP4, which always takes tags.
+            bool canCarryTags = request.Output != MediaOutput.Original
+                || MediaMergePlan.SupportsAudioMetadataFile(request.FileName ?? uri.AbsolutePath);
             if (request.Kind != JobKind.Http || request.MediaProvider is not { Length: > 0 and <= 80 }
-                || request.Output != MediaOutput.Original || request.BrowserProof is not null || request.Secrets is { Count: > 0 }
-                || request.ExpectedSha256 is not null || request.PieceMapJson is not null || request.MediaPlanJson is not null
-                || !MediaMergePlan.SupportsAudioMetadataFile(request.FileName ?? uri.AbsolutePath)
+                || request.BrowserProof is not null || request.Secrets is { Count: > 0 }
+                || request.ExpectedSha256 is not null || request.PieceMapJson is not null || request.MediaPlanJson is not null && request.Output != MediaOutput.Wav
+                || !canCarryTags
                 || !MediaMergePlan.TryParseMetadata(request.MediaMetadataJson, out mediaMetadata)
                 || (mediaMetadata is not null && !MediaMergePlan.HasAudioTagValues(mediaMetadata)
                     && string.IsNullOrWhiteSpace(request.MediaThumbnailUrl)))
-                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded audio metadata requires a discovered MP3, FLAC, Ogg or Opus download without credentials or a file checksum.");
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded audio metadata requires a discovered MP3, FLAC, Ogg or Opus download, or a converted M4A/MP4, without credentials or a file checksum.");
         }
 
         string? expected = null;
@@ -170,7 +176,7 @@ public sealed partial class DownloadEngine
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
-                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge ? request.MediaPlanJson : null,
+                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output == MediaOutput.Wav ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.
@@ -447,7 +453,8 @@ public sealed partial class DownloadEngine
                 if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
                 if (!MergeTransfer.DeleteSidecars(job)) throw new IOException("A merge track file could not be deleted.");
                 if (!DeleteTemporaryFile(job, PublicationStagePath(job))
-                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionAudioPath(job)))
+                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionAudioPath(job))
+                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionTaggedPath(job)))
                     throw new IOException("A temporary media file could not be deleted.");
                 RecoveryManifest.Delete(job.PartialPath);
             }

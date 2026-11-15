@@ -16,7 +16,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         {
             case "hello":
                 return BridgeResponse.Success(request.Id, "VESPER is running.",
-                    data: new { app = "VESPER", handoff = preferences().BrowserAction.ToString().ToLowerInvariant() }, version: Application.ProductVersion);
+                    data: new { app = "VESPER", handoff = preferences().BrowserAction.ToString().ToLowerInvariant(),
+                        build = Vesper.Shared.BuildInfo.Version(typeof(BrowserBridgeHandler).Assembly) },
+                    version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
 
             case "probe":
                 return BridgeResponse.Success(request.Id, data: await engine.ProbeMediaAsync(request.Url!, ct));
@@ -30,18 +32,13 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "media-select":
                 return SelectBrowserMedia(request);
 
+            case "batch-review":
             case "submit":
             case "browser-submit":
                 return await SubmitAsync(request, ct);
 
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);
-
-            case "browser-completed":
-                AddResult saved = engine.RegisterBrowserDownload(request.Id, request.CompletedFile!, request.TransferId);
-                if (saved.Ok) owner.FinishBrowserActivity(request.Id);
-                return saved.Ok ? BridgeResponse.Success(request.Id, saved.Message, data: new { jobId = saved.JobId })
-                    : BridgeResponse.Fail(request.Id, saved.Status == AddStatus.Busy ? "busy" : "invalid-file", saved.Message);
 
             case "browser-activity":
                 return await WatchBrowserActivityAsync(request, ct);
@@ -107,9 +104,20 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         string mode = request.Mode == "ask" ? preferences().BrowserAction.ToString().ToLowerInvariant() : request.Mode;
         if (request.Type == "browser-submit" && mode == "ask") mode = "download";
 
+        if (request.Type == "batch-review" || request.Items.Count > 1) mode = "ask";
+        IReadOnlySet<int>? selected = null;
         bool startNow = mode == "download";
         string? folder = null;
-        if (mode == "ask")
+        if (mode == "ask" && request.Items.Count > 1)
+        {
+            var reviewed = await ReviewBatchAsync(request, ct);
+            if (reviewed.Outcome == QuickDownloadForm.Outcome.Cancel || reviewed.Selected.Count == 0)
+                return BridgeResponse.Fail(request.Id, "cancelled", "No files were selected in VESPER.");
+            startNow = reviewed.Outcome == QuickDownloadForm.Outcome.Download;
+            folder = reviewed.Folder;
+            selected = reviewed.Selected;
+        }
+        else if (mode == "ask")
         {
             (QuickDownloadForm.Outcome outcome, string chosen) = await AskUserAsync(request, ct);
             if (outcome == QuickDownloadForm.Outcome.Cancel)
@@ -121,6 +129,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         var results = new List<BridgeResult>();
         for (int i = 0; i < request.Items.Count; i++)
         {
+            if (selected is not null && !selected.Contains(i)) continue;
             BridgeItem item = request.Items[i];
             Dictionary<string, string>? secrets = null;
             if (item.Cookie is not null || item.Authorization is not null)
@@ -142,10 +151,13 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 AddStatus.DestinationUnavailable => "destination",
                 _ => "invalid"
             };
-            bool? transferReady = request.ConfirmTransfer && added.Ok
-                ? await ConfirmTransferAsync(added.JobId, startNow, request.BrowserProof is not null, ct) : null;
+            bool? transferReady = null;
+            string? transferReason = null;
+            if (request.ConfirmTransfer && added.Ok)
+                (transferReady, transferReason) = await ConfirmTransferAsync(added.JobId, startNow, request.BrowserProof is not null, ct);
             results.Add(new BridgeResult(UrlPolicy.Redact(item.Url), status,
-                added.Ok || added.Status == AddStatus.Duplicate ? added.JobId.ToString("D") : null, added.Message, transferReady));
+                added.Ok || added.Status == AddStatus.Duplicate ? added.JobId.ToString("D") : null, added.Message,
+                transferReady, transferReason));
         }
 
         bool anyAccepted = results.Any(r => r.Status is "started" or "queued" or "already-submitted");
@@ -154,9 +166,14 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
     }
 
-    private async Task<bool> ConfirmTransferAsync(Guid id, bool startNow, bool staged, CancellationToken ct)
+    /// <summary>
+    /// Waits until VESPER has really received the file's first response. When it has not, the second value says why
+    /// (the job's own reason, or "queued", "busy", "slow"), so Chrome can tell the user why it kept the download.
+    /// </summary>
+    private async Task<(bool Ready, string? Reason)> ConfirmTransferAsync(Guid id, bool startNow, bool staged, CancellationToken ct)
     {
         var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        string? reason = null;
         void Inspect(JobSnapshot snapshot)
         {
             if (snapshot.Id != id) return;
@@ -166,7 +183,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 ready.TrySetResult(true);
             else if (snapshot.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed
                 or JobState.Cancelled or JobState.Suspect or JobState.Paused or JobState.Completed)
-                ready.TrySetResult(false);
+            {
+                if (ready.TrySetResult(false)) reason = TransferReasonCode(snapshot.Reason);
+            }
         }
         void InspectProgress(IReadOnlyList<JobSnapshot> snapshots)
         {
@@ -177,13 +196,18 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         engine.Progress += InspectProgress;
         try
         {
-            if (engine.Snapshot(id) is not { } current) return false;
+            if (engine.Snapshot(id) is not { } current) return (false, "unavailable");
             Inspect(current);
             // Queued downloads can wait indefinitely. Keep Chrome running if VESPER
             // cannot confirm receipt before this request returns.
-            if (!startNow) return ready.Task.IsCompletedSuccessfully && ready.Task.Result;
-            try { return await ready.Task.WaitAsync(TimeSpan.FromSeconds(8), ct); }
-            catch (TimeoutException) { return false; }
+            if (!startNow)
+                return ready.Task.IsCompletedSuccessfully && ready.Task.Result ? (true, null) : (false, reason ?? "queued");
+            try { return await ready.Task.WaitAsync(TimeSpan.FromSeconds(8), ct) ? (true, null) : (false, reason ?? "unavailable"); }
+            catch (TimeoutException)
+            {
+                // Still waiting for a free download slot, or the server has not answered yet.
+                return (false, engine.Snapshot(id)?.State == JobState.Queued ? "busy" : "slow");
+            }
         }
         finally
         {
@@ -191,6 +215,11 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             engine.Progress -= InspectProgress;
         }
     }
+
+    // Engine reasons are short lowercase codes such as "auth" or "browser-fallback". Anything else is not passed on.
+    private static string TransferReasonCode(string reason) =>
+        reason.Length is > 0 and <= 32 && reason.All(c => char.IsAsciiLetterLower(c) || char.IsAsciiDigit(c) || c == '-')
+            ? reason : "unavailable";
 
     private async Task<BridgeResponse> BrowserTransferAsync(BridgeRequest request, CancellationToken ct)
     {
@@ -242,6 +271,30 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
     };
 
     /// <summary>Shows the compact Quick Download window on the UI thread and waits for the user's choice.</summary>
+    private async Task<(QuickDownloadForm.Outcome Outcome, string Folder, IReadOnlySet<int> Selected)> ReviewBatchAsync(
+        BridgeRequest request, CancellationToken ct)
+    {
+        var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string, IReadOnlySet<int>)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        owner.BeginInvoke(() =>
+        {
+            if (ct.IsCancellationRequested) { done.TrySetCanceled(ct); return; }
+            try
+            {
+                owner.RequestShow();
+                using var form = new BatchReviewForm(preferences(), request.Items);
+                using var registration = ct.Register(() =>
+                {
+                    if (!form.IsDisposed && form.IsHandleCreated)
+                        try { form.BeginInvoke(() => form.Close()); } catch (InvalidOperationException) { }
+                });
+                form.ShowDialog(owner);
+                done.TrySetResult((form.Result, form.Destination, form.SelectedIndices));
+            }
+            catch (Exception ex) { done.TrySetException(ex); }
+        });
+        return await done.Task.WaitAsync(ct);
+    }
+
     private async Task<(QuickDownloadForm.Outcome, string)> AskUserAsync(BridgeRequest request, CancellationToken ct)
     {
         BridgeItem first = request.Items[0];

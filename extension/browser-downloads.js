@@ -4,6 +4,8 @@ const RECOVERY_ALARM = 'vesper-chrome-downloads';
 const MAX_BROWSER_RECORDS = 128;
 const RESPONSE_LIFETIME = 60_000;
 const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
+const DECISIONS_KEY = 'vesperCaptureDecisions';
+const MAX_DECISIONS = 20;
 const responses = new Map();
 const awaitingResponses = new Map();
 const requestChains = new Map();
@@ -11,15 +13,22 @@ const blockedRequests = new Map();
 const browserOperations = new Map();
 let recordWrites = Promise.resolve();
 let captureWrites = Promise.resolve();
+let decisionWrites = Promise.resolve();
 let captureRecovery;
 let profileIdPromise;
 let activityPort, openingActivity = false;
 
-const browserUrl = item => item.finalUrl || item.url;
+// A #fragment never reaches the server. Chrome's download list and its request log don't agree on keeping it,
+// so every address is compared without one.
+const withoutFragment = url => typeof url === 'string' ? url.split('#', 1)[0] : url;
+const startUrl = item => withoutFragment(item?.url);
+const browserUrl = item => withoutFragment(item.finalUrl || item.url);
 const isSafe = item => !!item && !item.incognito && ['safe', 'deepScannedSafe'].includes(item.danger);
 const startedByVesper = item => !!item?.byExtensionId && item.byExtensionId === chrome.runtime.id;
 const canMove = item => isSafe(item) && item.state === 'in_progress' && /^https?:\/\//i.test(browserUrl(item) || '');
 const byteCount = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+// While Chrome doesn't know a download's size it reports 0 or -1. Neither proves anything about the file.
+const knownSize = item => [item.fileSize, item.totalBytes].find(value => Number.isSafeInteger(value) && value > 0);
 const mimeType = value => {
   const mime = value?.split(';', 1)[0].trim().toLowerCase();
   return mime && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mime) && mime.length <= 100 ? mime : undefined;
@@ -106,7 +115,7 @@ function requestChainIsRelevant(chain) {
 async function persistRequestChainsForDownload(item) {
   let changed = false;
   for (const chain of requestChains.values()) {
-    if (chain.replayable && chain.originalUrl === item?.url && !chain.persisted) {
+    if (chain.replayable && chain.originalUrl === startUrl(item) && !chain.persisted) {
       chain.persisted = true;
       changed = true;
     }
@@ -115,9 +124,9 @@ async function persistRequestChainsForDownload(item) {
 }
 
 function rememberRequestRedirect(details) {
-  const chain = updateRequestChain(details.requestId, details.url, details.method);
+  const chain = updateRequestChain(details.requestId, withoutFragment(details.url), details.method);
   if (chain && typeof details.redirectUrl === 'string') {
-    chain.currentUrl = details.redirectUrl;
+    chain.currentUrl = withoutFragment(details.redirectUrl);
     chain.seen = Date.now();
     if (chain.replayable && requestChainIsRelevant(chain)) chain.persisted = true;
     if (chain.persisted || !chain.replayable) return saveCaptureState();
@@ -127,7 +136,8 @@ function rememberRequestRedirect(details) {
 
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
 async function observeDownloadResponse(details) {
-  const chain = updateRequestChain(details.requestId, details.url, details.method, details.statusCode);
+  const url = withoutFragment(details.url);
+  const chain = updateRequestChain(details.requestId, url, details.method, details.statusCode);
   if (details.statusCode !== 200 && details.statusCode !== 206) {
     if (details.statusCode === 401 || details.statusCode === 407) await saveCaptureState();
     return;
@@ -145,22 +155,25 @@ async function observeDownloadResponse(details) {
     && mime !== 'text/html' && mime !== 'application/xhtml+xml' && (mime || length !== undefined || etag);
   if (!attachment && !fileResponse && mime !== 'application/octet-stream') return;
   if (chain?.replayable) chain.persisted = true;
-  const old = responses.get(details.url);
+  const old = responses.get(url);
   const conflicts = old && Date.now() - old.seen <= RESPONSE_LIFETIME
     && (!old.replay || old.etag && etag && old.etag !== etag
         || old.length !== undefined && length !== undefined && old.length !== length);
-  responses.delete(details.url);
-  responses.set(details.url, { seen: Date.now(), replay: !!chain?.replayable
-      && details.method === 'GET' && (!encoding || encoding === 'identity') && !conflicts,
-    length, etag, contentType: mime });
+  // "why" is the plain reason VESPER must not fetch this file again by itself. The popup explains it.
+  let why;
+  if (!chain?.replayable || details.method !== 'GET') why = 'form';
+  else if (encoding && encoding !== 'identity') why = 'compressed';
+  else if (conflicts) why = old.why || 'changed';
+  responses.delete(url);
+  responses.set(url, { seen: Date.now(), replay: !why, why, length, etag, contentType: mime });
   const waiting = chain ? [...awaitingResponses.values()].filter(entry =>
     entry.url === chain.originalUrl || entry.url === chain.currentUrl) : [];
   const captured = [];
   for (const entry of waiting) {
     const item = await getChromeDownload(entry.id).catch(() => null);
-    if (item?.startTime === entry.startTime && item.url === chain.originalUrl
-        && (entry.url === item.url || entry.url === browserUrl(item)) && browserUrl(item) === details.url
-        && chain.currentUrl === details.url) {
+    if (item?.startTime === entry.startTime && startUrl(item) === chain.originalUrl
+        && (entry.url === startUrl(item) || entry.url === browserUrl(item)) && browserUrl(item) === url
+        && chain.currentUrl === url) {
       awaitingResponses.delete(entry.id);
       captured.push(item);
     }
@@ -169,28 +182,77 @@ async function observeDownloadResponse(details) {
   for (const item of captured) void captureChromeDownload(item).catch(() => {});
 }
 
+// Only document and attachment requests can sit behind a Chrome download. Listening for every XHR and
+// media response would wake the worker for the whole web.
+const DOWNLOAD_TYPES = ['main_frame', 'sub_frame', 'other'];
 chrome.webRequest.onHeadersReceived.addListener(details => {
   void captureStateReady.then(() => observeDownloadResponse(details)).catch(() => {});
 },
-  { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame', 'other', 'xmlhttprequest', 'media'] }, ['responseHeaders']);
+  { urls: ['http://*/*', 'https://*/*'], types: DOWNLOAD_TYPES }, ['responseHeaders']);
 chrome.webRequest.onBeforeRedirect.addListener(details => {
   void captureStateReady.then(() => rememberRequestRedirect(details)).catch(() => {});
 },
-  { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame', 'other', 'xmlhttprequest', 'media'] });
+  { urls: ['http://*/*', 'https://*/*'], types: DOWNLOAD_TYPES });
 
 function recentResponse(url) {
   const observed = responses.get(url);
   return observed && Date.now() - observed.seen <= RESPONSE_LIFETIME ? observed : undefined;
 }
 
+// What VESPER must see again from the server before it may replace Chrome's copy: the same size or the same
+// strong ETag. Without that, "reason" says in one word why Chrome keeps the download.
 function downloadProof(item, manual) {
   const hint = recentResponse(browserUrl(item));
-  if (hint ? !hint.replay : !manual) return null;
-  const size = byteCount(item.fileSize) ?? byteCount(item.totalBytes);
-  if (size !== undefined && hint?.length !== undefined && size !== hint.length) return null;
+  if (!hint && !manual) return { reason: 'unseen' };
+  if (hint && !hint.replay) return { reason: hint.why || 'form' };
+  const size = knownSize(item);
+  if (size !== undefined && hint?.length !== undefined && size !== hint.length) return { reason: 'changed' };
   const length = hint?.length ?? size;
-  if (length === undefined && !hint?.etag) return null;
-  return { length, etag: hint?.etag, contentType: hint?.contentType ?? mimeType(item.mime) };
+  if (length === undefined && !hint?.etag) return { reason: 'no-size' };
+  return { proof: { length, etag: hint?.etag, contentType: hint?.contentType ?? mimeType(item.mime) } };
+}
+
+// ---- why a download stayed in Chrome (shown in the popup)
+
+function decisionLabel(item) {
+  let name = chromeFileName(item), site = '';
+  try {
+    const url = new URL(browserUrl(item));
+    if (/^https?:$/.test(url.protocol)) {
+      site = url.hostname;
+      name ||= decodeURIComponent(url.pathname.split('/').pop() || '');
+    }
+  } catch { /* a blob or a badly escaped path: fall back to a generic name */ }
+  return { name: (name || 'Download').slice(0, 80), site: site.slice(0, 80) };
+}
+
+// Kept for this browser session only, newest first. File name and site, never the full link or its query,
+// and nothing at all from Incognito windows.
+function noteDecision(item, outcome) {
+  if (!item || item.incognito || !Number.isSafeInteger(item.id)) return Promise.resolve();
+  const entry = { id: item.id, at: Date.now(), ...decisionLabel(item), outcome };
+  const write = decisionWrites.then(async () => {
+    const { [DECISIONS_KEY]: saved } = await chrome.storage.session.get(DECISIONS_KEY);
+    const older = (Array.isArray(saved) ? saved : []).filter(old => old.id !== item.id);
+    await chrome.storage.session.set({ [DECISIONS_KEY]: [entry, ...older].slice(0, MAX_DECISIONS) });
+  });
+  decisionWrites = write.catch(() => {});
+  return decisionWrites;
+}
+
+// Turns VESPER's answer to a handoff into one of the popup's reasons.
+function handoffOutcome(reply, result, signedIn) {
+  if (!reply.ok) {
+    if (reply.code === 'host-missing') return 'app-missing';
+    if (['app-unavailable', 'timeout', 'host-error', 'error'].includes(reply.code)) return 'app-unavailable';
+    return reply.code === 'duplicate' ? 'duplicate' : 'refused';
+  }
+  switch (result?.transferReason) {
+    case 'auth': case 'forbidden': return signedIn ? 'site-refused' : 'sign-in';
+    case 'browser-fallback': return signedIn ? 'different' : 'different-signed-out';
+    case 'queued': case 'busy': case 'slow': return result.transferReason;
+    default: return result?.status === 'queued' ? 'queued' : 'not-ready';
+  }
 }
 
 function chromeFileName(item) {
@@ -200,7 +262,7 @@ function chromeFileName(item) {
 
 async function listChromeDownloads() {
   const downloads = await chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 });
-  return { ok: true, downloads: downloads.filter(item => canMove(item) && downloadProof(item, true)).slice(0, 8).map(item => ({
+  return { ok: true, downloads: downloads.filter(item => canMove(item) && downloadProof(item, true).proof).slice(0, 8).map(item => ({
     id: item.id, name: chromeFileName(item) || 'Download', paused: item.paused
   })) };
 }
@@ -272,8 +334,12 @@ function moveChromeDownload(id, mode, automatic = false) {
     const item = await getChromeDownload(id);
     if (!canMove(item) || automatic && item.paused || !Number.isFinite(Date.parse(item.startTime)))
       return chromeKeeps('This Chrome download is unavailable to move.');
-    const proof = downloadProof(item, !automatic);
-    if (!proof) return chromeKeeps('Chrome is handling this file.');
+    const note = outcome => automatic ? noteDecision(item, outcome) : Promise.resolve();
+    const { proof, reason } = downloadProof(item, !automatic);
+    if (!proof) {
+      await note(reason);
+      return chromeKeeps('Chrome is handling this file.');
+    }
     const previous = await browserRecord(item);
     if (previous?.stage === 'parked' || previous?.stage === 'parking') return { ok: true, chromePaused: item.paused };
     if (automatic && previous) return chromeKeeps();
@@ -289,6 +355,7 @@ function moveChromeDownload(id, mode, automatic = false) {
     if (!reply.ok || result?.transferReady !== true) {
       // A delayed reply cannot publish a tentative download. Release the job if the helper answered.
       if (reply.ok) await transferCommand(record.transferId, 'abandon');
+      await note(handoffOutcome(reply, result, authorized));
       return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
     }
 
@@ -296,6 +363,7 @@ function moveChromeDownload(id, mode, automatic = false) {
     if (!sameDownload(current, record) || !canMove(current) || browserUrl(current) !== browserUrl(item)
         || automatic && current.paused) {
       await transferCommand(record.transferId, 'abandon');
+      await note(sameDownload(current, record) && current.state === 'complete' ? 'chrome-finished' : 'not-ready');
       return chromeKeeps();
     }
     record.stage = 'parking';
@@ -312,10 +380,12 @@ function moveChromeDownload(id, mode, automatic = false) {
         record.stage = 'parked';
         await writeBrowserRecord(id, record);
         watchChromeDownload(id, record);
+        await noteDecision(item, 'moved');
         return { ...reply, chromePaused: true };
       }
     } catch { /* The recovery record was written before changing Chrome. */ }
     await restoreChromeDownload(id, record);
+    await note('not-ready');
     return chromeKeeps();
   });
 }
@@ -342,7 +412,12 @@ async function restoreChromeDownload(id, record) {
 
 async function finishBrowserHandoff(id, record) {
   const item = await getChromeDownload(id);
-  if (sameDownload(item, record) && item.state === 'in_progress' && item.paused) await chrome.downloads.cancel(id);
+  if (sameDownload(item, record) && item.state === 'in_progress' && item.paused) {
+    // VESPER has the file. Cancel Chrome's parked copy (which removes its partial file), then erase the
+    // record so Chrome's list shows no misleading "Canceled" entry for a download that succeeded.
+    await chrome.downloads.cancel(id).catch(() => {});
+    await chrome.downloads.erase({ id }).catch(() => {});
+  }
   await writeBrowserRecord(id, { ...record, stage: 'done' });
 }
 
@@ -368,7 +443,8 @@ async function reconcileChromeDownload(id, record, knownReply) {
   if (!current || current.transferId !== record.transferId || current.stage !== record.stage) return;
   const item = await getChromeDownload(id);
   if (!sameDownload(item, record)) { await writeBrowserRecord(id, null); return; }
-  if (item.state === 'complete') { await registerChromeDownload(item, current); return; }
+  // Chrome finished it. The file stays Chrome's; VESPER only stands down its own copy.
+  if (item.state === 'complete') { await releaseChromeDownload(item, current); return; }
   if (record.stage === 'import') { await writeBrowserRecord(id, null); return; }
   if (item.state === 'in_progress' && !item.paused) { await restoreChromeDownload(id, record); return; }
   if (record.stage === 'parking') {
@@ -405,36 +481,14 @@ function profileId() {
   return profileIdPromise;
 }
 
-function chromeOrigin(item) {
-  for (const url of [browserUrl(item), item.referrer]) {
-    try {
-      const origin = new URL(url).origin;
-      if (/^https?:\/\//i.test(origin)) return origin;
-    } catch { /* A generated file can have no web origin. */ }
-  }
-  return undefined;
-}
-
 const downloadReceiptId = (item, profile) => `c-${profile}-${item.id.toString(36)}-${Date.parse(item.startTime).toString(36)}`;
 
-async function registerChromeDownload(item, record) {
-  if (record?.stage === 'done') return;
-  if (!isSafe(item) || item.state !== 'complete' || item.exists === false || !item.filename ||
-      byteCount(item.fileSize) === undefined || !Number.isFinite(Date.parse(item.startTime))) {
-    if (record?.stage === 'import') await writeBrowserRecord(item.id, null);
-    return;
-  }
-  if (!record?.transferId && !startedByVesper(item) && !(await settings()).intercept) { await writeBrowserRecord(item.id, null); return; }
-  const attempt = { ...record, startTime: item.startTime, stage: 'import', tries: (record?.tries || 0) + 1 };
-  if (!(await writeBrowserRecord(item.id, attempt))) return;
-  await armBrowserRecovery();
-  if (attempt.transferId && record.stage !== 'import') await transferCommand(attempt.transferId, 'abandon');
-  const id = downloadReceiptId(item, await profileId());
-  const reply = await nativeRequest(envelope('browser-completed', {
-    id, path: item.filename, length: item.fileSize, origin: chromeOrigin(item), transferId: attempt.transferId
-  }), 16000);
-  const retry = !reply.ok && !['invalid', 'invalid-file', 'host-missing'].includes(reply.code) && attempt.tries < 3;
-  if (!retry) await writeBrowserRecord(item.id, { ...attempt, stage: 'done' });
+// Chrome completed this download, so it is Chrome's file. VESPER never claims it: it only abandons any
+// transfer it had started and forgets the handoff. Nothing is added to VESPER's list.
+async function releaseChromeDownload(item, record) {
+  if (!record) return;
+  if (record.transferId && record.stage !== 'done') await transferCommand(record.transferId, 'abandon').catch(() => {});
+  await writeBrowserRecord(item.id, null);
 }
 
 async function chromeActivity() {
@@ -504,23 +558,33 @@ async function captureChromeDownload(item) {
   await captureStateReady;
   await persistRequestChainsForDownload(item);
   if (item?.state === 'complete') {
+    // Too late to take over, and Chrome's file is not VESPER's to list. Just stand down if we had started one.
     if (awaitingResponses.delete(item.id)) await saveCaptureState();
     await inBrowserOrder(item.id, async () => {
       const current = await getChromeDownload(item.id);
-      if (current?.startTime === item.startTime) await registerChromeDownload(current, await browserRecord(current));
+      if (current?.startTime === item.startTime) await releaseChromeDownload(current, await browserRecord(current));
     });
     return;
   }
-  if (!canMove(item) || item.paused || startedByVesper(item)) return;
+  if (startedByVesper(item)) return;
+  const prefs = await settings();
+  const wanted = prefs.intercept && prefs.route !== 'chrome';
+  if (!canMove(item) || item.paused) {
+    // A file the page built itself (blob: or data:) has no address VESPER could fetch.
+    const pageMade = isSafe(item) && item.state === 'in_progress' && /^(blob|data):/i.test(item.finalUrl || item.url || '');
+    if (wanted && pageMade) await noteDecision(item, 'page-made');
+    return;
+  }
   const url = browserUrl(item);
-  if (!downloadProof(item, false)) {
+  const { proof, reason } = downloadProof(item, false);
+  if (!proof) {
     if (!recentResponse(url)) await rememberWaitingResponse(item, url);
     else if (awaitingResponses.delete(item.id)) await saveCaptureState();
+    if (wanted) await noteDecision(item, reason);
     return;
   }
   if (awaitingResponses.delete(item.id)) await saveCaptureState();
-  const prefs = await settings();
-  if (prefs.intercept && prefs.route !== 'chrome') await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
+  if (wanted) await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
 }
 
 chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {}); });
@@ -537,7 +601,7 @@ chrome.downloads.onChanged.addListener(async change => {
         if (record?.stage === 'parked') await reconcileChromeDownload(change.id, record);
       });
     } else if (change.state?.current === 'complete' || ['safe', 'deepScannedSafe'].includes(change.danger?.current)
-        || change.finalUrl || change.totalBytes) {
+        || change.finalUrl || change.totalBytes || change.fileSize) {
       await captureChromeDownload(await getChromeDownload(change.id));
     }
   } catch { /* The existing Chrome file or its recovery record is still available. */ }

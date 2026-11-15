@@ -4,7 +4,7 @@ using System.Text.Json;
 
 namespace Vesper.Engine;
 
-/// <summary>Serial, bounded clear fMP4 transfer through the existing durable session, limiters and publish path.</summary>
+/// <summary>Bounded, ordered clear fMP4 transfer through the existing durable session, limiters and publish path.</summary>
 internal sealed class DashTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
 {
     internal const long MaxObjectBytes = 64L * 1024 * 1024;
@@ -79,10 +79,22 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 offset = init.Length;
             }
             session.SetPhase(JobState.Downloading);
+            using var prefetch = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var pending = new Queue<Task<ReadOnlyMemory<byte>>>();
+            int fetchNext = next;
+            void Fill()
+            {
+                while (pending.Count < 3 && fetchNext < fragments.Count)
+                    pending.Enqueue(FetchAsync(fragments[fetchNext++], MaxObjectBytes, prefetch.Token));
+            }
+            try
+            {
             for (int i = next; i < fragments.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                ReadOnlyMemory<byte> fragment = await FetchAsync(fragments[i], MaxObjectBytes, ct).ConfigureAwait(false);
+                Fill();
+                ReadOnlyMemory<byte> fragment = await pending.Dequeue().ConfigureAwait(false);
+                Fill();
                 mp4.ValidateFragment(fragment.Span);
                 EnsureSpace(fragment.Length);
                 await LimitedWriteAsync(fragment, offset, ct).ConfigureAwait(false);
@@ -94,6 +106,13 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
                 await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
                 engine.UpdateJob(Job, j => j.Message = $"Fragment {i + 1} of {fragments.Count}");
+            }
+            }
+            finally
+            {
+                prefetch.Cancel();
+                foreach (var fetch in pending)
+                    try { await fetch.ConfigureAwait(false); } catch (Exception) { }
             }
             mp4.Finish(plan.RequireAudio, plan.RequireVideo);
         }

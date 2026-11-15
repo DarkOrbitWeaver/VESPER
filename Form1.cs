@@ -95,7 +95,9 @@ public partial class Form1 : Form
     {
         foreach (JobSnapshot snapshot in engine.Snapshots()) _items[snapshot.Id] = DownloadItem.From(snapshot);
 
+        CodecCapabilities.Prime();
         engine.JobChanged += Enqueue;
+        engine.JobChanged += snapshot => { if (MediaSourceRescue.ShouldTryAutomatically(snapshot)) _ = AutoRefreshAsync(engine, snapshot); };
         engine.Progress += batch => { foreach (JobSnapshot s in batch) Enqueue(s); };
         engine.JobRemoved += id => PostToUi(() => { _items.Remove(id); _grid.PruneChecks(_items.Keys); RefreshList(); });
         engine.ActivityChanged += active => PostToUi(() => EngineHost.HoldAwake(active && _prefs.PreventSleep));
@@ -236,6 +238,7 @@ public partial class Form1 : Form
     /// <summary>Tray notifications only for real transitions the user would want to know about.</summary>
     private void Announce(JobStatus before, DownloadItem item)
     {
+        if (before != item.Status) AnnounceToScreenReader(before, item);
         if (!_prefs.NotifyOnFinish || _tray is null || before == item.Status || item.Snapshot?.Kind == JobKind.BrowserFile) return;
         if (item.Status == JobStatus.Completed && before != JobStatus.Missing)
         {
@@ -259,6 +262,51 @@ public partial class Form1 : Form
     }
 
     private Rectangle NoticeArea => _noticeWorkArea.IsEmpty ? Screen.FromPoint(Cursor.Position).WorkingArea : _noticeWorkArea;
+
+    // "Pause tonight, resume tomorrow": an expired YouTube merge job gets fresh links by itself. The engine only
+    // accepts a plan that continues the saved bytes byte-for-byte, so this is safe to do without asking.
+    private static async Task AutoRefreshAsync(DownloadEngine engine, JobSnapshot job)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            RescueResult result = await MediaSourceRescue.RefreshAsync(engine, job, EngineHost.MediaNetwork(options: engine.Options), timeout.Token);
+            if (!result.Accepted) System.Diagnostics.Trace.WriteLine(result.Message, "Automatic link refresh");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.WriteLine(ex.Message, "Automatic link refresh");
+        }
+    }
+
+    // Narrator and other screen readers hear outcomes (finished, failed, needs attention) without the
+    // user having to tab into the list. Throttled: one announcement per second, most recent wins.
+    private DateTime _lastAnnouncement;
+    private void AnnounceToScreenReader(JobStatus before, DownloadItem item)
+    {
+        if (!IsHandleCreated) return;
+        string? text = item.Status switch
+        {
+            JobStatus.Completed when before != JobStatus.Missing => $"{item.Name} finished",
+            JobStatus.Failed => $"{item.Name} failed",
+            JobStatus.NeedsAttention or JobStatus.Suspect => $"{item.Name} needs attention",
+            JobStatus.NeedsLink => $"{item.Name} needs a new link",
+            _ => null
+        };
+        if (text is null) return;
+        DateTime now = DateTime.UtcNow;
+        if (now - _lastAnnouncement < TimeSpan.FromSeconds(1)) return;
+        _lastAnnouncement = now;
+        try
+        {
+            AccessibilityObject.RaiseAutomationNotification(System.Windows.Forms.Automation.AutomationNotificationKind.ActionCompleted,
+                System.Windows.Forms.Automation.AutomationNotificationProcessing.MostRecent, text);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or System.Runtime.InteropServices.COMException)
+        {
+            // No UI Automation client is listening; nothing to do.
+        }
+    }
 
     private void PresentNotice(string title, string detail, VesperIcon symbol, Action activate)
     {
@@ -289,7 +337,7 @@ public partial class Form1 : Form
         menu.Items.Add(new ToolStripSeparator());
         Add("Exit VESPER", VesperIcon.Close, (_, _) => ExitApplication());
 
-        _tray = new NotifyIcon { Icon = Icon, Text = "VESPER", Visible = true, ContextMenuStrip = menu };
+        _tray = new NotifyIcon { Icon = Icon, Text = "VESPER " + Vesper.Shared.BuildInfo.Version(typeof(Form1).Assembly), Visible = true, ContextMenuStrip = menu };
         ApplyTrayAppearance();
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowFromTray(); };
     }
@@ -450,7 +498,10 @@ public partial class Form1 : Form
         _tooltips.SetToolTip(_searchFrame, "Search downloads");
         _add.Click += (_, _) => AddDownload();
         _settings.Click += (_, _) => OpenSettings();
-        _search.TextChanged += (_, _) => RefreshList();
+        // Typing refilters once the keystrokes pause, not on every character (VES-019).
+        var searchDebounce = new System.Windows.Forms.Timer { Interval = 120 };
+        searchDebounce.Tick += (_, _) => { searchDebounce.Stop(); RefreshList(); };
+        _search.TextChanged += (_, _) => { searchDebounce.Stop(); searchDebounce.Start(); };
         _filter.SelectedIndexChanged += (_, _) => RefreshList();
         _sort.SelectedIndexChanged += (_, _) => RefreshList();
         _pause.Click += (_, _) =>
@@ -736,7 +787,7 @@ public partial class Form1 : Form
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
                 MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId,
-                Output: media.Output, MediaMetadataJson: media.MediaMetadataJson));
+                Output: media.Output, MediaMetadataJson: media.MediaMetadataJson, Secrets: media.Secrets));
             Record(result, media.Url);
         }
         foreach (string url in dialog.DownloadUrls)

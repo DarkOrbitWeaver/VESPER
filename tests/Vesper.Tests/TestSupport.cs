@@ -140,6 +140,19 @@ internal sealed class FaultServer : IAsyncDisposable
                     await res.Body.WriteAsync(packed.ToArray());
                 }
                 break;
+            case "/unknown-length": // no Content-Length, but ranges are honoured, so the length can be confirmed
+                res.Headers.AcceptRanges = "bytes";
+                res.ContentType = "application/octet-stream";
+                if (ctx.Request.Headers.TryGetValue("Range", out var unknownRange)
+                    && TryParseRange(unknownRange.ToString(), V1.Length, out long us, out long ue))
+                {
+                    res.StatusCode = 206;
+                    res.Headers.ContentRange = $"bytes {us}-{ue}/{V1.Length}";
+                    res.ContentLength = ue - us + 1;
+                    await res.Body.WriteAsync(V1.AsMemory((int)us, (int)(ue - us + 1)));
+                }
+                else await res.Body.WriteAsync(V1);
+                break;
             case "/chunked": // no Content-Length: the server streams until it is done
                 res.ContentType = "application/octet-stream";
                 for (int offset = 0; offset < V1.Length; offset += 32 * 1024)

@@ -64,6 +64,8 @@ public sealed record MediaRepresentation
     /// <summary>True when the audio presence could not be verified (e.g. direct file with no codec metadata).</summary>
     public bool AudioUnverified { get; init; }
 
+    /// <summary>Distinct delivery endpoint to retain as an alternative even at identical quality.</summary>
+    public string? DeliveryId { get; init; }
     public string? Label { get; init; }
     public long? FileSize { get; init; }
     public bool FileSizeIsEstimate { get; init; }

@@ -334,7 +334,8 @@ internal static class Mp4Demuxer
                 else if (item.Type == "aART") albumArtist = value;
                 else releaseDate = value;
             }
-            else if (item.Type is "trkn" or "disk" && kind == 0 && data.Value.End - data.Value.Start >= 16)
+            // trkn carries 8 payload bytes, disk only 6 (the iTunes layout); both put the number at offset 2.
+            else if (item.Type is "trkn" or "disk" && kind == 0 && data.Value.End - data.Value.Start >= 14)
             {
                 ushort value = BinaryPrimitives.ReadUInt16BigEndian(moov.AsSpan(data.Value.Start + 10, 2));
                 if (value is 0 or > 999) throw Bad("an MP4 track or disc number is invalid");

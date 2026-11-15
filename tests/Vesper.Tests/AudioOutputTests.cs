@@ -48,11 +48,12 @@ public sealed class AudioOutputTests
     [Fact]
     public void Explicit_m4a_uses_the_best_source_audio_and_exact_formats_preserve_their_encoding()
     {
+        // Native AAC is copied as-is. Transcoding Opus to AAC would only lose quality and time.
         var item = Item(Aac, Opus);
         MediaDownloadChoice m4a = Assert.IsType<MediaDownloadChoice>(
             MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice);
-        Assert.Equal((OperatingSystem.IsWindows() ? Opus : Aac).Url.AbsoluteUri, m4a.Url);
-        Assert.Equal(OperatingSystem.IsWindows() ? MediaOutput.M4a : MediaOutput.Original, m4a.Output);
+        Assert.Equal(Aac.Url.AbsoluteUri, m4a.Url);
+        Assert.Equal(MediaOutput.Original, m4a.Output);
 
         MediaDownloadChoice exact = Assert.IsType<MediaDownloadChoice>(
             MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, Aac, MediaOutputPreference.M4a).Choice);

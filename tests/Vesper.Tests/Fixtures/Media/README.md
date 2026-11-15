@@ -12,6 +12,7 @@ They contain no captured user media, cookies, tokens or third-party footage. The
 - `quiet-track.mp3`: 0.444-second generated silent MP3 for testing ID3v2 metadata without changing MPEG audio frames.
 - `quiet-track.flac`, `quiet-track.ogg`, and `quiet-track.opus`: short generated silent streams for native metadata rewrite and publication tests.
 - `quiet-track.webm`: short generated silent Opus stream for WebM metadata and cover attachment tests.
+- `quiet-track-aac.m4a`: `quiet-track.webm` decoded and re-encoded to AAC-LC in a plain (non-fragmented) MP4. It stands in for the Windows converter's output in the converted-M4A tag and artwork tests.
 
 Generation used an isolated FFmpeg 7.0.2 static tool, with `-movflags empty_moov+default_base_moof+frag_keyframe` for the fragmented MP4 sources.
 The MP4 sources were split at top-level `ftyp`/`moov` and consecutive `moof`/`mdat` boundaries; the optional `mfra` trailer was omitted.
@@ -19,6 +20,7 @@ The assembled MP4 fixtures were independently probed and fully decoded before us
 `quiet-track.mp3` was generated separately with FFmpeg 8.1.1 and libmp3lame as a short silent MPEG Layer III source for tag-copy tests.
 The FLAC, Vorbis and Opus fixtures were also generated with FFmpeg 8.1.1 as short silent sources for tag-copy tests.
 `quiet-track.webm` was generated with FFmpeg 8.1.1 and libopus as a short audio-only Matroska/WebM source.
+`quiet-track-aac.m4a` was generated from it with FFmpeg 9.0.2: `-map_metadata -1 -fflags +bitexact -flags:a +bitexact -c:a aac -b:a 64k -movflags +faststart`.
 
 Representative generation arguments (supply an explicitly user-installed development FFmpeg if regenerating):
 

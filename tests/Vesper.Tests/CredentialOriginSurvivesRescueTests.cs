@@ -27,8 +27,13 @@ public sealed class CredentialOriginSurvivesRescueTests
         JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
 
         Assert.Equal(replacement.V1, await File.ReadAllBytesAsync(done.FinalPath!));
-        FaultServer.ObservedHeaders request = Assert.Single(replacement.RequestsFor("/file"));
-        Assert.Null(request.Cookie);
-        Assert.Null(request.Authorization);
+        // A segmented transfer may open more than one connection; none of them may carry the old origin's secrets.
+        IReadOnlyList<FaultServer.ObservedHeaders> requests = replacement.RequestsFor("/file");
+        Assert.NotEmpty(requests);
+        Assert.All(requests, request =>
+        {
+            Assert.Null(request.Cookie);
+            Assert.Null(request.Authorization);
+        });
     }
 }

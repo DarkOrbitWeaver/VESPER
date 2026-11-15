@@ -30,6 +30,6 @@ The build creates a self-contained setup executable and a portable ZIP. Add `-Po
 
 ## Limits and verification
 
-VESPER does not bypass DRM, sign-in gates, or site JavaScript challenges, and it does not transcode media. Its native remuxer accepts only compatible, validated tracks; live capture and separate HLS audio renditions are not supported. Site compatibility depends on the current site implementation.
+VESPER does not bypass DRM, sign-in gates, or site JavaScript challenges. Its native remuxer copies compatible, validated tracks without re-encoding; the optional "plays everywhere" MP4 and M4A outputs use the Windows Media Foundation decoders and encoders already on the PC, and are offered only when those codecs are present. Separate HLS audio renditions are not supported. The single source of truth for what the media engine can and cannot do is [MEDIA_ENGINE_LIMITATIONS.md](MEDIA_ENGINE_LIMITATIONS.md); site compatibility depends on the current site implementation.
 
 See [release status and verification](DOCUMENTATION/RELEASE.md) and [current media limits](MEDIA_ENGINE_LIMITATIONS.md). Clean-machine installation, mixed-DPI interaction, live VPN/site coverage, and matched comparisons with IDM, FDM, and yt-dlp still need manual runs.

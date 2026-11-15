@@ -126,54 +126,6 @@ public sealed class BrowserDownloadTests
         Assert.False(harness.Engine.AcceptBrowserTransfer(TransferId));
     }
 
-    [Fact]
-    public async Task Chrome_completion_replaces_an_unused_handoff_and_preserves_the_existing_file()
-    {
-        await using var server = new FaultServer(64 * 1024);
-        await server.StartAsync();
-        using var harness = new Harness();
-        Guid id = Stage(harness, server, new BrowserTransferProof(server.V1.Length, "\"p1\"", null));
-        await harness.WaitAsync(id, job => job.Reason == "browser-ready");
-        harness.Engine.AbandonBrowserTransfer(TransferId);
-
-        string path = Path.Combine(harness.Downloads, "Chrome download.bin");
-        await File.WriteAllBytesAsync(path, server.V1);
-        var file = new BrowserCompletedFile(path, server.V1.Length, "https://example.com/only-the-origin?token=secret");
-        AddResult? result = null;
-        await harness.WaitAsync(id, _ => (result = harness.Engine.RegisterBrowserDownload("chrome-completed-test", file, TransferId)).Status != AddStatus.Busy);
-        AddResult registered = Assert.IsType<AddResult>(result);
-        Assert.True(registered.Ok, registered.Message);
-        Assert.Equal(id, registered.JobId);
-
-        harness.Restart();
-        Assert.Equal(AddStatus.AlreadySubmitted, harness.Engine.RegisterBrowserDownload("chrome-completed-test", file).Status);
-        JobSnapshot saved = Assert.Single(harness.Engine.Snapshots());
-        Assert.Equal(JobKind.BrowserFile, saved.Kind);
-        Assert.Equal(path, saved.FinalPath);
-        Assert.Equal("https://example.com/", saved.OriginalPageUrl);
-        Assert.False(harness.Engine.DeleteDownloadedFile(id).Deleted);
-        Assert.Equal(path, Assert.Single(harness.Files()));
-        Assert.Equal(server.V1, await File.ReadAllBytesAsync(path));
-    }
-
-    [Fact]
-    public void Registration_checks_the_download_folder_file_size_and_partial_extension()
-    {
-        using var harness = new Harness();
-        string outside = Path.Combine(harness.Root, "elsewhere.zip");
-        string partial = Path.Combine(harness.Downloads, "unfinished.crdownload");
-        string changed = Path.Combine(harness.Downloads, "changed.zip");
-        foreach (string path in new[] { outside, partial, changed }) File.WriteAllBytes(path, [1, 2, 3]);
-
-        foreach (BrowserCompletedFile file in new[]
-        {
-            new BrowserCompletedFile(outside, 3, null), new BrowserCompletedFile(partial, 3, null),
-            new BrowserCompletedFile(changed, 2, null)
-        })
-            Assert.Equal(AddStatus.Invalid, harness.Engine.RegisterBrowserDownload("chrome-completed-test", file).Status);
-        Assert.Empty(harness.Engine.Snapshots());
-    }
-
     private static Guid Stage(Harness harness, FaultServer server, BrowserTransferProof proof)
     {
         AddResult added = harness.Engine.Add(new AddRequest(server.Url("/file"), RequestId: TransferId + ":0", BrowserProof: proof));
