@@ -56,6 +56,45 @@ public class SiteAdapterTests
             + "<script data-sjs>" + JsonSerializer.Serialize(data) + "</script></html>";
     }
 
+    private static string InstagramCarouselPage(string first, string second)
+    {
+        object[] slides =
+        [
+            new
+            {
+                id = "clip-one", media_type = "VIDEO", video_duration = 5,
+                video_versions = new[] { new { url = first, width = 720, height = 1280 } }
+            },
+            new
+            {
+                id = "photo-only", media_type = "IMAGE", video_duration = 0,
+                video_versions = Array.Empty<object>()
+            },
+            new
+            {
+                id = "clip-two", media_type = "VIDEO", video_duration = 8,
+                video_versions = new[] { new { url = second, width = 1080, height = 1920 } }
+            }
+        ];
+        var data = new
+        {
+            data = new
+            {
+                xig_polaris_media = new
+                {
+                    if_not_gated_logged_out = new
+                    {
+                        caption = new { text = "Two clips" },
+                        owner = new { username = "fixture_creator" },
+                        carousel_media = slides
+                    }
+                }
+            }
+        };
+        return "<html><head><title>Two clips</title></head><script data-sjs>"
+            + JsonSerializer.Serialize(data) + "</script></html>";
+    }
+
     [Fact]
     public async Task Instagram_UsesEmbeddedWholeObjectChoicesThroughSharedValidation()
     {
@@ -117,6 +156,44 @@ public class SiteAdapterTests
         Assert.Equal(MediaErrorCode.BrowserContextRequired, result.Error!.Code);
         Assert.Contains("no verified playable URL", result.Error.Diagnostic, StringComparison.OrdinalIgnoreCase);
         Assert.Single(h.Requests);
+    }
+
+    [Fact]
+    public async Task Instagram_CarouselListsOnlyVerifiedVideoSlidesAsSeparateItems()
+    {
+        const string first = "https://scontent.cdninstagram.com/clip-one.mp4?token=short";
+        const string second = "https://scontent.cdninstagram.com/clip-two.mp4?token=short";
+        var h = new FakeHttpHandler()
+            .Add(InstagramPage, InstagramCarouselPage(first, second))
+            .AddMedia(first, "video/mp4", 7200)
+            .AddMedia(second, "video/mp4", 10800);
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage, CollectionIntent.CollectionOnly);
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        MediaCollection collection = result.Collection!;
+        Assert.Equal(CollectionKind.Album, collection.Kind);
+        Assert.Equal(["clip-one", "clip-two"], collection.Entries.Select(entry => entry.MediaId).ToArray());
+        Assert.All(collection.Entries, entry => Assert.NotEmpty(entry.Resolved!.Representations));
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsolutePath.Contains("/api/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Instagram_ItemDiscoveryDoesNotPrefetchTheWholeCarousel()
+    {
+        const string first = "https://scontent.cdninstagram.com/clip-one.mp4?token=short";
+        const string second = "https://scontent.cdninstagram.com/clip-two.mp4?token=short";
+        var h = new FakeHttpHandler()
+            .Add(InstagramPage, InstagramCarouselPage(first, second))
+            .AddMedia(first, "video/mp4", 7200)
+            .AddMedia(second, "video/mp4", 10800);
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage, CollectionIntent.ItemOnly);
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal("clip-one", result.Item!.MediaId);
+        Assert.Equal(CollectionKind.Album, result.Item.Related!.Kind);
+        Assert.Single(h.Requests, request => request.Url.Host == "scontent.cdninstagram.com");
     }
 
     // ---------------------------------------------------------------------------------------------- Vimeo

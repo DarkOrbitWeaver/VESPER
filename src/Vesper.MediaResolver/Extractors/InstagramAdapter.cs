@@ -13,17 +13,23 @@ internal sealed class InstagramAdapter : AdapterBase
     private const int MaxSjsScripts = 8;
     private const int MaxEmbeddedJsonChars = 1_500_000;
     private const int MaxVideoChoices = 16;
+    private const int MaxCarouselItems = 20;
     private readonly GenericAdapter _generic;
+
+    private sealed record EmbeddedVideo(string MediaId, int Index, string? Title, string? Description,
+        string? Uploader, Uri? Thumbnail, double? DurationSeconds, List<MediaCandidate> Candidates);
+    private sealed record EmbeddedPageMedia(IReadOnlyList<EmbeddedVideo> Videos, bool IsCarousel,
+        int SlideCount, bool Truncated, string? Caption, string? Uploader);
 
     public static readonly AdapterDescriptor Descriptor = new(
         "instagram", "Instagram", Matches, svc => new InstagramAdapter(svc),
         new AdapterCapabilities(
             Domains: ["instagram.com"],
             UrlPatterns: ["instagram.com/p/{code}", "instagram.com/reel/{code}", "instagram.com/tv/{code}", "instagram.com/stories/{user}/{id}"],
-            SingleItem: true, Playlist: false, AudioOnly: false, Subtitles: true,
+            SingleItem: true, Playlist: true, AudioOnly: false, Subtitles: true,
             Authentication: "Uses the page or explicitly authorized browser context; private content still requires access",
-            KnownUnsupported: ["player-only media without an observed whole-object source", "multi-video carousel/story sequence enumeration", "private, expired or access-gated media"],
-            Notes: "Reads bounded page-embedded media URLs and verifies them through the shared candidate pipeline."));
+            KnownUnsupported: ["player-only media without an observed whole-object source", "multi-story sequence enumeration", "private, expired or access-gated media"],
+            Notes: "Reads bounded page-embedded media URLs, including video slides in accessible carousels, and verifies them through the shared candidate pipeline."));
 
     private InstagramAdapter(ResolverServices svc) : base(svc) => _generic = new GenericAdapter(svc);
 
@@ -52,11 +58,19 @@ internal sealed class InstagramAdapter : AdapterBase
             return Fail(MediaErrors.NoMedia("Instagram returned a non-text page without a verified media URL. Open the post in Chrome and use the VESPER picker.", true));
 
         request.PageResponse = page;
-        List<MediaCandidate> candidates = ExtractEmbeddedVideos(page.Content);
+        EmbeddedPageMedia? embedded = ExtractEmbeddedMedia(page.Content, target.MediaId, Options.MaxCandidatesPerPage);
+        if (embedded is { IsCarousel: true })
+            return await ResolveCarouselAsync(request, target, page, embedded, ct).ConfigureAwait(false);
+
+        List<MediaCandidate> candidates = embedded?.Videos.FirstOrDefault()?.Candidates ?? [];
         MediaDiscoveryResult result = await _generic.ResolveAsync(request, candidates, ct, includeBrowserCandidates: false)
             .ConfigureAwait(false);
         if (result.Item is { } item)
-            return MediaDiscoveryResult.FromItem(item with { Provider = "instagram", MediaId = target.MediaId }, result.Warnings, result.Notes);
+            return MediaDiscoveryResult.FromItem(item with
+            {
+                Provider = "instagram",
+                MediaId = embedded?.Videos.FirstOrDefault()?.MediaId ?? target.MediaId
+            }, result.Warnings, result.Notes);
         if (result.Collection is not null) return result;
 
         if (result.Error?.Code == MediaErrorCode.NoDownloadableMedia)
@@ -68,10 +82,83 @@ internal sealed class InstagramAdapter : AdapterBase
         return result;
     }
 
-    private static List<MediaCandidate> ExtractEmbeddedVideos(string html)
+    private async Task<MediaDiscoveryResult> ResolveCarouselAsync(MediaDiscoveryRequest request, InstagramTarget target,
+        HttpTextResponse page, EmbeddedPageMedia carousel, CancellationToken ct)
     {
-        var results = new List<MediaCandidate>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        PageMetadata metadata = PageScanner.Scan(page.Content, page.FinalUrl, Options.MaxCandidatesPerPage);
+        MediaRequestContext context = request.ValidatedBrowser?.Context
+            ?? new MediaRequestContext { Referer = UrlUtil.WithoutFragment(page.FinalUrl).AbsoluteUri };
+        var entries = new List<CollectionEntry>();
+        var warnings = new List<MediaError>();
+        bool collectionRequested = request.Options.CollectionIntent == CollectionIntent.CollectionOnly;
+
+        foreach (EmbeddedVideo video in carousel.Videos)
+        {
+            ct.ThrowIfCancellationRequested();
+            CandidateOutcome outcome = await Svc.Candidates.ProcessAsync(video.Candidates, context, ct).ConfigureAwait(false);
+            if (outcome.Representations.Count == 0)
+            {
+                warnings.Add(MediaErrors.PartialPlaylist($"Instagram carousel video {video.Index + 1} had no verified media URL"));
+                continue;
+            }
+
+            string collectionTitle = carousel.Caption ?? metadata.Title ?? $"Instagram post {target.MediaId}";
+            var item = new MediaItem
+            {
+                SourceUrl = request.Url,
+                Provider = "instagram",
+                MediaId = video.MediaId,
+                Title = video.Title ?? $"{collectionTitle} · video {video.Index + 1}",
+                Description = video.Description ?? carousel.Caption ?? metadata.Description,
+                Uploader = video.Uploader ?? carousel.Uploader,
+                Duration = outcome.Duration ?? TextUtil.Seconds(video.DurationSeconds),
+                Thumbnail = video.Thumbnail ?? metadata.Thumbnail,
+                Representations = outcome.Representations,
+                AudioTracks = outcome.AudioTracks,
+                Subtitles = request.Options.IncludeSubtitles ? metadata.Subtitles : []
+            };
+            entries.Add(new CollectionEntry
+            {
+                MediaId = video.MediaId,
+                Url = request.Url,
+                Title = item.Title,
+                Duration = item.Duration,
+                Thumbnail = item.Thumbnail,
+                Index = video.Index,
+                Resolved = item
+            });
+            if (!collectionRequested) break;
+        }
+
+        if (collectionRequested && carousel.Truncated)
+            warnings.Add(MediaErrors.PartialPlaylist("The Instagram carousel exceeded the bounded discovery limit; later slides were not inspected"));
+
+        string title = carousel.Caption ?? metadata.Title ?? $"Instagram post {target.MediaId}";
+        var collection = new MediaCollection
+        {
+            SourceUrl = request.Url,
+            Provider = "instagram",
+            CollectionId = target.MediaId,
+            Title = title,
+            Kind = CollectionKind.Album,
+            Entries = entries,
+            IsComplete = warnings.Count == 0 && !carousel.Truncated
+        };
+
+        if (collectionRequested)
+            return MediaDiscoveryResult.FromCollection(collection, warnings);
+        if (entries.Count == 0)
+            return Fail(MediaErrors.BrowserContext("Instagram exposed a carousel but no video slide had a verified playable URL. Open the post in Chrome and use the VESPER picker."));
+
+        MediaItem first = entries[0].Resolved!;
+        if (carousel.SlideCount > 1)
+            first = first with { Related = new CollectionHint(CollectionKind.Album, target.MediaId, request.Url, false, title) };
+        return MediaDiscoveryResult.FromItem(first, warnings);
+    }
+
+    private static EmbeddedPageMedia? ExtractEmbeddedMedia(string html, string fallbackId, int maxCandidates)
+    {
+        maxCandidates = Math.Max(1, maxCandidates);
         int scripts = 0;
         foreach (HtmlTag tag in HtmlScanner.Scan(html))
         {
@@ -83,30 +170,74 @@ internal sealed class InstagramAdapter : AdapterBase
 
             foreach (JsonElement media in document.RootElement.FindAll("if_not_gated_logged_out", maxResults: 32))
             {
-                if (!HasVideoSource(media)) continue;
-                double? duration = media.P("video_duration").Dbl();
-                if (duration is not { } seconds || !double.IsFinite(seconds) || seconds < 0 || seconds > 86_400)
-                    duration = null;
+                string? caption = media.P("caption").P("text").Str();
+                string? uploader = media.P("owner").P("username").Str() ?? media.P("user").P("username").Str();
+                if (media.P("carousel_media") is { ValueKind: JsonValueKind.Array } slides)
+                {
+                    int slideCount = slides.GetArrayLength();
+                    var videos = new List<EmbeddedVideo>();
+                    int candidateCount = 0;
+                    int slideIndex = 0;
+                    bool truncated = slideCount > MaxCarouselItems;
+                    foreach (JsonElement slide in slides.Items().Take(MaxCarouselItems))
+                    {
+                        if (candidateCount >= maxCandidates)
+                        {
+                            truncated = true;
+                            break;
+                        }
+                        int index = slideIndex++;
+                        int choices = Math.Min(4, maxCandidates - candidateCount);
+                        EmbeddedVideo? video = ReadVideo(slide, $"{fallbackId}-{index + 1}", index, caption, uploader, choices);
+                        if (video is not null)
+                        {
+                            videos.Add(video);
+                            candidateCount += video.Candidates.Count;
+                        }
+                    }
+                    if (videos.Count > 0)
+                        return new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader);
+                }
 
-                foreach (JsonElement version in media.P("video_versions").Items())
-                    AddCandidate(version.P("url").Str(), version, duration, results, seen);
-                AddCandidate(media.P("video_url").Str(), media, duration, results, seen);
-                if (results.Count > 0) return results;
+                EmbeddedVideo? single = ReadVideo(media, fallbackId, 0, caption, uploader, Math.Min(MaxVideoChoices, maxCandidates));
+                if (single is not null) return new EmbeddedPageMedia([single], false, 1, false, caption, uploader);
             }
         }
-        return results;
+        return null;
     }
 
     private static bool HasVideoSource(JsonElement media) =>
         media.P("video_versions") is { ValueKind: JsonValueKind.Array }
         || !string.IsNullOrWhiteSpace(media.P("video_url").Str());
 
-    private static void AddCandidate(string? rawUrl, JsonElement metadata, double? duration,
-        List<MediaCandidate> results, HashSet<string> seen)
+    private static EmbeddedVideo? ReadVideo(JsonElement media, string fallbackId, int index,
+        string? sharedCaption, string? sharedUploader, int maxChoices)
     {
-        if (results.Count >= MaxVideoChoices || UrlUtil.TryAbsolute(rawUrl) is not { } url
-            || url.Scheme is not ("http" or "https") || !IsInstagramMediaHost(url) || !seen.Add(url.AbsoluteUri))
-            return;
+        if (!HasVideoSource(media) || maxChoices <= 0) return null;
+        double? duration = media.P("video_duration").Dbl();
+        if (duration is not { } seconds || !double.IsFinite(seconds) || seconds < 0 || seconds > 86_400)
+            duration = null;
+
+        var candidates = new List<MediaCandidate>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonElement version in media.P("video_versions").Items())
+            AddCandidate(version.P("url").Str(), version, duration, candidates, seen, maxChoices);
+        AddCandidate(media.P("video_url").Str(), media, duration, candidates, seen, maxChoices);
+        if (candidates.Count == 0) return null;
+
+        string mediaId = media.P("id").Str() ?? media.P("pk").Str() ?? fallbackId;
+        string? title = media.P("title").Str();
+        string? caption = media.P("caption").P("text").Str() ?? sharedCaption;
+        string? uploader = media.P("owner").P("username").Str() ?? media.P("user").P("username").Str() ?? sharedUploader;
+        Uri? thumbnail = UrlUtil.TryAbsolute(media.P("display_url").Str() ?? media.P("thumbnail_src").Str());
+        return new EmbeddedVideo(mediaId, index, title, caption, uploader, thumbnail, duration, candidates);
+    }
+
+    private static void AddCandidate(string? rawUrl, JsonElement metadata, double? duration,
+        List<MediaCandidate> results, HashSet<string> seen, int maxChoices)
+    {
+        if (results.Count >= maxChoices || UrlUtil.TryAbsolute(rawUrl) is not { } url
+            || url.Scheme is not ("http" or "https") || !IsInstagramMediaHost(url) || !seen.Add(url.AbsoluteUri)) return;
 
         int? width = PositiveDimension(metadata.P("width").Int());
         int? height = PositiveDimension(metadata.P("height").Int());
