@@ -278,6 +278,16 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public async Task ChunkedRangeBodyLongerThanRequested_IsRejectedBeforeCommit()
+    {
+        await using var server = await FixtureServer.StartAsync(); server.OversizedRangeBody = true;
+        using var h = new Harness();
+        var job = await h.WaitForStateAsync(Add(h, server, ranges: true), JobState.NeedsAttention);
+        Assert.Equal(0, job.CommittedBytes);
+        Assert.Null(job.FinalPath);
+    }
+
+    [Fact]
     public async Task InvalidMedia_IsNotPublishedOrCommitted()
     {
         await using var server = await FixtureServer.StartAsync(); server.InvalidFragment = true;
@@ -422,7 +432,7 @@ public sealed class DashTransferTests
         private int _activeFragmentRequests;
         private int _maxActiveFragmentRequests;
         private string _base = "";
-        internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst;
+        internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst, OversizedRangeBody;
         internal int FragmentDelayMs;
         internal int MaxActiveFragmentRequests => Volatile.Read(ref _maxActiveFragmentRequests);
         internal TaskCompletionSource FirstFragmentStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -490,6 +500,13 @@ public sealed class DashTransferTests
             {
                 var parts = range[6..].Split('-'); start = int.Parse(parts[0]); end = int.Parse(parts[1]);
                 context.Response.StatusCode = 206; context.Response.Headers.ContentRange = $"bytes {start}-{end}/{data.Length}";
+                if (OversizedRangeBody)
+                {
+                    context.Response.ContentType = "video/mp4";
+                    await context.Response.Body.WriteAsync(data.AsMemory(start, end - start + 1), context.RequestAborted);
+                    await context.Response.Body.WriteAsync(new byte[] { 0xA5 }, context.RequestAborted);
+                    return;
+                }
             }
             context.Response.ContentType = "video/mp4"; context.Response.ContentLength = end - start + 1;
             await context.Response.Body.WriteAsync(data.AsMemory(start, end - start + 1), context.RequestAborted);
