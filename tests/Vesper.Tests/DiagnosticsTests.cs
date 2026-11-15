@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Text;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -58,6 +59,32 @@ public sealed class DiagnosticsTests
             Assert.DoesNotContain(profile, events, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("cookies", contents);
             Assert.Contains("review before sharing", contents);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ExportBundle_keeps_the_previous_archive_if_replacement_fails()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "vesper-diagnostics-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            using var harness = new Harness();
+            string target = Path.Combine(root, "support.zip");
+            using (var locked = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                locked.Write(Encoding.UTF8.GetBytes("previous archive"));
+                locked.Flush(flushToDisk: true);
+                Exception failure = Assert.ThrowsAny<Exception>(() => Diagnostics.ExportBundle(harness.Engine, target, "1.0-test"));
+                Assert.True(failure is IOException or UnauthorizedAccessException);
+            }
+
+            Assert.Equal("previous archive", File.ReadAllText(target));
+            Assert.Single(Directory.GetFiles(root));
         }
         finally
         {
