@@ -31,7 +31,8 @@ internal static class MediaSourceRescue
         }
     }
 
-    public static async Task<RescueResult> RefreshAsync(DownloadEngine engine, JobSnapshot job, ResolverOptions network, CancellationToken ct)
+    public static async Task<RescueResult> RefreshAsync(DownloadEngine engine, JobSnapshot job, ResolverOptions network,
+        CancellationToken ct, bool automatic = false)
     {
         if (!Uri.TryCreate(job.OriginalPageUrl, UriKind.Absolute, out Uri? page))
             return new RescueResult(false, RescueMode.None, "The original page address is missing. Saved data was kept.", 0);
@@ -47,7 +48,7 @@ internal static class MediaSourceRescue
 
         if (job.Kind == JobKind.Http) return await RefreshDirectAsync(engine, job, item, ct);
         if (job.Kind == JobKind.Hls) return await RefreshLiveHlsAsync(engine, job, item, ct);
-        return await RefreshMergeAsync(engine, job, item, ct);
+        return await RefreshMergeAsync(engine, job, item, ct, automatic);
     }
 
     internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
@@ -109,13 +110,17 @@ internal static class MediaSourceRescue
 
     // A merge job's format id is "videoId+audioId" (or one id for audio only). Restrict the item to exactly
     // those formats and let the planner build the same plan again with fresh links.
-    private static async Task<RescueResult> RefreshMergeAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
+    private static async Task<RescueResult> RefreshMergeAsync(DownloadEngine engine, JobSnapshot job, MediaItem item,
+        CancellationToken ct, bool automatic)
     {
         string[] ids = job.MediaFormatId!.Split('+', StringSplitOptions.RemoveEmptyEntries);
         MediaRepresentation[] same = item.Representations.Where(r => ids.Contains(r.Id)).ToArray();
         if (same.Length != ids.Length)
             return new RescueResult(false, RescueMode.None,
                 "The source no longer offers the same formats. Saved data was kept; restart as a separate copy.", 0);
+        if (automatic && same.Any(format => format.Protocol is StreamProtocol.Hls or StreamProtocol.Dash))
+            return new RescueResult(false, RescueMode.None,
+                "Automatic refresh was skipped because verifying saved HLS/DASH parts can require fetching them again. Open Rescue to check this source manually; saved data was kept.", 0);
 
         bool audioOnly = same.All(r => !r.HasVideo);
         var prefs = audioOnly ? FormatPreferences.AudioOnly with { AudioCodecs = [] } : FormatPreferences.BestQuality;
@@ -126,6 +131,6 @@ internal static class MediaSourceRescue
         if (choice.Secrets is { Count: > 0 })
             return await engine.RefreshMergePlanWithCredentialsAsync(job.Id, plan, choice.ExpiresAt, choice.Secrets, ct)
                 .ConfigureAwait(false);
-        return engine.RefreshMergePlan(job.Id, plan, choice.ExpiresAt);
+        return await engine.RefreshMergePlanAsync(job.Id, plan, choice.ExpiresAt, ct).ConfigureAwait(false);
     }
 }

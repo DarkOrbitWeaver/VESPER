@@ -270,7 +270,8 @@ public partial class Form1 : Form
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            RescueResult result = await MediaSourceRescue.RefreshAsync(engine, job, EngineHost.MediaNetwork(options: engine.Options), timeout.Token);
+            RescueResult result = await MediaSourceRescue.RefreshAsync(engine, job,
+                EngineHost.MediaNetwork(options: engine.Options), timeout.Token, automatic: true);
             if (!result.Accepted) System.Diagnostics.Trace.WriteLine(result.Message, "Automatic link refresh");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
