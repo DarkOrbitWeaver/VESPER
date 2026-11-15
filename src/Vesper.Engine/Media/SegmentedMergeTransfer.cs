@@ -407,6 +407,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             || offset is long startOffset && length is long rangeLength && startOffset > long.MaxValue - rangeLength)
             throw new RunnerStop(NeedsAttention("invalid-range", "A rendition contains an invalid or oversized byte range."));
         long? end = offset is long start && length is long size ? checked(start + size - 1) : null;
+        long bodyLimit = length ?? limit;
         session.AddConnection();
         try
         {
@@ -426,10 +427,10 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             else if (status == 206)
                 throw new RunnerStop(NeedsAttention("unexpected-range", "The rendition server returned only part of a full segment."));
 
-            if (response.Content.Headers.ContentLength > limit)
+            if (response.Content.Headers.ContentLength > bodyLimit)
                 throw new RunnerStop(NeedsAttention("too-large", "A rendition segment exceeds the supported size limit."));
             if (lease is not null && response.Content.Headers.ContentLength is long declaredCapacity)
-                lease.Resize(SegmentBufferLimiter.Reservation(limit, declaredCapacity, copies));
+                lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, declaredCapacity, copies));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stall.CancelAfter(engine.Options.StallTimeout);
             try
@@ -445,7 +446,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     {
                         int read = await body.ReadAsync(buffer.AsMemory(), stall.Token).ConfigureAwait(false);
                         if (read == 0) break;
-                        if (result.Length + read > limit)
+                        if (result.Length + read > bodyLimit)
                             throw new RunnerStop(NeedsAttention("too-large", "A rendition segment exceeds the supported size limit."));
                         result.Write(buffer, 0, read);
                         stall.CancelAfter(engine.Options.StallTimeout);

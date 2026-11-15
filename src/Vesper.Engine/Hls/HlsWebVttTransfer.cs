@@ -266,7 +266,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         else if (status == 206) throw new RunnerStop(NeedsAttention("subtitle-range", "The server returned only part of a subtitle segment."));
         if (!HttpFacts.IsIdentityEncoded(response)) throw new RunnerStop(NeedsAttention("subtitle-encoding", "The server compressed an HLS subtitle segment."));
         if (HttpFacts.IsHtml(response)) throw new RunnerStop(NeedsAttention("subtitle-html", "The server sent a web page instead of a subtitle segment."));
-        byte[] bytes = await ReadBoundedAsync(response, MaxSegmentBytes, ct, lease, copies: 2).ConfigureAwait(false);
+        byte[] bytes = await ReadBoundedAsync(response, segment.RangeLength ?? MaxSegmentBytes, ct, lease, copies: 2).ConfigureAwait(false);
         if (segment.RangeLength is long expected && bytes.LongLength != expected)
             throw new TransientNetworkException("An HLS subtitle byte-range response was incomplete.");
         return bytes;
@@ -283,7 +283,7 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         {
             long? declaredLength = response.Content.Headers.ContentLength;
             if (lease is not null && declaredLength is long known)
-                lease.Resize(SegmentBufferLimiter.Reservation(limit, known, copies));
+                lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, known, copies));
             await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             using var buffer = new MemoryStream(declaredLength is > 0 and <= int.MaxValue
                 ? (int)declaredLength.Value : 16 * 1024);

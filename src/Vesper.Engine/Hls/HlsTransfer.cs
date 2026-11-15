@@ -741,7 +741,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         else if (code == 206)
             throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
         if (HlsLooksLikeHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
-        ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, limit, ct, lease, copies).ConfigureAwait(false);
+        ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies).ConfigureAwait(false);
         if (length is long expected && bytes.Length != expected)
             throw new TransientNetworkException("The HLS byte-range response was incomplete.");
         return bytes;
@@ -777,7 +777,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         {
             long? knownLength = response.Content.Headers.ContentLength;
             if (lease is not null && knownLength is long declaredCapacity)
-                lease.Resize(SegmentBufferLimiter.Reservation(limit, declaredCapacity, copies));
+                lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, declaredCapacity, copies));
             await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
             int initialCapacity = knownLength is > 0 ? checked((int)knownLength.Value) : (int)Math.Min(64 * 1024, limit);
             using var buffer = new MemoryStream(initialCapacity);
