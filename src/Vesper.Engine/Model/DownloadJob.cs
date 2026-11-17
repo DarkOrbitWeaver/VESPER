@@ -146,6 +146,68 @@ public sealed class DownloadJob
         return copy;
     }
 
+    /// <summary>
+    /// Publish exactly the staged state after a successful database commit, without replacing
+    /// the DownloadJob referenced by a running session or invoking a mutation twice.
+    /// Keep this list synchronized with public mutable DownloadJob fields.
+    /// </summary>
+    internal void ApplyPersistedState(DownloadJob saved)
+    {
+        if (saved.Id != Id) throw new InvalidOperationException("Cannot copy a different download's state.");
+        Kind = saved.Kind;
+        SourceUrl = saved.SourceUrl;
+        PreviousUrls = saved.PreviousUrls;
+        FileName = saved.FileName;
+        NameLocked = saved.NameLocked;
+        DestinationFolder = saved.DestinationFolder;
+        PartialPath = saved.PartialPath;
+        FinalPath = saved.FinalPath;
+        PendingFinalPath = saved.PendingFinalPath;
+        PendingConversionBytes = saved.PendingConversionBytes;
+        PendingConversionDigest = saved.PendingConversionDigest;
+        TotalBytes = saved.TotalBytes;
+        Extents = saved.Extents;
+        State = saved.State;
+        Reason = saved.Reason;
+        Message = saved.Message;
+        Priority = saved.Priority;
+        QueueOrder = saved.QueueOrder;
+        SpeedLimitBytes = saved.SpeedLimitBytes;
+        CreatedUtc = saved.CreatedUtc;
+        UpdatedUtc = saved.UpdatedUtc;
+        CompletedUtc = saved.CompletedUtc;
+        RetryCount = saved.RetryCount;
+        NextRetryUtc = saved.NextRetryUtc;
+        ETag = saved.ETag;
+        LastModified = saved.LastModified;
+        AcceptsRanges = saved.AcceptsRanges;
+        Identity = saved.Identity;
+        ContentType = saved.ContentType;
+        Category = saved.Category;
+        Referer = saved.Referer;
+        UserAgent = saved.UserAgent;
+        OriginalPageUrl = saved.OriginalPageUrl;
+        MediaProvider = saved.MediaProvider;
+        MediaId = saved.MediaId;
+        MediaQuality = saved.MediaQuality;
+        MediaFormatId = saved.MediaFormatId;
+        MediaThumbnailUrl = saved.MediaThumbnailUrl;
+        MediaExpiresAt = saved.MediaExpiresAt;
+        Output = saved.Output;
+        BrowserProof = saved.BrowserProof;
+        ExpectedSha256 = saved.ExpectedSha256;
+        PieceMapJson = saved.PieceMapJson;
+        RescueCandidate = saved.RescueCandidate;
+        RescueMode = saved.RescueMode;
+        Sha256Verified = saved.Sha256Verified;
+        UnverifiedResumeApproved = saved.UnverifiedResumeApproved;
+        NonResumable = saved.NonResumable;
+        MediaState = saved.MediaState;
+        MediaPlanJson = saved.MediaPlanJson;
+        MediaMetadataJson = saved.MediaMetadataJson;
+        Generation = saved.Generation;
+    }
+
     public DownloadJob CloneForCommit(ExtentSet extents, string? mediaState)
     {
         var copy = (DownloadJob)MemberwiseClone();

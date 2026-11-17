@@ -2,6 +2,15 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-17 continuation: transfer mutations and checkpoint progress must commit once
+
+This checkpoint follows the verified UI-command atomicity commit `4d49553` on the isolated `codex/vesper-continued` branch; it is a bounded correction, **not** certification of every storage or media operation.
+
+- **Transfer metadata durability:** `DownloadEngine.UpdateJob` formerly called `mutate(job)` before the SQLite write. Rejected updates could leave the live source URL, duplicate lookup, reason, timestamps, and committed extents at odds with the database. It now builds a detached `CopyForUpdate` candidate, invokes the mutation **once**, saves it to SQLite, then copies all mutable properties onto the original live `DownloadJob` under the engine lock. `ApplyPersistedState` is intentionally explicit, and a reflection-based regression compares **every public mutable property** so adding new properties cannot silently omit them. Active runner references remain the same; the mutation isn't replayed after the commit.
+- **Real checkpoint overwrite bug (red → green):** `CommitCheckpoint` wrote flushed bytes/extent generation to SQLite but returned before its caller updated the live job. A simultaneous ordinary metadata update could then overwrite committed extents with stale zero progress. A deterministic test wrote and flushed **8,192 bytes**, committed them, then performed the metadata save; SQLite recorded **zero** before the fix. `CommitCheckpoint` now advances in-memory `Extents`, `Generation` and `MediaState` immediately after SQLite succeeds, **inside the same engine lock**. No pending bytes are declared committed before the disk flush or database commit.
+- **Evidence:** four `TransferMutationAtomicityTests` pass, including failed-write preservation of source/index/byte-exact partial, single-execution timestamp parity, all-property copy, and the checkpoint interleave. Windows Release solution **963/963** tests (engine **545**, resolver **357**, WinForms **41**, installer **20**) pass with no skips or failures; the Chrome extension Node mock suite independently passed **126/126**, not a real-browser session.
+- **Still OPEN:** the rest of `USER-ATOMIC-STATE`—multi-row queue moves, StopAndKeepLive, Cancel/RestartFromScratch and cleanup, browser handoff, media refresh, direct `SaveLocked` call sites, completion, real concurrent sessions and long-lived crash/power-loss tests. Also check the cost of deep-cloning extent metadata under heavy segmented workloads. Q0–Q10 stay OPEN.
+
 ## 2026-11-17 continuation: ordinary UI actions no longer publish failed SQLite updates
 
 - **Red-green defect proof:** isolated SQLite `BEFORE UPDATE` fault-injection tests originally proved that Pause, Resume, Priority, Speed Limit and Rename changed the visible job although the write failed. All five failed before the fix and now pass; approval of unverified resume and a failed forced StartNow round out **seven** targeted cases.
