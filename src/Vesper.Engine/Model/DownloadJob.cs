@@ -132,6 +132,14 @@ public sealed class DownloadJob
     /// <summary>Incremented by every durable checkpoint; also written to the recovery manifest.</summary>
     public long Generation { get; set; }
 
+    /// <summary>Prepare a detached candidate so failed durable updates leave the live job untouched.</summary>
+    internal DownloadJob CopyForUpdate()
+    {
+        var copy = (DownloadJob)MemberwiseClone();
+        copy.Extents = Extents.Clone();
+        return copy;
+    }
+
     public DownloadJob CloneForCommit(ExtentSet extents, string? mediaState)
     {
         var copy = (DownloadJob)MemberwiseClone();

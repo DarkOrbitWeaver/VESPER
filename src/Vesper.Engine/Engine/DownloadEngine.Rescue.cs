@@ -13,11 +13,12 @@ public sealed record RescueResult(bool Accepted, RescueMode Mode, string Message
 
 /// <summary>
 /// Decides whether saved bytes may be reused with a replacement link. Pure and deterministic.
-///   R1b  trusted piece hashes  → verify stored pieces locally, fetch only missing/invalid ones
-///   R0   strong identity       → strong ETag equal, or same resource + same size + same Last-Modified
-///   R1   trusted full digest   → candidate reuse, final verification is mandatory
-///   R4   anything else         → reject; saved data stays untouched
-/// Random spot checks are never accepted as proof of identity.
+///   R1b  trusted piece hashes → verify stored pieces locally; refetch only missing/invalid ones
+///   R0   original strong ETag → same resource AND matching strong ETag
+///        original Last-Modified identity → same resource, size and modification time
+///   R1   trusted full SHA-256 → reuse candidates only with mandatory final verification
+///   R4   anything else → reject; saved data stays untouched
+/// Random spot checks never establish source identity.
 /// </summary>
 public static class RescueEvaluator
 {
@@ -122,7 +123,15 @@ public sealed partial class DownloadEngine
         long retained = job.Extents.TotalBytes;
         if (retained == 0)
         {
-            ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null, replacementCredentials);
+            try
+            {
+                if (!ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null, replacementCredentials))
+                    return Rejected("This download changed while checking its replacement link. Try again.");
+            }
+            catch (LocalStorageException ex)
+            {
+                return Rejected("The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message);
+            }
             return new RescueResult(true, RescueMode.None, "Link replaced. Nothing had been saved yet, so nothing needed validating.", 0);
         }
 
@@ -135,8 +144,11 @@ public sealed partial class DownloadEngine
         }
 
         RescueDecision decision = RescueEvaluator.Evaluate(job, uri, probe, sha, pieces);
-        Log(id, decision.Accepted ? "rescue-accepted" : "rescue-rejected", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
-        if (!decision.Accepted) return new RescueResult(false, decision.Mode, decision.Message, retained);
+        if (!decision.Accepted)
+        {
+            Log(id, "rescue-rejected", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
+            return new RescueResult(false, decision.Mode, decision.Message, retained);
+        }
 
         ExtentSet? verified = null;
         int refetch = 0;
@@ -153,7 +165,18 @@ public sealed partial class DownloadEngine
             catch (LocalStorageException ex) { return Rejected("The saved data could not be read for verification: " + ex.Message); }
         }
 
-        ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials);
+        try
+        {
+            if (!ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials))
+                return new RescueResult(false, RescueMode.R4,
+                    "This download changed while checking its replacement link. No replacement was applied.", retained);
+        }
+        catch (LocalStorageException ex)
+        {
+            return new RescueResult(false, RescueMode.R4,
+                "The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message, retained);
+        }
+        Log(id, "rescue-accepted", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
         long keep = verified?.TotalBytes ?? retained;
         string message = decision.Message + (decision.Mode == RescueMode.R1b ? $" {Formatting.Bytes(keep)} of verified data kept." : "");
         return new RescueResult(true, decision.Mode, message, keep, refetch);
@@ -172,52 +195,63 @@ public sealed partial class DownloadEngine
         return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response), HttpFacts.IsIdentityEncoded(response));
     }
 
-    private void ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
+    private bool ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
         ExtentSet? verified, RequestCredentials? replacementCredentials = null)
     {
         lock (_lock)
         {
+            if (!_jobs.TryGetValue(job.Id, out DownloadJob? current) || !ReferenceEquals(current, job)
+                || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed)
+                return false;
+
+            // The source and duplicate index become visible only AFTER SQLite accepts the new job.
+            // If a database write fails, the original state, saved bytes and credentials stay intact.
+            DownloadJob updated = job.CopyForUpdate();
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
-            ChangeSourceUrlLocked(job, uri.AbsoluteUri);
-            if (replacementCredentials is not null) _credentials[job.Id] = replacementCredentials;
-            else if (_credentials.TryGetValue(job.Id, out RequestCredentials? prior)
-                && !UrlPolicy.IsSameOrigin(prior.Origin, uri)) _credentials.Remove(job.Id);
-            job.RescueMode = decision.Mode;
+            updated.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
+            updated.SourceUrl = uri.AbsoluteUri;
+            updated.RescueMode = decision.Mode;
 
             if (decision.Mode is RescueMode.R1 or RescueMode.R1b && probe is not null)
             {
-                // Identity cannot be proven by headers here; the trusted hash / piece list carries the proof instead.
-                job.ETag = probe.StrongEtag;
-                job.LastModified = probe.LastModified;
-                job.Identity = probe.StrongEtag is not null ? IdentityLevel.StrongEtag : probe.LastModified is not null ? IdentityLevel.LastModified : IdentityLevel.None;
-                job.UnverifiedResumeApproved = true;
-                job.AcceptsRanges = true;
-                job.ExpectedSha256 = sha ?? job.ExpectedSha256;
-                job.RescueCandidate = decision.Mode == RescueMode.R1;
-                job.Sha256Verified = false;
+                updated.ETag = probe.StrongEtag;
+                updated.LastModified = probe.LastModified;
+                updated.Identity = probe.StrongEtag is not null ? IdentityLevel.StrongEtag
+                    : probe.LastModified is not null ? IdentityLevel.LastModified : IdentityLevel.None;
+                updated.UnverifiedResumeApproved = true;
+                updated.AcceptsRanges = true;
+                updated.ExpectedSha256 = sha ?? job.ExpectedSha256;
+                updated.RescueCandidate = decision.Mode == RescueMode.R1;
+                updated.Sha256Verified = false;
             }
             if (decision.Mode == RescueMode.R1b && pieces is not null && verified is not null)
             {
-                job.PieceMapJson = pieces.ToJson();
-                job.TotalBytes = pieces.TotalLength;
-                job.Extents = verified;
+                updated.PieceMapJson = pieces.ToJson();
+                updated.TotalBytes = pieces.TotalLength;
+                updated.Extents = verified;
             }
             if (decision.Mode == RescueMode.None)
-            {
-                (job.ETag, job.LastModified, job.Identity, job.AcceptsRanges) = (null, null, IdentityLevel.None, false);
-            }
+                (updated.ETag, updated.LastModified, updated.Identity, updated.AcceptsRanges) =
+                    (null, null, IdentityLevel.None, false);
 
-            job.State = JobState.Queued;
-            AddDuplicateCandidateLocked(job);
-            job.Reason = "";
-            job.Message = "";
-            job.RetryCount = 0;
-            job.NextRetryUtc = null;
-            SaveLocked(job);
-            Changed(job);
+            updated.State = JobState.Queued;
+            updated.Reason = "";
+            updated.Message = "";
+            updated.RetryCount = 0;
+            updated.NextRetryUtc = null;
+            SaveLocked(updated); // The only possible durable mutation happens before any in-memory one.
+
+            RemoveDuplicateCandidateLocked(job, job.SourceUrl);
+            _jobs[job.Id] = updated;
+            AddDuplicateCandidateLocked(updated);
+
+            if (replacementCredentials is not null) _credentials[job.Id] = replacementCredentials;
+            else if (_credentials.TryGetValue(job.Id, out RequestCredentials? prior)
+                && !UrlPolicy.IsSameOrigin(prior.Origin, uri)) _credentials.Remove(job.Id);
+            Changed(updated);
         }
         ScheduleNext();
+        return true;
     }
 
     private static RescueResult Rejected(string message) => new(false, RescueMode.R4, message, 0);
