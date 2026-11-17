@@ -46,4 +46,26 @@ foreach ($number in 1..9) {
     $id = 'VSP-{0:000}' -f $number
     if (-not $seen.ContainsKey($id)) { throw "Independent Claude audit is missing $id" }
 }
-Write-Host "VESPER backlog OK: $($rows.Count) unique registered IDs, $openCount unfinished and represented in MASTER-TODO.md."
+$auditPath = Join-Path $root 'DOCUMENTATION\AUDIT-RECONCILIATION.md'
+$gatesPath = Join-Path $root 'DOCUMENTATION\QUALITY-RELEASE-GATES.md'
+$handoffPath = Join-Path $root 'DOCUMENTATION\NEXT-CHAT-HANDOFF.md'
+foreach ($required in @($auditPath, $gatesPath, $handoffPath)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "Mandatory handoff / audit document is missing: $required"
+    }
+}
+$audit = [System.IO.File]::ReadAllText($auditPath)
+$quality = [System.IO.File]::ReadAllText($gatesPath)
+if ($todo -notmatch 'AUDIT-RECONCILIATION\.md' -or $todo -notmatch 'QUALITY-RELEASE-GATES\.md') {
+    throw 'Master TODO no longer references mandatory audit reconciliation or quality gates.'
+}
+foreach ($number in 0..10) {
+    $gate = 'Q' + $number
+    if ($quality -notmatch ('(?m)^\| ' + $gate + '\s')) {
+        throw "AAA-quality gate $gate is missing from QUALITY-RELEASE-GATES.md."
+    }
+}
+if ($audit -notmatch 'Original-audit reconciliation' -and $audit -notmatch 'Original-audit reconciliation ledger') {
+    throw 'Audit reconciliation ledger does not contain its required scope heading.'
+}
+Write-Host "VESPER backlog OK: $($rows.Count) unique IDs, $openCount unfinished; audit ledger and Q0-Q10 release gates present. Their actual completion still requires independent evidence."
