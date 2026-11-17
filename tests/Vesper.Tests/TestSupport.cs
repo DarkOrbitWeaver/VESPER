@@ -123,6 +123,12 @@ internal sealed class FaultServer : IAsyncDisposable
                 else if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
                 else res.StatusCode = 403;
                 break;
+            case "/expires-without-etag":
+                // A same-size, same-time replacement is not strong-ETag identical if its ETag disappears.
+                if (ctx.Request.Query["token"] == "fresh") await Serve(ctx, V1, null, Modified);
+                else if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
+                else res.StatusCode = 403;
+                break;
             case "/authenticated-refresh":
                 if (ctx.Request.Headers.Cookie == "session=refresh-secret") await Serve(ctx, V1, "\"p1\"", Modified);
                 else res.StatusCode = 401;
