@@ -1,5 +1,7 @@
 # VESPER implementation package
 
+**Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
+
 ## Baseline and selected input
 
 - Source: https://github.com/DarkOrbitWeaver/VESPER

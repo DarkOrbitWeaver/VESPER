@@ -17,6 +17,10 @@ The extension matches HTTP and HTTPS pages in all frames so it can detect direct
 
 VESPER has no telemetry or account service. Network requests are made for links and media discovery that the user submits.
 
+## Engineering continuation
+
+For the current cross-audit roadmap and restart instructions, use [Master TODO](DOCUMENTATION/MASTER-TODO.md), [Next-chat handoff](DOCUMENTATION/NEXT-CHAT-HANDOFF.md), and the detailed [status register](DOCUMENTATION/STATUS.tsv). These are development documents; historical release notes are not current build certification. Run `scripts/Verify-EngineeringBacklog.ps1` when updating the audit tracker.
+
 ## Build and test
 
 Use Windows 11 x64 with the .NET 10 SDK and Node.js for the extension tests.
