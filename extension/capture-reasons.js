@@ -2,11 +2,10 @@
 
 // What happened to a Chrome download, in plain words. The service worker stores one of these codes per
 // download (browser-downloads.js, noteDecision); the popup shows the text and, where it helps, one thing to do.
-// Actions: sign-in = turn on "Use site sign-in", download-now = stop queueing, check-app = ask VESPER if it
-// is running, move = open the Chrome downloads page to move it by hand.
+// Actions: sign-in = enable site sign-in, download-now = stop queueing, check-app = check native connection.
 const VesperCaptureReasons = {
-  'moved': { text: 'Moved to VESPER.' },
-  'chrome-finished': { text: 'Chrome finished it before VESPER could take over. It’s listed in VESPER too.' },
+  'moved': { text: 'VESPER accepted the download before Chrome saved any of the file.' },
+  'chrome-finished': { text: 'Chrome finished this file. It stays in Chrome, not VESPER.' },
   'sign-in': { text: 'This site needs your sign-in to download this file.', action: 'sign-in' },
   'different-signed-out': { text: 'The site offered VESPER something else than it gave Chrome. It may need your sign-in.', action: 'sign-in' },
   'different': { text: 'The site offered VESPER a different file than it gave Chrome.' },
@@ -16,14 +15,15 @@ const VesperCaptureReasons = {
   'compressed': { text: 'The site sent this file compressed, so VESPER couldn’t confirm it would get the same file.' },
   'no-size': { text: 'The site didn’t say how big this file is, so VESPER couldn’t confirm it would get the same file.' },
   'changed': { text: 'The file changed while VESPER was checking it.' },
-  'unseen': { text: 'Chrome didn’t share how this download was requested, so VESPER left it alone.', action: 'move' },
+  'unseen': { text: 'VESPER could not identify the request early enough. Chrome owns this download.' },
   'queued': { text: 'VESPER is set to queue new downloads, so Chrome kept this one going.', action: 'download-now' },
-  'busy': { text: 'VESPER was busy with other downloads.', action: 'move' },
-  'slow': { text: 'The site took too long to answer VESPER.', action: 'move' },
-  'not-ready': { text: 'VESPER couldn’t take over in time.', action: 'move' },
+  'busy': { text: 'VESPER was busy. Chrome owns this download.' },
+  'slow': { text: 'VESPER could not confirm the source in time. Chrome owns this download.' },
+  'not-ready': { text: 'VESPER could not start early enough. Chrome owns this download.' },
   'app-missing': { text: 'Chrome couldn’t find the VESPER app.', action: 'check-app' },
   'app-unavailable': { text: 'The VESPER app didn’t answer.', action: 'check-app' },
-  'capture-error': { text: 'VESPER couldn’t finish checking this download. Chrome kept it. Try moving it from the Transfers page.', action: 'move' },
+  'capture-error': { text: 'VESPER could not verify this request. Chrome owns the download. Start a fresh VESPER download if needed.' },
+  'chrome-started': { text: 'Chrome had already begun saving this file. VESPER left it alone.' },
   'duplicate': { text: 'VESPER already has this download.' },
   'refused': { text: 'VESPER can’t download from this address.' }
 };

@@ -5,7 +5,6 @@ namespace VESPER;
 
 /// <summary>
 /// Turns validated browser requests into engine calls. VESPER chooses new download destinations.
-/// A file already saved by Chrome can be listed at its verified existing location.
 /// "Success" is reported only after the engine has actually accepted the job.
 /// </summary>
 internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, Func<VesperPreferences> preferences)
@@ -41,7 +40,8 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 return await BrowserTransferAsync(request, ct);
 
             case "browser-activity":
-                return await WatchBrowserActivityAsync(request, ct);
+                // Chrome-owned downloads must never appear as VESPER jobs, even from older extensions.
+                return BridgeResponse.Fail(request.Id, "chrome-owned", "Chrome downloads stay in Chrome.");
 
             default:
                 return BridgeResponse.Fail(request.Id, "invalid", "Unknown request.");
@@ -186,10 +186,11 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         void Inspect(JobSnapshot snapshot)
         {
             if (snapshot.Id != id) return;
-            if (snapshot.State == JobState.Completed && !snapshot.FileMissing ||
-                (staged ? snapshot.Reason == "browser-ready" && snapshot.State == JobState.Downloading
-                    : snapshot.ProgressBytes > 0 && snapshot.State is (JobState.Downloading or JobState.Verifying or JobState.Finalizing or JobState.Converting)))
-                ready.TrySetResult(true);
+            bool transferReady = staged
+                ? snapshot.State == JobState.Downloading && snapshot.Reason == "browser-ready"
+                : snapshot.State == JobState.Completed && !snapshot.FileMissing
+                    || snapshot.ProgressBytes > 0 && snapshot.State is (JobState.Downloading or JobState.Verifying or JobState.Finalizing or JobState.Converting);
+            if (transferReady) ready.TrySetResult(true);
             else if (snapshot.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed
                 or JobState.Cancelled or JobState.Suspect or JobState.Paused or JobState.Completed)
             {

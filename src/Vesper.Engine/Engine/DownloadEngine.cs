@@ -131,6 +131,8 @@ public sealed partial class DownloadEngine : IDisposable
             // Completion is durable already, but actions must not race the runner's final cleanup.
             State = job.State == JobState.Completed && session is not null ? JobState.Finalizing : job.State,
             Reason = job.Reason, Message = job.Message,
+            IsUnacceptedBrowserCapture = job.BrowserProof is { } proof
+                && (proof.AwaitingConfirmation || job.Reason == "browser-fallback"),
             TotalBytes = job.TotalBytes, CommittedBytes = committed, ProgressBytes = progress,
             SpeedBytesPerSecond = downloading && estimate?.WaitingForData != true ? session?.SpeedBytesPerSecond ?? 0 : 0,
             Eta = estimate?.Remaining, EstimatingEta = estimate?.Estimating == true, WaitingForData = estimate?.WaitingForData == true,

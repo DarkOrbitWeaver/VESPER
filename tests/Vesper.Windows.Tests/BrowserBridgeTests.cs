@@ -9,6 +9,17 @@ namespace Vesper.Windows.Tests;
 public sealed class BrowserBridgeTests
 {
     [Fact]
+    public async Task LegacyChromeActivityCannotAddBrowserOwnedDownloads()
+    {
+        var bridge = new BrowserBridgeHandler(null!, null!, () => null!);
+        var request = new BridgeRequest("chrome-activity-test", "browser-activity", "ask", null, []);
+        BridgeResponse reply = await bridge.HandleAsync(request, CancellationToken.None);
+
+        Assert.False(reply.Ok);
+        Assert.Equal("chrome-owned", reply.Code);
+    }
+
+    [Fact]
     public void NativeMediaQueuePersistsDirectMp3Metadata()
     {
         string root = Path.Combine(Path.GetTempPath(), "vesper-browser-mp3-" + Guid.NewGuid().ToString("N"));

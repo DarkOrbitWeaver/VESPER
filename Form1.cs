@@ -101,7 +101,8 @@ public partial class Form1 : Form
 
     private void AttachEngine(DownloadEngine engine)
     {
-        foreach (JobSnapshot snapshot in engine.Snapshots()) _items[snapshot.Id] = DownloadItem.From(snapshot);
+        foreach (JobSnapshot snapshot in engine.Snapshots())
+            if (!snapshot.IsUnacceptedBrowserCapture) _items[snapshot.Id] = DownloadItem.From(snapshot);
 
         CodecCapabilities.Prime();
         engine.JobChanged += Enqueue;
@@ -225,6 +226,15 @@ public partial class Form1 : Form
         bool structural = false;
         foreach (JobSnapshot snapshot in batch)
         {
+            if (snapshot.IsUnacceptedBrowserCapture)
+            {
+                if (_items.Remove(snapshot.Id))
+                {
+                    _grid.PruneChecks(_items.Keys);
+                    structural = true;
+                }
+                continue;
+            }
             if (_items.TryGetValue(snapshot.Id, out DownloadItem? item))
             {
                 JobStatus before = item.Status;
@@ -965,6 +975,7 @@ public partial class Form1 : Form
 
     private void RevealDownload(JobSnapshot snapshot)
     {
+        if (snapshot.IsUnacceptedBrowserCapture) return;
         if (_items.TryGetValue(snapshot.Id, out DownloadItem? item)) item.UpdateFrom(snapshot);
         else _items[snapshot.Id] = item = DownloadItem.From(snapshot);
         _search.Clear();

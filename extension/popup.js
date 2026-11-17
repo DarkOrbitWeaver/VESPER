@@ -150,10 +150,6 @@ const RECENT_ACTIONS = {
     const reply = await chrome.runtime.sendMessage({ type: 'hello' });
     return reply?.ok ? 'VESPER is running. Start the download again.'
       : 'VESPER didn’t answer. Open the VESPER app once, then try again.';
-  } },
-  'move': { label: 'Move it now…', run: async () => {
-    await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
-    return '';
   } }
 };
 
