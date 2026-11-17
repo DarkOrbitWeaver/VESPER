@@ -231,7 +231,7 @@ public sealed partial class DownloadEngine
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job)) return;
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _cancelling.Contains(id)) return;
             if (_sessions.TryGetValue(id, out JobSession? session)) { session.Intent = StopIntent.Pause; session.Cts.Cancel(); return; }
             if (job.State is JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry)
             {
@@ -291,7 +291,7 @@ public sealed partial class DownloadEngine
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id)) return;
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id)) return;
             if (job.BrowserProof is { AwaitingConfirmation: true }
                 || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
             job.State = JobState.Queued;
@@ -404,7 +404,7 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return new RemoveResult(false, "That entry no longer exists.", null);
-            if (_sessions.ContainsKey(id)) return new RemoveResult(false, "Pause the download before removing it.", null);
+            if (_sessions.ContainsKey(id) || _cancelling.Contains(id)) return new RemoveResult(false, "This download is still stopping.", null);
 
             string? retained = job.State != JobState.Completed && File.Exists(job.PartialPath) ? job.PartialPath : null;
             _store.Delete(id);
@@ -463,7 +463,7 @@ public sealed partial class DownloadEngine
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || job.State == JobState.Completed) return false;
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id) || job.State == JobState.Completed) return false;
             try
             {
                 if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
