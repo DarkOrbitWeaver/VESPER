@@ -719,6 +719,63 @@ test('Chrome can complete while VESPER is staging the handoff: VESPER stands dow
   assert.deepEqual((await app.local.get('browserDownloads')).browserDownloads ?? {}, {});
 });
 
+test('Chrome completion after acceptance aborts VESPER and preserves Chrome\'s finished file', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': message =>
+    transfer(message.operation === 'abandon' ? 'failed' : 'active') }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(file.paused, true);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'parked');
+
+  file.state = 'complete';
+  file.paused = false;
+  await app.onChanged({ id: file.id, state: { current: 'complete' } });
+
+  assert.equal(file.state, 'complete');
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  assert.ok(app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'abandon'));
+  assert.deepEqual((await app.local.get('browserDownloads')).browserDownloads ?? {}, {});
+  assert.equal(app.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'chrome-finished');
+});
+
+test('Chrome completion keeps a durable cleanup record while the native helper is unreachable', async () => {
+  const file = activeDownload();
+  let nativeAvailable = false;
+  const app = load({ 'browser-submit': started, 'browser-transfer': message =>
+    message.operation === 'abandon'
+      ? nativeAvailable ? transfer('failed') : { ok: false, code: 'host-error' }
+      : transfer('active') }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  file.state = 'complete';
+  file.paused = false;
+  await app.onChanged({ id: file.id, state: { current: 'complete' } });
+
+  const records = (await app.local.get('browserDownloads')).browserDownloads;
+  assert.equal(records[file.id].stage, 'releasing', 'The native candidate still requires cleanup.');
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  // Simulate MV3 service-worker teardown while cleanup is awaiting the native helper.
+  const restarted = load({ 'browser-transfer': transfer('failed') },
+    { download: file, localData: { browserDownloads: records }, sessionData: app.sessionData });
+  await restarted.recover();
+  assert.deepEqual((await restarted.local.get('browserDownloads')).browserDownloads ?? {}, {});
+  assert.equal(restarted.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'chrome-finished');
+  assert.equal(restarted.actions.includes('cancel'), false);
+  assert.equal(file.state, 'complete');
+});
+
+test('completed Chrome files without a VESPER candidate are never sent to the native helper', async () => {
+  const file = { ...activeDownload(), state: 'complete' };
+  const app = load({}, { download: file });
+  await app.onChanged({ id: file.id, state: { current: 'complete' } });
+  assert.deepEqual(app.sent, []);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.deepEqual((await app.local.get('browserDownloads')).browserDownloads ?? {}, {});
+});
+
 test('an unknown abandon state keeps a Chrome download paused by an automatic capture', async () => {
   const file = activeDownload();
   let state = 'active';
