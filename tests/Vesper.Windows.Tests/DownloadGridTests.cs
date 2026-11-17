@@ -51,6 +51,93 @@ public sealed class DownloadGridTests
         Assert.True(item.MatchesSearch("new.example.test"));
         Assert.False(item.MatchesSearch("new-secret"));
     }
+    [Fact]
+    public void SearchRebuildsWhenTheSourceStartsMatching()
+    {
+        DownloadItem item = DownloadItem.From(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            SourceUrl = "https://old.example.test/file",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        const string searchTerm = "new.example.test";
+        JobStatus previousStatus = item.Status;
+        string previousName = item.Name;
+        long previousSize = item.SizeBytes;
+        bool previouslyMatched = item.MatchesSearch(searchTerm);
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            SourceUrl = "https://new.example.test/file?token=secret",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        Assert.False(previouslyMatched);
+        Assert.True(item.MatchesSearch(searchTerm));
+        Assert.True(Form1.NeedsListRefresh(item, previousStatus, previousName,
+            previousSize, previouslyMatched, searchTerm, sortBySize: false));
+        Assert.False(item.MatchesSearch("secret"));
+    }
+
+    [Fact]
+    public void SearchRebuildsWhenAReasonStopsMatching()
+    {
+        DownloadItem item = DownloadItem.From(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            Reason = "authentication needed",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        const string searchTerm = "authentication";
+        JobStatus previousStatus = item.Status;
+        string previousName = item.Name;
+        long previousSize = item.SizeBytes;
+        bool previouslyMatched = item.MatchesSearch(searchTerm);
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            Reason = "ready",
+            State = Vesper.Engine.JobState.Paused
+        });
+
+        Assert.True(previouslyMatched);
+        Assert.False(item.MatchesSearch(searchTerm));
+        Assert.True(Form1.NeedsListRefresh(item, previousStatus, previousName,
+            previousSize, previouslyMatched, searchTerm, sortBySize: false));
+    }
+
+    [Fact]
+    public void SizeSortRefreshesUnknownSizeWithoutRebuildingOtherViews()
+    {
+        DownloadItem item = DownloadItem.From(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            State = Vesper.Engine.JobState.Downloading,
+            CommittedBytes = 10
+        });
+
+        JobStatus previousStatus = item.Status;
+        string previousName = item.Name;
+        long previousSize = item.SizeBytes;
+        const string searchTerm = "sample";
+        bool previouslyMatched = item.MatchesSearch(searchTerm);
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "sample.bin",
+            State = Vesper.Engine.JobState.Downloading,
+            CommittedBytes = 40
+        });
+
+        Assert.False(Form1.NeedsListRefresh(item, previousStatus, previousName,
+            previousSize, previouslyMatched, searchTerm, sortBySize: false));
+        Assert.True(Form1.NeedsListRefresh(item, previousStatus, previousName,
+            previousSize, previouslyMatched, searchTerm, sortBySize: true));
+    }
 
     [Fact]
     public void RevealScrollsToAnExistingRow()

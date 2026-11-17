@@ -220,6 +220,8 @@ public partial class Form1 : Form
             _inboxQueued = false;
         }
 
+        string searchTerm = _search.Text.Trim();
+        bool sortBySize = _sort.SelectedText == "Size";
         bool structural = false;
         foreach (JobSnapshot snapshot in batch)
         {
@@ -227,8 +229,10 @@ public partial class Form1 : Form
             {
                 JobStatus before = item.Status;
                 string name = item.Name;
+                long size = item.SizeBytes;
+                bool matched = searchTerm.Length > 0 && item.MatchesSearch(searchTerm);
                 item.UpdateFrom(snapshot);
-                structural |= before != item.Status || name != item.Name;
+                structural |= NeedsListRefresh(item, before, name, size, matched, searchTerm, sortBySize);
                 Announce(before, item);
             }
             else
@@ -241,6 +245,14 @@ public partial class Form1 : Form
         }
         if (structural) RefreshList();
         else { _grid.RefreshRows(batch, static row => row.Id); UpdateFooter(); }
+    }
+
+    internal static bool NeedsListRefresh(DownloadItem item, JobStatus previousStatus, string previousName,
+        long previousSize, bool previouslyMatched, string searchTerm, bool sortBySize)
+    {
+        if (previousStatus != item.Status || previousName != item.Name) return true;
+        if (sortBySize && previousSize != item.SizeBytes) return true;
+        return searchTerm.Length > 0 && previouslyMatched != item.MatchesSearch(searchTerm);
     }
 
     /// <summary>Tray notifications only for real transitions the user would want to know about.</summary>
