@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -255,27 +256,33 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)
                 || job.State is JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting or JobState.Suspect
+                || job.Reason == "restart-cleanup" || job.Kind != JobKind.Hls
                 || !HlsTransfer.TryRequestLiveStop(job.MediaState, out string stopState))
                 return false;
 
             if (_sessions.TryGetValue(id, out JobSession? session))
             {
                 if (session.Intent != StopIntent.None) return false;
+                // Do not cancel the runner or mark a stop intent until SQLite accepts it.
+                PersistUiMutationLocked(job, pending =>
+                {
+                    pending.MediaState = stopState;
+                    pending.Message = "Finishing the recording";
+                });
                 session.Intent = StopIntent.LiveStop;
-                job.MediaState = stopState;
-                job.Message = "Finishing the recording";
-                SaveLocked(job);
                 Changed(job);
                 session.Cts.Cancel();
             }
             else
             {
-                job.MediaState = stopState;
-                job.State = JobState.Queued;
+                PersistUiMutationLocked(job, pending =>
+                {
+                    pending.MediaState = stopState;
+                    pending.State = JobState.Queued;
+                    pending.NextRetryUtc = null;
+                    pending.Message = "Finishing the recording";
+                });
                 AddDuplicateCandidateLocked(job);
-                job.NextRetryUtc = null;
-                job.Message = "Finishing the recording";
-                SaveLocked(job);
                 Changed(job);
                 queued = true;
             }
@@ -284,7 +291,6 @@ public sealed partial class DownloadEngine
         FlushOutbox();
         return true;
     }
-
     public void Resume(Guid id) => Requeue(id, startNow: false);
 
     public void StartNow(Guid id) => Requeue(id, startNow: true);
@@ -295,6 +301,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id)) return;
             if (job.BrowserProof is { AwaitingConfirmation: true }
+                || job.Reason == "restart-cleanup"
                 || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
             long queueOrder = startNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : job.QueueOrder;
             PersistUiMutationLocked(job, pending =>
@@ -369,15 +376,53 @@ public sealed partial class DownloadEngine
             List<DownloadJob> order = [.. _jobs.Values.Where(j => j.State != JobState.Completed).OrderBy(j => j.QueueOrder)];
             int index = order.IndexOf(job);
             if (index < 0) return;
+
+            DownloadJob? neighbor = null;
+            long position;
             switch (move)
             {
-                case QueueMove.Top: job.QueueOrder = order[0].QueueOrder - 1; break;
-                case QueueMove.Bottom: job.QueueOrder = order[^1].QueueOrder + 1; break;
-                case QueueMove.Up when index > 0: (job.QueueOrder, order[index - 1].QueueOrder) = (order[index - 1].QueueOrder, job.QueueOrder); SaveLocked(order[index - 1]); break;
-                case QueueMove.Down when index < order.Count - 1: (job.QueueOrder, order[index + 1].QueueOrder) = (order[index + 1].QueueOrder, job.QueueOrder); SaveLocked(order[index + 1]); break;
+                case QueueMove.Top:
+                    if (order[0].QueueOrder == long.MinValue)
+                        throw new InvalidOperationException("The queue cannot move further toward the top.");
+                    position = order[0].QueueOrder - 1;
+                    break;
+                case QueueMove.Bottom:
+                    if (order[^1].QueueOrder == long.MaxValue)
+                        throw new InvalidOperationException("The queue cannot move further toward the bottom.");
+                    position = order[^1].QueueOrder + 1;
+                    break;
+                case QueueMove.Up when index > 0:
+                    neighbor = order[index - 1];
+                    position = neighbor.QueueOrder;
+                    break;
+                case QueueMove.Down when index < order.Count - 1:
+                    neighbor = order[index + 1];
+                    position = neighbor.QueueOrder;
+                    break;
                 default: return;
             }
-            SaveLocked(job);
+
+            long neighborPosition = job.QueueOrder;
+            try
+            {
+                // The neighbor is saved first to expose and roll back a refused second write
+                // in the same SQLite transaction, never as a separately committed row.
+                if (neighbor is null)
+                    _store.SaveQueueOrders([(job.Id, position)]);
+                else
+                    _store.SaveQueueOrders([(neighbor.Id, neighborPosition), (job.Id, position)]);
+            }
+            catch (SqliteException ex)
+            {
+                throw new LocalStorageException("The queue order could not be saved: " + ex.Message, ex);
+            }
+
+            if (neighbor is not null)
+            {
+                neighbor.QueueOrder = neighborPosition;
+                Changed(neighbor);
+            }
+            job.QueueOrder = position;
             Changed(job);
         }
         FlushOutbox();
@@ -462,43 +507,66 @@ public sealed partial class DownloadEngine
     }
 
     /// <summary>
-    /// Explicitly throws away the partial data of an unfinished job and queues it from byte zero.
-    /// The only way partial data is ever deleted; callers must confirm with the user first.
+    /// Explicitly discards only this job's unfinished data. Persist a non-running recovery
+    /// state BEFORE deleting anything, so a crash or failed SQLite save cannot resume a
+    /// now-missing partial under stale extents. The user must confirm this action first.
     /// </summary>
     public bool RestartFromScratch(Guid id)
     {
+        bool restarted = false;
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id) || job.State == JobState.Completed) return false;
-            try
-            {
-                if (File.Exists(job.PartialPath)) File.Delete(job.PartialPath);
-                if (!MergeTransfer.DeleteSidecars(job)) throw new IOException("A merge track file could not be deleted.");
-                if (!DeleteTemporaryFile(job, PublicationStagePath(job))
-                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionAudioPath(job))
-                    || job.Output != MediaOutput.Original && !DeleteTemporaryFile(job, ConversionTaggedPath(job)))
-                    throw new IOException("A temporary media file could not be deleted.");
-                RecoveryManifest.Delete(job.PartialPath);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                job.Message = "The partial file could not be deleted: " + ex.Message;
-                SaveLocked(job);
-                Changed(job);
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id)
+                || _cancelling.Contains(id) || job.Kind == JobKind.BrowserFile
+                || job.State is JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting
+                || job.FinalPath is not null || job.PendingFinalPath is not null)
                 return false;
+
+            DownloadJob preparing = job.CopyForUpdate();
+            preparing.State = JobState.NeedsAttention;
+            preparing.Reason = "restart-cleanup";
+            preparing.Message = "Restart unfinished. If the data cannot be removed, fix the file and try Restart from scratch again.";
+            preparing.NextRetryUtc = null;
+            SaveLocked(preparing); // If this fails, no file has been touched.
+            job.ApplyPersistedState(preparing);
+
+            // The queued job is now safely parked even if deleting files or the next
+            // database update fails, or Windows terminates the process mid-cleanup.
+            if (TryRemoveCancelledFiles(job, out string error))
+            {
+                DownloadJob reset = job.CopyForUpdate();
+                reset.Extents = new ExtentSet();
+                reset.TotalBytes = reset.PieceMapJson is not null
+                    && PieceMap.TryParse(reset.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
+                (reset.ETag, reset.LastModified, reset.Identity, reset.AcceptsRanges, reset.NonResumable) =
+                    (null, null, IdentityLevel.None, false, false);
+                (reset.State, reset.Reason, reset.Message, reset.RetryCount, reset.MediaState, reset.RescueCandidate) =
+                    (JobState.Queued, "", "", 0, null, false);
+                reset.Sha256Verified = false;
+                reset.UnverifiedResumeApproved = false;
+                reset.NextRetryUtc = null;
+                ClearPendingPublication(reset);
+                try
+                {
+                    SaveLocked(reset);
+                    job.ApplyPersistedState(reset);
+                    AddDuplicateCandidateLocked(job);
+                    Log(id, "restart", "Partial data discarded at the user's request.");
+                    restarted = true;
+                }
+                catch (LocalStorageException ex)
+                {
+                    // The persisted restart-cleanup marker is still authoritative.
+                    // On restart, a missing partial must never be resumed using old extents.
+                    Log(id, "restart-pending", ex.Message);
+                }
             }
-            job.Extents = new ExtentSet();
-            job.TotalBytes = job.PieceMapJson is not null && PieceMap.TryParse(job.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
-            (job.ETag, job.LastModified, job.Identity, job.AcceptsRanges, job.NonResumable) = (null, null, IdentityLevel.None, false, false);
-            (job.State, job.Reason, job.Message, job.RetryCount, job.MediaState, job.RescueCandidate) = (JobState.Queued, "", "", 0, null, false);
-            AddDuplicateCandidateLocked(job);
-            ClearPendingPublication(job);
-            SaveLocked(job);
-            Log(id, "restart", "Partial data discarded at the user's request.");
+            else Log(id, "restart-pending", error);
             Changed(job);
         }
-        ScheduleNext();
-        return true;
+        FlushOutbox();
+        if (restarted) ScheduleNext();
+        return restarted;
     }
 
     /// <summary>For a completed entry whose file moved: point the record at the file the user located, if it plausibly matches.</summary>

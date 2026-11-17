@@ -95,6 +95,8 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out job)) return Rejected("That entry no longer exists.");
+            if (job.Reason == "restart-cleanup")
+                return Rejected("Restart from scratch must finish before this link can be replaced.");
             if (job.State == JobState.Completed) return Rejected("This download is already complete.");
             if (job.Kind != JobKind.Http)
                 return Rejected("A streaming manifest is not a replacement file URL. Resolve the source into a new plan; the existing fragments remain untouched.");
@@ -201,7 +203,7 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(job.Id, out DownloadJob? current) || !ReferenceEquals(current, job)
-                || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed)
+                || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed || job.Reason == "restart-cleanup")
                 return false;
 
             // The source and duplicate index become visible only AFTER SQLite accepts the new job.

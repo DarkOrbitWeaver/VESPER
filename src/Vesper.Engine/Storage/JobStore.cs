@@ -222,6 +222,35 @@ public sealed class JobStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reorder one or two existing jobs atomically. Only queue_order may change:
+    /// a full-row save could overwrite a newer download checkpoint from another caller.
+    /// Caller holds DownloadEngine._lock until the committed positions become live.
+    /// </summary>
+    public void SaveQueueOrders(IReadOnlyList<(Guid JobId, long Order)> changes)
+    {
+        if (changes.Count is < 1 or > 2 || changes.Select(c => c.JobId).Distinct().Count() != changes.Count)
+            throw new ArgumentException("A queue move needs one or two distinct existing jobs.", nameof(changes));
+
+        lock (_gate)
+        {
+            using SqliteTransaction transaction = _db.BeginTransaction();
+            using SqliteCommand update = _db.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = "UPDATE jobs SET queue_order=$order WHERE id=$id;";
+            SqliteParameter order = update.Parameters.Add("$order", SqliteType.Integer);
+            SqliteParameter id = update.Parameters.Add("$id", SqliteType.Text);
+            foreach ((Guid jobId, long position) in changes)
+            {
+                order.Value = position;
+                id.Value = jobId.ToString("D");
+                if (update.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException("A queue entry disappeared before its order could be saved.");
+            }
+            transaction.Commit();
+        }
+    }
+
     public IReadOnlyList<DownloadJob> LoadAll()
     {
         lock (_gate)
@@ -235,12 +264,20 @@ public sealed class JobStore : IDisposable
         }
     }
 
+    /// <summary>Removing a job and its browser request claim is one SQLite transaction.</summary>
     public void Delete(Guid id)
     {
         lock (_gate)
         {
-            Execute("DELETE FROM jobs WHERE id=$id;", ("$id", id.ToString("D")));
-            Execute("DELETE FROM submissions WHERE job_id=$id;", ("$id", id.ToString("D")));
+            using SqliteTransaction tx = _db.BeginTransaction();
+            using SqliteCommand command = _db.CreateCommand();
+            command.Transaction = tx;
+            command.Parameters.AddWithValue("$id", id.ToString("D"));
+            command.CommandText = "DELETE FROM submissions WHERE job_id=$id;";
+            command.ExecuteNonQuery();
+            command.CommandText = "DELETE FROM jobs WHERE id=$id;";
+            command.ExecuteNonQuery();
+            tx.Commit();
         }
     }
 
