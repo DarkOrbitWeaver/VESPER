@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.Versioning;
 using System.Text;
 using Vesper.Engine;
@@ -105,6 +106,72 @@ public sealed class MediaConversionTests
         Assert.Equal([TrackKind.Video, TrackKind.Audio], outputTracks.Select(track => track.Kind));
         AssertSameSamples(source, sourceTracks[0], output, outputTracks[0]);
         AssertSameSamples(source, sourceTracks[1], output, outputTracks[1]);
+    }
+
+    [Fact]
+    public async Task IndependentLosslessRemuxesDoNotWaitForTheEncoder()
+    {
+        await using var server = new FaultServer();
+        byte[] source = Audio();
+        server.Extra["/first.mp4"] = source;
+        server.Extra["/second.mp4"] = source;
+        await server.StartAsync();
+        using var harness = new Harness();
+        var gate = Assert.IsType<SemaphoreSlim>(typeof(DownloadEngine)
+            .GetField("_conversionSlot", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(harness.Engine));
+        Assert.True(gate.Wait(0));
+        try
+        {
+            var first = harness.Engine.Add(new AddRequest(server.Url("/first.mp4"),
+                FileName: "first.mp4", MediaProvider: "fixture", Output: MediaOutput.M4a));
+            var second = harness.Engine.Add(new AddRequest(server.Url("/second.mp4"),
+                FileName: "second.mp4", MediaProvider: "fixture", Output: MediaOutput.M4a));
+            Assert.True(first.Ok, first.Message);
+            Assert.True(second.Ok, second.Message);
+
+            JobSnapshot[] completed = await Task.WhenAll(
+                harness.WaitForStateAsync(first.JobId, JobState.Completed, seconds: 5),
+                harness.WaitForStateAsync(second.JobId, JobState.Completed, seconds: 5));
+            Assert.Equal(0, gate.CurrentCount);
+            Assert.Equal(2, completed.Select(j => j.FinalPath).Distinct().Count());
+            foreach (JobSnapshot job in completed)
+            {
+                Assert.EndsWith(".m4a", job.FileName);
+                using var file = File.OpenRead(job.FinalPath!);
+                DemuxedTrack audio = Assert.Single(MediaMerger.Demux(file, file.Length, default));
+                Assert.Equal("aac", audio.Codec);
+                Assert.NotEmpty(audio.Samples);
+            }
+        }
+        finally { gate.Release(); }
+    }
+
+    [Fact]
+    public async Task InjectedEncoderStillWaitsForTheExclusiveSlot()
+    {
+        await using var server = new FaultServer();
+        server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var entered = new ManualResetEventSlim();
+        using var harness = new Harness(convertMedia: (source, extension, stage, output, ct) =>
+        {
+            entered.Set();
+            File.Copy(source, stage);
+        });
+        var gate = Assert.IsType<SemaphoreSlim>(typeof(DownloadEngine)
+            .GetField("_conversionSlot", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(harness.Engine));
+        Assert.True(gate.Wait(0));
+        try
+        {
+            Guid id = AddAudio(harness, server);
+            await harness.WaitAsync(id, job => job.State == JobState.Converting);
+            Assert.False(entered.Wait(TimeSpan.FromMilliseconds(125)),
+                "An injected encoder must not run while another encoder owns the slot.");
+        }
+        finally { gate.Release(); }
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
     }
 
     [WindowsFact]
