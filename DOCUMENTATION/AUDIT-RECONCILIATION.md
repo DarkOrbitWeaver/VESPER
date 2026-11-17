@@ -1,6 +1,6 @@
 # VESPER — Original-audit reconciliation ledger
 
-**Status: ORIGINAL REPORTS READ END-TO-END; SOURCE LOCATIONS MAPPED; IMPLEMENTATION RECONCILIATION STILL OPEN.** This ledger remains a **release blocker** until each original requirement, including unnumbered claims, is cross-checked against current source, tests, and release evidence. Having 91 IDs in `STATUS.tsv` or passing automated tests does not certify it.
+**Status: ORIGINAL REPORTS READ END-TO-END; SOURCE LOCATIONS MAPPED; IMPLEMENTATION RECONCILIATION STILL OPEN.** This ledger remains a **release blocker** until each original requirement, including unnumbered claims, is cross-checked against current source, tests, and release evidence. Having 92 IDs in `STATUS.tsv` or passing automated tests does not certify it.
 
 **Takeover record (2026-11-17):** Read `OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md` 1–2185, `VESPER-ENGINEERING-AUDIT B.md` 1–608, and `VESPER-IMPLEMENTATION.md` 1–229 in successive contiguous ChatGPT Library ranges. Original report source identity and exact section/finding locations, including 25 explicit cross-cutting trace rows and the N opportunities, are now recorded in [`CLAUDE-AUDIT-SOURCE-INDEX.md`](CLAUDE-AUDIT-SOURCE-INDEX.md). That **indexes requirements, not proof of implementation**. An additional [independent VSP current-source matrix](VSP-INDEPENDENT-RECONCILIATION.md) now covers all nine Audit B findings and their remaining acceptance gates; it is not a release certificate.
 

@@ -235,10 +235,12 @@ public sealed partial class DownloadEngine
             if (_sessions.TryGetValue(id, out JobSession? session)) { session.Intent = StopIntent.Pause; session.Cts.Cancel(); return; }
             if (job.State is JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry)
             {
-                job.State = JobState.Paused;
-                job.NextRetryUtc = null;
-                job.Message = "";
-                SaveLocked(job);
+                PersistUiMutationLocked(job, static pending =>
+                {
+                    pending.State = JobState.Paused;
+                    pending.NextRetryUtc = null;
+                    pending.Message = "";
+                });
                 Changed(job);
             }
         }
@@ -294,14 +296,18 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id)) return;
             if (job.BrowserProof is { AwaitingConfirmation: true }
                 || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
-            job.State = JobState.Queued;
+            long queueOrder = startNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : job.QueueOrder;
+            PersistUiMutationLocked(job, pending =>
+            {
+                pending.State = JobState.Queued;
+                pending.NextRetryUtc = null;
+                pending.RetryCount = 0;
+                pending.Message = "";
+                pending.Reason = "";
+                if (startNow) pending.QueueOrder = queueOrder;
+            });
             AddDuplicateCandidateLocked(job);
-            job.NextRetryUtc = null;
-            job.RetryCount = 0;
-            job.Message = "";
-            job.Reason = "";
-            if (startNow) { job.QueueOrder = _jobs.Values.Min(j => j.QueueOrder) - 1; _forced.Add(id); }
-            SaveLocked(job);
+            if (startNow) _forced.Add(id);
             Changed(job);
         }
         ScheduleNext();
@@ -340,9 +346,9 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return;
-            job.SpeedLimitBytes = Math.Max(0, bytesPerSecond);
-            _sessions.GetValueOrDefault(id)?.Limiter.SetRate(job.SpeedLimitBytes);
-            SaveLocked(job);
+            long limit = Math.Max(0, bytesPerSecond);
+            PersistUiMutationLocked(job, pending => pending.SpeedLimitBytes = limit);
+            _sessions.GetValueOrDefault(id)?.Limiter.SetRate(limit);
             Changed(job);
         }
         FlushOutbox();
@@ -512,29 +518,40 @@ public sealed partial class DownloadEngine
 
     // ---- helpers --------------------------------------------------------------------------------------------------------
 
-    private void UpdateIfExists(Guid id, Action<DownloadJob> mutate, bool? markMissing = null)
+    /// <summary>
+    /// A UI edit must reach SQLite before it becomes visible to an active session or the UI.
+    /// This is deliberately limited to pure, repeatable scalar edits: each modifier runs once
+    /// against an unpublished candidate, then against the SAME live job after a successful save.
+    /// Never use it for file I/O, mutable extents, external side effects or network commands.
+    /// </summary>
+    private void PersistUiMutationLocked(DownloadJob job, Action<DownloadJob> mutate)
+    {
+        DownloadJob proposed = job.CopyForUiMutation();
+        mutate(proposed);
+        if (!ReferenceEquals(proposed.Extents, job.Extents))
+            throw new InvalidOperationException("Only durable checkpoints may replace download extents.");
+        SaveLocked(proposed);
+        mutate(job); // Existing JobSession references must still point to this same live object.
+    }
+
+    private void UpdateIfExists(Guid id, Action<DownloadJob> mutate, bool? markMissing = null, bool idleOnly = false)
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job)) return;
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || idleOnly && _sessions.ContainsKey(id)) return;
             bool wasCandidate = IsDuplicateCandidate(job);
             string previousSourceUrl = job.SourceUrl;
-            mutate(job);
+            PersistUiMutationLocked(job, mutate);
             ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             if (markMissing is true) _missing.Add(id);
             if (markMissing is false) _missing.Remove(id);
-            SaveLocked(job);
             Changed(job);
         }
         FlushOutbox();
     }
 
-    private void UpdateIfIdle(Guid id, Action<DownloadJob> mutate)
-    {
-        lock (_lock)
-            if (_sessions.ContainsKey(id)) return;
-        UpdateIfExists(id, mutate);
-    }
+    private void UpdateIfIdle(Guid id, Action<DownloadJob> mutate) =>
+        UpdateIfExists(id, mutate, idleOnly: true);
 
     private void ArmWakeTimerLocked()
     {

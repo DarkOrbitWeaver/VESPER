@@ -2,6 +2,12 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-17 continuation: ordinary UI actions no longer publish failed SQLite updates
+
+- **Red-green defect proof:** isolated SQLite `BEFORE UPDATE` fault-injection tests originally proved that Pause, Resume, Priority, Speed Limit and Rename changed the visible job although the write failed. All five failed before the fix and now pass; approval of unverified resume and a failed forced StartNow round out **seven** targeted cases.
+- **Fix:** `DownloadEngine.Commands.PersistUiMutationLocked` stages only deterministic scalar edits on `DownloadJob.CopyForUiMutation()`, persists that candidate, and then applies the same edit to the original live object under `_lock`. Existing session references and checkpoint extents are preserved. Pause, Requeue/StartNow, limiter updates and `UpdateIfExists/UpdateIfIdle` publish their live state and side effects only after SQLite accepts the edit; the idle gate is checked in the same lock.
+- **Verification boundary:** seven focused `JobCommandAtomicityTests` passed on the Windows RAMCA host. The original `952/952` .NET and `126/126` extension checks were previous-commit baselines, not this continuation's complete approval. `USER-ATOMIC-STATE` is still PARTIAL; `UpdateJob`, multi-row queue moves, Cancel, StopAndKeepLive, restart-from-scratch, browser/media refresh and runner completion still require independent atomicity and restart/failpoint proofs. Q1/Q9 and every release gate remain OPEN.
+
 ## 2026-11-17 continuation: native HTTP Rescue saves before making a replacement live
 
 This is **current, separately reproduced evidence** on isolated `codex/vesper-continued`, after the previous verified commit `ef23bb3`. It does not supersede the detailed historical implementation tables below.

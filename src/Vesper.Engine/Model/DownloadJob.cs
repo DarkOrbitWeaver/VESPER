@@ -132,6 +132,12 @@ public sealed class DownloadJob
     /// <summary>Incremented by every durable checkpoint; also written to the recovery manifest.</summary>
     public long Generation { get; set; }
 
+    /// <summary>
+    /// Stage scalar UI changes without replacing the live job or copying its concurrently updated extents.
+    /// Only side-effect-free scalar mutations are allowed; checkpoints exclusively own Extents.
+    /// </summary>
+    internal DownloadJob CopyForUiMutation() => (DownloadJob)MemberwiseClone();
+
     /// <summary>Prepare a detached candidate so failed durable updates leave the live job untouched.</summary>
     internal DownloadJob CopyForUpdate()
     {
