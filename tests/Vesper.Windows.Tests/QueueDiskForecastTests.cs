@@ -4,6 +4,7 @@ using Vesper.Engine;
 
 namespace Vesper.Windows.Tests;
 
+[Collection("Main window UI")]
 public sealed class QueueDiskForecastTests
 {
     [Fact]

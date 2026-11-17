@@ -76,7 +76,15 @@ public partial class Form1 : Form
             previousState = WindowState;
         };
         VisibleChanged += (_, _) => { RememberNoticeMonitor(); _browserHandler?.WakeBrowserActivity(); };
-        HandleCreated += (_, _) => VesperWindowChrome.Apply(this, _colors);
+        HandleCreated += (_, _) =>
+        {
+            VesperWindowChrome.Apply(this, _colors);
+            // Engine updates can arrive before the handle exists. PostToUi drops them then;
+            // drain the coalesced snapshot once the UI can actually accept a callback.
+            bool pending;
+            lock (_inboxLock) pending = _inboxQueued;
+            if (pending) DrainInbox();
+        };
 
         VesperWindowChrome.Brand(this);
         if (botanicalPreview)
