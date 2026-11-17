@@ -47,4 +47,50 @@ public sealed class CancelMenuTests
         Assert.True(thread.Join(TimeSpan.FromSeconds(10)));
         failure?.Throw();
     }
+    [Fact]
+    public void SelectionToolbarUsesCancelForUnfinishedAndRemoveForCompleted()
+    {
+        ExceptionDispatchInfo? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var form = new Form1();
+                var grid = (DownloadGrid)typeof(Form1)
+                    .GetField("_grid", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+                var remove = (Control)typeof(Form1)
+                    .GetField("_remove", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+
+                DownloadItem unfinished = DownloadItem.From(new JobSnapshot
+                {
+                    Id = Guid.NewGuid(), FileName = "partial.zip", State = JobState.Paused
+                });
+                DownloadItem completed = DownloadItem.From(new JobSnapshot
+                {
+                    Id = Guid.NewGuid(), FileName = "done.zip", State = JobState.Completed
+                });
+
+                grid.SetItems([unfinished]);
+                grid.CheckAllVisible();
+                Assert.True(remove.Enabled);
+                Assert.Equal("Cancel", remove.Text);
+
+                grid.ClearChecks();
+                grid.SetItems([completed]);
+                grid.CheckAllVisible();
+                Assert.True(remove.Enabled);
+                Assert.Equal("Remove", remove.Text);
+
+                grid.ClearChecks();
+                grid.SetItems([unfinished, completed]);
+                grid.CheckAllVisible();
+                Assert.False(remove.Enabled);
+            }
+            catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
+        }) { IsBackground = true };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(10)));
+        failure?.Throw();
+    }
 }

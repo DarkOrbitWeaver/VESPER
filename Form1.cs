@@ -624,7 +624,7 @@ public partial class Form1 : Form
                 if (row.BrowserFile is { Paused: true, CanResume: true }) ControlBrowserDownload(row, "resume");
                 else if (row.Snapshot is { } s) _engine?.Resume(s.Id);
         };
-        _remove.Click += (_, _) => _actions?.Remove(CheckedSnapshots());
+        _remove.Click += async (_, _) => await RemoveOrCancelSelectedAsync();
         _clear.Click += (_, _) => _grid.ClearChecks();
 
         _mast.Decoration = PaintMast;
@@ -659,6 +659,27 @@ public partial class Form1 : Form
 
     private List<JobSnapshot> CheckedSnapshots() =>
         [.. _grid.CheckedItems.Where(i => i.Snapshot is not null).Select(i => i.Snapshot!)];
+
+    internal static bool CanCancel(JobSnapshot snapshot) =>
+        snapshot.Kind != JobKind.BrowserFile && snapshot.State is not
+            (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting);
+
+    private async Task RemoveOrCancelSelectedAsync()
+    {
+        if (_actions is null) return;
+        List<JobSnapshot> selected = CheckedSnapshots();
+        if (selected.Count == 0) return;
+
+        if (selected.All(CanCancel))
+        {
+            foreach (JobSnapshot snapshot in selected) await _actions.CancelAsync(snapshot);
+        }
+        else if (selected.All(s => s.State == JobState.Completed))
+        {
+            _actions.Remove(selected);
+        }
+        // Mixed selections never combine data deletion with history-only removal.
+    }
 
     private void LayoutMast()
     {
@@ -913,7 +934,13 @@ public partial class Form1 : Form
         _pause.Enabled = selected.Any(r => r.Status is JobStatus.Downloading or JobStatus.Queued or JobStatus.Resolving or JobStatus.WaitingRetry or JobStatus.Waiting);
         _resume.Enabled = selected.Any(r => r.BrowserFile is { Paused: true, CanResume: true }
             || r.BrowserFile is null && r.Status is JobStatus.Paused or JobStatus.Failed or JobStatus.NeedsAttention);
-        _remove.Enabled = selected.Any(r => r.Snapshot is not null) || _engine is null && count > 0;
+        JobSnapshot[] native = [.. selected.Where(r => r.Snapshot is not null).Select(r => r.Snapshot!)];
+        bool allNative = native.Length == count && count > 0;
+        bool onlyUnfinished = allNative && native.All(CanCancel);
+        bool onlyCompleted = allNative && native.All(s => s.State == JobState.Completed);
+        _remove.Text = onlyUnfinished ? "Cancel" : "Remove";
+        _remove.Symbol = onlyUnfinished ? VesperIcon.Close : VesperIcon.RemoveList;
+        _remove.Enabled = onlyUnfinished || onlyCompleted;
         LayoutSelectionToolbar();
     }
 
@@ -1152,8 +1179,7 @@ public partial class Form1 : Form
             {
                 "Details" or "Rename entry…" => true,
                 "Remove from list…" => s.State == JobState.Completed,
-                "Cancel download" => s.Kind != JobKind.BrowserFile
-                    && s.State is not (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting),
+                "Cancel download" => CanCancel(s),
                 "Copy source URL" => s.Kind != JobKind.BrowserFile,
                 "Delete downloaded file…" => fileAvailable && s.Kind != JobKind.BrowserFile,
                 "Open file" or "Open containing folder" or "Verify integrity…" =>
