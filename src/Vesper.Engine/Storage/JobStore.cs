@@ -75,7 +75,8 @@ public sealed class JobStore : IDisposable
         {
             DataSource = path, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false
         }.ToString());
-        _db.Open();
+        try { _db.Open(); }
+        catch { _db.Dispose(); throw; }
     }
 
     /// <summary>
@@ -95,21 +96,53 @@ public sealed class JobStore : IDisposable
         {
             string backup = Quarantine(path);
             var fresh = new JobStore(path);
-            fresh.Initialize();
-            fresh.RecoveredFromCorruption = true;
-            fresh.CorruptBackupPath = backup;
-            return fresh;
+            try
+            {
+                fresh.Initialize();
+                fresh.RecoveredFromCorruption = true;
+                fresh.CorruptBackupPath = backup;
+                return fresh;
+            }
+            catch { fresh.Dispose(); throw; }
         }
     }
 
-    private static string Quarantine(string path)
+    internal static string Quarantine(string path)
     {
         string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
-        string target = $"{path}.corrupt-{stamp}";
-        File.Move(path, target);
-        foreach (string suffix in new[] { "-wal", "-shm" })
-            if (File.Exists(path + suffix)) File.Move(path + suffix, target + suffix);
-        return target;
+        string target = $"{path}.corrupt-{stamp}-{Guid.NewGuid():N}";
+        var moved = new List<(string Original, string Archived)>(3);
+
+        try
+        {
+            // Move the main database last. If a sidecar is locked, the original database
+            // must remain visible at its old path rather than becoming an empty new database.
+            foreach (string suffix in new[] { "-wal", "-shm", "" })
+            {
+                string original = path + suffix;
+                if (suffix.Length != 0 && !File.Exists(original)) continue;
+                string archived = target + suffix;
+                File.Move(original, archived);
+                moved.Add((original, archived));
+            }
+
+            return target;
+        }
+        catch (Exception originalError)
+        {
+            var restoreErrors = new List<Exception>();
+            for (int i = moved.Count - 1; i >= 0; i--)
+            {
+                try { File.Move(moved[i].Archived, moved[i].Original); }
+                catch (Exception restoreError) { restoreErrors.Add(restoreError); }
+            }
+
+            if (restoreErrors.Count != 0)
+                throw new IOException(
+                    "Database recovery could not restore every original file. The archived files were kept for manual recovery.",
+                    new AggregateException([originalError, .. restoreErrors]));
+            throw;
+        }
     }
 
     private void Initialize()

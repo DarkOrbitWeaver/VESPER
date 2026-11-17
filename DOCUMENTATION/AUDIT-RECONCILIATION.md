@@ -2,7 +2,7 @@
 
 **Status: ORIGINAL REPORTS READ END-TO-END; SOURCE LOCATIONS MAPPED; IMPLEMENTATION RECONCILIATION STILL OPEN.** This ledger remains a **release blocker** until each original requirement, including unnumbered claims, is cross-checked against current source, tests, and release evidence. Having 91 IDs in `STATUS.tsv` or passing automated tests does not certify it.
 
-**Takeover record (2026-11-17):** Read `OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md` 1–2185, `VESPER-ENGINEERING-AUDIT B.md` 1–608, and `VESPER-IMPLEMENTATION.md` 1–229 in successive contiguous ChatGPT Library ranges. Original report source identity and exact section/finding locations, including 23 explicit cross-cutting trace rows and the N opportunities, are now recorded in [`CLAUDE-AUDIT-SOURCE-INDEX.md`](CLAUDE-AUDIT-SOURCE-INDEX.md). That **indexes requirements, not proof of implementation**.
+**Takeover record (2026-11-17):** Read `OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md` 1–2185, `VESPER-ENGINEERING-AUDIT B.md` 1–608, and `VESPER-IMPLEMENTATION.md` 1–229 in successive contiguous ChatGPT Library ranges. Original report source identity and exact section/finding locations, including 25 explicit cross-cutting trace rows and the N opportunities, are now recorded in [`CLAUDE-AUDIT-SOURCE-INDEX.md`](CLAUDE-AUDIT-SOURCE-INDEX.md). That **indexes requirements, not proof of implementation**. An additional [independent VSP current-source matrix](VSP-INDEPENDENT-RECONCILIATION.md) now covers all nine Audit B findings and their remaining acceptance gates; it is not a release certificate.
 
 ## Sources, scope and procedure
 
@@ -18,8 +18,8 @@
 
 | Original source | Scope | Read end-to-end at current takeover? | Requirements mapped to current code/tests? | Unnumbered material reconciled? | Status |
 |---|---|---|---|---|---|
-| OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md | 2,185 lines; sections A–U plus appendix, 54 VES and N findings | **Yes, 1–2185 on 2026-11-17** | Source-location index only; current behavior partly sampled | **23 extra cross-cutting obligations indexed; decisions open** | **OPEN** |
-| VESPER-ENGINEERING-AUDIT B.md | Independent VSP-001–009, severity/verification evidence | **Yes, 1–608 on 2026-11-17** | Original line locations and focused VSP-001/002/004 source/test review | Independent acceptance matrix indexed; more scenarios open | **OPEN** |
+| OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md | 2,185 lines; sections A–U plus appendix, 54 VES and N findings | **Yes, 1–2185 on 2026-11-17** | Source-location index only; current behavior partly sampled | **25 cross-cutting obligations indexed; decisions open** | **OPEN** |
+| VESPER-ENGINEERING-AUDIT B.md | Independent VSP-001–009, severity/verification evidence | **Yes, 1–608 on 2026-11-17** | All nine original VSP findings mapped in `VSP-INDEPENDENT-RECONCILIATION.md`; evidence is partially automated | Independent acceptance/real-system scenarios still open | **OPEN** |
 | VESPER-IMPLEMENTATION.md | Historical implementation patch, limitations and claims | **Yes, 1–229 on 2026-11-17** | Historical patch claims indexed; changed code not wholesale re-audited | Linux-only historical test caveats preserved | **OPEN** |
 | Luna's earlier handoff and reports | Source changes, user decisions, edge cases, manual-test blockers | Partial historical review | Existing implementation/STATUS notes | Not exhaustively verified | **OPEN** |
 
@@ -30,8 +30,8 @@ Copy a row for every original numbered finding; also assign `AUDIT-EXTRA-###` id
 | Audit ID | Original report, section and exact lines | Original requirement/claim | Current source location | Test/observation/commit | Status | Remaining acceptance or reason not applicable |
 |---|---|---|---|---|---|---|
 | VES-001…VES-067 (54 original non-contiguous IDs) | **Exact source ranges in `CLAUDE-AUDIT-SOURCE-INDEX.md`** | Original headings or original table claim | Code/test review remains item-specific | Historical STATUS entries are not independent evidence | OPEN | Trace current methods/tests and risk gate for each ID |
-| VSP-001…VSP-009 | **Exact Audit B ranges in source index** | Independent security/reliability requirements | `HttpTransport`, `JobStore`, `RescueEvaluator` sampled | On Windows: 4/4 HLS credential tests, 3/3 DB tests (two new), 3/3 Rescue identity/partial preservation tests; other gaps open | OPEN | Chrome, file-lock/WAL/permission, restart/repeated Rescue and further independent proof |
-| Unnumbered sections A–U plus appendix | **23 trace rows in source index** | Behavioral contracts, original blind spots, Q crash/browser/UI/media matrices, performance methods and optional research | Current `QUALITY-RELEASE-GATES.md` Q0–Q10 | No universal implementation sign-off or raw real-world evidence yet | OPEN | Reconcile each obligation separately; keep optional ideas deferred |
+| VSP-001…VSP-009 | **Exact Audit B ranges in source index** | Independent security/reliability requirements | `VSP-INDEPENDENT-RECONCILIATION.md` maps all nine to present source and tests | On Windows: four HLS credential tests, six DB tests (including locked WAL/SHM recovery) and three Rescue identity/partial preservation tests; other gaps open | OPEN | Chrome, WAL/power-loss/permission, restart/repeated Rescue and independent proof |
+| Unnumbered sections A–U plus appendix | **25 trace rows in source index** | Behavioral contracts, original blind spots, Q crash/browser/UI/media matrices, performance methods and optional research | Current `QUALITY-RELEASE-GATES.md` Q0–Q10 | No universal implementation sign-off or raw real-world evidence yet | OPEN | Reconcile each obligation separately; keep optional ideas deferred |
 
 ## Completion gates
 

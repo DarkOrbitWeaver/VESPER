@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS  Builds, tests and packages VESPER for Windows 11 x64.
-.EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0
-.EXAMPLE   .\scripts\Build-Release.ps1 -Version 1.0.0 -PortableOnly
+.EXAMPLE   .\scripts\Build-Release.ps1 -AllowUnsigned  # isolated development only
+.EXAMPLE   .\scripts\Build-Release.ps1 -PortableOnly -AllowUnsigned
 .NOTES     Output: release\setup-<version>\VESPER-Setup.exe and release\VESPER-<version>.zip.
            Signing requires VESPER_SIGN_CERT_SHA1 (Windows certificate store). Use -AllowUnsigned only for development.
            The setup is self-contained. The ZIP is a portable app payload; use -SelfContained to bundle

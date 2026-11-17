@@ -15,7 +15,7 @@ The interface keeps its compact botanical design and light and dark themes.
 
 The extension matches HTTP and HTTPS pages in all frames so it can detect direct media links and sources inside embedded players on arbitrary sites. Background request listeners filter to relevant media and resource request types. Cookie access is optional and no cookie is read unless **Use site sign-in** is enabled in the extension settings.
 
-VESPER has no telemetry or account service. Network requests are made for links and media discovery that the user submits.
+VESPER has no telemetry or account service. Network requests are made for user-submitted links and supported automatic browser handoffs when that integration is enabled.
 
 ## Engineering continuation
 
@@ -27,13 +27,13 @@ Use Windows 11 x64 with the .NET 10 SDK and Node.js for the extension tests.
 
 ```powershell
 .\scripts\Run-Tests.ps1
-.\scripts\Build-Release.ps1 -Version 1.0.0
+.\scripts\Build-Release.ps1 -AllowUnsigned  # isolated development build only
 ```
 
-The build creates a self-contained setup executable and a portable ZIP. Add `-PortableOnly` to build only the ZIP; add `-SelfContained` to include the .NET runtime in that ZIP. Release executables are unsigned.
+The build creates a self-contained setup executable and a portable ZIP. Add `-PortableOnly` to build only the ZIP, or `-SelfContained` to include the .NET runtime in that ZIP. Shipping builds require an Authenticode certificate and verified signatures; `-AllowUnsigned` is for local development only. Packaging does not install or register anything.
 
 ## Limits and verification
 
-VESPER does not bypass DRM, sign-in gates, or site JavaScript challenges. Its native remuxer copies compatible, validated tracks without re-encoding; the optional "plays everywhere" MP4 and M4A outputs use the Windows Media Foundation decoders and encoders already on the PC, and are offered only when those codecs are present. Separate HLS audio renditions are not supported. The single source of truth for what the media engine can and cannot do is [MEDIA_ENGINE_LIMITATIONS.md](MEDIA_ENGINE_LIMITATIONS.md); site compatibility depends on the current site implementation.
+VESPER does not bypass DRM, sign-in gates, or site JavaScript challenges. Its native remuxer copies compatible, validated tracks without re-encoding; the optional "plays everywhere" MP4 and M4A outputs use the Windows Media Foundation decoders and encoders already on the PC, where the necessary codecs are available; decoder probing and actual playback must still be verified on the target Windows machine. Separate HLS audio renditions are not supported. The single source of truth for what the media engine can and cannot do is [MEDIA_ENGINE_LIMITATIONS.md](MEDIA_ENGINE_LIMITATIONS.md); site compatibility depends on the current site implementation.
 
-See [release status and verification](DOCUMENTATION/RELEASE.md) and [current media limits](MEDIA_ENGINE_LIMITATIONS.md). Clean-machine installation, mixed-DPI interaction, live VPN/site coverage, and matched comparisons with IDM, FDM, and yt-dlp still need manual runs.
+See [current build and release information](DOCUMENTATION/RELEASE.md), [historical November 12 verification](DOCUMENTATION/RELEASE-2026-11-12-HISTORICAL.md), and [current media limits](MEDIA_ENGINE_LIMITATIONS.md). Clean-machine installation, mixed-DPI interaction, live VPN/site coverage, and matched comparisons with IDM, FDM, and yt-dlp still need manual runs.

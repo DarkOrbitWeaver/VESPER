@@ -102,5 +102,77 @@ public sealed class JobStoreRecoveryTests
         }
     }
 
+    [Theory]
+    [InlineData("-wal")]
+    [InlineData("-shm")]
+    public void A_locked_sidecar_cannot_leave_the_database_separated_from_its_journal(string lockedSuffix)
+    {
+        // FileShare.None is enforced for moves on Windows. No installed application or real database is touched.
+        if (!OperatingSystem.IsWindows()) return;
+
+        string directory = Path.Combine(Path.GetTempPath(), "vesper-quarantine-rollback-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(directory, "vesper.db");
+        byte[] database = "original database bytes"u8.ToArray();
+        byte[] wal = "original WAL bytes"u8.ToArray();
+        byte[] shm = "original SHM bytes"u8.ToArray();
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllBytes(path, database);
+            File.WriteAllBytes(path + "-wal", wal);
+            File.WriteAllBytes(path + "-shm", shm);
+
+            using (var lockOwner = new FileStream(path + lockedSuffix, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                Assert.ThrowsAny<IOException>(() => JobStore.Quarantine(path));
+                Assert.True(File.Exists(path)); // Failure must not detach the authoritative database.
+            }
+
+            Assert.Equal(database, File.ReadAllBytes(path));
+            Assert.Equal(wal, File.ReadAllBytes(path + "-wal"));
+            Assert.Equal(shm, File.ReadAllBytes(path + "-shm"));
+            Assert.Empty(Directory.GetFiles(directory, "*.corrupt-*"));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Successful_quarantine_archives_the_database_and_all_existing_sidecars_with_unique_names()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "vesper-quarantine-complete-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(directory, "vesper.db");
+        byte[] database = "database backup"u8.ToArray();
+        byte[] wal = "WAL backup"u8.ToArray();
+        byte[] shm = "SHM backup"u8.ToArray();
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.WriteAllBytes(path, database);
+            File.WriteAllBytes(path + "-wal", wal);
+            File.WriteAllBytes(path + "-shm", shm);
+
+            string first = JobStore.Quarantine(path);
+            Assert.False(File.Exists(path));
+            Assert.False(File.Exists(path + "-wal"));
+            Assert.False(File.Exists(path + "-shm"));
+            Assert.Equal(database, File.ReadAllBytes(first));
+            Assert.Equal(wal, File.ReadAllBytes(first + "-wal"));
+            Assert.Equal(shm, File.ReadAllBytes(first + "-shm"));
+
+            File.WriteAllBytes(path, "second corrupt database"u8.ToArray());
+            string second = JobStore.Quarantine(path);
+            Assert.NotEqual(first, second);
+            Assert.Equal(database, File.ReadAllBytes(first));
+            Assert.Equal("second corrupt database"u8.ToArray(), File.ReadAllBytes(second));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static string Hash(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
 }
