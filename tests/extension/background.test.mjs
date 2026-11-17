@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
-  failDownloadSearch = false,
+  failDownloadSearch = false, failDownloadCancel = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value' }], playerPicker = false } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
@@ -82,7 +82,12 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       },
       pause: async () => { actions.push('pause'); download.paused = true; },
       resume: async () => { actions.push('resume'); download.paused = false; },
-      cancel: async () => { actions.push('cancel'); download.state = 'interrupted'; download.paused = false; },
+      cancel: async () => {
+        actions.push('cancel');
+        if (failDownloadCancel) throw new Error('Chrome refused cancellation.');
+        download.state = 'interrupted';
+        download.paused = false;
+      },
       erase: async () => actions.push('erase')
     },
     action: { setBadgeText: async value => badges.push(value), setBadgeBackgroundColor: async () => {} },
@@ -198,9 +203,10 @@ function observe(app, file, { method = 'GET', type = 'main_frame', contentType =
 }
 
 async function waitFor(condition, message) {
-  for (let attempt = 0; attempt < 40; attempt++) {
+  // WebCrypto digests and Chrome storage actions resolve asynchronously, not on the same event-loop turn.
+  for (let attempt = 0; attempt < 100; attempt++) {
     if (condition()) return;
-    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setTimeout(resolve, 2));
   }
   assert.ok(condition(), message);
 }
@@ -286,10 +292,10 @@ test('a download is picked up when Chrome reports its response after the downloa
   await app.onCreated(file);
   assert.equal(app.sent.length, 0);
   await observe(app, file, { contentType: null, attachment: false });
-  await new Promise(resolve => setImmediate(resolve));
+  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'), 'Late response capture was not submitted.');
   assert.equal(app.sent[0].browserProof.length, file.fileSize);
   assert.equal(app.sent[0].browserProof.contentType, undefined);
-  assert.equal(file.paused, true);
+  await waitFor(() => file.paused, 'Chrome was not paused after the late response was accepted.');
 });
 
 test('a redirected API attachment matches when Chrome creates the item with finalUrl already set', async () => {
@@ -503,7 +509,7 @@ test('a redirect chain survives service worker restart until the final attachmen
   const request = nextWorker.sent.find(message => message.type === 'browser-submit');
   assert.equal(request.items[0].cookie, 'session=test-value');
   assert.equal(request.authorized, true);
-  assert.equal(file.paused, true);
+  await waitFor(() => file.paused, 'Chrome was not paused after native acceptance.');
   assert.equal(file.state, 'in_progress');
   assert.equal(nextWorker.actions.includes('cancel'), false);
 });
@@ -856,6 +862,86 @@ test('after VESPER completes, the parked Chrome copy is cancelled and erased so 
   state = 'complete';
   await app.recover();
   assert.deepEqual(app.actions.slice(-2), ['cancel', 'erase']);
+});
+
+test('a failed Chrome cancel never erases a download that still belongs to Chrome', async () => {
+  const file = activeDownload();
+  let state = 'active';
+  const app = load({ 'browser-submit': started, 'browser-transfer': message =>
+    transfer(message.operation === 'abandon' ? 'complete' : state) },
+    { download: file, failDownloadCancel: true });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(file.paused, true);
+
+  state = 'complete';
+  await app.recover();
+  assert.equal(file.state, 'in_progress', 'Chrome never confirmed that its own download was canceled.');
+  assert.equal(file.paused, false, 'Chrome must not remain indefinitely paused after cancel failure.');
+  assert.ok(app.actions.includes('cancel'));
+  assert.equal(app.actions.includes('erase'), false);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'stand-down');
+});
+
+test('a changed redirect during native acceptance remains Chrome-owned', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': message => {
+    if (message.operation === 'accept') file.finalUrl = 'https://example.com/changed?signature=secret-2';
+    return transfer(message.operation === 'abandon' ? 'failed' : 'active');
+  } }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(file.paused, false, 'Chrome must be resumed after native abandonment.');
+  assert.equal(file.state, 'in_progress');
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  assert.ok(app.sent.some(message => message.operation === 'abandon'));
+  const records = (await app.local.get('browserDownloads')).browserDownloads;
+  assert.notEqual(records[file.id]?.stage, 'parked');
+  assert.equal(app.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'not-ready');
+});
+
+test('changed source after worker restart is never completed on Chrome\'s behalf', async () => {
+  const file = activeDownload();
+  let state = 'active';
+  const app = load({ 'browser-submit': started, 'browser-transfer': message =>
+    transfer(message.operation === 'abandon' ? 'complete' : state) }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(file.paused, true);
+
+  const records = (await app.local.get('browserDownloads')).browserDownloads;
+  assert.match(records[file.id].sourceHash, /^[a-f0-9]{64}$/);
+  assert.equal(Object.hasOwn(records[file.id], 'sourceUrl'), false,
+    'Signed source URLs must not persist in local storage.');
+  file.finalUrl = 'https://other.example/changed?token=secret-3';
+  state = 'complete';
+  const restarted = load({ 'browser-transfer': message =>
+    transfer(message.operation === 'abandon' ? 'complete' : state) },
+    { download: file, localData: { browserDownloads: records } });
+  await restarted.recover();
+
+  assert.equal(file.paused, false, 'Chrome keeps downloading when the native source has changed.');
+  assert.equal(file.state, 'in_progress');
+  assert.equal(restarted.actions.includes('cancel'), false);
+  assert.equal(restarted.actions.includes('erase'), false);
+  assert.equal((await restarted.local.get('browserDownloads')).browserDownloads[file.id].stage, 'stand-down');
+});
+
+test('legacy saved captures with no URL fingerprint fail closed and resume Chrome', async () => {
+  const file = { ...activeDownload(), paused: true };
+  const old = { startTime: file.startTime, transferId: 'legacy-transfer-identity', stage: 'parked',
+    resumeChrome: true, at: Date.now() };
+  const app = load({ 'browser-transfer': message =>
+    transfer(message.operation === 'abandon' ? 'failed' : 'active') }, {
+    download: file, localData: { browserDownloads: { [file.id]: old } }
+  });
+  await app.recover();
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'stand-down');
 });
 
 test('first-click discovery uses the actual player frame and its HTTP source', async () => {
