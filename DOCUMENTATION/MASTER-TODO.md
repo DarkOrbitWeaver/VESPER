@@ -2,6 +2,8 @@
 
 **Purpose:** One durable starting point for every future ChatGPT/Codex/Luna continuation. Updated 2026-11-17. Read this alongside `DOCUMENTATION/STATUS.tsv`; it is a prioritized view, not a replacement for the detailed row-by-row register.
 
+**NON-NEGOTIABLE OPEN RELEASE BLOCKER:** `DOCUMENTATION/AUDIT-RECONCILIATION.md` records the **not-yet-performed exhaustive, contiguous line-by-line review of Claude's full 2,185-line report**, independent Audit B, unnumbered recommendations, historical implementation, current source/tests and user decisions. `DOCUMENTATION/QUALITY-RELEASE-GATES.md` defines evidence-backed AAA-quality gates Q0–Q10. Read both on every takeover. **91 tracked IDs do not prove complete audit coverage and 1,067 past tests do not prove shippability.**
+
 ## Source of truth and baseline
 
 - **Authoritative current code:** `C:\DarkOrbitWeaver\VESPER\.ramca-worktrees\vesper-continued` on branch `codex/vesper-continued`, unless Git shows a newer explicitly approved continuation. The repository root `C:\DarkOrbitWeaver\VESPER` is `main`; do not edit or merge it.
@@ -106,6 +108,11 @@ These are **already added to `STATUS.tsv`**, but overlap categories above. The V
 - [ ] **VSP-009 (documentation mismatch):** fix release/README/install claims and stale internal links. Explicitly mark historical tests as historical. Overlap: VES-008, currently implemented for earlier docs but not a blanket exemption.
 
 ## I. Required acceptance and release gates (not accounted for in row counts)
+
+**These are release-blocking until proven on the exact candidate build; see `QUALITY-RELEASE-GATES.md`. Do not conflate test success with actual system/browser QA.**
+
+- [ ] **Q0 original-report reconciliation:** inspect every line of both Claude audits and historical implementation materials; populate `AUDIT-RECONCILIATION.md` with source line ranges, unnumbered actionable claims, verified current source/test evidence, dispositions and independent high-risk review.
+- [ ] **Q0–Q10 release signoff:** each quality gate has reproducible dated evidence, exact commit, device/OS/build identity and outcome; all P0 closed and no unaccepted core P1. Unavailable signing/Chrome/distribution work stays explicitly blocked.
 
 - [ ] Build and run all four .NET solution test projects and extension tests on the **current HEAD**, ideally repeated with no flaky retries. Use `dotnet test VESPER.slnx -c Release --no-restore --nologo` and `node --test tests/extension/*.test.mjs`.
 - [ ] Run adversarial HTTP/HTTPS tests: wrong 206, redirects, truncated bodies, unknown size, HTML/captive-portal responses, proxy PAC/IPv6, private-address rebinding, timeout, disk full, removed USB, same/changed validators and byte-exact output.

@@ -19,7 +19,7 @@ VESPER has no telemetry or account service. Network requests are made for links 
 
 ## Engineering continuation
 
-For the current cross-audit roadmap and restart instructions, use [Master TODO](DOCUMENTATION/MASTER-TODO.md), [Next-chat handoff](DOCUMENTATION/NEXT-CHAT-HANDOFF.md), and the detailed [status register](DOCUMENTATION/STATUS.tsv). These are development documents; historical release notes are not current build certification. Run `scripts/Verify-EngineeringBacklog.ps1` when updating the audit tracker.
+For the current cross-audit roadmap and restart instructions, use [Master TODO](DOCUMENTATION/MASTER-TODO.md), [Next-chat handoff](DOCUMENTATION/NEXT-CHAT-HANDOFF.md), the [audit reconciliation ledger](DOCUMENTATION/AUDIT-RECONCILIATION.md), the [AAA-quality release gates](DOCUMENTATION/QUALITY-RELEASE-GATES.md) and the detailed [status register](DOCUMENTATION/STATUS.tsv). Original audit reconciliation and release gates are **not yet signed off**; historical release notes are not current build certification. Run `scripts/Verify-EngineeringBacklog.ps1` when updating the audit tracker.
 
 ## Build and test
 
