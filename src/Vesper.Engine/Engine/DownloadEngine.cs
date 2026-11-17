@@ -316,7 +316,7 @@ public sealed partial class DownloadEngine : IDisposable
     {
         var activePerHost = _sessions.Values.GroupBy(s => s.Host).ToDictionary(g => g.Key, g => g.Count());
         return _jobs.Values
-            .Where(j => j.State == JobState.Queued && !_sessions.ContainsKey(j.Id))
+            .Where(j => j.State == JobState.Queued && !_sessions.ContainsKey(j.Id) && !_cancelling.Contains(j.Id))
             .Where(j => activePerHost.GetValueOrDefault(HostOf(j)) < Options.MaxJobsPerHost)
             // Highest priority first; then the host with the fewest running jobs (fairness); then queue order.
             .OrderByDescending(j => j.Priority)
@@ -374,6 +374,8 @@ public sealed partial class DownloadEngine : IDisposable
                 bool progressed = job.Extents.TotalBytes > session.CommittedAtStart;
                 if (session.Intent == StopIntent.BrowserFallback && outcome.State != JobState.Completed)
                     outcome = BrowserFallbackOutcome;
+                if (session.Intent == StopIntent.Cancel && outcome.State != JobState.Completed && job.State != JobState.Completed)
+                    outcome = new RunOutcome(JobState.Cancelled, "cancelled", "Cancelling download.");
                 bool wasCandidate = IsDuplicateCandidate(job);
                 string previousSourceUrl = job.SourceUrl;
                 ApplyOutcome(job, outcome, progressed);

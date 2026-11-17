@@ -54,6 +54,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             return session.Intent switch
             {
                 StopIntent.Pause => new RunOutcome(JobState.Paused, "", ""),
+                StopIntent.Cancel => new RunOutcome(JobState.Cancelled, "cancelled", "Cancelling download."),
                 StopIntent.BrowserFallback => DownloadEngine.BrowserFallbackOutcome,
                 StopIntent.Window => new RunOutcome(JobState.Queued, "schedule", "Waiting for the scheduled download window."),
                 _ => new RunOutcome(JobState.Queued, "shutdown", "Will resume when VESPER starts.")

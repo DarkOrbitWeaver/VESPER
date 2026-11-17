@@ -99,6 +99,23 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
             if (!engine.RestartFromScratch(s.Id)) Info("The partial data could not be removed. Nothing was changed.", "Start over", MessageBoxIcon.Warning);
     }
 
+    // ---- cancel / remove / delete -----------------------------------------------------------------------------------
+
+    public async Task CancelAsync(JobSnapshot snapshot)
+    {
+        try
+        {
+            CancelDownloadResult result = await engine.CancelDownloadAsync(snapshot.Id);
+            if (!result.Cancelled) Info(result.Message, "Cancel download", MessageBoxIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            // This is launched from a menu callback. Observe failures instead of leaving a faulted task.
+            if (owner is Control { IsDisposed: true }) return;
+            Info("Could not cancel this download: " + ex.Message, "Cancel download", MessageBoxIcon.Warning);
+        }
+    }
+
     // ---- remove / delete --------------------------------------------------------------------------------------------
 
     public void Remove(IReadOnlyList<JobSnapshot> items)

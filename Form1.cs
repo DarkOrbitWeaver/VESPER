@@ -1057,7 +1057,7 @@ public partial class Form1 : Form
         Add("Pause", VesperIcon.Pause, s => _engine?.Pause(s.Id));
         Add("Resume", VesperIcon.Play, s => _engine?.Resume(s.Id));
         Add("Stop and keep", VesperIcon.Check, s => { _engine?.StopAndKeepLive(s.Id); });
-        Add("Cancel download", VesperIcon.Close, _ => { });
+        Add("Cancel download", VesperIcon.Close, s => { if (_actions is { } actions) _ = actions.CancelAsync(s); });
         Add("Start now", VesperIcon.Play, s => _engine?.StartNow(s.Id));
         Add("Replace link…", VesperIcon.Link, s => _actions?.ReplaceLink(s));
         Add("Resume anyway…", VesperIcon.Play, s => _actions?.ApproveUnverified(s));
@@ -1150,7 +1150,10 @@ public partial class Form1 : Form
         {
             bool available = name switch
             {
-                "Details" or "Rename entry…" or "Remove from list…" => true,
+                "Details" or "Rename entry…" => true,
+                "Remove from list…" => s.State == JobState.Completed,
+                "Cancel download" => s.Kind != JobKind.BrowserFile
+                    && s.State is not (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting),
                 "Copy source URL" => s.Kind != JobKind.BrowserFile,
                 "Delete downloaded file…" => fileAvailable && s.Kind != JobKind.BrowserFile,
                 "Open file" or "Open containing folder" or "Verify integrity…" =>
