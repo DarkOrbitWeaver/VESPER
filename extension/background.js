@@ -795,11 +795,10 @@ async function describe(url, durationSeconds) {
 // ---------------------------------------------------------------- messages from the popup and content scripts
 
 // Content scripts run inside web pages, and a page that breaks out of its sandbox can forge their messages.
-// They get only what the in-page picker needs. Everything that reads other tabs, moves Chrome downloads or
-// submits links is reserved for VESPER's own pages (the popup and the Chrome downloads page).
+// They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
 const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select']);
-const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello', 'chrome-downloads', 'move-download',
+const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit']);
 
 function commandsFor(sender) {
@@ -846,8 +845,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => ({ id, at: p.at, count: p.request.items.length })) };
       }
       case 'hello': return nativeRequest(envelope('hello'), 20000);
-      case 'chrome-downloads': return listChromeDownloads();
-      case 'move-download': return moveChromeDownload(message.downloadId, 'download');
       case 'media-options': return playerOptions(message, sender);
       case 'media-source-select': return selectMediaSource(message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
@@ -921,7 +918,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   chrome.contextMenus.create({ id: 'vesper-page-media', title: 'Find video on this page with VESPER', contexts: ['page', 'frame'] });
   chrome.contextMenus.create({ id: 'vesper-link', title: 'Download link with VESPER', contexts: ['link'] });
   chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
-  chrome.contextMenus.create({ id: 'vesper-active-downloads', title: 'Move an active Chrome download…', contexts: ['action'] });
+  chrome.contextMenus.create({ id: 'vesper-transfers', title: 'Unconfirmed VESPER requests…', contexts: ['action'] });
   await updateBadge();
   await recoverChromeDownloads();
 });
@@ -930,7 +927,7 @@ chrome.runtime.onStartup.addListener(async () => { await updateBadge(); await re
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await recoverChromeCaptures();
-  if (info.menuItemId === 'vesper-active-downloads') {
+  if (info.menuItemId === 'vesper-transfers') {
     await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
     return;
   }

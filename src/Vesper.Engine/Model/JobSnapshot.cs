@@ -21,6 +21,8 @@ public sealed class JobSnapshot
     public JobState State { get; init; }
     public string Reason { get; init; } = "";
     public string Message { get; init; } = "";
+    // Candidate downloads are not VESPER jobs until Chrome has been safely paused and accepted.
+    public bool IsUnacceptedBrowserCapture { get; init; }
     public long? TotalBytes { get; init; }
 
     /// <summary>Bytes that survive a crash: validated, flushed, and recorded in the database.</summary>

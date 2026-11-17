@@ -3,13 +3,13 @@
 const RECOVERY_ALARM = 'vesper-chrome-downloads';
 const MAX_BROWSER_RECORDS = 128;
 const RESPONSE_LIFETIME = 5 * 60_000;
-const AUTOMATIC_RETRY_DELAY = 60_000;
-const MAX_CAPTURE_ATTEMPTS = 3;
+const NEW_DOWNLOAD_WINDOW = 15_000;
 const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
 const DECISIONS_KEY = 'vesperCaptureDecisions';
 const MAX_DECISIONS = 20;
 const responses = new Map();
 const awaitingResponses = new Map();
+const createdDownloads = new Map();
 const requestChains = new Map();
 const blockedRequests = new Map();
 const browserOperations = new Map();
@@ -17,8 +17,6 @@ let recordWrites = Promise.resolve();
 let captureWrites = Promise.resolve();
 let decisionWrites = Promise.resolve();
 let captureRecovery;
-let profileIdPromise;
-let activityPort, openingActivity = false;
 
 // A #fragment never reaches the server. Chrome's download list and its request log don't agree on keeping it,
 // so every address is compared without one.
@@ -27,7 +25,9 @@ const startUrl = item => withoutFragment(item?.url);
 const browserUrl = item => withoutFragment(item.finalUrl || item.url);
 const isSafe = item => !!item && !item.incognito && ['safe', 'deepScannedSafe'].includes(item.danger);
 const startedByVesper = item => !!item?.byExtensionId && item.byExtensionId === chrome.runtime.id;
-const canMove = item => isSafe(item) && item.state === 'in_progress' && /^https?:\/\//i.test(browserUrl(item) || '');
+// Chrome has already downloaded bytes? Then Chrome owns the file. Never take credit for its progress.
+const canMove = item => isSafe(item) && item.state === 'in_progress' && item.bytesReceived === 0
+  && /^https?:\/\//i.test(browserUrl(item) || '');
 const byteCount = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 // While Chrome doesn't know a download's size it reports 0 or -1. Neither proves anything about the file.
 const knownSize = item => [item.fileSize, item.totalBytes].find(value => Number.isSafeInteger(value) && value > 0);
@@ -48,6 +48,10 @@ const captureStateReady = chrome.storage.session.get(CAPTURE_STATE_KEY).then(({ 
         && /^https?:\/\//i.test(waiting.url) && Number.isFinite(waiting.seen)
         && now >= waiting.seen && now - waiting.seen <= RESPONSE_LIFETIME)
       awaitingResponses.set(id, waiting);
+  for (const [id, created] of Array.isArray(saved?.created) ? saved.created : [])
+    if (Number.isSafeInteger(id) && typeof created?.startTime === 'string' && Number.isFinite(created?.seen)
+        && now >= created.seen && now - created.seen <= NEW_DOWNLOAD_WINDOW && createdDownloads.size < MAX_BROWSER_RECORDS)
+      createdDownloads.set(id, created);
   for (const [id, chain] of Array.isArray(saved?.chains) ? saved.chains : [])
     if (typeof id === 'string' && id.length > 0 && id.length <= 128
         && /^https?:\/\//i.test(chain?.originalUrl || '') && /^https?:\/\//i.test(chain?.currentUrl || '')
@@ -68,16 +72,25 @@ function saveCaptureState() {
     if (now < waiting.seen || now - waiting.seen > RESPONSE_LIFETIME) awaitingResponses.delete(id);
   for (const [id, chain] of requestChains)
     if (now < chain.seen || now - chain.seen > RESPONSE_LIFETIME) requestChains.delete(id);
+  for (const [id, created] of createdDownloads)
+    if (now < created.seen || now - created.seen > NEW_DOWNLOAD_WINDOW) createdDownloads.delete(id);
   for (const [id, seen] of blockedRequests)
     if (now < seen || now - seen > RESPONSE_LIFETIME) blockedRequests.delete(id);
   while (responses.size > MAX_BROWSER_RECORDS) responses.delete(responses.keys().next().value);
   while (awaitingResponses.size > MAX_BROWSER_RECORDS) awaitingResponses.delete(awaitingResponses.keys().next().value);
+  while (createdDownloads.size > MAX_BROWSER_RECORDS) createdDownloads.delete(createdDownloads.keys().next().value);
   while (requestChains.size > MAX_BROWSER_RECORDS) requestChains.delete(requestChains.keys().next().value);
   const chains = [...requestChains].filter(([, chain]) => chain.persisted && chain.replayable);
-  const state = { responses: [...responses], awaiting: [...awaitingResponses], chains, blocked: [...blockedRequests] };
+  const state = { responses: [...responses], awaiting: [...awaitingResponses], created: [...createdDownloads], chains, blocked: [...blockedRequests] };
   const write = captureWrites.then(() => chrome.storage.session.set({ [CAPTURE_STATE_KEY]: state }));
   captureWrites = write.catch(() => {});
   return write;
+}
+
+function recentlyCreated(item) {
+  const created = createdDownloads.get(item?.id);
+  return !!created && created.startTime === item.startTime && Date.now() >= created.seen
+    && Date.now() - created.seen <= NEW_DOWNLOAD_WINDOW;
 }
 
 function rememberWaitingResponse(item, url) {
@@ -262,12 +275,6 @@ function chromeFileName(item) {
   return name && !/\.crdownload$/i.test(name) ? name : undefined;
 }
 
-async function listChromeDownloads() {
-  const downloads = await chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 });
-  return { ok: true, downloads: downloads.filter(item => canMove(item) && downloadProof(item, true).proof).slice(0, 8).map(item => ({
-    id: item.id, name: chromeFileName(item) || 'Download', paused: item.paused
-  })) };
-}
 
 const sameDownload = (item, record) => !!item && item.startTime === record.startTime && !item.incognito;
 const needsRecovery = record => ['parking', 'parked', 'import'].includes(record.stage);
@@ -276,14 +283,13 @@ const readBrowserRecords = async () => (await chrome.storage.local.get('browserD
 
 async function recoverUncapturedChromeDownloads() {
   await captureStateReady;
-  const [items, records] = await Promise.all([
-    chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 25 }),
-    readBrowserRecords()
-  ]);
-  const recoverable = items.filter(item => canMove(item) && !item.paused && !startedByVesper(item)
-    && !browserOperations.has(item.id)
-    && (!sameDownload(item, records[item.id] || {})
-      || records[item.id]?.stage === 'attempted' && (records[item.id].retryAt || 0) <= Date.now()));
+  const records = await readBrowserRecords();
+  // Only an onCreated event (also kept briefly across worker restarts) authorizes automatic capture.
+  // Do not scan Chrome's existing downloads and adopt work it has already been doing.
+  const items = await Promise.all([...createdDownloads.keys()].map(id => getChromeDownload(id).catch(() => null)));
+  const recoverable = items.filter(item => recentlyCreated(item) && canMove(item) && !item.paused
+    && !startedByVesper(item) && !browserOperations.has(item.id)
+    && (!sameDownload(item, records[item.id] || {}) || records[item.id]?.stage === 'attempted'));
   await Promise.allSettled(recoverable.map(item => captureChromeDownloadSafely(item)));
 }
 
@@ -336,7 +342,9 @@ function moveChromeDownload(id, mode, automatic = false) {
   if (!Number.isSafeInteger(id) || id < 0) return Promise.resolve(chromeKeeps('Choose a Chrome download.'));
   return inBrowserOrder(id, async () => {
     const item = await getChromeDownload(id);
-    if (!canMove(item) || automatic && item.paused || !Number.isFinite(Date.parse(item.startTime)))
+    if (!automatic || !recentlyCreated(item))
+      return chromeKeeps('Chrome owns this download. Start it with VESPER to download using VESPER.');
+    if (!canMove(item) || item.paused || !Number.isFinite(Date.parse(item.startTime)))
       return chromeKeeps('This Chrome download is unavailable to move.');
     const note = outcome => automatic ? noteDecision(item, outcome) : Promise.resolve();
     const { proof, reason } = downloadProof(item, !automatic);
@@ -361,28 +369,30 @@ function moveChromeDownload(id, mode, automatic = false) {
       referer: item.referrer || undefined, userAgent: navigator.userAgent
     }]);
     const reply = await nativeRequest(envelope('browser-submit', { id: record.transferId, mode, items, authorized, browserProof: proof }), 24000);
+    // Chrome may finish while native verification is in flight. Its completed file is never ours.
+    const latest = await getChromeDownload(id);
+    if (!sameDownload(latest, record) || latest.state === 'complete') {
+      if (reply.ok) await transferCommand(record.transferId, 'abandon').catch(() => {});
+      await writeBrowserRecord(id, null);
+      await note('chrome-finished');
+      return chromeKeeps();
+    }
     const result = reply.results?.[0];
     if (!reply.ok || result?.transferReady !== true) {
       // A delayed reply cannot publish a tentative download. Release the job if the helper answered.
       if (reply.ok) {
         const stopped = await transferCommand(record.transferId, 'abandon').catch(() => null);
-        if (stopped?.ok && stopped.data?.state === 'failed') record.transferId = crypto.randomUUID();
-        else if (stopped?.ok && stopped.data?.state === 'complete') {
-          record.stage = 'done';
-          await writeBrowserRecord(id, record);
-          await note(handoffOutcome(reply, result, authorized));
+        if (stopped?.ok && stopped.data?.state === 'complete') {
+          // A staged transfer must not publish before acceptance. Never label this Chrome-owned file moved.
+          await writeBrowserRecord(id, null);
+          await note('capture-error');
           return chromeKeeps();
         }
       }
-      if (record.attempts >= MAX_CAPTURE_ATTEMPTS) {
-        record.stage = 'stand-down';
-        delete record.retryAt;
-        await writeBrowserRecord(id, record);
-      } else {
-        record.retryAt = Date.now() + AUTOMATIC_RETRY_DELAY;
-        await writeBrowserRecord(id, record);
-        await armBrowserRecovery();
-      }
+      // No delayed retry: if Chrome keeps downloading after a failed attempt, ownership stays with Chrome.
+      record.stage = 'stand-down';
+      delete record.retryAt;
+      await writeBrowserRecord(id, record);
       await note(handoffOutcome(reply, result, authorized));
       return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
     }
@@ -391,6 +401,7 @@ function moveChromeDownload(id, mode, automatic = false) {
     if (!sameDownload(current, record) || !canMove(current) || browserUrl(current) !== browserUrl(item)
         || automatic && current.paused) {
       await transferCommand(record.transferId, 'abandon');
+      await writeBrowserRecord(id, null);
       await note(sameDownload(current, record) && current.state === 'complete' ? 'chrome-finished' : 'not-ready');
       return chromeKeeps();
     }
@@ -405,6 +416,20 @@ function moveChromeDownload(id, mode, automatic = false) {
         && browserUrl(paused) === browserUrl(item);
       const accepted = canAccept ? await transferCommand(record.transferId, 'accept') : null;
       if (canAccept && accepted?.ok && ['active', 'complete'].includes(accepted.data?.state)) {
+        // Chrome can finish between the paused check and the native acceptance reply.
+        const confirmed = await getChromeDownload(id);
+        if (!sameDownload(confirmed, record) || !canMove(confirmed) || !confirmed.paused
+            || browserUrl(confirmed) !== browserUrl(item)) {
+          if (sameDownload(confirmed, record) && confirmed.state === 'complete') {
+            await releaseChromeDownload(confirmed, record);
+            await note('chrome-finished');
+          } else {
+            // We paused Chrome. Only resume after the native transfer has stopped.
+            await restoreChromeDownload(id, record);
+            await note('not-ready');
+          }
+          return chromeKeeps();
+        }
         record.stage = 'parked';
         await writeBrowserRecord(id, record);
         watchChromeDownload(id, record);
@@ -435,7 +460,7 @@ async function restoreChromeDownload(id, record) {
   if (sameDownload(item, record) && record.resumeChrome &&
       (item.state === 'in_progress' && item.paused || item.state === 'interrupted' && item.canResume && !item.error?.startsWith('USER_')))
     await chrome.downloads.resume(id);
-  await writeBrowserRecord(id, { ...record, stage: 'attempted' });
+  await writeBrowserRecord(id, { ...record, stage: 'stand-down' });
 }
 
 async function finishBrowserHandoff(id, record) {
@@ -495,112 +520,31 @@ async function recoverChromeDownloads() {
   await Promise.allSettled(records.map(([key, record]) =>
     inBrowserOrder(Number(key), () => reconcileChromeDownload(Number(key), record))));
   if (Object.values(await readBrowserRecords()).some(needsRecovery)) await armBrowserRecovery();
-  await wakeChromeActivity(false);
 }
 
-function profileId() {
-  profileIdPromise ??= (async () => {
-    const { chromeDownloadProfile } = await chrome.storage.local.get('chromeDownloadProfile');
-    if (typeof chromeDownloadProfile === 'string' && /^[a-z0-9-]{8,36}$/i.test(chromeDownloadProfile)) return chromeDownloadProfile;
-    const id = crypto.randomUUID();
-    await chrome.storage.local.set({ chromeDownloadProfile: id });
-    return id;
-  })().catch(error => { profileIdPromise = undefined; throw error; });
-  return profileIdPromise;
-}
-
-const downloadReceiptId = (item, profile) => `c-${profile}-${item.id.toString(36)}-${Date.parse(item.startTime).toString(36)}`;
-
-// Chrome completed this download, so it is Chrome's file. VESPER never claims it: it only abandons any
-// transfer it had started and forgets the handoff. Nothing is added to VESPER's list.
-async function releaseChromeDownload(item, record) {
-  if (!record) return;
-  if (record.transferId && record.stage !== 'done') await transferCommand(record.transferId, 'abandon').catch(() => {});
-  await writeBrowserRecord(item.id, null);
-}
-
-async function chromeActivity() {
-  const [prefs, items, records] = await Promise.all([settings(),
-    chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 32 }), readBrowserRecords()]);
-  return items.filter(item => isSafe(item) && item.state === 'in_progress' && Number.isFinite(Date.parse(item.startTime))
-    && (prefs.intercept || startedByVesper(item)) && !browserOperations.has(item.id)
-    && !(sameDownload(item, records[item.id] || {}) && ['parking', 'parked', 'done'].includes(records[item.id].stage)));
-}
-
-async function wakeChromeActivity(startDesktop = true) {
-  if (activityPort || openingActivity || !chrome.runtime.connectNative) return;
-  openingActivity = true;
-  try {
-    let items = await chromeActivity();
-    if (!items.length) return;
-    const profile = await profileId();
-    const port = chrome.runtime.connectNative(HOST);
-    activityPort = port;
-    let ended = false;
-    function end() {
-      ended = true;
-      if (activityPort === port) activityPort = null;
-      port.disconnect();
-    }
-    function report(operation) {
-      port.postMessage(envelope('browser-activity', { profile, operation, files: items.map(item => ({
-        id: downloadReceiptId(item, profile), name: (chromeFileName(item) || 'Chrome download').slice(0, 255),
-        start: Date.parse(item.startTime), received: byteCount(item.bytesReceived) || 0,
-        length: byteCount(item.totalBytes) ?? byteCount(item.fileSize), paused: item.paused === true, canResume: item.canResume === true
-      })) }));
-    }
-    port.onMessage.addListener(async reply => {
-      if (ended) return;
-      if (!reply?.ok || items.length === 0) {
-        end();
-        if (reply?.code === 'app-unavailable') await armBrowserRecovery().catch(() => {});
-        return;
-      }
-      for (const command of reply.data?.commands || []) {
-        const expected = items.find(item => downloadReceiptId(item, profile) === command.id);
-        if (!expected) continue;
-        try {
-          const current = await getChromeDownload(expected.id);
-          if (!sameDownload(current, expected) || !isSafe(current) || current.state !== 'in_progress'
-              || browserOperations.has(current.id)) continue;
-          if (['parking', 'parked', 'done'].includes((await browserRecord(current))?.stage)) continue;
-          if (command.action === 'pause' && !current.paused) await chrome.downloads.pause(current.id);
-          else if (command.action === 'resume' && current.paused && current.canResume) await chrome.downloads.resume(current.id);
-          else if (command.action === 'cancel') await chrome.downloads.cancel(current.id);
-        } catch { /* Chrome may have finished while the command was in flight. */ }
-      }
-      try { items = await chromeActivity(); if (!ended) report('watch'); }
-      catch { end(); await armBrowserRecovery().catch(() => {}); }
-    });
-    port.onDisconnect.addListener(() => {
-      const error = chrome.runtime.lastError;
-      if (!ended && items.length && !/not found|forbidden/i.test(error?.message || '')) void armBrowserRecovery().catch(() => {});
-      ended = true;
-      if (activityPort === port) activityPort = null;
-    });
-    report(startDesktop ? 'connect' : 'watch');
-  } finally { openingActivity = false; }
-}
 
 async function captureChromeDownload(item) {
   await captureStateReady;
   await persistRequestChainsForDownload(item);
   if (item?.state === 'complete') {
     // Too late to take over, and Chrome's file is not VESPER's to list. Just stand down if we had started one.
-    if (awaitingResponses.delete(item.id)) await saveCaptureState();
+    const removed = createdDownloads.delete(item.id);
+    if (awaitingResponses.delete(item.id) || removed) await saveCaptureState();
     await inBrowserOrder(item.id, async () => {
       const current = await getChromeDownload(item.id);
       if (current?.startTime === item.startTime) await releaseChromeDownload(current, await browserRecord(current));
     });
     return;
   }
-  if (startedByVesper(item)) return;
+  if (startedByVesper(item) || !recentlyCreated(item)) return;
   const prefs = await settings();
   const wanted = prefs.intercept && prefs.route !== 'chrome';
   if (!canMove(item) || item.paused) {
     // A file the page built itself (blob: or data:) has no address VESPER could fetch.
     const pageMade = isSafe(item) && item.state === 'in_progress' && /^(blob|data):/i.test(item.finalUrl || item.url || '');
     if (wanted && pageMade) await noteDecision(item, 'page-made');
+    else if (wanted && isSafe(item) && item.state === 'in_progress' && item.bytesReceived > 0)
+      await noteDecision(item, 'chrome-started');
     return;
   }
   const url = browserUrl(item);
@@ -631,9 +575,14 @@ chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === SOURCE_EXPIRY_ALARM) return pruneObservedSources().catch(() => {});
 });
 chrome.downloads.onCreated.addListener(item => {
-  const wake = wakeChromeActivity().catch(() => {});
-  const capture = captureChromeDownloadSafely(item);
-  return Promise.all([wake, capture]).then(() => wakeChromeActivity().catch(() => {}));
+  const seen = Date.now();
+  return captureStateReady.then(async () => {
+    if (Number.isSafeInteger(item?.id) && item.state === 'in_progress' && !item.incognito && !startedByVesper(item)) {
+      createdDownloads.set(item.id, { startTime: item.startTime, seen });
+      await saveCaptureState();
+    }
+    await captureChromeDownloadSafely(item);
+  }).catch(() => {});
 });
 chrome.downloads.onChanged.addListener(async change => {
   try {
@@ -644,8 +593,8 @@ chrome.downloads.onChanged.addListener(async change => {
       });
     } else if (change.state?.current === 'complete' || ['safe', 'deepScannedSafe'].includes(change.danger?.current)
         || change.finalUrl || change.totalBytes || change.fileSize) {
-      await captureChromeDownloadSafely(await getChromeDownload(change.id));
+      const item = await getChromeDownload(change.id);
+      if (item?.state === 'complete' || recentlyCreated(item)) await captureChromeDownloadSafely(item);
     }
   } catch { /* The existing Chrome file or its recovery record is still available. */ }
-  await wakeChromeActivity().catch(() => {});
 });

@@ -29,15 +29,11 @@ function row(list, name, label, message) {
 }
 
 async function load() {
-  const [active, state] = await Promise.all([
-    chrome.runtime.sendMessage({ type: 'chrome-downloads' }), chrome.runtime.sendMessage({ type: 'tab-state' })
-  ]);
-  for (const download of active?.downloads || [])
-    row('active', download.name, 'Move to VESPER', { type: 'move-download', downloadId: download.id });
+  const state = await chrome.runtime.sendMessage({ type: 'tab-state' });
   const pending = state?.pending || [];
   $('unconfirmed').hidden = pending.length === 0;
   for (const entry of pending)
     row('pending', new Date(entry.at).toLocaleString(), 'Send again', { type: 'retry', id: entry.id });
-  if (!active?.downloads?.length && pending.length === 0) $('result').textContent = 'No active Chrome downloads.';
+  if (pending.length === 0) $('result').textContent = 'No unconfirmed VESPER requests. Chrome downloads stay in Chrome.';
 }
 void load();

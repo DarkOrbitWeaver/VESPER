@@ -65,12 +65,15 @@ public sealed class BrowserDownloadTests
         JobSnapshot staged = await harness.WaitAsync(id, job => job.Reason == "browser-ready");
         Assert.Equal(0, staged.ProgressBytes);
         Assert.Null(staged.FinalPath);
+        Assert.True(staged.IsUnacceptedBrowserCapture);
         Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
+        Assert.False(harness.Engine.BrowserTransferSnapshot(TransferId)!.IsUnacceptedBrowserCapture);
         Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
 
         JobSnapshot complete = await harness.WaitForStateAsync(id, JobState.Completed);
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(complete.FinalPath!));
         Assert.Equal(complete.FinalPath, Assert.Single(harness.Files()));
+        Assert.False(complete.IsUnacceptedBrowserCapture);
     }
 
     [Fact]
@@ -88,6 +91,7 @@ public sealed class BrowserDownloadTests
             && !harness.Engine.BrowserTransferIsRunning(TransferId));
 
         Assert.Equal("browser-fallback", stopped.Reason);
+        Assert.True(stopped.IsUnacceptedBrowserCapture);
         Assert.False(harness.Engine.BrowserTransferIsRunning(TransferId));
     }
 

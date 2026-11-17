@@ -26,6 +26,7 @@ public sealed partial class DownloadEngine
             if (job.State is not (JobState.Queued or JobState.Resolving or JobState.Downloading or JobState.WaitingForRetry
                 or JobState.WaitingForNetwork or JobState.Paused or JobState.Finalizing or JobState.Completed)) return false;
             if (!proof.AwaitingConfirmation) return true;
+            if (job.State != JobState.Downloading || job.Reason != "browser-ready") return false;
             var previousStatus = (job.Reason, job.Message);
             job.BrowserProof = proof with { AwaitingConfirmation = false };
             if (job.Reason == "browser-ready") { job.Reason = ""; job.Message = ""; }
