@@ -277,7 +277,7 @@ function chromeFileName(item) {
 
 
 const sameDownload = (item, record) => !!item && item.startTime === record.startTime && !item.incognito;
-const needsRecovery = record => ['parking', 'parked', 'import'].includes(record.stage);
+const needsRecovery = record => ['parking', 'parked', 'releasing', 'import'].includes(record.stage);
 const getChromeDownload = async id => (await chrome.downloads.search({ id }))[0];
 const readBrowserRecords = async () => (await chrome.storage.local.get('browserDownloads')).browserDownloads || {};
 
@@ -372,9 +372,8 @@ function moveChromeDownload(id, mode, automatic = false) {
     // Chrome may finish while native verification is in flight. Its completed file is never ours.
     const latest = await getChromeDownload(id);
     if (!sameDownload(latest, record) || latest.state === 'complete') {
-      if (reply.ok) await transferCommand(record.transferId, 'abandon').catch(() => {});
-      await writeBrowserRecord(id, null);
-      await note('chrome-finished');
+      await releaseChromeDownload(latest, { ...record, id });
+      if (latest?.state === 'complete') await note('chrome-finished');
       return chromeKeeps();
     }
     const result = reply.results?.[0];
@@ -421,7 +420,7 @@ function moveChromeDownload(id, mode, automatic = false) {
         if (!sameDownload(confirmed, record) || !canMove(confirmed) || !confirmed.paused
             || browserUrl(confirmed) !== browserUrl(item)) {
           if (sameDownload(confirmed, record) && confirmed.state === 'complete') {
-            await releaseChromeDownload(confirmed, record);
+            await releaseChromeDownload(confirmed, { ...record, id });
             await note('chrome-finished');
           } else {
             // We paused Chrome. Only resume after the native transfer has stopped.
@@ -441,6 +440,29 @@ function moveChromeDownload(id, mode, automatic = false) {
     await note('not-ready');
     return chromeKeeps();
   });
+}
+
+// Chrome finished its own file. The native candidate may still be running, so abort it
+// before dropping the durable recovery record. Never cancel or erase Chrome's completed file.
+async function releaseChromeDownload(item, record) {
+  if (!record || !record.transferId) return;
+  if (record.stage === 'done') {
+    await writeBrowserRecord(item?.id ?? record.id, null);
+    return;
+  }
+  const id = item?.id ?? record.id;
+  if (!Number.isSafeInteger(id)) return;
+  const releasing = { ...record, stage: 'releasing', id };
+  await writeBrowserRecord(id, releasing);
+  let stopped;
+  try { stopped = await transferCommand(record.transferId, 'abandon'); }
+  catch { /* The native helper may be offline. Retry on the recovery alarm. */ }
+  if (stopped?.ok && ['failed', 'complete'].includes(stopped.data?.state)) {
+    await writeBrowserRecord(id, null);
+    if (item?.state === 'complete') await noteDecision(item, 'chrome-finished');
+  } else {
+    await armBrowserRecovery();
+  }
 }
 
 async function restoreChromeDownload(id, record) {
@@ -465,6 +487,10 @@ async function restoreChromeDownload(id, record) {
 
 async function finishBrowserHandoff(id, record) {
   const item = await getChromeDownload(id);
+  if (sameDownload(item, record) && item.state === 'complete') {
+    await releaseChromeDownload(item, record);
+    return;
+  }
   if (sameDownload(item, record) && item.state === 'in_progress' && item.paused) {
     // VESPER has the file. Cancel Chrome's parked copy (which removes its partial file), then erase the
     // record so Chrome's list shows no misleading "Canceled" entry for a download that succeeded.
@@ -495,9 +521,12 @@ async function reconcileChromeDownload(id, record, knownReply) {
   const current = (await readBrowserRecords())[id];
   if (!current || current.transferId !== record.transferId || current.stage !== record.stage) return;
   const item = await getChromeDownload(id);
-  if (!sameDownload(item, record)) { await writeBrowserRecord(id, null); return; }
+  if (record.stage === 'releasing' || !sameDownload(item, record)) {
+    await releaseChromeDownload(item, { ...current, id });
+    return;
+  }
   // Chrome finished it. The file stays Chrome's; VESPER only stands down its own copy.
-  if (item.state === 'complete') { await releaseChromeDownload(item, current); return; }
+  if (item.state === 'complete') { await releaseChromeDownload(item, { ...current, id }); return; }
   if (record.stage === 'import') { await writeBrowserRecord(id, null); return; }
   if (item.state === 'in_progress' && !item.paused) { await restoreChromeDownload(id, record); return; }
   if (record.stage === 'parking') {
