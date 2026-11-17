@@ -8,7 +8,9 @@ public sealed partial class DownloadEngine
 {
     private sealed record PreparedMediaFile(long Bytes, string Digest, string Path, string FileName);
     private enum AudioMetadataWriteStatus { Written, NoChanges, ExistingTags, UnsupportedAudio }
+    // Only encoders need a single slot. Lossless, file-local MP4/M4A remuxes must not wait behind transcoding.
     private readonly SemaphoreSlim _conversionSlot = new(1);
+    private readonly SemaphoreSlim _remuxSlots = new(2, 2); // Two simultaneous file copies, even with many forced jobs.
 
     private static string OutputExtension(MediaOutput output) => output switch
     { MediaOutput.M4a => ".m4a", MediaOutput.Opus => ".opus", MediaOutput.Wav => ".wav", _ => ".mp4" };
@@ -27,11 +29,10 @@ public sealed partial class DownloadEngine
         string? notice = null;
         if (job.ExpectedSha256 is not null) return (file, notice);
         UpdateJob(job, j => { j.State = JobState.Converting; j.Reason = ""; j.Message = "Preparing a file for more devices."; });
-        bool exclusive = job.Output != MediaOutput.Opus;
-        if (exclusive) await _conversionSlot.WaitAsync(ct).ConfigureAwait(false);
         string stage = ConversionPath(job);
         bool ready = false;
         bool owned = false;
+        bool remuxPermit = false;
         try
         {
             if (!DeleteTemporaryFile(job, stage)) return (file, notice);
@@ -80,9 +81,12 @@ public sealed partial class DownloadEngine
                 && MediaMerger.ChooseContainer(remuxInputs.Select(input => input.Track).ToArray(), remuxContainer) == remuxContainer;
             if (directRemux)
             {
+                await _remuxSlots.WaitAsync(ct).ConfigureAwait(false);
+                remuxPermit = true;
                 using var remuxed = new FileStream(stage, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
                 MediaMerger.Merge(remuxInputs, remuxContainer!, remuxed, ct);
-                remuxed.Flush(flushToDisk: true);
+                // Disposal flushes buffered bytes for validation. The single durability flush happens
+                // after all metadata edits, just before the output is hashed and staged for publication.
             }
             else
             {
@@ -97,14 +101,21 @@ public sealed partial class DownloadEngine
                     int percent = totalSeconds > 0 ? (int)Math.Clamp(seconds / totalSeconds * 100, 0, 99) : 0;
                     UpdateJob(job, j => j.Message = $"Converting {percent}% ({FormatClock(seconds)} of {FormatClock(totalSeconds)})");
                 };
-                if (Options.ConvertMedia is { } convert) convert(job.PartialPath, extension, stage, job.Output, ct);
-                else if (OperatingSystem.IsWindows())
+                if (Options.ConvertMedia is null && !OperatingSystem.IsWindows()) return (file, notice);
+                // Native and injected encoders remain serialized (including RemuxWithAac's audio transcode).
+                // Hold this gate only for the actual conversion, not source inspection, metadata, hashing,
+                // or independent direct-remux jobs.
+                await _conversionSlot.WaitAsync(ct).ConfigureAwait(false);
+                try
                 {
-                    if (video is not null && TryRemuxWithAac(job, source, video, extension, stage, ct) is { } copied)
+                    if (Options.ConvertMedia is { } convert)
+                        convert(job.PartialPath, extension, stage, job.Output, ct);
+                    else if (video is not null && TryRemuxWithAac(job, source, video, extension, stage, ct) is { } copied)
                         video = copied;
-                    else WindowsMediaConverter.Convert(job.PartialPath, extension, stage, job.Output, ct, video, progress);
+                    else
+                        WindowsMediaConverter.Convert(job.PartialPath, extension, stage, job.Output, ct, video, progress);
                 }
-                else return (file, notice);
+                finally { _conversionSlot.Release(); }
             }
 
             ct.ThrowIfCancellationRequested();
@@ -162,8 +173,8 @@ public sealed partial class DownloadEngine
         finally
         {
             if (owned && !ready) DeleteTemporaryFile(job, stage);
+            if (remuxPermit) _remuxSlots.Release();
             DeleteTemporaryFile(job, ConversionTaggedPath(job));
-            if (exclusive) _conversionSlot.Release();
         }
     }
 
