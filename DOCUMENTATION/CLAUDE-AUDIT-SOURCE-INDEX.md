@@ -99,6 +99,18 @@ Original opportunity rows are explicitly **not** automatic release blockers. The
 | N-19 | 1735 | **Podcast feed follow** (new episodes queued on demand, no background polling unless opted in) | Open engineering |
 | N-20 | 1736 | **Windows Share target / "Open with VESPER" for .m3u8/.mpd files** | Open engineering |
 
+The original **ranks 1–7** are covered by existing VES/USER work rather than duplicate `N-01`–`N-07` identifiers. Their original claims still need individual dispositions:
+
+| Original rank / line | Opportunity | Existing backlog coverage | Status |
+|---|---|---|---|
+| 1 / 1717 | Identity-safe expired media URL refresh | VES-009, USER-SOURCE-REFRESH | Partial; unsafe cases refused |
+| 2 / 1718 | Explain why Chrome keeps a download | VES-021, USER-CHROME-REAL | Partial; real Chrome verification open |
+| 3 / 1719 | Intent-first shared picker | VES-045, VES-062 | Partial; shared capability document redesign open |
+| 4 / 1720 | Indexed media clips and WAV output | VES-030, VES-031 | Partial; byte-range clipping open |
+| 5 / 1721 | Native Opus remux | VES-030 | Implemented path; Windows playback verification open |
+| 6 / 1722 | Metadata/artwork after conversion | VES-006 | Partial; real players and output variants pending |
+| 7 / 1723 | Build identity and update awareness | VES-005, VES-051 | Identity implemented; manual update/check release gate incomplete |
+
 ## Unnumbered, cross-cutting and acceptance requirements
 
 These are **separate audit obligations**, not all new feature requests. A range may also contain numbered findings; the unnumbered behavior and test requirements still need dispositions.
@@ -127,15 +139,17 @@ These are **separate audit obligations**, not all new feature requests. A range 
 | AUDIT-EXTRA-020 | U 2075–2135 | Original finding index (distinct from all cross-cutting requirements) | OPEN — Reconcile independent of numbering |
 | AUDIT-EXTRA-021 | Appendix 2136–2185 | Seven original audit blind spots incl. content.js selection, DownloadGrid accessibility, installer rollback, native reply timings, live media churn and fuzzing | OPEN — Explicit current independent review queue |
 | AUDIT-EXTRA-022 | B (independent) 451–608 | Independent audit benchmark limits, P0–P3 prioritized repair plan and acceptance obligations | OPEN — Keep VSP risk gates open until matching proofs |
-| AUDIT-EXTRA-023 | Implementation 1–229 | Historical Linux patch verification, 65+ file changes, 87 extension tests and 11 user-facing fixes | OPEN — Historical only; current Windows 941 and extension 126 supersede counts |
+| AUDIT-EXTRA-023 | Implementation 1–229 | Historical Linux patch verification, 65+ file changes, 87 extension tests and 11 user-facing fixes | OPEN — Historical only; current Windows 947 and extension 126 supersede counts |
+| AUDIT-EXTRA-024 | B (independent) 1–170 | Historical executive assessment, audit methodology, architecture, workflows, code strengths and CI restrictions | OPEN — Cross-check current source in `VSP-INDEPENDENT-RECONCILIATION.md`; no old score adopted |
+| AUDIT-EXTRA-025 | B (independent) 379–450 | Capability and competitor comparison, product gaps, differentiation and limits | OPEN — Informational, not compatibility or performance proof |
 
 ## Current independent source checks (limited, reproducible)
 
 - `VSP-001`, definitive `VES-003` overlap: `HttpTransport.SendAsync` pins `CredentialOrigin`; `tests/Vesper.Tests/HlsCredentialScopeTests.cs` has four end-to-end, isolated-two-origin cases: same-origin playlist/segments/redirect, cross-origin key, cross-origin initialization/fragments, and cross-origin redirect. **4/4 passed** at HEAD before test-only changes, `dotnet test tests/Vesper.Tests -c Release --no-restore --filter FullyQualifiedName~HlsCredentialScopeTests` (combined focused run 10/10). This does not prove real authenticated Chrome handoff.
-- `VSP-002`: `JobStore.Open` quarantines only SQLite primary codes 11 (CORRUPT) or 26 (NOTADB); two new Windows/SQLite tests added 2026-11-17 for exclusive lock preservation and genuine invalid-data quarantine; existing migration rollback test retained. **3/3 passed** focused. Busy, permission, WAL and adversarial partial-failure scenarios still need proof.
+- `VSP-002`: `JobStore.Open` quarantines only SQLite primary codes 11 (CORRUPT) or 26 (NOTADB); two new Windows/SQLite tests added 2026-11-17 for exclusive lock preservation and genuine invalid-data quarantine; existing migration rollback test retained. **6/6 passed** focused after adding locked-sidecar rollback, successful sidecar archiving and unique-backup cases. Busy, permission, unclean shutdown and power-loss recovery still need proof.
 - `VSP-004`: `RescueEvaluator` accepts a strong-ETag R0 only with a matching strong ETag on the same resource; source's `RescueIdentityRegressionTests.cs` has missing ETag rejection, a trusted hash fallback, and a new real `FaultServer` partially downloaded strong-ETag fixture that rejects a no-ETag replacement without modifying persisted source URL, state or saved bytes. **3/3 passed** in focused batch. Additional restart/resume variants remain open.
-- 2026-11-17 Windows Release regression at `cd914a3` baseline: **941/941** .NET and **126/126** mocked extension tests. After adding the 3 regressions this takeover: **944/944** .NET (engine 526, resolver 357, WinForms 41, Setup 20), **126/126** extension; no failed or skipped tests in these runs. Test output is not real-browser, visual, signed-distribution or clean-VM evidence.
+- 2026-11-17 Windows Release regression at `cd914a3` baseline: **941/941** .NET and **126/126** mocked extension tests. After the further SQLite recovery hardening: **947/947** .NET (engine 529, resolver 357, WinForms 41, Setup 20), **126/126** extension; no failed or skipped tests in these runs. Test output is not real-browser, visual, signed-distribution or clean-VM evidence.
 
 ## Mandatory next reconciliation step
 
-For **every** row above, fill a separate evidence record containing: exact current source path and method/lines, behavior verified/rejected/superseded, named test and result + commit, remaining manual gate, and any conflict with user decisions. Cross-check current `STATUS.tsv` and `MASTER-TODO.md` bidirectionally. The source index proves original audit *location* and read coverage only; no item acquires release-ready status from this document alone.
+All nine independent B findings now have a current-source evidence ledger in `VSP-INDEPENDENT-RECONCILIATION.md`. For **every remaining** row above, fill a separate evidence record containing: exact current source path and method/lines, behavior verified/rejected/superseded, named test and result + commit, remaining manual gate, and any conflict with user decisions. Cross-check current `STATUS.tsv` and `MASTER-TODO.md` bidirectionally. The source index proves original audit *location* and read coverage only; no item acquires release-ready status from this document alone.
