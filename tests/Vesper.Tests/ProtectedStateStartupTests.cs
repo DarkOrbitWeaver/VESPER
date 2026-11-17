@@ -6,8 +6,10 @@ namespace Vesper.Tests;
 
 public sealed class ProtectedStateStartupTests
 {
-    [WindowsFact]
-    public void Invalid_dpapi_state_surfaces_without_replacing_the_database()
+    [WindowsTheory]
+    [InlineData("vesper-dpapi:1:not valid base64!", "malformed")]
+    [InlineData("vesper-dpapi:1:AQIDBAUGBwg=", "Windows could not")]
+    public void Invalid_dpapi_state_surfaces_without_replacing_the_database(string badState, string errorFragment)
     {
         string directory = Path.Combine(Path.GetTempPath(), "vesper-dpapi-startup-" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(directory, "vesper.db");
@@ -29,7 +31,8 @@ public sealed class ProtectedStateStartupTests
             {
                 connection.Open();
                 using var command = connection.CreateCommand();
-                command.CommandText = "UPDATE jobs SET source_url = 'vesper-dpapi:1:not valid base64!'";
+                command.CommandText = "UPDATE jobs SET source_url = $state";
+                command.Parameters.AddWithValue("$state", badState);
                 command.ExecuteNonQuery();
                 command.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
                 command.ExecuteNonQuery();
@@ -40,7 +43,7 @@ public sealed class ProtectedStateStartupTests
 
             CryptographicException error = Assert.Throws<CryptographicException>(() => DownloadEngine.Start(options));
 
-            Assert.Contains("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(errorFragment, error.Message, StringComparison.OrdinalIgnoreCase);
             Assert.Equal(originalHash, Hash(path));
             Assert.Empty(Directory.GetFiles(directory, "*.corrupt-*"));
         }
