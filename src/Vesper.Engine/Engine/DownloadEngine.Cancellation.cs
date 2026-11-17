@@ -31,11 +31,13 @@ public sealed partial class DownloadEngine
             {
                 // Persist the cancellation before touching files. If the app crashes during
                 // cleanup, recovery never silently resumes the discarded download.
-                job.State = JobState.Cancelled;
-                job.NextRetryUtc = null;
-                job.Reason = "cancelled";
-                job.Message = "Cancelling download.";
-                SaveLocked(job);
+                PersistUiMutationLocked(job, pending =>
+                {
+                    pending.State = JobState.Cancelled;
+                    pending.NextRetryUtc = null;
+                    pending.Reason = "cancelled";
+                    pending.Message = "Cancelling download.";
+                });
                 Changed(job);
                 running = null;
             }
@@ -59,11 +61,14 @@ public sealed partial class DownloadEngine
 
                 if (!TryRemoveCancelledFiles(job, out string error))
                 {
-                    job.State = JobState.Cancelled;
-                    job.NextRetryUtc = null;
-                    job.Reason = "cancel-cleanup";
-                    job.Message = "Could not remove download data: " + error;
-                    SaveLocked(job);
+                    string message = "Could not remove download data: " + error;
+                    PersistUiMutationLocked(job, pending =>
+                    {
+                        pending.State = JobState.Cancelled;
+                        pending.NextRetryUtc = null;
+                        pending.Reason = "cancel-cleanup";
+                        pending.Message = message;
+                    });
                     Changed(job);
                     result = new(false, job.Message);
                 }
@@ -146,25 +151,32 @@ public sealed partial class DownloadEngine
             partial + ".tagged.mp3", partial + ".tagged.flac", partial + ".tagged.ogg", partial + ".tagged.opus"
         ];
 
-        foreach (string file in files.Distinct(StringComparer.OrdinalIgnoreCase))
+        // First reject every known unsafe path before deleting even the first partial.
+        // During deletion recheck each path again to limit symlink/placeholder races.
+        string[] owned = [.. files.Distinct(StringComparer.OrdinalIgnoreCase)];
+        for (int pass = 0; pass < 2; pass++)
         {
-            try
+            foreach (string file in owned)
             {
-                FileAttributes attributes = File.GetAttributes(file);
-                if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0
-                    || PathSafety.Inspect(file).IsCloudPlaceholder)
+                try
                 {
-                    error = "A temporary path was replaced by a directory, link or cloud placeholder.";
+                    FileAttributes attributes = File.GetAttributes(file);
+                    if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0
+                        || PathSafety.Inspect(file).IsCloudPlaceholder)
+                    {
+                        error = "A temporary path was replaced by a directory, link or cloud placeholder.";
+                        return false;
+                    }
+                    if (pass == 1) File.Delete(file);
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    error = pass == 0 ? "A temporary path could not be checked: " + ex.Message
+                        : "A temporary file could not be removed: " + ex.Message;
                     return false;
                 }
-                File.Delete(file);
-            }
-            catch (FileNotFoundException) { }
-            catch (DirectoryNotFoundException) { }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                error = "A temporary file could not be removed: " + ex.Message;
-                return false;
             }
         }
 
