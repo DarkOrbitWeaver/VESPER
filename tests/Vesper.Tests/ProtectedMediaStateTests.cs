@@ -8,6 +8,11 @@ public sealed class WindowsFactAttribute : FactAttribute
     public WindowsFactAttribute() { if (!OperatingSystem.IsWindows()) Skip = "Requires Windows current-user DPAPI; not executable on Linux."; }
 }
 
+public sealed class WindowsTheoryAttribute : TheoryAttribute
+{
+    public WindowsTheoryAttribute() { if (!OperatingSystem.IsWindows()) Skip = "Requires Windows current-user DPAPI; not executable on Linux."; }
+}
+
 public sealed class ProtectedMediaStateTests
 {
     [Fact]

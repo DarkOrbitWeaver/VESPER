@@ -76,10 +76,20 @@ public sealed partial class DownloadEngine : IDisposable
     public static DownloadEngine Start(EngineOptions options)
     {
         var engine = new DownloadEngine(options);
-        engine.Recover();
-        engine.ScheduleNext();
-        _ = Task.Run(engine.RefreshAvailability);
-        return engine;
+        try
+        {
+            engine.Recover();
+            engine.ScheduleNext();
+            _ = Task.Run(engine.RefreshAvailability);
+            return engine;
+        }
+        catch
+        {
+            // A recovery write can fail after the constructor has subscribed to network events.
+            // Failed startup must not leave SQLite open or a half-started engine subscribed.
+            engine.Dispose();
+            throw;
+        }
     }
 
     public bool RecoveredFromCorruptDatabase => _store.RecoveredFromCorruption;
@@ -332,10 +342,23 @@ public sealed partial class DownloadEngine : IDisposable
     {
         var session = new JobSession(this, job);
         _sessions[job.Id] = session;
+        JobState oldState = job.State;
+        string oldMessage = job.Message;
+        DateTime? oldRetry = job.NextRetryUtc;
         job.State = JobState.Resolving;
         job.Message = "";
         job.NextRetryUtc = null;
-        SaveLocked(job);
+        try { SaveLocked(job); }
+        catch
+        {
+            // A refused SQLite write must not leave a phantom active job or its CTS alive.
+            job.State = oldState;
+            job.Message = oldMessage;
+            job.NextRetryUtc = oldRetry;
+            _sessions.Remove(job.Id);
+            session.Dispose();
+            throw;
+        }
         Changed(job);
         EnsurePump();
         session.RunTask = Task.Run(() => RunSessionAsync(session));
