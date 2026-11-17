@@ -27,6 +27,20 @@ The standalone First Flight Studio timeline or manifest was not present with the
 - [ ] Illustrated ICO looks sharp enough in real Windows taskbar / Explorer at 16/24/32/48 sizes.
 - [ ] Changing settings does not contact any download endpoint or alter files on disk.
 
+## Isolated Chrome ownership smoke check (optional)
+
+The normal installed Chrome 157 cannot load an unpacked MV3 extension with `--load-extension`; do not use it as evidence that the extension failed. A separate **Chrome for Testing** or Chromium binary is required for the opt-in test. No such binary was present on the current machine. The test has not passed in a browser yet.
+
+In PowerShell, with a separately acquired Chrome for Testing executable:
+
+```powershell
+$env:CHROME_PATH = 'C:\path\to\chrome-for-testing\chrome-win64\chrome.exe'
+node tests/extension/chrome-owned-smoke.mjs
+Remove-Item Env:\CHROME_PATH
+```
+
+This harness starts only a temporary headless browser profile and a local HTTP fixture, disables VESPER interception, verifies the exact bytes saved by Chrome, and cleans up its profile. It deliberately does **not** register or invoke VESPER's native helper or exercise interception success. That requires a separate live Chrome/native messaging acceptance test in an isolated environment.
+
 ## Goal 5 real-world workflow matrix (pending manual execution)
 
 Use public, authorized, non-DRM sample content where possible. Do not use tests that require defeating sign-in, age, bot, or DRM protections.
@@ -34,7 +48,7 @@ Use public, authorized, non-DRM sample content where possible. Do not use tests 
 | Journey | Steps | Pass condition |
 |---|---|---|
 | First Flight install | Start Setup; watch from the first progress update through the publisher reveal and completion screen; try Skip; repeat with a fast install, a failure, and cancellation. Enable Windows reduced motion for a separate run. | Installation starts immediately and reports real progress. The approved logo flashes and butterfly movement lead to the readable DarkOrbitWeaver publisher wordmark, then the VESPER welcome branding appears at completion; success remains immediately actionable while the intro finishes; Skip works; failure/cancel appears immediately; reduced motion avoids forced animation. |
-| Chrome capture and fallback | With capture enabled and Automatic connection selected, start a direct file download and a safe ZIP from a redirecting API endpoint; repeat with Use site sign-in off and with VESPER/native messaging unavailable. | Redirects stay associated with the same download. Only replayable GETs with verifiable size or a strong ETag can transfer; Chrome keeps downloads that need a request body, bearer authorization, or lack response proof. Chrome is paused only after VESPER confirms readiness. Completed Chrome files appear only when Chrome and local-file safety checks pass. |
+| Chrome capture and fallback | With capture enabled and Automatic connection selected, start a direct file download and a safe ZIP from a redirecting API endpoint; repeat with Use site sign-in off and with VESPER/native messaging unavailable. | Only fresh downloads observed in `onCreated` with zero bytes already received may be considered for automatic capture, and only replayable GETs with proof of source identity may transfer. Chrome pauses only after native transfer readiness and is canceled only after verified VESPER completion. Any Chrome-owned download, including a file Chrome finishes or starts receiving before acceptance, remains Chrome-owned and is never imported into VESPER or labeled completed by VESPER. |
 | Native messaging and reconnect | Open VESPER from the extension, submit the same item twice, close/reopen VESPER, then submit a new item. | Replies stay associated with the originating request; repeated requests do not create duplicate jobs; reconnect succeeds without losing authorization or leaving Chrome's download cancelled. |
 | YouTube watch, Shorts, and hover preview | Open a public watch page and a Short. On the homepage, hover several video cards and wait for each preview to start without moving the pointer; open VESPER's picker, navigate away, and repeat. | Each picker stays bound to the card/page whose player started, including delayed hover previews. Repeated interactions create no stale or duplicate item. Only currently usable formats are offered. |
 | Instagram Reels and TikTok feed | Try a public Reel and feed video, then navigate between items while playback or discovery is active. | Any offered media belongs to the current page. Unsupported or protected media receives an honest fallback; no duplicate, stale selection, or false success appears. |
