@@ -245,15 +245,21 @@ public sealed partial class DownloadEngine : IDisposable
         catch (SqliteException) { /* logging must never take a download down */ }
     }
 
+    /// <summary>
+    /// Persist a transfer metadata change before publishing it to the same DownloadJob
+    /// referenced by its active runner. The mutator is invoked only on the detached copy.
+    /// </summary>
     internal void UpdateJob(DownloadJob job, Action<DownloadJob> mutate)
     {
         lock (_lock)
         {
             bool wasCandidate = IsDuplicateCandidate(job);
             string previousSourceUrl = job.SourceUrl;
-            mutate(job);
+            DownloadJob staged = job.CopyForUpdate();
+            mutate(staged);
+            SaveLocked(staged);
+            job.ApplyPersistedState(staged);
             ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
-            SaveLocked(job);
             Changed(job);
         }
         FlushOutbox();
@@ -261,13 +267,20 @@ public sealed partial class DownloadEngine : IDisposable
 
     internal void SetPhase(DownloadJob job, JobState state) => UpdateJob(job, j => j.State = state);
 
-    /// <summary>The durability point of a checkpoint. Nothing in memory has changed if this throws.</summary>
+    /// <summary>
+    /// Durability point for new extents. Publish the saved progress while holding the engine
+    /// lock: another metadata writer must never re-save the previous extents/generation
+    /// between SQLite's commit and the checkpoint worker's later pending-range cleanup.
+    /// </summary>
     internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState)
     {
         lock (_lock)
         {
             DownloadJob copy = job.CloneForCommit(next, mediaState ?? job.MediaState);
             SaveLocked(copy);
+            job.Extents = copy.Extents;
+            job.Generation = copy.Generation;
+            job.MediaState = copy.MediaState;
             return copy;
         }
     }
