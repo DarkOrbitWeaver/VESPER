@@ -91,6 +91,7 @@ public sealed partial class DownloadEngine
         RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null)
     {
         DownloadJob? job;
+        DownloadJob snapshot;
         Task? stopping = null;
         lock (_lock)
         {
@@ -121,6 +122,8 @@ public sealed partial class DownloadEngine
             if (IsCleanupPending(current) || current.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its link can be replaced.");
             if (_sessions.ContainsKey(id)) return Rejected("The download is still stopping. Try again in a moment.");
+            if (current.State == JobState.Completed) return Rejected("This download is already complete.");
+            snapshot = current.CopyForUiMutation();
         }
         ct.ThrowIfCancellationRequested();
 
@@ -130,22 +133,22 @@ public sealed partial class DownloadEngine
         try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return Rejected(ex.Message); }
 
-        string? sha = job.ExpectedSha256;
+        string? sha = snapshot.ExpectedSha256;
         if (!string.IsNullOrWhiteSpace(input?.Sha256))
         {
             if (!TryNormalizeSha256(input.Sha256, out string normalized)) return Rejected("A SHA-256 checksum has 64 hexadecimal characters.");
             sha = normalized;
         }
         PieceMap? pieces = null;
-        string? pieceJson = input?.PieceMapJson ?? job.PieceMapJson;
+        string? pieceJson = input?.PieceMapJson ?? snapshot.PieceMapJson;
         if (pieceJson is not null && !PieceMap.TryParse(pieceJson, out pieces, out string pieceError)) return Rejected(pieceError);
 
-        long retained = job.Extents.TotalBytes;
+        long retained = snapshot.Extents.TotalBytes;
         if (retained == 0)
         {
             try
             {
-                if (!ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null,
+                if (!ApplyRescue(job, snapshot, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null,
                         replacementCredentials, mediaExpiresAt))
                     return Rejected("This download changed while checking its replacement link. Try again.");
             }
@@ -156,15 +159,15 @@ public sealed partial class DownloadEngine
             return new RescueResult(true, RescueMode.None, "Link replaced. Nothing had been saved yet, so nothing needed validating.", 0);
         }
 
-        long offset = job.Extents.Gaps(job.TotalBytes ?? long.MaxValue).Select(g => g.Start).DefaultIfEmpty(0).First();
+        long offset = snapshot.Extents.Gaps(snapshot.TotalBytes ?? long.MaxValue).Select(g => g.Start).DefaultIfEmpty(0).First();
         ProbeFacts probe;
-        try { probe = await ProbeAsync(job, uri, offset, ct, replacementCredentials).ConfigureAwait(false); }
+        try { probe = await ProbeAsync(snapshot, uri, offset, ct, replacementCredentials).ConfigureAwait(false); }
         catch (Exception ex) when (ex is not OperationCanceledException && (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException))
         {
             return Rejected("The new link could not be reached: " + ErrorClassifier.Describe(ex));
         }
 
-        RescueDecision decision = RescueEvaluator.Evaluate(job, uri, probe, sha, pieces);
+        RescueDecision decision = RescueEvaluator.Evaluate(snapshot, uri, probe, sha, pieces);
         if (!decision.Accepted)
         {
             Log(id, "rescue-rejected", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
@@ -178,17 +181,19 @@ public sealed partial class DownloadEngine
             try
             {
                 // Local reads only: stored pieces are checked against the trusted hashes; invalid ones leave the verified set.
-                using PartialFile file = PartialFile.Open(job.PartialPath);
-                verified = pieces!.VerifyStored(file, job.Extents, ct, out int invalid);
+                using PartialFile file = PartialFile.Open(snapshot.PartialPath, create: false);
+                verified = pieces!.VerifyStored(file, snapshot.Extents, ct, out int invalid);
                 refetch = Enumerable.Range(0, pieces.PieceCount).Count(i => !verified.Covers(pieces.RangeOf(i).Start, pieces.RangeOf(i).End));
                 if (invalid > 0) Log(id, "rescue-pieces", $"{invalid} stored piece(s) failed verification.");
             }
             catch (LocalStorageException ex) { return Rejected("The saved data could not be read for verification: " + ex.Message); }
         }
 
+        ct.ThrowIfCancellationRequested();
+        Failpoint("rescue.beforeCommit");
         try
         {
-            if (!ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt))
+            if (!ApplyRescue(job, snapshot, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt))
                 return new RescueResult(false, RescueMode.R4,
                     "This download changed while checking its replacement link. No replacement was applied.", retained);
         }
@@ -216,14 +221,17 @@ public sealed partial class DownloadEngine
         return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response), HttpFacts.IsIdentityEncoded(response));
     }
 
-    private bool ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
+    private bool ApplyRescue(DownloadJob job, DownloadJob snapshot, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
         ExtentSet? verified, RequestCredentials? replacementCredentials = null, DateTimeOffset? mediaExpiresAt = null)
     {
         lock (_lock)
         {
             if (!_jobs.TryGetValue(job.Id, out DownloadJob? current) || !ReferenceEquals(current, job)
                 || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed
-                || IsCleanupPending(job) || job.PendingFinalPath is not null)
+                || IsCleanupPending(job) || job.PendingFinalPath is not null || mediaExpiresAt <= DateTimeOffset.UtcNow
+                || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl
+                || !ReferenceEquals(job.Extents, snapshot.Extents) || job.ExpectedSha256 != snapshot.ExpectedSha256
+                || job.PieceMapJson != snapshot.PieceMapJson)
                 return false;
 
             // The source and duplicate index become visible only AFTER SQLite accepts the new job.

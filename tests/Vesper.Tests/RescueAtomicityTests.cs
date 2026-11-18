@@ -12,6 +12,32 @@ public sealed class RescueAtomicityTests
     }
 
     [Fact]
+    public async Task A_rescue_probe_cannot_be_applied_after_a_restart_discards_its_prefix()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        Action? restart = null;
+        using var h = new Harness(point =>
+        {
+            if (point == "rescue.beforeCommit") restart!();
+        });
+        string original = server.Url("/expires-after-truncate");
+        Guid id = h.Add(original, "rescue-during-restart.bin");
+        JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(stalled.CommittedBytes > 0);
+        h.Engine.Options.Schedule = ClosedWindow();
+        restart = () => Assert.True(h.Engine.RestartFromScratch(id));
+
+        RescueResult result = await h.Engine.ReplaceLinkAsync(id, server.Url("/expires-after-truncate?token=fresh"));
+
+        Assert.False(result.Accepted);
+        JobSnapshot after = h.Engine.Snapshot(id)!;
+        Assert.Equal(original, after.SourceUrl);
+        Assert.Equal(0, after.CommittedBytes);
+        Assert.False(File.Exists(after.PartialPath));
+    }
+
+    [Fact]
     public async Task Failed_rescue_database_write_preserves_memory_duplicate_index_and_saved_link()
     {
         using var harness = new Harness(tweak: options => options.Schedule = ClosedWindow());

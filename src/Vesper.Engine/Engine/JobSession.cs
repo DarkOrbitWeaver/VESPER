@@ -60,7 +60,7 @@ internal sealed class JobSession : IDisposable
 
     public long PendingBytes { get { lock (Gate) return _pending.TotalBytes; } }
 
-    public PartialFile OpenFile() => File ??= PartialFile.Open(Job.PartialPath);
+    public PartialFile OpenFile(bool create = true) => File ??= PartialFile.Open(Job.PartialPath, create);
 
     public void CloseFile()
     {

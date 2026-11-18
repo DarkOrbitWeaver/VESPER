@@ -60,11 +60,17 @@ if ((Test-Path $out) -or (Test-Path "$out.zip")) { throw "Release output already
 $setupOut = Join-Path $root "release\setup-$Version"
 if (-not $PortableOnly -and (Test-Path -LiteralPath $setupOut)) { throw "Setup output already exists: $setupOut." }
 $sc = if ($SelfContained -or -not $PortableOnly) { "--self-contained" } else { "--no-self-contained" }
-$runtimeArgs = @()
-if ($RuntimeVersion) { $runtimeArgs += "-p:RuntimeFrameworkVersion=$RuntimeVersion" }
+$buildArgs = @("-p:Version=$Version", "-p:DebugType=none")
+if ($RuntimeVersion) { $buildArgs += "-p:RuntimeFrameworkVersion=$RuntimeVersion" }
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $revision = git -C $root rev-parse --verify HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $revision -match '^[0-9a-f]{40}$') {
+        $buildArgs += "-p:SourceRevisionId=$revision"
+    }
+}
 
-Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
-Run "Publish native-messaging host" { dotnet publish src/Vesper.NativeHost/Vesper.NativeHost.csproj -c Release -r win-x64 $sc -p:Version=$Version -p:DebugType=none @runtimeArgs -o $out }
+Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc @buildArgs -o $out }
+Run "Publish native-messaging host" { dotnet publish src/Vesper.NativeHost/Vesper.NativeHost.csproj -c Release -r win-x64 $sc @buildArgs -o $out }
 
 Sign-ReleaseFile (Join-Path $out 'VESPER.exe')
 Sign-ReleaseFile (Join-Path $out 'vesper-host.exe')
@@ -99,8 +105,8 @@ if (-not $PortableOnly) {
         @{ Version = $Version; Files = $files } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding utf8
         Run "Publish First Flight" {
             dotnet publish src/Vesper.Setup/Vesper.Setup.csproj -c Release -r win-x64 --self-contained -o $setupOut `
-                -p:Version=$Version -p:DebugType=none -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
-                -p:EnableCompressionInSingleFile=true "-p:SetupPayload=$payloadPath" "-p:SetupManifest=$manifestPath" @runtimeArgs
+                -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+                -p:EnableCompressionInSingleFile=true "-p:SetupPayload=$payloadPath" "-p:SetupManifest=$manifestPath" @buildArgs
         }
         $setupExe = Join-Path $setupOut 'VESPER-Setup.exe'
         Sign-ReleaseFile $setupExe
