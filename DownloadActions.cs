@@ -68,13 +68,20 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         return true;
     }
 
-    public void Locate(JobSnapshot s)
+    public async void Locate(JobSnapshot s)
     {
         using var picker = new OpenFileDialog { Title = "Locate " + s.FileName, FileName = s.FileName, CheckFileExists = true };
         if (Directory.Exists(s.Destination)) picker.InitialDirectory = s.Destination;
         if (picker.ShowDialog(owner) != DialogResult.OK) return;
-        DeleteResult result = engine.LocateFile(s.Id, picker.FileName);
-        if (!result.Deleted) Info(result.Message, "Locate file", MessageBoxIcon.Warning);
+        string path = picker.FileName;
+        owner.Cursor(Cursors.WaitCursor);
+        try
+        {
+            DeleteResult result = await engine.LocateFileAsync(s.Id, path);
+            if (owner is not Control { IsDisposed: true } && !result.Deleted)
+                Info(result.Message, "Locate file", MessageBoxIcon.Warning);
+        }
+        finally { owner.Cursor(Cursors.Default); }
     }
 
     // ---- recovery -------------------------------------------------------------------------------------------------
@@ -149,13 +156,19 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         if (blocked.Count > 0) Info(string.Join("\n", blocked), "Remove from list", MessageBoxIcon.Information);
     }
 
-    public void DeleteFile(JobSnapshot s)
+    public async void DeleteFile(JobSnapshot s)
     {
         if (!Confirm($"Move this file to the Recycle Bin?\n\n{s.FinalPath}\n\nVESPER marks the entry as File missing.",
                 "Delete downloaded file", MessageBoxIcon.Warning, "Move to Recycle Bin", VesperIcon.Trash)) return;
-        DeleteResult result = engine.DeleteDownloadedFile(s.Id, EngineHost.RecycleFile);
-        Info(result.Deleted ? $"Moved to the Recycle Bin:\n{result.Path}" : result.Message, "Delete downloaded file",
-            result.Deleted ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        owner.Cursor(Cursors.WaitCursor);
+        try
+        {
+            DeleteResult result = await engine.DeleteDownloadedFileAsync(s.Id, EngineHost.RecycleFile, s.FinalPath);
+            if (owner is not Control { IsDisposed: true })
+                Info(result.Deleted ? $"Moved to the Recycle Bin:\n{result.Path}" : result.Message, "Delete downloaded file",
+                    result.Deleted ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        finally { owner.Cursor(Cursors.Default); }
     }
 
     // ---- information -----------------------------------------------------------------------------------------------

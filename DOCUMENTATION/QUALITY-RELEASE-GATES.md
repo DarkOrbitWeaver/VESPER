@@ -2,9 +2,11 @@
 
 **Current release status: NOT APPROVED.** "AAA" here is a quality target, not an external certification. The burden is observable correctness, refined native UX, security, accessibility, performance and repeatable installation—not feature count. Never announce "AAA", "production ready", "better than IDM" or "fully audited" from green unit tests alone.
 
-Every gate requires a **date, exact commit, environment, executable/build identity, test plan, evidence location, pass/fail result, and unresolved defect links**. Recording "passed" without an artifact or reproducible method is not sufficient. Maintain links in this document or a versioned release-evidence subdirectory.
+Every required gate needs a **date, exact commit, environment, executable/build identity, test plan, evidence location, pass/fail result, and unresolved defect links**. Recording "passed" without an artifact or reproducible method is not sufficient. Maintain links in this document or a versioned release-evidence subdirectory.
 
-## Required quality gates (all OPEN until separately demonstrated)
+## Release gates
+
+The owner deferred Q5 on 2026-11-18. It is optional for this release and remains unverified. Its acceptance criteria stay here for future work.
 
 | Gate | Standard for approval | Evidence that must exist | Status |
 |---|---|---|---|
@@ -13,7 +15,7 @@ Every gate requires a **date, exact commit, environment, executable/build identi
 | Q2 Chrome ownership and trust | Chrome-finished/ongoing work never claimed by VESPER. Native acceptance before ownership. Permissions, cookies, signed URL handling, worker restart and private-origin redirection remain safe | Real disposable Chrome/native-host sessions, protocol transcripts with secrets redacted, extension tests and decision logs | OPEN |
 | Q3 Media compatibility | Every advertised output preset/format is truthful and usable on the supported Windows codec set. No unsupported DRM/single-use claims. HLS/DASH/resolver failure is explicit and does not publish garbage | Sample corpus, resulting hashes/containers, ffprobe or equivalent developer-side verification, playback, seek, language/HDR/subtitles and repeatability | OPEN |
 | Q4 Native UI visual quality | No clipped, ghosted, flashing, overlapping, stale or broken windows/popups in supported resolutions, DPI, zoom and themes. Destructive actions are short and clear. Real butterfly animation is smooth and honors reduced motion | Annotated screenshots/videos taken from **current build**, measured render/scroll traces, keyboard navigation and side-by-side design review | OPEN |
-| Q5 Accessibility | Usable keyboard flow, logical focus, screen-reader names and event announcements, sufficient contrast, text scaling and accessible errors | Narrator sessions, keyboard-only test script, focus walkthrough, high contrast and scaling captures | OPEN |
+| Q5 Accessibility | Usable keyboard flow, logical focus, screen-reader names and event announcements, sufficient contrast, text scaling and accessible errors | Narrator sessions, keyboard-only test script, focus walkthrough, high contrast and scaling captures | DEFERRED (optional) |
 | Q6 Performance/resource efficiency | Idle CPU and memory, cold-start first paint, list scroll p95, media memory peak and sustained throughput are measured; no regressions versus current verified baseline without explained trade-off. Competing-app superiority claimed only from matched repeatable tests | Build/hardware/OS/protocol parameters, raw timings and memory/GDI/handle measurements, multiple repeats, outlier policy, 8h resource slope | OPEN |
 | Q7 Installer and update safety | Clean install, repair, version upgrade while app is running, interruption/rollback, portable build and uninstall all behave correctly. Default uninstall never removes downloaded data. Signed binaries/Chrome distribution prerequisites handled before public release | Disposable VM/account snapshots, setup logs, rollback artifacts, signatures and extension identity/permissions | OPEN |
 | Q8 Security/privacy | SSRF/redirect/resolution policies, host-credential scope, path canonicalization, reparse/placeholder handling, native messaging authorization and diagnostics redaction tested against hostile input | Threat-case fixtures, independent review, targeted VSP-001–009 evidence, dependency/source integrity review | OPEN |
@@ -44,4 +46,4 @@ A feature is **implemented** when changed in source, **tested** when automated t
 - Finish automated, real-browser, real-Windows, performance, installer and threat-model validation on the **exact release candidate commit**. Attach evidence with timestamps/versions.
 - Obtain an independent critical-path review of the release candidate; resolve failures; rerun affected gates. User decides on final shipping only after reviewing remaining limitations.
 - Prepare a signed distribution path where needed; neither this doc nor passing tests authorizes publishing/pushing/installation into the user's production machine.
-- Mark each gate PASS only with verifiable evidence and commit. An unresolved external requirement stays BLOCKED, never silently PASS.
+- Mark a gate PASS only with verifiable evidence and commit. Keep Q5 marked deferred unless it is verified. An unresolved external requirement stays BLOCKED, never silently PASS.

@@ -70,6 +70,7 @@ public sealed class DownloadJob
     public long? PendingConversionBytes { get; set; }
     // The existing digest also records publication proof for original files.
     public string? PendingConversionDigest { get; set; }
+    public string? PublishedSha256 { get; set; }
 
     public long? TotalBytes { get; set; }
     public ExtentSet Extents { get; set; } = new();
@@ -166,6 +167,7 @@ public sealed class DownloadJob
         PendingFinalPath = saved.PendingFinalPath;
         PendingConversionBytes = saved.PendingConversionBytes;
         PendingConversionDigest = saved.PendingConversionDigest;
+        PublishedSha256 = saved.PublishedSha256;
         TotalBytes = saved.TotalBytes;
         Extents = saved.Extents;
         State = saved.State;

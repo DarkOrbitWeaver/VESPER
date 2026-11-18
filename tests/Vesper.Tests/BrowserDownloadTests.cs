@@ -142,6 +142,9 @@ public sealed class BrowserDownloadTests
         Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
         Assert.Equal(file, completed.FinalPath);
         Assert.Equal(file, Assert.Single(harness.Files()));
+        using var completedStore = JobStore.Open(database);
+        Assert.Equal(Payloads.Sha256(server.V1), Assert.Single(completedStore.LoadAll()).PublishedSha256,
+            ignoreCase: true);
     }
 
     [Theory]

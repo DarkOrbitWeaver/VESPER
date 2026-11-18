@@ -2,7 +2,7 @@
 
 **Purpose:** One durable starting point for every future ChatGPT/Codex/Luna continuation. Updated 2026-11-18. Read this alongside `DOCUMENTATION/STATUS.tsv`; it is a prioritized view, not a replacement for the detailed row-by-row register.
 
-**NON-NEGOTIABLE OPEN RELEASE BLOCKER:** On 2026-11-17 the original 2,185-line Claude audit, 608-line independent Audit B, and 229-line historical implementation report were **read in full, and original finding/section locations indexed** in `DOCUMENTATION/CLAUDE-AUDIT-SOURCE-INDEX.md`. The **claim-by-claim reconciliation against present code, tests and user decisions remains unfinished**; see `DOCUMENTATION/AUDIT-RECONCILIATION.md`. All Q0–Q10 gates in `DOCUMENTATION/QUALITY-RELEASE-GATES.md` remain OPEN. **A source index and 92 tracked IDs are not release verification.**
+**NON-NEGOTIABLE OPEN RELEASE BLOCKER:** On 2026-11-17 the original 2,185-line Claude audit, 608-line independent Audit B, and 229-line historical implementation report were **read in full, and original finding/section locations indexed** in `DOCUMENTATION/CLAUDE-AUDIT-SOURCE-INDEX.md`. The **claim-by-claim reconciliation against present code, tests and user decisions remains unfinished**; see `DOCUMENTATION/AUDIT-RECONCILIATION.md`. The required gates remain open. Q5 accessibility is deferred as optional by the owner. See `DOCUMENTATION/QUALITY-RELEASE-GATES.md`. **A source index and 92 tracked IDs are not release verification.**
 
 ## Source of truth and baseline
 
@@ -12,7 +12,7 @@
 - **Original audit line index (2026-11-17):** `DOCUMENTATION/CLAUDE-AUDIT-SOURCE-INDEX.md` maps 54 original VES findings, 9 VSP findings, all 20 original N opportunities (13 N IDs plus seven mapped to existing VES/USER IDs) and 25 cross-cutting requirements to their original line ranges. Current implementation evidence has not been fully reconciled. The independent VSP-001–009 current-source matrix is in `DOCUMENTATION/VSP-INDEPENDENT-RECONCILIATION.md`; live release gates are still open.
 - **Original audits (in the user's ChatGPT Library, search by exact filenames):** `OPUS5.5MAX-VESPER-DEFINITIVE-ENGINEERING-EXCELLENCE-AUDIT.md` (Claude's 2,185-line report, 54 non-contiguous VES IDs and N opportunities); `VESPER-ENGINEERING-AUDIT B.md` (second independent audit, VSP-001–009); `VESPER-IMPLEMENTATION.md` (historical patch and limits); and pasted full Luna conversation `Pasted text(20261117-125009).txt`. If unavailable to a future agent, use their transcribed findings below and explicitly report unavailable sources, not invented details.
 - **Historical reports are not present-day validation.** Older `MEDIA_ENGINE_REPORT.md` and `DOCUMENTATION/RELEASE.md` were written for earlier commits; corroborate their assertions with current code and dated tests.
-- **2026-11-18 consolidation candidate:** 92 registered IDs (54 VES, 13 N, 16 USER and 9 VSP). 38 are marked implemented or preserved and 54 remain open. Q0–Q10 remain open. The evidence and limits of the repair batch are in the implementation log.
+- **2026-11-18 consolidation candidate:** 92 registered IDs (54 VES, 13 N, 16 USER and 9 VSP). 38 are marked implemented or preserved and 54 remain open. Ten required gates remain open and Q5 is deferred. The evidence and limits of the repair batch are in the implementation log.
 - **History:** Previous GitHub main `dca76ce` and the 18 continuation commits through `02534d9` must be ancestors of the consolidated main. Obtain the current checkpoint from Git.
 
 ## Hard constraints — don't regress these
@@ -40,7 +40,7 @@
 
 ## B0. P1 — Engine state durability (1 new independent finding)
 
-- [ ] **USER-ATOMIC-STATE — persisted state must match the live job (P1, PARTIAL).** The 2026-11-17 repair covered queue order, UI commands, transfer metadata, browser submission row deletion, HLS stop and restart markers. The 2026-11-18 repair covers active Cancel, checkpoint accounting, refresh guards, native acceptance, pending publication, and scheduler retries. See the dated implementation evidence. Still open: remaining direct saves, parallel refresh and Rescue, file identity and check-to-delete races, real process interruption and power loss, queue normalization, and throughput. Q0–Q10 stay open.
+- [ ] **USER-ATOMIC-STATE — persisted state must match the live job (P1, PARTIAL).** The 2026-11-17 repair covered queue order, UI commands, transfer metadata, browser submission row deletion, HLS stop and restart markers. The 2026-11-18 repair covers active Cancel, checkpoint accounting, refresh guards, native acceptance, pending publication, and scheduler retries. See the dated implementation evidence. Completed-file Delete and Locate now check the saved output digest. Windows compares a reopened path against the verified file ID before handing it to the shell. Older entries without proof must be managed in File Explorer. Still open: the final path race with the Recycle Bin, partial ownership, remaining direct saves, and parallel refresh and Rescue, real process interruption and power loss, queue normalization, and throughput. Q1 stays open.
 
 ## B. P1 — Media engine and provider compatibility (11 existing IDs)
 
@@ -117,14 +117,14 @@ These are **already added to `STATUS.tsv`**, but overlap categories above. The V
 **These are release-blocking until proven on the exact candidate build; see `QUALITY-RELEASE-GATES.md`. Do not conflate test success with actual system/browser QA.**
 
 - [ ] **Q0 original-report reconciliation:** inspect every line of both Claude audits and historical implementation materials; populate `AUDIT-RECONCILIATION.md` with source line ranges, unnumbered actionable claims, verified current source/test evidence, dispositions and independent high-risk review.
-- [ ] **Q0–Q10 release signoff:** each quality gate has reproducible dated evidence, exact commit, device/OS/build identity and outcome; all P0 closed and no unaccepted core P1. Unavailable signing/Chrome/distribution work stays explicitly blocked.
+- [ ] **Q0–Q10 release signoff:** each required gate has reproducible dated evidence, exact commit, device/OS/build identity and outcome; all P0 closed and no unaccepted core P1. Unavailable signing/Chrome/distribution work stays explicitly blocked.
 
 - [ ] Build and run all four .NET solution test projects and extension tests on the **current HEAD**, ideally repeated with no flaky retries. Use `dotnet test VESPER.slnx -c Release --no-restore --nologo` and `node --test tests/extension/*.test.mjs`.
 - [ ] Run adversarial HTTP/HTTPS tests: wrong 206, redirects, truncated bodies, unknown size, HTML/captive-portal responses, proxy PAC/IPv6, private-address rebinding, timeout, disk full, removed USB, same/changed validators and byte-exact output.
 - [ ] Run timed crash/failpoint matrix for HTTP, HLS, DASH, merge, conversion and cancellation; restart with original test data. Assert no duplicate published files, corruption, abandoned stages or unintended data deletion.
 - [ ] Run **actual Chrome/native-host** test in disposable profile with real transfer acceptance and failures (not mocked native replies). Test worker restarts while Chrome is paused, browser ownership, sign-in and exact source identity.
 - [ ] Run representative live-media corpus with current site conditions; validate all offered output choices via `ffprobe` / `ffmpeg` developer tools, playback, seek, codec/audio language/HDR/subtitles and refusal rules. Do not ship these tools as dependencies.
-- [ ] Run real WinForms visual review: 100–200% mixed DPI, 150% Windows text, dark/light/high-contrast, 10k rows, hover/scroll/resize/dialog clips, reduced motion, keyboard-only and Narrator.
+- [ ] Run real WinForms visual review: 100–200% mixed DPI, 150% Windows text, dark/light/high-contrast, 10k rows, hover/scroll/resize/dialog clips, and reduced motion. Q5 keyboard-only and Narrator acceptance is optional and deferred.
 - [ ] Run native media conversions on the target Windows codec setup, including M4A/Opus/WAV, metadata and sample-accurate short clip.
 - [ ] Run clean Windows account/VM installation, repair, upgrade/rollback, uninstall, portable path, registration ownership and user-data preservation.
 - [ ] Obtain signing and extension distribution prerequisites before any ordinary-user release; distinguish external owner approval from code changes.

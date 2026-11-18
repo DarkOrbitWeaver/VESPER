@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -47,6 +48,8 @@ public sealed record DeleteResult(bool Deleted, string Message, string? Path);
 
 public sealed partial class DownloadEngine
 {
+    private readonly HashSet<Guid> _completedFileActions = [];
+
     // ---- adding ---------------------------------------------------------------------------------------------------
 
     public AddResult Add(AddRequest request)
@@ -470,6 +473,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return new RemoveResult(false, "That entry no longer exists.", null);
             if (_sessions.ContainsKey(id) || _cancelling.Contains(id)) return new RemoveResult(false, "This download is still stopping.", null);
+            if (_completedFileActions.Contains(id)) return new RemoveResult(false, "Wait for the file action to finish.", null);
             if (IsCleanupPending(job)) return new RemoveResult(false, "Finish cleaning up this download before removing it.", null);
             if (job.PendingFinalPath is not null) return new RemoveResult(false, "This download is still being saved.", null);
 
@@ -489,38 +493,8 @@ public sealed partial class DownloadEngine
         return result;
     }
 
-    /// <summary>
-    /// Deletes the published file after re-validating it. It refuses links and cloud placeholders, and files whose
-    /// size no longer matches what VESPER wrote (the user may have replaced it). Uses <paramref name="remove"/>
-    /// (for example the Recycle Bin) when supplied.
-    /// </summary>
-    public DeleteResult DeleteDownloadedFile(Guid id, Action<string>? remove = null)
-    {
-        DownloadJob? job;
-        lock (_lock) _jobs.TryGetValue(id, out job);
-        if (job is null || job.State != JobState.Completed || string.IsNullOrEmpty(job.FinalPath))
-            return new DeleteResult(false, "There is no completed file to delete for this entry.", null);
-        if (job.Kind == JobKind.BrowserFile)
-            return new DeleteResult(false, "Manage this file from Chrome or File Explorer.", job.FinalPath);
-
-        string path = job.FinalPath;
-        FileCheck check = PathSafety.Inspect(path);
-        if (!check.Exists) return new DeleteResult(false, "The file is already gone. Nothing was deleted.", path);
-        if (check.IsDirectory) return new DeleteResult(false, "The recorded path is now a folder. Nothing was deleted.", path);
-        if (check.IsReparsePoint || check.IsCloudPlaceholder)
-            return new DeleteResult(false, "The file is a link or cloud placeholder. VESPER will not delete it; remove it in File Explorer.", path);
-        if (job.TotalBytes is long expected && check.Length != expected)
-            return new DeleteResult(false, "The file's size changed after VESPER saved it, so it may no longer be the downloaded file. Nothing was deleted.", path);
-
-        try { (remove ?? File.Delete)(path); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return new DeleteResult(false, "The file could not be deleted: " + ex.Message, path);
-        }
-        UpdateIfExists(id, _ => { }, markMissing: true);
-        Log(id, "file-deleted", "Downloaded file deleted by user.");
-        return new DeleteResult(true, "The file was deleted.", path);
-    }
+    public Task<DeleteResult> DeleteDownloadedFileAsync(Guid id, Action<string>? remove = null, string? confirmedPath = null) =>
+        ChangeCompletedFileAsync(id, locatePath: null, remove, confirmedPath);
 
     /// <summary>
     /// Explicitly discards only this job's unfinished data. Persist a non-running recovery
@@ -583,20 +557,104 @@ public sealed partial class DownloadEngine
         return restarted;
     }
 
-    /// <summary>For a completed entry whose file moved: point the record at the file the user located, if it plausibly matches.</summary>
-    public DeleteResult LocateFile(Guid id, string path)
-    {
-        FileCheck check = PathSafety.Inspect(path);
-        DownloadJob? job;
-        lock (_lock) _jobs.TryGetValue(id, out job);
-        if (job is null || job.State != JobState.Completed) return new DeleteResult(false, "This entry is not a completed download.", null);
-        if (!check.Exists || check.IsDirectory) return new DeleteResult(false, "That file does not exist.", path);
-        if (job.TotalBytes is long expected && check.Length != expected)
-            return new DeleteResult(false, $"That file is {Formatting.Bytes(check.Length)}, but the download was {Formatting.Bytes(expected)}. It is probably a different file.", path);
+    public Task<DeleteResult> LocateFileAsync(Guid id, string path) =>
+        string.IsNullOrWhiteSpace(path)
+            ? Task.FromResult(new DeleteResult(false, "Choose the file to locate.", path))
+            : ChangeCompletedFileAsync(id, path, remove: null, confirmedPath: null);
 
-        UpdateIfExists(id, j => j.FinalPath = Path.GetFullPath(path), markMissing: false);
-        return new DeleteResult(true, "The entry now points to that file.", path);
+    private async Task<DeleteResult> ChangeCompletedFileAsync(Guid id, string? locatePath, Action<string>? remove, string? confirmedPath)
+    {
+        bool deleting = locatePath is null;
+        string path;
+        string digest;
+        long length;
+        lock (_lock)
+        {
+            if (_disposed) return new(false, "VESPER is closing.", null);
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || job.State != JobState.Completed || job.FinalPath is null)
+                return new(false, "This entry has no completed file.", null);
+            if (job.Kind == JobKind.BrowserFile)
+                return new(false, "Manage this file from Chrome or File Explorer.", job.FinalPath);
+            if (confirmedPath is not null && confirmedPath != job.FinalPath)
+                return new(false, "The file location changed. Open the action again to confirm the new path.", job.FinalPath);
+            path = locatePath ?? job.FinalPath;
+            if (job.PublishedSha256 is not { Length: 64 } proof || job.TotalBytes is not long bytes)
+                return new(false, "VESPER has no saved checksum for this entry. Manage the file in File Explorer.", path);
+            digest = proof;
+            length = bytes;
+            if (!_completedFileActions.Add(id))
+                return new(false, "Another file action is in progress for this entry.", path);
+        }
+
+        try
+        {
+            if (!Path.IsPathFullyQualified(path))
+                return new(false, "Choose a file with a full path.", path);
+            path = Path.GetFullPath(path);
+            if (!IsSafeCompletedPath(path, length))
+                return new(false, "The file is missing, changed size, or uses an unsafe path.", path);
+
+            FileShare share = deleting ? FileShare.Read | FileShare.Delete : FileShare.Read;
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, share, 1 << 16,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            if (file.Length != length
+                || !Convert.ToHexString(await SHA256.HashDataAsync(file).ConfigureAwait(false)).Equals(digest, StringComparison.OrdinalIgnoreCase))
+                return new(false, "The file does not match the saved download.", path);
+
+            lock (_lock)
+            {
+                if (_disposed) return new(false, "VESPER is closing.", path);
+            }
+            Failpoint("completed-file.afterHash");
+            if (!IsSafeCompletedPath(path, length) || !PathSafety.PathStillNamesFile(path, file, digest))
+                return new(false, "VESPER could not confirm the file path. Check it in File Explorer.", path);
+
+            if (!deleting)
+            {
+                lock (_lock)
+                {
+                    if (_disposed) return new(false, "VESPER is closing.", path);
+                    DownloadJob job = _jobs[id];
+                    PersistUiMutationLocked(job, pending => pending.FinalPath = path);
+                    _missing.Remove(id);
+                    Changed(job);
+                }
+                FlushOutbox();
+                return new(true, "The entry now points to that file.", path);
+            }
+
+            (remove ?? File.Delete)(path);
+            file.Dispose();
+            if (File.Exists(path))
+                return new(false, "The file is still at the saved path. Check it in File Explorer.", path);
+            lock (_lock)
+            {
+                if (!_disposed)
+                {
+                    _missing.Add(id);
+                    Changed(_jobs[id]);
+                    Log(id, "file-deleted", "Downloaded file deleted by user.");
+                }
+            }
+            FlushOutbox();
+            return new(true, "The file was deleted.", path);
+        }
+        catch (OperationCanceledException) { return new(false, "The file action was cancelled.", path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return new(false, "The file action could not finish: " + ex.Message, path);
+        }
+        finally
+        {
+            lock (_lock) _completedFileActions.Remove(id);
+        }
     }
+
+    private static bool IsSafeCompletedPath(string path, long length) =>
+        !Path.GetFileName(path).Contains(':')
+        && Path.GetDirectoryName(path) is { } folder && PathSafety.TryCheckUnlinkedDirectory(folder, out _)
+        && PathSafety.Inspect(path) is { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false } file
+        && file.Length == length;
 
     // ---- helpers --------------------------------------------------------------------------------------------------------
 
@@ -616,7 +674,7 @@ public sealed partial class DownloadEngine
         mutate(job); // Existing JobSession references must still point to this same live object.
     }
 
-    private void UpdateIfExists(Guid id, Action<DownloadJob> mutate, bool? markMissing = null, bool idleOnly = false)
+    private void UpdateIfExists(Guid id, Action<DownloadJob> mutate, bool idleOnly = false)
     {
         lock (_lock)
         {
@@ -626,8 +684,6 @@ public sealed partial class DownloadEngine
             string previousSourceUrl = job.SourceUrl;
             PersistUiMutationLocked(job, mutate);
             ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
-            if (markMissing is true) _missing.Add(id);
-            if (markMissing is false) _missing.Remove(id);
             Changed(job);
         }
         FlushOutbox();

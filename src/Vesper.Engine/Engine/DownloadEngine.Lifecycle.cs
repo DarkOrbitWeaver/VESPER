@@ -361,6 +361,7 @@ public sealed partial class DownloadEngine
     private static void MarkPublished(DownloadJob job, string target)
     {
         job.FinalPath = target;
+        job.PublishedSha256 = PublicationDigest(job);
         job.PendingFinalPath = null;
         if (job.PendingConversionBytes is null) job.PendingConversionDigest = null;
         job.State = JobState.Completed;
@@ -472,7 +473,8 @@ public sealed partial class DownloadEngine
             bool missing = !PathSafety.Inspect(path).Exists;
             lock (_lock)
             {
-                if (!_jobs.TryGetValue(id, out DownloadJob? job) || missing == _missing.Contains(id)) continue;
+                if (!_jobs.TryGetValue(id, out DownloadJob? job) || job.FinalPath != path
+                    || _completedFileActions.Contains(id) || missing == _missing.Contains(id)) continue;
                 if (missing) _missing.Add(id); else _missing.Remove(id);
                 Changed(job);
             }
