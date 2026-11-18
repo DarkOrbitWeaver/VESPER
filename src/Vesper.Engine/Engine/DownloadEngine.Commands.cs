@@ -524,6 +524,7 @@ public sealed partial class DownloadEngine
             {
                 DownloadJob reset = job.CopyForUpdate();
                 reset.Extents = new ExtentSet();
+                reset.PartialIdentity = null;
                 reset.TotalBytes = reset.PieceMapJson is not null
                     && PieceMap.TryParse(reset.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
                 (reset.ETag, reset.LastModified, reset.Identity, reset.AcceptsRanges, reset.NonResumable) =
@@ -549,7 +550,11 @@ public sealed partial class DownloadEngine
                     Log(id, "restart-pending", ex.Message);
                 }
             }
-            else Log(id, "restart-pending", error);
+            else
+            {
+                Log(id, "restart-pending", error);
+                PersistUiMutationLocked(job, pending => pending.Message = "Could not remove download data: " + error);
+            }
             Changed(job);
         }
         FlushOutbox();

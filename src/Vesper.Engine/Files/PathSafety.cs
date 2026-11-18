@@ -217,6 +217,26 @@ public static class PathSafety
             && verified.Volume == found.Volume && verified.IdLow == found.IdLow && verified.IdHigh == found.IdHigh;
     }
 
+    internal static string? TemporaryFileIdentity(SafeFileHandle handle)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        const int fileIdInfo = 18;
+        if (!GetFileInformationByHandleEx(handle, fileIdInfo, out FileIdentity id, Marshal.SizeOf<FileIdentity>())
+            || (id.IdLow == 0 && id.IdHigh == 0))
+            throw new IOException("This drive did not provide a stable temporary file ID.");
+        long created = File.GetCreationTimeUtc(handle).Ticks;
+        return $"{id.Volume:X16}{id.IdHigh:X16}{id.IdLow:X16}{created:X16}";
+    }
+
+    internal static void RequireTemporaryIdentity(SafeFileHandle handle, string? expected)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        if (expected is null)
+            throw new IOException("This partial has no saved file identity. Move it to a safe location in File Explorer to start again.");
+        if (!string.Equals(expected, TemporaryFileIdentity(handle), StringComparison.Ordinal))
+            throw new IOException("The partial path now contains a different file. Move it to a safe location in File Explorer to start again.");
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct FileIdentity
     {

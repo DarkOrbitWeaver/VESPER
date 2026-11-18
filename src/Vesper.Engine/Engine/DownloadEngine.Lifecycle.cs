@@ -110,15 +110,17 @@ public sealed partial class DownloadEngine
         if (!IsPublicationFile(job, source, expectedLength))
             return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published is missing or changed.");
 
-        string? digest = prepared?.Digest ?? (job.Sha256Verified ? job.ExpectedSha256 : null);
-        if (digest is null)
-        {
-            await using var file = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
-            if (file.Length != expectedLength)
-                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed size.");
-            digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
-        }
+        const FileShare share = FileShare.Read | FileShare.Delete;
+        const FileOptions options = FileOptions.Asynchronous | FileOptions.SequentialScan;
+        using FileStream file = prepared is null
+            ? PartialFile.OpenOwnedRead(job, share, options)
+            : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
+        if (file.Length != expectedLength)
+            return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed size.");
+        string digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
+        string? expectedDigest = prepared?.Digest ?? (job.Sha256Verified ? job.ExpectedSha256 : null);
+        if (expectedDigest is not null && !digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase))
+            return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published failed its saved validation.");
 
         string fileName = job.Output == MediaOutput.Original ? job.FileName : prepared?.FileName ?? job.FileName;
         WriteMarkOfTheWeb(job, source);
@@ -135,6 +137,8 @@ public sealed partial class DownloadEngine
                 j.PendingConversionDigest = digest;
             });
             Failpoint("finalize.beforeMove");
+            if (!PathSafety.PathStillNamesFile(source, file, digest))
+                return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
             try
             {
                 File.Move(source, target, overwrite: false);
@@ -153,6 +157,8 @@ public sealed partial class DownloadEngine
             }
 
             Failpoint("finalize.afterMove");
+            if (!PathSafety.PathStillNamesFile(target, file, digest))
+                return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
             try
             {
                 UpdateJob(job, j =>

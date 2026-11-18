@@ -63,6 +63,7 @@ public sealed class CancelDownloadTests
         string partial = h.Engine.Snapshot(id)!.PartialPath;
         string harmless = Path.Combine(h.Downloads, "keep.txt");
         await File.WriteAllTextAsync(partial, "saved download");
+        h.OwnFixturePartial(id);
         await File.WriteAllTextAsync(harmless, "another file");
         string recovery = RecoveryManifest.PathFor(partial);
         Assert.True(CreateHardLinkW(recovery, harmless, IntPtr.Zero));
@@ -93,6 +94,7 @@ public sealed class CancelDownloadTests
             mine.PartialPath + ".convert-tagged.mp4", mine.PartialPath + ".tagged.mp3"
         ];
         foreach (string path in owned) await File.WriteAllTextAsync(path, "owned temporary content");
+        h.OwnFixturePartial(first);
         await File.WriteAllTextAsync(other.PartialPath, "other job");
         string unrelated = Path.Combine(h.Downloads, "keep-original.zip");
         await File.WriteAllTextAsync(unrelated, "personal file");
@@ -236,6 +238,7 @@ public sealed class CancelDownloadTests
         Guid id = h.Add("https://example.com/file", "safe.bin", startNow: false);
         JobSnapshot snapshot = h.Engine.Snapshot(id)!;
         await File.WriteAllTextAsync(snapshot.PartialPath, "unfinished data");
+        h.OwnFixturePartial(id);
         string other = Path.Combine(h.Downloads, "unrelated.bin");
         await File.WriteAllTextAsync(other, "user owned");
 
@@ -262,6 +265,7 @@ public sealed class CancelDownloadTests
         Guid id = h.Add("https://example.com/file", "blocked.bin", startNow: false);
         JobSnapshot snapshot = h.Engine.Snapshot(id)!;
         await File.WriteAllTextAsync(snapshot.PartialPath, "partial bytes");
+        h.OwnFixturePartial(id);
         string blocked = snapshot.PartialPath + ".vmeta";
         Directory.CreateDirectory(blocked);
         try
@@ -277,5 +281,38 @@ public sealed class CancelDownloadTests
         CancelDownloadResult retry = await h.Engine.CancelDownloadAsync(id);
         Assert.True(retry.Cancelled, retry.Message);
         Assert.Null(h.Engine.Snapshot(id));
+    }
+
+    [Fact]
+    public async Task Resume_and_cleanup_refuse_a_different_file_even_with_identical_bytes_after_reopen()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var h = new Harness();
+        Guid id = h.Add(server.Url("/expires-after-truncate"), "owned-partial.bin");
+        JobSnapshot stopped = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(stopped.CommittedBytes > 0);
+        string savedPath = stopped.PartialPath + ".kept";
+        byte[] saved = await File.ReadAllBytesAsync(stopped.PartialPath);
+        File.Move(stopped.PartialPath, savedPath);
+        await File.WriteAllBytesAsync(stopped.PartialPath, saved);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        int requests = server.Hits("/expires-after-truncate");
+
+        h.Engine.StartNow(id);
+        JobSnapshot refused = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+        Assert.Equal("storage", refused.Reason);
+        Assert.Contains("different file", refused.Message);
+        Assert.Equal(requests, server.Hits("/expires-after-truncate"));
+        Assert.False(h.Engine.RestartFromScratch(id));
+        Assert.False((await h.Engine.CancelDownloadAsync(id)).Cancelled);
+        Assert.Equal(saved, await File.ReadAllBytesAsync(stopped.PartialPath));
+
+        File.Move(stopped.PartialPath, stopped.PartialPath + ".replacement");
+        File.Move(savedPath, stopped.PartialPath);
+        Assert.True((await h.Engine.CancelDownloadAsync(id)).Cancelled);
+        Assert.False(File.Exists(stopped.PartialPath));
+        Assert.Equal(saved, await File.ReadAllBytesAsync(stopped.PartialPath + ".replacement"));
     }
 }

@@ -1,4 +1,9 @@
+using System.Diagnostics;
+using System.IO.Pipes;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
+using System.Text;
 using System.Text.Json;
 using VESPER;
 using Vesper.Engine;
@@ -8,6 +13,108 @@ namespace Vesper.Windows.Tests;
 
 public sealed class BrowserBridgeTests
 {
+    [Fact]
+    public async Task NativeHelperCompletesAStagedDownloadThroughTheRealDesktopBridge()
+    {
+        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_NATIVE_HOST");
+        if (string.IsNullOrWhiteSpace(helper)) return;
+        Assert.True(File.Exists(helper));
+        string pipe = BridgePipe.NameForCurrentUser();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        CancellationToken ct = deadline.Token;
+        using (var occupancy = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+        {
+            try
+            {
+                await occupancy.ConnectAsync(150, ct);
+                throw new InvalidOperationException("A VESPER bridge is already listening. Use a separate Windows account.");
+            }
+            catch (TimeoutException) { }
+        }
+
+        string root = Path.Combine(Path.GetTempPath(), "vesper-native-qa-" + Guid.NewGuid().ToString("N"));
+        string helperRoot = Path.Combine(root, "helper");
+        string downloads = Path.Combine(root, "downloads");
+        Directory.CreateDirectory(helperRoot);
+        Directory.CreateDirectory(downloads);
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(Path.GetDirectoryName(Path.GetFullPath(helper))!))
+                File.Copy(file, Path.Combine(helperRoot, Path.GetFileName(file)));
+            Assert.False(File.Exists(Path.Combine(helperRoot, "VESPER.exe")), "The isolated helper must not be able to start a desktop.");
+            string executable = Path.Combine(helperRoot, Path.GetFileName(helper));
+            byte[] payload = Enumerable.Repeat((byte)0x5a, 16 * 1024).ToArray();
+            using var server = new TcpListener(IPAddress.Loopback, 0);
+            server.Start();
+            Task response = ServeNativeFixtureAsync(server, payload, ct);
+            string url = $"http://127.0.0.1:{((IPEndPoint)server.LocalEndpoint).Port}/fixture";
+            using var engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads, AllowPrivateNetworks = true
+            });
+            var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
+            using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
+            desktop.Start();
+
+            const string transferId = "native-fixture-0001";
+            BridgeResponse submit = await SendThroughHelperAsync(executable, new
+            {
+                v = 1, id = transferId, type = "browser-submit", mode = "download",
+                items = new[] { new { url, fileName = "native-fixture.bin", kind = "http" } },
+                browserProof = new { length = payload.Length, etag = "\"native-fixture\"", contentType = "application/octet-stream" }
+            }, ct);
+            Assert.True(submit.Ok, submit.Message);
+            BridgeResult result = Assert.Single(submit.Results!);
+            Assert.True(result.TransferReady, result.TransferReason);
+            JobSnapshot staged = Assert.IsType<JobSnapshot>(engine.Snapshot(Guid.Parse(result.JobId!)));
+            Assert.Equal(0, staged.CommittedBytes);
+            Assert.Null(staged.FinalPath);
+
+            BridgeResponse accepted = await SendThroughHelperAsync(executable,
+                new { v = 1, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" }, ct);
+            Assert.True(accepted.Ok, accepted.Message);
+            BridgeResponse watched = await SendThroughHelperAsync(executable,
+                new { v = 1, id = "native-watch-0001", type = "browser-transfer", transferId, operation = "watch" }, ct);
+            Assert.True(watched.Ok, watched.Message);
+            Assert.Equal("complete", Assert.IsType<JsonElement>(watched.Data).GetProperty("state").GetString());
+            Assert.Equal(payload, await File.ReadAllBytesAsync(Assert.Single(Directory.GetFiles(downloads, "*.bin")), ct));
+            Assert.Single(engine.Snapshots());
+            await response;
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static async Task<BridgeResponse> SendThroughHelperAsync(string path, object request, CancellationToken ct)
+    {
+        using Process process = Process.Start(new ProcessStartInfo(path)
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true
+        })!;
+        try
+        {
+            await BridgeProtocol.WriteFrameAsync(process.StandardInput.BaseStream, JsonSerializer.Serialize(request), ct);
+            process.StandardInput.Close();
+            string? json = await BridgeProtocol.ReadFrameAsync(process.StandardOutput.BaseStream, ct);
+            await process.WaitForExitAsync(ct);
+            Assert.Equal(0, process.ExitCode);
+            Assert.NotNull(json);
+            return JsonSerializer.Deserialize<BridgeResponse>(json, BridgeProtocol.Json)!;
+        }
+        finally { if (!process.HasExited) process.Kill(); }
+    }
+
+    private static async Task ServeNativeFixtureAsync(TcpListener server, byte[] payload, CancellationToken ct)
+    {
+        using TcpClient client = await server.AcceptTcpClientAsync(ct);
+        using NetworkStream stream = client.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        while (await reader.ReadLineAsync(ct) is { Length: > 0 }) { }
+        byte[] headers = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {payload.Length}\r\n"
+            + "Content-Type: application/octet-stream\r\nETag: \"native-fixture\"\r\nConnection: close\r\n\r\n");
+        await stream.WriteAsync(headers, ct);
+        await stream.WriteAsync(payload, ct);
+    }
+
     [Fact]
     public async Task LegacyChromeActivityCannotAddBrowserOwnedDownloads()
     {

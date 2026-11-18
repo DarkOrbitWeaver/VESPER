@@ -145,7 +145,7 @@ public sealed class MediaProvenanceTests
             {
                 raw.Open();
                 using var command = raw.CreateCommand();
-                command.CommandText = "ALTER TABLE jobs DROP COLUMN published_sha256; ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5;";
+                command.CommandText = "ALTER TABLE jobs DROP COLUMN partial_identity; ALTER TABLE jobs DROP COLUMN published_sha256; ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5;";
                 command.ExecuteNonQuery();
             }
 
@@ -159,7 +159,7 @@ public sealed class MediaProvenanceTests
 
             DownloadJob roundTrip = Assert.Single(migrated.LoadAll());
             Assert.Equal(retained.MediaMetadataJson, roundTrip.MediaMetadataJson);
-            Assert.Equal(7, JobStore.SchemaVersion);
+            Assert.Equal(8, JobStore.SchemaVersion);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

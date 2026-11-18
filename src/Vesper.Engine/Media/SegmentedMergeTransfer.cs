@@ -495,7 +495,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         session.CloseFile();
         try
         {
-            using var source = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
+            using var source = PartialFile.OpenOwnedRead(Job, options: FileOptions.RandomAccess);
             if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
             using var samples = PathSafety.OpenTemporaryStream(samplesPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.RandomAccess);
             ownsSamples = true;
@@ -594,12 +594,12 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
     private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
     {
-        await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
+        string? identity = await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
             cursor.TracksLength, cursor.TracksSha256, ct).ConfigureAwait(false);
         var extents = new ExtentSet();
         extents.Add(new ByteRange(0, cursor.MuxLength));
         DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
-            totalBytes: cursor.MuxLength);
+            totalBytes: cursor.MuxLength, partialIdentity: identity);
         engine.WriteManifest(committed);
         return await PublishAsync(ct).ConfigureAwait(false);
     }
@@ -717,13 +717,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 })
             return Stop("The merged output cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged output is missing.");
-        using (var stream = new FileStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))
-        {
-            if (stream.Length < cursor.MuxLength) return Stop("The merged output is shorter than recorded.");
-            string actual = Convert.ToHexString(await SHA256.HashDataAsync(new RegionStream(stream, 0, cursor.MuxLength), ct).ConfigureAwait(false));
-            if (actual != cursor.MuxSha256) return Stop("The merged output failed SHA-256 validation.");
-        }
-        if (Job.TotalBytes != cursor.MuxLength) engine.UpdateJob(Job, job => job.TotalBytes = cursor.MuxLength);
+        if (!await MergeTransfer.VerifyMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false))
+            return Stop("The merged output failed its saved validation.");
         return await PublishAsync(ct).ConfigureAwait(false);
     }
 

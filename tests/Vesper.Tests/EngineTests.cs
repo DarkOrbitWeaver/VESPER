@@ -633,6 +633,38 @@ public class CrashRecoveryTests
         Assert.DoesNotContain(h.Files(), f => f.EndsWith(".vpart"));
     }
 
+    [Fact]
+    public async Task Publication_never_moves_a_same_size_replacement_after_recording_its_proof()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        Action? replace = null;
+        using var h = new Harness(point =>
+        {
+            if (point == "finalize.beforeMove") replace!();
+        }, tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add(server.Url("/file"), "kept.bin", startNow: false);
+        string partial = h.Engine.Snapshot(id)!.PartialPath;
+        string moved = partial + ".original";
+        byte[] unrelated = [.. server.V1];
+        unrelated[0] ^= 0x5a;
+        replace = () =>
+        {
+            File.Move(partial, moved);
+            File.WriteAllBytes(partial, unrelated);
+        };
+        h.Engine.StartNow(id);
+
+        JobSnapshot stopped = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+
+        Assert.Equal("publication-pending", stopped.Reason);
+        Assert.Null(stopped.FinalPath);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(moved));
+        Assert.Equal(unrelated, await File.ReadAllBytesAsync(partial));
+        Assert.False(File.Exists(Path.Combine(h.Downloads, "kept.bin")));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

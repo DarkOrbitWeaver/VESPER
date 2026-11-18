@@ -2,6 +2,14 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-18 partial identity and native helper
+
+Windows records the identity of the main partial before the first write. Resume, Rescue reads, merge and conversion, publication, Cancel and Start over verify the opened file against the saved claim. A replacement with identical bytes does not pass. Older partials with no proof are retained and must be moved aside in File Explorer before starting fresh. A legacy muxed file can be bound when its saved hash matches. Identity for every sidecar and the final Recycle Bin path race remain open.
+
+The first batched run passed all 1,008 Windows .NET tests. After adding the publication rename checks, the final Release build had zero warnings or errors, 101 affected engine cases passed, and the opt-in native helper test passed. The actual helper executable, desktop named pipe and production bridge handler staged a 16 KiB HTTP download, recorded zero committed bytes before acceptance, and published the fixture exactly after acceptance. Chrome launching a registered host remains unverified.
+
+A separate engine process was killed after the checkpoint commit without closing its SQLite connection. A fresh process reopened the database and resumed at byte 134,902. It produced one exact 2 MiB file. This proves that HTTP process interruption case. Power loss and real process interruption during media merge and publication still need coverage.
+
 ## 2026-11-18 merge recovery and Chrome ownership
 
 Direct and segmented merge save both file proofs before moving the tracks or output. Recovery finishes a verified swap without requesting the tracks again. It keeps conflicting files and does not remove old sidecars without proof. The muxed cursor, extents and size now commit together. Windows Cancel and Start over validate every temporary file before deletion and use the same handles to remove them.

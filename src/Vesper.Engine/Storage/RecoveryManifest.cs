@@ -15,7 +15,7 @@ internal static class RecoveryManifest
 
     private sealed record Body(int V, Guid JobId, long Generation, string Url, string FileName, long? Total,
         string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0,
-        string? MediaMetadataJson = null, string? MediaThumbnailUrl = null);
+        string? MediaMetadataJson = null, string? MediaThumbnailUrl = null, string? PartialIdentity = null);
 
     private sealed record Envelope(string Check, string Body);
 
@@ -26,7 +26,7 @@ internal static class RecoveryManifest
         if (job.PartialPath.Length == 0) return;
         var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
             job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder,
-            (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl));
+            (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl), job.PartialIdentity);
         string bodyJson = JsonSerializer.Serialize(body);
         string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
 
@@ -63,6 +63,8 @@ internal static class RecoveryManifest
 
             string partial = manifestPath[..^Extension.Length];
             using var saved = PathSafety.OpenTemporaryHandle(partial, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (body.PartialIdentity is not null)
+                PathSafety.RequireTemporaryIdentity(saved, body.PartialIdentity);
             long length = RandomAccess.GetLength(saved);
 
             // The checksum is unkeyed, so a planted manifest could name another folder or file.
@@ -82,7 +84,7 @@ internal static class RecoveryManifest
             job = new DownloadJob
             {
                 Id = body.JobId, Kind = Enum.IsDefined((JobKind)body.Kind) ? (JobKind)body.Kind : JobKind.Http, SourceUrl = body.Url, FileName = fileName, NameLocked = true,
-                DestinationFolder = here, PartialPath = partial, TotalBytes = body.Total, Extents = extents,
+                DestinationFolder = here, PartialPath = partial, PartialIdentity = body.PartialIdentity, TotalBytes = body.Total, Extents = extents,
                 State = body.Kind == 0 ? JobState.NeedsLink : JobState.NeedsAttention, Reason = "restored",
                 Message = body.Kind == 0 ? "Restored from a recovery file. Provide the download link again to continue."
                     : "Streaming partial restored without a private transfer plan. Resolve a new copy; saved fragments were kept and must not be treated as an ordinary HTTP file.",

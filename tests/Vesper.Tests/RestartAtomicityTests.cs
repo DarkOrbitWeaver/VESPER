@@ -13,6 +13,7 @@ public sealed class RestartAtomicityTests
         JobSnapshot original = Assert.IsType<JobSnapshot>(h.Engine.Snapshot(id));
         byte[] bytes = Payloads.Make(4_096, 81);
         await File.WriteAllBytesAsync(original.PartialPath, bytes);
+        h.OwnFixturePartial(id);
         string database = Path.Combine(h.Data, "vesper.db");
         using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
         connection.Open();
@@ -45,6 +46,7 @@ public sealed class RestartAtomicityTests
         Guid id = h.Add("http://127.0.0.1:65530/atomic-restart-finish", "discard.bin", startNow: false);
         JobSnapshot original = Assert.IsType<JobSnapshot>(h.Engine.Snapshot(id));
         await File.WriteAllBytesAsync(original.PartialPath, Payloads.Make(2_048, 88));
+        h.OwnFixturePartial(id);
         string database = Path.Combine(h.Data, "vesper.db");
         using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
         connection.Open();

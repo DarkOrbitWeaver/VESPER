@@ -40,7 +40,7 @@ public sealed partial class DownloadEngine
             if (PathSafety.Inspect(job.PartialPath) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
                 return (file, notice);
 
-            using var source = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var source = PartialFile.OpenOwnedRead(job);
             List<DemuxedTrack> tracks = MediaMerger.Demux(source, source.Length, ct);
             DemuxedTrack? audio = tracks.Find(t => t.Kind == TrackKind.Audio);
             DemuxedTrack? video = tracks.Find(t => t.Kind == TrackKind.Video);
@@ -321,7 +321,7 @@ public sealed partial class DownloadEngine
             if (PathSafety.Inspect(job.PartialPath) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
                 return (null, "Track details could not be embedded; the original audio file was saved unchanged.");
 
-            using var source = new FileStream(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var source = PartialFile.OpenOwnedRead(job);
             using var output = new FileStream(stage, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1 << 16,
                 FileOptions.SequentialScan);
             owned = true;
@@ -460,7 +460,19 @@ public sealed partial class DownloadEngine
     {
         if (PathSafety.Inspect(path) is { IsDirectory: true } or { IsReparsePoint: true } or { IsCloudPlaceholder: true })
             return false;
-        try { File.Delete(path); return true; }
+        try
+        {
+            if (path == job.PartialPath)
+            {
+                using var file = PathSafety.OpenTemporaryHandle(path, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, allowDelete: true);
+                PathSafety.RequireTemporaryIdentity(file, job.PartialIdentity);
+                PathSafety.DeleteOpenTemporaryFile(file, path);
+            }
+            else File.Delete(path);
+            return true;
+        }
+        catch (FileNotFoundException) { return true; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Log(job.Id, "temporary-file", "Temporary media file could not be removed: " + ex.Message);

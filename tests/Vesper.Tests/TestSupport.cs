@@ -494,6 +494,17 @@ internal sealed class Harness : IDisposable
         Engine = Start(failpoint, tweak);
     }
 
+    public void OwnFixturePartial(Guid id)
+    {
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(Engine)!;
+        DownloadJob job = jobs[id];
+        using var file = File.OpenHandle(job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        string? identity = PathSafety.TemporaryFileIdentity(file);
+        Engine.UpdateJob(job, saved => saved.PartialIdentity = identity);
+    }
+
     public Guid Add(string url, string? name = null, string? sha256 = null, string? pieces = null, bool startNow = true)
     {
         AddResult result = Engine.Add(new AddRequest(url, FileName: name, ExpectedSha256: sha256, PieceMapJson: pieces, StartNow: startNow));

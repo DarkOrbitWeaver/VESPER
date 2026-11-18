@@ -31,6 +31,7 @@ public sealed class LifecycleCommandAtomicityTests
         DownloadJob job = Live(h, id);
         byte[] savedBytes = Payloads.Make(3_333, 34);
         await File.WriteAllBytesAsync(job.PartialPath, savedBytes);
+        h.OwnFixturePartial(id);
         string database = Path.Combine(h.Data, "vesper.db");
         JobState before = job.State;
         RefuseStateWrites(database, true);
@@ -97,6 +98,7 @@ public sealed class LifecycleCommandAtomicityTests
         JobSnapshot snapshot = Assert.IsType<JobSnapshot>(h.Engine.Snapshot(id));
         byte[] bytes = Payloads.Make(2_048, 99);
         await File.WriteAllBytesAsync(snapshot.PartialPath, bytes);
+        h.OwnFixturePartial(id);
         string invalidSidecar = snapshot.PartialPath + ".vmeta";
         Directory.CreateDirectory(invalidSidecar);
         try

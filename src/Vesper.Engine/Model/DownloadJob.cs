@@ -71,6 +71,7 @@ public sealed class DownloadJob
     // The existing digest also records publication proof for original files.
     public string? PendingConversionDigest { get; set; }
     public string? PublishedSha256 { get; set; }
+    public string? PartialIdentity { get; set; }
 
     public long? TotalBytes { get; set; }
     public ExtentSet Extents { get; set; } = new();
@@ -168,6 +169,7 @@ public sealed class DownloadJob
         PendingConversionBytes = saved.PendingConversionBytes;
         PendingConversionDigest = saved.PendingConversionDigest;
         PublishedSha256 = saved.PublishedSha256;
+        PartialIdentity = saved.PartialIdentity;
         TotalBytes = saved.TotalBytes;
         Extents = saved.Extents;
         State = saved.State;
