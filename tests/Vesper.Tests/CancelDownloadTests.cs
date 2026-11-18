@@ -55,6 +55,26 @@ public sealed class CancelDownloadTests
     private static extern bool CreateHardLinkW(string newPath, string existingPath, IntPtr security);
 
     [Fact]
+    public async Task Cancel_refuses_all_deletion_when_a_later_sidecar_is_a_hard_link()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/cancel-linked", "linked.bin", startNow: false);
+        string partial = h.Engine.Snapshot(id)!.PartialPath;
+        string harmless = Path.Combine(h.Downloads, "keep.txt");
+        await File.WriteAllTextAsync(partial, "saved download");
+        await File.WriteAllTextAsync(harmless, "another file");
+        string recovery = RecoveryManifest.PathFor(partial);
+        Assert.True(CreateHardLinkW(recovery, harmless, IntPtr.Zero));
+
+        Assert.False((await h.Engine.CancelDownloadAsync(id)).Cancelled);
+        Assert.Equal("saved download", await File.ReadAllTextAsync(partial));
+        Assert.Equal("another file", await File.ReadAllTextAsync(harmless));
+        Assert.Equal("another file", await File.ReadAllTextAsync(recovery));
+        Assert.True(h.Engine.Snapshot(id)!.IsCleanupPending);
+    }
+
+    [Fact]
     public async Task CancelRemovesAnUnfinishedJobAndOnlyItsExactTemporaryFiles()
     {
         using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);

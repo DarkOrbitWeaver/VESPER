@@ -275,17 +275,20 @@ public sealed partial class DownloadEngine : IDisposable
     /// Saves flushed bytes before making them visible. Retire the batch under the same lock
     /// so snapshots cannot count it twice and metadata writers see the committed version.
     /// </summary>
-    internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState, Action? retirePending = null)
+    internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState, Action? retirePending = null,
+        long? totalBytes = null)
     {
         lock (_lock)
         {
             if (job.Kind == JobKind.Hls && mediaState is not null)
                 mediaState = HlsTransfer.PreserveLiveStop(job.MediaState, mediaState);
             DownloadJob copy = job.CloneForCommit(next, mediaState ?? job.MediaState);
+            if (totalBytes is not null) copy.TotalBytes = totalBytes;
             SaveLocked(copy);
             job.Extents = copy.Extents;
             job.Generation = copy.Generation;
             job.MediaState = copy.MediaState;
+            job.TotalBytes = copy.TotalBytes;
             retirePending?.Invoke();
             return copy;
         }

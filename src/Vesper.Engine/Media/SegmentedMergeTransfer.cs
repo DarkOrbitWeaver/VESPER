@@ -20,7 +20,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     internal sealed record Cursor(int Version, string Fingerprint, string Phase, int Track = 0, int Next = 0,
         long Offset = 0, string PrefixHash = "", int[]? CompletedParts = null, long[]? PartLengths = null,
         string?[]? SourceFingerprints = null, long MuxLength = 0, string? MuxSha256 = null,
-        string[]? KeyFingerprints = null, string?[]? SourceShapeFingerprints = null);
+        string[]? KeyFingerprints = null, string?[]? SourceShapeFingerprints = null,
+        long TracksLength = 0, string? TracksSha256 = null);
 
     internal async Task<RunOutcome> RunAsync(MediaMergePlan plan, CancellationToken ct)
     {
@@ -32,6 +33,12 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         Cursor? cursor = ReadCursor();
         if (Job.MediaState is not null && cursor is null) return Stop("The saved segmented merge cursor is invalid.");
         if (cursor is { Phase: "muxed" }) return await FinalizeMergedAsync(cursor, fingerprint, ct).ConfigureAwait(false);
+        if (cursor is { Phase: "swapping" })
+        {
+            if (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint)
+                return Stop("The saved swap belongs to a different rendition plan.");
+            return await FinishSwapAsync(cursor, ct).ConfigureAwait(false);
+        }
         if (cursor is not null && (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.Phase != "download"))
             return Stop("The saved data belongs to a different rendition plan. Restart as a separate copy.");
 
@@ -49,9 +56,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (cursor is not null && !CursorMatches(cursor, fingerprint, tracks))
             return Stop("A selected playlist or fragment plan changed. Saved data was kept.");
 
-        RecoverInterruptedSwap();
-        TryDelete(MergeTransfer.MergingPath(Job));
-        TryDelete(Job.PartialPath + ".samples");
+        MergeTransfer.RestoreLegacyTracks(Job);
         PartialFile file = session.OpenFile();
         long offset = Job.Extents.ContiguousFromZero();
         if (Job.Extents.TotalBytes != offset || file.Length < offset
@@ -486,12 +491,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         string samplesPath = Job.PartialPath + ".samples";
         long length;
         string sha;
+        bool ownsSamples = false;
         session.CloseFile();
         try
         {
             using var source = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
             if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
             using var samples = PathSafety.OpenTemporaryStream(samplesPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.RandomAccess);
+            ownsSamples = true;
             var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
             int partIndex = 0;
             long trackOffset = 0;
@@ -574,18 +581,26 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             TryDelete(mergingPath);
             return RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to merge. Saved data was kept.");
         }
-        finally { TryDelete(samplesPath); }
+        finally { if (ownsSamples) TryDelete(samplesPath); }
 
-        string tracksPath = MergeTransfer.TracksPath(Job);
-        if (File.Exists(tracksPath)) return Stop("An older merge sidecar is in the way.");
-        File.Move(Job.PartialPath, tracksPath);
-        File.Move(mergingPath, Job.PartialPath);
+        if (MergeTransfer.PathExists(MergeTransfer.TracksPath(Job))) return Stop("An older merge sidecar is in the way.");
+        ct.ThrowIfCancellationRequested();
+        var swap = new Cursor(1, fingerprint, "swapping", MuxLength: length, MuxSha256: sha,
+            TracksLength: partLengths.Sum(), TracksSha256: ReadCursor()?.PrefixHash);
+        engine.UpdateJob(Job, job => job.MediaState = JsonSerializer.Serialize(swap));
+        engine.Failpoint("merge.beforeSwap");
+        return await FinishSwapAsync(swap, ct).ConfigureAwait(false);
+    }
+
+    private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
+    {
+        await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
+            cursor.TracksLength, cursor.TracksSha256, ct).ConfigureAwait(false);
         var extents = new ExtentSet();
-        extents.Add(new ByteRange(0, length));
-        var muxed = new Cursor(1, fingerprint, "muxed", MuxLength: length, MuxSha256: sha);
-        DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(muxed));
+        extents.Add(new ByteRange(0, cursor.MuxLength));
+        DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
+            totalBytes: cursor.MuxLength);
         engine.WriteManifest(committed);
-        engine.UpdateJob(Job, job => { job.TotalBytes = length; job.Message = ""; });
         return await PublishAsync(ct).ConfigureAwait(false);
     }
 
@@ -718,15 +733,6 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (result.State == JobState.Completed && !MergeTransfer.DeleteSidecars(Job))
             engine.UpdateJob(Job, job => job.Message = "Saved. A temporary track file could not be removed: " + PathSafety.ForDisplay(MergeTransfer.TracksPath(job)));
         return result;
-    }
-
-    private void RecoverInterruptedSwap()
-    {
-        string tracksPath = MergeTransfer.TracksPath(Job);
-        if (!File.Exists(tracksPath)) return;
-        session.CloseFile();
-        if (File.Exists(Job.PartialPath)) File.Delete(Job.PartialPath);
-        File.Move(tracksPath, Job.PartialPath);
     }
 
     private void EnsureSpace(long additional)

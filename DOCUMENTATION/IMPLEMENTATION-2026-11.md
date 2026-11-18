@@ -2,6 +2,12 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-18 merge recovery and Chrome ownership
+
+Direct and segmented merge save both file proofs before moving the tracks or output. Recovery finishes a verified swap without requesting the tracks again. It keeps conflicting files and does not remove old sidecars without proof. The muxed cursor, extents and size now commit together. Windows Cancel and Start over validate every temporary file before deletion and use the same handles to remove them.
+
+The Release solution built with zero warnings or errors. The full run passed 1,004 cases and exposed two incorrect HTTP fixture assertions. Six focused cases passed after correcting those assertions to check the staged bytes and actual inputs. Product code was unchanged between the runs. Real Chrome for Testing 158.0.8127.36 kept a 262,144-byte opt-out HTTP file and a byte-exact generated Blob with capture enabled. The Blob produced the page-made decision. The disposable profile blocked native calls. Native acceptance, real process interruption and performance measurements remain open.
+
 ## 2026-11-18 temporary files, Rescue and packaging
 
 Windows now checks the temporary file handle before writing or truncating partials, mux stages and recovery manifests. It refuses links, multiply linked files, directories and cloud placeholders. Rescue and segmented prefix checks open existing data without creating a missing partial. HTTP Rescue saves a probe result only while it still matches the persisted prefix and source. The final Recycle Bin path race, persistent temporary-file ownership and merge swap recovery remain open.
