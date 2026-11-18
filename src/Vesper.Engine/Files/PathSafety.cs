@@ -1,4 +1,5 @@
 using Microsoft.Win32.SafeHandles;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
@@ -85,6 +86,98 @@ public static class PathSafety
 
     internal static bool IsCloudPlaceholder(FileAttributes attributes) =>
         (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
+
+    internal static SafeFileHandle OpenTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options = FileOptions.None)
+    {
+        if (!Path.IsPathFullyQualified(path)) throw new IOException("The temporary file path is invalid.");
+        path = Path.GetFullPath(path);
+        string? folder = Path.GetDirectoryName(path);
+        if (folder is null || Path.GetFileName(path).Contains(':'))
+            throw new IOException("The temporary file path is invalid.");
+        if (!TryCheckUnlinkedDirectory(folder, out string error)) throw new IOException(error);
+
+        // Inspect the opened object before allowing a write or truncation.
+        FileMode openMode = mode == FileMode.Create ? FileMode.OpenOrCreate : mode;
+        SafeFileHandle handle = OperatingSystem.IsWindows()
+            ? OpenWindowsTemporaryHandle(path, openMode, access, share, options)
+            : File.OpenHandle(path, openMode, access, share, options);
+        try
+        {
+            if (!TryCheckUnlinkedDirectory(folder, out error)) throw new IOException(error);
+            if (OperatingSystem.IsWindows())
+            {
+                if (!GetFileInformationByHandle(handle, out TemporaryFileInfo info))
+                    throw FileError(Marshal.GetLastPInvokeError(), path);
+                if (!IsPlainFile(info.Attributes) || info.LinkCount != 1)
+                    throw new IOException("A temporary path points to a link, folder or cloud placeholder.");
+            }
+            else if (!IsPlainFile(File.GetAttributes(path)))
+                throw new IOException("A temporary path points to a link, folder or cloud placeholder.");
+
+            if (mode == FileMode.Create) RandomAccess.SetLength(handle, 0);
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    internal static FileStream OpenTemporaryStream(string path, FileMode mode, FileAccess access, FileShare share,
+        int bufferSize, FileOptions options = FileOptions.None)
+    {
+        SafeFileHandle handle = OpenTemporaryHandle(path, mode, access, share, options);
+        try { return new FileStream(handle, access, bufferSize, (options & FileOptions.Asynchronous) != 0); }
+        catch { handle.Dispose(); throw; }
+    }
+
+    private static bool IsPlainFile(FileAttributes attributes) =>
+        (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) == 0
+        && !IsCloudPlaceholder(attributes);
+
+    private static SafeFileHandle OpenWindowsTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
+    {
+        const uint read = 0x80000000, write = 0x40000000;
+        const uint openReparsePoint = 0x00200000, anonymousSecurity = 0x00100000;
+        uint rights = access == FileAccess.Read ? read : read | write;
+        string nativePath = path.StartsWith(@"\\?\") ? path
+            : path.StartsWith(@"\\") ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
+        SafeFileHandle handle = CreateFileW(nativePath, rights, (uint)share, IntPtr.Zero, (uint)mode,
+            unchecked((uint)options) | openReparsePoint | anonymousSecurity, IntPtr.Zero);
+        if (!handle.IsInvalid) return handle;
+        int error = Marshal.GetLastPInvokeError();
+        handle.Dispose();
+        throw FileError(error, path);
+    }
+
+    private static IOException FileError(int code, string path)
+    {
+        string message = new Win32Exception(code).Message;
+        return code switch
+        {
+            2 => new FileNotFoundException(message, path),
+            3 => new DirectoryNotFoundException(message),
+            _ => new IOException(message, unchecked((int)0x80070000) | code)
+        };
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TemporaryFileInfo
+    {
+        public FileAttributes Attributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint Volume, SizeHigh, SizeLow, LinkCount, IdHigh, IdLow;
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint mode, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle file, out TemporaryFileInfo info);
 
     internal static bool PathStillNamesFile(string path, FileStream verifiedFile, string digest)
     {

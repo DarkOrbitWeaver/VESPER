@@ -213,7 +213,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         session.CloseFile();
         try
         {
-            using (var source = new FileStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess))
+            using (var source = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess))
             {
                 if (source.Length < plan.TotalBytes) return Stop("The partial file is shorter than its committed tracks.");
                 var inputs = new List<(DemuxedTrack Track, Stream Source)>();
@@ -237,7 +237,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                 MediaThumbnail? thumbnail = container is "mp4" or "m4a" or "webm" or "mkv"
                     ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
                     : null;
-                using var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20);
+                using var output = PathSafety.OpenTemporaryStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20);
                 MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                 output.Flush(flushToDisk: true);
                 length = output.Length;
@@ -274,7 +274,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
     {
         if (cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 }) return Stop("The merge cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged file is missing.");
-        using (var fs = new FileStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16, FileOptions.SequentialScan))
+        using (var fs = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan))
         {
             if (fs.Length < cursor.MuxLength) return Stop("The merged file is shorter than recorded.");
             string actual = Convert.ToHexString(await SHA256.HashDataAsync(new RegionStream(fs, 0, cursor.MuxLength), ct).ConfigureAwait(false));

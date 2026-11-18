@@ -19,12 +19,12 @@ internal sealed class PartialFile : IDisposable
 
     private PartialFile(string path, SafeFileHandle handle) { Path = path; _handle = handle; }
 
-    public static PartialFile Open(string path)
+    public static PartialFile Open(string path, bool create = true)
     {
         try
         {
             // FileShare.Read lets a virus scanner read the file but blocks deletion or truncation by others.
-            SafeFileHandle handle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+            SafeFileHandle handle = PathSafety.OpenTemporaryHandle(path, create ? FileMode.OpenOrCreate : FileMode.Open, FileAccess.ReadWrite,
                 FileShare.Read, FileOptions.Asynchronous | FileOptions.RandomAccess);
             return new PartialFile(path, handle);
         }

@@ -2,6 +2,12 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-18 temporary files, Rescue and packaging
+
+Windows now checks the temporary file handle before writing or truncating partials, mux stages and recovery manifests. It refuses links, multiply linked files, directories and cloud placeholders. Rescue and segmented prefix checks open existing data without creating a missing partial. HTTP Rescue saves a probe result only while it still matches the persisted prefix and source. The final Recycle Bin path race, persistent temporary-file ownership and merge swap recovery remain open.
+
+The Windows Release build had zero warnings or errors. All 1,000 .NET tests passed (582 engine, 357 resolver, 41 WinForms, 20 setup). The 126 extension mocks passed at the previous checkpoint and the extension source is unchanged. The release script now passes the same Git revision to the app, native host and First Flight.
+
 ## 2026-11-18 completed file safety
 
 New publications save the output SHA-256 with the completed entry, including recovery after an interrupted rename. Delete and Locate refuse different bytes, even at the same size. Older entries without a saved digest are managed in File Explorer. The schema upgrade keeps existing history and uses the migration backup. Windows reopens the path to compare the file ID immediately before deletion. The Recycle Bin still acts on a path, so a final replacement race remains open.

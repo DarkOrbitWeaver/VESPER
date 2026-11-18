@@ -127,7 +127,7 @@ These are **separate audit obligations**, not all new feature requests. A range 
 | AUDIT-EXTRA-008 | I 1309–1412 | UI paint audit, nested layout, text-size matrix and artwork provenance | OPEN — Actual DPI/theme/Narrator evidence Q4/Q5 |
 | AUDIT-EXTRA-009 | J 1413–1511 | Butterfly motion states, arrival, rigid follow, idle budget and focus contrast | OPEN — Real Chrome motion and reduced-motion acceptance Q2/Q4/Q5 |
 | AUDIT-EXTRA-010 | K 1512–1629 | Intent-first picker, shared C# capability document, format honesty, time-range clips, quality presets | OPEN — Compare both front ends; current full redesign remains open |
-| AUDIT-EXTRA-011 | L 1630–1669 | First Flight timeline, installer behavior, signing and app/extension distribution requirements | OPEN — Windows clean VM and signing/store Q7/Q10 |
+| AUDIT-EXTRA-011 | L 1630–1669 | First Flight timeline, installer behavior, signing and app/extension distribution requirements | PARTIAL — First Flight UI timing and live-window captures verified on ae9b091. Original timeline, clean Windows install, signing and Store Q7/Q10 remain open. |
 | AUDIT-EXTRA-012 | M 1670–1710 | Benchmark interpretation, extension wake-up, disk fsync, 8-hour memory and leak measurements | OPEN — Current reproducible measurements Q6 |
 | AUDIT-EXTRA-013 | N 1711–1741 | 20 separately ranked product opportunities; deliberately deferred feature bloat | OPEN — N-ID rows below; P3 unless owner explicitly upgrades |
 | AUDIT-EXTRA-014 | O 1742–1766 | Architectural simplification proposals; VES-068 positive comment-quality finding omitted from U index | OPEN — Keep design readable, remove duplication only with proofs |

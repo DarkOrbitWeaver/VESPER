@@ -32,7 +32,9 @@ internal static class RecoveryManifest
 
         string path = PathFor(job.PartialPath);
         string temp = path + ".tmp";
-        File.WriteAllText(temp, json, Encoding.UTF8);
+        using (var file = PathSafety.OpenTemporaryStream(temp, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 4096))
+        using (var writer = new StreamWriter(file, Encoding.UTF8))
+            writer.Write(json);
         File.Move(temp, path, overwrite: true);          // atomic replace: a reader sees the old or the new manifest
     }
 
@@ -49,15 +51,19 @@ internal static class RecoveryManifest
         problem = "";
         try
         {
-            Envelope? envelope = JsonSerializer.Deserialize<Envelope>(File.ReadAllText(manifestPath));
+            if (!manifestPath.EndsWith(Extension, StringComparison.OrdinalIgnoreCase))
+            { problem = "invalid recovery file name"; return false; }
+            using var manifest = PathSafety.OpenTemporaryStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096);
+            using var reader = new StreamReader(manifest, Encoding.UTF8);
+            Envelope? envelope = JsonSerializer.Deserialize<Envelope>(reader.ReadToEnd());
             if (envelope is null || Hash(envelope.Body) != envelope.Check) { problem = "checksum mismatch"; return false; }
             Body? body = JsonSerializer.Deserialize<Body>(envelope.Body);
             if (body is null || body.V != 1) { problem = "unsupported version"; return false; }
             if (!ExtentSet.TryParse(body.Extents, out ExtentSet extents)) { problem = "unreadable extents"; return false; }
 
             string partial = manifestPath[..^Extension.Length];
-            long length = File.Exists(partial) ? new FileInfo(partial).Length : -1;
-            if (length < 0) { problem = "partial file missing"; return false; }
+            using var saved = PathSafety.OpenTemporaryHandle(partial, FileMode.Open, FileAccess.Read, FileShare.Read);
+            long length = RandomAccess.GetLength(saved);
 
             // The checksum is unkeyed, so a planted manifest could name another folder or file.
             // Only import one that describes the partial sitting next to it.

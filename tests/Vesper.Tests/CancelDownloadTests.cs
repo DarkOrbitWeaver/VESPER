@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
@@ -6,6 +7,53 @@ namespace Vesper.Tests;
 
 public sealed class CancelDownloadTests
 {
+    [Fact]
+    public async Task A_hard_link_in_place_of_a_partial_is_refused_before_network_or_disk_writes()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add(server.Url("/file"), "linked-partial.bin", startNow: false);
+        string partial = h.Engine.Snapshot(id)!.PartialPath;
+        string original = Path.Combine(h.Downloads, "keep.bin");
+        byte[] bytes = [1, 3, 5, 7];
+        await File.WriteAllBytesAsync(original, bytes);
+        Assert.True(CreateHardLinkW(partial, original, IntPtr.Zero));
+
+        h.Engine.StartNow(id);
+
+        JobSnapshot refused = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+        Assert.Equal("storage", refused.Reason);
+        Assert.Equal(0, server.Hits("/file"));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(original));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(partial));
+    }
+
+    [Fact]
+    public async Task A_hard_link_in_place_of_the_recovery_stage_is_never_truncated()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/file", "manifest.bin", startNow: false);
+        using var store = JobStore.Open(Path.Combine(h.Data, "vesper.db"));
+        DownloadJob saved = Assert.Single(store.LoadAll());
+        Assert.Equal(id, saved.Id);
+        string manifest = RecoveryManifest.PathFor(saved.PartialPath);
+        string original = Path.Combine(h.Downloads, "keep.txt");
+        await File.WriteAllTextAsync(original, "keep these bytes");
+        Assert.True(CreateHardLinkW(manifest + ".tmp", original, IntPtr.Zero));
+
+        Assert.ThrowsAny<IOException>(() => RecoveryManifest.Write(saved));
+
+        Assert.Equal("keep these bytes", await File.ReadAllTextAsync(original));
+        Assert.False(File.Exists(manifest));
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLinkW(string newPath, string existingPath, IntPtr security);
+
     [Fact]
     public async Task CancelRemovesAnUnfinishedJobAndOnlyItsExactTemporaryFiles()
     {

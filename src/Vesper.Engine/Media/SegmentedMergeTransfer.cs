@@ -258,7 +258,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         using (var savedKeys = new HlsKeyCache(cursor.KeyFingerprints))
             if (!savedKeys.Valid) return (false, null, "The saved HLS key fingerprints are invalid. Saved data was kept.");
 
-        using PartialFile file = session.OpenFile();
+        using PartialFile file = session.OpenFile(create: false);
         if (file.Length < cursor.Offset)
             return (false, null, "The saved segment file is shorter than its cursor. Saved data was kept.");
         using var prefixHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -489,9 +489,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         session.CloseFile();
         try
         {
-            using var source = new FileStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
+            using var source = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess);
             if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
-            using var samples = new FileStream(samplesPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.RandomAccess);
+            using var samples = PathSafety.OpenTemporaryStream(samplesPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.RandomAccess);
             var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
             int partIndex = 0;
             long trackOffset = 0;
@@ -554,7 +554,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             MediaThumbnail? thumbnail = container is "mp4" or "m4a" or "webm" or "mkv"
                 ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
                 : null;
-            using (var output = new FileStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
+            using (var output = PathSafety.OpenTemporaryStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
             {
                 MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                 output.Flush(flushToDisk: true);
