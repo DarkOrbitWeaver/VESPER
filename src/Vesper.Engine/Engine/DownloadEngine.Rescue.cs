@@ -85,26 +85,44 @@ public sealed partial class DownloadEngine
     /// If it is not accepted, the job (including its partial data) is left exactly as it was.
     /// </summary>
     public Task<RescueResult> ReplaceLinkAsync(Guid id, string newUrl, RescueInput? input = null, CancellationToken ct = default) =>
-        ReplaceLinkCoreAsync(id, newUrl, input, ct, null);
+        ReplaceLinkCoreAsync(id, newUrl, input, ct, null, null);
 
     private async Task<RescueResult> ReplaceLinkCoreAsync(Guid id, string newUrl, RescueInput? input, CancellationToken ct,
-        RequestCredentials? replacementCredentials)
+        RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null)
     {
         DownloadJob? job;
         Task? stopping = null;
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out job)) return Rejected("That entry no longer exists.");
+            if (_cancelling.Contains(id)) return Rejected("The download is being cancelled.");
             if (job.Reason == "restart-cleanup")
                 return Rejected("Restart from scratch must finish before this link can be replaced.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its link can be replaced.");
             if (job.State == JobState.Completed) return Rejected("This download is already complete.");
             if (job.Kind != JobKind.Http)
                 return Rejected("A streaming manifest is not a replacement file URL. Resolve the source into a new plan; the existing fragments remain untouched.");
-            if (_sessions.TryGetValue(id, out JobSession? running)) { running.Intent = StopIntent.Pause; running.Cts.Cancel(); stopping = running.RunTask; }
+            if (_sessions.TryGetValue(id, out JobSession? running))
+            {
+                if (running.Intent is not (StopIntent.None or StopIntent.Window or StopIntent.Pause))
+                    return Rejected("The download is already stopping. Try again in a moment.");
+                running.Intent = StopIntent.Pause;
+                running.Cts.Cancel();
+                stopping = running.RunTask;
+            }
         }
         if (stopping is not null) await Task.WhenAny(stopping, Task.Delay(TimeSpan.FromSeconds(15), ct)).ConfigureAwait(false);
         lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? current) || !ReferenceEquals(current, job))
+                return Rejected("The download changed while it was stopping. Try again.");
+            if (_cancelling.Contains(id)) return Rejected("The download is being cancelled.");
+            if (IsCleanupPending(current) || current.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its link can be replaced.");
             if (_sessions.ContainsKey(id)) return Rejected("The download is still stopping. Try again in a moment.");
+        }
+        ct.ThrowIfCancellationRequested();
 
         if (!UrlPolicy.TryParse(newUrl, out Uri uri, out string urlError)) return Rejected(urlError);
         if (MediaPageLinks.TryGetSite(uri, out string mediaSite))
@@ -127,7 +145,8 @@ public sealed partial class DownloadEngine
         {
             try
             {
-                if (!ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null, replacementCredentials))
+                if (!ApplyRescue(job, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null,
+                        replacementCredentials, mediaExpiresAt))
                     return Rejected("This download changed while checking its replacement link. Try again.");
             }
             catch (LocalStorageException ex)
@@ -169,7 +188,7 @@ public sealed partial class DownloadEngine
 
         try
         {
-            if (!ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials))
+            if (!ApplyRescue(job, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt))
                 return new RescueResult(false, RescueMode.R4,
                     "This download changed while checking its replacement link. No replacement was applied.", retained);
         }
@@ -198,12 +217,13 @@ public sealed partial class DownloadEngine
     }
 
     private bool ApplyRescue(DownloadJob job, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
-        ExtentSet? verified, RequestCredentials? replacementCredentials = null)
+        ExtentSet? verified, RequestCredentials? replacementCredentials = null, DateTimeOffset? mediaExpiresAt = null)
     {
         lock (_lock)
         {
             if (!_jobs.TryGetValue(job.Id, out DownloadJob? current) || !ReferenceEquals(current, job)
-                || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed || job.Reason == "restart-cleanup")
+                || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed
+                || IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return false;
 
             // The source and duplicate index become visible only AFTER SQLite accepts the new job.
@@ -213,6 +233,7 @@ public sealed partial class DownloadEngine
             updated.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
             updated.SourceUrl = uri.AbsoluteUri;
             updated.RescueMode = decision.Mode;
+            if (mediaExpiresAt is not null) updated.MediaExpiresAt = mediaExpiresAt;
 
             if (decision.Mode is RescueMode.R1 or RescueMode.R1b && probe is not null)
             {

@@ -39,6 +39,18 @@ public sealed class CancelMenuTests
                 configure.Invoke(form, [null, new CancelEventArgs()]);
                 Assert.False(commands["Cancel download"].Available);
                 Assert.True(commands["Remove from list…"].Available);
+
+                target.SetValue(form, DownloadItem.From(new JobSnapshot
+                {
+                    Id = Guid.NewGuid(), FileName = "retry.zip", State = JobState.NeedsAttention,
+                    Reason = "restart-cleanup", IsLiveRecording = true
+                }));
+                configure.Invoke(form, [null, new CancelEventArgs()]);
+                Assert.True(commands["Start over…"].Available);
+                Assert.True(commands["Cancel download"].Available);
+                Assert.False(commands["Resume"].Available);
+                Assert.False(commands["Replace link…"].Available);
+                Assert.False(commands["Stop and keep"].Available);
             }
             catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
         }) { IsBackground = true };

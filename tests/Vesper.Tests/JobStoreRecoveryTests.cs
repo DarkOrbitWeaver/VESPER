@@ -87,6 +87,7 @@ public sealed class JobStoreRecoveryTests
                 Assert.True(recovered.RecoveredFromCorruption);
                 backup = Assert.IsType<string>(recovered.CorruptBackupPath);
                 Assert.Empty(recovered.LoadAll());
+                recovered.FinishQuarantineRecovery();
             }
 
             Assert.StartsWith(path + ".corrupt-", backup, StringComparison.Ordinal);
@@ -172,6 +173,83 @@ public sealed class JobStoreRecoveryTests
         {
             if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
         }
+    }
+
+    [Fact]
+    public void Migration_backup_includes_committed_pages_held_in_the_wal()
+    {
+        using var h = new Harness();
+        h.Engine.Dispose();
+        string path = Path.Combine(h.Data, "vesper.db");
+        using var writer = new SqliteConnection($"Data Source={path};Pooling=False");
+        writer.Open();
+        Execute(writer, "ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5; PRAGMA wal_checkpoint(TRUNCATE);");
+
+        using var reader = new SqliteConnection($"Data Source={path};Pooling=False");
+        reader.Open();
+        Execute(reader, "BEGIN; SELECT COUNT(*) FROM events;");
+        Execute(writer, "INSERT INTO events(utc, kind, detail) VALUES ('2026-01-01', 'backup', 'committed in WAL');");
+        Assert.True(new FileInfo(path + "-wal").Length > 0);
+
+        using var upgraded = JobStore.Open(path);
+        using var backup = new SqliteConnection($"Data Source={path}.bak-v5;Mode=ReadOnly;Pooling=False");
+        backup.Open();
+        using var command = backup.CreateCommand();
+        command.CommandText = "PRAGMA user_version;";
+        Assert.Equal(5L, command.ExecuteScalar());
+        command.CommandText = "SELECT detail FROM events WHERE kind = 'backup';";
+        Assert.Equal("committed in WAL", command.ExecuteScalar());
+    }
+
+    [Fact]
+    public void Interrupted_quarantine_restores_the_wal_before_opening_the_database()
+    {
+        using var h = new Harness();
+        h.Engine.Dispose();
+        string original = Path.Combine(h.Data, "vesper.db");
+        using var writer = new SqliteConnection($"Data Source={original};Pooling=False");
+        writer.Open();
+        Execute(writer, "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint = 0;");
+        Execute(writer, "INSERT INTO events(utc, kind, detail) VALUES ('2026-01-01', 'recovery', 'committed in WAL');");
+
+        string restoredDirectory = Path.Combine(h.Root, "interrupted");
+        Directory.CreateDirectory(restoredDirectory);
+        string path = Path.Combine(restoredDirectory, "vesper.db");
+        string archive = path + ".corrupt-20261118120101-" + Guid.NewGuid().ToString("N");
+        File.Copy(original, path);
+        File.Copy(original + "-wal", archive + "-wal");
+        File.WriteAllText(path + ".quarantine-pending", Path.GetFileName(archive));
+
+        using var restored = JobStore.Open(path);
+        Assert.False(restored.RecoveredFromCorruption);
+        Assert.Contains(restored.ReadEvents(), line => line.Contains("committed in WAL", StringComparison.Ordinal));
+        Assert.False(File.Exists(archive + "-wal"));
+        Assert.False(File.Exists(path + ".quarantine-pending"));
+    }
+
+    [Fact]
+    public void Startup_finishes_a_quarantine_interrupted_before_initializing_the_new_database()
+    {
+        using var h = new Harness();
+        h.Engine.Dispose();
+        string path = Path.Combine(h.Data, "vesper.db");
+        byte[] original = "Damaged database"u8.ToArray();
+        File.WriteAllBytes(path, original);
+        string archive = JobStore.Quarantine(path, keepMarker: true);
+
+        using var fresh = JobStore.Open(path);
+        Assert.True(fresh.RecoveredFromCorruption);
+        Assert.Equal(archive, fresh.CorruptBackupPath);
+        Assert.Equal(original, File.ReadAllBytes(archive));
+        Assert.True(File.Exists(path + ".quarantine-pending"));
+        Assert.Empty(fresh.LoadAll());
+    }
+
+    private static void Execute(SqliteConnection connection, string sql)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
     }
 
     private static string Hash(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));

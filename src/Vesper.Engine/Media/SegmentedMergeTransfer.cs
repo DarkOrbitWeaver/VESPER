@@ -584,12 +584,6 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         extents.Add(new ByteRange(0, length));
         var muxed = new Cursor(1, fingerprint, "muxed", MuxLength: length, MuxSha256: sha);
         DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(muxed));
-        lock (session.Gate)
-        {
-            Job.Extents = extents;
-            Job.Generation = committed.Generation;
-            Job.MediaState = committed.MediaState;
-        }
         engine.WriteManifest(committed);
         engine.UpdateJob(Job, job => { job.TotalBytes = length; job.Message = ""; });
         return await PublishAsync(ct).ConfigureAwait(false);

@@ -456,21 +456,6 @@ public sealed partial class DownloadEngine
         source.DurationSeconds > 0 && output.DurationSeconds > 0
         && Math.Abs(source.DurationSeconds - output.DurationSeconds) <= Math.Clamp(source.DurationSeconds * .01, .05, .25);
 
-    private static bool MatchesConversion(DownloadJob job, string path)
-    {
-        if (job.PendingConversionBytes is not > 0 || job.PendingConversionDigest is null
-            || !PathSafety.IsInside(job.DestinationFolder, path)
-            || PathSafety.Inspect(path) is not { Exists: true, IsReparsePoint: false, IsCloudPlaceholder: false, IsDirectory: false } found
-            || found.Length != job.PendingConversionBytes)
-            return false;
-        try
-        {
-            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
-            return Convert.ToHexString(SHA256.HashData(file)) == job.PendingConversionDigest;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
-    }
-
     private bool DeleteTemporaryFile(DownloadJob job, string path)
     {
         if (PathSafety.Inspect(path) is { IsDirectory: true } or { IsReparsePoint: true } or { IsCloudPlaceholder: true })

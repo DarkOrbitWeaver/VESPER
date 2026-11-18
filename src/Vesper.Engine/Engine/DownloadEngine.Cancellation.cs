@@ -1,95 +1,70 @@
+using Microsoft.Data.Sqlite;
+
 namespace Vesper.Engine;
 
 public sealed record CancelDownloadResult(bool Cancelled, string Message);
 
 public sealed partial class DownloadEngine
 {
+    private const string CancelCleanup = "cancel-cleanup";
+    private const string RestartCleanup = "restart-cleanup";
+
     // A cancel is one operation, not Pause + RemoveFromList: no runner or queue action
     // may start using this job while its files are being discarded.
     private readonly HashSet<Guid> _cancelling = [];
 
+    internal static bool IsCleanupPending(DownloadJob job) => IsCleanupPending(job.State, job.Reason);
+
+    internal static bool IsCleanupPending(JobState state, string reason) =>
+        reason is CancelCleanup or RestartCleanup || state == JobState.Cancelled && reason == "cancelled";
+
+    private static bool CanDiscardPartial(DownloadJob job) =>
+        job.Kind != JobKind.BrowserFile
+        && job.State is not (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting)
+        && job.FinalPath is null && job.PendingFinalPath is null;
+
     public async Task<CancelDownloadResult> CancelDownloadAsync(Guid id)
     {
-        Task? running;
-        lock (_lock)
-        {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || job.Kind == JobKind.BrowserFile)
-                return new(false, "This download is no longer available.");
-            if (_cancelling.Contains(id))
-                return new(false, "This download is already being cancelled.");
-            if (job.State is JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting
-                || job.FinalPath is not null || job.PendingFinalPath is not null)
-                return new(false, "This download has already reached file publication. Nothing was deleted.");
-
-            if (_sessions.TryGetValue(id, out JobSession? session))
-            {
-                session.Intent = StopIntent.Cancel;
-                session.Cts.Cancel();
-                running = session.RunTask;
-            }
-            else
-            {
-                // Persist the cancellation before touching files. If the app crashes during
-                // cleanup, recovery never silently resumes the discarded download.
-                PersistUiMutationLocked(job, pending =>
-                {
-                    pending.State = JobState.Cancelled;
-                    pending.NextRetryUtc = null;
-                    pending.Reason = "cancelled";
-                    pending.Message = "Cancelling download.";
-                });
-                Changed(job);
-                running = null;
-            }
-            _cancelling.Add(id);
-        }
-
+        bool cancelling = false;
         try
         {
+            Task? running = null;
+            lock (_lock)
+            {
+                if (!_jobs.TryGetValue(id, out DownloadJob? job) || job.Kind == JobKind.BrowserFile)
+                    return new(false, "This download is no longer available.");
+                if (!CanDiscardPartial(job))
+                    return new(false, "This download has already reached file publication. Nothing was deleted.");
+                if (!_cancelling.Add(id))
+                    return new(false, "This download is already being cancelled.");
+                cancelling = true;
+
+                if (_sessions.TryGetValue(id, out JobSession? session))
+                {
+                    session.Intent = StopIntent.Cancel;
+                    session.Cts.Cancel();
+                    running = session.RunTask;
+                }
+            }
+
             if (running is not null) await running.ConfigureAwait(false);
 
             CancelDownloadResult result;
-            bool removed = false;
             lock (_lock)
             {
                 if (!_jobs.TryGetValue(id, out DownloadJob? job))
                     return new(false, "This download no longer exists.");
-                if (_sessions.ContainsKey(id) || job.State is JobState.Completed or JobState.Verifying
-                    or JobState.Finalizing or JobState.Converting || job.FinalPath is not null
-                    || job.PendingFinalPath is not null)
+                if (_sessions.ContainsKey(id) || !CanDiscardPartial(job))
                     return new(false, "The download reached file publication before cancellation. Nothing was deleted.");
 
-                if (!TryRemoveCancelledFiles(job, out string error))
-                {
-                    string message = "Could not remove download data: " + error;
-                    PersistUiMutationLocked(job, pending =>
-                    {
-                        pending.State = JobState.Cancelled;
-                        pending.NextRetryUtc = null;
-                        pending.Reason = "cancel-cleanup";
-                        pending.Message = message;
-                    });
-                    Changed(job);
-                    result = new(false, job.Message);
-                }
-                else
-                {
-                    _store.Delete(id);
-                    RemoveDuplicateCandidateLocked(job, job.SourceUrl);
-                    _jobs.Remove(id);
-                    _credentials.Remove(id);
-                    _missing.Remove(id);
-                    _forced.Remove(id);
-                    Log(id, "cancelled", "The unfinished download and its owned temporary files were removed.");
-                    removed = true;
-                    result = new(true, "Download cancelled.");
-                }
+                result = FinishCancellationLocked(job);
+                if (!result.Cancelled) Changed(job);
             }
 
             // Deliver any older state notifications before the removal notification, so
             // a delayed queued snapshot cannot bring the cancelled row back to the UI.
             FlushOutbox();
-            if (removed)
+            if (result.Cancelled)
             {
                 JobRemoved?.Invoke(id);
                 ScheduleNext();
@@ -98,8 +73,44 @@ public sealed partial class DownloadEngine
         }
         finally
         {
-            lock (_lock) _cancelling.Remove(id);
+            if (cancelling)
+            {
+                lock (_lock) _cancelling.Remove(id);
+            }
         }
+    }
+
+    private CancelDownloadResult FinishCancellationLocked(DownloadJob job)
+    {
+        // A settled runner may have failed to save its outcome. Require our own cleanup commit before deleting bytes.
+        PersistUiMutationLocked(job, static pending =>
+        {
+            pending.State = JobState.Cancelled;
+            pending.NextRetryUtc = null;
+            pending.Reason = CancelCleanup;
+            pending.Message = "Cancellation is unfinished. Choose Cancel download to retry cleanup.";
+        });
+        RemoveDuplicateCandidateLocked(job, job.SourceUrl);
+        _forced.Remove(job.Id);
+
+        if (!TryRemoveCancelledFiles(job, out string error))
+        {
+            Log(job.Id, CancelCleanup, error);
+            return new(false, $"Could not remove download data: {error} Choose Cancel download to retry.");
+        }
+
+        try { _store.Delete(job.Id); }
+        catch (SqliteException ex)
+        {
+            Log(job.Id, CancelCleanup, ex.Message);
+            return new(false, "The temporary files were removed. Choose Cancel download to retry removing the entry.");
+        }
+
+        _jobs.Remove(job.Id);
+        _credentials.Remove(job.Id);
+        _missing.Remove(job.Id);
+        Log(job.Id, "cancelled", "The unfinished download and its owned temporary files were removed.");
+        return new(true, "Download cancelled.");
     }
 
     private static bool TryRemoveCancelledFiles(DownloadJob job, out string error)
@@ -108,6 +119,11 @@ public sealed partial class DownloadEngine
         string partial, folder;
         try
         {
+            if (!Path.IsPathFullyQualified(job.PartialPath) || !Path.IsPathFullyQualified(job.DestinationFolder))
+            {
+                error = "The recorded download path is invalid.";
+                return false;
+            }
             partial = Path.GetFullPath(job.PartialPath);
             folder = Path.GetFullPath(job.DestinationFolder);
         }
@@ -123,20 +139,6 @@ public sealed partial class DownloadEngine
             || !string.Equals(Path.GetDirectoryName(partial), folder, StringComparison.OrdinalIgnoreCase))
         {
             error = "The temporary file no longer matches this download.";
-            return false;
-        }
-
-        try
-        {
-            if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0)
-            {
-                error = "The download directory is a link; no files were deleted.";
-                return false;
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            error = "The download directory is unavailable.";
             return false;
         }
 
@@ -156,13 +158,15 @@ public sealed partial class DownloadEngine
         string[] owned = [.. files.Distinct(StringComparer.OrdinalIgnoreCase)];
         for (int pass = 0; pass < 2; pass++)
         {
+            if (!PathSafety.TryCheckUnlinkedDirectory(folder, out error)) return false;
+
             foreach (string file in owned)
             {
                 try
                 {
                     FileAttributes attributes = File.GetAttributes(file);
                     if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0
-                        || PathSafety.Inspect(file).IsCloudPlaceholder)
+                        || PathSafety.IsCloudPlaceholder(attributes))
                     {
                         error = "A temporary path was replaced by a directory, link or cloud placeholder.";
                         return false;

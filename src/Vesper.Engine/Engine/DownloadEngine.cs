@@ -27,6 +27,7 @@ public sealed partial class DownloadEngine : IDisposable
     private readonly HashSet<Guid> _forced = [];
     private readonly HashSet<Guid> _missing = [];
     private readonly ConcurrentQueue<JobSnapshot> _outbox = new();
+    private readonly object _outboxLock = new();
     private Timer? _wakeTimer;
     private Timer? _pumpTimer;
     private volatile bool _crashed;
@@ -210,10 +211,13 @@ public sealed partial class DownloadEngine : IDisposable
     /// <summary>Raises queued change events outside every lock so handlers may call back into the engine.</summary>
     private void FlushOutbox()
     {
-        while (_outbox.TryDequeue(out JobSnapshot? snapshot)) JobChanged?.Invoke(snapshot);
-        bool active;
-        lock (_lock) active = _sessions.Count > 0;
-        if (active != _wasActive) { _wasActive = active; ActivityChanged?.Invoke(active); }
+        lock (_outboxLock)
+        {
+            while (_outbox.TryDequeue(out JobSnapshot? snapshot)) JobChanged?.Invoke(snapshot);
+            bool active;
+            lock (_lock) active = _sessions.Count > 0;
+            if (active != _wasActive) { _wasActive = active; ActivityChanged?.Invoke(active); }
+        }
     }
 
     // ---- internal services used by runners ------------------------------------------------------------------------
@@ -268,19 +272,21 @@ public sealed partial class DownloadEngine : IDisposable
     internal void SetPhase(DownloadJob job, JobState state) => UpdateJob(job, j => j.State = state);
 
     /// <summary>
-    /// Durability point for new extents. Publish the saved progress while holding the engine
-    /// lock: another metadata writer must never re-save the previous extents/generation
-    /// between SQLite's commit and the checkpoint worker's later pending-range cleanup.
+    /// Saves flushed bytes before making them visible. Retire the batch under the same lock
+    /// so snapshots cannot count it twice and metadata writers see the committed version.
     /// </summary>
-    internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState)
+    internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState, Action? retirePending = null)
     {
         lock (_lock)
         {
+            if (job.Kind == JobKind.Hls && mediaState is not null)
+                mediaState = HlsTransfer.PreserveLiveStop(job.MediaState, mediaState);
             DownloadJob copy = job.CloneForCommit(next, mediaState ?? job.MediaState);
             SaveLocked(copy);
             job.Extents = copy.Extents;
             job.Generation = copy.Generation;
             job.MediaState = copy.MediaState;
+            retirePending?.Invoke();
             return copy;
         }
     }
@@ -312,6 +318,7 @@ public sealed partial class DownloadEngine : IDisposable
 
             foreach (Guid id in _forced.ToArray())
             {
+                if (_cancelling.Contains(id)) continue;
                 if (_jobs.TryGetValue(id, out DownloadJob? job) && job.State == JobState.Queued && !_sessions.ContainsKey(id)) StartSession(job);
                 else if (!_sessions.ContainsKey(id)) _forced.Remove(id);
             }
@@ -324,6 +331,7 @@ public sealed partial class DownloadEngine : IDisposable
             else
             {
                 foreach (JobSession session in _sessions.Values.Where(s => !_forced.Contains(s.Job.Id)
+                    && s.Intent == StopIntent.None
                     && s.Job.State is not (JobState.Verifying or JobState.Converting or JobState.Finalizing)))
                 {
                     session.Intent = StopIntent.Window;
@@ -408,17 +416,30 @@ public sealed partial class DownloadEngine : IDisposable
                 _sessions.Remove(job.Id);
                 _forced.Remove(job.Id);
                 bool progressed = job.Extents.TotalBytes > session.CommittedAtStart;
-                if (session.Intent == StopIntent.BrowserFallback && outcome.State != JobState.Completed)
+                if (session.Intent == StopIntent.BrowserFallback && outcome.State != JobState.Completed
+                    && job.PendingFinalPath is null)
                     outcome = BrowserFallbackOutcome;
-                if (session.Intent == StopIntent.Cancel && outcome.State != JobState.Completed && job.State != JobState.Completed)
+                if (session.Intent == StopIntent.Cancel && outcome.State != JobState.Completed
+                    && job.State != JobState.Completed && job.PendingFinalPath is null)
                     outcome = new RunOutcome(JobState.Cancelled, "cancelled", "Cancelling download.");
                 bool wasCandidate = IsDuplicateCandidate(job);
                 string previousSourceUrl = job.SourceUrl;
-                ApplyOutcome(job, outcome, progressed);
-                ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
-                SaveLocked(job);
-                Changed(job);
-                Log(job.Id, "run-ended", $"{job.State} {job.Reason} {outcome.Message}");
+                DownloadJob updated = job.CopyForUpdate();
+                ApplyOutcome(updated, outcome, progressed);
+                try
+                {
+                    SaveLocked(updated);
+                    job.ApplyPersistedState(updated);
+                    ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
+                    Changed(job);
+                    Log(job.Id, "run-ended", $"{job.State} {job.Reason} {outcome.Message}");
+                }
+                catch (LocalStorageException ex)
+                {
+                    // Keep the live record at its last committed state. Startup will recover
+                    // the durable active state and retry the unfinished transfer.
+                    Log(job.Id, "save-failed", ex.Message);
+                }
             }
         }
         catch (FailpointCrash) { _crashed = true; }
@@ -489,17 +510,37 @@ public sealed partial class DownloadEngine : IDisposable
     {
         lock (_lock)
         {
+            if (_disposed || _crashed) return;
+
             DateTime now = DateTime.UtcNow;
             foreach (DownloadJob job in _jobs.Values.Where(j => j.State is JobState.WaitingForRetry or JobState.WaitingForNetwork
                 && j.NextRetryUtc is { } due && due <= now && !_sessions.ContainsKey(j.Id)))
             {
-                job.State = JobState.Queued;
-                job.NextRetryUtc = null;
-                SaveLocked(job);
-                Changed(job);
+                try
+                {
+                    PersistUiMutationLocked(job, static pending =>
+                    {
+                        pending.State = JobState.Queued;
+                        pending.NextRetryUtc = null;
+                    });
+                    Changed(job);
+                }
+                catch (LocalStorageException ex) { Log(job.Id, "wake-save-failed", ex.Message); }
             }
         }
-        ScheduleNext();
+
+        try { ScheduleNext(); }
+        catch (LocalStorageException ex)
+        {
+            lock (_lock)
+            {
+                if (_disposed || _crashed) return;
+                Log(null, "wake-start-failed", ex.Message);
+                // A queued job has no retry timestamp after waking. Re-arm the one-shot timer.
+                _wakeTimer?.Change(TimeSpan.FromSeconds(2), Timeout.InfiniteTimeSpan);
+            }
+            FlushOutbox();
+        }
     }
 
     private void OnNetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e)
@@ -515,10 +556,16 @@ public sealed partial class DownloadEngine : IDisposable
             foreach (DownloadJob job in _jobs.Values.Where(j => !_sessions.ContainsKey(j.Id)
                 && (j.State == JobState.WaitingForNetwork || (includeRetry && j.State == JobState.WaitingForRetry))))
             {
-                job.State = JobState.Queued;
-                job.NextRetryUtc = null;
-                SaveLocked(job);
-                Changed(job);
+                try
+                {
+                    PersistUiMutationLocked(job, static pending =>
+                    {
+                        pending.State = JobState.Queued;
+                        pending.NextRetryUtc = null;
+                    });
+                    Changed(job);
+                }
+                catch (LocalStorageException ex) { Log(job.Id, "wake-save-failed", ex.Message); }
             }
         }
         ScheduleNext();

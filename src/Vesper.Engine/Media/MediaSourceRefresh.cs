@@ -21,6 +21,9 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
+            if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (job.Kind == JobKind.Hls && HlsTransfer.IsLiveState(job.MediaState))
             {
                 if (_sessions.ContainsKey(id)) return Rejected("Pause the live recording before refreshing its source.");
@@ -46,17 +49,8 @@ public sealed partial class DownloadEngine
             return Rejected(credentialError);
         if (liveState is not null)
             return await RefreshLiveHlsSourceAsync(id, replacement, liveState, credentials, ct).ConfigureAwait(false);
-        var result = await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials).ConfigureAwait(false);
-        if (result.Accepted)
-        {
-            lock (_lock)
-            {
-                if (_jobs.TryGetValue(id, out var job) && job.SourceUrl == replacement.Url)
-                { job.MediaExpiresAt = replacement.ExpiresAt; SaveLocked(job); Changed(job); }
-            }
-            FlushOutbox();
-        }
-        return result;
+        return await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials, replacement.ExpiresAt)
+            .ConfigureAwait(false);
     }
 
     private static bool TryCreateReplacementCredentials(ResolvedMediaSource replacement,
@@ -134,8 +128,9 @@ public sealed partial class DownloadEngine
         DateTimeOffset? expiresAt, IReadOnlyDictionary<string, string> secrets, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(secrets);
+        DownloadJob original;
         DownloadJob snapshot;
-        string savedPlanJson;
+        ExtentSet savedExtents;
         MediaMergePlan current;
         MediaMergePlan next;
         RequestCredentials? credentials;
@@ -143,6 +138,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
             if (job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
                 or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
@@ -159,8 +157,9 @@ public sealed partial class DownloadEngine
             if (!TryCreateMergeCredentials(next, firstTrack, secrets, out credentials, out string credentialError)
                 || credentials is null)
                 return Rejected(credentialError.Length > 0 ? credentialError : "The refreshed merge credentials are unavailable.");
-            savedPlanJson = job.MediaPlanJson!;
-            snapshot = job;
+            original = job;
+            savedExtents = job.Extents;
+            snapshot = job.CopyForUpdate();
         }
 
         string? probeError = await ProbeCredentialedMergeTracksAsync(next, snapshot.Referer, snapshot.UserAgent, credentials!, ct)
@@ -170,22 +169,25 @@ public sealed partial class DownloadEngine
 
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, snapshot)
-                || _sessions.ContainsKey(id) || job.MediaPlanJson != savedPlanJson
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, original)
+                || _cancelling.Contains(id)
+                || IsCleanupPending(job) || job.PendingFinalPath is not null
+                || _sessions.ContainsKey(id) || job.MediaPlanJson != snapshot.MediaPlanJson
+                || job.MediaState != snapshot.MediaState || !ReferenceEquals(job.Extents, savedExtents)
                 || job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
                     or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
                 return Rejected("The merge job changed while its refreshed tracks were being checked. Saved data was kept.");
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The refreshed source expired before it could be installed.");
 
-            job.MediaPlanJson = next.ToJson();
-            ChangeSourceUrlLocked(job, next.Tracks[0].Url);
-            job.MediaExpiresAt = expiresAt;
-            _credentials[id] = credentials!;
+            DownloadJob updated = job.CopyForUpdate();
+            updated.PreviousUrls = AppendPreviousUrl(updated.PreviousUrls, updated.SourceUrl);
+            updated.MediaPlanJson = next.ToJson();
+            updated.SourceUrl = next.Tracks[0].Url;
+            updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
-                (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
-            AddDuplicateCandidateLocked(job);
-            SaveLocked(job);
-            Changed(job);
+                (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
+            SaveRefreshedJobLocked(job, updated);
+            _credentials[id] = credentials!;
         }
         FlushOutbox();
         ScheduleNext();
@@ -238,6 +240,8 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls
+                || _cancelling.Contains(id)
+                || IsCleanupPending(current) || current.PendingFinalPath is not null
                 || _sessions.ContainsKey(id) || current.MediaState != savedState)
                 return Rejected("The live recording changed before its replacement could be checked. Saved data was kept.");
             job = current;
@@ -257,28 +261,31 @@ public sealed partial class DownloadEngine
         long retained;
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls || _sessions.ContainsKey(id)
+            if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls
+                || _cancelling.Contains(id)
+                || IsCleanupPending(current) || current.PendingFinalPath is not null || _sessions.ContainsKey(id)
                 || current.MediaState != savedState || !HlsTransfer.IsLiveState(current.MediaState))
                 return Rejected("The live recording changed while its replacement was being checked. Saved data was kept.");
+            if (replacement.ExpiresAt <= DateTimeOffset.UtcNow)
+                return Rejected("The refreshed live source expired before it could be installed.");
             job = current;
             retained = job.Extents.TotalBytes;
-            string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            job.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
-            ChangeSourceUrlLocked(job, replacement.Url);
-            if (credentials is not null) _credentials[job.Id] = credentials;
-            else if (_credentials.TryGetValue(job.Id, out RequestCredentials? prior)
+            DownloadJob updated = job.CopyForUpdate();
+            updated.PreviousUrls = AppendPreviousUrl(updated.PreviousUrls, updated.SourceUrl);
+            updated.SourceUrl = replacement.Url;
+            updated.MediaState = nextState;
+            updated.MediaExpiresAt = replacement.ExpiresAt;
+            updated.State = JobState.Queued;
+            updated.Reason = "";
+            updated.Message = "Source refreshed; continuing at the next live sequence.";
+            updated.RetryCount = 0;
+            updated.NextRetryUtc = null;
+            bool removeCredentials = credentials is null && _credentials.TryGetValue(job.Id, out RequestCredentials? prior)
                 && Uri.TryCreate(replacement.Url, UriKind.Absolute, out Uri? replacementUri)
-                && !UrlPolicy.IsSameOrigin(prior.Origin, replacementUri)) _credentials.Remove(job.Id);
-            job.MediaState = nextState;
-            job.MediaExpiresAt = replacement.ExpiresAt;
-            job.State = JobState.Queued;
-            AddDuplicateCandidateLocked(job);
-            job.Reason = "";
-            job.Message = "Source refreshed; continuing at the next live sequence.";
-            job.RetryCount = 0;
-            job.NextRetryUtc = null;
-            SaveLocked(job);
-            Changed(job);
+                && !UrlPolicy.IsSameOrigin(prior.Origin, replacementUri);
+            SaveRefreshedJobLocked(job, updated);
+            if (credentials is not null) _credentials[job.Id] = credentials;
+            else if (removeCredentials) _credentials.Remove(job.Id);
         }
         FlushOutbox();
         ScheduleNext();
@@ -296,6 +303,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan current, out _)
                 && MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan next, out _))
             {
@@ -320,6 +330,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
             if (job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
                 or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
@@ -356,22 +369,24 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, snapshot)
+                || _cancelling.Contains(id)
+                || IsCleanupPending(job) || job.PendingFinalPath is not null
                 || _sessions.ContainsKey(id) || job.MediaPlanJson != savedPlanJson
                 || job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
                     or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
                 return Rejected("The merge job changed while its refreshed parts were being checked. Saved data was kept.");
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The refreshed source expired before it could be installed.");
 
-            job.MediaPlanJson = next.ToJson();
-            job.MediaState = rebasedCursor;
-            ChangeSourceUrlLocked(job, next.Tracks[0].Url);
-            job.MediaExpiresAt = expiresAt;
-            _credentials.Remove(id);
+            DownloadJob updated = job.CopyForUpdate();
+            updated.PreviousUrls = AppendPreviousUrl(updated.PreviousUrls, updated.SourceUrl);
+            updated.MediaPlanJson = next.ToJson();
+            updated.MediaState = rebasedCursor;
+            updated.SourceUrl = next.Tracks[0].Url;
+            updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
-                (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
-            AddDuplicateCandidateLocked(job);
-            SaveLocked(job);
-            Changed(job);
+                (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
+            SaveRefreshedJobLocked(job, updated);
+            _credentials.Remove(id);
         }
         FlushOutbox();
         ScheduleNext();
@@ -426,6 +441,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (IsCleanupPending(job) || job.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
             if (job.State == JobState.Completed) return Rejected("The download is already complete.");
             if (!MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out var current, out _))
@@ -435,18 +453,31 @@ public sealed partial class DownloadEngine
             next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
             if (!current.CanContinueWith(next, out var why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
-            job.MediaPlanJson = next.ToJson();
-            ChangeSourceUrlLocked(job, next.Tracks[0].Url);
-            job.MediaExpiresAt = expiresAt;
-            _credentials.Remove(id);
+            DownloadJob updated = job.CopyForUpdate();
+            updated.PreviousUrls = AppendPreviousUrl(updated.PreviousUrls, updated.SourceUrl);
+            updated.MediaPlanJson = next.ToJson();
+            updated.SourceUrl = next.Tracks[0].Url;
+            updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
-                (job.State, job.Reason, job.Message, job.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
-            AddDuplicateCandidateLocked(job);
-            SaveLocked(job);
-            Changed(job);
+                (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
+            SaveRefreshedJobLocked(job, updated);
+            _credentials.Remove(id);
         }
         FlushOutbox();
         ScheduleNext();
         return new RescueResult(true, RescueMode.R0, "The refreshed source matches the saved tracks byte-for-byte by provider identity. Download continues.", 0);
     }
+
+    private void SaveRefreshedJobLocked(DownloadJob job, DownloadJob updated)
+    {
+        bool wasCandidate = IsDuplicateCandidate(job);
+        string previousSourceUrl = job.SourceUrl;
+        SaveLocked(updated);
+        job.ApplyPersistedState(updated);
+        ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
+        Changed(job);
+    }
+
+    private static string AppendPreviousUrl(string previousUrls, string sourceUrl) =>
+        string.Join('\n', previousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries).Append(sourceUrl).TakeLast(10));
 }

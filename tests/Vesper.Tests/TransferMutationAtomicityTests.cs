@@ -134,6 +134,26 @@ public sealed class TransferMutationAtomicityTests
     }
 
     [Fact]
+    public async Task Progress_counts_committed_checkpoint_bytes_once()
+    {
+        await using var server = new FaultServer(128 * 1024);
+        await server.StartAsync();
+        var progress = new TaskCompletionSource<JobSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Harness? active = null;
+        using var h = active = new Harness(point =>
+        {
+            if (point == "checkpoint.afterCommit")
+                progress.TrySetResult(Assert.Single(active!.Engine.Snapshots()));
+        });
+        Guid id = h.Add(server.Url("/file"), "progress.bin");
+
+        JobSnapshot snapshot = await progress.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.InRange(snapshot.CommittedBytes, 1, server.V1.Length);
+        Assert.Equal(snapshot.CommittedBytes, snapshot.ProgressBytes);
+        await h.WaitForStateAsync(id, JobState.Completed);
+    }
+
+    [Fact]
     public void Successful_update_invokes_mutator_once_and_keeps_saved_timestamp_identical()
     {
         using var harness = new Harness(tweak: o => o.Schedule = ClosedWindow());

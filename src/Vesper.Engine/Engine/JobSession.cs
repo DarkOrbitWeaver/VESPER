@@ -130,17 +130,16 @@ internal sealed class JobSession : IDisposable
 
             ExtentSet next = Job.Extents.Clone();
             foreach (ByteRange r in batch) next.Add(r);
-            DownloadJob committed = _engine.CommitCheckpoint(Job, next, media);   // throws if the commit failed
-            _engine.Failpoint("checkpoint.afterCommit");
-
-            lock (Gate)
+            DownloadJob committed = _engine.CommitCheckpoint(Job, next, media, () =>
             {
-                Job.Extents = next;
-                Job.Generation = committed.Generation;
-                Job.MediaState = committed.MediaState;
-                foreach (ByteRange r in batch) _pending.Remove(r);
-                _writtenSinceCheckpoint = _pending.TotalBytes;
-            }
+                lock (Gate)
+                {
+                    foreach (ByteRange r in batch) _pending.Remove(r);
+                    _writtenSinceCheckpoint = _pending.TotalBytes;
+                    if (_pending.IsEmpty) _pendingMediaState = null;
+                }
+            });
+            _engine.Failpoint("checkpoint.afterCommit");
             Volatile.Write(ref _lastCheckpointTicks, Stopwatch.GetTimestamp());
             // The manifest is a temp-file write plus a rename, which sync folders and antivirus notice.
             // The database commit above is the real checkpoint; the manifest only needs to be recent.

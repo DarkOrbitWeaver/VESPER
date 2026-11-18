@@ -488,10 +488,10 @@ internal sealed class Harness : IDisposable
         return DownloadEngine.Start(options);
     }
 
-    public void Restart(Action<string>? failpoint = null)
+    public void Restart(Action<string>? failpoint = null, Action<EngineOptions>? tweak = null)
     {
         Engine.Dispose();
-        Engine = Start(failpoint, null);
+        Engine = Start(failpoint, tweak);
     }
 
     public Guid Add(string url, string? name = null, string? sha256 = null, string? pieces = null, bool startNow = true)

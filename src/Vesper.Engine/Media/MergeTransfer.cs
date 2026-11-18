@@ -265,12 +265,6 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         var next = new ExtentSet();
         next.Add(new ByteRange(0, length));
         DownloadJob committed = engine.CommitCheckpoint(Job, next, JsonSerializer.Serialize(new Cursor(1, fingerprint, "muxed", length, sha)));
-        lock (session.Gate)
-        {
-            Job.Extents = next;
-            Job.Generation = committed.Generation;
-            Job.MediaState = committed.MediaState;
-        }
         engine.WriteManifest(committed);
         engine.UpdateJob(Job, j => { j.TotalBytes = length; j.Message = ""; });
         return await PublishAsync(ct).ConfigureAwait(false);

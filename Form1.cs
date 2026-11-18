@@ -933,7 +933,7 @@ public partial class Form1 : Form
         var selected = _grid.CheckedItems;
         _pause.Enabled = selected.Any(r => r.Status is JobStatus.Downloading or JobStatus.Queued or JobStatus.Resolving or JobStatus.WaitingRetry or JobStatus.Waiting);
         _resume.Enabled = selected.Any(r => r.BrowserFile is { Paused: true, CanResume: true }
-            || r.BrowserFile is null && r.Status is JobStatus.Paused or JobStatus.Failed or JobStatus.NeedsAttention);
+            || r.Snapshot is { IsCleanupPending: false, State: JobState.Paused or JobState.Failed or JobState.NeedsAttention });
         JobSnapshot[] native = [.. selected.Where(r => r.Snapshot is not null).Select(r => r.Snapshot!)];
         bool allNative = native.Length == count && count > 0;
         bool onlyUnfinished = allNative && native.All(CanCancel);
@@ -1186,12 +1186,13 @@ public partial class Form1 : Form
                     fileAvailable || (name == "Open containing folder" && s.State == JobState.Suspect),
                 "Locate file…" => s.State == JobState.Completed && s.FileMissing,
                 "Pause" => s.State is JobState.Resolving or JobState.Downloading or JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry,
-                "Resume" => s.State is JobState.Paused or JobState.Failed or JobState.NeedsAttention or JobState.Cancelled,
-                "Stop and keep" => s.IsLiveRecording && s.State is not (JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting),
-                "Start now" => s.State is JobState.Queued or JobState.Paused or JobState.WaitingForRetry or JobState.WaitingForNetwork,
-                "Replace link…" => s.State is JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.Queued or JobState.WaitingForRetry,
+                "Resume" => !s.IsCleanupPending && s.State is (JobState.Paused or JobState.Failed or JobState.NeedsAttention or JobState.Cancelled),
+                "Stop and keep" => !s.IsCleanupPending && s.IsLiveRecording && s.State is not (JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting),
+                "Start now" => !s.IsCleanupPending && s.State is (JobState.Queued or JobState.Paused or JobState.WaitingForRetry or JobState.WaitingForNetwork),
+                "Replace link…" => !s.IsCleanupPending && s.State is (JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.Queued or JobState.WaitingForRetry),
                 "Resume anyway…" => s.State == JobState.NeedsAttention && s.Reason == "no-validator",
-                "Start over…" => s.CommittedBytes > 0 && s.State is JobState.NeedsAttention or JobState.Failed or JobState.Suspect or JobState.Paused or JobState.NeedsLink,
+                "Start over…" => s is { IsCleanupPending: true, State: JobState.NeedsAttention }
+                    || s.CommittedBytes > 0 && s.State is (JobState.NeedsAttention or JobState.Failed or JobState.Suspect or JobState.Paused or JobState.NeedsLink),
                 _ => false
             };
             if (command.Available != available) command.Available = available;

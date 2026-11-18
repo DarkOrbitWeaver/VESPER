@@ -31,7 +31,7 @@ A feature is **implemented** when changed in source, **tested** when automated t
 
 ## Humanify and human-written quality criteria
 
-1. Discover the actual Humanify skill (user asked for it). **At the time of this document, the installed skill catalog did not contain Humanify.** If later installed, read and apply its instructions. Otherwise mark "Humanify tool unavailable; manual human-centered review performed" and do not pretend the skill was used.
+1. Use the installed Humanify skill for implementation and review. It was read and applied to the 2026-11-18 repair batch. Release quality still requires the review and evidence below.
 2. Humanify is **not** license to cosmetically rewrite working code or remove useful assertions, comments, logs, tests or safety checks. Favor small readable functions, expressive names, explicit contracts, no invented abstractions, and comments explaining nonobvious invariants. Preserve code style and avoid robotic filler.
 3. UI quality requires actual current-build inspection: short natural labels, clear states and recoverable errors, human proportions/spacing, consistent icons and colors, predictable focus and hover, no artificial loading animation or fake progress. Validate with users' expected everyday actions.
 4. Review high-impact flows (first run; paste; browser click; quality choice; download start; pause/resume; Cancel; Rescue; error; completion; update/uninstall) for **fewest reasonable steps**, no inconsistent terminology, no hidden destructive side effects, and positive/negative states.

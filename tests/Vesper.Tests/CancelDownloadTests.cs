@@ -1,4 +1,5 @@
 using System.Reflection;
+using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -63,6 +64,84 @@ public sealed class CancelDownloadTests
         Assert.False(File.Exists(partial + ".vmeta"));
         Assert.False(File.Exists(Path.Combine(h.Downloads, "slow.bin")));
         h.Restart();
+        Assert.Null(h.Engine.Snapshot(id));
+    }
+
+    [Fact]
+    public async Task Active_cancel_keeps_committed_bytes_if_cleanup_cannot_be_saved()
+    {
+        await using var server = new FaultServer(16 * 1024 * 1024);
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConnectionsPerJob = 1);
+        Guid id = h.Add(server.Url("/slow"), "slow.bin");
+        JobSnapshot running = await h.WaitAsync(id, s => s.State == JobState.Downloading && s.CommittedBytes > 0);
+
+        string database = Path.Combine(h.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TRIGGER refuse_cancel BEFORE UPDATE ON jobs WHEN NEW.state = 13
+            BEGIN SELECT RAISE(ABORT, 'cancellation write refused'); END;
+            CREATE TRIGGER refuse_delete BEFORE DELETE ON jobs
+            BEGIN SELECT RAISE(ABORT, 'job removal refused'); END;
+            """;
+        command.ExecuteNonQuery();
+
+        await Assert.ThrowsAsync<LocalStorageException>(() => h.Engine.CancelDownloadAsync(id));
+        byte[] partial = await File.ReadAllBytesAsync(running.PartialPath);
+        Assert.Equal(server.V1[..(int)running.CommittedBytes], partial[..(int)running.CommittedBytes]);
+        using (JobStore store = JobStore.Open(database))
+        {
+            DownloadJob saved = Assert.Single(store.LoadAll());
+            Assert.Equal(id, saved.Id);
+            Assert.True(saved.Extents.TotalBytes >= running.CommittedBytes);
+            Assert.NotEqual(JobState.Cancelled, saved.State);
+        }
+
+        command.CommandText = "DROP TRIGGER refuse_cancel; DROP TRIGGER refuse_delete;";
+        command.ExecuteNonQuery();
+        Assert.True((await h.Engine.CancelDownloadAsync(id)).Cancelled);
+        Assert.False(File.Exists(running.PartialPath));
+    }
+
+    [Fact]
+    public async Task Refused_row_delete_leaves_cleanup_pending_until_cancel_is_retried()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/hls/live/index.m3u8"),
+            FileName: "capture", Kind: JobKind.Hls));
+        Assert.True(added.Ok, added.Message);
+        Guid id = added.JobId;
+        JobSnapshot recording = await h.WaitAsync(id, s => s.IsLiveRecording && s.CommittedBytes > 0);
+
+        string database = Path.Combine(h.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "CREATE TRIGGER refuse_delete BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'job removal refused'); END;";
+        command.ExecuteNonQuery();
+
+        CancelDownloadResult refused = await h.Engine.CancelDownloadAsync(id);
+        Assert.False(refused.Cancelled);
+        Assert.Contains("retry", refused.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(recording.PartialPath));
+
+        h.Restart();
+        JobSnapshot parked = Assert.IsType<JobSnapshot>(h.Engine.Snapshot(id));
+        Assert.Equal(JobState.Cancelled, parked.State);
+        Assert.True(parked.IsCleanupPending);
+        h.Engine.Resume(id);
+        h.Engine.StartNow(id);
+        Assert.False(h.Engine.StopAndKeepLive(id));
+        Assert.False(h.Engine.RemoveFromList(id).Removed);
+        Assert.Equal(JobState.Cancelled, h.Engine.Snapshot(id)!.State);
+
+        command.CommandText = "DROP TRIGGER refuse_delete;";
+        command.ExecuteNonQuery();
+        Assert.True((await h.Engine.CancelDownloadAsync(id)).Cancelled);
         Assert.Null(h.Engine.Snapshot(id));
     }
 
