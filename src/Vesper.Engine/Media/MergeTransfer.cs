@@ -9,7 +9,7 @@ namespace Vesper.Engine;
 /// Native merge job. Phase 1 downloads every track into its own region of the job's partial file using bounded
 /// (8 MiB) range requests through the normal durable checkpoint pipeline, so progress, pause, crash recovery and
 /// per-chunk retry all reuse the engine's guarantees. Phase 2 demuxes the committed regions, remuxes them into one
-/// container (no transcoding), re-validates the output and swaps it in atomically. The downloaded tracks are kept
+/// container (no transcoding), validates the output and records the swap before moving files. The downloaded tracks are kept
 /// until the merged file is published, so a failed merge never destroys completed work.
 /// </summary>
 internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
@@ -19,7 +19,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
     private const int ChunkAttempts = 3;
     private DownloadJob Job => session.Job;
 
-    internal sealed record Cursor(int Version, string Fingerprint, string Phase, long MuxLength = 0, string? MuxSha256 = null);
+    internal sealed record Cursor(int Version, string Fingerprint, string Phase, long MuxLength = 0, string? MuxSha256 = null,
+        long TracksLength = 0, string? TracksSha256 = null);
     private sealed class Progress { public long Offset; }
 
     internal static string TracksPath(DownloadJob job) => job.PartialPath + ".tracks";
@@ -28,13 +29,25 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
     /// <summary>Removes merge sidecars. Returns false when a file could not be removed (the caller decides how to report it).</summary>
     internal static bool DeleteSidecars(DownloadJob job)
     {
-        bool ok = true;
-        foreach (string path in new[] { TracksPath(job), MergingPath(job) })
+        string tracks = TracksPath(job);
+        try
         {
-            try { if (File.Exists(path)) File.Delete(path); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { ok = false; }
+            if (PathExists(MergingPath(job))) return false;
+            if (!PathExists(tracks)) return true;
+            if (job.MediaState is null
+                || JsonSerializer.Deserialize<Cursor>(job.MediaState) is not
+                    { Phase: "muxed", TracksLength: > 0, TracksSha256: { Length: 64 } digest } cursor) return false;
+
+            using var handle = PathSafety.OpenTemporaryHandle(tracks, FileMode.Open, FileAccess.Read, FileShare.Read,
+                FileOptions.SequentialScan, allowDelete: true);
+            using var file = new FileStream(handle, FileAccess.Read, 1 << 16);
+            if (file.Length != cursor.TracksLength
+                || !Convert.ToHexString(SHA256.HashData(file)).Equals(digest, StringComparison.OrdinalIgnoreCase))
+                return false;
+            PathSafety.DeleteOpenTemporaryFile(handle, tracks);
+            return true;
         }
-        return ok;
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
 
     internal async Task<RunOutcome> RunAsync(CancellationToken ct)
@@ -54,10 +67,11 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             if (cursor is null || cursor.Version != 1 || cursor.Fingerprint != fingerprint)
                 return Stop("The saved data belongs to a different representation. Restart as a separate copy.");
         }
+        if (cursor?.Phase == "swapping") return await FinishSwapAsync(cursor, ct).ConfigureAwait(false);
         if (cursor?.Phase == "muxed") return await FinalizeMergedAsync(cursor, ct).ConfigureAwait(false);
         if (cursor is not null && cursor.Phase != "download") return Stop("The saved merge cursor has an unknown phase.");
 
-        RecoverInterruptedSwap();
+        RestoreLegacyTracks(Job);
         long total = plan.TotalBytes;
         if (Job.Extents.End > total) return Stop("Committed bytes extend past the planned tracks.");
         if (Job.TotalBytes != total) engine.UpdateJob(Job, j => j.TotalBytes = total);
@@ -210,6 +224,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         string mergingPath = MergingPath(Job);
         long length;
         string sha;
+        long tracksLength;
+        string tracksSha;
         session.CloseFile();
         try
         {
@@ -244,6 +260,9 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                 MediaMerger.Validate(output, length, expected, ct, merged.Metadata, merged.ThumbnailSha256);
                 output.Position = 0;
                 sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+                tracksLength = source.Length;
+                source.Position = 0;
+                tracksSha = Convert.ToHexString(await SHA256.HashDataAsync(source, ct).ConfigureAwait(false));
             }
         }
         catch (MediaContainerException ex)
@@ -257,16 +276,23 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             return RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to merge. Saved data was kept.");
         }
 
-        // Swap: the downloaded tracks stay on disk under a sidecar name until the merged file is published.
-        string tracksPath = TracksPath(Job);
-        if (File.Exists(tracksPath)) return Stop("An older merge sidecar is in the way.");
-        File.Move(Job.PartialPath, tracksPath);
-        File.Move(mergingPath, Job.PartialPath);
+        if (PathExists(TracksPath(Job))) return Stop("An older merge sidecar is in the way.");
+        ct.ThrowIfCancellationRequested();
+        var swap = new Cursor(1, fingerprint, "swapping", length, sha, tracksLength, tracksSha);
+        engine.UpdateJob(Job, job => job.MediaState = JsonSerializer.Serialize(swap));
+        engine.Failpoint("merge.beforeSwap");
+        return await FinishSwapAsync(swap, ct).ConfigureAwait(false);
+    }
+
+    private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
+    {
+        await FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, cursor.TracksLength, cursor.TracksSha256, ct)
+            .ConfigureAwait(false);
         var next = new ExtentSet();
-        next.Add(new ByteRange(0, length));
-        DownloadJob committed = engine.CommitCheckpoint(Job, next, JsonSerializer.Serialize(new Cursor(1, fingerprint, "muxed", length, sha)));
+        next.Add(new ByteRange(0, cursor.MuxLength));
+        DownloadJob committed = engine.CommitCheckpoint(Job, next, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
+            totalBytes: cursor.MuxLength);
         engine.WriteManifest(committed);
-        engine.UpdateJob(Job, j => { j.TotalBytes = length; j.Message = ""; });
         return await PublishAsync(ct).ConfigureAwait(false);
     }
 
@@ -292,14 +318,58 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         return outcome;
     }
 
-    /// <summary>A crash between the two renames leaves the tracks under the sidecar name; the merge output was never committed.</summary>
-    private void RecoverInterruptedSwap()
+    internal static void RestoreLegacyTracks(DownloadJob job)
     {
-        string tracks = TracksPath(Job);
-        if (!File.Exists(tracks)) return;
-        session.CloseFile();
-        if (File.Exists(Job.PartialPath)) File.Delete(Job.PartialPath);
-        File.Move(tracks, Job.PartialPath);
+        string tracks = TracksPath(job);
+        if (!PathExists(tracks)) return;
+        if (PathExists(job.PartialPath) || job.Extents.IsEmpty)
+            throw new RunnerStop(Stop("There are two possible files from an older merge and no saved proof of the swap."));
+        using (var saved = PathSafety.OpenTemporaryHandle(tracks, FileMode.Open, FileAccess.Read, FileShare.Read))
+            if (RandomAccess.GetLength(saved) < job.Extents.End)
+                throw new RunnerStop(Stop("The saved tracks are shorter than the committed data."));
+        File.Move(tracks, job.PartialPath);
+    }
+
+    internal static async Task FinishSwapAsync(DownloadEngine engine, DownloadJob job, long muxLength, string? muxSha,
+        long tracksLength, string? tracksSha, CancellationToken ct)
+    {
+        string partial = job.PartialPath;
+        string tracks = TracksPath(job);
+        string stage = MergingPath(job);
+        bool hasTracks = PathExists(tracks);
+        bool hasStage = PathExists(stage);
+        bool hasPartial = PathExists(partial);
+        if ((!hasTracks && !(hasStage && hasPartial)) || (hasTracks && hasStage == hasPartial)
+            || tracksLength < job.Extents.End
+            || !await MatchesAsync(hasStage ? stage : partial, muxLength, muxSha, ct).ConfigureAwait(false)
+            || !await MatchesAsync(hasTracks ? tracks : partial, tracksLength, tracksSha, ct).ConfigureAwait(false))
+            throw new RunnerStop(Stop("The files from the interrupted merge do not match the saved swap."));
+
+        ct.ThrowIfCancellationRequested();
+        if (!hasTracks)
+        {
+            File.Move(partial, tracks);
+            engine.Failpoint("merge.afterTracksMove");
+        }
+        if (hasStage)
+        {
+            File.Move(stage, partial);
+            engine.Failpoint("merge.afterOutputMove");
+        }
+    }
+
+    internal static async Task<bool> MatchesAsync(string path, long length, string? digest, CancellationToken ct)
+    {
+        if (length <= 0 || digest is not { Length: 64 }) return false;
+        using var file = PathSafety.OpenTemporaryStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+        return file.Length == length
+            && Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false)).Equals(digest, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool PathExists(string path)
+    {
+        try { _ = File.GetAttributes(path); return true; }
+        catch (FileNotFoundException) { return false; }
     }
 
     private void EnsureSpace(long additional)

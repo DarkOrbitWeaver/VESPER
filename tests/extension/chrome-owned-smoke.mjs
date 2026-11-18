@@ -3,7 +3,7 @@
 //   $env:CHROME_PATH = 'C:\\path\\to\\chrome-for-testing\\chrome-win64\\chrome.exe'
 //   node tests/extension/chrome-owned-smoke.mjs
 // Chrome 137+ ignores --load-extension, so an ordinary installed Chrome cannot run this check.
-// The test explicitly disables interception before issuing a local, verifiable browser download.
+// The test covers opt-out and page-generated downloads without launching a native host.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -40,7 +40,8 @@ class Connection {
     const socket = new WebSocket(address);
     await new Promise((resolve, reject) => {
       socket.addEventListener('open', resolve, { once: true });
-      socket.addEventListener('error', () => reject(new Error('Cannot open the isolated Chrome debugger.')), { once: true });
+      socket.addEventListener('error', event => reject(new Error(
+        'Cannot open the isolated Chrome debugger: ' + (event.message || 'connection failed'))), { once: true });
     });
     return new Connection(socket);
   }
@@ -84,6 +85,11 @@ async function main() {
   await mkdir(downloadFolder);
   const bytes = Buffer.alloc(256 * 1024, 0x5a);
   const server = createServer((request, response) => {
+    if (request.url === '/page') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>VESPER smoke fixture</title><body></body>');
+      return;
+    }
     if (request.url !== '/fixture') {
       response.writeHead(404);
       response.end();
@@ -153,16 +159,21 @@ async function main() {
     }
     const workerSession = (await browser.send('Target.attachToTarget',
       { targetId: worker.targetId, flatten: true })).sessionId;
+    await browser.send('Runtime.enable', {}, workerSession);
 
-    async function evaluate(expression) {
+    async function evaluate(label, expression) {
       const reply = await browser.send('Runtime.evaluate',
-        { expression, awaitPromise: true, returnByValue: true }, workerSession);
-      if (reply.exceptionDetails) throw new Error('Extension worker rejected a test command.');
+        { expression, awaitPromise: true, returnByValue: true }, workerSession)
+        .catch(error => { throw new Error(label + ': ' + error.message, { cause: error }); });
+      if (reply.exceptionDetails) throw new Error(label + ': ' + reply.exceptionDetails.text);
       return reply.result.value;
     }
 
-    await evaluate("(async () => { await chrome.storage.sync.set({ intercept: false, route: 'chrome' });"
-      + "globalThis.__ownershipSmoke = { created: [], changed: [] };"
+    await evaluate("Configure Chrome ownership", "(async () => { await chrome.storage.sync.set({ intercept: false, route: 'chrome' });"
+      + "globalThis.__ownershipSmoke = { created: [], changed: [], nativeCalls: 0 };"
+      + "const guard = () => { __ownershipSmoke.nativeCalls++; throw new Error('Native calls are disabled in this test'); };"
+      + "chrome.runtime.sendNativeMessage = guard;"
+      + "if (chrome.runtime.sendNativeMessage !== guard) throw new Error('Could not guard the installed native host');"
       + "chrome.downloads.onCreated.addListener(d => __ownershipSmoke.created.push("
       + "{ id:d.id, state:d.state, bytesReceived:d.bytesReceived, totalBytes:d.totalBytes }));"
       + "chrome.downloads.onChanged.addListener(d => __ownershipSmoke.changed.push("
@@ -179,20 +190,46 @@ async function main() {
     await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/fixture' }, tab);
 
     const item = await waitFor(async () => {
-      const matches = await evaluate("chrome.downloads.search({})");
+      const matches = await evaluate("Read Chrome downloads", "chrome.downloads.search({})");
       return matches.find(candidate => candidate.filename?.endsWith('vesper-browser-owned-fixture.bin')
         && candidate.state === 'complete');
     }, 15000, 'Chrome did not finish the isolated fixture download.');
-    const observations = await evaluate('globalThis.__ownershipSmoke');
+    const observations = await evaluate('Read Chrome events', 'globalThis.__ownershipSmoke');
     const saved = await readFile(join(downloadFolder, 'vesper-browser-owned-fixture.bin'));
     assert.equal(saved.compare(bytes), 0, 'Chrome did not save the source bytes exactly.');
     assert.equal(observations.created.length, 1, 'The extension missed or duplicated the Chrome download event.');
     assert.equal(observations.created[0].id, item.id);
     assert.equal(item.state, 'complete');
     assert.ok(item.filename.startsWith(downloadFolder), 'The download escaped the isolated test folder.');
-    const decisions = await evaluate("chrome.storage.session.get('vesperCaptureDecisions')");
+    const decisions = await evaluate("Read VESPER decisions", "chrome.storage.session.get('vesperCaptureDecisions')");
     assert.ok(!decisions.vesperCaptureDecisions?.some(entry => entry.outcome === 'moved'),
       'A Chrome-owned file was falsely marked as a VESPER download.');
+
+    // With interception enabled, a page-generated download must still stay in Chrome.
+    await evaluate('Enable automatic capture', "chrome.storage.sync.set({ intercept: true, route: 'auto' })");
+    const blobName = 'vesper-page-made-fixture.bin';
+    await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/page' }, tab);
+    await waitFor(async () => {
+      const result = await browser.send('Runtime.evaluate',
+        { expression: "document.title === 'VESPER smoke fixture' && !!document.body", returnByValue: true }, tab);
+      return result.result.value;
+    }, 5000, 'The isolated fixture page did not load.');
+    const generated = await browser.send('Runtime.evaluate', { expression:
+      "(() => { const link = document.createElement('a');"
+      + "link.href = URL.createObjectURL(new Blob([new Uint8Array(262144).fill(90)]));"
+      + "link.download = 'vesper-page-made-fixture.bin'; document.body.append(link); link.click(); })()"
+    }, tab);
+    assert.ok(!generated.exceptionDetails, 'Could not create the isolated Blob download.');
+    await waitFor(async () => {
+      const matches = await evaluate('Read page-made download', 'chrome.downloads.search({})');
+      return matches.find(candidate => candidate.filename?.endsWith(blobName) && candidate.state === 'complete');
+    }, 15000, 'Chrome did not finish the page-generated download.');
+    assert.equal((await readFile(join(downloadFolder, blobName))).compare(bytes), 0);
+    await waitFor(async () => {
+      const capture = await evaluate('Read final capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
+      return capture.vesperCaptureDecisions?.some(entry => entry.outcome === 'page-made');
+    }, 5000, 'The extension did not record that Chrome owns the page-generated download.');
+    assert.equal(await evaluate('Check native isolation', '__ownershipSmoke.nativeCalls'), 0);
     process.stdout.write(JSON.stringify({
       ok: true,
       browser: 'Chrome (isolated headless profile)',
@@ -200,6 +237,7 @@ async function main() {
       changedEvents: observations.changed.length,
       completedBytes: saved.length,
       keptInChrome: true,
+      pageMadeKeptInChrome: true,
       nativeMessagingInvoked: false
     }) + '\n');
   }

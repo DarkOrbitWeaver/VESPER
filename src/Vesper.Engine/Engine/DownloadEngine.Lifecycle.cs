@@ -403,12 +403,13 @@ public sealed partial class DownloadEngine
     private void FinishPublication(DownloadJob job, bool recovering = false)
     {
         RecoveryManifest.Delete(job.PartialPath);
+        if (recovering && job.Kind == JobKind.Merge && !MergeTransfer.DeleteSidecars(job))
+            Log(job.Id, "publication-cleanup", "A merge sidecar was kept because it could not be verified or removed.");
         if (job.PendingConversionBytes is null || !DeleteTemporaryFile(job, job.PartialPath)) return;
         try
         {
             if (recovering)
             {
-                MergeTransfer.DeleteSidecars(job);
                 DownloadJob saved = job.CopyForUpdate();
                 ClearPendingPublication(saved);
                 SaveRecoveredJob(job, saved);

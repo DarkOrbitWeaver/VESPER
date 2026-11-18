@@ -120,9 +120,9 @@ These are **separate audit obligations**, not all new feature requests. A range 
 | AUDIT-EXTRA-001 | A 51–146 | Historical executive scorecard and claims; do not reuse numerical ratings as current evidence | OPEN — Historical context; compare with current Q0–Q10 |
 | AUDIT-EXTRA-002 | B 147–220 | Coverage inventory and unexamined code paths | OPEN — Independent current source coverage outstanding |
 | AUDIT-EXTRA-003 | C 221–287 | 50-capability feature inventory and exposed/unreachable paths | OPEN — Compare to current limitations and front ends |
-| AUDIT-EXTRA-004 | D 288–406 | Architecture, durability state machine, browser handoff sequence, and eight documentation discrepancies | OPEN — Revalidate current code, source ownership and documentation |
+| AUDIT-EXTRA-004 | D 288–406 | Architecture, durability state machine, browser handoff sequence, and eight documentation discrepancies | PARTIAL — Merge swap proof, atomic muxed checkpoint and restart-path regressions cover the media rename boundary. Remaining direct saves and real interruption are open. |
 | AUDIT-EXTRA-005 | F 824–1044 | HTTP protocol invariants, fault cases and prospective performance fixes beyond numbered headings | OPEN — Verify adversarial Q1/Q8 and performance Q6 |
-| AUDIT-EXTRA-006 | G 1045–1171 | Chrome state machine and API ZIP variant matrix, including POST/blob/single-use failures | OPEN — Real Chrome/native-host acceptance and disclosure Q2 |
+| AUDIT-EXTRA-006 | G 1045–1171 | Chrome state machine and API ZIP variant matrix, including POST/blob/single-use failures | PARTIAL — Chrome for Testing retained the HTTP opt-out and generated Blob, including the page-made decision. Real native acceptance and remaining Q2 cases are open. |
 | AUDIT-EXTRA-007 | H 1172–1308 | Media mux/demux strengths, output-format capability matrix and decoder availability | OPEN — Fixture corpus, Windows codecs and Q3 |
 | AUDIT-EXTRA-008 | I 1309–1412 | UI paint audit, nested layout, text-size matrix and artwork provenance | OPEN — Actual DPI/theme/Narrator evidence Q4/Q5 |
 | AUDIT-EXTRA-009 | J 1413–1511 | Butterfly motion states, arrival, rigid follow, idle budget and focus contrast | OPEN — Real Chrome motion and reduced-motion acceptance Q2/Q4/Q5 |

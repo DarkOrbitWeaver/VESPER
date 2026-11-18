@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vesper.Engine;
 
@@ -153,37 +154,33 @@ public sealed partial class DownloadEngine
             partial + ".tagged.mp3", partial + ".tagged.flac", partial + ".tagged.ogg", partial + ".tagged.opus"
         ];
 
-        // First reject every known unsafe path before deleting even the first partial.
-        // During deletion recheck each path again to limit symlink/placeholder races.
-        string[] owned = [.. files.Distinct(StringComparer.OrdinalIgnoreCase)];
-        for (int pass = 0; pass < 2; pass++)
+        var opened = new List<(string Path, SafeFileHandle Handle)>();
+        try
         {
-            if (!PathSafety.TryCheckUnlinkedDirectory(folder, out error)) return false;
-
-            foreach (string file in owned)
+            foreach (string file in files.Distinct(StringComparer.OrdinalIgnoreCase))
             {
                 try
                 {
-                    FileAttributes attributes = File.GetAttributes(file);
-                    if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0
-                        || PathSafety.IsCloudPlaceholder(attributes))
-                    {
-                        error = "A temporary path was replaced by a directory, link or cloud placeholder.";
-                        return false;
-                    }
-                    if (pass == 1) File.Delete(file);
+                    SafeFileHandle handle = PathSafety.OpenTemporaryHandle(file, FileMode.Open, FileAccess.Read,
+                        FileShare.Read, allowDelete: true);
+                    opened.Add((file, handle));
                 }
                 catch (FileNotFoundException) { }
-                catch (DirectoryNotFoundException) { }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    error = pass == 0 ? "A temporary path could not be checked: " + ex.Message
-                        : "A temporary file could not be removed: " + ex.Message;
-                    return false;
-                }
             }
-        }
 
-        return true;
+            // Open every file before deleting any. On Windows, deletion uses those same handles.
+            foreach (var (file, handle) in opened)
+                PathSafety.DeleteOpenTemporaryFile(handle, file);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            error = ex.Message;
+            return false;
+        }
+        finally
+        {
+            foreach (var (_, handle) in opened) handle.Dispose();
+        }
     }
 }

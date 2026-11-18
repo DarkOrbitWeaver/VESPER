@@ -87,7 +87,8 @@ public static class PathSafety
     internal static bool IsCloudPlaceholder(FileAttributes attributes) =>
         (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
 
-    internal static SafeFileHandle OpenTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options = FileOptions.None)
+    internal static SafeFileHandle OpenTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share,
+        FileOptions options = FileOptions.None, bool allowDelete = false)
     {
         if (!Path.IsPathFullyQualified(path)) throw new IOException("The temporary file path is invalid.");
         path = Path.GetFullPath(path);
@@ -99,7 +100,7 @@ public static class PathSafety
         // Inspect the opened object before allowing a write or truncation.
         FileMode openMode = mode == FileMode.Create ? FileMode.OpenOrCreate : mode;
         SafeFileHandle handle = OperatingSystem.IsWindows()
-            ? OpenWindowsTemporaryHandle(path, openMode, access, share, options)
+            ? OpenWindowsTemporaryHandle(path, openMode, access, share, options, allowDelete)
             : File.OpenHandle(path, openMode, access, share, options);
         try
         {
@@ -136,11 +137,13 @@ public static class PathSafety
         (attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint | FileAttributes.Device)) == 0
         && !IsCloudPlaceholder(attributes);
 
-    private static SafeFileHandle OpenWindowsTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
+    private static SafeFileHandle OpenWindowsTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share,
+        FileOptions options, bool allowDelete)
     {
         const uint read = 0x80000000, write = 0x40000000;
         const uint openReparsePoint = 0x00200000, anonymousSecurity = 0x00100000;
         uint rights = access == FileAccess.Read ? read : read | write;
+        if (allowDelete) rights |= 0x00010000; // DELETE
         string nativePath = path.StartsWith(@"\\?\") ? path
             : path.StartsWith(@"\\") ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
         SafeFileHandle handle = CreateFileW(nativePath, rights, (uint)share, IntPtr.Zero, (uint)mode,
@@ -178,6 +181,23 @@ public static class PathSafety
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle file, out TemporaryFileInfo info);
+
+    internal static void DeleteOpenTemporaryFile(SafeFileHandle file, string path)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            File.Delete(path);
+            return;
+        }
+        const int fileDispositionInfo = 4;
+        byte delete = 1;
+        if (!SetFileInformationByHandle(file, fileDispositionInfo, ref delete, sizeof(byte)))
+            throw FileError(Marshal.GetLastPInvokeError(), path);
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle file, int infoClass, ref byte data, int size);
 
     internal static bool PathStillNamesFile(string path, FileStream verifiedFile, string digest)
     {

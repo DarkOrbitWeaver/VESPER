@@ -984,6 +984,98 @@ public sealed class MediaMergeTests
             new Uri($"https://cdn.example.com/{id}-{i}.m4s"), 1, StartSeconds: i - 1)).ToArray()
     };
 
+    [Theory]
+    [InlineData("http", "merge.beforeSwap")]
+    [InlineData("http", "merge.afterTracksMove")]
+    [InlineData("hls", "merge.afterOutputMove")]
+    [InlineData("dash", "merge.afterTracksMove")]
+    public async Task Merge_recovers_each_durable_swap_state_without_fetching_again(string protocol, string point)
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        MediaMergePlan plan = SwapTestPlan(server, protocol);
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var h = new Harness(name =>
+        {
+            if (name != point) return;
+            interrupted.TrySetResult();
+            throw new FailpointCrash(point);
+        });
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "resume-merge.mp4",
+            MediaPlanJson: plan.ToJson(), Kind: JobKind.Merge));
+        Assert.True(added.Ok, added.Message);
+        await interrupted.Task.WaitAsync(TimeSpan.FromSeconds(12));
+        int requests = server.Requests.Values.Sum(items => items.Count);
+        string partial = h.Engine.Snapshot(added.JobId)!.PartialPath;
+        string muxed = point == "merge.afterOutputMove" ? partial : partial + ".merging";
+        byte[] expected = await File.ReadAllBytesAsync(muxed);
+
+        h.Restart();
+
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, done.State);
+        Assert.Equal(requests, server.Requests.Values.Sum(items => items.Count));
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        if (protocol == "http")
+        {
+            using var video = new MemoryStream(server.Extra["/m/video.mp4"]);
+            using var audio = new MemoryStream(server.Extra["/m/audio.m4a"]);
+            using var published = File.OpenRead(done.FinalPath!);
+            MediaMerger.Validate(published, published.Length, [Track(video, TrackKind.Video), Track(audio, TrackKind.Audio)], default);
+        }
+        else Assert.Equal(2, ValidateSegmentedOutput(done.FinalPath!).TrackCount);
+        Assert.Single(h.Files(), path => path.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Merge_preserves_an_unrelated_partial_that_arrives_during_an_interrupted_swap()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        MediaMergePlan plan = SwapTestPlan(server, "http");
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var h = new Harness(name =>
+        {
+            if (name != "merge.afterTracksMove") return;
+            interrupted.TrySetResult();
+            throw new FailpointCrash(name);
+        });
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "blocked-merge.mp4",
+            MediaPlanJson: plan.ToJson(), Kind: JobKind.Merge));
+        Assert.True(added.Ok, added.Message);
+        await interrupted.Task.WaitAsync(TimeSpan.FromSeconds(12));
+        string partial = h.Engine.Snapshot(added.JobId)!.PartialPath;
+        byte[] tracks = await File.ReadAllBytesAsync(partial + ".tracks");
+        byte[] staged = await File.ReadAllBytesAsync(partial + ".merging");
+        await File.WriteAllTextAsync(partial, "unrelated file");
+
+        h.Restart();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+        Assert.Equal("merge-integrity", stopped.Reason);
+        Assert.Equal("unrelated file", await File.ReadAllTextAsync(partial));
+        Assert.Equal(tracks, await File.ReadAllBytesAsync(partial + ".tracks"));
+        Assert.Equal(staged, await File.ReadAllBytesAsync(partial + ".merging"));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    private static MediaMergePlan SwapTestPlan(FaultServer server, string protocol)
+    {
+        if (protocol != "http") return CreateSegmentedPlan(server, protocol);
+        byte[] video = server.Extra["/m/video.mp4"] = Fixture("video-only.mp4");
+        byte[] audio = server.Extra["/m/audio.m4a"] = AacFmp4();
+        return new MediaMergePlan
+        {
+            Provider = "test", MediaId = "swap", OutputContainer = "mp4", RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), video.Length, "mp4", "h264", "v-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.m4a"), audio.Length, "m4a", "aac", "a-id")
+            ]
+        };
+    }
+
     [Fact]
     public async Task MergeJob_DownloadsBothTracks_MergesAndPublishesOneValidatedFile()
     {
