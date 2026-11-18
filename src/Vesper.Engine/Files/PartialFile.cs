@@ -19,18 +19,54 @@ internal sealed class PartialFile : IDisposable
 
     private PartialFile(string path, SafeFileHandle handle) { Path = path; _handle = handle; }
 
-    public static PartialFile Open(string path, bool create = true)
+    public static PartialFile Open(string path, bool create = true) =>
+        Open(path, create ? FileMode.OpenOrCreate : FileMode.Open);
+
+    internal static PartialFile Open(string path, FileMode mode)
     {
         try
         {
             // FileShare.Read lets a virus scanner read the file but blocks deletion or truncation by others.
-            SafeFileHandle handle = PathSafety.OpenTemporaryHandle(path, create ? FileMode.OpenOrCreate : FileMode.Open, FileAccess.ReadWrite,
+            SafeFileHandle handle = PathSafety.OpenTemporaryHandle(path, mode, FileAccess.ReadWrite,
                 FileShare.Read, FileOptions.Asynchronous | FileOptions.RandomAccess);
             return new PartialFile(path, handle);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             throw new LocalStorageException("The partial file could not be opened: " + ex.Message, ex);
+        }
+    }
+
+    internal string? CaptureIdentity() => PathSafety.TemporaryFileIdentity(_handle);
+
+    internal static PartialFile OpenOwned(DownloadJob job)
+    {
+        PartialFile file = Open(job.PartialPath, create: false);
+        try
+        {
+            PathSafety.RequireTemporaryIdentity(file._handle, job.PartialIdentity);
+            return file;
+        }
+        catch (IOException ex)
+        {
+            file.Dispose();
+            throw new LocalStorageException(ex.Message, ex);
+        }
+    }
+
+    internal static FileStream OpenOwnedRead(DownloadJob job, FileShare share = FileShare.Read,
+        FileOptions options = FileOptions.SequentialScan)
+    {
+        FileStream file = PathSafety.OpenTemporaryStream(job.PartialPath, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
+        try
+        {
+            PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, job.PartialIdentity);
+            return file;
+        }
+        catch
+        {
+            file.Dispose();
+            throw;
         }
     }
 

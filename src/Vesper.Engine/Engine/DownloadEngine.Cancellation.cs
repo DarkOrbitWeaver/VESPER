@@ -164,6 +164,8 @@ public sealed partial class DownloadEngine
                     SafeFileHandle handle = PathSafety.OpenTemporaryHandle(file, FileMode.Open, FileAccess.Read,
                         FileShare.Read, allowDelete: true);
                     opened.Add((file, handle));
+                    if (string.Equals(file, partial, StringComparison.OrdinalIgnoreCase))
+                        PathSafety.RequireTemporaryIdentity(handle, job.PartialIdentity);
                 }
                 catch (FileNotFoundException) { }
             }

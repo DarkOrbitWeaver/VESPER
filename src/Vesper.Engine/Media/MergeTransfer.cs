@@ -229,7 +229,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         session.CloseFile();
         try
         {
-            using (var source = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.RandomAccess))
+            using (var source = PartialFile.OpenOwnedRead(Job, options: FileOptions.RandomAccess))
             {
                 if (source.Length < plan.TotalBytes) return Stop("The partial file is shorter than its committed tracks.");
                 var inputs = new List<(DemuxedTrack Track, Stream Source)>();
@@ -286,12 +286,12 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
     private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
     {
-        await FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, cursor.TracksLength, cursor.TracksSha256, ct)
+        string? identity = await FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, cursor.TracksLength, cursor.TracksSha256, ct)
             .ConfigureAwait(false);
         var next = new ExtentSet();
         next.Add(new ByteRange(0, cursor.MuxLength));
         DownloadJob committed = engine.CommitCheckpoint(Job, next, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
-            totalBytes: cursor.MuxLength);
+            totalBytes: cursor.MuxLength, partialIdentity: identity);
         engine.WriteManifest(committed);
         return await PublishAsync(ct).ConfigureAwait(false);
     }
@@ -300,13 +300,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
     {
         if (cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 }) return Stop("The merge cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged file is missing.");
-        using (var fs = PathSafety.OpenTemporaryStream(Job.PartialPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan))
-        {
-            if (fs.Length < cursor.MuxLength) return Stop("The merged file is shorter than recorded.");
-            string actual = Convert.ToHexString(await SHA256.HashDataAsync(new RegionStream(fs, 0, cursor.MuxLength), ct).ConfigureAwait(false));
-            if (actual != cursor.MuxSha256) return Stop("The merged file failed SHA-256 validation.");
-        }
-        if (Job.TotalBytes != cursor.MuxLength) engine.UpdateJob(Job, j => j.TotalBytes = cursor.MuxLength);
+        if (!await VerifyMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false))
+            return Stop("The merged file failed its saved validation.");
         return await PublishAsync(ct).ConfigureAwait(false);
     }
 
@@ -325,12 +320,15 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         if (PathExists(job.PartialPath) || job.Extents.IsEmpty)
             throw new RunnerStop(Stop("There are two possible files from an older merge and no saved proof of the swap."));
         using (var saved = PathSafety.OpenTemporaryHandle(tracks, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            PathSafety.RequireTemporaryIdentity(saved, job.PartialIdentity);
             if (RandomAccess.GetLength(saved) < job.Extents.End)
                 throw new RunnerStop(Stop("The saved tracks are shorter than the committed data."));
+        }
         File.Move(tracks, job.PartialPath);
     }
 
-    internal static async Task FinishSwapAsync(DownloadEngine engine, DownloadJob job, long muxLength, string? muxSha,
+    internal static async Task<string?> FinishSwapAsync(DownloadEngine engine, DownloadJob job, long muxLength, string? muxSha,
         long tracksLength, string? tracksSha, CancellationToken ct)
     {
         string partial = job.PartialPath;
@@ -340,10 +338,15 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         bool hasStage = PathExists(stage);
         bool hasPartial = PathExists(partial);
         if ((!hasTracks && !(hasStage && hasPartial)) || (hasTracks && hasStage == hasPartial)
-            || tracksLength < job.Extents.End
-            || !await MatchesAsync(hasStage ? stage : partial, muxLength, muxSha, ct).ConfigureAwait(false)
+            || tracksLength < job.Extents.End || muxLength <= 0 || muxSha is not { Length: 64 }
             || !await MatchesAsync(hasTracks ? tracks : partial, tracksLength, tracksSha, ct).ConfigureAwait(false))
             throw new RunnerStop(Stop("The files from the interrupted merge do not match the saved swap."));
+
+        using var output = PathSafety.OpenTemporaryStream(hasStage ? stage : partial, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, 1 << 16, FileOptions.SequentialScan);
+        if (output.Length != muxLength || !Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false))
+            .Equals(muxSha, StringComparison.OrdinalIgnoreCase))
+            throw new RunnerStop(Stop("The output from the interrupted merge does not match the saved swap."));
 
         ct.ThrowIfCancellationRequested();
         if (!hasTracks)
@@ -356,6 +359,25 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             File.Move(stage, partial);
             engine.Failpoint("merge.afterOutputMove");
         }
+        if (!PathSafety.PathStillNamesFile(partial, output, muxSha))
+            throw new RunnerStop(Stop("The merged output path changed during the swap."));
+        return PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
+    }
+
+    // Older muxed rows have a saved output hash but no file ID. Bind the verified object before opening it for publication.
+    internal static async Task<bool> VerifyMergedOutputAsync(DownloadEngine engine, DownloadJob job,
+        long length, string digest, CancellationToken ct)
+    {
+        using var output = PathSafety.OpenTemporaryStream(job.PartialPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+        if (output.Length != length || !Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false))
+            .Equals(digest, StringComparison.OrdinalIgnoreCase))
+            return false;
+        string? identity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
+        if (job.PartialIdentity is not null && job.PartialIdentity != identity) return false;
+        if (job.PartialIdentity != identity || job.TotalBytes != length)
+            engine.UpdateJob(job, pending => { pending.PartialIdentity = identity; pending.TotalBytes = length; });
+        return true;
     }
 
     internal static async Task<bool> MatchesAsync(string path, long length, string? digest, CancellationToken ct)

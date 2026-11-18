@@ -276,7 +276,7 @@ public sealed partial class DownloadEngine : IDisposable
     /// so snapshots cannot count it twice and metadata writers see the committed version.
     /// </summary>
     internal DownloadJob CommitCheckpoint(DownloadJob job, ExtentSet next, string? mediaState, Action? retirePending = null,
-        long? totalBytes = null)
+        long? totalBytes = null, string? partialIdentity = null)
     {
         lock (_lock)
         {
@@ -284,11 +284,13 @@ public sealed partial class DownloadEngine : IDisposable
                 mediaState = HlsTransfer.PreserveLiveStop(job.MediaState, mediaState);
             DownloadJob copy = job.CloneForCommit(next, mediaState ?? job.MediaState);
             if (totalBytes is not null) copy.TotalBytes = totalBytes;
+            if (partialIdentity is not null) copy.PartialIdentity = partialIdentity;
             SaveLocked(copy);
             job.Extents = copy.Extents;
             job.Generation = copy.Generation;
             job.MediaState = copy.MediaState;
             job.TotalBytes = copy.TotalBytes;
+            job.PartialIdentity = copy.PartialIdentity;
             retirePending?.Invoke();
             return copy;
         }

@@ -181,7 +181,7 @@ public sealed partial class DownloadEngine
             try
             {
                 // Local reads only: stored pieces are checked against the trusted hashes; invalid ones leave the verified set.
-                using PartialFile file = PartialFile.Open(snapshot.PartialPath, create: false);
+                using PartialFile file = PartialFile.OpenOwned(snapshot);
                 verified = pieces!.VerifyStored(file, snapshot.Extents, ct, out int invalid);
                 refetch = Enumerable.Range(0, pieces.PieceCount).Count(i => !verified.Covers(pieces.RangeOf(i).Start, pieces.RangeOf(i).End));
                 if (invalid > 0) Log(id, "rescue-pieces", $"{invalid} stored piece(s) failed verification.");

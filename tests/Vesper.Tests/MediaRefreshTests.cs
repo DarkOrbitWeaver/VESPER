@@ -34,6 +34,7 @@ public sealed class MediaRefreshTests
 
         JobSnapshot before = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(added.JobId));
         await File.WriteAllBytesAsync(before.PartialPath, media);
+        harness.OwnFixturePartial(added.JobId);
         string database = Path.Combine(harness.Data, "vesper.db");
         using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
         connection.Open();
@@ -233,6 +234,7 @@ public sealed class MediaRefreshTests
         DownloadJob job = jobs[id];
         byte[] prefix = [.. committedParts.SelectMany(part => part)];
         File.WriteAllBytes(job.PartialPath, prefix);
+        harness.OwnFixturePartial(id);
         var extents = new ExtentSet();
         extents.Add(new Vesper.Engine.ByteRange(0, prefix.LongLength));
         int version = shapeFingerprints is null ? 1 : 2;

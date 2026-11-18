@@ -60,7 +60,26 @@ internal sealed class JobSession : IDisposable
 
     public long PendingBytes { get { lock (Gate) return _pending.TotalBytes; } }
 
-    public PartialFile OpenFile(bool create = true) => File ??= PartialFile.Open(Job.PartialPath, create);
+    public PartialFile OpenFile(bool create = true)
+    {
+        if (File is not null) return File;
+        if (!OperatingSystem.IsWindows()) return File = PartialFile.Open(Job.PartialPath, create);
+        if (!create || Job.PartialIdentity is not null || !Job.Extents.IsEmpty)
+            return File = PartialFile.OpenOwned(Job);
+
+        PartialFile created = PartialFile.Open(Job.PartialPath, FileMode.CreateNew);
+        try
+        {
+            string? identity = created.CaptureIdentity();
+            _engine.UpdateJob(Job, pending => pending.PartialIdentity = identity);
+            return File = created;
+        }
+        catch
+        {
+            created.Dispose();
+            throw;
+        }
+    }
 
     public void CloseFile()
     {
