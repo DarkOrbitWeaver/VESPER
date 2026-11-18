@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -543,6 +544,71 @@ public class CrashRecoveryTests
         Assert.DoesNotContain(h.Files(), f => f.EndsWith(".vpart"));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_refused_completion_write_is_reconciled_without_publishing_again(bool restart)
+    {
+        await using var server = new FaultServer(128 * 1024);
+        await server.StartAsync();
+        using var h = new Harness();
+        using var db = new SqliteConnection($"Data Source={Path.Combine(h.Data, "vesper.db")};Pooling=False");
+        db.Open();
+        using var command = db.CreateCommand();
+        command.CommandText = "CREATE TRIGGER refuse_completed BEFORE UPDATE ON jobs WHEN NEW.state = 10 BEGIN SELECT RAISE(ABORT, 'storage fault'); END;";
+        command.ExecuteNonQuery();
+
+        Guid id = h.Add(server.Url("/file"), "published.bin");
+        JobSnapshot pending = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+        Assert.Equal("publication-pending", pending.Reason);
+        string published = Path.Combine(h.Downloads, "published.bin");
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(published));
+        Assert.False(File.Exists(pending.PartialPath));
+        int requests = server.Hits("/file");
+
+        command.CommandText = "DROP TRIGGER refuse_completed;";
+        command.ExecuteNonQuery();
+        if (restart) h.Restart();
+        else h.Engine.Resume(id);
+
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(published, done.FinalPath);
+        Assert.Equal(published, Assert.Single(Directory.GetFiles(h.Downloads, "*.bin")));
+        Assert.Equal(requests, server.Hits("/file"));
+    }
+
+    [Fact]
+    public async Task Recovery_never_claims_a_same_size_replacement_as_the_published_file()
+    {
+        await using var server = new FaultServer(128 * 1024);
+        await server.StartAsync();
+        var moved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var h = new Harness(point =>
+        {
+            if (point != "finalize.afterMove") return;
+            moved.TrySetResult();
+            throw new FailpointCrash(point);
+        });
+
+        Guid id = h.Add(server.Url("/file"), "published.bin");
+        await moved.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        h.Engine.Dispose();
+        string published = Path.Combine(h.Downloads, "published.bin");
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(published));
+        await File.WriteAllBytesAsync(published, server.V2);
+        int requests = server.Hits("/file");
+
+        h.Restart();
+        JobSnapshot pending = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+        Assert.Null(pending.FinalPath);
+        Assert.Equal("finalize-lost", pending.Reason);
+        h.Engine.Resume(id);
+        Assert.Equal(JobState.NeedsAttention, h.Engine.Snapshot(id)!.State);
+        Assert.Equal(server.V2, await File.ReadAllBytesAsync(published));
+        Assert.Equal(published, Assert.Single(Directory.GetFiles(h.Downloads, "*.bin")));
+        Assert.Equal(requests, server.Hits("/file"));
+    }
+
     [Fact]
     public async Task A_full_disk_stops_conservatively_and_keeps_the_data()
     {
@@ -568,8 +634,16 @@ public class CrashRecoveryTests
         JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
         h.Engine.Dispose();
 
-        File.WriteAllText(Path.Combine(h.Data, "vesper.db"), "garbage" + new string('z', 4096));
+        string database = Path.Combine(h.Data, "vesper.db");
+        File.WriteAllText(database, "garbage" + new string('z', 4096));
         foreach (string leftover in Directory.GetFiles(h.Data, "vesper.db-*")) File.Delete(leftover);
+
+        // Opening SQLite can finish before the engine gets a chance to import saved jobs.
+        using (var fresh = JobStore.Open(database))
+        {
+            Assert.True(fresh.RecoveredFromCorruption);
+            Assert.Empty(fresh.LoadAll());
+        }
         h.Restart();
 
         Assert.True(h.Engine.RecoveredFromCorruptDatabase);
@@ -577,5 +651,6 @@ public class CrashRecoveryTests
         Assert.Equal(JobState.NeedsLink, recovered.State);
         Assert.True(recovered.CommittedBytes > 0 && recovered.CommittedBytes <= stalled.CommittedBytes);
         Assert.True(File.Exists(stalled.PartialPath));
+        Assert.False(File.Exists(database + ".quarantine-pending"));
     }
 }

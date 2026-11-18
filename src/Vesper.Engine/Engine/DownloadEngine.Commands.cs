@@ -133,7 +133,8 @@ public sealed partial class DownloadEngine
         string category = FileNames.CategoryFor(name);
         string baseFolder = request.DestinationFolder ?? Options.DefaultFolder;
         string folderText = request.DestinationFolder is null && Options.CategorySubfolders ? Path.Combine(baseFolder, category) : baseFolder;
-        if (!PathSafety.TryResolveFolder(folderText, create: true, out string folder, out string folderError))
+        if (!PathSafety.TryResolveFolder(folderText, create: true, out string folder, out string folderError)
+            || !PathSafety.TryCheckUnlinkedDirectory(folder, out folderError))
             return new AddResult(AddStatus.DestinationUnavailable, Guid.Empty, folderError);
 
         lock (_lock)
@@ -232,8 +233,14 @@ public sealed partial class DownloadEngine
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _cancelling.Contains(id)) return;
-            if (_sessions.TryGetValue(id, out JobSession? session)) { session.Intent = StopIntent.Pause; session.Cts.Cancel(); return; }
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || _cancelling.Contains(id) || IsCleanupPending(job)) return;
+            if (_sessions.TryGetValue(id, out JobSession? session))
+            {
+                if (session.Intent is StopIntent.Cancel or StopIntent.LiveStop or StopIntent.BrowserFallback or StopIntent.Shutdown) return;
+                session.Intent = StopIntent.Pause;
+                session.Cts.Cancel();
+                return;
+            }
             if (job.State is JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry)
             {
                 PersistUiMutationLocked(job, static pending =>
@@ -256,7 +263,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)
                 || job.State is JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting or JobState.Suspect
-                || job.Reason == "restart-cleanup" || job.Kind != JobKind.Hls
+                || _cancelling.Contains(id) || IsCleanupPending(job) || job.PendingFinalPath is not null || job.Kind != JobKind.Hls
                 || !HlsTransfer.TryRequestLiveStop(job.MediaState, out string stopState))
                 return false;
 
@@ -300,21 +307,28 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id)) return;
-            if (job.BrowserProof is { AwaitingConfirmation: true }
-                || job.Reason == "restart-cleanup"
-                || job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
-            long queueOrder = startNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : job.QueueOrder;
-            PersistUiMutationLocked(job, pending =>
+            if (job.BrowserProof is { AwaitingConfirmation: true } || IsCleanupPending(job)) return;
+
+            if (job.PendingFinalPath is not null)
             {
-                pending.State = JobState.Queued;
-                pending.NextRetryUtc = null;
-                pending.RetryCount = 0;
-                pending.Message = "";
-                pending.Reason = "";
-                if (startNow) pending.QueueOrder = queueOrder;
-            });
-            AddDuplicateCandidateLocked(job);
-            if (startNow) _forced.Add(id);
+                ReconcileFinalizing(job);
+            }
+            else
+            {
+                if (job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
+                long queueOrder = startNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : job.QueueOrder;
+                PersistUiMutationLocked(job, pending =>
+                {
+                    pending.State = JobState.Queued;
+                    pending.NextRetryUtc = null;
+                    pending.RetryCount = 0;
+                    pending.Message = "";
+                    pending.Reason = "";
+                    if (startNow) pending.QueueOrder = queueOrder;
+                });
+                AddDuplicateCandidateLocked(job);
+            }
+            if (startNow && job.State == JobState.Queued) _forced.Add(id);
             Changed(job);
         }
         ScheduleNext();
@@ -456,6 +470,8 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return new RemoveResult(false, "That entry no longer exists.", null);
             if (_sessions.ContainsKey(id) || _cancelling.Contains(id)) return new RemoveResult(false, "This download is still stopping.", null);
+            if (IsCleanupPending(job)) return new RemoveResult(false, "Finish cleaning up this download before removing it.", null);
+            if (job.PendingFinalPath is not null) return new RemoveResult(false, "This download is still being saved.", null);
 
             string? retained = job.State != JobState.Completed && File.Exists(job.PartialPath) ? job.PartialPath : null;
             _store.Delete(id);
@@ -517,15 +533,13 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id)
-                || _cancelling.Contains(id) || job.Kind == JobKind.BrowserFile
-                || job.State is JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting
-                || job.FinalPath is not null || job.PendingFinalPath is not null)
+                || _cancelling.Contains(id) || !CanDiscardPartial(job))
                 return false;
 
             DownloadJob preparing = job.CopyForUpdate();
             preparing.State = JobState.NeedsAttention;
-            preparing.Reason = "restart-cleanup";
-            preparing.Message = "Restart unfinished. If the data cannot be removed, fix the file and try Restart from scratch again.";
+            preparing.Reason = RestartCleanup;
+            preparing.Message = "Restart is unfinished. Choose Start over to retry, or Cancel download to remove the entry.";
             preparing.NextRetryUtc = null;
             SaveLocked(preparing); // If this fails, no file has been touched.
             job.ApplyPersistedState(preparing);
@@ -606,7 +620,8 @@ public sealed partial class DownloadEngine
     {
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || idleOnly && _sessions.ContainsKey(id)) return;
+            if (!_jobs.TryGetValue(id, out DownloadJob? job)
+                || idleOnly && (_sessions.ContainsKey(id) || _cancelling.Contains(id) || IsCleanupPending(job) || job.PendingFinalPath is not null)) return;
             bool wasCandidate = IsDuplicateCandidate(job);
             string previousSourceUrl = job.SourceUrl;
             PersistUiMutationLocked(job, mutate);

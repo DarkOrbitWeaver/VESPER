@@ -1,5 +1,9 @@
 using System.Text.Json;
 using System.Text;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 using VESPER;
 using Vesper.Engine;
 using Vesper.MediaResolver.Models;
@@ -319,6 +323,126 @@ public class HlsTests
 
         Assert.Equal("live-stopped", saved.Reason);
         Assert.Equal(expected, await File.ReadAllBytesAsync(saved.FinalPath!));
+    }
+
+    [Fact]
+    public async Task LiveHls_A_checkpoint_keeps_a_stop_requested_after_its_batch_was_taken()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        const string playlist = "/hls/live-stop-checkpoint/index.m3u8";
+        byte[] first = FaultServer.HlsSegment(0);
+        byte[] second = FaultServer.HlsSegment(1);
+        server.HlsPlaylists[playlist] = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\none.ts\n#EXTINF:1,\ntwo.ts\n";
+        server.HlsFiles["/hls/live-stop-checkpoint/one.ts"] = first;
+        server.HlsFiles["/hls/live-stop-checkpoint/two.ts"] = second;
+
+        var crashed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Harness? active = null;
+        int flushes = 0, commits = 0;
+        bool stopAccepted = false;
+        using var h = active = new Harness(point =>
+        {
+            if (point == "checkpoint.afterFlush" && Interlocked.Increment(ref flushes) == 2)
+            {
+                DownloadEngine engine = active!.Engine;
+                stopAccepted = engine.StopAndKeepLive(Assert.Single(engine.Snapshots()).Id);
+            }
+            if (point == "checkpoint.afterCommit" && Interlocked.Increment(ref commits) == 2)
+            {
+                crashed.TrySetResult();
+                throw new FailpointCrash(point);
+            }
+        });
+        Guid id = AddHls(h, server, playlist);
+        await crashed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(stopAccepted);
+        using (var store = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
+        {
+            DownloadJob saved = Assert.Single(store.LoadAll());
+            using JsonDocument cursor = JsonDocument.Parse(saved.MediaState!);
+            Assert.True(cursor.RootElement.GetProperty("StopRequested").GetBoolean());
+            Assert.Equal(first.LongLength + second.LongLength, saved.Extents.TotalBytes);
+        }
+
+        h.Restart();
+        JobSnapshot completed = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(first.Concat(second).ToArray(), await File.ReadAllBytesAsync(completed.FinalPath!));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Concurrent_fmp4_initializations_release_slots_before_fetching_fragments(bool live)
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var server = builder.Build();
+        var initialized = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fetchingSecondParts = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSecondParts = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int initRequests = 0, secondPartRequests = 0, includeSecond = 0;
+        byte[] init = DashTransferTests.Fixture("av-init.mp4");
+        byte[] first = DashTransferTests.Fixture("av-1.m4s");
+        byte[] second = DashTransferTests.Fixture("av-2.m4s");
+        const string playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1,\nfirst.m4s\n";
+
+        server.MapGet("/{id}/index.m3u8", () =>
+        {
+            string text = live ? playlist : playlist + "#EXT-X-ENDLIST\n";
+            if (live && Volatile.Read(ref includeSecond) != 0)
+                text += "#EXTINF:1,\nsecond.m4s\n";
+            return Results.Text(text, "application/vnd.apple.mpegurl");
+        });
+        server.MapGet("/{id}/init.mp4", async (HttpContext context) =>
+        {
+            if (Interlocked.Increment(ref initRequests) == 3) initialized.TrySetResult();
+            await initialized.Task.WaitAsync(TimeSpan.FromSeconds(8), context.RequestAborted);
+            return Results.File(init, "video/mp4");
+        });
+        server.MapGet("/{id}/first.m4s", () => Results.File(first, "video/mp4"));
+        server.MapGet("/{id}/second.m4s", async (HttpContext context) =>
+        {
+            if (Interlocked.Increment(ref secondPartRequests) == 3) fetchingSecondParts.TrySetResult();
+            await releaseSecondParts.Task.WaitAsync(context.RequestAborted);
+            return Results.File(second, "video/mp4");
+        });
+        await server.StartAsync();
+
+        using var h = new Harness(tweak: options => options.MaxJobsPerHost = 3);
+        Guid[] ids = Enumerable.Range(0, 3).Select(i => h.Engine.Add(new AddRequest(
+            $"{server.Urls.Single()}/{i}/index.m3u8", FileName: $"recording-{i}.mp4", Kind: JobKind.Hls)).JobId).ToArray();
+        byte[] expected = [.. init, .. first];
+        await initialized.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        if (!live)
+        {
+            JobSnapshot[] results = await Task.WhenAll(ids.Select(id => h.WaitForStateAsync(id, JobState.Completed, seconds: 8)));
+            foreach (JobSnapshot completed in results)
+                Assert.Equal(expected, await File.ReadAllBytesAsync(completed.FinalPath!));
+            return;
+        }
+
+        await Task.WhenAll(ids.Select(id => h.WaitAsync(id, s => s.CommittedBytes == expected.Length, seconds: 8)));
+        Volatile.Write(ref includeSecond, 1);
+        try
+        {
+            await fetchingSecondParts.Task.WaitAsync(TimeSpan.FromSeconds(8));
+            Assert.True((await h.Engine.CancelDownloadAsync(ids[0]).WaitAsync(TimeSpan.FromSeconds(8))).Cancelled);
+            Assert.True(h.Engine.StopAndKeepLive(ids[1]));
+            JobSnapshot stopped = await h.WaitForStateAsync(ids[1], JobState.Completed, seconds: 8);
+            Assert.Equal(expected, await File.ReadAllBytesAsync(stopped.FinalPath!));
+        }
+        finally { releaseSecondParts.TrySetResult(); }
+
+        long fullLength = expected.LongLength + second.Length;
+        await h.WaitAsync(ids[2], s => s.CommittedBytes == fullLength, seconds: 8);
+        Assert.True(h.Engine.StopAndKeepLive(ids[2]));
+        JobSnapshot final = await h.WaitForStateAsync(ids[2], JobState.Completed, seconds: 8);
+        Assert.Equal(expected.Concat(second).ToArray(), await File.ReadAllBytesAsync(final.FinalPath!));
     }
 
     [Fact]

@@ -57,5 +57,6 @@ public sealed class JobSnapshot
 
     public double? Fraction => TotalBytes is > 0 ? Math.Clamp((double)ProgressBytes / TotalBytes.Value, 0, 1) : null;
     public bool IsActive => JobStates.IsActive(State);
+    public bool IsCleanupPending => DownloadEngine.IsCleanupPending(State, Reason);
     public bool HasRetainedData => CommittedBytes > 0 && State != JobState.Completed;
 }

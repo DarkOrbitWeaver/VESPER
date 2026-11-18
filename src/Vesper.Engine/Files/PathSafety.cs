@@ -54,6 +54,34 @@ public static class PathSafety
         return p.StartsWith(r, StringComparison.OrdinalIgnoreCase);
     }
 
+    internal static bool TryCheckUnlinkedDirectory(string folder, out string error)
+    {
+        try
+        {
+            for (string? directory = Path.GetFullPath(folder); !string.IsNullOrEmpty(directory); directory = Path.GetDirectoryName(directory))
+            {
+                FileAttributes attributes = File.GetAttributes(directory);
+                if ((attributes & FileAttributes.Directory) == 0
+                    || (attributes & FileAttributes.ReparsePoint) != 0 || IsCloudPlaceholder(attributes))
+                {
+                    error = "The download directory or one of its parents is a link, placeholder, or file.";
+                    return false;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            error = "The download directory is unavailable.";
+            return false;
+        }
+
+        error = "";
+        return true;
+    }
+
+    internal static bool IsCloudPlaceholder(FileAttributes attributes) =>
+        (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
+
     public static FileCheck Inspect(string path)
     {
         try
@@ -62,7 +90,7 @@ public static class PathSafety
             bool directory = attributes.HasFlag(FileAttributes.Directory);
             long length = directory ? 0 : new FileInfo(path).Length;
             bool reparse = attributes.HasFlag(FileAttributes.ReparsePoint);
-            bool cloud = (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
+            bool cloud = IsCloudPlaceholder(attributes);
             return new FileCheck(true, length, reparse, cloud, directory);
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or IOException

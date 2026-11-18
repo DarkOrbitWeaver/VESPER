@@ -95,8 +95,21 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     public void StartOver(JobSnapshot s)
     {
         string saved = s.CommittedBytes > 0 ? $"{Formatting.Bytes(s.CommittedBytes)} of saved data" : "the partial file";
-        if (Confirm($"This permanently deletes {saved} for {s.FileName} and starts again from zero.\n\nThis cannot be undone. Continue?", "Start over", MessageBoxIcon.Warning))
-            if (!engine.RestartFromScratch(s.Id)) Info("The partial data could not be removed. Nothing was changed.", "Start over", MessageBoxIcon.Warning);
+        if (!Confirm($"This permanently deletes {saved} for {s.FileName} and starts again from zero.\n\nThis cannot be undone. Continue?", "Start over", MessageBoxIcon.Warning))
+            return;
+
+        try
+        {
+            if (engine.RestartFromScratch(s.Id)) return;
+            JobSnapshot? latest = engine.Snapshot(s.Id);
+            string message = latest is { IsCleanupPending: true, State: JobState.NeedsAttention }
+                ? latest.Message : "This download could not be restarted. Check its current status and try again.";
+            Info(message, "Start over", MessageBoxIcon.Warning);
+        }
+        catch (LocalStorageException ex)
+        {
+            Info(ex.Message, "Start over", MessageBoxIcon.Warning);
+        }
     }
 
     // ---- cancel / remove / delete -----------------------------------------------------------------------------------

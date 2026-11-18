@@ -68,6 +68,7 @@ public sealed class DownloadJob
     /// <summary>Recorded before publishing so a crash during rename can be reconciled.</summary>
     public string? PendingFinalPath { get; set; }
     public long? PendingConversionBytes { get; set; }
+    // The existing digest also records publication proof for original files.
     public string? PendingConversionDigest { get; set; }
 
     public long? TotalBytes { get; set; }

@@ -28,6 +28,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         CancellationToken ct = session.Cts.Token;
         try
         {
+            if (!PathSafety.TryResolveFolder(Job.DestinationFolder, create: true, out string folder, out string folderError)
+                || !PathSafety.TryCheckUnlinkedDirectory(folder, out folderError))
+                return RunOutcome.NeedsAttention("destination", folderError + " Saved data was kept.");
+
             return Job.Kind switch
             {
                 JobKind.Hls => HlsWebVttPlan.TryParse(Job.MediaPlanJson, out _)
@@ -109,9 +113,6 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     {
         if (!UrlPolicy.TryParse(Job.SourceUrl, out _url, out string urlError))
             throw Stop(RunOutcome.NeedsLink("bad-url", urlError));
-
-        if (!PathSafety.TryResolveFolder(Job.DestinationFolder, create: true, out _, out string folderError))
-            throw Stop(RunOutcome.NeedsAttention("destination", folderError + " Saved data was kept."));
 
         PartialFile file = session.OpenFile();
         ReconcileWithFile(file);

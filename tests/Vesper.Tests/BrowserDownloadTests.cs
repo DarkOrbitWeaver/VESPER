@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -93,6 +94,54 @@ public sealed class BrowserDownloadTests
         Assert.Equal("browser-fallback", stopped.Reason);
         Assert.True(stopped.IsUnacceptedBrowserCapture);
         Assert.False(harness.Engine.BrowserTransferIsRunning(TransferId));
+    }
+
+    [Fact]
+    public async Task A_pending_browser_publication_keeps_the_accepted_handoff()
+    {
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = Stage(harness, server, new BrowserTransferProof(server.V1.Length, "\"p1\"", null));
+        await harness.WaitAsync(id, job => job.Reason == "browser-ready");
+
+        string database = Path.Combine(harness.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TRIGGER refuse_completion BEFORE UPDATE ON jobs WHEN NEW.state = 10
+            BEGIN SELECT RAISE(ABORT, 'completion write refused'); END;
+            """;
+        command.ExecuteNonQuery();
+
+        Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
+        JobSnapshot pending = await harness.WaitForStateAsync(id, JobState.NeedsAttention);
+        Assert.Equal("publication-pending", pending.Reason);
+        string file = Assert.Single(harness.Files(), path => !path.EndsWith(".vmeta", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(file));
+
+        Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
+        harness.Engine.AbandonBrowserTransfer(TransferId);
+        JobSnapshot handoff = Assert.IsType<JobSnapshot>(harness.Engine.BrowserTransferSnapshot(TransferId));
+        Assert.Equal(JobState.Finalizing, handoff.State);
+        Assert.False(handoff.IsUnacceptedBrowserCapture);
+        using (var store = JobStore.Open(database))
+        {
+            DownloadJob saved = Assert.Single(store.LoadAll());
+            Assert.Equal(JobState.NeedsAttention, saved.State);
+            Assert.Equal(file, saved.PendingFinalPath);
+            Assert.False(saved.BrowserProof!.AwaitingConfirmation);
+        }
+
+        command.CommandText = "DROP TRIGGER refuse_completion;";
+        command.ExecuteNonQuery();
+        harness.Engine.Resume(id);
+
+        JobSnapshot completed = await harness.WaitForStateAsync(id, JobState.Completed);
+        Assert.True(harness.Engine.AcceptBrowserTransfer(TransferId));
+        Assert.Equal(file, completed.FinalPath);
+        Assert.Equal(file, Assert.Single(harness.Files()));
     }
 
     [Theory]

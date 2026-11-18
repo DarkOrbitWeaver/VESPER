@@ -16,6 +16,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     RequestCredentials? credentialOverride = null)
 {
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
+    private const int MaxInitializationBytes = 8 * 1024 * 1024;
     private const long MaxSegmentBytes = 64L * 1024 * 1024; // Bound buffering until streaming decryption is available.
     private const int PrefetchSegments = 3;                   // segments in flight ahead of the one being committed
     private const string LiveMode = "live-hls";
@@ -39,6 +40,14 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (cursor is not { Mode: LiveMode, Offset: > 0 }) { updated = ""; return false; }
         updated = JsonSerializer.Serialize(cursor with { StopRequested = true });
         return true;
+    }
+
+    internal static string PreserveLiveStop(string? saved, string updated)
+    {
+        if (ParseCursor(saved) is { Mode: LiveMode, StopRequested: true }
+            && TryRequestLiveStop(updated, out string stopping))
+            return stopping;
+        return updated;
     }
 
     public async Task<RunOutcome> RunAsync(CancellationToken ct)
@@ -162,25 +171,12 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             {
                 ct.ThrowIfCancellationRequested();
                 HlsSegment segment = segments[i];
-                HlsMap? map = i == 0 ? segment.Map : null;
-                using SegmentBufferLease? initializationLease = map is { } mapToFetch
-                    ? await engine.AcquireSegmentBufferAsync(SegmentBufferLimiter.Reservation(
-                        8 * 1024 * 1024, mapToFetch.Length, mapToFetch.Key is null ? 1 : 2), ct).ConfigureAwait(false)
-                    : null;
-                ReadOnlyMemory<byte>? initialization = null;
-                if (map is { } initializationMap)
+                long mediaOffset = offset;
+                if (i == 0 && segment.Map is { } map)
                 {
-                    initialization = await FetchSegmentAsync(initializationMap.Uri, initializationMap.Offset,
-                        initializationMap.Length, 8 * 1024 * 1024, initializationLease!,
-                        initializationMap.Key is null ? 1 : 2, ct).ConfigureAwait(false);
-                    if (initializationMap.Key is { } mapKey)
-                    {
-                        if (mapKey.Iv is null) throw new MediaContainerException("Encrypted initialization requires an explicit IV.");
-                        initialization = await DecryptAsync(initialization.Value, mapKey, segment.Sequence, keys, ct).ConfigureAwait(false);
-                    }
-                    if (initialization.Value.Length > 8 * 1024 * 1024) throw new MediaContainerException("Initialization exceeds the supported size limit.");
-                    mp4 = FragmentedMp4.Open(initialization.Value.Span);
-                    initLength = initialization.Value.Length;
+                    (mp4, initLength) = await WriteInitializationAsync(map, segment.Sequence, offset, hash, keys,
+                        liveKeyFingerprints: null, ct).ConfigureAwait(false);
+                    mediaOffset += initLength;
                 }
                 Prefetch();
                 (int fetchedIndex, Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> Data) queued = prefetched.Dequeue();
@@ -200,21 +196,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 }
                 if (fragmented) mp4!.ValidateFragment(data.Span);
                 else transport!.Validate(data.Span);
-                int totalLength = checked((initialization?.Length ?? 0) + data.Length);
-                string? root = Path.GetPathRoot(Job.PartialPath);
-                if (root is not null && new DriveInfo(root) is { IsReady: true } drive
-                    && drive.AvailableFreeSpace < totalLength + engine.Options.FreeSpaceReserve)
-                    throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "Not enough free disk space. Saved data was kept."));
-                await session.Limiter.AcquireAsync(totalLength, ct).ConfigureAwait(false);
-                await engine.GlobalLimiter.AcquireAsync(totalLength, ct).ConfigureAwait(false);
-                if (initialization is not null)
-                {
-                    await session.WriteAsync(initialization.Value, offset, report: false, ct).ConfigureAwait(false);
-                    hash.AppendData(initialization.Value.Span);
-                }
-                await session.WriteAsync(data, offset + (initialization?.Length ?? 0), report: false, ct).ConfigureAwait(false);
-                hash.AppendData(data.Span);
-                long end = checked(offset + totalLength);
+                await WritePartAsync(data, mediaOffset, hash, ct).ConfigureAwait(false);
+                long end = checked(mediaOffset + data.Length);
                 session.Report(new ByteRange(offset, end), JsonSerializer.Serialize(new Cursor(playlistUrl, i + 1,
                     planHash, end, Convert.ToHexString(hash.GetCurrentHash()), initLength, mp4?.Snapshot())));
                 offset = end;
@@ -380,27 +363,14 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     if (segment.Sequence == long.MaxValue)
                         return RunOutcome.NeedsAttention("live-sequence", "The live media sequence number overflowed. Saved data was kept.");
 
-                    HlsMap? map = offset == 0 && cursor.Container == "mp4" ? segment.Map : null;
-                    using SegmentBufferLease? initializationLease = map is { } mapToFetch
-                        ? await engine.AcquireSegmentBufferAsync(SegmentBufferLimiter.Reservation(
-                            8 * 1024 * 1024, mapToFetch.Length, mapToFetch.Key is null ? 1 : 2), ct).ConfigureAwait(false)
-                        : null;
-                    ReadOnlyMemory<byte>? initialization = null;
+                    long mediaOffset = offset;
                     if (offset == 0 && cursor.Container == "mp4")
                     {
-                        if (map is not { } initializationMap)
+                        if (segment.Map is not { } map)
                             return RunOutcome.NeedsAttention("live-layout", "The live MP4 playlist has no initialization segment.");
-                        initialization = await FetchSegmentAsync(initializationMap.Uri, initializationMap.Offset,
-                            initializationMap.Length, 8 * 1024 * 1024, initializationLease!,
-                            initializationMap.Key is null ? 1 : 2, ct).ConfigureAwait(false);
-                        if (initializationMap.Key is { } mapKey)
-                        {
-                            if (mapKey.Iv is null) return RunOutcome.NeedsAttention("key", "Encrypted initialization requires an explicit AES IV.");
-                            initialization = await DecryptLiveAsync(initialization.Value, mapKey, segment.Sequence, keys, keyFingerprints, ct).ConfigureAwait(false);
-                        }
-                        if (initialization.Value.Length is < 8 or > 8 * 1024 * 1024)
-                            throw new MediaContainerException("The live initialization segment is empty or too large.");
-                        mp4 = FragmentedMp4.Open(initialization.Value.Span);
+                        (mp4, initLength) = await WriteInitializationAsync(map, segment.Sequence, offset, hash, keys,
+                            keyFingerprints, ct).ConfigureAwait(false);
+                        mediaOffset += initLength;
                     }
 
                     (ReadOnlyMemory<byte> data, SegmentBufferLease mediaLease) = await FetchBufferedSegmentAsync(
@@ -413,20 +383,9 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     if (cursor.Container == "ts") transport!.Validate(data.Span);
                     else mp4!.ValidateFragment(data.Span);
 
-                    int partLength = checked((initialization?.Length ?? 0) + data.Length);
-                    EnsureLiveSpace(partLength);
-                    await session.Limiter.AcquireAsync(partLength, ct).ConfigureAwait(false);
-                    await engine.GlobalLimiter.AcquireAsync(partLength, ct).ConfigureAwait(false);
                     long start = offset;
-                    if (initialization is not null)
-                    {
-                        initLength = initialization.Value.Length;
-                        await session.WriteAsync(initialization.Value, offset, report: false, ct).ConfigureAwait(false);
-                        hash.AppendData(initialization.Value.Span);
-                    }
-                    await session.WriteAsync(data, offset + (initialization?.Length ?? 0), report: false, ct).ConfigureAwait(false);
-                    hash.AppendData(data.Span);
-                    offset = checked(offset + partLength);
+                    await WritePartAsync(data, mediaOffset, hash, ct).ConfigureAwait(false);
+                    offset = checked(mediaOffset + data.Length);
                     nextSequence = segment.Sequence + 1;
                     lastDiscontinuity = segment.DiscontinuitySequence;
                     capturedSeconds += segment.Duration;
@@ -529,7 +488,11 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     private Cursor MarkLiveGap(Cursor cursor, string message)
     {
         Cursor updated = cursor with { HadGaps = true, GapMessage = message };
-        engine.UpdateJob(Job, job => { job.MediaState = JsonSerializer.Serialize(updated); job.Message = message; });
+        engine.UpdateJob(Job, job =>
+        {
+            job.MediaState = PreserveLiveStop(job.MediaState, JsonSerializer.Serialize(updated));
+            job.Message = message;
+        });
         return updated;
     }
 
@@ -681,12 +644,44 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         return "Recording live · " + time;
     }
 
-    private void EnsureLiveSpace(long additional)
+    private async Task<(FragmentedMp4 Validator, int Length)> WriteInitializationAsync(HlsMap map, long sequence,
+        long offset, IncrementalHash hash, Dictionary<string, byte[]> keys,
+        Dictionary<string, string>? liveKeyFingerprints, CancellationToken ct)
+    {
+        int copies = map.Key is null ? 1 : 2;
+        using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+            SegmentBufferLimiter.Reservation(MaxInitializationBytes, map.Length, copies), ct).ConfigureAwait(false);
+        ReadOnlyMemory<byte> initialization = await FetchSegmentAsync(map.Uri, map.Offset, map.Length,
+            MaxInitializationBytes, lease, copies, ct).ConfigureAwait(false);
+        if (map.Key is { } key)
+        {
+            if (key.Iv is null)
+            {
+                if (liveKeyFingerprints is null)
+                    throw new MediaContainerException("Encrypted initialization requires an explicit IV.");
+                throw new RunnerStop(RunOutcome.NeedsAttention("key", "Encrypted initialization requires an explicit AES IV."));
+            }
+            initialization = liveKeyFingerprints is null
+                ? await DecryptAsync(initialization, key, sequence, keys, ct).ConfigureAwait(false)
+                : await DecryptLiveAsync(initialization, key, sequence, keys, liveKeyFingerprints, ct).ConfigureAwait(false);
+        }
+        FragmentedMp4 validator = FragmentedMp4.Open(initialization.Span);
+        // Release the map buffer before acquiring a media buffer. The map only becomes
+        // committed with the first complete fragment, so an interrupted start can retry it.
+        await WritePartAsync(initialization, offset, hash, ct).ConfigureAwait(false);
+        return (validator, initialization.Length);
+    }
+
+    private async ValueTask WritePartAsync(ReadOnlyMemory<byte> bytes, long offset, IncrementalHash hash, CancellationToken ct)
     {
         string? root = Path.GetPathRoot(Path.GetFullPath(Job.PartialPath));
         if (root is not null && new DriveInfo(root) is { IsReady: true } drive
-            && drive.AvailableFreeSpace < additional + engine.Options.FreeSpaceReserve)
-            throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "Not enough free space to continue recording. Saved data was kept."));
+            && drive.AvailableFreeSpace < bytes.Length + engine.Options.FreeSpaceReserve)
+            throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "Not enough free disk space. Saved data was kept."));
+        await session.Limiter.AcquireAsync(bytes.Length, ct).ConfigureAwait(false);
+        await engine.GlobalLimiter.AcquireAsync(bytes.Length, ct).ConfigureAwait(false);
+        await session.WriteAsync(bytes, offset, report: false, ct).ConfigureAwait(false);
+        hash.AppendData(bytes.Span);
     }
 
     private Cursor? ReadCursor()

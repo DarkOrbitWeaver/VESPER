@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
@@ -13,6 +14,7 @@ public sealed class StoreTooNewException(int found, int supported)
 /// </summary>
 public sealed class JobStore : IDisposable
 {
+    private static readonly string[] JournalSuffixes = ["-wal", "-shm", "-journal"];
     // Index + 1 is the schema version. Append only; never edit a shipped migration.
     private static readonly string[] Migrations =
     [
@@ -86,47 +88,61 @@ public sealed class JobStore : IDisposable
     public static JobStore Open(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        try
-        {
-            var store = new JobStore(path);
-            try { store.Initialize(); return store; }
-            catch { store.Dispose(); throw; }
-        }
+        string? interruptedBackup = RecoverQuarantine(path);
+        if (interruptedBackup is not null) return OpenAfterQuarantine(path, interruptedBackup);
+        try { return OpenInitialized(path); }
         catch (SqliteException ex) when (File.Exists(path) && (ex.SqliteErrorCode is 11 or 26))
         {
-            string backup = Quarantine(path);
-            var fresh = new JobStore(path);
-            try
-            {
-                fresh.Initialize();
-                fresh.RecoveredFromCorruption = true;
-                fresh.CorruptBackupPath = backup;
-                return fresh;
-            }
-            catch { fresh.Dispose(); throw; }
+            return OpenAfterQuarantine(path, Quarantine(path, keepMarker: true));
         }
     }
 
-    internal static string Quarantine(string path)
+    private static JobStore OpenInitialized(string path)
+    {
+        var store = new JobStore(path);
+        try { store.Initialize(); return store; }
+        catch { store.Dispose(); throw; }
+    }
+
+    private static JobStore OpenAfterQuarantine(string path, string backup)
+    {
+        JobStore store = OpenInitialized(path);
+        store.RecoveredFromCorruption = true;
+        store.CorruptBackupPath = backup;
+        return store;
+    }
+
+    internal void FinishQuarantineRecovery() => File.Delete(QuarantineMarker(_path));
+
+    internal static string Quarantine(string path, bool keepMarker = false)
     {
         string stamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
         string target = $"{path}.corrupt-{stamp}-{Guid.NewGuid():N}";
-        var moved = new List<(string Original, string Archived)>(3);
+        var moved = new List<(string Original, string Archived)>(JournalSuffixes.Length + 1);
+        string pending = QuarantineMarker(path);
+        string staged = target + ".marker.tmp";
+        try
+        {
+            using (var marker = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                marker.Write(Encoding.UTF8.GetBytes(Path.GetFileName(target)));
+                marker.Flush(flushToDisk: true);
+            }
+            File.Move(staged, pending);
+        }
+        finally { if (File.Exists(staged)) File.Delete(staged); }
 
         try
         {
-            // Move the main database last. If a sidecar is locked, the original database
-            // must remain visible at its old path rather than becoming an empty new database.
-            foreach (string suffix in new[] { "-wal", "-shm", "" })
+            // Move the database last so startup can tell whether to restore the journals.
+            foreach (string suffix in JournalSuffixes.Append(""))
             {
                 string original = path + suffix;
-                if (suffix.Length != 0 && !File.Exists(original)) continue;
+                if (suffix.Length != 0 && !QuarantineFileExists(original)) continue;
                 string archived = target + suffix;
                 File.Move(original, archived);
                 moved.Add((original, archived));
             }
-
-            return target;
         }
         catch (Exception originalError)
         {
@@ -137,12 +153,73 @@ public sealed class JobStore : IDisposable
                 catch (Exception restoreError) { restoreErrors.Add(restoreError); }
             }
 
+            if (restoreErrors.Count == 0)
+            {
+                try { File.Delete(pending); }
+                catch (Exception markerError) { restoreErrors.Add(markerError); }
+            }
             if (restoreErrors.Count != 0)
                 throw new IOException(
                     "Database recovery could not restore every original file. The archived files were kept for manual recovery.",
                     new AggregateException([originalError, .. restoreErrors]));
             throw;
         }
+
+        if (!keepMarker) File.Delete(pending);
+        return target;
+    }
+
+    private static string QuarantineMarker(string path) => path + ".quarantine-pending";
+
+    private static string? RecoverQuarantine(string path)
+    {
+        string marker = QuarantineMarker(path);
+        if (!QuarantineFileExists(marker)) return null;
+
+        string prefix = Path.GetFileName(path) + ".corrupt-";
+        int nameLength = Encoding.UTF8.GetByteCount(prefix) + 14 + 1 + 32;
+        string name;
+        using (var file = File.OpenRead(marker))
+        {
+            if (file.Length != nameLength) throw new IOException("The database recovery marker is incomplete.");
+            byte[] bytes = new byte[nameLength];
+            file.ReadExactly(bytes);
+            name = Encoding.UTF8.GetString(bytes);
+        }
+        if (name.Length != prefix.Length + 14 + 1 + 32 || !name.StartsWith(prefix, StringComparison.Ordinal)
+            || !DateTime.TryParseExact(name.AsSpan(prefix.Length, 14), "yyyyMMddHHmmss", CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out _)
+            || name[prefix.Length + 14] != '-' || !Guid.TryParseExact(name.AsSpan(prefix.Length + 15), "N", out _))
+            throw new IOException("The database recovery marker is invalid.");
+
+        string archive = Path.Combine(Path.GetDirectoryName(path)!, name);
+        bool liveDatabase = QuarantineFileExists(path);
+        if (QuarantineFileExists(archive))
+        {
+            if (!liveDatabase && JournalSuffixes.Any(suffix => QuarantineFileExists(path + suffix)))
+                throw new IOException("Database recovery found journals without their database.");
+            return archive;
+        }
+
+        if (!liveDatabase) throw new IOException("Database recovery could not find the original database.");
+        foreach (string suffix in JournalSuffixes)
+        {
+            if (QuarantineFileExists(archive + suffix))
+                File.Move(archive + suffix, path + suffix);
+        }
+        File.Delete(marker);
+        return null;
+    }
+
+    private static bool QuarantineFileExists(string path)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                throw new IOException("Database recovery found a directory or link where a file was expected.");
+            return true;
+        }
+        catch (FileNotFoundException) { return false; }
     }
 
     private void Initialize()
@@ -173,10 +250,28 @@ public sealed class JobStore : IDisposable
 
     private void BackupBeforeMigration(int version)
     {
-        Execute("PRAGMA wal_checkpoint(TRUNCATE);");
         string backup = $"{_path}.bak-v{version}";
         if (File.Exists(backup)) backup += "-" + DateTime.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N")[..8];
-        File.Copy(_path, backup, overwrite: false);
+        string temporary = backup + ".new-" + Guid.NewGuid().ToString("N");
+        using (new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+        try
+        {
+            using (var copy = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = temporary, Mode = SqliteOpenMode.ReadWrite, Pooling = false
+            }.ToString()))
+            {
+                copy.Open();
+                _db.BackupDatabase(copy);
+            }
+            File.Move(temporary, backup);
+        }
+        catch
+        {
+            try { File.Delete(temporary); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
     }
 
     // ---- jobs -------------------------------------------------------------------------------------------------

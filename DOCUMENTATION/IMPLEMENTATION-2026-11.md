@@ -2,6 +2,16 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-18 consolidation
+
+The 18 commits through `02534d9` extend the former GitHub main `dca76ce`. The independent Windows audit reproduced five failures on the continuation. For 15 regressions already present there, the archived GitHub baseline failed 13 and the continuation passed all 15.
+
+- Active Cancel saves a retryable cleanup marker after the writer closes and before deleting files. Failed saves keep bytes, failed row deletion leaves an entry to retry, and refresh and run controls respect both cleanup markers.
+- Checkpoints retire pending bytes with the committed extents and cursor. Concurrent fMP4 recordings release the initialization buffer before requesting a fragment. The existing slot and byte limits stay in effect.
+- A pending publication records the output digest before rename. Windows tests cover a rejected completion write, an unrelated file of the same size and an accepted browser handoff that stays parked until recovery.
+- Migration backup includes committed WAL data. Interrupted quarantine resumes or restores the journals, and its marker stays until the engine imports partial manifests. Engine outcome, wake, and refresh updates save before taking effect.
+- The Windows Release solution and resolver benchmark project built with zero warnings or errors. All 994 .NET tests passed (576 engine, 357 resolver, 41 WinForms, 20 setup), along with 126 Node extension mocks. Q0–Q10 remain open, including actual Chrome/native host, interrupted filesystem operations, file identity, large-file hashing cost, clean Windows install, accessibility, signing and distribution.
+
 ## 2026-11-17 continuation: atomic queue movement, safe cancellation and two-phase restart
 
 This is the **larger follow-up batch** after transfer/checkpoint progress commit `9174549`, on isolated `codex/vesper-continued`. It adds **14 Windows .NET regression cases** to the 963-test baseline. This is narrow engineering evidence, **not** release approval or actual installed Chrome validation.

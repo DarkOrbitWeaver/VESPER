@@ -393,6 +393,14 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     private IEnumerable<(string Text, bool Primary, Action Action)> Actions()
     {
         JobSnapshot j = _job;
+        if (j.IsCleanupPending)
+        {
+            if (j.State == JobState.NeedsAttention)
+                yield return ("Start over…", true, () => _actions.StartOver(j));
+            yield return ("Cancel download", j.State == JobState.Cancelled, () => _ = _actions.CancelAsync(j));
+            yield break;
+        }
+
         switch (j.State)
         {
             case JobState.Completed when j.FileMissing: yield return ("Locate file", true, () => _actions.Locate(j)); break;

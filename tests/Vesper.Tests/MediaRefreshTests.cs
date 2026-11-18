@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 using Vesper.MediaResolver.Models;
 
@@ -13,6 +14,75 @@ public sealed class MediaRefreshTests
 
     private static byte[] FragmentedAudioFixture() =>
         [.. MediaFixture("audio-init.mp4"), .. MediaFixture("audio-1.m4s")];
+
+    [Fact]
+    public async Task No_media_refresh_path_can_clear_a_parked_restart_cleanup_marker()
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string oldUrl = "http://127.0.0.1:65530/expired.m4a?generation=1";
+        const string freshUrl = "http://127.0.0.1:65530/expired.m4a?generation=2";
+        byte[] media = MediaFixture("audio-init.mp4");
+        MediaMergePlan oldPlan = AudioPlan(oldUrl, media);
+        MediaMergePlan freshPlan = oldPlan with
+        {
+            Tracks = [oldPlan.Tracks[0] with { Url = freshUrl }]
+        };
+        AddResult added = harness.Engine.Add(new AddRequest(oldUrl, FileName: "audio.m4a", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: "fixture", MediaId: "audio",
+            MediaFormatId: "audio-format", MediaPlanJson: oldPlan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot before = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(added.JobId));
+        await File.WriteAllBytesAsync(before.PartialPath, media);
+        string database = Path.Combine(harness.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "CREATE TRIGGER block_final_restart BEFORE UPDATE ON jobs WHEN NEW.state = 0 BEGIN SELECT RAISE(ABORT, 'final queue commit refused'); END;";
+        command.ExecuteNonQuery();
+        try
+        {
+            Assert.False(harness.Engine.RestartFromScratch(added.JobId));
+            Assert.False(File.Exists(before.PartialPath));
+        }
+        finally
+        {
+            command.CommandText = "DROP TRIGGER block_final_restart";
+            command.ExecuteNonQuery();
+        }
+
+        harness.Restart();
+        JobSnapshot parked = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(added.JobId));
+        Assert.Equal(JobState.NeedsAttention, parked.State);
+        Assert.Equal("restart-cleanup", parked.Reason);
+        Assert.False(File.Exists(parked.PartialPath));
+
+        RescueResult direct = harness.Engine.RefreshMergePlan(added.JobId, freshPlan.ToJson());
+        RescueResult asynchronous = await harness.Engine.RefreshMergePlanAsync(added.JobId, freshPlan.ToJson());
+        RescueResult credentialed = await harness.Engine.RefreshMergePlanWithCredentialsAsync(added.JobId,
+            freshPlan.ToJson(), null, new Dictionary<string, string> { ["Cookie"] = "session=must-not-be-installed" });
+        RescueResult source = await harness.Engine.RefreshMediaSourceAsync(added.JobId,
+            new ResolvedMediaSource("fixture", "audio", "audio-format", freshUrl,
+                DateTimeOffset.UtcNow.AddMinutes(5)));
+        RescueResult replacement = await harness.Engine.ReplaceLinkAsync(added.JobId, freshUrl);
+
+        foreach (RescueResult result in new[] { direct, asynchronous, credentialed, source, replacement })
+        {
+            Assert.False(result.Accepted, result.Message);
+        }
+        Assert.Contains("cleanup", direct.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("cleanup", asynchronous.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("cleanup", credentialed.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("cleanup", source.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Restart from scratch", replacement.Message, StringComparison.OrdinalIgnoreCase);
+
+        JobSnapshot after = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(added.JobId));
+        Assert.Equal("restart-cleanup", after.Reason);
+        Assert.Equal(oldUrl, after.SourceUrl);
+        using var savedStore = JobStore.Open(database);
+        Assert.Equal(oldPlan.ToJson(), Assert.Single(savedStore.LoadAll()).MediaPlanJson);
+        Assert.False(File.Exists(after.PartialPath));
+    }
 
     private static MediaMergePlan AudioPlan(string url, byte[] audio) => new()
     {
