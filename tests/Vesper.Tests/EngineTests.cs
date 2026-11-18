@@ -335,7 +335,7 @@ public class FileOperationTests
 
         Guid second = h.Add(server.Url("/lmonly"), "second.bin");
         JobSnapshot done2 = await h.WaitForStateAsync(second, JobState.Completed);
-        DeleteResult deleted = h.Engine.DeleteDownloadedFile(second);
+        DeleteResult deleted = await h.Engine.DeleteDownloadedFileAsync(second);
         Assert.True(deleted.Deleted);
         Assert.False(File.Exists(done2.FinalPath));
         Assert.True((await h.WaitAsync(second, s => s.FileMissing)).FileMissing);   // "completed but file missing", not "failed"
@@ -350,8 +350,97 @@ public class FileOperationTests
         JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
         await File.WriteAllTextAsync(done.FinalPath!, "the user put something else here");
 
-        Assert.False(h.Engine.DeleteDownloadedFile(id).Deleted);
+        Assert.False((await h.Engine.DeleteDownloadedFileAsync(id)).Deleted);
         Assert.True(File.Exists(done.FinalPath));
+    }
+
+    [Fact]
+    public async Task A_same_size_replacement_is_neither_deleted_nor_attached_after_restart()
+    {
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var h = new Harness();
+        Guid id = h.Add(server.Url("/file"), "original.bin");
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        string original = done.FinalPath!;
+        string moved = Path.Combine(h.Downloads, "moved.bin");
+        File.Move(original, moved);
+        byte[] unrelated = [.. server.V1];
+        unrelated[0] ^= 0xff;
+        await File.WriteAllBytesAsync(original, unrelated);
+        string other = Path.Combine(h.Downloads, "other.bin");
+        await File.WriteAllBytesAsync(other, unrelated);
+        h.Restart();
+
+        Assert.False((await h.Engine.DeleteDownloadedFileAsync(id,
+            _ => throw new InvalidOperationException("Unrelated file reached deletion."))).Deleted);
+        Assert.Equal(unrelated, await File.ReadAllBytesAsync(original));
+        Assert.False((await h.Engine.LocateFileAsync(id, other)).Deleted);
+        Assert.Equal(original, h.Engine.Snapshot(id)!.FinalPath);
+
+        Assert.True((await h.Engine.LocateFileAsync(id, moved)).Deleted);
+        Assert.Equal(moved, h.Engine.Snapshot(id)!.FinalPath);
+        Assert.True((await h.Engine.DeleteDownloadedFileAsync(id)).Deleted);
+        Assert.False(File.Exists(moved));
+        Assert.Equal(unrelated, await File.ReadAllBytesAsync(other));
+    }
+
+    [Fact]
+    public async Task A_completed_record_without_saved_file_proof_leaves_both_paths_untouched()
+    {
+        using var h = new Harness();
+        string file = Path.Combine(h.Downloads, "legacy.bin");
+        string candidate = Path.Combine(h.Downloads, "candidate.bin");
+        byte[] contents = [1, 2, 3, 4];
+        await File.WriteAllBytesAsync(file, contents);
+        await File.WriteAllBytesAsync(candidate, contents);
+        Guid id = Guid.NewGuid();
+        h.Engine.Dispose();
+        using (var db = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
+        {
+            db.Save(new DownloadJob
+            {
+                Id = id, State = JobState.Completed, SourceUrl = "https://example.com/legacy.bin",
+                FileName = "legacy.bin", FinalPath = file, TotalBytes = contents.Length,
+                DestinationFolder = h.Downloads, PartialPath = file + ".vpart",
+            });
+        }
+        h.Restart();
+
+        Assert.False((await h.Engine.LocateFileAsync(id, candidate)).Deleted);
+        Assert.False((await h.Engine.DeleteDownloadedFileAsync(id)).Deleted);
+        Assert.Equal(file, h.Engine.Snapshot(id)!.FinalPath);
+        Assert.Equal(contents, await File.ReadAllBytesAsync(file));
+        Assert.Equal(contents, await File.ReadAllBytesAsync(candidate));
+    }
+
+    [Fact]
+    public async Task A_renamed_file_is_checked_again_before_deletion()
+    {
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        string? path = null;
+        string? moved = null;
+        byte[] unrelated = [.. server.V1];
+        unrelated[0] ^= 0xff;
+        using var h = new Harness(point =>
+        {
+            if (point != "completed-file.afterHash") return;
+            File.Move(path!, moved!);
+            File.WriteAllBytes(path!, unrelated);
+            File.SetLastWriteTimeUtc(path!, File.GetLastWriteTimeUtc(moved!));
+        });
+        Guid id = h.Add(server.Url("/file"), "replace-during-check.bin");
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        path = done.FinalPath!;
+        moved = Path.Combine(h.Downloads, "kept.bin");
+
+        DeleteResult result = await h.Engine.DeleteDownloadedFileAsync(id,
+            _ => throw new InvalidOperationException("A replacement reached deletion."));
+
+        Assert.False(result.Deleted);
+        Assert.Equal(unrelated, await File.ReadAllBytesAsync(path));
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(moved));
     }
 
     [Fact]

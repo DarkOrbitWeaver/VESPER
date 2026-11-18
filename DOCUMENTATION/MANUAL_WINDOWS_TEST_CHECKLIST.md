@@ -4,6 +4,8 @@ Automated tests cover some of these behaviors, but they do not replace the manua
 
 The standalone First Flight Studio timeline or manifest was not present with the supplied source assets. Verify the requested sequence beats below on Windows; an original-keyframe comparison is not available.
 
+2026-11-18 at ae9b091 (Windows build 26200): 10 First Flight UI tests passed with the visible capture option enabled. Light and dark captures show the intro, publisher reveal, and completion with Open VESPER available during the intro. This run used an injected install operation. Packaged install, cancellation, live reduced motion and mixed DPI remain in the manual check below.
+
 - [ ] `dotnet restore` + Release build on Windows 11 with .NET 10.
 - [ ] Form has real Windows caption, usable minimize/maximize/resize, no custom titlebar.
 - [ ] Default v8.3 clean light surface shows list; footer always 30 logical pixels.

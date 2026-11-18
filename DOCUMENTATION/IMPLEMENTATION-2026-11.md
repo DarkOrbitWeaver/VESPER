@@ -2,6 +2,12 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-18 completed file safety
+
+New publications save the output SHA-256 with the completed entry, including recovery after an interrupted rename. Delete and Locate refuse different bytes, even at the same size. Older entries without a saved digest are managed in File Explorer. The schema upgrade keeps existing history and uses the migration backup. Windows reopens the path to compare the file ID immediately before deletion. The Recycle Bin still acts on a path, so a final replacement race remains open.
+
+The regressions cover a same-size replacement after restart, a legacy entry without a digest, a replacement after hashing, and a recovered browser publication. The backlog stays at 92 findings and 54 unfinished. The Windows Release build had zero warnings or errors. All 997 .NET tests and 126 extension mocks passed. First Flight UI timing and the light and dark captures were verified separately on `ae9b091`. Packaged installer acceptance remains open.
+
 ## 2026-11-18 consolidation
 
 The 18 commits through `02534d9` extend the former GitHub main `dca76ce`. The independent Windows audit reproduced five failures on the continuation. For 15 regressions already present there, the archived GitHub baseline failed 13 and the continuation passed all 15.

@@ -1,3 +1,7 @@
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
 namespace Vesper.Engine;
 
 public readonly record struct FileCheck(bool Exists, long Length, bool IsReparsePoint, bool IsCloudPlaceholder, bool IsDirectory);
@@ -81,6 +85,36 @@ public static class PathSafety
 
     internal static bool IsCloudPlaceholder(FileAttributes attributes) =>
         (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
+
+    internal static bool PathStillNamesFile(string path, FileStream verifiedFile, string digest)
+    {
+        using SafeFileHandle current = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+        if (!OperatingSystem.IsWindows())
+        {
+            using var reopened = new FileStream(current, FileAccess.Read);
+            return reopened.Length == verifiedFile.Length
+                && Convert.ToHexString(SHA256.HashData(reopened)).Equals(digest, StringComparison.OrdinalIgnoreCase);
+        }
+
+        const int fileIdInfo = 18;
+        int size = Marshal.SizeOf<FileIdentity>();
+        return GetFileInformationByHandleEx(verifiedFile.SafeFileHandle, fileIdInfo, out FileIdentity verified, size)
+            && GetFileInformationByHandleEx(current, fileIdInfo, out FileIdentity found, size)
+            && (verified.IdLow != 0 || verified.IdHigh != 0)
+            && verified.Volume == found.Volume && verified.IdLow == found.IdLow && verified.IdHigh == found.IdHigh;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileIdentity
+    {
+        public ulong Volume;
+        public ulong IdLow;
+        public ulong IdHigh;
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int infoClass, out FileIdentity info, int size);
 
     public static FileCheck Inspect(string path)
     {

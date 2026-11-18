@@ -183,7 +183,7 @@ public sealed class JobStoreRecoveryTests
         string path = Path.Combine(h.Data, "vesper.db");
         using var writer = new SqliteConnection($"Data Source={path};Pooling=False");
         writer.Open();
-        Execute(writer, "ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5; PRAGMA wal_checkpoint(TRUNCATE);");
+        Execute(writer, "ALTER TABLE jobs DROP COLUMN published_sha256; ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5; PRAGMA wal_checkpoint(TRUNCATE);");
 
         using var reader = new SqliteConnection($"Data Source={path};Pooling=False");
         reader.Open();

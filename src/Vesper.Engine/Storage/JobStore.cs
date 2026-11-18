@@ -57,6 +57,9 @@ public sealed class JobStore : IDisposable
         """,
         """
         ALTER TABLE jobs ADD COLUMN media_metadata_json TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN published_sha256 TEXT;
         """
     ];
 
@@ -284,7 +287,7 @@ public sealed class JobStore : IDisposable
         "accepts_ranges", "identity_level", "content_type", "category", "referer", "user_agent", "expected_sha256", "piece_map",
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
         "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
-        "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json"
+        "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json", "published_sha256"
     ];
 
     private static readonly string UpsertSql =
@@ -423,6 +426,7 @@ public sealed class JobStore : IDisposable
         yield return ("media_output", (int)j.Output);
         yield return ("pending_conversion_bytes", j.PendingConversionBytes);
         yield return ("pending_conversion_digest", j.PendingConversionDigest);
+        yield return ("published_sha256", j.PublishedSha256);
         yield return ("browser_proof", j.BrowserProof is null ? null : JsonSerializer.Serialize(j.BrowserProof));
         yield return ("media_metadata_json", ProtectedMediaState.Protect(j.MediaMetadataJson));
         yield return ("generation", j.Generation);
@@ -457,6 +461,7 @@ public sealed class JobStore : IDisposable
             PendingFinalPath = NStr("pending_final_path"),
             PendingConversionBytes = NInt("pending_conversion_bytes"),
             PendingConversionDigest = NStr("pending_conversion_digest"),
+            PublishedSha256 = NStr("published_sha256"),
             BrowserProof = NStr("browser_proof") is { } proof ? JsonSerializer.Deserialize<BrowserTransferProof>(proof) : null,
             TotalBytes = NInt("total_bytes"),
             Extents = extents,
