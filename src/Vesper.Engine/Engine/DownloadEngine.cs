@@ -81,6 +81,7 @@ public sealed partial class DownloadEngine : IDisposable
         try
         {
             engine.Recover();
+            engine.NormalizeQueueOrdersOnStartup();
             engine.MeteredNetworkPreferenceChanged();
             engine.ScheduleNext();
             _ = Task.Run(engine.RefreshAvailability);
