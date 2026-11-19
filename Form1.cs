@@ -134,6 +134,10 @@ public partial class Form1 : Form
 
     internal VesperPalette CurrentPalette => _colors;
     private readonly Dictionary<Guid, DownloadItem> _items = [];
+    private List<DownloadItem>? _sortedFilterItems;
+    private string? _sortedFilterOrder;
+    private string? _sortedFilterMode;
+    private bool _sortedFilterHidesMissing;
     private readonly Dictionary<string, DownloadItem> _browserItems = new(StringComparer.Ordinal);
     private readonly HashSet<string> _recentBrowserCompletions = new(StringComparer.Ordinal);
     private readonly VesperPreferences _prefs;
@@ -272,7 +276,12 @@ public partial class Form1 : Form
         engine.JobRemoved += id =>
         {
             MediaSourceRescue.ForgetAutomaticAttempt(id);
-            PostToUi(() => { _items.Remove(id); _grid.PruneChecks(_items.Keys); RefreshList(); });
+            PostToUi(() =>
+            {
+                if (_items.Remove(id)) InvalidateSortedFilterItems();
+                _grid.PruneChecks(_items.Keys);
+                RefreshList();
+            });
         };
         engine.ActivityChanged += active => PostToUi(() => EngineHost.HoldAwake(active && _prefs.PreventSleep));
 
@@ -317,13 +326,20 @@ public partial class Form1 : Form
                     row = new DownloadItem { Id = Guid.NewGuid() };
                     _items.Add(row.Id, row);
                     _browserItems.Add(file.Id, row);
+                    InvalidateSortedFilterItems();
                     structure = true;
                 }
                 else if (row.BrowserFile == file) continue;
                 var previous = row.BrowserFile;
+                JobStatus previousStatus = row.Status;
+                string previousName = row.Name;
+                long previousSize = row.SizeBytes;
+                DateTime previousCreated = row.CreatedUtc;
                 row.UpdateFromBrowser(activity.Profile, file);
+                bool sortKeyChanged = SortKeyChanged(row, previousStatus, previousName, previousSize, previousCreated);
+                if (sortKeyChanged || previousStatus != row.Status) InvalidateSortedFilterItems();
                 structure |= previous is null || previous.Name != file.Name || previous.Paused != file.Paused
-                    || previous.CanResume != file.CanResume || _sort.SelectedText == "Size" && previous.Length != file.Length;
+                    || previous.CanResume != file.CanResume || sortKeyChanged;
                 changed.Add(row.Id);
             }
             if (structure) RefreshList();
@@ -354,7 +370,11 @@ public partial class Form1 : Form
             _browserItems.Remove(row.BrowserFile!.Id);
             _items.Remove(row.Id);
         }
-        if (removed.Length > 0) _grid.PruneChecks(_items.Keys);
+        if (removed.Length > 0)
+        {
+            InvalidateSortedFilterItems();
+            _grid.PruneChecks(_items.Keys);
+        }
         return removed.Length > 0;
     }
 
@@ -403,6 +423,7 @@ public partial class Form1 : Form
             {
                 if (_items.Remove(snapshot.Id))
                 {
+                    InvalidateSortedFilterItems();
                     _grid.PruneChecks(_items.Keys);
                     structural = true;
                 }
@@ -414,17 +435,21 @@ public partial class Form1 : Form
                 JobState? previousState = item.Snapshot?.State;
                 string name = item.Name;
                 long size = item.SizeBytes;
+                DateTime created = item.CreatedUtc;
                 bool matched = searchTerm.Length > 0 && item.MatchesSearch(searchTerm);
                 item.UpdateFrom(snapshot);
+                bool sortKeyChanged = SortKeyChanged(item, before, name, size, created);
+                if (before != item.Status || sortKeyChanged) InvalidateSortedFilterItems();
                 if (IsQueueTermination(snapshot) && previousState != snapshot.State)
                     queueTerminations.Add(snapshot);
-                structural |= NeedsListRefresh(item, before, name, size, matched, searchTerm, sortBySize);
+                structural |= sortKeyChanged || NeedsListRefresh(item, before, name, size, matched, searchTerm, sortBySize);
                 Announce(before, item);
             }
             else
             {
                 var added = DownloadItem.From(snapshot);
                 _items[snapshot.Id] = added;
+                InvalidateSortedFilterItems();
                 if (added.Status == JobStatus.Completed) Announce(JobStatus.Queued, added);
                 if (IsQueueTermination(snapshot))
                     queueTerminations.Add(snapshot);
@@ -542,6 +567,20 @@ public partial class Form1 : Form
         if (sortBySize && previousSize != item.SizeBytes) return true;
         return searchTerm.Length > 0 && previouslyMatched != item.MatchesSearch(searchTerm);
     }
+
+    private bool SortKeyChanged(DownloadItem item, JobStatus previousStatus, string previousName,
+        long previousSize, DateTime previousCreated)
+    {
+        return _sort.SelectedText switch
+        {
+            "Name" => previousName != item.Name,
+            "Size" => previousSize != item.SizeBytes,
+            "Status" => previousStatus != item.Status || previousName != item.Name,
+            _ => previousCreated != item.CreatedUtc
+        };
+    }
+
+    private void InvalidateSortedFilterItems() => _sortedFilterItems = null;
 
     /// <summary>Tray notifications only for real transitions the user would want to know about.</summary>
     private void Announce(JobStatus before, DownloadItem item)
@@ -1156,19 +1195,35 @@ public partial class Form1 : Form
         if (_engine is not null) throw new InvalidOperationException("Sample data requires an offline window.");
         _items.Clear();
         foreach (var row in rows) _items.Add(row.Id, row);
+        InvalidateSortedFilterItems();
         RefreshList();
     }
 
     private void RefreshList()
     {
-        IEnumerable<DownloadItem> records = _items.Values;
-        if (_prefs.HideMissingCompleted) records = records.Where(r => r.Status != JobStatus.Missing);
-
         string term = _search.Text.Trim();
-        if (term.Length > 0)
-            records = records.Where(r => r.MatchesSearch(term));
+        IEnumerable<DownloadItem> records = GetSortedFilterItems();
+        if (term.Length > 0) records = records.Where(r => r.MatchesSearch(term));
 
-        records = _filter.SelectedText switch
+        _grid.EmptyTitle = _items.Count == 0 ? "No downloads yet" : "No matching downloads";
+        _grid.EmptyHint = _items.Count == 0 ? "Add a link or send one from your browser." : "";
+        _grid.SetItems(records.ToList());
+        UpdateFooter();
+        UpdateSelectedTools();
+    }
+
+    private IReadOnlyList<DownloadItem> GetSortedFilterItems()
+    {
+        string order = _sort.SelectedText;
+        string filter = _filter.SelectedText;
+        bool hideMissing = _prefs.HideMissingCompleted;
+        if (_sortedFilterItems is not null && _sortedFilterOrder == order
+            && _sortedFilterMode == filter && _sortedFilterHidesMissing == hideMissing)
+            return _sortedFilterItems;
+
+        IEnumerable<DownloadItem> records = _items.Values;
+        if (hideMissing) records = records.Where(r => r.Status != JobStatus.Missing);
+        records = filter switch
         {
             "Downloading" => records.Where(r => r.Status is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing or JobStatus.Converting),
             "Paused" => records.Where(r => r.Status == JobStatus.Paused),
@@ -1178,19 +1233,18 @@ public partial class Form1 : Form
                 or JobStatus.NeedsAttention or JobStatus.Failed),
             _ => records
         };
-        records = _sort.SelectedText switch
+        records = order switch
         {
             "Name" => records.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase),
             "Size" => records.OrderByDescending(r => r.SizeBytes),
             "Status" => records.OrderBy(r => r.Status).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase),
             _ => records.OrderByDescending(r => r.CreatedUtc)
         };
-
-        _grid.EmptyTitle = _items.Count == 0 ? "No downloads yet" : "No matching downloads";
-        _grid.EmptyHint = _items.Count == 0 ? "Add a link or send one from your browser." : "";
-        _grid.SetItems(records.ToList());
-        UpdateFooter();
-        UpdateSelectedTools();
+        _sortedFilterItems = records.ToList();
+        _sortedFilterOrder = order;
+        _sortedFilterMode = filter;
+        _sortedFilterHidesMissing = hideMissing;
+        return _sortedFilterItems;
     }
 
     private void UpdateFooter()
@@ -1570,8 +1624,21 @@ public partial class Form1 : Form
     private void RevealDownload(JobSnapshot snapshot)
     {
         if (snapshot.IsUnacceptedBrowserCapture) return;
-        if (_items.TryGetValue(snapshot.Id, out DownloadItem? item)) item.UpdateFrom(snapshot);
-        else _items[snapshot.Id] = item = DownloadItem.From(snapshot);
+        if (_items.TryGetValue(snapshot.Id, out DownloadItem? item))
+        {
+            JobStatus previousStatus = item.Status;
+            string previousName = item.Name;
+            long previousSize = item.SizeBytes;
+            DateTime previousCreated = item.CreatedUtc;
+            item.UpdateFrom(snapshot);
+            if (previousStatus != item.Status || SortKeyChanged(item, previousStatus, previousName, previousSize, previousCreated))
+                InvalidateSortedFilterItems();
+        }
+        else
+        {
+            _items[snapshot.Id] = item = DownloadItem.From(snapshot);
+            InvalidateSortedFilterItems();
+        }
         _search.Clear();
         _filter.SelectedIndex = 0;
         RefreshList();
