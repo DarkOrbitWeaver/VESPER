@@ -36,7 +36,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-024 | G, 1150–1159 | The butterfly detaches from the player during scroll; its rest state is fully static | Partial | `STATUS.tsv:25` |
 | VES-025 | G, 1160–1171 | Minor extension items | Partial | `STATUS.tsv:26` |
 | VES-030 | H, 1185–1194 | No WAV, FLAC, MP3 or Opus output selection | Partial | `STATUS.tsv:27` |
-| VES-031 | H, 1195–1216 | Time ranges work only for segmented HLS/DASH, but YouTube's single-file formats are indexed and could be clipped by byte range | Partial | `STATUS.tsv:28` |
+| VES-031 | H, 1195–1216 | Time ranges work only for segmented HLS/DASH, but YouTube's single-file formats are indexed and could be clipped by byte range | Partial; owner design required for the indexed single-file boundary and fallback contract | `STATUS.tsv:28`, `OWNER-DESIGN-REQUIRED.md` |
 | VES-032 | H, 1217–1229 | The "M4A (AAC)" choice prefers transcoding Opus over YouTube's native AAC | Preserved | `STATUS.tsv:29` |
 | VES-033 | H, 1230–1240 | Conversion is offered without probing whether this machine has the decoder | Partial; Windows verify | `STATUS.tsv:30` |
 | VES-034 | H, 1241–1247 | MP4 tag details (latent) | Preserved | `STATUS.tsv:31` |
@@ -50,7 +50,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-044 | I, 1371–1378 | Status changes are not announced to screen readers | Preserved; Windows verify | `STATUS.tsv:39` |
 | VES-045 | I, 1379–1395 | Visible vocabulary that exposes internals | Partial | `STATUS.tsv:40` |
 | VES-046 | I, 1396–1404 | The dangerous-extension list for Open is incomplete | Preserved | `STATUS.tsv:41` |
-| VES-050 | L, 1661 | Installer's final message | External + open integration | `STATUS.tsv:42` |
+| VES-050 | L, 1661 | Installer's final message | Partial; owner design required for live connection status; Store listing external | `STATUS.tsv:42`, `OWNER-DESIGN-REQUIRED.md` |
 | VES-051 | L, 1662 | No update awareness | Implemented; Windows verify | `STATUS.tsv:43` |
 | VES-052 | L, 1663 | Portable build cannot connect Chrome | Implemented; Windows verify | `STATUS.tsv:44` |
 | VES-053 | L, 1664 | No "remove my data" on uninstall | Implemented; setup tests; packaged UI and interruption checks open | `STATUS.tsv:45` |
@@ -90,8 +90,8 @@ Original opportunity rows are explicitly **not** automatic release blockers. The
 | N-09 | 1725 | **Completion actions**: open folder, notify, "sleep when queue finishes" (with a 60 s cancelable prompt) | Partial; focused Windows tests passed; shutdown remains open |
 | N-10 | 1726 | **Metered-connection awareness**: pause new jobs on metered networks unless allowed | Implemented; engine/settings tests; Windows transition check open |
 | N-11 | 1727 | **Checksum from page** (detect `SHA256SUMS`/`.sha256` next to a download URL; offer "verify with publisher checksum") | Implemented; solution tests |
-| N-12 | 1728 | **Mirror substitution** (user pastes another link; identity rules decide) | Partial |
-| N-13 | 1729 | **Batch/playlist quality decision once** ("apply to all 24") | Partial |
+| N-12 | 1728 | **Mirror substitution** (user pastes another link; identity rules decide) | Implemented; focused identity/refusal tests passed 5/5; broader Rescue acceptance remains under VES-009/VSP-004 |
+| N-13 | 1729 | **Batch/playlist quality decision once** ("apply to all 24") | Implemented; focused native/browser tests passed; live Chrome acceptance remains open |
 | N-14 | 1730 | **Import/export** of the list (JSON/CSV of URLs plus states; no secrets) | Implemented; format/engine tests; packaged UI check open |
 | N-15 | 1731 | **Drag-and-drop** of links and `.url` files onto the window | Implemented; Windows fixture |
 | N-16 | 1732 | **Per-site rules** (always audio, always a given folder, never capture) | Partial; focused tests passed; real Chrome acceptance open |

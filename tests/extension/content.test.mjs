@@ -47,6 +47,18 @@ test('subtitle embedding stays opt-in and travels with the native media selectio
   assert.match(background, /mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles/);
 });
 
+test('browser playlist browsing only opens the native picker from resolver collection metadata', () => {
+  const content = source('content');
+  const background = source('background');
+  const options = readFileSync(new URL('../../BrowserMediaOptions.cs', import.meta.url), 'utf8');
+  assert.match(content, /result\.data\?\.hasRelatedCollection/);
+  assert.match(content, /type: 'native-picker', title/);
+  assert.match(content, /formats\.hasRelatedCollection && !formats\.browserChoice/);
+  assert.match(background, /const trustedContentPage = sender\.tab \? mediaPage\(\{\}, sender\)\?\.href : null/);
+  assert.match(options, /resolved\.Collection is \{ \} collection/);
+  assert.match(options, /hasRelatedCollection = HasRelatedCollection\(item\)/);
+});
+
 test('System motion follows the reduced-motion preference and explicit choices override it', () => {
   const document = new EventTarget();
   document.querySelectorAll = () => [];

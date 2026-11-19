@@ -14,6 +14,27 @@ namespace Vesper.Windows.Tests;
 public sealed class BrowserBridgeTests
 {
     [Fact]
+    public void Browser_collection_shortcut_requires_a_resolver_supplied_http_collection()
+    {
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch?v=one&list=PL1"),
+            Provider = "test",
+            Title = "One"
+        };
+
+        Assert.False(BrowserBridgeHandler.HasRelatedCollection(item));
+        Assert.False(BrowserBridgeHandler.HasRelatedCollection(item with
+        {
+            Related = new CollectionHint(CollectionKind.Playlist, "PL1", new Uri("javascript:alert(1)"), false, "Playlist")
+        }));
+        Assert.True(BrowserBridgeHandler.HasRelatedCollection(item with
+        {
+            Related = new CollectionHint(CollectionKind.Playlist, "PL1", new Uri("https://video.example.test/playlist?list=PL1"), false, "Playlist")
+        }));
+    }
+
+    [Fact]
     public void App_mutex_and_show_event_are_scoped_to_the_current_user()
     {
         string currentPipe = BridgePipe.NameForCurrentUser();

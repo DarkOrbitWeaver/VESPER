@@ -1,6 +1,7 @@
 using VESPER;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
+using System.Runtime.ExceptionServices;
 
 namespace Vesper.Windows.Tests;
 
@@ -27,5 +28,113 @@ public sealed class MediaDiscoveryFormTests
         Assert.False(several.IncludeAutoSubtitles);
         Assert.Equal(new[] { "en", "es" }, generated.SubtitleLanguages);
         Assert.True(generated.IncludeAutoSubtitles);
+    }
+
+    [Fact]
+    public void CollectionQualityIsAppliedIndependentlyAndRowsShowReadyOrSkipped()
+    {
+        var first = Item("site-a", [
+            Representation("site-a", "1080p60", 1080, 60),
+            Representation("site-a", "720p30", 720, 30)
+        ]);
+        var second = Item("site-b", [Representation("site-b", "480p30", 480, 30)]);
+        var incompatible = Item("site-c", [Representation("site-c", "external", 1080, 30,
+            ProcessingRequirement.ExtractAudio)]);
+
+        var firstResult = MediaDiscoveryForm.PrepareCollectionEntry(first, FormatPreferences.BalancedQuality,
+            MediaOutputPreference.Original);
+        var secondResult = MediaDiscoveryForm.PrepareCollectionEntry(second, FormatPreferences.BalancedQuality,
+            MediaOutputPreference.Original);
+        var incompatibleResult = MediaDiscoveryForm.PrepareCollectionEntry(incompatible,
+            FormatPreferences.BalancedQuality, MediaOutputPreference.Original);
+
+        Assert.Null(firstResult.Error);
+        Assert.Contains("1080p", firstResult.Choice!.DisplayDetail, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(secondResult.Error);
+        Assert.Contains("480p", secondResult.Choice!.DisplayDetail, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(incompatibleResult.Choice);
+        Assert.NotNull(incompatibleResult.Error);
+        Assert.Contains("Ready", MediaDiscoveryForm.CollectionRowText("Episode One",
+            MediaDiscoveryForm.CollectionAvailabilityText(firstResult.Choice, null)));
+        Assert.Contains("Skipped", MediaDiscoveryForm.CollectionRowText("Episode Three",
+            MediaDiscoveryForm.CollectionAvailabilityText(null, incompatibleResult.Error)));
+    }
+
+    [Fact]
+    public void CollectionOutputChangeInvalidatesOldAvailability()
+    {
+        OnSta(() =>
+        {
+            using var form = new MediaDiscoveryForm(new VesperPreferences(),
+                [new Uri("https://example.test/episode-one")]);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+
+            var statuses = (Dictionary<int, string>)typeof(MediaDiscoveryForm)
+                .GetField("_collectionAvailability", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            statuses[0] = "Ready · MP4 · 720p";
+            var output = (VesperChoice)typeof(MediaDiscoveryForm)
+                .GetField("_outputChoice", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            output.SelectedIndex = 1;
+            Application.DoEvents();
+
+            Assert.Empty(statuses);
+            var notice = (Label)typeof(MediaDiscoveryForm)
+                .GetField("_notice", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            Assert.Contains("No entries are added until you confirm", notice.Text);
+
+            statuses[0] = "Ready · MP4 · 1080p";
+            var entries = (CheckedListBox)typeof(MediaDiscoveryForm)
+                .GetField("_entries", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            entries.SetItemChecked(0, true);
+            Application.DoEvents();
+            Assert.Empty(statuses);
+            var status = (Label)typeof(MediaDiscoveryForm)
+                .GetField("_status", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            Assert.Contains("Selection changed", status.Text);
+        });
+    }
+
+    private static MediaItem Item(string provider, IReadOnlyList<MediaRepresentation> formats) => new()
+    {
+        SourceUrl = new Uri($"https://{provider}.example.test/watch/one"),
+        Provider = provider,
+        Title = "Episode",
+        Representations = formats
+    };
+
+    private static MediaRepresentation Representation(string provider, string id, int height, double frameRate,
+        ProcessingRequirement requirements = ProcessingRequirement.None) => new()
+    {
+        Id = id,
+        Url = new Uri($"https://{provider}.example.test/{id}.mp4"),
+        Content = Vesper.MediaResolver.Models.StreamContent.VideoAndAudio,
+        Container = "mp4",
+        VideoCodec = "h264",
+        AudioCodec = "aac",
+        Height = height,
+        FrameRate = frameRate,
+        Requirements = requirements
+    };
+
+    private static void OnSta(Action action)
+    {
+        ExceptionDispatchInfo? error = null;
+        var thread = new Thread(() =>
+        {
+            try { action(); }
+            catch (Exception ex) { error = ExceptionDispatchInfo.Capture(ex); }
+        }) { IsBackground = true };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(8)), "The media discovery UI test did not finish.");
+        error?.Throw();
     }
 }

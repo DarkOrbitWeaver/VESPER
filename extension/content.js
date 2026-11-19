@@ -648,6 +648,14 @@
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
+    if (result?.ok && result.data?.hasRelatedCollection
+        && !result.data?.choices?.length && !result.data?.sourceChoices?.length) {
+      const note = result.data.collectionIsDynamic
+        ? 'This is a changing playlist snapshot. Choose entries and one quality in VESPER.'
+        : 'Choose playlist entries and one quality in VESPER. Nothing is added until you confirm.';
+      const controls = collectionPickerControls(title, request);
+      return renderShell(result.data.title || title, poster, duration, element('div', 'msg', note), ...controls);
+    }
     if (!result?.ok || (!result.data?.choices?.length && !result.data?.sourceChoices?.length)) {
       const message = errorMessage(result);
       if (!['protected', 'blocked', 'chrome-format'].includes(result?.code)) appendRetry(message, loadFormats, result?.data?.retryAt);
@@ -688,6 +696,40 @@
     panel.replaceChildren(head, ...body);
     place();
     return close;
+  }
+
+  function collectionPickerControls(title, request) {
+    const browse = element('button', 'vesper-button', 'Browse playlist in VESPER');
+    const status = element('small', 'hint', 'VESPER will show the available entries and their quality matches.');
+    status.hidden = true;
+    browse.onclick = async () => {
+      if (!panelMedia || !isCurrentRequest(request) || browse.disabled) return;
+      browse.disabled = true;
+      browse.textContent = 'Opening VESPER…';
+      status.hidden = false;
+      status.textContent = 'Choose checked entries and confirm in VESPER.';
+      status.classList.remove('bad');
+      try {
+        const reply = await send({ type: 'native-picker', title });
+        if (!isCurrentRequest(request)) return;
+        browse.disabled = false;
+        browse.textContent = 'Browse playlist in VESPER';
+        if (reply?.ok) {
+          const accepted = (reply.results || []).filter(result => ['queued', 'started', 'already-submitted'].includes(result.status)).length;
+          status.textContent = `${accepted} item(s) accepted in VESPER.`;
+        } else {
+          status.textContent = errorMessage(reply);
+          status.classList.toggle('bad', reply?.code !== 'cancelled');
+        }
+      } catch {
+        if (!isCurrentRequest(request)) return;
+        browse.disabled = false;
+        browse.textContent = 'Browse playlist in VESPER';
+        status.textContent = 'VESPER could not open the playlist picker.';
+        status.classList.add('bad');
+      }
+    };
+    return [browse, status];
   }
 
   function renderChoices(title, poster, seconds, formats, expanded = false, useOriginal = false, useM4a = true) {
@@ -861,6 +903,8 @@
       };
       body.push(more);
     }
+    if (formats.hasRelatedCollection && !formats.browserChoice)
+      body.push(...collectionPickerControls(title, request));
     const footer = element('div', 'foot');
     for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
