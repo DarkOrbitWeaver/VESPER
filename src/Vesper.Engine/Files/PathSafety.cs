@@ -195,6 +195,24 @@ public static class PathSafety
             throw FileError(Marshal.GetLastPInvokeError(), path);
     }
 
+    internal static bool TryDeleteTemporaryFile(string path, out string error)
+    {
+        error = "";
+        try
+        {
+            using SafeFileHandle file = OpenTemporaryHandle(path, FileMode.Open, FileAccess.Read,
+                FileShare.Read, allowDelete: true);
+            DeleteOpenTemporaryFile(file, path);
+            return true;
+        }
+        catch (FileNotFoundException) { return true; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle file, int infoClass, ref byte data, int size);

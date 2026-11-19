@@ -2,6 +2,14 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-19 temporary-file cleanup uses validated handles
+
+`PathSafety.TryDeleteTemporaryFile` opens a temporary file with the existing directory, link-count and placeholder checks, then deletes through that same handle on Windows. Recovery-manifest cleanup, conversion stages, and direct and segmented merge cleanup now use it. The main partial still requires its saved file identity before deletion.
+
+The focused Windows Release tests passed **4/4** on build 26200 with .NET SDK 11.0.100 and runtime 10.0.15. The filter covered `PathSafetyTests` and `Recovery_manifest_cleanup_refuses_a_hard_link_to_an_unrelated_file`; the latter preserves the original file and hard link. The full log is `release/audit-evidence/ownership-cleanup-cc85d83-targeted.log`. This run used the working tree based on `cc85d83` plus these source and test changes. An earlier folder-path invocation selected the root solution and stopped at unavailable win-x64 runtime packs before tests; its log is retained as `release/audit-evidence/ownership-cleanup-cc85d83-focused.log`. The backlog verifier passed with 92 unique IDs and 54 unfinished; log: `release/audit-evidence/ownership-cleanup-backlog-20261119.log`.
+
+This narrows unsafe path cleanup but does not establish persistent identity for every sidecar or solve the final completed-file Recycle Bin path race. `USER-ATOMIC-STATE` and Q1/Q8 remain open.
+
 ## 2026-11-18 partial identity and native helper
 
 Windows records the identity of the main partial before the first write. Resume, Rescue reads, merge and conversion, publication, Cancel and Start over verify the opened file against the saved claim. A replacement with identical bytes does not pass. Older partials with no proof are retained and must be moved aside in File Explorer before starting fresh. A legacy muxed file can be bound when its saved hash matches. Identity for every sidecar and the final Recycle Bin path race remain open.
@@ -64,7 +72,7 @@ This checkpoint follows the verified UI-command atomicity commit `4d49553`; it i
 
 - **Red-green defect proof:** isolated SQLite `BEFORE UPDATE` fault-injection tests originally proved that Pause, Resume, Priority, Speed Limit and Rename changed the visible job although the write failed. All five failed before the fix and now pass; approval of unverified resume and a failed forced StartNow round out **seven** targeted cases.
 - **Fix:** `DownloadEngine.Commands.PersistUiMutationLocked` stages only deterministic scalar edits on `DownloadJob.CopyForUiMutation()`, persists that candidate, and then applies the same edit to the original live object under `_lock`. Existing session references and checkpoint extents are preserved. Pause, Requeue/StartNow, limiter updates and `UpdateIfExists/UpdateIfIdle` publish their live state and side effects only after SQLite accepts the edit; the idle gate is checked in the same lock.
-- **Verification boundary:** seven focused `JobCommandAtomicityTests` passed on the Windows RAMCA host. The original `952/952` .NET and `126/126` extension checks were previous-commit baselines, not this continuation's complete approval. `USER-ATOMIC-STATE` is still PARTIAL; `UpdateJob`, multi-row queue moves, Cancel, StopAndKeepLive, restart-from-scratch, browser/media refresh and runner completion still require independent atomicity and restart/failpoint proofs. Q1/Q9 and every release gate remain OPEN.
+- **Verification boundary:** seven focused `JobCommandAtomicityTests` passed on Windows. The original `952/952` .NET and `126/126` extension checks were previous-commit baselines, not this continuation's complete approval. `USER-ATOMIC-STATE` is still PARTIAL; `UpdateJob`, multi-row queue moves, Cancel, StopAndKeepLive, restart-from-scratch, browser/media refresh and runner completion still require independent atomicity and restart/failpoint proofs. Q1/Q9 and every release gate remain OPEN.
 
 ## 2026-11-17 continuation: native HTTP Rescue saves before making a replacement live
 

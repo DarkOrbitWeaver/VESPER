@@ -50,6 +50,24 @@ public sealed class CancelDownloadTests
         Assert.False(File.Exists(manifest));
     }
 
+    [Fact]
+    public void Recovery_manifest_cleanup_refuses_a_hard_link_to_an_unrelated_file()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/file", "manifest.bin", startNow: false);
+        string partial = h.Engine.Snapshot(id)!.PartialPath;
+        string manifest = RecoveryManifest.PathFor(partial);
+        string unrelated = Path.Combine(h.Downloads, "keep.txt");
+        File.WriteAllText(unrelated, "keep these bytes");
+        Assert.True(CreateHardLinkW(manifest, unrelated, IntPtr.Zero));
+
+        RecoveryManifest.Delete(partial);
+
+        Assert.True(File.Exists(manifest));
+        Assert.Equal("keep these bytes", File.ReadAllText(unrelated));
+    }
+
     [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateHardLinkW(string newPath, string existingPath, IntPtr security);

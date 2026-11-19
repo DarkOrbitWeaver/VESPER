@@ -40,8 +40,7 @@ internal static class RecoveryManifest
 
     public static void Delete(string partialPath)
     {
-        try { File.Delete(PathFor(partialPath)); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* auxiliary file; harmless to leave */ }
+        _ = PathSafety.TryDeleteTemporaryFile(PathFor(partialPath), out _);
     }
 
     /// <summary>Returns a job in NeedsLink state: the manifest knows the identity but not the secret link.</summary>

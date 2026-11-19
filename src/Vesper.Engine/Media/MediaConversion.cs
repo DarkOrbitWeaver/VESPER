@@ -469,7 +469,8 @@ public sealed partial class DownloadEngine
                 PathSafety.RequireTemporaryIdentity(file, job.PartialIdentity);
                 PathSafety.DeleteOpenTemporaryFile(file, path);
             }
-            else File.Delete(path);
+            else if (!PathSafety.TryDeleteTemporaryFile(path, out string error))
+                throw new IOException(error);
             return true;
         }
         catch (FileNotFoundException) { return true; }

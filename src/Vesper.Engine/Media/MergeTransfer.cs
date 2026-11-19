@@ -402,11 +402,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to download and merge. Saved data was kept."));
     }
 
-    private static void TryDelete(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* an unpublished temp file; next run overwrites it */ }
-    }
+    private static void TryDelete(string path) => _ = PathSafety.TryDeleteTemporaryFile(path, out _);
 
     private static RunOutcome Stop(string reason) => RunOutcome.NeedsAttention("merge-integrity", reason + " Saved data was kept.");
 }

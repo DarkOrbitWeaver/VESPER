@@ -756,11 +756,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     private static RunOutcome NeedsAttention(string reason, string message) => RunOutcome.NeedsAttention(reason, message + " Saved data was kept.");
     private static RunOutcome Stop(string reason) => NeedsAttention("merge-integrity", reason);
 
-    private static void TryDelete(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-    }
+    private static void TryDelete(string path) => _ = PathSafety.TryDeleteTemporaryFile(path, out _);
 
     private sealed class HlsKeyCache : IDisposable
     {
