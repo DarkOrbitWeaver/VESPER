@@ -19,7 +19,7 @@ internal static class RecoveryManifest
     private sealed record Body(int V, Guid JobId, long Generation, string Url, string FileName, long? Total,
         string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0,
         string? MediaMetadataJson = null, string? MediaThumbnailUrl = null, string? PartialIdentity = null,
-        string? FinalResourceIdentity = null);
+        string? FinalResourceIdentity = null, string? ManifestIdentity = null);
 
     private sealed record Envelope(string? Check, string? Body);
     private sealed record MergeSwapProof(int Version, string Fingerprint, string Phase, long MuxLength,
@@ -32,12 +32,6 @@ internal static class RecoveryManifest
         if (job.PartialPath.Length == 0) return;
         if (livePartialHandle is not null)
             PathSafety.RequireTemporaryIdentity(livePartialHandle, job.PartialIdentity);
-        var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
-            job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder,
-            (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl), job.PartialIdentity,
-            job.FinalResourceIdentity);
-        string bodyJson = JsonSerializer.Serialize(body);
-        string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
 
         string path = PathFor(job.PartialPath);
         string temp = path + ".tmp";
@@ -51,6 +45,12 @@ internal static class RecoveryManifest
                 try
                 {
                     tempIdentity = PathSafety.TemporaryFileIdentity(file.SafeFileHandle);
+                    var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
+                        job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder,
+                        (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl), job.PartialIdentity,
+                        job.FinalResourceIdentity, tempIdentity);
+                    string bodyJson = JsonSerializer.Serialize(body);
+                    string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
                     using (var writer = new StreamWriter(file, Encoding.UTF8, 4096, leaveOpen: true))
                     {
                         writer.Write(json);
@@ -407,7 +407,7 @@ internal static class RecoveryManifest
                 return false;
 
             body = JsonSerializer.Deserialize<Body>(bodyJson)!;
-            return body is not null;
+            return body is not null && ManifestIdentityMatches(body, handle);
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException
             or ArgumentException or NotSupportedException)
@@ -434,6 +434,12 @@ internal static class RecoveryManifest
 
         if (string.Equals(body.PartialIdentity, job.PartialIdentity, StringComparison.Ordinal)) return true;
         return MatchesMuxedMergeIdentity(job, body.PartialIdentity);
+    }
+
+    private static bool ManifestIdentityMatches(Body body, SafeFileHandle handle)
+    {
+        if (body.ManifestIdentity is null) return true;
+        return string.Equals(body.ManifestIdentity, PathSafety.TemporaryFileIdentity(handle), StringComparison.Ordinal);
     }
 
     private static bool MatchesMuxedMergeIdentity(DownloadJob job, string? manifestIdentity)
@@ -498,6 +504,8 @@ internal static class RecoveryManifest
             if (Hash(bodyJson) != check) { problem = "checksum mismatch"; return false; }
             Body? body = JsonSerializer.Deserialize<Body>(bodyJson);
             if (body is null || body.V != 1) { problem = "unsupported version"; return false; }
+            if (!ManifestIdentityMatches(body, manifestSource))
+            { problem = "recovery file identity mismatch"; return false; }
             if (body.JobId == Guid.Empty) { problem = "invalid recovery job id"; return false; }
             if (body.Generation < 0) { problem = "invalid recovery generation"; return false; }
             if (body.Total is < 0) { problem = "invalid recovery file length"; return false; }
