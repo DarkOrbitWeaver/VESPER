@@ -3,7 +3,8 @@ using System.Net.Http;
 namespace Vesper.Engine;
 
 /// <summary>What one request to the replacement link revealed. Built from a single ranged GET; the body is never read.</summary>
-public sealed record ProbeFacts(int Status, bool RangeOk, long? TotalBytes, string? StrongEtag, DateTimeOffset? LastModified, bool IdentityEncoding);
+public sealed record ProbeFacts(int Status, bool RangeOk, long? TotalBytes, string? StrongEtag, DateTimeOffset? LastModified,
+    bool IdentityEncoding, string? FinalResourceIdentity = null);
 
 public sealed record RescueDecision(RescueMode Mode, bool Accepted, string Message);
 
@@ -51,8 +52,12 @@ public static class RescueEvaluator
         Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? old);
         // An ETag only identifies a representation within the scope of its resource.
         // A different host or path may reuse the same ETag for unrelated bytes.
-        bool sameResource = old is not null && UrlPolicy.IsSameOrigin(old, newUrl)
+        bool sameStartingResource = old is not null && UrlPolicy.IsSameOrigin(old, newUrl)
             && UrlPolicy.IsSameResource(old, newUrl);
+        bool sameFinalResource = HttpTransport.IsResourceIdentity(job.FinalResourceIdentity)
+            && HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity)
+            && string.Equals(job.FinalResourceIdentity, probe.FinalResourceIdentity, StringComparison.Ordinal);
+        bool sameResource = sameStartingResource || sameFinalResource;
         string differs = "";
         if (job.Identity == IdentityLevel.StrongEtag)
         {
@@ -174,6 +179,21 @@ public sealed partial class DownloadEngine
             return new RescueResult(false, decision.Mode, decision.Message, retained);
         }
 
+        if (!HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity))
+            return Rejected("The replacement did not provide a verifiable final file location. Saved data was kept.");
+
+        bool sameFinalResource = HttpTransport.IsResourceIdentity(snapshot.FinalResourceIdentity)
+            && HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity)
+            && string.Equals(snapshot.FinalResourceIdentity, probe.FinalResourceIdentity, StringComparison.Ordinal);
+        if (!sameFinalResource && decision.Mode != RescueMode.R1b)
+        {
+            if (sha is null)
+                return Rejected("The replacement resolves to a different file location, or the saved download predates redirect identity checks. Add a trusted checksum or piece list to verify its saved bytes; no bytes were changed.");
+
+            decision = new RescueDecision(RescueMode.R1, true,
+                "The replacement resolves to a different file location. VESPER will verify the finished file against its trusted SHA-256 before publishing it.");
+        }
+
         ExtentSet? verified = null;
         int refetch = 0;
         if (decision.Mode == RescueMode.R1b)
@@ -218,7 +238,10 @@ public sealed partial class DownloadEngine
         int status = (int)response.StatusCode;
         RangeCheck check = HttpFacts.CheckRangeResponse(response, offset, null);
         long? total = check.IsValid ? check.Total : response.Content.Headers.ContentLength;
-        return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response), HttpFacts.IsIdentityEncoded(response));
+        string? finalIdentity = response.RequestMessage?.RequestUri is { } finalUri
+            ? HttpTransport.ResourceIdentity(finalUri) : null;
+        return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response),
+            HttpFacts.IsIdentityEncoded(response), finalIdentity);
     }
 
     private bool ApplyRescue(DownloadJob job, DownloadJob snapshot, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
@@ -230,6 +253,7 @@ public sealed partial class DownloadEngine
                 || _sessions.ContainsKey(job.Id) || _cancelling.Contains(job.Id) || job.State == JobState.Completed
                 || IsCleanupPending(job) || job.PendingFinalPath is not null || mediaExpiresAt <= DateTimeOffset.UtcNow
                 || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl
+                || job.FinalResourceIdentity != snapshot.FinalResourceIdentity
                 || !ReferenceEquals(job.Extents, snapshot.Extents) || job.ExpectedSha256 != snapshot.ExpectedSha256
                 || job.PieceMapJson != snapshot.PieceMapJson)
                 return false;
@@ -240,6 +264,7 @@ public sealed partial class DownloadEngine
             string[] previous = job.PreviousUrls.Split('\n', StringSplitOptions.RemoveEmptyEntries);
             updated.PreviousUrls = string.Join('\n', previous.Append(job.SourceUrl).TakeLast(10));
             updated.SourceUrl = uri.AbsoluteUri;
+            updated.FinalResourceIdentity = probe?.FinalResourceIdentity;
             updated.RescueMode = decision.Mode;
             if (mediaExpiresAt is not null) updated.MediaExpiresAt = mediaExpiresAt;
 

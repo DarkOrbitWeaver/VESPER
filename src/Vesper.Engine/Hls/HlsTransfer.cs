@@ -25,7 +25,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         string? Mode = null, long? NextSequence = null, long? LastDiscontinuitySequence = null,
         string? Container = null, string? MapIdentity = null, string? SourceIdentity = null, int TargetDuration = 0,
         double CapturedSeconds = 0, string[]? KeyFingerprints = null, bool StopRequested = false,
-        bool HadGaps = false, string? GapMessage = null);
+        bool HadGaps = false, string? GapMessage = null, long? EpochOffsetTicks = null,
+        long? TimelineOriginPts = null, string? TimelineCounters = null, string? CodecProfile = null);
     private DownloadJob Job => session.Job;
 
     internal static bool IsLiveState(string? json)
@@ -94,12 +95,29 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (cursor?.Mode == LiveMode || !media.IsVod)
             return await RunLiveAsync(playlistUrl, media, cursor, ct).ConfigureAwait(false);
         if (media.Segments.Count == 0) return RunOutcome.Failed("empty", "The playlist contains no media segments.");
-        if (media.Segments.Any(segment => segment.DiscontinuityBefore || segment.IsGap))
-            return RunOutcome.NeedsAttention("unsupported", "Discontinuous or missing media requires processing that is not supported.");
+        if (media.Segments.Any(segment => segment.IsGap))
+            return RunOutcome.NeedsAttention("unsupported", "A playlist gap cannot be included in a complete file. Saved data was kept.");
         if (media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
             return RunOutcome.NeedsAttention("unsupported", "Initialization URI, byte range or encryption changes part-way. A remux is required; saved data was kept.");
-        byte[] planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(media.Segments)
-            : JsonSerializer.SerializeToUtf8Bytes(new { media.Segments, Clip = clipRange });
+        bool hasDiscontinuityMetadata = media.Segments.Any(segment =>
+            segment.DiscontinuityBefore || segment.DiscontinuitySequence != 0);
+        byte[] planBytes;
+        if (hasDiscontinuityMetadata)
+        {
+            var plannedSegments = media.Segments.Select(segment => new
+            {
+                segment.Uri, segment.Duration, segment.RangeLength, segment.RangeOffset, segment.Key, segment.Map,
+                segment.Sequence, segment.DiscontinuityBefore, segment.DiscontinuitySequence, segment.IsGap
+            }).ToArray();
+            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(plannedSegments)
+                : JsonSerializer.SerializeToUtf8Bytes(new { Segments = plannedSegments, Clip = clipRange });
+        }
+        else
+        {
+            // Keep the existing plan identity for continuous playlists so saved progress remains resumable.
+            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(media.Segments)
+                : JsonSerializer.SerializeToUtf8Bytes(new { media.Segments, Clip = clipRange });
+        }
         string planHash = Convert.ToHexString(SHA256.HashData(planBytes));
         IReadOnlyList<HlsSegment> segments = media.Segments;
         double actualStart = 0, actualEnd = 0;
@@ -118,17 +136,25 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 job.MediaQuality = quality + " · " + range;
             });
         }
+        bool fragmented = segments[0].Map is not null;
+        bool hasSelectedDiscontinuity = segments.Skip(1).Any(segment => segment.DiscontinuityBefore);
+        if (fragmented && hasSelectedDiscontinuity)
+            return RunOutcome.NeedsAttention("discontinuity", "Fragmented MP4 timestamps cannot be rebased safely across discontinuity epochs. Saved data was kept.");
         int next = cursor?.Next ?? 0;
         long offset = Job.Extents.ContiguousFromZero();
         if (next < 0 || next > segments.Count || (next == 0) != (offset == 0) || Job.Extents.TotalBytes != offset)
             return RunOutcome.NeedsAttention("cursor", "Saved progress no longer matches the playlist. Saved data was kept.");
-        bool fragmented = media.Segments[0].Map is not null;
         SetOutputName(fragmented ? ".mp4" : ".ts");
         PartialFile file = session.OpenFile();
         if (file.Length < offset) return RunOutcome.NeedsAttention("cursor", "The partial file is shorter than committed progress. Saved data was kept.");
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         FragmentedMp4? mp4 = null;
         TransportStreamValidator? transport = fragmented ? null : new();
+        var timeline = new HlsTransportTimeline();
+        long epochOffset = cursor?.EpochOffsetTicks ?? 0;
+        long? timelineOriginPts = cursor?.TimelineOriginPts;
+        long? lastDiscontinuitySequence = cursor?.LastDiscontinuitySequence;
+        string? codecProfile = cursor?.CodecProfile;
         int initLength = 0;
         var keys = new Dictionary<string, byte[]>();
         try
@@ -137,9 +163,19 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             {
                 if (cursor?.PlanHash != planHash || cursor.Offset != offset || cursor.PrefixHash is null)
                     return RunOutcome.NeedsAttention("source-changed", "The playlist changed, or this legacy cursor has no verified manifest identity. Restart is required; saved data was kept.");
-                MediaPartialIntegrity.HashPrefix(file, offset, hash, ct, transport);
+                MediaPartialIntegrity.HashPrefix(file, offset, hash, ct, transport,
+                    fragmented ? null : timeline);
                 if (Convert.ToHexString(hash.GetCurrentHash()) != cursor.PrefixHash)
                     return RunOutcome.NeedsAttention("integrity", "The committed HLS prefix failed SHA-256 validation. Saved data was kept.");
+                if (hasSelectedDiscontinuity)
+                {
+                    if (timelineOriginPts is null || cursor.EpochOffsetTicks is null
+                        || cursor.LastDiscontinuitySequence is null || !timeline.TryRestoreCounters(cursor.TimelineCounters))
+                        return RunOutcome.NeedsAttention("source-changed", "The saved HLS cursor predates discontinuity timeline state. Restart is required; saved data was kept.");
+                    if (codecProfile is { } savedProfile
+                        && (savedProfile.Length != 64 || !savedProfile.All(Uri.IsHexDigit)))
+                        return RunOutcome.NeedsAttention("source-changed", "The saved HLS codec profile is invalid. Restart is required; saved data was kept.");
+                }
                 initLength = cursor.InitLength;
                 if (fragmented)
                 {
@@ -148,6 +184,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     mp4.Restore(cursor.Progress);
                 }
             }
+            if (file.Length > offset) file.Truncate(offset);
             session.SetPhase(JobState.Downloading);
             DateTime lastMessage = DateTime.MinValue;
             // Fetch a few segments ahead so round trips overlap, but decrypt, validate and commit strictly in order:
@@ -194,13 +231,67 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 {
                     data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
                 }
-                if (fragmented) mp4!.ValidateFragment(data.Span);
-                else transport!.Validate(data.Span);
+                bool firstOutputSegment = offset == 0 && i == 0;
+                bool startEpoch = !firstOutputSegment && (segment.DiscontinuityBefore
+                    || lastDiscontinuitySequence is long previousSequence
+                        && segment.DiscontinuitySequence != previousSequence);
+                if (fragmented)
+                {
+                    mp4!.ValidateFragment(data.Span);
+                }
+                else if (startEpoch)
+                {
+                    TransportStreamLayout expectedLayout = transport!.SnapshotLayout()
+                        ?? throw new MediaContainerException("The preceding HLS epoch has no complete program layout.");
+                    var nextEpoch = new TransportStreamValidator(expectedLayout: expectedLayout);
+                    nextEpoch.Validate(data.Span);
+                    if (nextEpoch.SnapshotLayout() is null)
+                        throw new MediaContainerException("The new HLS epoch did not begin with complete program tables.");
+                    string? nextCodecProfile = HlsTransportCodecProfile.TryRead(data, ct);
+                    if (codecProfile is null || nextCodecProfile is null)
+                        throw new MediaContainerException("The HLS discontinuity has no verified H.264/AAC decoder configuration to compare.");
+                    if (!string.Equals(codecProfile, nextCodecProfile, StringComparison.Ordinal))
+                        throw new MediaContainerException("The HLS discontinuity changes decoder configuration; a remux is required.");
+                    long firstPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
+                        ?? throw new MediaContainerException("The new HLS epoch has no presentation timestamp to rebase.");
+                    if (timelineOriginPts is not long originPts)
+                        throw new MediaContainerException("The first HLS epoch has no verified presentation timestamp.");
+                    long elapsedTicks = TimelineTicks(segments, i);
+                    long targetPts = checked(originPts + elapsedTicks);
+                    epochOffset = checked(targetPts - firstPts);
+                    transport = nextEpoch;
+                    data = timeline.Rewrite(data, epochOffset, startEpoch: true, ct: ct);
+                }
+                else
+                {
+                    transport!.Validate(data.Span);
+                    if (firstOutputSegment && hasSelectedDiscontinuity)
+                    {
+                        timelineOriginPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
+                            ?? throw new MediaContainerException("The first HLS epoch has no presentation timestamp to anchor later epochs.");
+                        codecProfile = HlsTransportCodecProfile.TryRead(data, ct);
+                    }
+                    else if (!firstOutputSegment && hasSelectedDiscontinuity)
+                    {
+                        string? currentProfile = HlsTransportCodecProfile.TryRead(data, ct);
+                        if (currentProfile is not null && codecProfile is not null
+                            && !string.Equals(codecProfile, currentProfile, StringComparison.Ordinal))
+                            throw new MediaContainerException("An HLS epoch changes decoder configuration between segments.");
+                        codecProfile ??= currentProfile;
+                    }
+                    data = timeline.Rewrite(data, epochOffset, startEpoch: false, ct: ct);
+                }
                 await WritePartAsync(data, mediaOffset, hash, ct).ConfigureAwait(false);
                 long end = checked(mediaOffset + data.Length);
                 session.Report(new ByteRange(offset, end), JsonSerializer.Serialize(new Cursor(playlistUrl, i + 1,
-                    planHash, end, Convert.ToHexString(hash.GetCurrentHash()), initLength, mp4?.Snapshot())));
+                    planHash, end, Convert.ToHexString(hash.GetCurrentHash()), initLength, mp4?.Snapshot(),
+                    LastDiscontinuitySequence: segment.DiscontinuitySequence,
+                    EpochOffsetTicks: hasSelectedDiscontinuity ? epochOffset : null,
+                    TimelineOriginPts: hasSelectedDiscontinuity ? timelineOriginPts : null,
+                    TimelineCounters: hasSelectedDiscontinuity ? timeline.SnapshotCounters() : null,
+                    CodecProfile: hasSelectedDiscontinuity ? codecProfile : null)));
                 offset = end;
+                lastDiscontinuitySequence = segment.DiscontinuitySequence;
                 await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
                 if (DateTime.UtcNow - lastMessage > TimeSpan.FromSeconds(1))
                 {
@@ -823,6 +914,18 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         catch (CryptographicException) { throw new RunnerStop(RunOutcome.NeedsAttention("decrypt", "A segment could not be decrypted with the supplied key.")); }
     }
 
+    private static long TimelineTicks(IReadOnlyList<HlsSegment> segments, int beforeIndex)
+    {
+        double seconds = 0;
+        for (int i = 0; i < beforeIndex; i++) seconds += segments[i].Duration;
+        if (!double.IsFinite(seconds) || seconds < 0 || seconds > long.MaxValue / 90_000d)
+            throw new MediaContainerException("The HLS timeline is too long to rebase safely.");
+        double ticks = Math.Round(seconds * 90_000d, MidpointRounding.AwayFromZero);
+        if (!double.IsFinite(ticks) || ticks < 0 || ticks >= long.MaxValue)
+            throw new MediaContainerException("The HLS timeline is too long to rebase safely.");
+        return (long)ticks;
+    }
+
     private static bool SameInitialization(HlsMap? left, HlsMap? right)
     {
         if (left is null || right is null) return left is null && right is null;
@@ -899,8 +1002,13 @@ public sealed partial class DownloadEngine
                         ? new MediaProbeResult("unsupported", "Every quality keeps its audio in a separate track, which VESPER cannot join.", type, null, null, [])
                         : new MediaProbeResult("hls-master", "", type, null, null, variants);
                 }
-                HlsMedia media = HlsParser.ParseMedia(text, uri);
+                HlsMedia media = HlsParser.ParseMedia(text, uri, allowTimelineChanges: true);
                 if (media.Unsupported is { } why) return new MediaProbeResult("unsupported", why, type, null, null, []);
+                if (media.Segments.Any(segment => segment.IsGap))
+                    return new MediaProbeResult("unsupported", "The playlist omits media segments and cannot produce a complete file.", type, null, null, []);
+                if (media.Segments.Skip(1).Any(segment => segment.DiscontinuityBefore)
+                    && media.Segments[0].Map is not null)
+                    return new MediaProbeResult("unsupported", "Fragmented MP4 discontinuity timestamps cannot be rebased safely.", type, null, null, []);
                 if (!media.IsVod) return new MediaProbeResult("unsupported", "Live streams are not supported.", type, null, null, []);
                 return new MediaProbeResult("hls-media", "", type, null, media.TotalSeconds, []);
             }

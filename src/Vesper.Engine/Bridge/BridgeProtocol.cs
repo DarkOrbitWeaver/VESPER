@@ -4,7 +4,8 @@ using System.Text.Json.Serialization;
 
 namespace Vesper.Engine;
 
-public sealed record BridgeItem(string Url, string? FileName, string Kind, string? Referer, string? UserAgent, string? Sha256, string? Cookie, string? Authorization);
+public sealed record BridgeItem(string Url, string? FileName, string Kind, string? Referer, string? UserAgent, string? Sha256,
+    string? Cookie, string? Authorization, string? OriginalUrl = null);
 
 public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType);
 
@@ -13,7 +14,8 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     Guid? MediaSession = null, int? FormatChoice = null, BrowserTransferProof? BrowserProof = null,
     string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
-    IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false);
+    IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
+    bool EmbedSubtitles = false);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -118,6 +120,7 @@ public static class BridgeProtocol
             string? audioTrack = null;
             List<string>? subtitleLanguages = null;
             bool autoSubtitles = false;
+            bool embedSubtitles = false;
             BridgeItem? mediaAuth = null;
             BrowserTransferProof? browserProof = null;
             BrowserActivity? activity = null;
@@ -129,7 +132,7 @@ public static class BridgeProtocol
                 if (type is ("media-picker" or "media-options") && root.TryGetProperty("mediaAuth", out var auth))
                 {
                     bool authorized = root.TryGetProperty("authorized", out var consent) && consent.ValueKind == JsonValueKind.True;
-                    if (!authorized || !TryItem(auth, authorized, out mediaAuth, out error)
+                    if (!authorized || !TryItem(auth, authorized, false, out mediaAuth, out error)
                         || mediaAuth is null || mediaAuth.Url != probeUrl || mediaAuth.Kind != "http")
                     { error = "Invalid media authorization context."; return false; }
                 }
@@ -175,6 +178,14 @@ public static class BridgeProtocol
                     }
                 }
                 autoSubtitles = root.TryGetProperty("includeAutoSubtitles", out var auto) && auto.ValueKind == JsonValueKind.True;
+                if (root.TryGetProperty("embedSubtitles", out var embed))
+                {
+                    if (embed.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    { error = "Invalid subtitle embedding preference."; return false; }
+                    embedSubtitles = embed.ValueKind == JsonValueKind.True;
+                }
+                if (embedSubtitles && subtitleLanguages is not { Count: > 0 })
+                { error = "Choose at least one subtitle language before embedding."; return false; }
                 mediaSession = session;
                 formatChoice = index;
                 // "Download part": optional start/end in seconds, checked again by the planner.
@@ -197,7 +208,7 @@ public static class BridgeProtocol
 
                 foreach (JsonElement element in array.EnumerateArray())
                 {
-                    if (!TryItem(element, authorized, out BridgeItem? item, out error)) return false;
+                    if (!TryItem(element, authorized, type == "browser-submit", out BridgeItem? item, out error)) return false;
                     items.Add(item!);
                 }
                 if (type == "browser-submit")
@@ -228,7 +239,8 @@ public static class BridgeProtocol
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
             string? pageTitle = type is ("media-picker" or "media-options") && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
-                confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth, audioTrack, subtitleLanguages, autoSubtitles);
+                confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
+                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
@@ -238,11 +250,19 @@ public static class BridgeProtocol
         }
     }
 
-    private static bool TryItem(JsonElement e, bool authorized, out BridgeItem? item, out string error)
+    private static bool TryItem(JsonElement e, bool authorized, bool browserSubmit, out BridgeItem? item, out string error)
     {
         item = null;
         if (e.ValueKind != JsonValueKind.Object) { error = "Each item must be an object."; return false; }
         if (!UrlPolicy.TryParse(Str(e, "url"), out Uri uri, out error)) return false;
+
+        string? originalUrl = null;
+        if (browserSubmit && e.TryGetProperty("originalUrl", out JsonElement original))
+        {
+            if (original.ValueKind != JsonValueKind.String
+                || !UrlPolicy.TryParse(original.GetString(), out Uri originalUri, out error)) return false;
+            originalUrl = originalUri.AbsoluteUri;
+        }
 
         string kind = Str(e, "kind") ?? "http";
         if (kind is not ("http" or "hls")) { error = "Unsupported item kind."; return false; }
@@ -257,7 +277,8 @@ public static class BridgeProtocol
         if ((cookie ?? authorization) is null && authorized && (e.TryGetProperty("cookie", out _) || e.TryGetProperty("authorization", out _)))
         { error = "Invalid credential header."; return false; }
 
-        item = new BridgeItem(uri.AbsoluteUri, Str(e, "fileName") is { Length: > 0 } n ? FileNames.Sanitize(n) : null, kind, referer, agent, sha, cookie, authorization);
+        item = new BridgeItem(uri.AbsoluteUri, Str(e, "fileName") is { Length: > 0 } n ? FileNames.Sanitize(n) : null,
+            kind, referer, agent, sha, cookie, authorization, originalUrl);
         error = "";
         return true;
     }

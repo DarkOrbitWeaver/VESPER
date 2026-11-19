@@ -15,21 +15,29 @@ public sealed class LocalStorageException(string message, Exception inner) : IOE
 internal sealed class PartialFile : IDisposable
 {
     private readonly SafeFileHandle _handle;
+    private bool _unclaimedNewFile;
+    private string? _capturedIdentity;
     public string Path { get; }
+    internal SafeFileHandle Handle => _handle;
 
-    private PartialFile(string path, SafeFileHandle handle) { Path = path; _handle = handle; }
+    private PartialFile(string path, SafeFileHandle handle, bool unclaimedNewFile)
+    {
+        Path = path;
+        _handle = handle;
+        _unclaimedNewFile = unclaimedNewFile;
+    }
 
     public static PartialFile Open(string path, bool create = true) =>
         Open(path, create ? FileMode.OpenOrCreate : FileMode.Open);
 
-    internal static PartialFile Open(string path, FileMode mode)
+    internal static PartialFile Open(string path, FileMode mode, bool allowDelete = false)
     {
         try
         {
             // FileShare.Read lets a virus scanner read the file but blocks deletion or truncation by others.
             SafeFileHandle handle = PathSafety.OpenTemporaryHandle(path, mode, FileAccess.ReadWrite,
-                FileShare.Read, FileOptions.Asynchronous | FileOptions.RandomAccess);
-            return new PartialFile(path, handle);
+                FileShare.Read, FileOptions.Asynchronous | FileOptions.RandomAccess, allowDelete);
+            return new PartialFile(path, handle, mode == FileMode.CreateNew && allowDelete);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -37,7 +45,29 @@ internal sealed class PartialFile : IDisposable
         }
     }
 
-    internal string? CaptureIdentity() => PathSafety.TemporaryFileIdentity(_handle);
+    internal string? CaptureIdentity()
+    {
+        string? identity = PathSafety.TemporaryFileIdentity(_handle);
+        if (_unclaimedNewFile) _capturedIdentity = identity;
+        return identity;
+    }
+
+    internal void MarkIdentitySaved()
+    {
+        if (!_unclaimedNewFile) throw new InvalidOperationException("This partial was not created for an identity update.");
+        _unclaimedNewFile = false;
+        _capturedIdentity = null;
+    }
+
+    internal void DeleteUnclaimedNewFile()
+    {
+        if (!_unclaimedNewFile) throw new InvalidOperationException("This partial is already claimed.");
+        if (_capturedIdentity is not null)
+            PathSafety.RequireTemporaryIdentity(_handle, _capturedIdentity);
+        PathSafety.DeleteOpenTemporaryFile(_handle, Path);
+        _unclaimedNewFile = false;
+        _capturedIdentity = null;
+    }
 
     internal static PartialFile OpenOwned(DownloadJob job)
     {

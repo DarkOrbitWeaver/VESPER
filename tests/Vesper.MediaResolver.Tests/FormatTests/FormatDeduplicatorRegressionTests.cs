@@ -59,4 +59,17 @@ public sealed class FormatDeduplicatorRegressionTests
         Assert.Contains(result, r => r.Id == "portrait");
         Assert.Contains(result, r => r.Id == "encrypted");
     }
+
+    [Fact]
+    public void DoesNotDiscardFrameRateVariantThatPassesTheRequestedLimit()
+    {
+        var highBitrateOverLimit = T.Video("high-fps", 720, kbps: 1500, fps: 50.49);
+        var lowerBitrateWithinLimit = T.Video("within-limit", 720, kbps: 1000, fps: 50.0);
+        var item = T.Item(highBitrateOverLimit, lowerBitrateWithinLimit);
+        item = item with { Representations = FormatDeduplicator.Deduplicate(item.Representations) };
+
+        var selected = FormatSelector.Select(item, new FormatPreferences { MaxFrameRate = 49.5 });
+
+        Assert.Equal("within-limit", selected.Selection?.Video?.Id);
+    }
 }

@@ -45,6 +45,73 @@ async function settings() {
   return { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
 }
 
+const SITE_CAPTURE_RULES_KEY = 'vesperSiteNeverCaptureHosts';
+let siteNeverCaptureHosts = new Set();
+let siteRulesLoaded = chrome.storage.local.get(SITE_CAPTURE_RULES_KEY).then(async saved => {
+  const hosts = normalizeNeverCaptureHosts(saved[SITE_CAPTURE_RULES_KEY]);
+  siteNeverCaptureHosts = new Set(hosts);
+}).catch(() => {});
+let siteRulesRefresh = null;
+
+function normalizeRuleHost(value) {
+  if (typeof value !== 'string' || value.length > 253) return null;
+  const text = value.trim().replace(/\.+$/, '');
+  if (!text || /[\\/@?#*\s]/.test(text)
+      || text.startsWith('[') !== text.endsWith(']')) return null;
+  try {
+    const host = text.includes(':') && !text.startsWith('[') ? `[${text}]` : text;
+    const parsed = new URL(`https://${host}/`);
+    if (parsed.username || parsed.password || parsed.port || parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+    return parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '') || null;
+  } catch { return null; }
+}
+
+function normalizeNeverCaptureHosts(value) {
+  if (!Array.isArray(value) || value.length > 100) return null;
+  const hosts = [];
+  for (const host of value) {
+    const normalized = normalizeRuleHost(host);
+    if (!normalized) return null;
+    if (!hosts.includes(normalized)) hosts.push(normalized);
+  }
+  return hosts;
+}
+
+async function cacheNeverCaptureHosts(reply) {
+  await siteRulesLoaded;
+  const hosts = normalizeNeverCaptureHosts(reply?.data?.siteRules?.neverCaptureHosts);
+  if (reply?.ok !== true || !hosts) return false;
+  await chrome.storage.local.set({ [SITE_CAPTURE_RULES_KEY]: hosts });
+  siteNeverCaptureHosts = new Set(hosts);
+  return true;
+}
+
+async function refreshNeverCaptureHosts() {
+  await siteRulesLoaded;
+  if (siteRulesRefresh) return siteRulesRefresh;
+  siteRulesRefresh = (async () => {
+    try {
+      const reply = await nativeRequest(envelope('hello'), 2500);
+      return await cacheNeverCaptureHosts(reply);
+    } catch { return false; }
+  })().finally(() => { siteRulesRefresh = null; });
+  return siteRulesRefresh;
+}
+
+async function shouldKeepChromeForSite(item) {
+  if (!(await refreshNeverCaptureHosts())) return 'policy-unavailable';
+  for (const address of [item?.referrer, item?.url, item?.finalUrl]) {
+    try {
+      const candidate = new URL(address);
+      if (candidate.protocol === 'http:' || candidate.protocol === 'https:') {
+        const host = normalizeRuleHost(candidate.hostname);
+        if (host && siteNeverCaptureHosts.has(host)) return 'site-rule';
+      }
+    } catch { /* Invalid sources have no site host to compare. */ }
+  }
+  return 'allowed';
+}
+
 // ---------------------------------------------------------------- submission (durable and idempotent)
 
 // Pending signed URLs are short-lived and kept in session storage only.
@@ -844,7 +911,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const pending = await readPending();
         return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => ({ id, at: p.at, count: p.request.items.length })) };
       }
-      case 'hello': return nativeRequest(envelope('hello'), 20000);
+      case 'hello': {
+        const reply = await nativeRequest(envelope('hello'), 20000);
+        await cacheNeverCaptureHosts(reply);
+        return reply;
+      }
       case 'media-options': return playerOptions(message, sender);
       case 'media-source-select': return selectMediaSource(message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
@@ -854,6 +925,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const subtitles = Array.isArray(message.subtitles) && message.subtitles.length <= 25
           && message.subtitles.every(language => typeof language === 'string' && /^[a-z0-9_-]{1,35}$/i.test(language)) ? message.subtitles : undefined;
         const includeAutoSubtitles = message.includeAutoSubtitles === true;
+        const embedSubtitles = message.embedSubtitles === true;
         if (!/^[a-f0-9]{32}$/i.test(mediaSession || '') || !Number.isInteger(formatChoice) || formatChoice < 0 ||
             formatChoice >= 64 || !['queue', 'download'].includes(mode))
           return { ok: false, code: 'invalid', message: 'Choose an available format.' };
@@ -867,14 +939,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         const suffix = range ? `-${Math.round(range.start * 1000).toString(36)}-${Math.round(range.end * 1000).toString(36)}` : '';
         let intentSuffix = '';
-        if (audioTrack || subtitles?.length || includeAutoSubtitles) {
-          const bytes = new TextEncoder().encode(JSON.stringify([audioTrack || null, [...(subtitles || [])].sort(), includeAutoSubtitles]));
+        if (audioTrack || subtitles?.length || includeAutoSubtitles || embedSubtitles) {
+          const bytes = new TextEncoder().encode(JSON.stringify([audioTrack || null, [...(subtitles || [])].sort(), includeAutoSubtitles, embedSubtitles]));
           const digest = await crypto.subtle.digest('SHA-256', bytes);
           intentSuffix = '-' + [...new Uint8Array(digest)].slice(0, 16).map(byte => byte.toString(16).padStart(2, '0')).join('');
         }
         return nativeRequest(envelope('media-select', {
           id: `${mediaSession}-${formatChoice}-${mode}${suffix}${intentSuffix}`,
-          mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles
+          mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles
         }), 25000);
       }
       case 'native-picker': {

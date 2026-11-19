@@ -3,7 +3,10 @@ using System.Text;
 
 namespace Vesper.Engine;
 
-internal enum TrackKind { Video, Audio }
+internal enum TrackKind { Video, Audio, Subtitle }
+
+internal readonly record struct Mp4EditListEntry(ulong SegmentDuration, long MediaTime,
+    short MediaRateInteger, short MediaRateFraction);
 
 /// <summary>One coded frame (MP4 sample) or one Matroska block, located in a source stream. Times use the track timescale.</summary>
 internal struct TrackSample
@@ -40,8 +43,14 @@ internal sealed class DemuxedTrack
     public int Width, Height, Channels, SampleRate, BitDepth;
     public long CodecDelayNs, SeekPreRollNs, DefaultDurationNs;
     public string Language = "und";
+    public string Name = "";
     /// <summary>MP4 edit-list media_time (track timescale), 0 when there is none.</summary>
     public long EditMediaTime;
+    public uint MovieTimescale;
+    public ulong TrackHeaderDurationMovieTicks;
+    public ulong MovieHeaderDurationMovieTicks;
+    public uint EditMovieTimescale;
+    public List<Mp4EditListEntry>? EditList;
     public List<TrackSample> Samples = new();
 
     public bool HasLacing => Samples.Exists(s => s.Lacing != 0);
@@ -515,11 +524,24 @@ internal static class Mp4Demuxer
 
     private static void ParseMoov(byte[] b, Dictionary<uint, State> states, List<uint> order)
     {
+        uint movieTimescale = 0;
+        ulong movieDuration = 0;
+        if (Find(b, 0, b.Length, "mvhd") is { } movieHeader)
+        {
+            int version = b[movieHeader.Start];
+            if (version is not (0 or 1)) throw Bad("the movie header has an unsupported version");
+            movieTimescale = U32(b, movieHeader.Start + (version == 1 ? 20 : 12), movieHeader.End);
+            movieDuration = version == 1
+                ? U64(b, movieHeader.Start + 24, movieHeader.End)
+                : U32(b, movieHeader.Start + 16, movieHeader.End);
+            if (movieTimescale == 0) throw Bad("the movie timescale is zero");
+        }
+
         foreach (var c in Children(b, 0, b.Length))
         {
             if (c.Type == "trak")
             {
-                var parsed = ParseTrak(b, c.Start, c.End);
+                var parsed = ParseTrak(b, c.Start, c.End, movieTimescale, movieDuration);
                 if (parsed is null) continue;
                 if (states.ContainsKey(parsed.Value.Id)) throw Bad("two tracks share an id");
                 states[parsed.Value.Id] = new State { Track = parsed.Value.Track };
@@ -536,15 +558,20 @@ internal static class Mp4Demuxer
                 }
     }
 
-    private static (uint Id, DemuxedTrack Track)? ParseTrak(byte[] b, int start, int end)
+    private static (uint Id, DemuxedTrack Track)? ParseTrak(byte[] b, int start, int end,
+        uint movieTimescale, ulong movieDuration)
     {
         var tkhd = Find(b, start, end, "tkhd") ?? throw Bad("a track has no header");
         int tv = b[tkhd.Start];
         uint id = U32(b, tkhd.Start + (tv == 1 ? 20 : 12), tkhd.End);
+        if (tv is not (0 or 1)) throw Bad("a track header has an unsupported version");
+        ulong trackDuration = tv == 1
+            ? U64(b, tkhd.Start + 28, tkhd.End)
+            : U32(b, tkhd.Start + 20, tkhd.End);
         var mdia = Find(b, start, end, "mdia") ?? throw Bad("a track has no media box");
         var hdlr = Find(b, mdia.Start, mdia.End, "hdlr") ?? throw Bad("a track has no handler");
         string handler = MuxIo.FourCc(b.AsSpan(hdlr.Start + 8, 4));
-        if (handler is not ("vide" or "soun")) return null; // text, hint, metadata tracks are not media we merge
+        if (handler is not ("vide" or "soun" or "sbtl")) return null; // other text, hint, metadata tracks are not media we merge
         var mdhd = Find(b, mdia.Start, mdia.End, "mdhd") ?? throw Bad("a track has no media header");
         int mv = b[mdhd.Start];
         uint timescale = U32(b, mdhd.Start + (mv == 1 ? 20 : 12), mdhd.End);
@@ -553,23 +580,52 @@ internal static class Mp4Demuxer
 
         var track = new DemuxedTrack
         {
-            Kind = handler == "vide" ? TrackKind.Video : TrackKind.Audio,
+            Kind = handler switch { "vide" => TrackKind.Video, "soun" => TrackKind.Audio, _ => TrackKind.Subtitle },
             SourceContainer = "mp4",
             Timescale = timescale,
+            MovieTimescale = movieTimescale,
+            TrackHeaderDurationMovieTicks = trackDuration,
+            MovieHeaderDurationMovieTicks = movieDuration,
             Language = UnpackLanguage(lang)
         };
 
         if (Find(b, start, end, "edts") is { } edts && Find(b, edts.Start, edts.End, "elst") is { } elst)
         {
-            int ev = b[elst.Start];
+            int version = b[elst.Start];
+            if (version is not (0 or 1)) throw Bad("a track edit list has an unsupported version");
             uint count = U32(b, elst.Start + 4, elst.End);
+            int editEntrySize = version == 1 ? 20 : 12;
+            if (count > 16 || (long)elst.Start + 8 + (long)count * editEntrySize != elst.End)
+                throw Bad("a track edit list has an invalid size");
+            if (movieTimescale == 0) throw Bad("a track edit list has no movie timescale");
+
+            var edits = new List<Mp4EditListEntry>((int)count);
             int p = elst.Start + 8;
-            for (uint i = 0; i < count && i < 16; i++)
+            for (uint i = 0; i < count; i++)
             {
-                long mediaTime = ev == 1 ? (long)U64(b, p + 8, elst.End) : (int)U32(b, p + 4, elst.End);
-                p += ev == 1 ? 20 : 12;
-                if (mediaTime >= 0) { track.EditMediaTime = mediaTime; break; }
+                ulong segmentDuration;
+                long mediaTime;
+                if (version == 1)
+                {
+                    segmentDuration = U64(b, p, elst.End);
+                    mediaTime = BinaryPrimitives.ReadInt64BigEndian(b.AsSpan(p + 8, 8));
+                    p += 16;
+                }
+                else
+                {
+                    segmentDuration = U32(b, p, elst.End);
+                    mediaTime = BinaryPrimitives.ReadInt32BigEndian(b.AsSpan(p + 4, 4));
+                    p += 8;
+                }
+                short rateInteger = BinaryPrimitives.ReadInt16BigEndian(b.AsSpan(p, 2));
+                short rateFraction = BinaryPrimitives.ReadInt16BigEndian(b.AsSpan(p + 2, 2));
+                p += 4;
+                edits.Add(new Mp4EditListEntry(segmentDuration, mediaTime, rateInteger, rateFraction));
             }
+            track.EditList = edits;
+            track.EditMovieTimescale = movieTimescale;
+            int firstMediaEdit = edits.FindIndex(edit => edit.MediaTime >= 0);
+            if (firstMediaEdit >= 0) track.EditMediaTime = edits[firstMediaEdit].MediaTime;
         }
 
         var minf = Find(b, mdia.Start, mdia.End, "minf") ?? throw Bad("a track has no media information");
@@ -598,6 +654,13 @@ internal static class Mp4Demuxer
             t.Height = U16(b, payload + 26, end);
             childStart = payload + 78;
         }
+        else if (t.Kind == TrackKind.Subtitle)
+        {
+            if (fourcc != "tx3g")
+                throw new MediaContainerException($"The MP4 subtitle codec '{fourcc}' is not supported for merging.");
+            t.Codec = "tx3g";
+            childStart = payload + 38;
+        }
         else
         {
             ushort version = U16(b, payload + 8, end);
@@ -606,12 +669,13 @@ internal static class Mp4Demuxer
             t.SampleRate = (int)(U32(b, payload + 24, end) >> 16);
             childStart = payload + 28 + (version == 1 ? 16 : version == 2 ? 36 : 0);
         }
-        t.Codec = fourcc switch
-        {
-            "avc1" or "avc3" => "h264", "hvc1" or "hev1" => "h265", "dvh1" or "dvhe" => "h265", "av01" => "av1",
-            "vp09" => "vp9", "vp08" => "vp8", "mp4a" => "aac", "Opus" => "opus", "fLaC" => "flac", "ac-3" => "ac3",
-            "ec-3" => "eac3", ".mp3" => "mp3", _ => throw new MediaContainerException($"The MP4 codec '{fourcc}' is not supported for merging.")
-        };
+        if (t.Kind != TrackKind.Subtitle)
+            t.Codec = fourcc switch
+            {
+                "avc1" or "avc3" => "h264", "hvc1" or "hev1" => "h265", "dvh1" or "dvhe" => "h265", "av01" => "av1",
+                "vp09" => "vp9", "vp08" => "vp8", "mp4a" => "aac", "Opus" => "opus", "fLaC" => "flac", "ac-3" => "ac3",
+                "ec-3" => "eac3", ".mp3" => "mp3", _ => throw new MediaContainerException($"The MP4 codec '{fourcc}' is not supported for merging.")
+            };
         if (childStart > end) throw Bad("a sample entry is truncated");
         foreach (var c in Children(b, childStart, end))
         {

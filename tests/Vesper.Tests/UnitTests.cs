@@ -194,6 +194,21 @@ public class PathSafetyTests
     }
 }
 
+public class BridgePipeTests
+{
+    [Fact]
+    public void Named_object_scopes_differ_by_user_and_purpose()
+    {
+        string firstMutex = BridgePipe.NameForIdentity("VESPER.SingleInstance", "S-1-5-21-test-user-a");
+        string secondMutex = BridgePipe.NameForIdentity("VESPER.SingleInstance", "S-1-5-21-test-user-b");
+        string firstShowEvent = BridgePipe.NameForIdentity("VESPER.Show", "S-1-5-21-test-user-a");
+
+        Assert.NotEqual(firstMutex, secondMutex);
+        Assert.NotEqual(firstMutex, firstShowEvent);
+        Assert.StartsWith("VESPER.SingleInstance-", firstMutex);
+    }
+}
+
 public class UrlPolicyTests
 {
     [Theory]

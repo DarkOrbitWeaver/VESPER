@@ -40,8 +40,8 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-032 | H, 1217–1229 | The "M4A (AAC)" choice prefers transcoding Opus over YouTube's native AAC | Preserved | `STATUS.tsv:29` |
 | VES-033 | H, 1230–1240 | Conversion is offered without probing whether this machine has the decoder | Partial; Windows verify | `STATUS.tsv:30` |
 | VES-034 | H, 1241–1247 | MP4 tag details (latent) | Preserved | `STATUS.tsv:31` |
-| VES-035 | H, 1248–1257 | HLS discontinuities and codec changes are refused rather than handled | Open engineering | `STATUS.tsv:32` |
-| VES-036 | H, 1258–1268 | Embedded subtitles: a realistic path | Open engineering | `STATUS.tsv:33` |
+| VES-035 | H, 1248–1257 | HLS discontinuities and codec changes are refused rather than handled | Partial; focused Release tests passed | `STATUS.tsv:32` |
+| VES-036 | H, 1258–1268 | Embedded subtitles: a realistic path | Partial; focused Release tests passed | `STATUS.tsv:33` |
 | VES-037 | H, 1269–1282 | YouTube depends on a single hard-coded client profile | Partial; resolver tests, live verification open | `STATUS.tsv:34` |
 | VES-038 | H, 1283–1289 | The resolver's sanitizer is platform-dependent (deterministic Linux test failure) | Implemented; exact regression passed | `STATUS.tsv:35` |
 | VES-040 | I, 1311–1345 | Verification of the Settings rendering repair (`2620e76`) | Partial; Windows verify | `STATUS.tsv:36` |
@@ -53,7 +53,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-050 | L, 1661 | Installer's final message | External + open integration | `STATUS.tsv:42` |
 | VES-051 | L, 1662 | No update awareness | Implemented; Windows verify | `STATUS.tsv:43` |
 | VES-052 | L, 1663 | Portable build cannot connect Chrome | Implemented; Windows verify | `STATUS.tsv:44` |
-| VES-053 | L, 1664 | No "remove my data" on uninstall | Open engineering | `STATUS.tsv:45` |
+| VES-053 | L, 1664 | No "remove my data" on uninstall | Implemented; setup tests; packaged UI and interruption checks open | `STATUS.tsv:45` |
 | VES-054 | L, 1665 | Running-process replacement | Partial; Windows verify | `STATUS.tsv:46` |
 | VES-055 | L, 1666 | Asset provenance/naming | Open / owner input | `STATUS.tsv:47` |
 | VES-060 | O, 1746 | Two HTTP stacks | Partial | `STATUS.tsv:48` |
@@ -64,6 +64,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-065 | O, 1751 | `Publish` file-name predicate | Preserved | `STATUS.tsv:53` |
 | VES-066 | O, 1752 | No guard against unreachable APIs | Open engineering | `STATUS.tsv:54` |
 | VES-067 | O, 1753 | Stringly-typed reasons | Open engineering | `STATUS.tsv:55` |
+| VES-068 | O, 1754 | Preserve explanatory comments and add debug invariants at checkpoint/publication boundaries | Implemented locally; source review and Release build | `STATUS.tsv:56` |
 
 ## Independent audit B: nine VSP findings
 
@@ -74,8 +75,8 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VSP-003 | 219–242 | The documented ZIP installer is not transactional | Partial; packaged-path verification open | `STATUS.tsv:86` |
 | VSP-004 | 243–266 | R0 rescue can accept a validator downgrade that the runner then rejects | Partial; end-to-end rescue proof open | `STATUS.tsv:87` |
 | VSP-005 | 267–290 | DPAPI failures can escape startup error handling | Partial; Windows negative-case verification open | `STATUS.tsv:88` |
-| VSP-006 | 291–314 | Format deduplication discards user-meaningful variants before selection | Partial; regression coverage audit open | `STATUS.tsv:89` |
-| VSP-007 | 315–336 | Successful media-cache hits can outlive their source URL expiry | Partial; clock-boundary test open | `STATUS.tsv:90` |
+| VSP-006 | 291–314 | Format deduplication discards user-meaningful variants before selection | Partial; frame-rate collision fixed, provider coverage open | `STATUS.tsv:89` |
+| VSP-007 | 315–336 | Successful media-cache hits can outlive their source URL expiry | Implemented; focused expiry tests 4/4 | `STATUS.tsv:94` |
 | VSP-008 | 337–358 | The stated performance gates have no complete reproducible baseline harness | Open engineering | `STATUS.tsv:91` |
 | VSP-009 | 359–378 | Primary documentation describes a different application state | Partial; documentation reconciliation open | `STATUS.tsv:92` |
 
@@ -86,18 +87,18 @@ Original opportunity rows are explicitly **not** automatic release blockers. The
 | Backlog ID | Original line | Original ranked idea | Tracker status |
 |---|---|---|---|
 | N-08 | 1724 | **Smart filename templates** (`{title} - {artist}`, `{site}/{title}`), previewed live | Implemented; focused engine and settings tests |
-| N-09 | 1725 | **Completion actions**: open folder, notify, "sleep when queue finishes" (with a 60 s cancelable prompt) | Open engineering |
-| N-10 | 1726 | **Metered-connection awareness**: pause new jobs on metered networks unless allowed | Open engineering |
+| N-09 | 1725 | **Completion actions**: open folder, notify, "sleep when queue finishes" (with a 60 s cancelable prompt) | Partial; focused Windows tests passed; shutdown remains open |
+| N-10 | 1726 | **Metered-connection awareness**: pause new jobs on metered networks unless allowed | Implemented; engine/settings tests; Windows transition check open |
 | N-11 | 1727 | **Checksum from page** (detect `SHA256SUMS`/`.sha256` next to a download URL; offer "verify with publisher checksum") | Implemented; solution tests |
 | N-12 | 1728 | **Mirror substitution** (user pastes another link; identity rules decide) | Partial |
 | N-13 | 1729 | **Batch/playlist quality decision once** ("apply to all 24") | Partial |
-| N-14 | 1730 | **Import/export** of the list (JSON/CSV of URLs plus states; no secrets) | Open engineering |
+| N-14 | 1730 | **Import/export** of the list (JSON/CSV of URLs plus states; no secrets) | Implemented; format/engine tests; packaged UI check open |
 | N-15 | 1731 | **Drag-and-drop** of links and `.url` files onto the window | Implemented; Windows fixture |
-| N-16 | 1732 | **Per-site rules** (always audio, always a given folder, never capture) | Open engineering |
+| N-16 | 1732 | **Per-site rules** (always audio, always a given folder, never capture) | Partial; focused tests passed; real Chrome acceptance open |
 | N-17 | 1733 | **Diagnostics bundle** (redacted log, versions, settings; local zip the user can share) | Implemented; solution tests |
 | N-18 | 1734 | **Low-disk forecast** ("Queue needs 14 GB; 9 GB free") | Implemented; solution tests |
-| N-19 | 1735 | **Podcast feed follow** (new episodes queued on demand, no background polling unless opted in) | Open engineering |
-| N-20 | 1736 | **Windows Share target / "Open with VESPER" for .m3u8/.mpd files** | Open engineering |
+| N-19 | 1735 | **Podcast feed follow** (new episodes queued on demand, no background polling unless opted in) | Partial; focused Windows tests passed; live feed acceptance open |
+| N-20 | 1736 | **Windows Share target / "Open with VESPER" for .m3u8/.mpd files** | OWNER DESIGN REQUIRED; see `DOCUMENTATION/OWNER-DESIGN-REQUIRED.md` |
 
 The original **ranks 1–7** are covered by existing VES/USER work rather than duplicate `N-01`–`N-07` identifiers. Their original claims still need individual dispositions:
 
@@ -130,14 +131,14 @@ These are **separate audit obligations**, not all new feature requests. A range 
 | AUDIT-EXTRA-011 | L 1630–1669 | First Flight timeline, installer behavior, signing and app/extension distribution requirements | PARTIAL — First Flight UI timing and live-window captures verified on ae9b091. Original timeline, clean Windows install, signing and Store Q7/Q10 remain open. |
 | AUDIT-EXTRA-012 | M 1670–1710 | Benchmark interpretation, extension wake-up, disk fsync, 8-hour memory and leak measurements | OPEN — Current reproducible measurements Q6 |
 | AUDIT-EXTRA-013 | N 1711–1741 | 20 separately ranked product opportunities; deliberately deferred feature bloat | OPEN — N-ID rows below; P3 unless owner explicitly upgrades |
-| AUDIT-EXTRA-014 | O 1742–1766 | Architectural simplification proposals; VES-068 positive comment-quality finding omitted from U index | OPEN — Keep design readable, remove duplication only with proofs |
+| AUDIT-EXTRA-014 | O 1742–1766 | Architectural simplification proposals; VES-068 positive comment-quality finding omitted from U index | PARTIAL — VES-068 now has debug-only checkpoint/publication assertions; evaluate other proposals independently and preserve comment quality |
 | AUDIT-EXTRA-015 | P 1767–1882 | Reference sketches and underlying assumptions, including proposed/nonexistent APIs | OPEN — Do not mistake sketches for implemented functions |
-| AUDIT-EXTRA-016 | Q 1883–1972 | T0–T3 test tiers, 8×8 failpoint crash matrix ×50, network faults, Chrome test harness, UI matrix, media validation, release signoffs | OPEN — All acceptance plans separately tracked by Q0–Q10; not completed |
+| AUDIT-EXTRA-016 | Q 1883–1972 | T0–T3 test tiers, 8×8 failpoint crash matrix ×50, network faults, Chrome test harness, UI matrix, media validation, release signoffs | OPEN — Q6 demux corruption coverage is tracked as USER-DEMUX-FUZZ; all acceptance plans remain open |
 | AUDIT-EXTRA-017 | R 1973–2037 | Phase 0–5 dependency roadmap and P0 priorities | OPEN — Reprioritize based on actual current source; no blind rewrites |
 | AUDIT-EXTRA-018 | S 2038–2060 | Original release-candidate caveats and explicit broad-release blockers | OPEN — Current decision NOT APPROVED |
 | AUDIT-EXTRA-019 | T 2061–2074 | Research: live CMAF, hashes/Metalink, HTTP/3, hardware MFT, accessible waveform, reproducible builds, bridge schema | OPEN — Optional research; require measurements or approval before expansion |
 | AUDIT-EXTRA-020 | U 2075–2135 | Original finding index (distinct from all cross-cutting requirements) | OPEN — Reconcile independent of numbering |
-| AUDIT-EXTRA-021 | Appendix 2136–2185 | Seven original audit blind spots incl. content.js selection, DownloadGrid accessibility, installer rollback, native reply timings, live media churn and fuzzing | OPEN — Explicit current independent review queue |
+| AUDIT-EXTRA-021 | Appendix 2178–2185 | Seven final audit blind spots: content.js ad/preview/iframe selection; DownloadGrid painting and accessibility; installer rollback under power loss; native `transferReady` timing; DASH timeline and hours-long live HLS churn; line-level demux/mux review and fuzzing; real Windows runs | OPEN — Detailed source/test evidence, dispositions and exact remaining acceptance are recorded in `AUDIT-RECONCILIATION.md`; the single master checklist item and machine-readable status row are in `MASTER-TODO.md` and `STATUS.tsv`. Narrator/accessibility acceptance remains explicitly deferred under Q5. |
 | AUDIT-EXTRA-022 | B (independent) 451–608 | Independent audit benchmark limits, P0–P3 prioritized repair plan and acceptance obligations | OPEN — Keep VSP risk gates open until matching proofs |
 | AUDIT-EXTRA-023 | Implementation 1–229 | Historical Linux patch verification, 65+ file changes, 87 extension tests and 11 user-facing fixes | OPEN — Historical only; current Windows 947 and extension 126 supersede counts |
 | AUDIT-EXTRA-024 | B (independent) 1–170 | Historical executive assessment, audit methodology, architecture, workflows, code strengths and CI restrictions | OPEN — Cross-check current source in `VSP-INDEPENDENT-RECONCILIATION.md`; no old score adopted |

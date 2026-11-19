@@ -696,7 +696,7 @@
     const selectedAudio = formats.audioOutputs?.find(entry => entry.choice.index === formats.selectedAudio)?.choice;
     const audioChoice = selectedAudio || (useM4a ? formats.audioM4a : null);
     const presets = audioChoice ? originalPresets.map(c => c.label === 'Audio only' ? audioChoice : c) : originalPresets;
-    const intent = formats.intent ||= { audioTrack: null, subtitles: [], includeAutoSubtitles: false };
+    const intent = formats.intent ||= { audioTrack: null, subtitles: [], includeAutoSubtitles: false, embedSubtitles: false };
     const moreFormats = formats.more || [];
     const all = expanded ? [...presets, ...moreFormats] : presets;
     const output = element('label', 'output', 'Output');
@@ -822,14 +822,32 @@
         tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; };
         label.append(tracks); advanced.append(label);
       }
+      let embedSubtitleControl = null;
       for (const subtitle of formats.subtitleOptions || []) {
         const label = element('label', 'output'), check = element('input'); check.type = 'checkbox';
         check.checked = intent.subtitles.includes(subtitle.language);
         check.onchange = () => {
           intent.subtitles = check.checked ? [...new Set([...intent.subtitles, subtitle.language])] : intent.subtitles.filter(language => language !== subtitle.language);
           intent.includeAutoSubtitles = !!advanced.querySelector('input[data-auto=true]:checked');
+          const canEmbed = (formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
+          if (embedSubtitleControl) embedSubtitleControl.disabled = !canEmbed;
+          if (!canEmbed) {
+            intent.embedSubtitles = false;
+            if (embedSubtitleControl) embedSubtitleControl.checked = false;
+          }
         };
         check.dataset.auto = String(subtitle.auto); label.append(check, document.createTextNode(subtitle.label + (subtitle.auto ? ' (automatic)' : ''))); advanced.append(label);
+      }
+      if ((formats.subtitleOptions || []).some(subtitle => subtitle.embedSupported)) {
+        const embedLabel = element('label', 'output');
+        embedSubtitleControl = element('input');
+        embedSubtitleControl.type = 'checkbox';
+        embedSubtitleControl.checked = !!intent.embedSubtitles;
+        embedSubtitleControl.disabled = !(formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
+        embedSubtitleControl.onchange = () => { intent.embedSubtitles = embedSubtitleControl.checked; };
+        embedLabel.append(embedSubtitleControl, document.createTextNode('Embed selected subtitles'));
+        const embedHint = element('small', 'hint', 'Separate subtitle files are still queued. Live, segmented, styled, or unsupported tracks stay separate.');
+        advanced.append(embedLabel, embedHint);
       }
       body.push(advanced);
     }

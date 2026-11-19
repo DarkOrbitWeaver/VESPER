@@ -313,6 +313,30 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public async Task DashResume_discards_uncommitted_bytes_before_retrying_a_fragment()
+    {
+        await using var server = await FixtureServer.StartAsync(); server.ExpireSecond = true;
+        using var h = new Harness();
+        Guid id = Add(h, server);
+        JobSnapshot waiting = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(waiting.CommittedBytes > 0);
+
+        h.Restart();
+        await AppendUncommittedTailAsync(waiting.PartialPath);
+        h.Engine.Resume(id);
+        await h.WaitAsync(id, job => job.State == JobState.NeedsLink && server.Hits("/av-2.m4s") >= 2);
+
+        Assert.Equal(waiting.CommittedBytes, new FileInfo(waiting.PartialPath).Length);
+    }
+
+    private static async Task AppendUncommittedTailAsync(string path)
+    {
+        await using var file = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        byte[] tail = [0xA5, 0x5A, 0xC3, 0x3C];
+        await file.WriteAsync(tail);
+    }
+
+    [Fact]
     public async Task CorruptCommittedPrefix_IsKeptButNeverResumedOrPublished()
     {
         await using var server = await FixtureServer.StartAsync(); server.ExpireSecond = true;

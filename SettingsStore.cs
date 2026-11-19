@@ -34,6 +34,7 @@ internal static class SettingsStore
                 ?? new VesperPreferences();
             if (PathSafety.TryGetFullPath(preferences.DefaultFolder, out string folder, out _))
                 preferences.DefaultFolder = folder;
+            preferences.SiteRules = SiteRule.Normalize(preferences.SiteRules);
             return preferences;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
@@ -60,6 +61,7 @@ internal static class SettingsStore
         try
         {
             Directory.CreateDirectory(directory);
+            preferences.SiteRules = SiteRule.Normalize(preferences.SiteRules);
             using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 JsonSerializer.Serialize(stream, preferences, Options);

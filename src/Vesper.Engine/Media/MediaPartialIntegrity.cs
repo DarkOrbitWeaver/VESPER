@@ -6,7 +6,8 @@ namespace Vesper.Engine;
 /// <summary>Bounded local verification shared by streaming transfers. No scheduled checks or remote spot checks.</summary>
 internal static class MediaPartialIntegrity
 {
-    internal static void HashPrefix(PartialFile file, long length, IncrementalHash hash, CancellationToken ct, TransportStreamValidator? transport = null)
+    internal static void HashPrefix(PartialFile file, long length, IncrementalHash hash, CancellationToken ct,
+        TransportStreamValidator? transport = null, HlsTransportTimeline? hlsTimeline = null)
     {
         byte[] buffer = ArrayPool<byte>.Shared.Rent(188 * 512);
         try
@@ -23,7 +24,10 @@ internal static class MediaPartialIntegrity
                     if (read <= 0) throw new MediaContainerException("The partial file ended while checking its committed prefix.");
                     n += read;
                 }
-                hash.AppendData(buffer, 0, n); transport?.Validate(buffer.AsSpan(0, n)); offset += n;
+                hash.AppendData(buffer, 0, n);
+                transport?.Validate(buffer.AsSpan(0, n));
+                hlsTimeline?.ObservePrefix(buffer.AsSpan(0, n), ct);
+                offset += n;
             }
         }
         finally { ArrayPool<byte>.Shared.Return(buffer); }

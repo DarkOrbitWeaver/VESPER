@@ -341,6 +341,8 @@ public sealed class SecureHttpClient : IDisposable
                     var next = location.IsAbsoluteUri ? location : new Uri(url, location);
                     if (url.Scheme == Uri.UriSchemeHttps && next.Scheme == Uri.UriSchemeHttp)
                         throw new MediaResolverException(MediaErrors.Blocked("Redirect downgrades https to http"));
+                    if (method != HttpMethod.Get && method != HttpMethod.Head && !HasSameOrigin(url, next))
+                        throw new MediaResolverException(MediaErrors.Blocked("Refusing to forward a request body across origins"));
                     url = next; // the next loop iteration re-validates it and re-filters credentials for the new host
                     continue;
                 }
@@ -428,6 +430,11 @@ public sealed class SecureHttpClient : IDisposable
         mediaType.Contains("javascript", StringComparison.OrdinalIgnoreCase) ||
         mediaType.Contains("mpegurl", StringComparison.OrdinalIgnoreCase) ||
         mediaType.Contains("dash", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasSameOrigin(Uri first, Uri second) =>
+        first.Scheme.Equals(second.Scheme, StringComparison.OrdinalIgnoreCase)
+        && first.IdnHost.Equals(second.IdnHost, StringComparison.OrdinalIgnoreCase)
+        && first.Port == second.Port;
 
     private static string NameValuePart(string setCookie)
     {

@@ -11,43 +11,20 @@ namespace Vesper.Engine;
 internal static class MatroskaMuxer
 {
     private const int SeekHeadReserve = 160;
+    private const long NanosecondsPerMillisecond = 1_000_000;
+
+    internal sealed record TrackTiming(long[]? DecodeNanoseconds, long[] PresentationMilliseconds);
+    internal sealed record Timeline(IReadOnlyList<TrackTiming> Tracks, long ShiftNanoseconds, long DurationMilliseconds);
 
     public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output, bool webm,
         CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
-        if (inputs.Count is < 1 or > 8) throw new MediaContainerException("A Matroska output needs between one and eight tracks.");
+        if (inputs.Count is < 1 or > MediaMerger.MaxTrackCount)
+            throw new MediaContainerException($"A Matroska output needs between one and {MediaMerger.MaxTrackCount} tracks.");
         long origin = output.Position;
 
-        // ---- timing: decode-order key and presentation time (ns) for every sample
-        var dtsNs = new long[inputs.Count][];
-        var ptsNs = new long[inputs.Count][];
-        long minPts = long.MaxValue;
-        for (int ti = 0; ti < inputs.Count; ti++)
-        {
-            var t = inputs[ti].Track;
-            var d = new long[t.Samples.Count];
-            var p = new long[t.Samples.Count];
-            long edit = t.SourceContainer == "mp4" ? Math.Max(0, t.EditMediaTime) : 0;
-            for (int i = 0; i < d.Length; i++)
-            {
-                var s = t.Samples[i];
-                d[i] = ToNs(s.Dts - edit, t.Timescale);
-                p[i] = ToNs(s.Dts + s.CtsOffset - edit, t.Timescale);
-                if (p[i] < minPts) minPts = p[i];
-            }
-            dtsNs[ti] = d; ptsNs[ti] = p;
-        }
-        long shift = minPts < 0 ? -minPts : 0;
+        Timeline timeline = BuildTimeline(inputs.Select(input => input.Track).ToArray(), ct);
         bool hasVideo = inputs.Any(i => i.Track.Kind == TrackKind.Video);
-
-        long durationMs = 0;
-        for (int ti = 0; ti < inputs.Count; ti++)
-        {
-            var t = inputs[ti].Track;
-            if (t.Samples.Count == 0) continue;
-            long lastEnd = ptsNs[ti].Max() + shift + ToNs(Math.Max(0, t.Samples[^1].Duration), t.Timescale);
-            durationMs = Math.Max(durationMs, lastEnd / 1_000_000);
-        }
 
         // ---- EBML header + segment
         var hdr = new MemoryStream();
@@ -67,7 +44,7 @@ internal static class MatroskaMuxer
         Str(info, 0x4D80, "VESPER");
         Str(info, 0x5741, "VESPER");
         if (metadata?.Title is { Length: > 0 } title) Str(info, 0x7BA9, title);
-        Float(info, 0x4489, durationMs);
+        Float(info, 0x4489, timeline.DurationMilliseconds);
         Master(output, WebmDemuxer.IdInfo, info.ToArray());
 
         long tracksPos = output.Position - segData;
@@ -111,13 +88,16 @@ internal static class MatroskaMuxer
                 for (int ti = 0; ti < inputs.Count; ti++)
                 {
                     if (next[ti] >= inputs[ti].Track.Samples.Count) continue;
-                    if (pick < 0 || dtsNs[ti][next[ti]] < dtsNs[pick][next[pick]]) pick = ti;
+                    long decodeTime = timeline.Tracks[ti].DecodeNanoseconds![next[ti]];
+                    if (pick < 0 || decodeTime < timeline.Tracks[pick].DecodeNanoseconds![next[pick]]) pick = ti;
                 }
                 if (pick < 0) break;
                 var t = inputs[pick].Track;
-                var s = t.Samples[next[pick]];
-                long pts = (ptsNs[pick][next[pick]] + shift) / 1_000_000;
-                next[pick]++;
+                int sampleIndex = next[pick]++;
+                var s = t.Samples[sampleIndex];
+                TrackTiming trackTiming = timeline.Tracks[pick];
+                long pts = trackTiming.PresentationMilliseconds[sampleIndex];
+                long sampleDuration = SampleDurationMilliseconds(t, s, timeline.ShiftNanoseconds, pts);
                 bool videoKey = t.Kind == TrackKind.Video && s.Key;
                 long rel = pts - clusterStartMs;
                 bool newCluster = clusterSizePos < 0
@@ -138,13 +118,31 @@ internal static class MatroskaMuxer
                     if (videoKey || !hasVideo) cues.Add((clusterStartMs, pick + 1, clusterPos));
                     rel = pts - clusterStartMs;
                 }
-                Id(output, 0xA3);
+                bool blockGroup = sampleDuration > 0;
+                long blockGroupSizePosition = -1;
+                if (blockGroup)
+                {
+                    Id(output, 0xA0); // BlockGroup carries an explicit per-sample duration.
+                    blockGroupSizePosition = output.Position;
+                    Size8(output, 0);
+                    Id(output, 0xA1);
+                }
+                else Id(output, 0xA3);
                 Size(output, 4 + s.Size);
                 output.WriteByte((byte)(0x80 | (pick + 1)));
                 BinaryPrimitives.WriteInt16BigEndian(tc, checked((short)rel));
                 output.Write(tc);
-                output.WriteByte((byte)((s.Key ? 0x80 : 0) | ((s.Lacing & 3) << 1)));
+                byte flags = (byte)((s.Lacing & 3) << 1);
+                if (!blockGroup && s.Key) flags |= 0x80;
+                output.WriteByte(flags);
                 Mp4Muxer.CopyRange(inputs[pick].Source, s.Offset, s.Size, output, buffer);
+                if (blockGroup)
+                {
+                    if (!s.Key)
+                        WriteSignedInteger(output, 0xFB, 0); // The source gives no dependency graph; mark the frame non-RAP.
+                    UInt(output, 0x9B, (ulong)sampleDuration);
+                    PatchSize8(output, blockGroupSizePosition);
+                }
                 clusterBytes += s.Size;
             }
         }
@@ -251,14 +249,139 @@ internal static class MatroskaMuxer
         return container.ToArray();
     }
 
-    private static long ToNs(long ticks, uint timescale) => (long)((Int128)ticks * 1_000_000_000 / timescale);
+    internal static Timeline BuildTimeline(IReadOnlyList<DemuxedTrack> tracks, CancellationToken ct = default,
+        bool includeDecodeTime = true)
+    {
+        foreach (DemuxedTrack track in tracks) ValidateMatroskaEditSemantics(track);
+
+        long minPresentationNs = long.MaxValue;
+        for (int trackIndex = 0; trackIndex < tracks.Count; trackIndex++)
+        {
+            DemuxedTrack track = tracks[trackIndex];
+            if (track.Timescale == 0) throw new MediaContainerException("A media track has no time scale.");
+            long edit = track.SourceContainer == "mp4" ? Math.Max(0, track.EditMediaTime) : 0;
+            for (int sampleIndex = 0; sampleIndex < track.Samples.Count; sampleIndex++)
+            {
+                ct.ThrowIfCancellationRequested();
+                TrackSample sample = track.Samples[sampleIndex];
+                long presentationTicks = checked(sample.Dts + sample.CtsOffset - edit);
+                minPresentationNs = Math.Min(minPresentationNs, ToNs(presentationTicks, track.Timescale));
+            }
+        }
+
+        long shift = minPresentationNs < 0 ? checked(-minPresentationNs) : 0;
+        var timing = new TrackTiming[tracks.Count];
+        long durationMilliseconds = 0;
+        for (int trackIndex = 0; trackIndex < tracks.Count; trackIndex++)
+        {
+            DemuxedTrack track = tracks[trackIndex];
+            var presentationMilliseconds = new long[track.Samples.Count];
+            long[]? decodeNanoseconds = includeDecodeTime ? new long[track.Samples.Count] : null;
+            long edit = track.SourceContainer == "mp4" ? Math.Max(0, track.EditMediaTime) : 0;
+            for (int sampleIndex = 0; sampleIndex < track.Samples.Count; sampleIndex++)
+            {
+                ct.ThrowIfCancellationRequested();
+                TrackSample sample = track.Samples[sampleIndex];
+                if (decodeNanoseconds is not null)
+                    decodeNanoseconds[sampleIndex] = ToNs(checked(sample.Dts - edit), track.Timescale);
+                long presentationTicks = checked(sample.Dts + sample.CtsOffset - edit);
+                long presentationNs = ToNs(presentationTicks, track.Timescale);
+                long startNs = checked(presentationNs + shift);
+                long startMs = startNs / NanosecondsPerMillisecond;
+                presentationMilliseconds[sampleIndex] = startMs;
+                long sampleDuration = SampleDurationMilliseconds(track, sample, shift, startMs);
+                durationMilliseconds = Math.Max(durationMilliseconds, checked(startMs + sampleDuration));
+            }
+            timing[trackIndex] = new TrackTiming(decodeNanoseconds, presentationMilliseconds);
+        }
+        return new Timeline(timing, shift, durationMilliseconds);
+    }
+
+    private static void ValidateMatroskaEditSemantics(DemuxedTrack track)
+    {
+        if (track.SourceContainer != "mp4") return;
+        if (track.EditList is not { } edits)
+        {
+            if (track.EditMediaTime != 0)
+                throw new MediaContainerException("Matroska output cannot preserve an MP4 media edit without its edit-list duration.");
+            return;
+        }
+
+        if (edits.Count != 1)
+            throw new MediaContainerException("Matroska output cannot preserve empty or multiple MP4 edit segments.");
+
+        Mp4EditListEntry edit = edits[0];
+        if (edit.MediaTime < 0 || edit.MediaRateInteger != 1 || edit.MediaRateFraction != 0
+            || edit.SegmentDuration == 0 || track.EditMovieTimescale == 0)
+            throw new MediaContainerException("Matroska output supports only a full-length, rate-1 MP4 media edit.");
+
+        long presentationEnd = long.MinValue;
+        foreach (TrackSample sample in track.Samples)
+        {
+            long presentationStart = checked(sample.Dts + sample.CtsOffset);
+            if (presentationStart < edit.MediaTime)
+                throw new MediaContainerException("Matroska output cannot preserve a trimmed MP4 edit interval.");
+            presentationEnd = Math.Max(presentationEnd, checked(presentationStart + sample.Duration));
+        }
+
+        if (presentationEnd == long.MinValue)
+            throw new MediaContainerException("Matroska output cannot preserve a trimmed MP4 edit interval.");
+
+        long editedPresentationDuration = checked(presentationEnd - edit.MediaTime);
+        if (editedPresentationDuration <= 0
+            || (Int128)edit.SegmentDuration * track.Timescale
+                != (Int128)editedPresentationDuration * track.EditMovieTimescale)
+            throw new MediaContainerException("Matroska output cannot preserve a trimmed MP4 edit interval.");
+    }
+
+    internal static long SampleDurationMilliseconds(DemuxedTrack track, TrackSample sample, long shift, long startMilliseconds)
+    {
+        if (sample.Duration <= 0) return 0;
+        long edit = track.SourceContainer == "mp4" ? Math.Max(0, track.EditMediaTime) : 0;
+        long endTicks = checked(sample.Dts + sample.CtsOffset + sample.Duration - edit);
+        long endNanoseconds = checked(ToNs(endTicks, track.Timescale) + shift);
+        long endMilliseconds = endNanoseconds / NanosecondsPerMillisecond;
+        if (endMilliseconds < startMilliseconds)
+            throw new MediaContainerException("A media sample ends before its presentation time.");
+        if (endMilliseconds == startMilliseconds)
+            throw new MediaContainerException("Matroska's 1 ms timecode cannot represent this sample duration.");
+        return endMilliseconds - startMilliseconds;
+    }
+
+    private static long ToNs(long ticks, uint timescale) => checked((long)((Int128)ticks * 1_000_000_000 / timescale));
+
+    private static void WriteSignedInteger(Stream output, uint id, long value)
+    {
+        int bytes = 1;
+        while (bytes < sizeof(long))
+        {
+            int bits = bytes * 8 - 1;
+            long minimum = -(1L << bits);
+            long maximum = (1L << bits) - 1;
+            if (value >= minimum && value <= maximum) break;
+            bytes++;
+        }
+
+        Id(output, id);
+        Size(output, bytes);
+        ulong encoded = unchecked((ulong)value);
+        for (int index = bytes - 1; index >= 0; index--)
+            output.WriteByte((byte)(encoded >> (index * 8)));
+    }
 
     private static byte[] TrackEntry(DemuxedTrack t, int number, bool webm)
     {
         bool video = t.Kind == TrackKind.Video;
+        bool audio = t.Kind == TrackKind.Audio;
+        bool subtitle = t.Kind == TrackKind.Subtitle;
         string codecId;
         byte[]? priv;
-        if (t.SourceContainer == "webm")
+        if (subtitle && t.SourceContainer == "subtitle")
+        {
+            codecId = "S_TEXT/UTF8";
+            priv = null;
+        }
+        else if (t.SourceContainer == "webm")
         {
             codecId = t.MatroskaCodecId ?? throw new MediaContainerException("A WebM track has no codec id.");
             priv = t.CodecPrivate;
@@ -285,9 +408,15 @@ internal static class MatroskaMuxer
         var e = new MemoryStream();
         UInt(e, 0xD7, (ulong)number);
         UInt(e, 0x73C5, (ulong)number);
-        UInt(e, 0x83, video ? 1UL : 2UL);
+        UInt(e, 0x83, video ? 1UL : audio ? 2UL : 17UL);
         UInt(e, 0x9C, t.HasLacing ? 1UL : 0UL);
-        Str(e, 0x22B59C, t.Language is { Length: 3 } l && l.All(char.IsAsciiLetterLower) ? l : "und");
+        if (subtitle)
+        {
+            Str(e, 0x22B59C, MatroskaLanguageCode(t.Language));
+            Str(e, 0x22B59D, t.Language);
+            if (t.Name.Length > 0) Str(e, 0x536E, t.Name);
+        }
+        else Str(e, 0x22B59C, t.Language is { Length: 3 } l && l.All(char.IsAsciiLetterLower) ? l : "und");
         Str(e, 0x86, codecId);
         if (priv is { Length: > 0 }) Bin(e, 0x63A2, priv);
         if (t.SourceContainer == "webm" && t.DefaultDurationNs > 0) UInt(e, 0x23E383, (ulong)t.DefaultDurationNs);
@@ -302,7 +431,7 @@ internal static class MatroskaMuxer
             UInt(v, 0xBA, (ulong)Math.Max(1, t.Height));
             Master(e, 0xE0, v.ToArray());
         }
-        else
+        else if (audio)
         {
             var a = new MemoryStream();
             Float(a, 0xB5, t.SampleRate > 0 ? t.SampleRate : 48000);
@@ -311,6 +440,14 @@ internal static class MatroskaMuxer
             Master(e, 0xE1, a.ToArray());
         }
         return e.ToArray();
+    }
+
+    private static string MatroskaLanguageCode(string language)
+    {
+        string primary = language.Split('-')[0];
+        if (primary.Length == 3) return primary.ToLowerInvariant();
+        try { return System.Globalization.CultureInfo.GetCultureInfo(primary).ThreeLetterISOLanguageName.ToLowerInvariant(); }
+        catch (System.Globalization.CultureNotFoundException) { return "und"; }
     }
 
     private static void SeekEntry(Stream s, uint id, long position)
@@ -403,9 +540,13 @@ internal sealed record MergeResult(string Container, long Bytes, IReadOnlyList<s
 /// </summary>
 internal static class MediaMerger
 {
-    private static readonly HashSet<string> Mp4Codecs = ["h264", "h265", "av1", "vp9", "aac", "mp3", "opus"];
+    internal const int MaxTrackCount = 8;
+    private static readonly HashSet<string> Mp4Codecs = ["h264", "h265", "av1", "vp9", "aac", "mp3", "opus", "tx3g"];
     private static readonly HashSet<string> WebmCodecs = ["vp8", "vp9", "av1", "opus", "vorbis"];
-    private static readonly HashSet<string> MkvCodecs = ["h264", "h265", "av1", "vp8", "vp9", "aac", "mp3", "opus", "vorbis"];
+    private static readonly HashSet<string> MkvCodecs = ["h264", "h265", "av1", "vp8", "vp9", "aac", "mp3", "opus", "vorbis", "utf8"];
+
+    internal static int AvailableTrackSlots(string container, int existingTrackCount) =>
+        container is "mp4" or "mkv" ? Math.Max(0, MaxTrackCount - existingTrackCount) : 0;
 
     public static List<DemuxedTrack> Demux(Stream s, long length, CancellationToken ct) =>
         WebmDemuxer.LooksLikeMatroska(s, length) ? WebmDemuxer.Read(s, length, ct) : Mp4Demuxer.Read(s, length, ct);
@@ -431,6 +572,11 @@ internal static class MediaMerger
     public static MergeResult Merge(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, string container,
         Stream output, CancellationToken ct, MediaMergeMetadata? metadata = null, MediaThumbnail? thumbnail = null)
     {
+        if (inputs.Any(input => input.Track.Kind == TrackKind.Subtitle)
+            && (container == "mkv" && inputs.Any(input => input.Track.Kind == TrackKind.Subtitle && input.Track.Codec != "utf8")
+                || container == "mp4" && inputs.Any(input => input.Track.Kind == TrackKind.Subtitle && input.Track.Codec != "tx3g")
+                || container is not ("mkv" or "mp4")))
+            throw new MediaContainerException("The selected subtitle encoding is not supported by this output container.");
         if (thumbnail is not null && container is not ("mp4" or "m4a" or "webm" or "mkv"))
             throw new MediaContainerException("Cover images are supported only in MP4, M4A, WebM, or Matroska output.");
         long bytes;
@@ -453,11 +599,27 @@ internal static class MediaMerger
             inputs.Max(i => i.Track.DurationSeconds), writtenMetadata, thumbnail?.Sha256);
     }
 
-    /// <summary>Re-reads a finished output and proves it carries exactly the expected tracks and samples.</summary>
+    /// <summary>Re-reads a finished output and checks its track shape and selected metadata.</summary>
     public static void Validate(Stream output, long length, IReadOnlyList<DemuxedTrack> expected, CancellationToken ct,
         MediaMergeMetadata? expectedMetadata = null, string? expectedThumbnailSha256 = null)
+        => ValidateCore(output, length, expected, null, ct, expectedMetadata, expectedThumbnailSha256);
+
+    /// <summary>Validates each remuxed sample's payload and representable timing.</summary>
+    public static void ValidateRemux(Stream output, long length,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, CancellationToken ct,
+        MediaMergeMetadata? expectedMetadata = null, string? expectedThumbnailSha256 = null)
+    {
+        if (inputs.Count == 0) throw new MediaContainerException("A remux needs at least one source track.");
+        ValidateCore(output, length, inputs.Select(input => input.Track).ToArray(), inputs,
+            ct, expectedMetadata, expectedThumbnailSha256);
+    }
+
+    private static void ValidateCore(Stream output, long length, IReadOnlyList<DemuxedTrack> expected,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)>? inputs, CancellationToken ct,
+        MediaMergeMetadata? expectedMetadata, string? expectedThumbnailSha256)
     {
         List<DemuxedTrack> got = Demux(output, length, ct);
+        bool matroska = WebmDemuxer.LooksLikeMatroska(output, length);
         if (got.Count != expected.Count)
             throw new MediaContainerException($"The merged file has {got.Count} tracks; {expected.Count} were selected.");
         for (int i = 0; i < expected.Count; i++)
@@ -468,8 +630,13 @@ internal static class MediaMerger
             if (g.Samples.Count != e.Samples.Count || g.PayloadBytes != e.PayloadBytes)
                 throw new MediaContainerException($"Merged {e.Kind.ToString().ToLowerInvariant()} track lost samples ({g.Samples.Count}/{e.Samples.Count}).");
             double tolerance = Math.Max(0.5, e.DurationSeconds * 0.01);
-            if (Math.Abs(g.DurationSeconds - e.DurationSeconds) > tolerance)
+            if (!(inputs is not null && matroska) && Math.Abs(g.DurationSeconds - e.DurationSeconds) > tolerance)
                 throw new MediaContainerException($"Merged {e.Kind.ToString().ToLowerInvariant()} duration {g.DurationSeconds:0.##}s differs from the source {e.DurationSeconds:0.##}s.");
+        }
+        if (inputs is not null)
+        {
+            ValidateSamplePayloads(output, got, inputs, ct);
+            ValidateRemuxTimeline(output, length, got, inputs, matroska, ct);
         }
         if (expectedMetadata is not null)
         {
@@ -488,6 +655,188 @@ internal static class MediaMerger
                 ? WebmDemuxer.ReadThumbnail(output, length) : Mp4Demuxer.ReadThumbnail(output, length);
             if (thumbnail?.Sha256 != expectedThumbnailSha256)
                 throw new MediaContainerException("The merged file did not retain the selected cover image.");
+        }
+    }
+
+    private static void ValidateSamplePayloads(Stream output, IReadOnlyList<DemuxedTrack> actual,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> expected, CancellationToken ct)
+    {
+        if (!output.CanRead || !output.CanSeek)
+            throw new MediaContainerException("The merged output cannot be checked for sample payload changes.");
+
+        var sourcePositions = new List<(Stream Stream, long Position)>();
+        foreach (var input in expected)
+        {
+            Stream source = input.Source;
+            if (!source.CanRead || !source.CanSeek)
+                throw new MediaContainerException("A source track cannot be checked for sample payload changes.");
+
+            if (!sourcePositions.Any(saved => ReferenceEquals(saved.Stream, source)))
+                sourcePositions.Add((source, source.Position));
+        }
+
+        const int bufferSize = 64 * 1024;
+        byte[] sourceBuffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+        byte[] outputBuffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+        long outputPosition = output.Position;
+        try
+        {
+            for (int trackIndex = 0; trackIndex < expected.Count; trackIndex++)
+            {
+                DemuxedTrack expectedTrack = expected[trackIndex].Track;
+                DemuxedTrack actualTrack = actual[trackIndex];
+                if (expectedTrack.Samples.Count != actualTrack.Samples.Count)
+                    throw new MediaContainerException($"The merged {expectedTrack.Kind.ToString().ToLowerInvariant()} track changed its sample count.");
+
+                Stream source = expected[trackIndex].Source;
+                for (int sampleIndex = 0; sampleIndex < expectedTrack.Samples.Count; sampleIndex++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    TrackSample sourceSample = expectedTrack.Samples[sampleIndex];
+                    TrackSample outputSample = actualTrack.Samples[sampleIndex];
+                    if (sourceSample.Size != outputSample.Size)
+                        throw new MediaContainerException($"The merged {expectedTrack.Kind.ToString().ToLowerInvariant()} track changed a sample size.");
+                    if (sourceSample.Size < 0 || sourceSample.Offset < 0 || sourceSample.Offset > source.Length - sourceSample.Size
+                        || outputSample.Offset < 0 || outputSample.Offset > output.Length - outputSample.Size)
+                        throw new MediaContainerException("A sample lies outside its source or merged file.");
+
+                    source.Position = sourceSample.Offset;
+                    output.Position = outputSample.Offset;
+                    int remaining = sourceSample.Size;
+                    while (remaining > 0)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        int count = Math.Min(bufferSize, remaining);
+                        ReadSampleBytes(source, sourceBuffer, count, ct);
+                        ReadSampleBytes(output, outputBuffer, count, ct);
+                        if (!sourceBuffer.AsSpan(0, count).SequenceEqual(outputBuffer.AsSpan(0, count)))
+                            throw new MediaContainerException("The merged file contains a different encoded sample payload.");
+                        remaining -= count;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                foreach ((Stream stream, long position) in sourcePositions) stream.Position = position;
+                output.Position = outputPosition;
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(sourceBuffer);
+                ArrayPool<byte>.Shared.Return(outputBuffer);
+            }
+        }
+    }
+
+    private static void ValidateRemuxTimeline(Stream output, long length, IReadOnlyList<DemuxedTrack> actual,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> expected, bool matroska, CancellationToken ct)
+    {
+        if (expected.Count != actual.Count)
+            throw new MediaContainerException("The remux changed the selected track count.");
+
+        if (matroska)
+        {
+            MatroskaMuxer.Timeline wanted = MatroskaMuxer.BuildTimeline(
+                expected.Select(input => input.Track).ToArray(), ct, includeDecodeTime: false);
+            if (actual.Any(track => track.Timescale != 1000))
+                throw new MediaContainerException("The Matroska output does not use the validated 1 ms timecode scale.");
+
+            for (int trackIndex = 0; trackIndex < expected.Count; trackIndex++)
+            {
+                DemuxedTrack sourceTrack = expected[trackIndex].Track;
+                DemuxedTrack outputTrack = actual[trackIndex];
+                MatroskaMuxer.TrackTiming sourceTiming = wanted.Tracks[trackIndex];
+                if (outputTrack.Samples.Any(sample => sample.CtsOffset != 0))
+                    throw new MediaContainerException("A Matroska track contains an unsupported composition offset.");
+                for (int sampleIndex = 0; sampleIndex < sourceTrack.Samples.Count; sampleIndex++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    TrackSample sourceSample = sourceTrack.Samples[sampleIndex];
+                    TrackSample outputSample = outputTrack.Samples[sampleIndex];
+                    if (sourceSample.Duration <= 0)
+                        throw new MediaContainerException("A source sample has no duration that can be validated in Matroska.");
+                    long durationMilliseconds = MatroskaMuxer.SampleDurationMilliseconds(sourceTrack, sourceSample,
+                        wanted.ShiftNanoseconds, sourceTiming.PresentationMilliseconds[sampleIndex]);
+                    if (outputSample.Dts != sourceTiming.PresentationMilliseconds[sampleIndex]
+                        || outputSample.CtsOffset != 0
+                        || outputSample.Duration != durationMilliseconds)
+                        throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} timing.");
+                    if (outputSample.Key != sourceSample.Key)
+                        throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} keyframe status.");
+                }
+            }
+            return;
+        }
+
+        if (!output.CanSeek || length != output.Length)
+            throw new MediaContainerException("The MP4 output length cannot be validated.");
+        ulong expectedMovieDuration = 0;
+        uint? outputMovieTimescale = null;
+        ulong? outputMovieDuration = null;
+        for (int trackIndex = 0; trackIndex < expected.Count; trackIndex++)
+        {
+            DemuxedTrack sourceTrack = expected[trackIndex].Track;
+            DemuxedTrack outputTrack = actual[trackIndex];
+            if (sourceTrack.SourceContainer != "mp4" || outputTrack.SourceContainer != "mp4"
+                || sourceTrack.Timescale != outputTrack.Timescale
+                || !Mp4Muxer.EditListsMatch(sourceTrack, outputTrack))
+                throw new MediaContainerException("The MP4 remux changed a track's time base or edit-list timeline.");
+
+            ulong trackDuration = Mp4Muxer.MoviePresentationDuration(sourceTrack);
+            expectedMovieDuration = Math.Max(expectedMovieDuration, trackDuration);
+            if (outputTrack.MovieTimescale == 0
+                || (Int128)outputTrack.TrackHeaderDurationMovieTicks * Mp4Muxer.MovieTimescale
+                    != (Int128)trackDuration * outputTrack.MovieTimescale)
+                throw new MediaContainerException($"The MP4 remux changed the {sourceTrack.Kind.ToString().ToLowerInvariant()} track's presentation duration.");
+            if ((outputMovieTimescale is { } savedTimescale && savedTimescale != outputTrack.MovieTimescale)
+                || (outputMovieDuration is { } savedDuration
+                    && savedDuration != outputTrack.MovieHeaderDurationMovieTicks))
+                throw new MediaContainerException("The MP4 tracks disagree about the movie header duration.");
+            outputMovieTimescale = outputTrack.MovieTimescale;
+            outputMovieDuration = outputTrack.MovieHeaderDurationMovieTicks;
+
+            if (sourceTrack.Samples.Count == 0)
+                throw new MediaContainerException("An MP4 remux track has no samples to validate.");
+            // Flat MP4 starts DTS at zero; the muxer carries this exact source origin into ctts.
+            long decodeOrigin = sourceTrack.Samples[0].Dts;
+
+            for (int sampleIndex = 0; sampleIndex < sourceTrack.Samples.Count; sampleIndex++)
+            {
+                ct.ThrowIfCancellationRequested();
+                TrackSample sourceSample = sourceTrack.Samples[sampleIndex];
+                TrackSample outputSample = outputTrack.Samples[sampleIndex];
+                long expectedDts = checked(sourceSample.Dts - decodeOrigin);
+                long expectedComposition = checked(sourceSample.CtsOffset + decodeOrigin);
+                if (expectedComposition is < int.MinValue or > int.MaxValue)
+                    throw new MediaContainerException("The MP4 composition offset cannot preserve the source decode origin.");
+                long sourcePts = checked(sourceSample.Dts + sourceSample.CtsOffset);
+                long outputPts = checked(outputSample.Dts + outputSample.CtsOffset);
+                if (outputSample.Dts != expectedDts || outputSample.CtsOffset != (int)expectedComposition
+                    || outputPts != sourcePts || outputSample.Duration != sourceSample.Duration)
+                    throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} timing.");
+                if (outputSample.Key != sourceSample.Key)
+                    throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} keyframe status.");
+            }
+        }
+
+        if (outputMovieTimescale is not { } movieTimescale || outputMovieDuration is not { } movieDuration
+            || (Int128)movieDuration * Mp4Muxer.MovieTimescale
+                != (Int128)expectedMovieDuration * movieTimescale)
+            throw new MediaContainerException("The MP4 remux changed the movie header duration.");
+    }
+
+    private static void ReadSampleBytes(Stream stream, byte[] buffer, int count, CancellationToken ct)
+    {
+        int read = 0;
+        while (read < count)
+        {
+            ct.ThrowIfCancellationRequested();
+            int amount = stream.Read(buffer, read, count - read);
+            if (amount == 0) throw new MediaContainerException("A source or merged sample ended before its declared size.");
+            read += amount;
         }
     }
 }

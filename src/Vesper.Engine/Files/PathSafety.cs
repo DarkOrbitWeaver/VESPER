@@ -2,6 +2,7 @@ using Microsoft.Win32.SafeHandles;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace Vesper.Engine;
 
@@ -156,7 +157,7 @@ public static class PathSafety
 
     private static IOException FileError(int code, string path)
     {
-        string message = new Win32Exception(code).Message;
+        string message = new Win32Exception(code).Message + $" (Windows error {code}).";
         return code switch
         {
             2 => new FileNotFoundException(message, path),
@@ -213,9 +214,194 @@ public static class PathSafety
         }
     }
 
+    internal static bool TryDeleteTemporaryFile(string path, string? expectedIdentity, out string error)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Stable temporary file identity is not supported on this platform.";
+            return false;
+        }
+        if (expectedIdentity is not { Length: 64 } || !expectedIdentity.All(Uri.IsHexDigit))
+        {
+            error = "The temporary file has no valid saved identity.";
+            return false;
+        }
+
+        try
+        {
+            using SafeFileHandle file = OpenTemporaryHandle(path, FileMode.Open, FileAccess.Read,
+                FileShare.Read, allowDelete: true);
+            if (!string.Equals(expectedIdentity, TemporaryFileIdentity(file), StringComparison.Ordinal))
+            {
+                error = "The temporary path now contains a different file.";
+                return false;
+            }
+
+            DeleteOpenTemporaryFile(file, path);
+            return true;
+        }
+        catch (FileNotFoundException) { return true; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity, out string error)
+        => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null);
+
+    internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity,
+        out string error, Action? duringMove)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Handle-bound temporary file moves are not supported on this platform.";
+            return false;
+        }
+        if (expectedSourceIdentity is not { Length: 64 } || !expectedSourceIdentity.All(Uri.IsHexDigit))
+        {
+            error = "The temporary file has no valid saved identity.";
+            return false;
+        }
+        if (!TryGetFullPath(sourcePath, out string source, out error)
+            || !TryGetFullPath(targetPath, out string target, out error)) return false;
+
+        string? sourceDirectory = Path.GetDirectoryName(source);
+        string? targetDirectory = Path.GetDirectoryName(target);
+        string sourceName = Path.GetFileName(source);
+        string targetName = Path.GetFileName(target);
+        if (sourceDirectory is null || targetDirectory is null
+            || !string.Equals(sourceDirectory, targetDirectory, StringComparison.OrdinalIgnoreCase)
+            || sourceName.Length == 0 || targetName.Length == 0
+            || sourceName.Contains(':') || targetName.Contains(':'))
+        {
+            error = "Temporary file moves must use two file names in the same folder.";
+            return false;
+        }
+        if (string.Equals(sourceName, targetName, StringComparison.OrdinalIgnoreCase))
+        {
+            error = "The temporary source and target names are the same.";
+            return false;
+        }
+
+        try
+        {
+            using SafeFileHandle directory = OpenTemporaryDirectoryHandle(sourceDirectory);
+            using SafeFileHandle sourceFile = OpenTemporaryHandle(source, FileMode.Open, FileAccess.Read,
+                FileShare.Read, allowDelete: true);
+            if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(sourceFile), StringComparison.Ordinal))
+            {
+                error = "The temporary source path now contains a different file.";
+                return false;
+            }
+
+            // Recheck the folder after the caller's last async work and before renaming.
+            duringMove?.Invoke();
+            if (!TryCheckUnlinkedDirectory(sourceDirectory, out error))
+            {
+                error = "The temporary folder path changed before the file could be moved.";
+                return false;
+            }
+
+            string nativeTarget = target.StartsWith(@"\\?\") ? target
+                : target.StartsWith(@"\\") ? @"\\?\UNC\" + target[2..] : @"\\?\" + target;
+            byte[] name = Encoding.Unicode.GetBytes(nativeTarget);
+            int nameOffset = Marshal.OffsetOf<FileRenameInfoPrefix>(nameof(FileRenameInfoPrefix.FileName)).ToInt32();
+            int bufferSize = checked(Marshal.SizeOf<FileRenameInfoPrefix>() + name.Length);
+            IntPtr info = Marshal.AllocHGlobal(bufferSize);
+            try
+            {
+                for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(info, i, 0);
+                int rootOffset = Marshal.OffsetOf<FileRenameInfoPrefix>(nameof(FileRenameInfoPrefix.RootDirectory)).ToInt32();
+                int lengthOffset = Marshal.OffsetOf<FileRenameInfoPrefix>(nameof(FileRenameInfoPrefix.FileNameLength)).ToInt32();
+                Marshal.WriteByte(info, 0, 0); // ReplaceIfExists = false
+                Marshal.WriteInt32(info, lengthOffset, name.Length);
+                Marshal.Copy(name, 0, IntPtr.Add(info, nameOffset), name.Length);
+                Marshal.WriteIntPtr(info, rootOffset, IntPtr.Zero);
+                if (!SetFileInformationByHandle(sourceFile, fileRenameInfo, info, bufferSize))
+                    throw FileError(Marshal.GetLastPInvokeError(), target);
+            }
+            finally { Marshal.FreeHGlobal(info); }
+
+            if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(sourceFile), StringComparison.Ordinal))
+            {
+                error = "The moved temporary file no longer has its saved identity.";
+                return false;
+            }
+
+            using SafeFileHandle movedFile = OpenTemporaryHandle(target, FileMode.Open, FileAccess.Read,
+                FileShare.Read | FileShare.Delete);
+            if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(movedFile), StringComparison.Ordinal))
+            {
+                error = "The temporary target path now contains a different file.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    internal static SafeFileHandle OpenTemporaryDirectoryHandle(string path)
+    {
+        if (!TryCheckUnlinkedDirectory(path, out string error)) throw new IOException(error);
+        const uint fileTraverse = 0x00000020, fileReadAttributes = 0x00000080;
+        const uint openExisting = 3;
+        const uint openReparsePoint = 0x00200000, backupSemantics = 0x02000000, openNoRecall = 0x00100000;
+        string nativePath = path.StartsWith(@"\\?\") ? path
+            : path.StartsWith(@"\\") ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
+        SafeFileHandle handle = CreateFileW(nativePath, fileTraverse | fileReadAttributes,
+            (uint)(FileShare.Read | FileShare.Write), IntPtr.Zero, openExisting,
+            openReparsePoint | backupSemantics | openNoRecall, IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int code = Marshal.GetLastPInvokeError();
+            handle.Dispose();
+            throw FileError(code, path);
+        }
+
+        try
+        {
+            if (!TryCheckUnlinkedDirectory(path, out error)
+                || !GetFileInformationByHandle(handle, out TemporaryFileInfo info)
+                || (info.Attributes & FileAttributes.Directory) == 0
+                || (info.Attributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0
+                || IsCloudPlaceholder(info.Attributes))
+                throw new IOException(error.Length > 0 ? error : "The temporary folder is not a plain directory.");
+            return handle;
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    private const int fileRenameInfo = 3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileRenameInfoPrefix
+    {
+        public byte ReplaceIfExists;
+        public IntPtr RootDirectory;
+        public uint FileNameLength;
+        public ushort FileName;
+    }
+
     [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle file, int infoClass, ref byte data, int size);
+
+    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle file, int infoClass, IntPtr data, int size);
 
     internal static bool PathStillNamesFile(string path, FileStream verifiedFile, string digest)
     {

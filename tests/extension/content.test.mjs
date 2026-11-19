@@ -37,6 +37,16 @@ test('the media picker wraps long metadata and keeps horizontal overflow inside 
   assert.match(content, /\.opt>span:nth-child\(2\)\{flex:1 1 auto;min-width:0;overflow-wrap:anywhere/);
 });
 
+test('subtitle embedding stays opt-in and travels with the native media selection', () => {
+  const content = source('content');
+  const background = source('background');
+  assert.match(content, /embedSubtitles: false/);
+  assert.match(content, /Embed selected subtitles/);
+  assert.match(content, /formats\.browserChoice \? \{ type: 'browser-media-select'[\s\S]*: \{ type: 'media-select',[\s\S]*\.\.\.intent/);
+  assert.match(background, /const embedSubtitles = message\.embedSubtitles === true/);
+  assert.match(background, /mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles/);
+});
+
 test('System motion follows the reduced-motion preference and explicit choices override it', () => {
   const document = new EventTarget();
   document.querySelectorAll = () => [];

@@ -31,16 +31,40 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     // ---- opening --------------------------------------------------------------------------------------------------
 
     /// <summary>Revalidates the path, asks before launching anything runnable, and never runs anything unprompted.</summary>
-    public void Open(JobSnapshot s)
+    public async void Open(JobSnapshot s)
     {
         if (!TryGetFile(s, out string path)) return;
-        if (RunnableExtensions.Contains(Path.GetExtension(path)) &&
-            !Confirm($"{Path.GetFileName(path)} is a program or script. Windows will treat it as downloaded from the internet.\n\nRun it?", "Open file", MessageBoxIcon.Warning))
+        if (RequiresOpenConfirmation(path) &&
+            !Confirm(OpenConfirmationText(path), "Open file", MessageBoxIcon.Warning))
             return;
-        try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
-        { Info("The file could not be opened: " + ex.Message, "Open file", MessageBoxIcon.Warning); }
+
+        if (owner is Control control) control.UseWaitCursor = true;
+        OpenCompletedFileResult result;
+        try { result = await engine.OpenCompletedFileAsync(s.Id, path); }
+        finally
+        {
+            if (owner is Control { IsDisposed: false } current) current.UseWaitCursor = false;
+        }
+
+        if (result.Lease is null)
+        {
+            Info(result.Message, "Open file", MessageBoxIcon.Warning);
+            return;
+        }
+
+        using (result.Lease)
+        {
+            try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
+            { Info("The file could not be opened: " + ex.Message, "Open file", MessageBoxIcon.Warning); }
+        }
     }
+
+    internal static bool RequiresOpenConfirmation(string finalPath) =>
+        RunnableExtensions.Contains(Path.GetExtension(finalPath));
+
+    internal static string OpenConfirmationText(string finalPath) =>
+        $"{Path.GetFileName(finalPath)} is a program or script. Windows will treat it as downloaded from the internet.\n\nRun it?";
 
     public void ShowFolder(JobSnapshot s)
     {

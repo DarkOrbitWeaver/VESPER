@@ -86,7 +86,7 @@ public sealed class SettingsAccessibilityTests
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Browser" })
+            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser" })
             {
                 showPage.Invoke(form, [name]);
                 Application.DoEvents();
@@ -109,7 +109,7 @@ public sealed class SettingsAccessibilityTests
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Browser" })
+            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser" })
             {
                 showPage.Invoke(form, [name]);
                 Application.DoEvents();
@@ -212,6 +212,90 @@ public sealed class SettingsAccessibilityTests
                 Directory.Delete(root, recursive: true);
             }
         });
+    }
+
+    [Fact]
+    public void Site_rules_can_be_added_and_removed_in_settings()
+    {
+        OnSta(() =>
+        {
+            using var form = new SettingsForm();
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            _ = form.Handle;
+            typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(form, ["Sites"]);
+            Application.DoEvents();
+            TextBox host = Descendants(form).OfType<TextBox>().Single(control => control.Name == "siteHostInput");
+            CheckBox audio = Descendants(form).OfType<CheckBox>().Single(control => control.Name == "siteAlwaysAudio");
+            VesperButton save = Descendants(form).OfType<VesperButton>().Single(control => control.Name == "saveSiteRule");
+            VesperButton remove = Descendants(form).OfType<VesperButton>().Single(control => control.Name == "removeSiteRule");
+
+            host.Text = "BÜCHER.Example.";
+            audio.Checked = true;
+            save.PerformClick();
+
+            SiteRule saved = Assert.Single(form.Result.SiteRules);
+            Assert.Equal("xn--bcher-kva.example", saved.Host);
+            Assert.True(saved.AlwaysAudio);
+            Assert.True(remove.Enabled);
+
+            remove.PerformClick();
+            Assert.Empty(form.Result.SiteRules);
+        });
+    }
+
+    [Fact]
+    public void Site_audio_rule_selects_audio_in_the_native_media_picker()
+    {
+        OnSta(() =>
+        {
+            var preferences = new VesperPreferences
+            {
+                SiteRules = [new SiteRule { Host = "video.example", AlwaysAudio = true }]
+            };
+            using var picker = new MediaDiscoveryForm(preferences, new Uri("https://video.example/watch"));
+            FieldInfo selectedPreset = typeof(MediaDiscoveryForm).GetField("_presetIndex", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            Assert.Equal(3, (int)selectedPreset.GetValue(picker)!);
+        });
+    }
+
+    [Fact]
+    public void Add_download_suggests_site_folder_for_single_or_same_host_urls_but_not_mixed_hosts()
+    {
+        string globalFolder = Path.Combine(Path.GetTempPath(), "vesper-global-downloads");
+        string siteFolder = Path.Combine(Path.GetTempPath(), "vesper-media-downloads");
+        var preferences = new VesperPreferences
+        {
+            DefaultFolder = globalFolder,
+            SiteRules = [new SiteRule { Host = "media.example", Folder = siteFolder }]
+        };
+
+        OnSta(() =>
+        {
+            using var single = new AddDownloadForm(preferences, "https://media.example/a.zip");
+            Assert.Equal(siteFolder, DestinationInput(single).Text);
+
+            using var sameHostBatch = new AddDownloadForm(preferences,
+                "https://media.example/a.zip\nhttps://media.example/b.zip");
+            Assert.Equal(siteFolder, DestinationInput(sameHostBatch).Text);
+
+            using var mixedHostBatch = new AddDownloadForm(preferences,
+                "https://media.example/a.zip\nhttps://other.example/b.zip");
+            Assert.Equal(globalFolder, DestinationInput(mixedHostBatch).Text);
+
+            TextBox destination = DestinationInput(single);
+            TextBox url = Descendants(single).OfType<TextBox>().Single(control => control.Name == "downloadUrl");
+            string chosen = Path.Combine(Path.GetTempPath(), "vesper-one-time-folder");
+            destination.Text = chosen;
+            url.Text = "https://other.example/next.zip";
+            Assert.Equal(chosen, destination.Text);
+        });
+
+        static TextBox DestinationInput(AddDownloadForm form) =>
+            Descendants(form).OfType<TextBox>().Single(control => control.Name == "destinationFolder");
     }
 
     [Fact]

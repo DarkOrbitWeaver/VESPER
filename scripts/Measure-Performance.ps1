@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS  Compares release startup, UI responsiveness, transfer throughput, memory and media processing against a Git baseline.
-.EXAMPLE   .\scripts\Measure-Performance.ps1 -BaselineRef 07d6143
+.EXAMPLE   .\scripts\Measure-Performance.ps1 -BaselineRef cc85d83
 .NOTES     Runs only on Windows. Builds both revisions and stores raw samples under release\performance-*.
 #>
 param(
-    [string]$BaselineRef = "07d6143",
+    [string]$BaselineRef = "cc85d83",
     [ValidateRange(5, 100)][int]$Runs = 20,
     [ValidateRange(10, 600)][int]$IdleSeconds = 60,
-    [ValidateRange(3, 20)][int]$ThroughputRuns = 5
+    [ValidateRange(3, 20)][int]$ThroughputRuns = 5,
+    [ValidateRange(3, 10)][int]$MediaRuns = 5
 )
 $ErrorActionPreference = 'Stop'
 if (-not [OperatingSystem]::IsWindows()) { throw 'Performance comparison requires Windows.' }
@@ -122,7 +123,7 @@ function Start-VesperWindow([string]$exe, [string]$dataDirectory) {
             $process.Refresh()
             if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
                 $clock.Stop()
-                return [pscustomobject]@{ Process = $process; StartupMs = $clock.Elapsed.TotalMilliseconds }
+                return [pscustomobject]@{ Process = $process; WindowHandleAvailableMs = $clock.Elapsed.TotalMilliseconds }
             }
             Start-Sleep -Milliseconds 25
         }
@@ -142,18 +143,86 @@ function Stop-Vesper([System.Diagnostics.Process]$process) {
     finally { $process.Dispose() }
 }
 
-function Measure-Startup([string]$label, $version, [int]$iteration) {
+function Measure-WindowHandleAvailability([string]$label, $version, [int]$iteration) {
     $data = Join-Path $tempRoot "$label-data-$iteration"
     $started = Start-VesperWindow $version.App $data
     Stop-Vesper $started.Process
-    [pscustomobject]@{ run = $iteration; mode = if ($iteration -eq 1) { 'first process' } else { 'subsequent process' }; startupMs = $started.StartupMs }
+    [pscustomobject]@{
+        run = $iteration
+        mode = if ($iteration -eq 1) { 'first process in this sequence' } else { 'later process in this sequence' }
+        windowHandleAvailableMs = $started.WindowHandleAvailableMs
+    }
 }
 
 function Get-Median([double[]]$values) {
     if ($values.Length -eq 0) { throw 'Cannot calculate a median from no samples.' }
     [Array]::Sort($values)
-    if ($values.Length % 2) { return $values[[int]($values.Length / 2)] }
-    return ($values[$values.Length / 2 - 1] + $values[$values.Length / 2]) / 2
+    $middle = [int][Math]::Floor($values.Length / 2.0)
+    if ($values.Length % 2 -eq 1) { return $values[$middle] }
+    return ($values[$middle - 1] + $values[$middle]) / 2
+}
+
+function Get-MedianProperty([object[]]$rows, [string]$propertyName) {
+    $values = [double[]]@($rows | ForEach-Object { [double]$_.$propertyName })
+    return Get-Median $values
+}
+
+function Test-WithinRegressionLimit([double]$baseline, [double]$current, [double]$maximumRatio = 1.05) {
+    return $current -le $baseline * $maximumRatio
+}
+
+function Get-GridRegressionLimit([double]$baseline) {
+    $maximumRelativeRegressionMs = $baseline * 0.15
+    $regressionAllowanceMs = [Math]::Max(1.0, $maximumRelativeRegressionMs)
+    return [Math]::Min(16.7, $baseline + $regressionAllowanceMs)
+}
+
+function Test-GridRegression([double]$baseline, [double]$current) {
+    if ([double]::IsNaN($baseline) -or [double]::IsInfinity($baseline) -or
+        [double]::IsNaN($current) -or [double]::IsInfinity($current) -or
+        $baseline -le 0 -or $current -lt 0) {
+        return $false
+    }
+
+    return $current -le (Get-GridRegressionLimit $baseline)
+}
+
+function Get-IdleCpuGate([double]$baseline, [double]$current) {
+    $maximumRegressionPercentagePoints = 0.05
+    $maximumIdleCpuPercent = 0.1
+    $allowedCurrentIdleCpuPercent = [Math]::Min(
+        $maximumIdleCpuPercent,
+        $baseline + $maximumRegressionPercentagePoints)
+    [pscustomobject]@{
+        baselineIdleCpuPercent = $baseline
+        currentIdleCpuPercent = $current
+        regressionPercentagePoints = [Math]::Round($current - $baseline, 3)
+        maximumRegressionPercentagePoints = $maximumRegressionPercentagePoints
+        maximumIdleCpuPercent = $maximumIdleCpuPercent
+        allowedCurrentIdleCpuPercent = $allowedCurrentIdleCpuPercent
+        passed = ($current -le $allowedCurrentIdleCpuPercent)
+    }
+}
+
+function Test-ComparisonPasses(
+    $windowHandleAvailability,
+    $grid,
+    $idleCpu,
+    [object[]]$throughput,
+    $smallTransfer,
+    $queue,
+    $memory,
+    [object[]]$mediaProcessing,
+    [object[]]$segmentedMerges,
+    [bool]$currentTreeClean) {
+
+    if (-not $currentTreeClean -or $null -eq $smallTransfer -or $null -eq $queue) { return $false }
+
+    return $windowHandleAvailability.passed -and $grid.passed -and $idleCpu.passed -and $memory.passed -and
+        $smallTransfer.passed -and $queue.passed -and
+        @($throughput | Where-Object { -not $_.passed }).Count -eq 0 -and
+        $mediaProcessing.Count -eq 3 -and @($mediaProcessing | Where-Object { -not $_.passed }).Count -eq 0 -and
+        $segmentedMerges.Count -eq 2 -and @($segmentedMerges | Where-Object { -not $_.passed }).Count -eq 0
 }
 
 function Measure-Idle([string]$label, $version) {
@@ -260,57 +329,149 @@ function Measure-Throughput([string]$label, $version, [int]$iteration) {
 
 function Parse-MediaBenchmarkLog([string]$path) {
     $rows = @()
-    $pattern = 'remux:\s+container=(?<container>mp4|webm|mkv);\s+duration=(?<duration>[0-9.]+)s;\s+samples=(?<samples>\d+);\s+bytes=(?<bytes>\d+);\s+merge-p50-ms=(?<merge>[0-9.]+);\s+validate-p50-ms=(?<validate>[0-9.]+);\s+merge-MiB-s=(?<throughput>[0-9.]+);\s+merge-allocated-MiB=(?<mergeAllocated>[0-9.]+);\s+validate-allocated-MiB=(?<validateAllocated>[0-9.]+);\s+peak-process-working-set-growth-MiB=(?<workingSet>[0-9.]+)'
+    $runPattern = 'remux-run:\s+container=(?<container>mp4|webm|mkv);\s+run=(?<run>\d+);\s+warmup=(?<warmup>true|false);\s+merge-ms=(?<merge>[0-9.]+);\s+validation-ms=(?<validation>[0-9.]+);\s+merge-allocated-MiB=(?<mergeAllocated>[0-9.]+);\s+validation-allocated-MiB=(?<validationAllocated>[0-9.]+);\s+throughput-MiB-s=(?<throughput>[0-9.]+);\s+peak-working-set-growth-MiB=(?<workingSet>[0-9.]+);\s+packets=(?<packetCount>\d+);\s+output-bytes=(?<bytes>\d+)'
+    $medianPattern = 'remux:\s+container=(?<container>mp4|webm|mkv);\s+duration=(?<duration>[0-9.]+)s;\s+samples=(?<packetCount>\d+);\s+bytes=(?<bytes>\d+);\s+merge-p50-ms=(?<merge>[0-9.]+);\s+validate-p50-ms=(?<validate>[0-9.]+);\s+merge-MiB-s=(?<throughput>[0-9.]+);\s+merge-allocated-MiB=(?<mergeAllocated>[0-9.]+);\s+validate-allocated-MiB=(?<validationAllocated>[0-9.]+);\s+peak-process-working-set-growth-MiB=(?<workingSet>[0-9.]+)'
     foreach ($line in Get-Content -LiteralPath $path) {
         $text = $line.Trim()
-        if ($text -notmatch $pattern) { continue }
-        $rows += [pscustomobject]@{
-            container = $Matches.container
-            durationSeconds = [double]$Matches.duration
-            samples = [int]$Matches.samples
-            outputBytes = [long]$Matches.bytes
-            mergeMedianMs = [double]$Matches.merge
-            validationMedianMs = [double]$Matches.validate
-            mergeMiBPerSecond = [double]$Matches.throughput
-            mergeAllocatedMiB = [double]$Matches.mergeAllocated
-            validationAllocatedMiB = [double]$Matches.validateAllocated
-            peakWorkingSetGrowthMiB = [double]$Matches.workingSet
+        if ($text -match $runPattern) {
+            $rows += [pscustomobject]@{
+                recordType = 'run'
+                container = $Matches.container
+                run = [int]$Matches.run
+                warmup = [bool]::Parse($Matches.warmup)
+                mergeMs = [double]$Matches.merge
+                validationMs = [double]$Matches.validation
+                mergeAllocatedMiB = [double]$Matches.mergeAllocated
+                validationAllocatedMiB = [double]$Matches.validationAllocated
+                throughputMiBPerSecond = [double]$Matches.throughput
+                peakWorkingSetGrowthMiB = [double]$Matches.workingSet
+                packetCount = [int]$Matches.packetCount
+                outputBytes = [long]$Matches.bytes
+            }
+            continue
+        }
+        if ($text.StartsWith('remux-run:', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Could not parse a remux-run row in ${path}: $text"
+        }
+        if ($text -match $medianPattern) {
+            $rows += [pscustomobject]@{
+                recordType = 'median'
+                container = $Matches.container
+                durationSeconds = [double]$Matches.duration
+                packetCount = [int]$Matches.packetCount
+                timingSamples = 3
+                warmupRuns = 1
+                outputBytes = [long]$Matches.bytes
+                mergeMedianMs = [double]$Matches.merge
+                validationMedianMs = [double]$Matches.validate
+                mergeMiBPerSecond = [double]$Matches.throughput
+                mergeAllocatedMiB = [double]$Matches.mergeAllocated
+                validationAllocatedMiB = [double]$Matches.validationAllocated
+                peakWorkingSetGrowthMiB = [double]$Matches.workingSet
+            }
         }
     }
     return $rows
 }
 
-function Measure-MediaBenchmarks([string]$label, $version) {
-    $log = Join-Path $results "$label-media.log"
-    $trx = Join-Path $results "$label-media.trx"
+function Test-MediaBenchmarkRows([object[]]$rows, [bool]$requireRawRuns) {
+    $rawRunCount = @($rows | Where-Object recordType -eq 'run').Count
+
+    foreach ($container in 'mp4', 'webm', 'mkv') {
+        $medianRows = @($rows | Where-Object { $_.container -eq $container -and $_.recordType -eq 'median' })
+        if ($medianRows.Count -ne 1) {
+            throw "Expected one $container remux median row."
+        }
+
+        $median = $medianRows[0]
+        if ($median.packetCount -le 0 -or $median.durationSeconds -le 0 -or $median.outputBytes -le 0 -or
+            $median.mergeMedianMs -le 0 -or $median.validationMedianMs -le 0 -or
+            $median.mergeAllocatedMiB -lt 0 -or $median.validationAllocatedMiB -lt 0) {
+            throw "The $container remux median contains invalid measurements."
+        }
+
+        $containerRuns = @($rows | Where-Object { $_.container -eq $container -and $_.recordType -eq 'run' } | Sort-Object run)
+        if ($containerRuns.Count -eq 0) {
+            if ($requireRawRuns -or $rawRunCount -gt 0) {
+                throw "Expected four raw $container remux-run rows."
+            }
+            continue
+        }
+        if ($containerRuns.Count -ne 4 -or (($containerRuns.run -join ',') -ne '0,1,2,3')) {
+            throw "Expected raw $container remux runs 0 through 3."
+        }
+        if (-not $containerRuns[0].warmup -or @($containerRuns | Where-Object { $_.run -gt 0 -and $_.warmup }).Count -ne 0) {
+            throw "The $container remux rows must mark only run 0 as warm-up."
+        }
+        foreach ($run in $containerRuns) {
+            if ($run.packetCount -le 0 -or $run.outputBytes -le 0 -or $run.mergeMs -le 0 -or
+                $run.validationMs -le 0 -or $run.mergeAllocatedMiB -lt 0 -or
+                $run.validationAllocatedMiB -lt 0 -or $run.throughputMiBPerSecond -le 0 -or
+                $run.peakWorkingSetGrowthMiB -lt 0) {
+                throw "Raw remux run $($run.run) for $container contains invalid measurements."
+            }
+        }
+    }
+
+    if ($rawRunCount -gt 0 -and $rawRunCount -ne 12) {
+        throw 'Raw remux rows must be present for all three containers or absent for the baseline.'
+    }
+    if ($requireRawRuns -and $rawRunCount -ne 12) {
+        throw 'The current revision must provide four raw remux runs per container.'
+    }
+    return $rawRunCount -gt 0
+}
+
+function Measure-MediaBenchmarks([string]$label, $version, [int]$iteration, [bool]$requireRawRuns) {
+    $log = Join-Path $results "$label-media-$iteration.log"
     Invoke-DotNet $version.Source @('test', $version.Tests, '-c', 'Release', '--no-build', '--no-restore', '--nologo',
-        '--filter', 'Category=MediaBenchmark', '--logger', 'console;verbosity=detailed', '--logger', "trx;LogFileName=$label-media.trx",
+        '--filter', 'Category=MediaBenchmark', '--logger', 'console;verbosity=detailed', '--logger', "trx;LogFileName=$label-media-$iteration.trx",
         '--results-directory', $results) $log
     $rows = @(Parse-MediaBenchmarkLog $log)
-    foreach ($container in 'mp4', 'webm', 'mkv') {
-        if (@($rows | Where-Object container -eq $container).Count -ne 1) {
-            throw "Could not read one $container remux result from $log."
-        }
+    $null = Test-MediaBenchmarkRows $rows $requireRawRuns
+    foreach ($row in $rows) {
+        $row | Add-Member -NotePropertyName invocation -NotePropertyValue $iteration
     }
     return $rows
 }
 
 function Parse-SegmentedBenchmarkLog([string]$path) {
     $rows = @()
-    $pattern = 'segmented-median:\s+protocol=(?<protocol>hls|dash);\s+samples=(?<samples>\d+) after one warm-up;\s+elapsed-ms=(?<elapsed>[0-9.]+);\s+media-bytes=(?<mediaBytes>\d+);\s+entity-bytes=(?<entityBytes>\d+);\s+output-bytes=(?<outputBytes>\d+);\s+managed-allocated-MiB=(?<allocated>[0-9.]+);\s+validation-ms=(?<validation>[0-9.]+);\s+requests=(?<requests>\d+)'
+    $runPattern = 'segmented:\s+protocol=(?<protocol>hls|dash);\s+run=(?<run>\d+);\s+elapsed-ms=(?<elapsed>[0-9.]+);\s+media-bytes=(?<mediaBytes>\d+);\s+entity-bytes=(?<entityBytes>\d+);\s+output-bytes=(?<outputBytes>\d+);\s+managed-allocated-MiB=(?<allocated>[0-9.]+);\s+validation-ms=(?<validation>[0-9.]+);\s+tracks=(?<tracks>\d+);\s+samples=(?<packetCount>\d+);\s+requests=(?<requests>\d+)'
+    $medianPattern = 'segmented-median:\s+protocol=(?<protocol>hls|dash);\s+samples=(?<timingSamples>\d+) after one warm-up;\s+elapsed-ms=(?<elapsed>[0-9.]+);\s+media-bytes=(?<mediaBytes>\d+);\s+entity-bytes=(?<entityBytes>\d+);\s+output-bytes=(?<outputBytes>\d+);\s+managed-allocated-MiB=(?<allocated>[0-9.]+);\s+validation-ms=(?<validation>[0-9.]+);\s+requests=(?<requests>\d+)'
     foreach ($line in Get-Content -LiteralPath $path) {
         $text = $line.Trim()
-        if ($text -notmatch $pattern) { continue }
-        $rows += [pscustomobject]@{
-            protocol = $Matches.protocol
-            samples = [int]$Matches.samples
-            elapsedMs = [double]$Matches.elapsed
-            mediaBytes = [long]$Matches.mediaBytes
-            entityBytes = [long]$Matches.entityBytes
-            outputBytes = [long]$Matches.outputBytes
-            allocatedMiB = [double]$Matches.allocated
-            validationMs = [double]$Matches.validation
-            requests = [int]$Matches.requests
+        if ($text -match $runPattern) {
+            $rows += [pscustomobject]@{
+                recordType = 'run'
+                protocol = $Matches.protocol
+                run = [int]$Matches.run
+                elapsedMs = [double]$Matches.elapsed
+                mediaBytes = [long]$Matches.mediaBytes
+                entityBytes = [long]$Matches.entityBytes
+                outputBytes = [long]$Matches.outputBytes
+                allocatedMiB = [double]$Matches.allocated
+                validationMs = [double]$Matches.validation
+                tracks = [int]$Matches.tracks
+                packetCount = [int]$Matches.packetCount
+                requests = [int]$Matches.requests
+            }
+            continue
+        }
+        if ($text -match $medianPattern) {
+            $rows += [pscustomobject]@{
+                recordType = 'median'
+                protocol = $Matches.protocol
+                timingSamples = [int]$Matches.timingSamples
+                warmupRuns = 1
+                elapsedMs = [double]$Matches.elapsed
+                mediaBytes = [long]$Matches.mediaBytes
+                entityBytes = [long]$Matches.entityBytes
+                outputBytes = [long]$Matches.outputBytes
+                allocatedMiB = [double]$Matches.allocated
+                validationMs = [double]$Matches.validation
+                requests = [int]$Matches.requests
+            }
         }
     }
     return $rows
@@ -324,8 +485,9 @@ function Measure-SegmentedBenchmarks([string]$label, $version) {
         '--results-directory', $results) $log
     $rows = @(Parse-SegmentedBenchmarkLog $log)
     foreach ($protocol in 'hls', 'dash') {
-        if (@($rows | Where-Object protocol -eq $protocol).Count -ne 1) {
-            throw "Could not read one $protocol segmented merge result from $log."
+        if (@($rows | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'median' }).Count -ne 1 -or
+            @($rows | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'run' }).Count -ne 4) {
+            throw "Could not read one $protocol segmented median and four raw run rows from $log."
         }
     }
     return $rows
@@ -405,16 +567,16 @@ try {
         throw 'A Release apphost was not produced.'
     }
 
-    $baselineStartup = @()
-    $currentStartup = @()
+    $baselineWindowHandleSamples = @()
+    $currentWindowHandleSamples = @()
     for ($i = 1; $i -le $Runs; $i++) {
         if ($i % 2) {
-            $baselineStartup += Measure-Startup 'baseline' $baseline $i
-            $currentStartup += Measure-Startup 'current' $current $i
+            $baselineWindowHandleSamples += Measure-WindowHandleAvailability 'baseline' $baseline $i
+            $currentWindowHandleSamples += Measure-WindowHandleAvailability 'current' $current $i
         }
         else {
-            $currentStartup += Measure-Startup 'current' $current $i
-            $baselineStartup += Measure-Startup 'baseline' $baseline $i
+            $currentWindowHandleSamples += Measure-WindowHandleAvailability 'current' $current $i
+            $baselineWindowHandleSamples += Measure-WindowHandleAvailability 'baseline' $baseline $i
         }
     }
 
@@ -436,8 +598,18 @@ try {
         }
     }
 
-    $baselineMedia = Measure-MediaBenchmarks 'baseline' $baseline
-    $currentMedia = Measure-MediaBenchmarks 'current' $current
+    $baselineMedia = @()
+    $currentMedia = @()
+    for ($i = 1; $i -le $MediaRuns; $i++) {
+        if ($i % 2) {
+            $baselineMedia += Measure-MediaBenchmarks 'baseline' $baseline $i $false
+            $currentMedia += Measure-MediaBenchmarks 'current' $current $i $true
+        }
+        else {
+            $currentMedia += Measure-MediaBenchmarks 'current' $current $i $true
+            $baselineMedia += Measure-MediaBenchmarks 'baseline' $baseline $i $false
+        }
+    }
     $baselineSegmentedMedia = Measure-SegmentedBenchmarks 'baseline' $baseline
     $currentSegmentedMedia = Measure-SegmentedBenchmarks 'current' $current
 
@@ -447,8 +619,10 @@ try {
         runtimeMode = 'Framework-dependent apphost using the installed .NET 10 runtime.'
         benchmarkDataDirectoryHook = 'Baseline and current processes used VESPER_TEST_DATA_DIRECTORY under the temporary benchmark directory.'
         machine = $machine
-        runs = $Runs
-        startupSamples = $baselineStartup
+        windowHandleRuns = $Runs
+        throughputRuns = $ThroughputRuns
+        mediaRuns = $MediaRuns
+        windowHandleAvailabilitySamples = $baselineWindowHandleSamples
         idle = $baselineIdle
         grid = $baselineGrid
         throughputSamples = $baselineThroughput
@@ -461,8 +635,10 @@ try {
         runtimeMode = 'Framework-dependent apphost using the installed .NET 10 runtime.'
         workingTreeDirty = $currentDirty
         machine = $machine
-        runs = $Runs
-        startupSamples = $currentStartup
+        windowHandleRuns = $Runs
+        throughputRuns = $ThroughputRuns
+        mediaRuns = $MediaRuns
+        windowHandleAvailabilitySamples = $currentWindowHandleSamples
         idle = $currentIdle
         grid = $currentGrid
         throughputSamples = $currentThroughput
@@ -470,30 +646,48 @@ try {
         mediaSamples = $currentMedia
         segmentedMergeSamples = $currentSegmentedMedia
     }
+    $baselineMediaRawRunRows = @($baselineMedia | Where-Object recordType -eq 'run')
+    $currentMediaRawRunRows = @($currentMedia | Where-Object recordType -eq 'run')
+    $baselineResult | Add-Member -NotePropertyName mediaRawSubRunsAvailable -NotePropertyValue ($baselineMediaRawRunRows.Count -gt 0)
+    $baselineResult | Add-Member -NotePropertyName mediaRawSubRunsStatus -NotePropertyValue $(
+        if ($baselineMediaRawRunRows.Count -gt 0) { 'Available: four rows per container per invocation.' }
+        else { 'Unavailable: baseline output contains no remux-run rows.' })
+    $baselineResult | Add-Member -NotePropertyName mediaRawSubRunRows -NotePropertyValue $baselineMediaRawRunRows
+    $currentResult | Add-Member -NotePropertyName mediaRawSubRunsAvailable -NotePropertyValue ($currentMediaRawRunRows.Count -gt 0)
+    $currentResult | Add-Member -NotePropertyName mediaRawSubRunsStatus -NotePropertyValue 'Available: four rows per container per invocation.'
+    $currentResult | Add-Member -NotePropertyName mediaRawSubRunRows -NotePropertyValue $currentMediaRawRunRows
     Write-Json (Join-Path $results 'baseline.json') $baselineResult
     Write-Json (Join-Path $results 'current.json') $currentResult
 
-    $baselineStartupMedian = Get-Median ([double[]]@($baselineStartup | ForEach-Object startupMs))
-    $currentStartupMedian = Get-Median ([double[]]@($currentStartup | ForEach-Object startupMs))
-    $startupAllowance = [Math]::Max(30, $baselineStartupMedian * 0.05)
-    $startup = [pscustomobject]@{
-        baselineMedianMs = [Math]::Round($baselineStartupMedian, 2)
-        currentMedianMs = [Math]::Round($currentStartupMedian, 2)
-        maximumAllowedRegressionMs = [Math]::Round($startupAllowance, 2)
-        passed = $currentStartupMedian -le $baselineStartupMedian + $startupAllowance
+    $baselineWindowHandleMedian = Get-Median ([double[]]@($baselineWindowHandleSamples | ForEach-Object windowHandleAvailableMs))
+    $currentWindowHandleMedian = Get-Median ([double[]]@($currentWindowHandleSamples | ForEach-Object windowHandleAvailableMs))
+    $windowHandleAllowance = [Math]::Max(30, $baselineWindowHandleMedian * 0.05)
+    $windowHandleAvailability = [pscustomobject]@{
+        baselineMedianMs = [Math]::Round($baselineWindowHandleMedian, 2)
+        currentMedianMs = [Math]::Round($currentWindowHandleMedian, 2)
+        maximumAllowedRegressionMs = [Math]::Round($windowHandleAllowance, 2)
+        passed = $currentWindowHandleMedian -le $baselineWindowHandleMedian + $windowHandleAllowance
     }
+    $drawLimitMs = Get-GridRegressionLimit $baselineGrid.GridDrawP95Ms
+    $scrollLimitMs = Get-GridRegressionLimit $baselineGrid.GridScrollP95Ms
+    $progressLimitMs = Get-GridRegressionLimit $baselineGrid.ProgressBatchP95Ms
     $grid = [pscustomobject]@{
         rows = $currentGrid.Rows
         baselineP95Ms = $baselineGrid.GridDrawP95Ms
         currentP95Ms = $currentGrid.GridDrawP95Ms
+        maximumDrawP95Ms = $drawLimitMs
         baselineScrollP95Ms = $baselineGrid.GridScrollP95Ms
         currentScrollP95Ms = $currentGrid.GridScrollP95Ms
+        maximumScrollP95Ms = $scrollLimitMs
         baselineProgressBatchP95Ms = $baselineGrid.ProgressBatchP95Ms
         currentProgressBatchP95Ms = $currentGrid.ProgressBatchP95Ms
-        maximumMs = 16.7
+        maximumProgressBatchP95Ms = $progressLimitMs
+        absoluteFrameBudgetMs = 16.7
         gdiChangeAfter20MainWindows = $currentGrid.GdiChangeAfter20MainWindows
-        passed = ($currentGrid.Rows -eq 10000 -and $currentGrid.GridDrawP95Ms -le 16.7 -and
-            $currentGrid.GridScrollP95Ms -le 16.7 -and $currentGrid.ProgressBatchP95Ms -le 16.7)
+        passed = ($currentGrid.Rows -eq 10000 -and
+            (Test-GridRegression $baselineGrid.GridDrawP95Ms $currentGrid.GridDrawP95Ms) -and
+            (Test-GridRegression $baselineGrid.GridScrollP95Ms $currentGrid.GridScrollP95Ms) -and
+            (Test-GridRegression $baselineGrid.ProgressBatchP95Ms $currentGrid.ProgressBatchP95Ms))
     }
     $throughput = foreach ($connections in 1, 4) {
         $baseMedian = Get-Median ([double[]]@($baselineThroughput | Where-Object connections -eq $connections | ForEach-Object mibPerSecond))
@@ -534,6 +728,7 @@ try {
         maximumRegressionMiB = 12
         passed = $memoryRegression -le 12
     }
+    $idleCpu = Get-IdleCpuGate $baselineIdle.idleCpuPercent $currentIdle.idleCpuPercent
     $baselineQueueSamples = @($baselineThroughput | Where-Object itemsPerSecond -gt 0)
     $currentQueueSamples = @($currentThroughput | Where-Object itemsPerSecond -gt 0)
     $queue = $null
@@ -558,39 +753,104 @@ try {
         }
     }
     $mediaProcessing = foreach ($container in 'mp4', 'webm', 'mkv') {
-        $base = $baselineMedia | Where-Object container -eq $container
-        $currentResultForContainer = $currentMedia | Where-Object container -eq $container
+        $baseRows = @($baselineMedia | Where-Object { $_.container -eq $container -and $_.recordType -eq 'median' })
+        $currentRows = @($currentMedia | Where-Object { $_.container -eq $container -and $_.recordType -eq 'median' })
+        $baseSubRunRows = @($baselineMedia | Where-Object { $_.container -eq $container -and $_.recordType -eq 'run' })
+        $currentSubRunRows = @($currentMedia | Where-Object { $_.container -eq $container -and $_.recordType -eq 'run' })
+        if ($baseRows.Count -ne $MediaRuns -or $currentRows.Count -ne $MediaRuns) {
+            throw "Expected $MediaRuns raw $container benchmark rows for both revisions."
+        }
+        if (($currentSubRunRows.Count -ne $MediaRuns * 4) -or
+            ($baseSubRunRows.Count -ne 0 -and $baseSubRunRows.Count -ne $MediaRuns * 4)) {
+            throw "Expected four current $container raw rows per invocation; baseline raw rows must be complete or unavailable."
+        }
+        $baseMergeMedian = Get-MedianProperty $baseRows 'mergeMedianMs'
+        $currentMergeMedian = Get-MedianProperty $currentRows 'mergeMedianMs'
+        $baseValidationMedian = Get-MedianProperty $baseRows 'validationMedianMs'
+        $currentValidationMedian = Get-MedianProperty $currentRows 'validationMedianMs'
+        $baseMergeAllocationMedian = Get-MedianProperty $baseRows 'mergeAllocatedMiB'
+        $currentMergeAllocationMedian = Get-MedianProperty $currentRows 'mergeAllocatedMiB'
+        $baseValidationAllocationMedian = Get-MedianProperty $baseRows 'validationAllocatedMiB'
+        $currentValidationAllocationMedian = Get-MedianProperty $currentRows 'validationAllocatedMiB'
+        $basePeakGrowthMax = [double](($baseRows | Measure-Object -Property peakWorkingSetGrowthMiB -Maximum).Maximum)
+        $currentPeakGrowthMax = [double](($currentRows | Measure-Object -Property peakWorkingSetGrowthMiB -Maximum).Maximum)
+        $mergeTimeRatio = $currentMergeMedian / $baseMergeMedian
+        $validationTimeRatio = $currentValidationMedian / $baseValidationMedian
+        $mergeAllocationRatio = $currentMergeAllocationMedian / $baseMergeAllocationMedian
+        $validationAllocationRatio = $currentValidationAllocationMedian / $baseValidationAllocationMedian
+        $peakWorkingSetRegressionMiB = $currentPeakGrowthMax - $basePeakGrowthMax
+        $maximumPeakWorkingSetRegressionMiB = [Math]::Max(1, $basePeakGrowthMax * 0.05)
         [pscustomobject]@{
             container = $container
-            durationSeconds = $base.durationSeconds
-            outputBytes = $base.outputBytes
-            baselineMergeMedianMs = $base.mergeMedianMs
-            currentMergeMedianMs = $currentResultForContainer.mergeMedianMs
-            mergeTimeRatio = [Math]::Round($currentResultForContainer.mergeMedianMs / $base.mergeMedianMs, 4)
-            baselineMiBPerSecond = $base.mergeMiBPerSecond
-            currentMiBPerSecond = $currentResultForContainer.mergeMiBPerSecond
-            baselineAllocatedMiB = $base.mergeAllocatedMiB
-            currentAllocatedMiB = $currentResultForContainer.mergeAllocatedMiB
-            baselinePeakWorkingSetGrowthMiB = $base.peakWorkingSetGrowthMiB
-            currentPeakWorkingSetGrowthMiB = $currentResultForContainer.peakWorkingSetGrowthMiB
-            validationMedianMs = $currentResultForContainer.validationMedianMs
+            durationSeconds = $baseRows[0].durationSeconds
+            outputBytes = $baseRows[0].outputBytes
+            baselineTimingRuns = $baseRows.Count
+            currentTimingRuns = $currentRows.Count
+            baselineMergeMedianMs = $baseMergeMedian
+            currentMergeMedianMs = $currentMergeMedian
+            mergeTimeRatio = [Math]::Round($mergeTimeRatio, 4)
+            validationTimeRatio = [Math]::Round($validationTimeRatio, 4)
+            baselineMiBPerSecond = Get-MedianProperty $baseRows 'mergeMiBPerSecond'
+            currentMiBPerSecond = Get-MedianProperty $currentRows 'mergeMiBPerSecond'
+            baselineAllocatedMiB = $baseMergeAllocationMedian
+            currentAllocatedMiB = $currentMergeAllocationMedian
+            mergeAllocationRatio = [Math]::Round($mergeAllocationRatio, 4)
+            baselineValidationAllocatedMiB = $baseValidationAllocationMedian
+            currentValidationAllocatedMiB = $currentValidationAllocationMedian
+            validationAllocationRatio = [Math]::Round($validationAllocationRatio, 4)
+            baselinePeakWorkingSetGrowthMiB = $basePeakGrowthMax
+            currentPeakWorkingSetGrowthMiB = $currentPeakGrowthMax
+            peakWorkingSetRegressionMiB = [Math]::Round($peakWorkingSetRegressionMiB, 2)
+            maximumPeakWorkingSetRegressionMiB = [Math]::Round($maximumPeakWorkingSetRegressionMiB, 2)
+            baselineValidationMedianMs = $baseValidationMedian
+            currentValidationMedianMs = $currentValidationMedian
+            maximumRegressionRatio = 1.05
+            baselineInvocationRows = $baseRows
+            currentInvocationRows = $currentRows
+            baselineSubRunRows = $baseSubRunRows
+            currentSubRunRows = $currentSubRunRows
+            baselineSubRunsAvailable = $baseSubRunRows.Count -gt 0
+            passed = (Test-WithinRegressionLimit $baseMergeMedian $currentMergeMedian) -and
+                (Test-WithinRegressionLimit $baseValidationMedian $currentValidationMedian) -and
+                (Test-WithinRegressionLimit $baseMergeAllocationMedian $currentMergeAllocationMedian) -and
+                (Test-WithinRegressionLimit $baseValidationAllocationMedian $currentValidationAllocationMedian) -and
+                $peakWorkingSetRegressionMiB -le $maximumPeakWorkingSetRegressionMiB
         }
     }
     $segmentedMerges = foreach ($protocol in 'hls', 'dash') {
-        $base = $baselineSegmentedMedia | Where-Object protocol -eq $protocol
-        $currentResultForProtocol = $currentSegmentedMedia | Where-Object protocol -eq $protocol
+        $base = @($baselineSegmentedMedia | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'median' })
+        $currentResultForProtocol = @($currentSegmentedMedia | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'median' })
+        $baseRuns = @($baselineSegmentedMedia | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'run' } | Sort-Object run)
+        $currentRuns = @($currentSegmentedMedia | Where-Object { $_.protocol -eq $protocol -and $_.recordType -eq 'run' } | Sort-Object run)
+        if ($base.Count -ne 1 -or $currentResultForProtocol.Count -ne 1 -or $baseRuns.Count -ne 4 -or $currentRuns.Count -ne 4) {
+            throw "Expected one $protocol median and four raw run rows for both revisions."
+        }
+        $base = $base[0]
+        $currentResultForProtocol = $currentResultForProtocol[0]
+        $elapsedRatio = $currentResultForProtocol.elapsedMs / $base.elapsedMs
+        $allocationRatio = $currentResultForProtocol.allocatedMiB / $base.allocatedMiB
+        $validationRatio = $currentResultForProtocol.validationMs / $base.validationMs
         [pscustomobject]@{
             protocol = $protocol
             mediaBytes = $base.mediaBytes
             outputBytes = $base.outputBytes
             requests = $base.requests
+            timingSamples = $base.timingSamples
             baselineMedianMs = $base.elapsedMs
             currentMedianMs = $currentResultForProtocol.elapsedMs
-            elapsedRatio = [Math]::Round($currentResultForProtocol.elapsedMs / $base.elapsedMs, 4)
+            elapsedRatio = [Math]::Round($elapsedRatio, 4)
             baselineAllocatedMiB = $base.allocatedMiB
             currentAllocatedMiB = $currentResultForProtocol.allocatedMiB
+            allocationRatio = [Math]::Round($allocationRatio, 4)
             baselineValidationMs = $base.validationMs
             currentValidationMs = $currentResultForProtocol.validationMs
+            validationRatio = [Math]::Round($validationRatio, 4)
+            maximumRegressionRatio = 1.05
+            baselineRunRows = $baseRuns
+            currentRunRows = $currentRuns
+            passed = (Test-WithinRegressionLimit $base.elapsedMs $currentResultForProtocol.elapsedMs) -and
+                (Test-WithinRegressionLimit $base.allocatedMiB $currentResultForProtocol.allocatedMiB) -and
+                (Test-WithinRegressionLimit $base.validationMs $currentResultForProtocol.validationMs)
         }
     }
     $comparison = [pscustomobject]@{
@@ -600,31 +860,52 @@ try {
         currentWorkingTreeDirty = $currentDirty
         machine = $machine
         thresholds = [pscustomobject]@{
-            startup = 'Current median <= baseline median + max(5% of baseline, 30 ms).'
-            gridPaint = '10,000 rows; draw, scroll and 3-row progress-batch p95 <= 16.7 ms.'
+            windowHandleAvailability = 'Time until the top-level window handle exists; current median <= baseline median + max(5% of baseline, 30 ms). This is not first paint.'
+            gridPaint = '10,000 rows; each draw, scroll and 3-row progress-batch p95 <= min(16.7 ms, baseline + max(1 ms, 15% of baseline)).'
             throughput = 'Current median >= 95% of baseline for 1 and 4 connections.'
             smallDirectLatency = '16 KiB direct download median <= 105% of baseline.'
             queue = '2,000 queued items; elapsed time and allocations <= 105% of baseline.'
             privateMemory = 'Current idle median <= baseline median + 12 MiB.'
+            idleCpu = 'Current idle CPU <= min(0.1%, baseline + 0.05 percentage points).'
+            mediaProcessing = 'Five alternating invocations per revision; compare median invocation summaries (each is median-of-three after one warm-up); merge/validation time and allocations <= 105%, peak working-set growth <= baseline + max(1 MiB, 5%).'
+            segmentedMerges = 'For HLS and DASH, median merge and validation time and allocations <= 105% of baseline.'
         }
         gates = [pscustomobject]@{
-            startup = $startup
+            windowHandleAvailability = $windowHandleAvailability
             gridPaint = $grid
             throughput = @($throughput)
             smallDirectLatency = $smallTransfer
             queue = $queue
             privateMemory = $memory
+            idleCpu = $idleCpu
             mediaProcessing = @($mediaProcessing)
             segmentedMerges = @($segmentedMerges)
         }
-        passed = $startup.passed -and $grid.passed -and $memory.passed -and $smallTransfer.passed -and $queue.passed `
-            -and @($throughput | Where-Object { -not $_.passed }).Count -eq 0
+        measurementComparisonPassed = Test-ComparisonPasses -windowHandleAvailability $windowHandleAvailability `
+            -grid $grid -idleCpu $idleCpu -throughput @($throughput) `
+            -smallTransfer $smallTransfer -queue $queue -memory $memory `
+            -mediaProcessing @($mediaProcessing) -segmentedMerges @($segmentedMerges) `
+            -currentTreeClean (-not $currentDirty)
+        firstPaint = [pscustomobject]@{
+            supported = $false
+            status = 'Not measured. The window-handle timestamp is not a first-paint timestamp.'
+        }
+        q6Passed = $false
+        q6Status = 'INCOMPLETE: this script cannot establish Q6 completion.'
+        q6OpenMeasurements = @(
+            'Cold-start first painted content, which requires app instrumentation or a separate capture harness.',
+            'An 8-hour resource slope.',
+            'Real device and codec conversion time, peak memory, and playback.',
+            'Chrome background wake behavior.',
+            'Matched real-network comparisons and competitor runs before making superiority claims.'
+        )
         rawResults = $results
     }
     Write-Json (Join-Path $results 'comparison.json') $comparison
     Write-Host (ConvertTo-Json -InputObject $comparison -Depth 8)
-    Write-Host "Raw samples: $results"
-    if (-not $comparison.passed) { exit 1 }
+    Write-Host "Raw results: $results"
+    if ($currentDirty) { Write-Host 'The working tree was dirty; this run cannot produce an authoritative comparison pass.' }
+    if (-not $comparison.measurementComparisonPassed) { exit 1 }
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

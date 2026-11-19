@@ -4,13 +4,13 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-dotnet test tests/Vesper.Tests -c Release --nologo --logger "trx;LogFileName=vesper-tests.trx" --results-directory release\test-results
+dotnet test tests/Vesper.Tests/Vesper.Tests.csproj -c Release --nologo --logger "trx;LogFileName=vesper-tests.trx" --results-directory release\test-results
 $dotnet = $LASTEXITCODE
-dotnet test tests/Vesper.MediaResolver.Tests -c Release --nologo --logger "trx;LogFileName=vesper-media-tests.trx" --results-directory release\test-results
+dotnet test tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj -c Release --nologo --logger "trx;LogFileName=vesper-media-tests.trx" --results-directory release\test-results
 $mediaDotnet = $LASTEXITCODE
-dotnet test tests/Vesper.Setup.Tests -c Release --nologo --logger "trx;LogFileName=vesper-setup-tests.trx" --results-directory release\test-results
+dotnet test tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj -c Release --nologo --logger "trx;LogFileName=vesper-setup-tests.trx" --results-directory release\test-results
 $setupDotnet = $LASTEXITCODE
-dotnet test tests/Vesper.Windows.Tests -c Release --nologo --logger "trx;LogFileName=vesper-windows-tests.trx" --results-directory release\test-results
+dotnet test tests/Vesper.Windows.Tests/Vesper.Windows.Tests.csproj -c Release --nologo --logger "trx;LogFileName=vesper-windows-tests.trx" --results-directory release\test-results
 $windowsDotnet = $LASTEXITCODE
 if (Get-Command node -ErrorAction SilentlyContinue) {
     $testFiles = @(Get-ChildItem (Join-Path $root 'tests/extension') -Filter '*.test.mjs' -File | ForEach-Object FullName)

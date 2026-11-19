@@ -2,13 +2,15 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using VESPER;
+using Vesper.Shared;
 
 namespace Vesper.Setup;
 
 internal static class Program
 {
-    private const string AppMutex = @"Local\VESPER.SingleInstance";
     private const uint SpiGetClientAreaAnimation = 0x1042;
+
+    internal static string InstanceMutexName => WindowsObjectNames.LocalNameForCurrentUser("VESPER.SingleInstance");
 
     [STAThread]
     private static void Main(string[] args)
@@ -29,9 +31,9 @@ internal static class Program
             VesperPalette palette = UiKit.Palette(UiKit.IsSystemDark(), botanical: true);
             VesperWindowChrome.ApplyNativeColors(palette);
             var transaction = new InstallTransaction(paths, new WindowsInstallRegistration(paths), AcquireAppLock);
-            using var window = new SetupWindow(mode, paths, palette, (progress, ct) =>
+            using var window = new SetupWindow(mode, paths, palette, (progress, ct, deleteUserData) =>
             {
-                if (mode == SetupMode.Uninstall) transaction.Run(mode, null, null, progress, ct);
+                if (mode == SetupMode.Uninstall) transaction.Run(mode, null, null, progress, ct, deleteUserData);
                 else
                 {
                     using var package = InstallPayload.Resource("Vesper.Setup.Payload.zip");
@@ -48,7 +50,7 @@ internal static class Program
 
     private static IDisposable AcquireAppLock()
     {
-        var mutex = new Mutex(true, AppMutex, out bool acquired);
+        var mutex = new Mutex(true, InstanceMutexName, out bool acquired);
         if (acquired) return new AppLock(mutex);
         mutex.Dispose();
         throw new IOException("Exit VESPER from its tray menu, then try again.");

@@ -36,7 +36,8 @@ public sealed record AddRequest(
     string? MediaFormatId = null,
     MediaOutput Output = MediaOutput.Original,
     BrowserTransferProof? BrowserProof = null,
-    string? MediaMetadataJson = null);
+    string? MediaMetadataJson = null,
+    bool InitiallyPaused = false);
 
 public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
 {
@@ -45,6 +46,26 @@ public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
 
 public sealed record RemoveResult(bool Removed, string Message, string? RetainedPartialPath);
 public sealed record DeleteResult(bool Deleted, string Message, string? Path);
+public sealed record OpenCompletedFileResult(CompletedFileOpenLease? Lease, string Message);
+
+/// <summary>Keeps the verified completed file at its saved path through the shell handoff.</summary>
+public sealed class CompletedFileOpenLease : IDisposable
+{
+    private readonly FileStream _file;
+    private Action? _release;
+
+    internal CompletedFileOpenLease(FileStream file, Action release)
+    {
+        _file = file;
+        _release = release;
+    }
+
+    public void Dispose()
+    {
+        try { _file.Dispose(); }
+        finally { Interlocked.Exchange(ref _release, null)?.Invoke(); }
+    }
+}
 
 public sealed partial class DownloadEngine
 {
@@ -54,8 +75,9 @@ public sealed partial class DownloadEngine
 
     public AddResult Add(AddRequest request)
     {
-        AddResult result = AddCore(request);
-        FlushOutbox();
+        AddResult result;
+        try { result = AddCore(request); }
+        finally { FlushOutbox(); }
         if (result.Status == AddStatus.Added) ScheduleNext();
         return result;
     }
@@ -173,6 +195,15 @@ public sealed partial class DownloadEngine
             if (existing is not null)
                 return new AddResult(AddStatus.Duplicate, existing.Id, $"This link is already in your list ({existing.FileName}).");
 
+            if (_jobs.Count > 0)
+            {
+                long boundary = request.StartNow
+                    ? _jobs.Values.Min(j => j.QueueOrder)
+                    : _jobs.Values.Max(j => j.QueueOrder);
+                if (request.StartNow ? boundary == long.MinValue : boundary == long.MaxValue)
+                    RebaseQueueOrdersLocked();
+            }
+
             var id = Guid.NewGuid();
             string partialName = FileNames.Sanitize(name) + "." + id.ToString("N")[..8] + ".vpart";
             long order = _jobs.Count == 0 ? 0 : request.StartNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : _jobs.Values.Max(j => j.QueueOrder) + 1;
@@ -180,7 +211,8 @@ public sealed partial class DownloadEngine
             var job = new DownloadJob
             {
                 Id = id, Kind = request.Kind, SourceUrl = uri.AbsoluteUri, FileName = name, NameLocked = request.FileName is { Length: > 0 },
-                DestinationFolder = folder, PartialPath = Path.Combine(folder, partialName), State = JobState.Queued,
+                DestinationFolder = folder, PartialPath = Path.Combine(folder, partialName),
+                State = request.InitiallyPaused ? JobState.Paused : JobState.Queued,
                 Priority = request.Priority, QueueOrder = order, Category = category, Referer = request.Referer, UserAgent = request.UserAgent,
                 ExpectedSha256 = expected, PieceMapJson = request.PieceMapJson, MediaState = request.MediaState,
                 OriginalPageUrl = originalPage,
@@ -319,6 +351,8 @@ public sealed partial class DownloadEngine
             else
             {
                 if (job.State is JobState.Completed or JobState.Suspect or JobState.Verifying or JobState.Finalizing or JobState.Converting) return;
+                if (startNow && _jobs.Values.Min(j => j.QueueOrder) == long.MinValue)
+                    RebaseQueueOrdersLocked();
                 long queueOrder = startNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : job.QueueOrder;
                 PersistUiMutationLocked(job, pending =>
                 {
@@ -335,6 +369,27 @@ public sealed partial class DownloadEngine
             Changed(job);
         }
         ScheduleNext();
+    }
+
+    // Leave room at both ends so adding or starting a job cannot wrap a signed queue order.
+    // The store commits the whole rebase before any live job is changed.
+    private void RebaseQueueOrdersLocked()
+    {
+        DownloadJob[] ordered = [.. _jobs.Values.OrderBy(j => j.QueueOrder)];
+        var changes = new (Guid JobId, long Order)[ordered.Length];
+        for (int i = 0; i < ordered.Length; i++) changes[i] = (ordered[i].Id, i);
+
+        try { _store.SaveQueueOrders(changes); }
+        catch (SqliteException ex)
+        {
+            throw new LocalStorageException("The queue order could not be saved: " + ex.Message, ex);
+        }
+
+        for (int i = 0; i < ordered.Length; i++)
+        {
+            ordered[i].QueueOrder = changes[i].Order;
+            Changed(ordered[i]);
+        }
     }
 
     public void PauseAll()
@@ -378,7 +433,7 @@ public sealed partial class DownloadEngine
         FlushOutbox();
     }
 
-    /// <summary>Call after changing <see cref="Options"/>. Applies limits and re-evaluates the queue; running transfers are not disturbed.</summary>
+    /// <summary>Call after changing <see cref="Options"/>. Applies limits and re-evaluates the queue; network policy may checkpoint running work.</summary>
     public void SettingsChanged()
     {
         GlobalLimiter.SetRate(Options.GlobalLimitBytesPerSecond);
@@ -525,6 +580,7 @@ public sealed partial class DownloadEngine
                 DownloadJob reset = job.CopyForUpdate();
                 reset.Extents = new ExtentSet();
                 reset.PartialIdentity = null;
+                reset.FinalResourceIdentity = null;
                 reset.TotalBytes = reset.PieceMapJson is not null
                     && PieceMap.TryParse(reset.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null;
                 (reset.ETag, reset.LastModified, reset.Identity, reset.AcceptsRanges, reset.NonResumable) =
@@ -566,6 +622,122 @@ public sealed partial class DownloadEngine
         string.IsNullOrWhiteSpace(path)
             ? Task.FromResult(new DeleteResult(false, "Choose the file to locate.", path))
             : ChangeCompletedFileAsync(id, path, remove: null, confirmedPath: null);
+
+    public async Task<OpenCompletedFileResult> OpenCompletedFileAsync(Guid id, string? confirmedPath,
+        CancellationToken ct = default)
+    {
+        string path;
+        string digest;
+        string? savedIdentity;
+        long length;
+        lock (_lock)
+        {
+            if (_disposed) return new(null, "VESPER is closing.");
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || job.State != JobState.Completed || job.FinalPath is null)
+                return new(null, "This entry has no completed file to open.");
+            if (job.Kind == JobKind.BrowserFile)
+                return new(null, "This file is owned by Chrome. Open it from Chrome downloads.");
+            if (!SameCompletedPath(job.FinalPath, confirmedPath))
+                return new(null, "The file location changed. Open the action again to confirm the current file.");
+            if (job.PublishedSha256 is not { Length: 64 } proof || job.TotalBytes is not long bytes || bytes < 0)
+                return new(null, "VESPER has no saved file proof for this entry. Manage it in File Explorer.");
+            if (!_completedFileActions.Add(id))
+                return new(null, "Another file action is in progress for this entry.");
+
+            path = job.FinalPath;
+            digest = proof;
+            savedIdentity = job.PublishedFileIdentity;
+            length = bytes;
+        }
+
+        FileStream? file = null;
+        bool keepAction = false;
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!Path.IsPathFullyQualified(path))
+                return new(null, "The saved file path is not valid.");
+            path = Path.GetFullPath(path);
+            if (!IsSafeCompletedPath(path, length))
+                return new(null, "The saved file is missing, changed size, or uses an unsafe path.");
+
+            file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Write, 1 << 16,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            if (file.Length != length)
+                return new(null, "The saved file no longer matches the completed download.");
+
+            string? currentIdentity = TryGetPublishedFileIdentity(file.SafeFileHandle);
+            if (OperatingSystem.IsWindows() && currentIdentity is null)
+                return new(null, "VESPER could not verify this file's saved Windows identity. Check it in File Explorer.");
+
+            if (savedIdentity is not null)
+            {
+                if (currentIdentity is null)
+                    return new(null, "VESPER could not verify the file's saved identity. Check it in File Explorer.");
+                if (!string.Equals(savedIdentity, currentIdentity, StringComparison.Ordinal))
+                    return new(null, "A different file now occupies the saved path. The entry was kept unchanged.");
+            }
+            else
+            {
+                file.Position = 0;
+                string currentDigest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
+                if (!currentDigest.Equals(digest, StringComparison.OrdinalIgnoreCase))
+                    return new(null, "The saved file does not match the completed download. The entry was kept unchanged.");
+                file.Position = 0;
+
+                if (currentIdentity is not null)
+                {
+                    lock (_lock)
+                    {
+                        if (_disposed || !_jobs.TryGetValue(id, out DownloadJob? currentJob)
+                            || currentJob.State != JobState.Completed || !SameCompletedPath(currentJob.FinalPath, path))
+                            return new(null, "The completed entry changed while VESPER checked the file.");
+                        if (currentJob.PublishedFileIdentity is not null
+                            && !string.Equals(currentJob.PublishedFileIdentity, currentIdentity, StringComparison.Ordinal))
+                            return new(null, "A different file now occupies the saved path. The entry was kept unchanged.");
+
+                        PersistUiMutationLocked(currentJob, pending => pending.PublishedFileIdentity = currentIdentity);
+                        Changed(currentJob);
+                    }
+                    FlushOutbox();
+                }
+            }
+
+            if (!IsSafeCompletedPath(path, length) || !PathSafety.PathStillNamesFile(path, file, digest))
+                return new(null, "VESPER could not confirm the saved file path. Check it in File Explorer.");
+
+            lock (_lock)
+            {
+                if (_disposed || !_jobs.TryGetValue(id, out DownloadJob? currentJob)
+                    || currentJob.State != JobState.Completed || !SameCompletedPath(currentJob.FinalPath, path)
+                    || !_completedFileActions.Contains(id))
+                    return new(null, "The completed entry changed while VESPER checked the file.");
+            }
+
+            var lease = new CompletedFileOpenLease(file, () => ReleaseCompletedFileAction(id));
+            file = null;
+            keepAction = true;
+            return new(lease, "");
+        }
+        catch (OperationCanceledException)
+        {
+            return new(null, "Opening the completed file was cancelled.");
+        }
+        catch (LocalStorageException ex)
+        {
+            return new(null, "VESPER could not save the file identity: " + ex.Message);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or System.Security.SecurityException)
+        {
+            return new(null, "VESPER could not safely open this file: " + ex.Message);
+        }
+        finally
+        {
+            file?.Dispose();
+            if (!keepAction) ReleaseCompletedFileAction(id);
+        }
+    }
 
     private async Task<DeleteResult> ChangeCompletedFileAsync(Guid id, string? locatePath, Action<string>? remove, string? confirmedPath)
     {
@@ -616,11 +788,16 @@ public sealed partial class DownloadEngine
 
             if (!deleting)
             {
+                string? fileIdentity = TryGetPublishedFileIdentity(file.SafeFileHandle);
                 lock (_lock)
                 {
                     if (_disposed) return new(false, "VESPER is closing.", path);
                     DownloadJob job = _jobs[id];
-                    PersistUiMutationLocked(job, pending => pending.FinalPath = path);
+                    PersistUiMutationLocked(job, pending =>
+                    {
+                        pending.FinalPath = path;
+                        pending.PublishedFileIdentity = fileIdentity;
+                    });
                     _missing.Remove(id);
                     Changed(job);
                 }
@@ -660,6 +837,25 @@ public sealed partial class DownloadEngine
         && Path.GetDirectoryName(path) is { } folder && PathSafety.TryCheckUnlinkedDirectory(folder, out _)
         && PathSafety.Inspect(path) is { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false } file
         && file.Length == length;
+
+    private static bool SameCompletedPath(string? savedPath, string? confirmedPath)
+    {
+        if (string.IsNullOrWhiteSpace(savedPath) || string.IsNullOrWhiteSpace(confirmedPath)) return false;
+        try
+        {
+            StringComparison comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return string.Equals(Path.GetFullPath(savedPath), Path.GetFullPath(confirmedPath), comparison);
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private void ReleaseCompletedFileAction(Guid id)
+    {
+        lock (_lock) _completedFileActions.Remove(id);
+    }
 
     // ---- helpers --------------------------------------------------------------------------------------------------------
 

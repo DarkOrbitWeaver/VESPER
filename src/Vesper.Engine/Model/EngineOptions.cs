@@ -4,6 +4,8 @@ namespace Vesper.Engine;
 
 public enum ProxyMode { Direct, System, Custom }
 
+internal enum NetworkCostStatus { Unknown, Unmetered, Metered }
+
 public sealed class RetryOptions
 {
     public TimeSpan BaseDelay { get; init; } = TimeSpan.FromSeconds(2);
@@ -50,6 +52,8 @@ public sealed class EngineOptions
     public string FileNameTemplate { get; set; } = "";
     public SchedulePolicy Schedule { get; set; } = SchedulePolicy.Always;
     public bool PreventSleepWhileActive { get; set; }
+    public bool PauseOnMeteredNetwork { get; set; }
+    internal Func<NetworkCostStatus>? NetworkCostProvider { get; set; }
 
     /// <summary>Loopback/private targets are blocked unless the user explicitly allows them.</summary>
     public bool AllowPrivateNetworks { get; init; }

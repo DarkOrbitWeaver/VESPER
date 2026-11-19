@@ -65,6 +65,11 @@ public sealed class MediaMergeTests
             DefaultDurationNs = source.DefaultDurationNs,
             Language = source.Language,
             EditMediaTime = source.EditMediaTime,
+            EditMovieTimescale = source.EditMovieTimescale,
+            EditList = source.EditList?.Select(edit => edit with
+            {
+                SegmentDuration = checked(edit.SegmentDuration * (ulong)count)
+            }).ToList(),
             Samples = new List<TrackSample>(checked(source.Samples.Count * count))
         };
         long duration = source.DurationTicks;
@@ -309,6 +314,7 @@ public sealed class MediaMergeTests
         var peakGrowth = new List<double>();
         long outputBytes = 0;
         double outputDuration = 0;
+        int packetCount = inputs.Sum(input => input.Track.Samples.Count);
 
         for (int run = 0; run < 4; run++)
         {
@@ -319,10 +325,12 @@ public sealed class MediaMergeTests
             var mergeWatch = Stopwatch.StartNew();
             string outputPath = Path.Combine(outputFolder, $"{container}-{run}.media");
             long mergeAllocatedBytes = 0;
+            double validationAllocatedMiB = 0;
+            double validationMs = 0;
             long peak = await MeasurePeakWorkingSet(() =>
             {
                 using var output = new FileStream(outputPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 16,
-                    FileOptions.SequentialScan);
+                    FileOptions.None);
                 MergeResult result = MediaMerger.Merge(inputs, container, output, default);
                 output.Flush(flushToDisk: true);
                 outputBytes = result.Bytes;
@@ -332,14 +340,22 @@ public sealed class MediaMergeTests
 
                 long validationAllocatedBytes = GC.GetTotalAllocatedBytes(precise: true);
                 var validationWatch = Stopwatch.StartNew();
-                MediaMerger.Validate(output, output.Length, inputs.Select(input => input.Track).ToArray(), default);
+                MediaMerger.ValidateRemux(output, output.Length, inputs, default);
                 validationWatch.Stop();
-                validationAllocations.Add((GC.GetTotalAllocatedBytes(precise: true) - validationAllocatedBytes) / (1024.0 * 1024.0));
-                validationTimes.Add(validationWatch.Elapsed.TotalMilliseconds);
+                validationAllocatedMiB = (GC.GetTotalAllocatedBytes(precise: true) - validationAllocatedBytes) / (1024.0 * 1024.0);
+                validationMs = validationWatch.Elapsed.TotalMilliseconds;
+                validationAllocations.Add(validationAllocatedMiB);
+                validationTimes.Add(validationMs);
             });
-            mergeTimes.Add(mergeWatch.Elapsed.TotalMilliseconds);
-            mergeAllocations.Add(mergeAllocatedBytes / (1024.0 * 1024.0));
-            peakGrowth.Add(peak / (1024.0 * 1024.0));
+            double mergeMs = mergeWatch.Elapsed.TotalMilliseconds;
+            double mergeAllocatedMiB = mergeAllocatedBytes / (1024.0 * 1024.0);
+            double peakGrowthMiB = peak / (1024.0 * 1024.0);
+            double throughputMiBs = outputBytes / (1024.0 * 1024.0) / (mergeMs / 1000.0);
+            mergeTimes.Add(mergeMs);
+            mergeAllocations.Add(mergeAllocatedMiB);
+            peakGrowth.Add(peakGrowthMiB);
+            _output.WriteLine(FormattableString.Invariant(
+                $"remux-run: container={container}; run={run}; warmup={(run == 0 ? "true" : "false")}; merge-ms={mergeMs:0.###}; validation-ms={validationMs:0.###}; merge-allocated-MiB={mergeAllocatedMiB:0.###}; validation-allocated-MiB={validationAllocatedMiB:0.###}; throughput-MiB-s={throughputMiBs:0.###}; peak-working-set-growth-MiB={peakGrowthMiB:0.###}; packets={packetCount}; output-bytes={outputBytes}"));
             File.Delete(outputPath);
         }
 
@@ -915,8 +931,135 @@ public sealed class MediaMergeTests
         {
             Subtitles = [subtitle with { Format = "imsc1" }]
         }, preferences);
-        Assert.Null(unsupported.Choice);
-        Assert.Contains("transport or format", unsupported.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(unsupported.Error);
+        Assert.Equal(JobKind.Http, unsupported.Choice!.Kind);
+        Assert.Contains("unsupported", unsupported.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(MediaTransferBridge.ExpandSubtitleChoices([unsupported.Choice]));
+    }
+
+    [Fact]
+    public void MediaTransferBridge_EmbedsOnlyOnOptInAndKeepsSelectedSubtitleSidecars()
+    {
+        var stream = new MediaRepresentation
+        {
+            Id = "muxed", Url = new Uri("https://cdn.example.com/video.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            FileSize = 8_000_000, ContentIdentity = "video-etag-and-size"
+        };
+        var english = new SubtitleTrack(new Uri("https://cdn.example.com/captions/en.srt"), "en", "English", "srt");
+        var french = new SubtitleTrack(new Uri("https://cdn.example.com/captions/fr.vtt"), "fr", "French", "vtt");
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "test", MediaId = "one",
+            Title = "One", Representations = [stream], Subtitles = [english, french]
+        };
+        FormatPreferences preferences = FormatPreferences.BestQuality with { SubtitleLanguages = ["en", "fr"] };
+
+        var defaultChoice = MediaTransferBridge.Prepare(item, preferences);
+        Assert.Null(defaultChoice.Error);
+        Assert.Equal(JobKind.Http, defaultChoice.Choice!.Kind);
+        Assert.False(MediaMergePlan.TryParse(defaultChoice.Choice.MediaPlanJson, false, out _, out _));
+
+        var optedIn = MediaTransferBridge.Prepare(item, preferences with { EmbedSubtitles = true });
+        Assert.Null(optedIn.Error);
+        Assert.Equal(JobKind.Merge, optedIn.Choice!.Kind);
+        Assert.Equal(2, optedIn.Choice.EmbeddedSubtitleCount);
+        Assert.True(MediaMergePlan.TryParse(optedIn.Choice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.Equal("mp4", plan.OutputContainer);
+        Assert.Equal("muxed", Assert.Single(plan.Tracks).Role);
+        Assert.Collection(plan.Subtitles,
+            subtitle => { Assert.Equal(english.Url.AbsoluteUri, subtitle.Url); Assert.Equal("en", subtitle.Language); Assert.Equal("English", subtitle.Name); },
+            subtitle => { Assert.Equal(french.Url.AbsoluteUri, subtitle.Url); Assert.Equal("fr", subtitle.Language); Assert.Equal("French", subtitle.Name); });
+
+        MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([optedIn.Choice])];
+        Assert.Equal(3, jobs.Length);
+        Assert.Equal(JobKind.Merge, jobs[0].Kind);
+        Assert.Equal(2, jobs[0].EmbeddedSubtitleCount);
+        Assert.Equal(JobKind.Http, jobs[1].Kind);
+        Assert.Equal(english.Url.AbsoluteUri, jobs[1].Url);
+        Assert.Equal(0, jobs[1].EmbeddedSubtitleCount);
+        Assert.Null(jobs[1].SubtitleNotice);
+        Assert.Equal(JobKind.Http, jobs[2].Kind);
+        Assert.Equal(french.Url.AbsoluteUri, jobs[2].Url);
+    }
+
+    [Fact]
+    public void MediaTransferBridge_LeavesEverySidecarWhenTheEmbeddingTrackLimitIsExceeded()
+    {
+        var stream = new MediaRepresentation
+        {
+            Id = "muxed", Url = new Uri("https://cdn.example.com/video.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            FileSize = 8_000_000, ContentIdentity = "video-etag-and-size"
+        };
+        SubtitleTrack[] subtitles = Enumerable.Range(0, 26).Select(index =>
+        {
+            string language = ((char)('a' + index)).ToString() + "a";
+            return new SubtitleTrack(new Uri($"https://cdn.example.com/captions/{language}.srt"), language, language, "srt");
+        }).ToArray();
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "test", MediaId = "one",
+            Title = "One", Representations = [stream], Subtitles = subtitles
+        };
+        FormatPreferences preferences = FormatPreferences.BestQuality with
+        {
+            SubtitleLanguages = subtitles.Select(subtitle => subtitle.Language).ToArray(),
+            EmbedSubtitles = true
+        };
+
+        var prepared = MediaTransferBridge.Prepare(item, preferences);
+
+        Assert.Null(prepared.Error);
+        Assert.Equal(JobKind.Merge, prepared.Choice!.Kind);
+        Assert.Equal(0, prepared.Choice.EmbeddedSubtitleCount);
+        Assert.Contains("at most 25", prepared.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.True(MediaMergePlan.TryParse(prepared.Choice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.Empty(plan.Subtitles);
+        MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice])];
+        Assert.Equal(27, jobs.Length);
+        Assert.Equal(subtitles.Length, jobs.Skip(1).Count());
+    }
+
+    [Fact]
+    public void SubtitlePickersFilterUnsupportedTracksAndMediaStillQueuesSupportedSidecars()
+    {
+        var stream = new MediaRepresentation
+        {
+            Id = "muxed", Url = new Uri("https://cdn.example.com/video.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac"
+        };
+        var selectedEnglish = new SubtitleTrack(new Uri("https://cdn.example.com/captions/a-en.vtt"), "en", "English", "vtt");
+        SubtitleTrack[] subtitles =
+        [
+            new(new Uri("https://cdn.example.com/captions/0-en.ass"), "en", "English styled", "ass"),
+            new(new Uri("https://cdn.example.com/captions/z-en.srt"), "en", "English alternate", "srt"),
+            selectedEnglish,
+            new(new Uri("https://cdn.example.com/captions/fr.ass"), "fr", "French", "ass"),
+            new(new Uri("http://127.0.0.1/captions/de.srt"), "de", "German local", "srt")
+        ];
+        SubtitleTrack[] pickerOptions = MediaTransferBridge.SelectableSubtitleTracks(subtitles);
+        Assert.Equal(new[] { "en" }, pickerOptions.Select(track => track.Language));
+        Assert.Equal(selectedEnglish.Url, Assert.Single(pickerOptions).Url);
+
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.com/watch/one"), Provider = "test", MediaId = "one",
+            Title = "One", Representations = [stream], Subtitles = subtitles
+        };
+        var prepared = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality with
+        {
+            SubtitleLanguages = ["en", "fr", "de"]
+        });
+
+        Assert.Null(prepared.Error);
+        Assert.Equal(JobKind.Http, prepared.Choice!.Kind);
+        Assert.Equal(selectedEnglish.Url, Assert.Single(prepared.Choice.SubtitleTracks!).Url);
+        Assert.Contains("media and supported sidecars remain queued", prepared.Choice.SubtitleNotice,
+            StringComparison.OrdinalIgnoreCase);
+        MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice])];
+        Assert.Equal(2, jobs.Length);
+        Assert.Equal(selectedEnglish.Url.AbsoluteUri, jobs[1].Url);
     }
 
     [Fact]
@@ -1172,6 +1315,250 @@ public sealed class MediaMergeTests
         Assert.Equal(JobState.Completed, noCoverDone.State);
         using var noCoverOutput = File.OpenRead(noCoverDone.FinalPath!);
         Assert.Null(WebmDemuxer.ReadThumbnail(noCoverOutput, noCoverOutput.Length));
+    }
+
+    [Fact]
+    public async Task MergeJob_EmbedsValidatedSrtInMatroskaAndPreservesMediaSamples()
+    {
+        await using var server = new FaultServer();
+        byte[] videoBytes = Fixture("video-only.mp4");
+        byte[] audioBytes = AacFmp4();
+        byte[] subtitleBytes = Encoding.UTF8.GetBytes("1\n00:00:00,500 --> 00:00:01,750\nFirst cue\n\n"
+            + "2\n00:00:02,000 --> 00:00:02,900\nSecond cue\n");
+        server.Extra["/m/video.mp4"] = videoBytes;
+        server.Extra["/m/audio.m4a"] = audioBytes;
+        server.Extra["/m/en.srt"] = subtitleBytes;
+        await server.StartAsync();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Version = 3,
+            Provider = "test",
+            MediaId = "embedded-srt",
+            OutputContainer = "mkv",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), videoBytes.Length, "mp4", "h264", "video-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.m4a"), audioBytes.Length, "m4a", "aac", "audio-id")
+            ],
+            Subtitles = [new MergeSubtitle(server.Url("/m/en.srt"), "srt", "en-US", "English")]
+        };
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "embedded-srt.mkv",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson(), MediaProvider: plan.Provider, MediaId: plan.MediaId));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, done.State);
+
+        using var videoSource = new MemoryStream(videoBytes);
+        using var audioSource = new MemoryStream(audioBytes);
+        DemuxedTrack videoTrack = Track(videoSource, TrackKind.Video);
+        DemuxedTrack audioTrack = Track(audioSource, TrackKind.Audio);
+        double duration = Math.Max(videoTrack.DurationSeconds, audioTrack.DurationSeconds);
+        ParsedSubtitle expectedSubtitle = TextSubtitleParser.Parse(subtitleBytes, "srt", "en-US", "English", duration);
+        using MemoryStream expectedSubtitleSource = expectedSubtitle.Source;
+        var expected = new List<(DemuxedTrack Track, Stream Source)>
+        {
+            (videoTrack, videoSource), (audioTrack, audioSource), (expectedSubtitle.Track, expectedSubtitleSource)
+        };
+        using var published = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> tracks = MediaMerger.Demux(published, published.Length, default);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio, TrackKind.Subtitle], tracks.Select(track => track.Kind));
+        Assert.Equal("en-US", tracks[2].Language);
+        Assert.Equal("English", tracks[2].Name);
+        Assert.Equal(2, tracks[2].Samples.Count);
+        MediaMerger.ValidateRemux(published, published.Length, expected, default);
+        Assert.False(File.Exists(done.PartialPath + ".tracks"));
+    }
+
+    [Fact]
+    public async Task InvalidEmbeddedSubtitleIsSkippedAndMediaStillPublishes()
+    {
+        await using var server = new FaultServer();
+        byte[] videoBytes = Fixture("video-only.mp4");
+        byte[] audioBytes = AacFmp4();
+        server.Extra["/m/video.mp4"] = videoBytes;
+        server.Extra["/m/audio.m4a"] = audioBytes;
+        server.Extra["/m/bad.srt"] = Encoding.UTF8.GetBytes("1\nnot a timestamp\nBroken cue\n");
+        await server.StartAsync();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Version = 3,
+            Provider = "test",
+            MediaId = "bad-embedded-srt",
+            OutputContainer = "mkv",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), videoBytes.Length, "mp4", "h264", "video-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.m4a"), audioBytes.Length, "m4a", "aac", "audio-id")
+            ],
+            Subtitles = [new MergeSubtitle(server.Url("/m/bad.srt"), "srt", "en", "English")]
+        };
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "bad-embedded-srt.mkv",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot stopped = await h.WaitAsync(added.JobId,
+            snapshot => snapshot.State is JobState.NeedsAttention or JobState.Failed
+                || snapshot.State == JobState.Completed && snapshot.Message.Contains("not embedded", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(JobState.Completed, stopped.State);
+        Assert.NotNull(stopped.FinalPath);
+        Assert.Contains("not embedded", stopped.Message, StringComparison.OrdinalIgnoreCase);
+        using var published = File.OpenRead(stopped.FinalPath!);
+        Assert.DoesNotContain(MediaMerger.Demux(published, published.Length, default), track => track.Kind == TrackKind.Subtitle);
+    }
+
+    [Fact]
+    public async Task MatroskaTrackLimitLeavesExcessSubtitleSidecarsAndPublishesMedia()
+    {
+        await using var server = new FaultServer();
+        byte[] videoBytes = Fixture("video-only.mp4");
+        byte[] audioBytes = AacFmp4();
+        byte[] subtitleBytes = Encoding.UTF8.GetBytes("1\n00:00:00,100 --> 00:00:00,500\nCaption\n");
+        server.Extra["/m/video.mp4"] = videoBytes;
+        server.Extra["/m/audio.m4a"] = audioBytes;
+        await server.StartAsync();
+        string[] languages = ["en", "fr", "de", "es", "it", "pt", "nl"];
+        SubtitleTrack[] subtitleTracks = languages.Select(language =>
+        {
+            string path = $"/m/captions/{language}.srt";
+            server.Extra[path] = subtitleBytes;
+            return new SubtitleTrack(new Uri(server.Url(path)), language, language, "srt");
+        }).ToArray();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Version = 3,
+            Provider = "test",
+            MediaId = "subtitle-track-limit",
+            OutputContainer = "mkv",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), videoBytes.Length, "mp4", "h264", "video-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.m4a"), audioBytes.Length, "m4a", "aac", "audio-id")
+            ],
+            Subtitles = subtitleTracks.Select(track => new MergeSubtitle(track.Url.AbsoluteUri, "srt", track.Language, track.Name)).ToArray()
+        };
+        var choice = new MediaDownloadChoice(plan.Tracks[0].Url, "subtitle-track-limit.mkv", JobKind.Merge, null, null,
+            MediaPlanJson: plan.ToJson(), SubtitleTracks: subtitleTracks);
+        Assert.Equal(8, MediaTransferBridge.ExpandSubtitleChoices([choice]).Count);
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "subtitle-track-limit.mkv",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId, snapshot =>
+            snapshot.State is JobState.NeedsAttention or JobState.Failed
+            || snapshot.State == JobState.Completed && snapshot.Message.Contains("supports at most 8 total tracks", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(JobState.Completed, done.State);
+        Assert.Contains("1 selected subtitle remains separate", done.Message, StringComparison.OrdinalIgnoreCase);
+        using var published = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> tracks = MediaMerger.Demux(published, published.Length, default);
+        Assert.Equal(MediaMerger.MaxTrackCount, tracks.Count);
+        Assert.Equal(6, tracks.Count(track => track.Kind == TrackKind.Subtitle));
+    }
+
+    [Fact]
+    public async Task MergeJob_EmbedsSrtFromOneMuxedSourceTrack()
+    {
+        await using var server = new FaultServer();
+        byte[] muxedBytes = Fixture("muxed.webm");
+        byte[] subtitleBytes = Encoding.UTF8.GetBytes("1\n00:00:00,250 --> 00:00:01,000\nMuxed source cue\n");
+        server.Extra["/m/source.webm"] = muxedBytes;
+        server.Extra["/m/en.srt"] = subtitleBytes;
+        await server.StartAsync();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Version = 3,
+            Provider = "test",
+            MediaId = "embedded-muxed-srt",
+            OutputContainer = "mkv",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks = [new MergeTrack("muxed", "source", server.Url("/m/source.webm"), muxedBytes.Length, "webm", "vp9", "source-id")],
+            Subtitles = [new MergeSubtitle(server.Url("/m/en.srt"), "srt", "en", "English")]
+        };
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "embedded-muxed-srt.mkv",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, done.State);
+
+        using var source = new MemoryStream(muxedBytes);
+        List<DemuxedTrack> sourceTracks = MediaMerger.Demux(source, source.Length, default);
+        double duration = sourceTracks.Where(track => track.Kind is TrackKind.Video or TrackKind.Audio)
+            .Max(track => track.DurationSeconds);
+        ParsedSubtitle expectedSubtitle = TextSubtitleParser.Parse(subtitleBytes, "srt", "en", "English", duration);
+        using MemoryStream expectedSubtitleSource = expectedSubtitle.Source;
+        var expected = sourceTracks.Select(track => (Track: track, Source: (Stream)source))
+            .Append((expectedSubtitle.Track, (Stream)expectedSubtitleSource)).ToArray();
+        using var published = File.OpenRead(done.FinalPath!);
+        Assert.Equal(3, MediaMerger.Demux(published, published.Length, default).Count);
+        MediaMerger.ValidateRemux(published, published.Length, expected, default);
+    }
+
+    [Fact]
+    public async Task MergeJob_EmbedsSrtAsValidatedTx3gInMp4()
+    {
+        await using var server = new FaultServer();
+        byte[] videoBytes = Fixture("video-only.mp4");
+        byte[] audioBytes = AacFmp4();
+        byte[] subtitleBytes = Encoding.UTF8.GetBytes("1\n00:00:00,100 --> 00:00:00,300\nHello\n");
+        server.Extra["/m/video.mp4"] = videoBytes;
+        server.Extra["/m/audio.m4a"] = audioBytes;
+        server.Extra["/m/en.srt"] = subtitleBytes;
+        await server.StartAsync();
+        using var h = new Harness();
+        var plan = new MediaMergePlan
+        {
+            Version = 3,
+            Provider = "test",
+            MediaId = "embedded-tx3g",
+            OutputContainer = "mp4",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "v1", server.Url("/m/video.mp4"), videoBytes.Length, "mp4", "h264", "video-id"),
+                new MergeTrack("audio", "a1", server.Url("/m/audio.m4a"), audioBytes.Length, "m4a", "aac", "audio-id")
+            ],
+            Subtitles = [new MergeSubtitle(server.Url("/m/en.srt"), "srt", "en-US", "English")]
+        };
+
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "embedded-tx3g.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson(), MediaProvider: plan.Provider, MediaId: plan.MediaId));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            snapshot => snapshot.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.Equal(JobState.Completed, done.State);
+
+        using var videoSource = new MemoryStream(videoBytes);
+        using var audioSource = new MemoryStream(audioBytes);
+        DemuxedTrack videoTrack = Track(videoSource, TrackKind.Video);
+        DemuxedTrack audioTrack = Track(audioSource, TrackKind.Audio);
+        double duration = Math.Max(videoTrack.DurationSeconds, audioTrack.DurationSeconds);
+        ParsedSubtitle expectedSubtitle = TextSubtitleParser.Parse(subtitleBytes, "srt", "en-US", "English", duration,
+            outputContainer: "mp4", videoWidth: videoTrack.Width, videoHeight: videoTrack.Height);
+        using MemoryStream expectedSubtitleSource = expectedSubtitle.Source;
+        var expected = new List<(DemuxedTrack Track, Stream Source)>
+        {
+            (videoTrack, videoSource), (audioTrack, audioSource), (expectedSubtitle.Track, expectedSubtitleSource)
+        };
+        using var published = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> tracks = MediaMerger.Demux(published, published.Length, default);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio, TrackKind.Subtitle], tracks.Select(track => track.Kind));
+        Assert.Equal("tx3g", tracks[2].Codec);
+        MediaMerger.ValidateRemux(published, published.Length, expected, default);
     }
 
     [Fact]

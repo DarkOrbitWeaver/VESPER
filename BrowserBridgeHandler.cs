@@ -14,10 +14,15 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         switch (request.Type)
         {
             case "hello":
+            {
+                VesperPreferences current = preferences();
                 return BridgeResponse.Success(request.Id, "VESPER is running.",
-                    data: new { app = "VESPER", handoff = preferences().BrowserAction.ToString().ToLowerInvariant(),
+                    data: new { app = "VESPER", handoff = current.BrowserAction.ToString().ToLowerInvariant(),
+                        siteRules = new { neverCaptureHosts = SiteRule.Normalize(current.SiteRules)
+                            .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray() },
                         build = Vesper.Shared.BuildInfo.Version(typeof(BrowserBridgeHandler).Assembly) },
                     version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
+            }
 
             case "probe":
                 return BridgeResponse.Success(request.Id, data: await engine.ProbeMediaAsync(request.Url!, ct));
@@ -100,6 +105,13 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
     private async Task<BridgeResponse> SubmitAsync(BridgeRequest request, CancellationToken ct)
     {
+        if (request.Type == "browser-submit")
+        {
+            IReadOnlyList<SiteRule> siteRules = SiteRule.Normalize(preferences().SiteRules);
+            if (request.Items.Any(item => IsNeverCaptureRule(item, siteRules)))
+                return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep automatic downloads in Chrome.");
+        }
+
         // "ask" from the browser means "apply VESPER's own handoff setting"; download/queue are explicit overrides.
         string mode = request.Mode == "ask" ? preferences().BrowserAction.ToString().ToLowerInvariant() : request.Mode;
         if (request.Type == "browser-submit" && mode == "ask") mode = "download";
@@ -107,12 +119,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         IReadOnlySet<int>? selected = null;
         IReadOnlySet<int> trustedChecksums = new HashSet<int>();
         bool startNow = mode == "download";
-        string? folder = null;
+        string? folder = SiteFolderFor(request.Items);
         bool requiresReview = RequiresNativeReview(request);
         if (requiresReview) mode = "ask";
         if (requiresReview)
         {
-            var reviewed = await ReviewBatchAsync(request, ct);
+            var reviewed = await ReviewBatchAsync(request, folder, ct);
             if (reviewed.Outcome == QuickDownloadForm.Outcome.Cancel || reviewed.Selected.Count == 0)
                 return BridgeResponse.Fail(request.Id, "cancelled", "No files were selected in VESPER.");
             startNow = reviewed.Outcome == QuickDownloadForm.Outcome.Download;
@@ -122,7 +134,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         }
         else if (mode == "ask")
         {
-            (QuickDownloadForm.Outcome outcome, string chosen) = await AskUserAsync(request, ct);
+            (QuickDownloadForm.Outcome outcome, string chosen) = await AskUserAsync(request, folder, ct);
             if (outcome == QuickDownloadForm.Outcome.Cancel)
                 return BridgeResponse.Fail(request.Id, "cancelled", "Cancelled in VESPER.");
             startNow = outcome == QuickDownloadForm.Outcome.Download;
@@ -174,6 +186,25 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
     internal static bool RequiresNativeReview(BridgeRequest request) => request.Type == "batch-review"
         || request.Items.Count > 1 || request.Items.Any(item => item.Sha256 is not null);
+
+    private static bool IsNeverCaptureRule(BridgeItem item, IReadOnlyList<SiteRule> siteRules) =>
+        SiteRule.ForPage(siteRules, item.Referer)?.NeverCapture == true
+        || SiteRule.ForPage(siteRules, item.OriginalUrl)?.NeverCapture == true
+        || SiteRule.ForPage(siteRules, item.Url)?.NeverCapture == true;
+
+    internal string? SiteFolderFor(IReadOnlyList<BridgeItem> items)
+    {
+        if (items.Count == 0) return null;
+        VesperPreferences current = preferences();
+        SiteRule? first = SiteRule.ForPage(current.SiteRules, items[0].Referer ?? items[0].Url);
+        if (first?.Folder is not { Length: > 0 } folder) return null;
+        foreach (BridgeItem item in items)
+        {
+            SiteRule? rule = SiteRule.ForPage(current.SiteRules, item.Referer ?? item.Url);
+            if (!string.Equals(rule?.Host, first.Host, StringComparison.OrdinalIgnoreCase)) return null;
+        }
+        return folder;
+    }
 
     /// <summary>
     /// Waits until VESPER has really received the file's first response. When it has not, the second value says why
@@ -282,8 +313,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
     /// <summary>Shows the compact Quick Download window on the UI thread and waits for the user's choice.</summary>
     private async Task<(QuickDownloadForm.Outcome Outcome, string Folder, IReadOnlySet<int> Selected,
-        IReadOnlySet<int> TrustedChecksums)> ReviewBatchAsync(
-        BridgeRequest request, CancellationToken ct)
+        IReadOnlySet<int> TrustedChecksums)> ReviewBatchAsync(BridgeRequest request, string? siteFolder, CancellationToken ct)
     {
         var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string, IReadOnlySet<int>, IReadOnlySet<int>)>(TaskCreationOptions.RunContinuationsAsynchronously);
         owner.BeginInvoke(() =>
@@ -292,7 +322,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             try
             {
                 owner.RequestShow();
-                using var form = new BatchReviewForm(preferences(), request.Items);
+                VesperPreferences formPreferences = preferences().Clone();
+                if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
+                using var form = new BatchReviewForm(formPreferences, request.Items);
                 using var registration = ct.Register(() =>
                 {
                     if (!form.IsDisposed && form.IsHandleCreated)
@@ -306,7 +338,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         return await done.Task.WaitAsync(ct);
     }
 
-    private async Task<(QuickDownloadForm.Outcome, string)> AskUserAsync(BridgeRequest request, CancellationToken ct)
+    private async Task<(QuickDownloadForm.Outcome, string)> AskUserAsync(BridgeRequest request, string? siteFolder, CancellationToken ct)
     {
         BridgeItem first = request.Items[0];
         string title, detail;
@@ -330,7 +362,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string)>();
         owner.BeginInvoke(() =>
         {
-            using var form = new QuickDownloadForm(preferences(), title, detail, size);
+            VesperPreferences formPreferences = preferences().Clone();
+            if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
+            using var form = new QuickDownloadForm(formPreferences, title, detail, size);
             form.ShowDialog();
             done.TrySetResult((form.Result, form.Destination));
         });

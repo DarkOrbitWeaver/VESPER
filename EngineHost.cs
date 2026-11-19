@@ -52,6 +52,7 @@ internal static class EngineHost
             DataDirectory = DataDirectory,
             BrowserDownloadsFolder = WindowsDownloadsFolder(),
             AllowPrivateNetworks = p.AllowPrivateNetworks,
+            PauseOnMeteredNetwork = p.PauseOnMeteredNetwork,
             Proxy = Enum.TryParse(p.ProxyMode, out ProxyMode mode) ? mode : ProxyMode.Direct,
             ProxyAddress = string.IsNullOrWhiteSpace(p.ProxyAddress) ? null : p.ProxyAddress
         };
@@ -82,6 +83,7 @@ internal static class EngineHost
         options.CategorySubfolders = p.CategoryFolders;
         options.FileNameTemplate = p.FileNameTemplate;
         options.PreventSleepWhileActive = p.PreventSleep;
+        options.PauseOnMeteredNetwork = p.PauseOnMeteredNetwork;
         options.Schedule = TimeOnly.TryParse(p.ScheduleStart, out TimeOnly start) && TimeOnly.TryParse(p.ScheduleEnd, out TimeOnly end)
             ? new SchedulePolicy(p.ScheduleEnabled, start, end) : SchedulePolicy.Always;
     }
@@ -89,6 +91,7 @@ internal static class EngineHost
     public static void Apply(DownloadEngine engine, VesperPreferences p)
     {
         ApplyLive(engine.Options, p);
+        engine.MeteredNetworkPreferenceChanged();
         engine.SettingsChanged();
     }
 
@@ -100,9 +103,20 @@ internal static class EngineHost
     [DllImport("kernel32.dll")]
     private static extern ExecutionState SetThreadExecutionState(ExecutionState state);
 
+    [DllImport("PowrProf.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.U1)]
+    private static extern bool SetSuspendState(
+        [MarshalAs(UnmanagedType.U1)] bool hibernate,
+        [MarshalAs(UnmanagedType.U1)] bool forceCritical,
+        [MarshalAs(UnmanagedType.U1)] bool disableWakeEvent);
+
     /// <summary>Must be called from one consistent thread (the UI thread).</summary>
     public static void HoldAwake(bool hold) =>
         SetThreadExecutionState(hold ? ExecutionState.Continuous | ExecutionState.SystemRequired : ExecutionState.Continuous);
+
+    /// <summary>Requests normal Windows sleep. The caller must obtain an explicit user choice first.</summary>
+    internal static bool SleepComputer() =>
+        OperatingSystem.IsWindows() && SetSuspendState(hibernate: false, forceCritical: false, disableWakeEvent: false);
 
     /// <summary>Moves a file to the Recycle Bin so an accidental delete can be undone.</summary>
     public static void RecycleFile(string path) =>

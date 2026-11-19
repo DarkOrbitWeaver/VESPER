@@ -62,7 +62,13 @@ public sealed class CancelDownloadTests
         File.WriteAllText(unrelated, "keep these bytes");
         Assert.True(CreateHardLinkW(manifest, unrelated, IntPtr.Zero));
 
-        RecoveryManifest.Delete(partial);
+        Assert.False(RecoveryManifest.Delete(new DownloadJob
+        {
+            Id = id,
+            Kind = JobKind.Http,
+            PartialPath = partial,
+            DestinationFolder = h.Downloads
+        }));
 
         Assert.True(File.Exists(manifest));
         Assert.Equal("keep these bytes", File.ReadAllText(unrelated));
@@ -94,25 +100,18 @@ public sealed class CancelDownloadTests
     }
 
     [Fact]
-    public async Task CancelRemovesAnUnfinishedJobAndOnlyItsExactTemporaryFiles()
+    public async Task CancelRemovesAnUnfinishedJobAndItsProvenFiles()
     {
         using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
         Guid first = h.Add("https://example.com/first", "first.bin", startNow: false);
         Guid second = h.Add("https://example.com/second", "second.bin", startNow: false);
         JobSnapshot mine = h.Engine.Snapshot(first)!;
         JobSnapshot other = h.Engine.Snapshot(second)!;
-
-        // The real sidecar names, not a wildcard that could match someone else's data.
-        string[] owned =
-        [
-            mine.PartialPath, mine.PartialPath + ".vmeta", mine.PartialPath + ".vmeta.tmp",
-            mine.PartialPath + ".tracks", mine.PartialPath + ".merging", mine.PartialPath + ".samples",
-            mine.PartialPath + ".convert.mp4", mine.PartialPath + ".convert.opus",
-            mine.PartialPath + ".convert.wav", mine.PartialPath + ".convert-audio.mp4",
-            mine.PartialPath + ".convert-tagged.mp4", mine.PartialPath + ".tagged.mp3"
-        ];
-        foreach (string path in owned) await File.WriteAllTextAsync(path, "owned temporary content");
+        await File.WriteAllTextAsync(mine.PartialPath, "owned partial bytes");
         h.OwnFixturePartial(first);
+        using (var store = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
+            RecoveryManifest.Write(store.LoadAll().Single(job => job.Id == first));
+        string manifest = RecoveryManifest.PathFor(mine.PartialPath);
         await File.WriteAllTextAsync(other.PartialPath, "other job");
         string unrelated = Path.Combine(h.Downloads, "keep-original.zip");
         await File.WriteAllTextAsync(unrelated, "personal file");
@@ -124,7 +123,9 @@ public sealed class CancelDownloadTests
         Assert.True(result.Cancelled, result.Message);
         Assert.Null(h.Engine.Snapshot(first));
         Assert.Contains(first, removed);
-        Assert.All(owned, path => Assert.False(File.Exists(path), path));
+        Assert.False(File.Exists(mine.PartialPath));
+        Assert.False(File.Exists(manifest));
+        Assert.False(File.Exists(manifest + ".tmp"));
         Assert.True(File.Exists(other.PartialPath));
         Assert.True(File.Exists(unrelated));
         Assert.NotNull(h.Engine.Snapshot(second));
@@ -132,6 +133,38 @@ public sealed class CancelDownloadTests
         Assert.Null(h.Engine.Snapshot(first));
         Assert.NotNull(h.Engine.Snapshot(second));
         Assert.True(File.Exists(unrelated));
+    }
+
+    [Fact]
+    public async Task CancelRefusesAStaleRecoveryIdentityAndKeepsTheFiles()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/first", "first.bin", startNow: false);
+        Guid otherId = h.Add("https://example.com/other", "other.bin", startNow: false);
+        JobSnapshot job = h.Engine.Snapshot(id)!;
+        JobSnapshot other = h.Engine.Snapshot(otherId)!;
+        await File.WriteAllTextAsync(job.PartialPath, "owned partial bytes");
+        await File.WriteAllTextAsync(other.PartialPath, "other partial bytes");
+        h.OwnFixturePartial(id);
+        h.OwnFixturePartial(otherId);
+
+        using (var store = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
+        {
+            Dictionary<Guid, DownloadJob> saved = store.LoadAll().ToDictionary(candidate => candidate.Id);
+            DownloadJob staleManifest = saved[id];
+            staleManifest.PartialIdentity = saved[otherId].PartialIdentity;
+            RecoveryManifest.Write(staleManifest);
+        }
+
+        string manifest = RecoveryManifest.PathFor(job.PartialPath);
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(id);
+
+        Assert.False(result.Cancelled);
+        Assert.Contains("recovery file", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("owned partial bytes", await File.ReadAllTextAsync(job.PartialPath));
+        Assert.True(File.Exists(manifest));
+        Assert.True(h.Engine.Snapshot(id)!.IsCleanupPending);
     }
 
     [Fact]

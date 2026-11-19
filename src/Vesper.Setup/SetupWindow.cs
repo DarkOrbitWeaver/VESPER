@@ -9,13 +9,20 @@ internal sealed class SetupWindow : Form
 
     private readonly SetupMode _mode;
     private readonly InstallPaths _paths;
-    private readonly Action<IProgress<InstallProgress>, CancellationToken> _work;
+    private readonly Action<IProgress<InstallProgress>, CancellationToken, bool> _work;
     private readonly FirstFlightCanvas _canvas;
     private readonly Icon _icon;
     private readonly VesperButton _action = new() { Primary = true, TabIndex = 0 };
     private readonly VesperButton _skip = new() { Text = "Skip intro", TabIndex = 1 };
     private readonly VesperButton _cancel = new() { Text = "Cancel", TabIndex = 2 };
     private readonly VesperButton _extension = new() { Text = "Extension files", Symbol = VesperIcon.Folder, TabIndex = 1 };
+    private readonly CheckBox _deleteUserData = new()
+    {
+        Text = "Delete VESPER settings, download history, and podcast subscriptions",
+        Checked = false,
+        TabIndex = 1,
+        UseVisualStyleBackColor = false
+    };
     private readonly Label _status = new() { TextAlign = ContentAlignment.MiddleCenter, UseMnemonic = false, AutoEllipsis = true };
     private readonly Label _note = new() { TextAlign = ContentAlignment.MiddleCenter, UseMnemonic = false, AutoEllipsis = true };
     private readonly ProgressBar _meter = new() { AccessibleName = "Verified installation files", Style = ProgressBarStyle.Continuous };
@@ -30,6 +37,10 @@ internal sealed class SetupWindow : Form
     private bool _closeAfterCancel;
 
     internal SetupWindow(SetupMode mode, InstallPaths paths, VesperPalette palette, Action<IProgress<InstallProgress>, CancellationToken> work)
+        : this(mode, paths, palette, (progress, ct, _) => work(progress, ct)) { }
+
+    internal SetupWindow(SetupMode mode, InstallPaths paths, VesperPalette palette,
+        Action<IProgress<InstallProgress>, CancellationToken, bool> work)
     {
         _mode = mode;
         _paths = paths;
@@ -50,13 +61,15 @@ internal sealed class SetupWindow : Form
         _canvas.IntroFinished += IntroFinished;
         _status.Font = _statusFont;
         _note.Font = _noteFont;
-        Controls.AddRange([_action, _skip, _cancel, _extension, _status, _note, _meter, _canvas]);
+        Controls.AddRange([_action, _skip, _cancel, _extension, _deleteUserData, _status, _note, _meter, _canvas]);
         _canvas.SendToBack();
         _action.Click += (_, _) => StartOrOpen();
         _skip.Click += (_, _) => SkipIntro();
         _cancel.Click += (_, _) => RequestCancellation();
         _extension.Click += (_, _) => OpenPath(Path.Combine(_paths.App, "extension"), shell: true);
+        _deleteUserData.CheckedChanged += (_, _) => RefreshControls();
         _tips.SetToolTip(_extension, "In Chrome, open Extensions, turn on Developer mode, and choose Load unpacked.");
+        _tips.SetToolTip(_deleteUserData, "This removes VESPER settings, download history, and podcast subscriptions. Downloaded files are never deleted.");
         AcceptButton = _action;
         ApplyPalette();
         RefreshControls();
@@ -93,7 +106,8 @@ internal sealed class SetupWindow : Form
         });
         try
         {
-            await Task.Run(() => _work(progress, cancellation.Token));
+            bool deleteUserData = _mode == SetupMode.Uninstall && _deleteUserData.Checked;
+            await Task.Run(() => _work(progress, cancellation.Token, deleteUserData));
             _view = View.Complete;
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { _view = View.Cancelled; }
@@ -120,6 +134,9 @@ internal sealed class SetupWindow : Form
         _cancel.Visible = working && !intro;
         _cancel.Enabled = _cancellation?.IsCancellationRequested == false;
         _skip.Visible = intro;
+        _deleteUserData.Visible = _mode == SetupMode.Uninstall
+            && (_view is View.Ready or View.Failed or View.Cancelled);
+        _deleteUserData.Enabled = !working;
         _extension.Visible = _view == View.Complete && _mode != SetupMode.Uninstall;
         _meter.Visible = working && !intro && _progress.Total > 0;
         if (_meter.Visible) _meter.Value = (int)Math.Clamp(100d * _progress.Verified / _progress.Total, 0, 100);
@@ -148,10 +165,14 @@ internal sealed class SetupWindow : Form
         _tips.SetToolTip(_status, _view == View.Failed ? _error : null);
         _note.Text = _view switch
         {
-            View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, and history will be kept.",
+            View.Ready when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
+                "Settings, download history, and podcast subscriptions will be deleted. Downloaded files are never deleted.",
+            View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and podcast subscriptions will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
             View.Complete when _mode != SetupMode.Uninstall => "In Chrome, use Developer mode → Load unpacked to enable the bundled extension.",
-            View.Complete => "Your downloads, settings, and history were kept.",
+            View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
+                "Settings, download history, and podcast subscriptions were deleted. Downloaded files were kept.",
+            View.Complete => "Your downloads, settings, download history, and podcast subscriptions were kept.",
             _ => ""
         };
         AcceptButton = intro && working ? _skip : working ? null : _action;
@@ -209,6 +230,8 @@ internal sealed class SetupWindow : Form
         _status.BackColor = _note.BackColor = BackColor;
         _note.ForeColor = _palette.Muted;
         foreach (var button in new[] { _action, _cancel, _skip, _extension }) button.ApplyPalette(_palette);
+        _deleteUserData.ForeColor = _palette.Text;
+        _deleteUserData.BackColor = Color.Transparent;
         _canvas.SetPalette(_palette);
         if (IsHandleCreated) VesperWindowChrome.Apply(this, _palette);
     }
@@ -244,12 +267,13 @@ internal sealed class SetupWindow : Form
         int Px(int value) => (int)Math.Round(value * scale);
         SuspendLayout();
         ClientSize = new Size(Px(FirstFlightCanvas.LogicalWidth), Px(FirstFlightCanvas.LogicalHeight));
-        _action.SetBounds(Px(220), Px(357), Px(360), Px(43));
+        _action.SetBounds(Px(220), Px(_mode == SetupMode.Uninstall ? 378 : 357), Px(360), Px(43));
         _skip.SetBounds(Px(675), Px(14), Px(110), Px(32));
         _cancel.SetBounds(Px(339), Px(396), Px(122), Px(32));
         _extension.SetBounds(Px(600), Px(357), Px(153), Px(43));
-        _status.SetBounds(Px(44), Px(300), Px(712), Px(54));
-        _note.SetBounds(Px(34), Px(412), Px(732), Px(32));
+        _deleteUserData.SetBounds(Px(220), Px(350), Px(540), Px(25));
+        _status.SetBounds(Px(44), Px(_mode == SetupMode.Uninstall ? 286 : 300), Px(712), Px(54));
+        _note.SetBounds(Px(34), Px(_mode == SetupMode.Uninstall ? 423 : 412), Px(732), Px(25));
         _meter.SetBounds(Px(220), Px(365), Px(360), Px(12));
         ResumeLayout();
         Location = new Point(Math.Clamp(Left, work.Left, Math.Max(work.Left, work.Right - Width)),

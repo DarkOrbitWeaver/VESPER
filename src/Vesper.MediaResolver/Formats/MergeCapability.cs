@@ -107,4 +107,18 @@ public static class MergeCapability
             ? audio.AudioCodec is "opus" or "vorbis" ? "webm" : null
             : audio.AudioCodec is "aac" or "mp3" ? "m4a" : null;
     }
+
+    /// <summary>Output container for a single direct video object that already contains its selected tracks.</summary>
+    public static string? MuxedContainer(MediaRepresentation track, string? preferred = null)
+    {
+        if (!IsNativeHttpTrack(track) || !track.HasVideo || track.VideoCodec is not { } video) return null;
+        bool hasAudio = track.HasAudio;
+        string? audio = track.AudioCodec;
+        bool mp4 = track.Container == "mp4" && Mp4Video.Contains(video)
+            && (!hasAudio || audio is not null && Mp4Audio.Contains(audio));
+        bool matroska = MkvVideo.Contains(video) && (!hasAudio || audio is not null && MkvAudio.Contains(audio));
+        if (preferred == "mp4" && mp4) return "mp4";
+        if (preferred == "mkv" && matroska) return "mkv";
+        return mp4 ? "mp4" : matroska ? "mkv" : null;
+    }
 }

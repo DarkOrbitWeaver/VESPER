@@ -1,5 +1,7 @@
 # VESPER — WinForms UI milestone U0/U1 (2026-11-09)
 
+> Historical snapshot from 2026-11-09. U0/U1 used in-memory demo rows and simulated queue actions; later milestones replaced these paths with the native download engine and persisted history. Keep this file as a record of the original UI decisions, not as current product behavior or acceptance guidance. Use the [current release information](RELEASE.md), [status register](STATUS.tsv), [master TODO](MASTER-TODO.md), and [media limits](../MEDIA_ENGINE_LIMITATIONS.md) for current behavior and remaining work.
+
 ## What was inspected
 
 - `VESPER.slnx` / `VESPER.csproj`: existing single-project .NET 10 WinForms solution, no external NuGet packages.
@@ -27,7 +29,7 @@ The handoff's framework selection was superseded by the current user's **WinForm
 - Two theme palettes (light/dark) via a single theme structure. In `System` mode the app reads the current Windows apps-light preference; no registry writes.
 - The illustrated icon is **a candidate**; on Windows verify 16/24/32px taskbar, Explorer, High Contrast and light/dark themes. The prepared original simplified icons remain available as fallback. The illustrated candidate is now referenced by `ApplicationIcon` and main Form icon to honor user preference, but it has **not** been accepted by a real Windows visual test.
 
-## Functional vs simulated
+## Functional vs simulated at the U0/U1 milestone (2026-11-09)
 
 ### Working UI behavior (no engine needed)
 - Search, filter, sort, checkbox selection and header check-all.
@@ -37,7 +39,7 @@ The handoff's framework selection was superseded by the current user's **WinForm
 - Settings navigation, Save/Cancel, appearance/theme/density, category folders setting, hide-missing setting and in-session transfer preference values.
 - Native title bar, resizing, footer sample disclaimer and file-type-icon details launch.
 
-### **Not implemented / never claimed**
+### **Not implemented / never claimed in U0/U1**
 - Real downloads, network traffic, HTTP validation, concurrency, resume, progress persistence or Rescue.
 - File presence checks, verified Open, Open Folder, Locate, Delete file, or auto-run anything.
 - Applied bandwidth caps, category subfolder creation, automatic retries, torrent handling.
@@ -61,7 +63,7 @@ Run in Visual Studio, or launch the compiled `bin\Release\net10.0-windows\VESPER
 
 The source in this package was produced in a **Linux container without `dotnet` or Windows desktop runtime**. No real build or GUI execution has been performed here. The provided `STATIC_QA_RESULTS.txt` is a static sanity check only, **not a substitute for a Windows compile or tests**.
 
-## Suggested next pass after your Windows build
+## Suggested next pass at the time (retained as historical notes)
 
 1. Capture a v8.3 light screenshot at 1222px and 830px wide; compare against reference.
 2. Test each density at 100, 125, 150 and 200% scaling, with Windows text-size changes.

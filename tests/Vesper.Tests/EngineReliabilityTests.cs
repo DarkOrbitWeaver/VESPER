@@ -1,4 +1,7 @@
 using System.Net;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Vesper.Engine;
 
 namespace Vesper.Tests;
@@ -7,6 +10,289 @@ namespace Vesper.Tests;
 /// unknown-length verification, self-compressed files and recovery-manifest import.</summary>
 public sealed class EngineReliabilityTests
 {
+    [Fact]
+    public async Task Cancel_refuses_a_same_content_replacement_of_the_merge_tracks_sidecar()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = CancellationMergePlan();
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "merged.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot snapshot = h.Engine.Snapshot(added.JobId)!;
+        byte[] tracksBytes = [1, 3, 5, 7, 9, 11];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, tracksBytes);
+        h.OwnFixturePartial(added.JobId);
+        DownloadJob job = LiveJob(h, added.JobId);
+        var cursor = new MergeTransfer.Cursor(1, plan.Fingerprint, "swapping",
+            MuxLength: 6, MuxSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            TracksLength: tracksBytes.Length, TracksSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            MuxIdentity: new string('A', 64));
+        h.Engine.UpdateJob(job, current => current.MediaState = JsonSerializer.Serialize(cursor));
+
+        string tracks = MergeTransfer.TracksPath(job);
+        File.Move(snapshot.PartialPath, tracks);
+        string original = tracks + ".original";
+        File.Move(tracks, original);
+        await File.WriteAllBytesAsync(tracks, tracksBytes);
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.False(result.Cancelled);
+        Assert.Equal(tracksBytes, await File.ReadAllBytesAsync(tracks));
+        Assert.Equal(tracksBytes, await File.ReadAllBytesAsync(original));
+        JobSnapshot parked = h.Engine.Snapshot(added.JobId)!;
+        Assert.Equal(JobState.Cancelled, parked.State);
+        Assert.Equal("cancel-cleanup", parked.Reason);
+        Assert.True(parked.IsCleanupPending);
+    }
+
+    [Theory]
+    [InlineData("swapping", false)]
+    [InlineData("muxed", true)]
+    public async Task Cancel_deletes_tracks_and_mux_partial_with_saved_cursor_identities(string phase, bool muxIdentityCommitted)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = CancellationMergePlan();
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "merged.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot snapshot = h.Engine.Snapshot(added.JobId)!;
+        byte[] tracksBytes = [1, 3, 5, 7, 9, 11];
+        byte[] muxBytes = [2, 4, 6, 8, 10, 12];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, tracksBytes);
+        h.OwnFixturePartial(added.JobId);
+        string tracksIdentity = LiveJob(h, added.JobId).PartialIdentity!;
+        string tracks = MergeTransfer.TracksPath(LiveJob(h, added.JobId));
+        File.Move(snapshot.PartialPath, tracks);
+        await File.WriteAllBytesAsync(snapshot.PartialPath, muxBytes);
+        h.OwnFixturePartial(added.JobId);
+
+        DownloadJob job = LiveJob(h, added.JobId);
+        string muxIdentity = job.PartialIdentity!;
+        if (!muxIdentityCommitted)
+        {
+            h.Engine.UpdateJob(job, current => current.PartialIdentity = tracksIdentity);
+            job = LiveJob(h, added.JobId);
+        }
+        var cursor = new MergeTransfer.Cursor(1, plan.Fingerprint, phase,
+            MuxLength: muxBytes.Length, MuxSha256: Convert.ToHexString(SHA256.HashData(muxBytes)),
+            TracksLength: tracksBytes.Length, TracksSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            MuxIdentity: muxIdentity, TracksIdentity: tracksIdentity);
+        h.Engine.UpdateJob(job, current => current.MediaState = JsonSerializer.Serialize(cursor));
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.True(result.Cancelled, result.Message);
+        Assert.Null(h.Engine.Snapshot(added.JobId));
+        Assert.False(File.Exists(snapshot.PartialPath));
+        Assert.False(File.Exists(tracks));
+    }
+
+    [Fact]
+    public async Task Cancel_keeps_tracks_when_a_legacy_muxed_cursor_has_no_tracks_identity()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = CancellationMergePlan();
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "merged.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot snapshot = h.Engine.Snapshot(added.JobId)!;
+        byte[] tracksBytes = [1, 3, 5, 7, 9, 11];
+        byte[] muxBytes = [2, 4, 6, 8, 10, 12];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, tracksBytes);
+        h.OwnFixturePartial(added.JobId);
+        string tracks = MergeTransfer.TracksPath(LiveJob(h, added.JobId));
+        File.Move(snapshot.PartialPath, tracks);
+        await File.WriteAllBytesAsync(snapshot.PartialPath, muxBytes);
+        h.OwnFixturePartial(added.JobId);
+
+        DownloadJob job = LiveJob(h, added.JobId);
+        var legacyCursor = new MergeTransfer.Cursor(1, plan.Fingerprint, "muxed",
+            MuxLength: muxBytes.Length, MuxSha256: Convert.ToHexString(SHA256.HashData(muxBytes)),
+            TracksLength: tracksBytes.Length, TracksSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            MuxIdentity: job.PartialIdentity);
+        h.Engine.UpdateJob(job, current => current.MediaState = JsonSerializer.Serialize(legacyCursor));
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.False(result.Cancelled);
+        Assert.Equal(tracksBytes, await File.ReadAllBytesAsync(tracks));
+        Assert.Equal(muxBytes, await File.ReadAllBytesAsync(snapshot.PartialPath));
+        JobSnapshot parked = h.Engine.Snapshot(added.JobId)!;
+        Assert.Equal("cancel-cleanup", parked.Reason);
+        Assert.True(parked.IsCleanupPending);
+    }
+
+    [Fact]
+    public async Task Cancel_deletes_a_pre_swap_manifest_after_muxed_commit()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = CancellationMergePlan();
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "merged.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot snapshot = h.Engine.Snapshot(added.JobId)!;
+        byte[] tracksBytes = [1, 3, 5, 7, 9, 11];
+        byte[] muxBytes = [2, 4, 6, 8, 10, 12];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, tracksBytes);
+        h.OwnFixturePartial(added.JobId);
+        DownloadJob job = LiveJob(h, added.JobId);
+        string tracksIdentity = job.PartialIdentity!;
+        RecoveryManifest.Write(job);
+        string manifest = RecoveryManifest.PathFor(snapshot.PartialPath);
+
+        string tracks = MergeTransfer.TracksPath(job);
+        File.Move(snapshot.PartialPath, tracks);
+        await File.WriteAllBytesAsync(snapshot.PartialPath, muxBytes);
+        h.OwnFixturePartial(added.JobId);
+        job = LiveJob(h, added.JobId);
+        var cursor = new MergeTransfer.Cursor(1, plan.Fingerprint, "muxed",
+            MuxLength: muxBytes.Length, MuxSha256: Convert.ToHexString(SHA256.HashData(muxBytes)),
+            TracksLength: tracksBytes.Length, TracksSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            MuxIdentity: job.PartialIdentity, TracksIdentity: tracksIdentity);
+        var extents = new ExtentSet();
+        extents.Add(new ByteRange(0, muxBytes.Length));
+        h.Engine.CommitCheckpoint(job, extents, JsonSerializer.Serialize(cursor),
+            totalBytes: muxBytes.Length, partialIdentity: job.PartialIdentity);
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.True(result.Cancelled, result.Message);
+        Assert.Null(h.Engine.Snapshot(added.JobId));
+        Assert.False(File.Exists(snapshot.PartialPath));
+        Assert.False(File.Exists(tracks));
+        Assert.False(File.Exists(manifest));
+    }
+
+    [Fact]
+    public async Task Cancel_retry_accepts_the_saved_mux_identity_after_tracks_were_removed()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        int failedPartialDelete = 0;
+        using var h = new Harness(point =>
+        {
+            if (point == "cancel.beforePartialDelete" && Interlocked.Exchange(ref failedPartialDelete, 1) == 0)
+                throw new IOException("Simulated partial delete refusal.");
+        }, options => options.MaxConcurrentJobs = 0);
+        MediaMergePlan plan = CancellationMergePlan();
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "merged.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot snapshot = h.Engine.Snapshot(added.JobId)!;
+        byte[] tracksBytes = [1, 3, 5, 7, 9, 11];
+        byte[] muxBytes = [2, 4, 6, 8, 10, 12];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, tracksBytes);
+        h.OwnFixturePartial(added.JobId);
+        DownloadJob job = LiveJob(h, added.JobId);
+        string tracksIdentity = job.PartialIdentity!;
+        string tracks = MergeTransfer.TracksPath(job);
+        File.Move(snapshot.PartialPath, tracks);
+        await File.WriteAllBytesAsync(snapshot.PartialPath, muxBytes);
+        h.OwnFixturePartial(added.JobId);
+        string muxIdentity = LiveJob(h, added.JobId).PartialIdentity!;
+
+        var cursor = new MergeTransfer.Cursor(1, plan.Fingerprint, "swapping",
+            MuxLength: muxBytes.Length, MuxSha256: Convert.ToHexString(SHA256.HashData(muxBytes)),
+            TracksLength: tracksBytes.Length, TracksSha256: Convert.ToHexString(SHA256.HashData(tracksBytes)),
+            MuxIdentity: muxIdentity, TracksIdentity: tracksIdentity);
+        job = LiveJob(h, added.JobId);
+        h.Engine.UpdateJob(job, current =>
+        {
+            current.PartialIdentity = tracksIdentity;
+            current.MediaState = JsonSerializer.Serialize(cursor);
+        });
+
+        CancelDownloadResult refused = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.False(refused.Cancelled);
+        Assert.False(File.Exists(tracks));
+        Assert.Equal(muxBytes, await File.ReadAllBytesAsync(snapshot.PartialPath));
+        Assert.True(h.Engine.Snapshot(added.JobId)!.IsCleanupPending);
+
+        CancelDownloadResult retried = await h.Engine.CancelDownloadAsync(added.JobId);
+
+        Assert.True(retried.Cancelled, retried.Message);
+        Assert.Null(h.Engine.Snapshot(added.JobId));
+        Assert.False(File.Exists(snapshot.PartialPath));
+    }
+
+    [Theory]
+    [InlineData(".vmeta.tmp")]
+    [InlineData(".tracks")]
+    [InlineData(".merging")]
+    [InlineData(".samples")]
+    [InlineData(".convert.mp4")]
+    [InlineData(".tagged.flac")]
+    public async Task Cancel_keeps_partial_and_unproved_staging_files(string suffix)
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/unowned-stage", "stage.bin", startNow: false);
+        JobSnapshot snapshot = h.Engine.Snapshot(id)!;
+        byte[] bytes = [2, 4, 6, 8];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, bytes);
+        h.OwnFixturePartial(id);
+        string stage = snapshot.PartialPath + suffix;
+        await File.WriteAllBytesAsync(stage, bytes);
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(id);
+
+        Assert.False(result.Cancelled);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(snapshot.PartialPath));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(stage));
+        JobSnapshot parked = h.Engine.Snapshot(id)!;
+        Assert.Equal(JobState.Cancelled, parked.State);
+        Assert.Equal("cancel-cleanup", parked.Reason);
+        Assert.True(parked.IsCleanupPending);
+    }
+
+    [Fact]
+    public async Task Cancel_keeps_an_unproved_conversion_rollback_backup()
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/rollback-stage", "rollback.bin", startNow: false);
+        JobSnapshot snapshot = h.Engine.Snapshot(id)!;
+        byte[] bytes = [1, 2, 3, 4];
+        await File.WriteAllBytesAsync(snapshot.PartialPath, bytes);
+        h.OwnFixturePartial(id);
+        string backup = Path.Combine(h.Downloads, $".vesper-rollback-{id:N}-{new string('B', 64)}");
+        await File.WriteAllBytesAsync(backup, bytes);
+
+        CancelDownloadResult result = await h.Engine.CancelDownloadAsync(id);
+
+        Assert.False(result.Cancelled);
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(snapshot.PartialPath));
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(backup));
+        JobSnapshot parked = h.Engine.Snapshot(id)!;
+        Assert.Equal(JobState.Cancelled, parked.State);
+        Assert.Equal("cancel-cleanup", parked.Reason);
+        Assert.True(parked.IsCleanupPending);
+    }
+
+    private static MediaMergePlan CancellationMergePlan() => new()
+    {
+        OutputContainer = "mp4",
+        RequireVideo = true,
+        Tracks =
+        [
+            new MergeTrack("video", "video-1", "https://media.example.test/video.mp4", 6, "mp4", "h264"),
+            new MergeTrack("audio", "audio-1", "https://media.example.test/audio.m4a", 6, "m4a", "aac")
+        ]
+    };
+
+    private static DownloadJob LiveJob(Harness h, Guid id) =>
+        ((Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!)[id];
+
     // ---- VES-010: a dead first address must not eat the whole connect budget -------------------------------
 
     [Fact]
@@ -29,7 +315,7 @@ public sealed class EngineReliabilityTests
         watch.Stop();
 
         Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5),
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1),
             $"Took {watch.Elapsed}; a black-holed first address should not consume the connect budget.");
     }
 
@@ -388,5 +674,38 @@ public sealed class BridgeClipRangeTests
         string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2}}";
         Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out _));
         Assert.Null(request.Clip);
+    }
+}
+
+public sealed class BridgeSubtitleEmbeddingTests
+{
+    private const string Session = "0123456789abcdef0123456789abcdef";
+
+    [Fact]
+    public void Explicit_subtitle_embedding_is_parsed_with_selected_languages()
+    {
+        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en-US\"],\"embedSubtitles\":true}}";
+        Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out string error), error);
+        Assert.True(request.EmbedSubtitles);
+        Assert.Equal(new[] { "en-US" }, request.SubtitleLanguages);
+    }
+
+    [Theory]
+    [InlineData("\"true\"")]
+    [InlineData("1")]
+    [InlineData("null")]
+    public void Invalid_embedding_preferences_are_refused(string value)
+    {
+        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en\"],\"embedSubtitles\":{value}}}";
+        Assert.False(BridgeProtocol.TryParse(json, out _, out string error));
+        Assert.Equal("Invalid subtitle embedding preference.", error);
+    }
+
+    [Fact]
+    public void Embedding_without_a_selected_language_is_refused()
+    {
+        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"embedSubtitles\":true}}";
+        Assert.False(BridgeProtocol.TryParse(json, out _, out string error));
+        Assert.Equal("Choose at least one subtitle language before embedding.", error);
     }
 }

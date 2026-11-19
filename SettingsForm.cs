@@ -38,6 +38,14 @@ internal sealed class SettingsForm : VesperPopupForm
     private TextBox _proxyAddress = null!;
     private VesperInputFrame _proxyFrame = null!;
     private TextBox _fileNameTemplate = null!;
+    private ListBox _siteRuleList = null!;
+    private TextBox _siteHost = null!;
+    private TextBox _siteFolder = null!;
+    private CheckBox _siteAudio = null!;
+    private CheckBox _siteNeverCapture = null!;
+    private bool _loadingSiteRule;
+    private bool _siteRuleDirty;
+    private Func<bool>? _saveSiteRuleEditor;
 
     public VesperPreferences Result => _draft.Clone();
     public SettingsForm() : this(new VesperPreferences()) { }
@@ -71,7 +79,7 @@ internal sealed class SettingsForm : VesperPopupForm
         (string Title, VesperIcon Icon)[] tabs =
         [
             ("Downloads", VesperIcon.Download), ("Transfers", VesperIcon.Gauge), ("Network", VesperIcon.Provider),
-            ("Appearance", VesperIcon.Leaf), ("Browser", VesperIcon.Link)
+            ("Appearance", VesperIcon.Leaf), ("Sites", VesperIcon.Provider), ("Browser", VesperIcon.Link)
         ];
         for (int i = 0; i < tabs.Length; i++)
         {
@@ -115,6 +123,7 @@ internal sealed class SettingsForm : VesperPopupForm
         BuildTransfers();
         BuildNetwork();
         BuildAppearance();
+        BuildSiteRules();
         BuildBrowser();
         ShowPage("Downloads");
         ClientSize = new Size(ClientSize.Width, ClientSize.Height + VesperDialogChrome.HeaderHeight);
@@ -295,20 +304,231 @@ internal sealed class SettingsForm : VesperPopupForm
         var tray = Check("Keep VESPER in the tray when I close the window", 25, 640, _draft.CloseToTray, v => _draft.CloseToTray = v);
         var collisions = Label("Existing files are never overwritten: a number is added to the new file's name instead.", 8, muted: true);
         collisions.SetBounds(25, 670, 490, 23);
+        var separator5 = Divider(705);
+        var openFolder = Check("Open the latest download folder when the queue finishes", 25, 718,
+            _draft.OpenFolderWhenQueueFinishes, value => _draft.OpenFolderWhenQueueFinishes = value);
+        var openFolderNote = Label("Uses the folder of the most recently completed file.", 8, muted: true);
+        openFolderNote.SetBounds(45, 746, 470, 22);
+        var sleepQueue = Check("Ask before putting the PC to sleep when the queue finishes", 25, 776,
+            _draft.SleepWhenQueueFinishes, value => _draft.SleepWhenQueueFinishes = value);
+        var sleepNote = Label("Choose Sleep now within 60 seconds. New downloads or exiting VESPER cancels the prompt.", 8, muted: true);
+        sleepNote.SetBounds(45, 804, 470, 36);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
-            separator4, notify, sound, previewSound, clipboard, tray, collisions]);
+            separator4, notify, sound, previewSound, clipboard, tray, collisions, separator5, openFolder,
+            openFolderNote, sleepQueue, sleepNote]);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
             browse.Left = Math.Max(308, right - browse.Width);
             frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
             int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
-            categoryNote.Width = missingNote.Width = collisions.Width = templateNote.Width = templatePreview.Width = noteWidth;
+            categoryNote.Width = missingNote.Width = collisions.Width = templateNote.Width = templatePreview.Width
+                = openFolderNote.Width = sleepNote.Width = noteWidth;
             templateFrame.Width = Math.Max(UiKit.Scale(this, 180), right - 50);
         }
         page.Resize += (_, _) => Layout();
         Layout();
+    }
+
+    private void BuildSiteRules()
+    {
+        var page = Page("Sites", "Choose a default behavior for an exact website host.");
+        var listLabel = Label("Site rules", 9, bold: true);
+        listLabel.SetBounds(25, 108, 400, 22);
+        _siteRuleList = new ListBox
+        {
+            Name = "siteRuleList", AccessibleName = "Site rules", IntegralHeight = false,
+            Location = new Point(25, 134), Size = new Size(505, 142),
+            BackColor = _colors.Surface, ForeColor = _colors.Text, Font = new Font("Segoe UI", 9)
+        };
+        var hostLabel = Label("Website host", 9, bold: true);
+        hostLabel.SetBounds(25, 287, 250, 22);
+        var (hostFrame, host) = Input("", 350);
+        hostFrame.SetBounds(25, 313, 350, 34);
+        host.Name = "siteHostInput";
+        host.AccessibleName = "Website host";
+        _siteHost = host;
+        var audio = Check("Prefer audio-only media", 25, 354, false, _ => { });
+        audio.Name = "siteAlwaysAudio";
+        audio.AccessibleName = "Prefer audio-only media on this site";
+        _siteAudio = audio;
+        var capture = Check("Keep automatic browser downloads in Chrome", 25, 384, false, _ => { });
+        capture.Name = "siteNeverCapture";
+        capture.AccessibleName = "Keep automatic browser downloads in Chrome for this site";
+        _siteNeverCapture = capture;
+
+        var folderLabel = Label("Always use this download folder", 9, bold: true);
+        folderLabel.SetBounds(25, 418, 310, 22);
+        var (folderFrame, folder) = Input("", 385);
+        folderFrame.SetBounds(25, 445, 385, 34);
+        folder.Name = "siteFolderInput";
+        folder.AccessibleName = "Website download folder";
+        _siteFolder = folder;
+        var browse = Button("Browse…", 96);
+        browse.SetBounds(434, 445, 96, 34);
+        browse.Click += (_, _) =>
+        {
+            using var picker = new FolderBrowserDialog { Description = "Folder for this website", UseDescriptionForTitle = true };
+            if (PathSafety.TryGetFullPath(_siteFolder.Text, out string selected, out _) && Directory.Exists(selected))
+                picker.SelectedPath = selected;
+            if (picker.ShowDialog(this) == DialogResult.OK) _siteFolder.Text = picker.SelectedPath;
+        };
+
+        var saveRule = Button("Add rule", 130, symbol: VesperIcon.Plus);
+        saveRule.Name = "saveSiteRule";
+        saveRule.AccessibleName = "Add or update site rule";
+        saveRule.SetBounds(25, 492, 130, 34);
+        var removeRule = Button("Remove rule", 130, symbol: VesperIcon.Trash);
+        removeRule.Name = "removeSiteRule";
+        removeRule.SetBounds(163, 492, 130, 34);
+        var note = Label("Hosts match exactly; add a separate rule for a subdomain. Audio-only is the starting choice. A folder chosen in a review dialog overrides the saved site folder for that download. VESPER stores the host, not the page address or query string.",
+            8, muted: true);
+        note.SetBounds(25, 538, 505, 42);
+        note.AutoEllipsis = false;
+
+        void MarkDirty()
+        {
+            if (!_loadingSiteRule) _siteRuleDirty = true;
+        }
+
+        void LoadSelectedRule()
+        {
+            _loadingSiteRule = true;
+            int selected = _siteRuleList.SelectedIndex;
+            if (selected >= 0 && selected < _draft.SiteRules.Count)
+            {
+                SiteRule rule = _draft.SiteRules[selected];
+                _siteHost.Text = rule.Host;
+                _siteAudio.Checked = rule.AlwaysAudio;
+                _siteFolder.Text = rule.Folder ?? "";
+                _siteNeverCapture.Checked = rule.NeverCapture;
+                saveRule.Text = "Update rule";
+                removeRule.Enabled = true;
+            }
+            else
+            {
+                _siteHost.Clear();
+                _siteAudio.Checked = false;
+                _siteFolder.Clear();
+                _siteNeverCapture.Checked = false;
+                saveRule.Text = "Add rule";
+                removeRule.Enabled = false;
+            }
+            _loadingSiteRule = false;
+            _siteRuleDirty = false;
+        }
+
+        void RefreshRules(int selected = -1)
+        {
+            _loadingSiteRule = true;
+            _siteRuleList.BeginUpdate();
+            _siteRuleList.Items.Clear();
+            foreach (SiteRule rule in _draft.SiteRules)
+            {
+                var choices = new List<string>();
+                if (rule.AlwaysAudio) choices.Add("audio");
+                if (rule.Folder is { Length: > 0 }) choices.Add("folder set");
+                if (rule.NeverCapture) choices.Add("keep in Chrome");
+                _siteRuleList.Items.Add(rule.Host + "  ·  " + string.Join("  ·  ", choices));
+            }
+            _siteRuleList.SelectedIndex = selected >= 0 && selected < _siteRuleList.Items.Count ? selected : -1;
+            _siteRuleList.EndUpdate();
+            _loadingSiteRule = false;
+            LoadSelectedRule();
+        }
+
+        bool SaveSiteRule()
+        {
+            if (!SiteRule.TryNormalizeHost(_siteHost.Text, out string host))
+            {
+                ShowPage("Sites");
+                _siteHost.Focus();
+                VesperMessageBox.Show(this, "Enter a website host such as example.com. Do not include a page path, port, or wildcard.",
+                    "Invalid website host", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+
+            string? folder = null;
+            if (!string.IsNullOrWhiteSpace(_siteFolder.Text))
+            {
+                if (!PathSafety.TryGetFullPath(_siteFolder.Text, out folder, out _))
+                {
+                    ShowPage("Sites");
+                    _siteFolder.Focus();
+                    VesperMessageBox.Show(this, "Choose a valid absolute folder path.", "Invalid site folder",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return false;
+                }
+            }
+            if (!_siteAudio.Checked && folder is null && !_siteNeverCapture.Checked)
+            {
+                ShowPage("Sites");
+                VesperMessageBox.Show(this, "Choose at least one site rule before saving.", "No site rule selected",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+
+            int selected = _siteRuleList.SelectedIndex;
+            int existing = _draft.SiteRules.FindIndex(rule => string.Equals(rule.Host, host, StringComparison.OrdinalIgnoreCase));
+            if (selected >= 0 && existing >= 0 && selected != existing)
+            {
+                ShowPage("Sites");
+                VesperMessageBox.Show(this, "A rule for that host already exists. Select it to make changes.",
+                    "Duplicate site rule", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+            int index = selected >= 0 ? selected : existing;
+            if (index < 0 && _draft.SiteRules.Count >= 100)
+            {
+                VesperMessageBox.Show(this, "VESPER supports up to 100 site rules.", "Site rule limit",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+            var updated = new SiteRule
+            {
+                Host = host, AlwaysAudio = _siteAudio.Checked, Folder = folder, NeverCapture = _siteNeverCapture.Checked
+            };
+            if (index < 0)
+            {
+                index = _draft.SiteRules.Count;
+                _draft.SiteRules.Add(updated);
+            }
+            else _draft.SiteRules[index] = updated;
+            RefreshRules(index);
+            return true;
+        }
+
+        _saveSiteRuleEditor = SaveSiteRule;
+
+        _siteRuleList.SelectedIndexChanged += (_, _) => LoadSelectedRule();
+        _siteHost.TextChanged += (_, _) => MarkDirty();
+        _siteFolder.TextChanged += (_, _) => MarkDirty();
+        _siteAudio.CheckedChanged += (_, _) => MarkDirty();
+        _siteNeverCapture.CheckedChanged += (_, _) => MarkDirty();
+        saveRule.Click += (_, _) => SaveSiteRule();
+        removeRule.Click += (_, _) =>
+        {
+            int index = _siteRuleList.SelectedIndex;
+            if (index < 0 || index >= _draft.SiteRules.Count) return;
+            _draft.SiteRules.RemoveAt(index);
+            RefreshRules(Math.Min(index, _draft.SiteRules.Count - 1));
+        };
+        page.Controls.AddRange([listLabel, _siteRuleList, hostLabel, hostFrame, audio, capture,
+            folderLabel, folderFrame, browse, saveRule, removeRule, note]);
+        void Layout()
+        {
+            int available = page.ClientSize.Width - 50;
+            int gap = UiKit.Scale(this, 8);
+            _siteRuleList.Width = Math.Max(UiKit.Scale(this, 200), available);
+            hostFrame.Width = Math.Max(UiKit.Scale(this, 200), available);
+            folderFrame.Width = Math.Max(UiKit.Scale(this, 200), available - browse.Width - gap);
+            browse.Left = folderFrame.Right + gap;
+            note.Width = Math.Max(UiKit.Scale(this, 200), available);
+        }
+        page.Resize += (_, _) => Layout();
+        Layout();
+        RefreshRules();
     }
 
     private void BuildTransfers()
@@ -472,9 +692,16 @@ internal sealed class SettingsForm : VesperPopupForm
         privateNote.SetBounds(45, 446, 480, 34);
         privateNote.AutoEllipsis = false;
         var sleep = Check("Keep the PC awake while downloads are running", 25, 488, _draft.PreventSleep, v => _draft.PreventSleep = v);
+        var metered = Check("Pause on metered or unknown networks", 25, 532, _draft.PauseOnMeteredNetwork,
+            v => _draft.PauseOnMeteredNetwork = v);
+        var meteredNote = Label("When enabled, Windows must report an unmetered connection. Choose Start now to allow one download.", 8, muted: true);
+        meteredNote.SetBounds(45, 559, 480, 34);
+        meteredNote.AutoEllipsis = false;
 
         page.Controls.AddRange([connLabel, connNote, connections, separator1, schedule, scheduleNote, _scheduleStartFrame, to, _scheduleEndFrame,
-            scheduleHint, separator2, proxyLabel, proxyNote, proxy, _proxyFrame, separator3, privateNetworks, privateNote, sleep]);
+            scheduleHint, separator2, proxyLabel, proxyNote, proxy, _proxyFrame, separator3, privateNetworks, privateNote, sleep,
+            metered, meteredNote]);
+        page.AutoScrollMinSize = new Size(0, 610);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
@@ -486,6 +713,7 @@ internal sealed class SettingsForm : VesperPopupForm
             scheduleNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
             scheduleHint.Width = Math.Max(UiKit.Scale(this, 120), right - scheduleHint.Left);
             privateNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
+            meteredNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -525,15 +753,6 @@ internal sealed class SettingsForm : VesperPopupForm
         var status = Label("", 8.5F, muted: true);
         status.SetBounds(25, 213, 505, 44);
         status.AutoEllipsis = false;
-        void Refresh()
-        {
-            status.Text = !NativeHostSetup.HostPresent
-                ? "The browser helper isn't included in this development build. The release installer installs it automatically."
-                : NativeHostSetup.IsRegistered
-                    ? "Desktop helper is registered. Enable the VESPER extension in your browser to start using it."
-                    : "Desktop helper found. The release installer normally registers it automatically.";
-        }
-
         var sep1 = Divider(265);
         var handoff = Label("When the butterfly captures a download", 9, bold: true);
         handoff.SetBounds(25, 283, 320, 22);
@@ -562,6 +781,7 @@ internal sealed class SettingsForm : VesperPopupForm
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
             { VesperMessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         };
+        VesperButton disconnect = null!;
         var repair = Button(NativeHostSetup.IsRegistered ? "Repair helper" : "Connect Chrome", 131, symbol: VesperIcon.Refresh);
         repair.SetBounds(213, 448, 131, 34);
         repair.Enabled = NativeHostSetup.HostPresent;
@@ -574,7 +794,7 @@ internal sealed class SettingsForm : VesperPopupForm
             if (error is not null) VesperMessageBox.Show(this, error, "Repair browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             Refresh();
         };
-        var disconnect = Button("Disconnect helper", 160, symbol: VesperIcon.Close);
+        disconnect = Button("Disconnect helper", 160, symbol: VesperIcon.Close);
         disconnect.SetBounds(354, 448, 160, 34);
         disconnect.Enabled = NativeHostSetup.IsRegistered;
         disconnect.Click += (_, _) =>
@@ -583,8 +803,20 @@ internal sealed class SettingsForm : VesperPopupForm
                 "Disconnect helper", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             string? problem = NativeHostSetup.Unregister();
             if (problem is not null) VesperMessageBox.Show(this, problem, "Browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            Refresh(); disconnect.Enabled = NativeHostSetup.IsRegistered;
+            Refresh();
         };
+        void Refresh()
+        {
+            bool hostPresent = NativeHostSetup.HostPresent;
+            bool registered = NativeHostSetup.IsRegistered;
+            status.Text = !hostPresent
+                ? "The browser helper isn't included in this development build. The release installer installs it automatically."
+                : registered
+                    ? "Desktop helper is registered. Enable the VESPER extension in your browser to start using it."
+                    : "Desktop helper found. The release installer normally registers it automatically.";
+            ApplyBrowserHelperState(repair, disconnect, hostPresent, registered);
+        }
+
         var updates = Button("Check for updates", 182, symbol: VesperIcon.Refresh);
         updates.SetBounds(25, 539, 182, 34);
         updates.Click += async (_, _) =>
@@ -639,6 +871,14 @@ internal sealed class SettingsForm : VesperPopupForm
             handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
         };
         Refresh();
+    }
+
+    internal static void ApplyBrowserHelperState(VesperButton repair, VesperButton disconnect,
+        bool hostPresent, bool registered)
+    {
+        repair.Text = registered ? "Repair helper" : "Connect Chrome";
+        repair.Enabled = hostPresent;
+        disconnect.Enabled = registered;
     }
 
     private void ExportDiagnostics()
@@ -714,6 +954,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void Save()
     {
+        if (_siteRuleDirty && _saveSiteRuleEditor is not null && !_saveSiteRuleEditor()) return;
         if (!FileNames.TryValidateTemplate(_draft.FileNameTemplate, out string templateProblem))
         {
             ShowPage("Downloads");

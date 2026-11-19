@@ -13,6 +13,8 @@ namespace Vesper.Engine;
 public sealed record MergeTrack(string Role, string FormatId, string Url, long Size, string Container,
     string? Codec = null, string? Identity = null, string? Language = null, MergeMediaSource? Source = null);
 
+public sealed record MergeSubtitle(string Url, string Format, string Language, string? Name = null);
+
 /// <summary>Plan for a segmented rendition. HLS resolves a static playlist at run time; DASH has explicit fMP4 parts.</summary>
 public sealed record MergeMediaSource(string Protocol, string? PlaylistUrl = null, DashDownloadPlan? Dash = null);
 
@@ -55,6 +57,7 @@ public sealed record MediaMergePlan
     public MediaTimeRange? ClipRange { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public MediaTimeRange? OutputRange { get; init; }
+    public IReadOnlyList<MergeSubtitle> Subtitles { get; init; } = [];
 
     public string ToJson() => JsonSerializer.Serialize(this);
     public long TotalBytes => Tracks.Where(t => t.Source is null).Sum(t => t.Size);
@@ -87,6 +90,13 @@ public sealed record MediaMergePlan
                   .Append(t.Container).Append(',').Append(t.Codec).Append(',').Append(t.Identity).Append(',').Append(t.Language);
                 if (t.Source is not null)
                     sb.Append(",S:").Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(t.Source)))));
+            }
+            foreach (MergeSubtitle subtitle in Subtitles)
+            {
+                if (!Uri.TryCreate(subtitle.Url, UriKind.Absolute, out Uri? uri)) continue;
+                sb.Append("|S:").Append(HttpTransport.ResourceIdentity(uri)).Append(',')
+                    .Append(JsonSerializer.Serialize(new[] { subtitle.Format, subtitle.Language, subtitle.Name ?? "" }))
+                    .Append(',').Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(uri.Query))));
             }
             return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
         }
@@ -121,31 +131,54 @@ public sealed record MediaMergePlan
         try
         {
             var value = JsonSerializer.Deserialize<MediaMergePlan>(json, new JsonSerializerOptions { MaxDepth = 12 });
-            if (value is null || value.Version is not (1 or 2) || !Outputs.Contains(value.OutputContainer)
+            if (value is null || value.Version is not (1 or 2 or 3) || !Outputs.Contains(value.OutputContainer)
                 || value.Tracks is not { Count: >= 1 and <= 4 }
+                || value.Subtitles is not { Count: <= 25 }
                 || (value.Provider?.Length ?? 0) > 80 || (value.MediaId?.Length ?? 0) > 256) return false;
             if (value.Metadata is { } metadata && !ValidMetadata(metadata)) return false;
             bool segmented = value.Tracks.Any(track => track?.Source is not null);
+            bool muxed = value.Tracks.Any(track => track?.Role == "muxed");
+            int expectedVersion = segmented ? 2 : value.Subtitles.Count > 0 || muxed ? 3 : 1;
+            if (value.Version != expectedVersion) return false;
             if (value.OutputRange is { IsValid: false }) return false;
             if (value.ClipRange is { IsValid: false } || value.ClipRange is not null && !segmented) return false;
             if (value.ClipRange is not null && value.Tracks.Any(track => track.Source?.Dash?.Fragments.Any(fragment => fragment.DurationSeconds is null) == true)) return false;
-            if (segmented != (value.Version == 2) || (segmented && value.Tracks.Any(track => track?.Source is null))) return false;
-            int videos = 0, audios = 0;
+            if (segmented && value.Tracks.Any(track => track?.Source is null)) return false;
+            int videos = 0, audios = 0, muxedTracks = 0;
             foreach (var t in value.Tracks)
             {
-                if (t is null || t.Role is not ("video" or "audio") || t.FormatId is not { Length: > 0 and <= 256 }
+                if (t is null || t.Role is not ("video" or "audio" or "muxed") || t.FormatId is not { Length: > 0 and <= 256 }
                     || (t.Source is null ? t.Size <= 0 || t.Size > MaxTrackBytes : t.Size != 0)
                     || t.Container is not ("mp4" or "m4a" or "webm" or "ts")
                     || (t.Identity?.Length ?? 0) > 512 || (t.Codec?.Length ?? 0) > 64 || (t.Language?.Length ?? 0) > 35
                     || t.Url is not { Length: > 0 and <= 16384 } || !UrlPolicy.TryParse(t.Url, out var uri, out _)) return false;
                 UrlPolicy.EnsureAllowed(uri, allowPrivate);
                 if (t.Source is { } source && !ValidSource(t, source, allowPrivate)) return false;
-                if (t.Role == "video") videos++; else audios++;
+                if (t.Role == "video") videos++;
+                else if (t.Role == "audio") audios++;
+                else { muxedTracks++; videos++; audios++; }
             }
+            if (muxedTracks > 0 && (muxedTracks != 1 || value.Tracks.Count != 1 || segmented)) return false;
             if (videos > 1 || (value.RequireVideo && videos == 0) || (value.RequireAudio && audios == 0)) return false;
             if (segmented && (videos != 1 || audios != 1 || !value.RequireVideo || !value.RequireAudio
                 || value.Tracks.Select(t => t.Source!.Protocol).Distinct(StringComparer.Ordinal).Count() != 1)) return false;
             if (value.OutputContainer == "m4a" && videos > 0) return false;
+            if (value.Subtitles.Count > 0)
+            {
+                if (value.OutputContainer is not ("mkv" or "mp4") || segmented || value.ClipRange is not null
+                    || value.OutputRange is not null || !value.RequireVideo)
+                    return false;
+                foreach (MergeSubtitle? subtitle in value.Subtitles)
+                {
+                    if (subtitle is null || subtitle.Format is not ("srt" or "vtt")
+                        || !ValidSubtitleLanguage(subtitle.Language)
+                        || (subtitle.Name?.Length ?? 0) > 128
+                        || subtitle.Name?.Any(char.IsControl) == true
+                        || subtitle.Url is not { Length: > 0 and <= 16384 }
+                        || !UrlPolicy.TryParse(subtitle.Url, out Uri subtitleUri, out _)) return false;
+                    UrlPolicy.EnsureAllowed(subtitleUri, allowPrivate);
+                }
+            }
             plan = value;
             error = "";
             return true;
@@ -224,4 +257,12 @@ public sealed record MediaMergePlan
                 System.Globalization.DateTimeStyles.None, out _)
             || DateOnly.TryParseExact(value, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
                 System.Globalization.DateTimeStyles.None, out _));
+
+    private static bool ValidSubtitleLanguage(string? value)
+    {
+        if (value is not { Length: >= 2 and <= 35 }) return false;
+        string[] parts = value.Split('-');
+        if (parts.Length == 0 || parts[0].Length is < 2 or > 3 || parts[0].Any(c => !char.IsAsciiLetter(c))) return false;
+        return parts.Skip(1).All(part => part.Length is >= 1 and <= 8 && part.All(char.IsAsciiLetterOrDigit));
+    }
 }

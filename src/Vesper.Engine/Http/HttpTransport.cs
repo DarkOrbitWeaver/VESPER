@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
 using Vesper.Shared;
 
 namespace Vesper.Engine;
@@ -15,7 +17,8 @@ public sealed record RequestSpec(
     string? Referer = null,
     string? UserAgent = null,
     IReadOnlyDictionary<string, string>? Secrets = null,
-    string? CredentialOrigin = null);
+    string? CredentialOrigin = null,
+    string? ExpectedResourceIdentity = null);
 
 internal sealed record RequestCredentials(Uri Origin, IReadOnlyDictionary<string, string> Headers);
 
@@ -155,7 +158,17 @@ internal sealed class HttpTransport : IDisposable
                 }
                 if (delay is { } wait) _options.Cooldown.Remember(current, now + wait);
             }
-            if (!IsRedirect(response.StatusCode)) return response;
+            if (!IsRedirect(response.StatusCode))
+            {
+                if (spec.ExpectedResourceIdentity is { Length: > 0 } expected
+                    && (!IsResourceIdentity(expected)
+                        || !string.Equals(expected, ResourceIdentity(current), StringComparison.Ordinal)))
+                {
+                    response.Dispose();
+                    throw new RedirectException("The download link now points to a different file location. Saved data was kept.");
+                }
+                return response;
+            }
 
             Uri? location = response.Headers.Location;
             response.Dispose();
@@ -220,6 +233,17 @@ internal sealed class HttpTransport : IDisposable
     private static bool IsRedirect(HttpStatusCode code) =>
         code is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.SeeOther
             or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
+
+    internal static string ResourceIdentity(Uri uri)
+    {
+        // Signed query values can rotate, so a query-only change is treated as the same resource.
+        var resource = new UriBuilder(uri) { Query = "", Fragment = "" }.Uri;
+        string normalized = UrlPolicy.Normalize(resource);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+    }
+
+    internal static bool IsResourceIdentity(string? identity) =>
+        identity is { Length: 64 } && identity.All(Uri.IsHexDigit);
 
     private async Task<IPAddress> ResolveProxyDestinationAsync(Uri uri, CancellationToken ct)
     {

@@ -195,6 +195,31 @@ public sealed class MediaConversionTests
         Assert.InRange(Math.Abs(info.Duration - sourceAudio.DurationSeconds), 0, 0.05);
     }
 
+    [Fact]
+    public async Task WaveAudioWritesAndReadsRf64SizeTable()
+    {
+        using var decoded = new MemoryStream();
+        using (var writer = new BinaryWriter(decoded, Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write("RIFF"u8); writer.Write(0u); writer.Write("WAVEfmt "u8); writer.Write(16u);
+            writer.Write((short)1); writer.Write((short)1); writer.Write(8000); writer.Write(16000);
+            writer.Write((short)2); writer.Write((short)16); writer.Write("data"u8); writer.Write(8u);
+            writer.Write(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
+            writer.Seek(4, SeekOrigin.Begin); writer.Write((uint)(decoded.Length - 8));
+        }
+
+        using var rf64 = new MemoryStream();
+        await WaveAudio.WriteAsync(decoded, rf64, null, null, CancellationToken.None, forceRf64: true);
+
+        Assert.Equal("RF64", Encoding.ASCII.GetString(rf64.GetBuffer(), 0, 4));
+        Assert.Equal(uint.MaxValue, BitConverter.ToUInt32(rf64.GetBuffer(), 4));
+        Assert.Equal(8UL, BitConverter.ToUInt64(rf64.GetBuffer(), 28));
+        Assert.Equal(4UL, BitConverter.ToUInt64(rf64.GetBuffer(), 36));
+        WaveAudio.Info result = WaveAudio.Read(rf64);
+        Assert.Equal(4, result.SampleCount);
+        Assert.Equal(8, result.DataBytes);
+    }
+
     [WindowsFact]
     [Trait("Category", "ConversionBenchmark")]
     [SupportedOSPlatform("windows")]
@@ -249,7 +274,46 @@ public sealed class MediaConversionTests
         JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
         Assert.Equal("saved-original", done.Reason);
         Assert.Equal("audio.mp4", done.FileName);
-        Assert.Equal(audio, File.ReadAllBytes(Assert.Single(h.Files())));
+        string[] files = h.Files();
+        Assert.True(files.Length == 1, $"Unexpected files: {string.Join(", ", files)}\n{string.Join("\n", h.Engine.ReadLog())}");
+        Assert.Equal(audio, File.ReadAllBytes(files[0]));
+    }
+
+    [Fact]
+    public async Task Generic_wav_failure_keeps_the_approved_saved_original_fallback()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness(convertMedia: (_, _, target, _, _) => File.WriteAllBytes(target, [1, 2, 3]));
+
+        Guid id = AddAudio(harness, server, MediaOutput.Wav);
+        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("saved-original", done.Reason);
+        Assert.Equal("audio.mp4", done.FileName);
+        Assert.Equal(audio, File.ReadAllBytes(Assert.Single(harness.Files())));
+    }
+
+    [Fact]
+    public async Task Failed_wav_clip_does_not_publish_the_unclipped_original()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness(convertMedia: (_, _, target, _, _) => File.WriteAllBytes(target, [1, 2, 3]));
+        MediaTimeRange range = new(.1, .3);
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/audio.mp4"), FileName: "audio.mp4",
+            MediaProvider: "fixture", Output: MediaOutput.Wav, MediaPlanJson: System.Text.Json.JsonSerializer.Serialize(range)));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot failed = await harness.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+
+        Assert.Null(failed.FinalPath);
+        Assert.Contains("WAV output", failed.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(audio, await File.ReadAllBytesAsync(failed.PartialPath));
+        Assert.Equal(new byte[] { 1, 2, 3 }, await File.ReadAllBytesAsync(failed.PartialPath + ".convert.wav"));
+        Assert.False(File.Exists(Path.Combine(harness.Downloads, "audio.wav")));
     }
 
     [Theory]
@@ -282,14 +346,44 @@ public sealed class MediaConversionTests
 
         h.Restart();
         JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
-        Assert.Equal(moved ? "audio.m4a" : "audio (1).m4a", done.FileName);
+        Assert.True(done.FileName == (moved ? "audio.m4a" : "audio (1).m4a"),
+            $"Unexpected published name: {done.FileName}\n{string.Join(Environment.NewLine, h.Engine.ReadLog())}");
         Assert.Equal("", done.Reason);
         Assert.Equal(audio, File.ReadAllBytes(done.FinalPath!));
         Assert.Equal(audio.LongLength, done.TotalBytes);
         Assert.Equal("audio/mp4", done.ContentType);
         Assert.Equal("unrelated", File.ReadAllText(occupied));
         Assert.Equal(2, h.Files().Length);
-        Assert.Equal(moved ? 1 : 2, conversions);
+        Assert.Equal(1, conversions);
+    }
+
+    [Fact]
+    public async Task Recovery_does_not_accept_a_same_content_replacement_for_a_prepared_conversion()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var crashed = new ManualResetEventSlim();
+        using var harness = new Harness(failpoint: point =>
+        {
+            if (point != "finalize.afterMove") return;
+            crashed.Set();
+            throw new FailpointCrash(point);
+        }, convertMedia: (source, _, target, _, _) => File.Copy(source, target));
+
+        Guid id = AddAudio(harness, server);
+        Assert.True(crashed.Wait(TimeSpan.FromSeconds(10)), "The conversion did not reach the move failpoint.");
+        string published = Path.Combine(harness.Downloads, "audio.m4a");
+        Assert.Equal(audio, File.ReadAllBytes(published));
+        File.Delete(published);
+        File.WriteAllBytes(published, audio);
+
+        harness.Restart();
+        JobSnapshot attention = await harness.WaitForStateAsync(id, JobState.NeedsAttention);
+
+        Assert.Equal("finalize-lost", attention.Reason);
+        Assert.Null(attention.FinalPath);
+        Assert.Equal(audio, File.ReadAllBytes(published));
     }
 
     private static Guid AddAudio(Harness h, FaultServer server, MediaOutput output = MediaOutput.M4a)

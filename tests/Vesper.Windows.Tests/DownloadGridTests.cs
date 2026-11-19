@@ -153,4 +153,32 @@ public sealed class DownloadGridTests
         Assert.True(grid.AutoScrollPosition.Y < 0);
         Assert.False(grid.Reveal(Guid.NewGuid()));
     }
+
+    [Fact]
+    public void Keyboard_focus_stays_with_the_same_download_when_rows_reorder()
+    {
+        var first = new DownloadItem { Id = Guid.NewGuid(), Name = "first.bin" };
+        var focused = new DownloadItem { Id = Guid.NewGuid(), Name = "focused.bin" };
+        var last = new DownloadItem { Id = Guid.NewGuid(), Name = "last.bin" };
+        using var grid = new DownloadGrid { Size = new Size(640, 300) };
+        grid.CreateControl();
+        grid.SetItems([first, focused, last]);
+        Assert.True(grid.Reveal(focused.Id));
+        var refreshedFocused = new DownloadItem { Id = focused.Id, Name = "focused-refresh.bin" };
+        grid.SetItems(
+        [
+            new DownloadItem { Id = last.Id, Name = "last-refresh.bin" },
+            new DownloadItem { Id = first.Id, Name = "first-refresh.bin" },
+            refreshedFocused
+        ]);
+
+        DownloadItem? opened = null;
+        grid.DetailsRequested += item => opened = item;
+        var onKeyDown = typeof(DownloadGrid).GetMethod("OnKeyDown",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        onKeyDown.Invoke(grid, [new KeyEventArgs(Keys.Enter)]);
+
+        Assert.Equal(focused.Id, opened?.Id);
+        Assert.Equal("focused-refresh.bin", opened?.Name);
+    }
 }

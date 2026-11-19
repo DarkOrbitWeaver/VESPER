@@ -22,6 +22,7 @@ public sealed class MediaDiscoveryFormTests
 
         Assert.Empty(off.SubtitleLanguages);
         Assert.False(off.IncludeAutoSubtitles);
+        Assert.False(off.EmbedSubtitles);
         Assert.Equal(new[] { "en", "fr" }, several.SubtitleLanguages);
         Assert.False(several.IncludeAutoSubtitles);
         Assert.Equal(new[] { "en", "es" }, generated.SubtitleLanguages);

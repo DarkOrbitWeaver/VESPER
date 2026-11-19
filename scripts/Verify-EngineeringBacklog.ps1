@@ -17,7 +17,7 @@ foreach ($row in $rows) {
     $seen[$row.ID] = $true
 }
 
-$matches = [regex]::Matches($todo, '(?m)^\s*-\s*\[(?<mark>[ xX])\]\s*\*\*(?<id>(?:VES-\d{3}|VSP-\d{3}|USER-[A-Z0-9-]+|N-\d{2}))\b')
+$matches = [regex]::Matches($todo, '(?m)^\s*-\s*\[(?<mark>[ xX])\]\s*\*\*(?<id>(?:VES-\d{3}|VSP-\d{3}|USER-[A-Z0-9-]+|N-\d{2}|AUDIT-EXTRA-\d{3}))\b')
 $checks = @{}
 foreach ($match in $matches) {
     $id = $match.Groups['id'].Value

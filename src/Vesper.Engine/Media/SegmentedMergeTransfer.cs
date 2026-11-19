@@ -21,7 +21,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         long Offset = 0, string PrefixHash = "", int[]? CompletedParts = null, long[]? PartLengths = null,
         string?[]? SourceFingerprints = null, long MuxLength = 0, string? MuxSha256 = null,
         string[]? KeyFingerprints = null, string?[]? SourceShapeFingerprints = null,
-        long TracksLength = 0, string? TracksSha256 = null);
+        long TracksLength = 0, string? TracksSha256 = null, string? MuxIdentity = null, string? TracksIdentity = null);
 
     internal async Task<RunOutcome> RunAsync(MediaMergePlan plan, CancellationToken ct)
     {
@@ -489,113 +489,146 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     {
         string mergingPath = MergeTransfer.MergingPath(Job);
         string samplesPath = Job.PartialPath + ".samples";
-        long length;
-        string sha;
-        bool ownsSamples = false;
-        session.CloseFile();
+        if (MergeTransfer.PathExists(mergingPath) || MergeTransfer.PathExists(samplesPath))
+            return Stop("An unfinished merge sidecar has no saved ownership proof. Saved renditions and the sidecar were kept.");
+
+        string? samplesIdentity = null;
+        string? mergingIdentity = null;
+        string? tracksIdentity = null;
+        bool swapCursorSaved = false;
+        bool preserveStageForCrash = false;
         try
         {
-            using var source = PartialFile.OpenOwnedRead(Job, options: FileOptions.RandomAccess);
-            if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
-            using var samples = PathSafety.OpenTemporaryStream(samplesPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.RandomAccess);
-            ownsSamples = true;
-            var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
-            int partIndex = 0;
-            long trackOffset = 0;
-            for (int i = 0; i < tracks.Length; i++)
+            long length;
+            string sha;
+            session.CloseFile();
+            try
             {
-                PreparedTrack prepared = tracks[i];
-                if (completed[i] != prepared.Parts.Count) return Stop("A committed rendition is missing segments.");
-                long[] sizes = partLengths.Skip(partIndex).Take(completed[i]).ToArray();
-                partIndex += completed[i];
-                long trackLength = sizes.Sum();
-                TrackKind kind = prepared.Track.Role == "video" ? TrackKind.Video : TrackKind.Audio;
-                List<DemuxedTrack> demuxed;
-                Stream sampleSource;
-                if (prepared.Fragmented)
+                using var source = PartialFile.OpenOwnedRead(Job, options: FileOptions.RandomAccess);
+                if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
+                tracksIdentity = PathSafety.TemporaryFileIdentity(source.SafeFileHandle)
+                    ?? throw new IOException("Stable temporary file identity is not supported on this platform.");
+                using var samples = MergeTransfer.CreateNewSidecar(samplesPath, FileOptions.RandomAccess);
+                samplesIdentity = MergeTransfer.CaptureSidecarIdentity(samples);
+                var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
+                int partIndex = 0;
+                long trackOffset = 0;
+                for (int i = 0; i < tracks.Length; i++)
                 {
-                    demuxed = DemuxFragmented(source, trackOffset, sizes, kind, prepared.Track.Codec, ct);
-                    sampleSource = source;
+                    PreparedTrack prepared = tracks[i];
+                    if (completed[i] != prepared.Parts.Count) return Stop("A committed rendition is missing segments.");
+                    long[] sizes = partLengths.Skip(partIndex).Take(completed[i]).ToArray();
+                    partIndex += completed[i];
+                    long trackLength = sizes.Sum();
+                    TrackKind kind = prepared.Track.Role == "video" ? TrackKind.Video : TrackKind.Audio;
+                    List<DemuxedTrack> demuxed;
+                    Stream sampleSource;
+                    if (prepared.Fragmented)
+                    {
+                        demuxed = DemuxFragmented(source, trackOffset, sizes, kind, prepared.Track.Codec, ct);
+                        sampleSource = source;
+                    }
+                    else
+                    {
+                        using var region = new RegionStream(source, trackOffset, trackLength);
+                        demuxed = MpegTsDemuxer.Read(region, trackLength, samples, ct);
+                        sampleSource = samples;
+                    }
+                    DemuxedTrack[] selectedTracks = [.. demuxed.Where(track => track.Kind == kind)];
+                    if (selectedTracks.Length == 0)
+                        return RunOutcome.NeedsAttention(kind == TrackKind.Audio ? "missing-audio" : "missing-video",
+                            $"The selected {prepared.Track.Role} rendition contains no {prepared.Track.Role} track. Saved data was kept.");
+                    if (selectedTracks.Length > 1)
+                        throw new MediaContainerException($"The selected {prepared.Track.Role} rendition contains multiple {prepared.Track.Role} tracks.");
+                    DemuxedTrack selected = selectedTracks[0];
+                    if (prepared.Track.Codec is { } expected && !selected.Codec.Equals(expected, StringComparison.OrdinalIgnoreCase))
+                        throw new MediaContainerException($"The selected {prepared.Track.Role} codec differs from the playlist metadata.");
+                    if (selected.Language == "und" && prepared.Track.Language is { Length: 3 } language)
+                        selected.Language = language.ToLowerInvariant();
+                    inputs.Add((selected, sampleSource));
+                    trackOffset += trackLength;
                 }
-                else
+                samples.Flush(flushToDisk: true);
+                if (inputs.Count == 2) ValidateTimeline(inputs);
+                if (plan.ClipRange is not null)
                 {
-                    using var region = new RegionStream(source, trackOffset, trackLength);
-                    demuxed = MpegTsDemuxer.Read(region, trackLength, samples, ct);
-                    sampleSource = samples;
+                    double actualStart = tracks.Min(track => track.ActualStartSeconds ?? 0);
+                    double actualEnd = tracks.Max(track => track.ActualEndSeconds ?? 0);
+                    string range = MediaTimeRange.Describe(actualStart, actualEnd);
+                    engine.UpdateJob(Job, job =>
+                    {
+                        string quality = job.MediaQuality ?? "Media";
+                        int priorRange = quality.IndexOf(" · Segment-aligned ", StringComparison.Ordinal);
+                        if (priorRange >= 0) quality = quality[..priorRange];
+                        job.MediaQuality = quality + " · " + range;
+                    });
                 }
-                DemuxedTrack[] selectedTracks = [.. demuxed.Where(track => track.Kind == kind)];
-                if (selectedTracks.Length == 0)
-                    return RunOutcome.NeedsAttention(kind == TrackKind.Audio ? "missing-audio" : "missing-video",
-                        $"The selected {prepared.Track.Role} rendition contains no {prepared.Track.Role} track. Saved data was kept.");
-                if (selectedTracks.Length > 1)
-                    throw new MediaContainerException($"The selected {prepared.Track.Role} rendition contains multiple {prepared.Track.Role} tracks.");
-                DemuxedTrack selected = selectedTracks[0];
-                if (prepared.Track.Codec is { } expected && !selected.Codec.Equals(expected, StringComparison.OrdinalIgnoreCase))
-                    throw new MediaContainerException($"The selected {prepared.Track.Role} codec differs from the playlist metadata.");
-                if (selected.Language == "und" && prepared.Track.Language is { Length: 3 } language)
-                    selected.Language = language.ToLowerInvariant();
-                inputs.Add((selected, sampleSource));
-                trackOffset += trackLength;
-            }
-            samples.Flush(flushToDisk: true);
-            if (inputs.Count == 2) ValidateTimeline(inputs);
-            if (plan.ClipRange is not null)
-            {
-                double actualStart = tracks.Min(track => track.ActualStartSeconds ?? 0);
-                double actualEnd = tracks.Max(track => track.ActualEndSeconds ?? 0);
-                string range = MediaTimeRange.Describe(actualStart, actualEnd);
-                engine.UpdateJob(Job, job =>
+                long outputPayloadBytes = inputs.Sum(input => input.Track.PayloadBytes);
+                EnsureSpace(outputPayloadBytes + (1 << 20));
+                string? container = MediaMerger.ChooseContainer(inputs.Select(input => input.Track).ToList(), plan.OutputContainer);
+                if (container is null)
+                    return RunOutcome.NeedsAttention("unsupported-container",
+                        $"The downloaded codecs ({string.Join(", ", inputs.Select(input => input.Track.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Saved data was kept.");
+                MediaThumbnail? thumbnail = container is "mp4" or "m4a" or "webm" or "mkv"
+                    ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
+                    : null;
+                using (var output = MergeTransfer.CreateNewSidecar(mergingPath))
                 {
-                    string quality = job.MediaQuality ?? "Media";
-                    int priorRange = quality.IndexOf(" · Segment-aligned ", StringComparison.Ordinal);
-                    if (priorRange >= 0) quality = quality[..priorRange];
-                    job.MediaQuality = quality + " · " + range;
-                });
+                    mergingIdentity = MergeTransfer.CaptureSidecarIdentity(output);
+                    MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
+                    output.Flush(flushToDisk: true);
+                    length = output.Length;
+                    MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
+                    output.Position = 0;
+                    sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+                }
+                engine.Failpoint("merge.afterStageWrite");
             }
-            long outputPayloadBytes = inputs.Sum(input => input.Track.PayloadBytes);
-            EnsureSpace(outputPayloadBytes + (1 << 20));
-            string? container = MediaMerger.ChooseContainer(inputs.Select(input => input.Track).ToList(), plan.OutputContainer);
-            if (container is null)
-                return RunOutcome.NeedsAttention("unsupported-container",
-                    $"The downloaded codecs ({string.Join(", ", inputs.Select(input => input.Track.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Saved data was kept.");
-            MediaThumbnail? thumbnail = container is "mp4" or "m4a" or "webm" or "mkv"
-                ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
-                : null;
-            using (var output = PathSafety.OpenTemporaryStream(mergingPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20))
+            catch (MediaContainerException ex)
             {
-                MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
-                output.Flush(flushToDisk: true);
-                length = output.Length;
-                MediaMerger.Validate(output, length, inputs.Select(input => input.Track).ToList(), ct, merged.Metadata, merged.ThumbnailSha256);
-                output.Position = 0;
-                sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+                return RunOutcome.NeedsAttention("invalid-container", ex.Message + " Nothing was published; saved data was kept.");
             }
-        }
-        catch (MediaContainerException ex)
-        {
-            TryDelete(mergingPath);
-            return RunOutcome.NeedsAttention("invalid-container", ex.Message + " Nothing was published; saved data was kept.");
-        }
-        catch (IOException ex) when (ErrorClassifier.IsDiskFull(ex))
-        {
-            TryDelete(mergingPath);
-            return RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to merge. Saved data was kept.");
-        }
-        finally { if (ownsSamples) TryDelete(samplesPath); }
+            catch (IOException ex) when (ErrorClassifier.IsDiskFull(ex))
+            {
+                return RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to merge. Saved data was kept.");
+            }
 
-        if (MergeTransfer.PathExists(MergeTransfer.TracksPath(Job))) return Stop("An older merge sidecar is in the way.");
-        ct.ThrowIfCancellationRequested();
-        var swap = new Cursor(1, fingerprint, "swapping", MuxLength: length, MuxSha256: sha,
-            TracksLength: partLengths.Sum(), TracksSha256: ReadCursor()?.PrefixHash);
-        engine.UpdateJob(Job, job => job.MediaState = JsonSerializer.Serialize(swap));
-        engine.Failpoint("merge.beforeSwap");
-        return await FinishSwapAsync(swap, ct).ConfigureAwait(false);
+            if (MergeTransfer.PathExists(MergeTransfer.TracksPath(Job))) return Stop("An older merge sidecar is in the way.");
+            ct.ThrowIfCancellationRequested();
+            var swap = new Cursor(1, fingerprint, "swapping", MuxLength: length, MuxSha256: sha,
+                TracksLength: partLengths.Sum(), TracksSha256: ReadCursor()?.PrefixHash, MuxIdentity: mergingIdentity,
+                TracksIdentity: tracksIdentity);
+            string swapState = JsonSerializer.Serialize(swap);
+            try
+            {
+                engine.UpdateJob(Job, job => job.MediaState = swapState);
+                swapCursorSaved = true;
+            }
+            catch
+            {
+                swapCursorSaved = string.Equals(Job.MediaState, swapState, StringComparison.Ordinal);
+                throw;
+            }
+            engine.Failpoint("merge.beforeSwap");
+            return await FinishSwapAsync(swap, ct).ConfigureAwait(false);
+        }
+        catch (FailpointCrash)
+        {
+            preserveStageForCrash = true;
+            throw;
+        }
+        finally
+        {
+            if (!swapCursorSaved && !preserveStageForCrash && mergingIdentity is not null)
+                TryDelete(mergingPath, mergingIdentity);
+            if (samplesIdentity is not null) TryDelete(samplesPath, samplesIdentity);
+        }
     }
 
     private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
     {
         string? identity = await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
-            cursor.TracksLength, cursor.TracksSha256, ct).ConfigureAwait(false);
+            cursor.TracksLength, cursor.TracksSha256, cursor.MuxIdentity, cursor.TracksIdentity, ct).ConfigureAwait(false);
         var extents = new ExtentSet();
         extents.Add(new ByteRange(0, cursor.MuxLength));
         DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
@@ -756,7 +789,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     private static RunOutcome NeedsAttention(string reason, string message) => RunOutcome.NeedsAttention(reason, message + " Saved data was kept.");
     private static RunOutcome Stop(string reason) => NeedsAttention("merge-integrity", reason);
 
-    private static void TryDelete(string path) => _ = PathSafety.TryDeleteTemporaryFile(path, out _);
+    private static void TryDelete(string path, string? expectedIdentity) =>
+        _ = MergeTransfer.TryDeleteSidecar(path, expectedIdentity, out _);
 
     private sealed class HlsKeyCache : IDisposable
     {

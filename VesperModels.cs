@@ -1,4 +1,6 @@
 using System.Drawing;
+using System.Globalization;
+using System.Net;
 using Vesper.Engine;
 
 namespace VESPER;
@@ -188,10 +190,14 @@ internal sealed class VesperPreferences
     public int MaxConnectionsPerJob { get; set; } = 4;
     public bool NotifyOnFinish { get; set; } = true;
     public bool PlayCompletionSound { get; set; } = true;
+    public bool OpenFolderWhenQueueFinishes { get; set; }
+    public bool SleepWhenQueueFinishes { get; set; }
     public bool WatchClipboard { get; set; }
     public bool PreventSleep { get; set; }
+    public bool PauseOnMeteredNetwork { get; set; }
     public bool CloseToTray { get; set; } = true;
     public bool AllowPrivateNetworks { get; set; }
+    public List<SiteRule> SiteRules { get; set; } = [];
     public string ProxyMode { get; set; } = "Direct";
     public string ProxyAddress { get; set; } = "";
     public bool ScheduleEnabled { get; set; }
@@ -202,7 +208,82 @@ internal sealed class VesperPreferences
     {
         var copy = (VesperPreferences)MemberwiseClone();
         copy.BandwidthPresetsKbs = [.. BandwidthPresetsKbs];
+        copy.SiteRules = SiteRule.Normalize(SiteRules);
         return copy;
+    }
+}
+
+internal sealed class SiteRule
+{
+    public string Host { get; set; } = "";
+    public bool AlwaysAudio { get; set; }
+    public string? Folder { get; set; }
+    public bool NeverCapture { get; set; }
+
+    public static bool TryNormalizeHost(string? value, out string host)
+    {
+        host = "";
+        string input = value?.Trim().TrimEnd('.') ?? "";
+        if (input.Length is 0 or > 253 || input.Any(char.IsControl)
+            || input.Contains('/') || input.Contains('\\') || input.Contains('@')
+            || input.Contains('?') || input.Contains('#') || input.Contains('*'))
+            return false;
+
+        string address = input.Length >= 2 && input[0] == '[' && input[^1] == ']'
+            ? input[1..^1]
+            : input;
+        if (IPAddress.TryParse(address, out IPAddress? ip))
+        {
+            host = ip.ToString().ToLowerInvariant();
+            return true;
+        }
+        if (input.Contains(':')) return false;
+
+        try { input = new IdnMapping().GetAscii(input).ToLowerInvariant(); }
+        catch (ArgumentException) { return false; }
+        if (input.Length is 0 or > 253 || Uri.CheckHostName(input) != UriHostNameType.Dns)
+            return false;
+        foreach (string label in input.Split('.'))
+        {
+            if (label.Length is 0 or > 63 || label[0] == '-' || label[^1] == '-') return false;
+            if (label.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-')) return false;
+        }
+        host = input;
+        return true;
+    }
+
+    public static SiteRule? ForPage(IEnumerable<SiteRule>? rules, string? pageUrl)
+    {
+        if (rules is null || !Uri.TryCreate(pageUrl, UriKind.Absolute, out Uri? page)
+            || page.Scheme is not ("http" or "https")
+            || !TryNormalizeHost(page.IdnHost, out string host))
+            return null;
+
+        foreach (SiteRule? rule in rules)
+        {
+            if (rule is not null && TryNormalizeHost(rule.Host, out string ruleHost)
+                && string.Equals(host, ruleHost, StringComparison.OrdinalIgnoreCase))
+                return rule;
+        }
+        return null;
+    }
+
+    public static List<SiteRule> Normalize(IEnumerable<SiteRule>? rules)
+    {
+        var normalized = new List<SiteRule>();
+        if (rules is null) return normalized;
+        foreach (SiteRule? rule in rules.Take(100))
+        {
+            if (rule is null || !TryNormalizeHost(rule.Host, out string host)) continue;
+            string? folder = null;
+            if (!string.IsNullOrWhiteSpace(rule.Folder) && PathSafety.TryGetFullPath(rule.Folder, out string full, out _))
+                folder = full;
+            if (!rule.AlwaysAudio && folder is null && !rule.NeverCapture) continue;
+
+            normalized.RemoveAll(existing => string.Equals(existing.Host, host, StringComparison.OrdinalIgnoreCase));
+            normalized.Add(new SiteRule { Host = host, AlwaysAudio = rule.AlwaysAudio, Folder = folder, NeverCapture = rule.NeverCapture });
+        }
+        return normalized;
     }
 }
 
