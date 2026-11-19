@@ -1,3 +1,5 @@
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 using VESPER;
 
 namespace Vesper.Windows.Tests;
@@ -50,6 +52,109 @@ public sealed class DownloadGridTests
         Assert.False(item.MatchesSearch("old.example.test"));
         Assert.True(item.MatchesSearch("new.example.test"));
         Assert.False(item.MatchesSearch("new-secret"));
+    }
+
+    [Fact]
+    public void SearchIndexTracksMetadataAndSourceChangesWithoutIndexingQueryTokens()
+    {
+        DownloadItem item = DownloadItem.From(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "episode.mp3",
+            SourceUrl = "https://old.example.test/file.mp3?token=old-secret",
+            MediaProvider = "Old Provider",
+            MediaId = "old-id",
+            Category = "Music",
+            State = Vesper.Engine.JobState.Queued
+        });
+
+        const string metadataTerm = "new provider";
+        JobStatus previousStatus = item.Status;
+        string previousName = item.Name;
+        long previousSize = item.SizeBytes;
+        bool previouslyMatched = item.MatchesSearch(metadataTerm);
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "episode.mp3",
+            SourceUrl = "https://old.example.test/file.mp3?token=new-secret",
+            MediaProvider = "New Provider",
+            MediaId = "new-id",
+            Category = "Podcasts",
+            State = Vesper.Engine.JobState.Queued
+        });
+
+        Assert.False(item.MatchesSearch("old provider"));
+        Assert.False(item.MatchesSearch("old-id"));
+        Assert.True(item.MatchesSearch("new provider"));
+        Assert.True(Form1.NeedsListRefresh(item, previousStatus, previousName, previousSize,
+            previouslyMatched, metadataTerm, sortBySize: false));
+        Assert.True(item.MatchesSearch("new-id"));
+        Assert.True(item.MatchesSearch("podcasts"));
+        Assert.True(item.MatchesSearch("old.example.test"));
+        Assert.False(item.MatchesSearch("old-secret"));
+        Assert.False(item.MatchesSearch("new-secret"));
+
+        item.UpdateFrom(new Vesper.Engine.JobSnapshot
+        {
+            FileName = "episode.mp3",
+            SourceUrl = "https://new.example.test/file.mp3?token=latest-secret",
+            MediaProvider = "New Provider",
+            MediaId = "new-id",
+            Category = "Podcasts",
+            State = Vesper.Engine.JobState.Queued
+        });
+
+        Assert.False(item.MatchesSearch("old.example.test"));
+        Assert.True(item.MatchesSearch("new.example.test"));
+        Assert.False(item.MatchesSearch("latest-secret"));
+    }
+
+    [Fact]
+    public void Ten_thousand_downloads_keep_search_order_and_selection_by_download_id()
+    {
+        RunOnSta(() =>
+        {
+            using var form = new Form1(new VesperPreferences(), null, startHidden: false);
+            _ = form.Handle;
+            DownloadItem[] rows = Enumerable.Range(0, 10_000).Select(index => DownloadItem.From(new Vesper.Engine.JobSnapshot
+            {
+                Id = Guid.NewGuid(),
+                FileName = $"download-{index:D5}.bin",
+                SourceUrl = $"https://cdn.example.test/files/{index:D5}.bin?token=private-{index}",
+                TotalBytes = 10_000 - index,
+                State = index % 2 == 0 ? Vesper.Engine.JobState.Completed : Vesper.Engine.JobState.Paused,
+                CreatedUtc = DateTime.UnixEpoch.AddMinutes(index)
+            })).ToArray();
+            form.LoadPreviewRows(rows);
+
+            DownloadGrid grid = (DownloadGrid)typeof(Form1).GetField("_grid", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            VesperChoice sort = (VesperChoice)typeof(Form1).GetField("_sort", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            VesperChoice filter = (VesperChoice)typeof(Form1).GetField("_filter", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            DownloadItem target = rows[7_500];
+
+            Assert.Equal(10_000, grid.VisibleItems.Count);
+            Assert.Equal(rows[^1].Id, grid.VisibleItems[0].Id);
+            grid.CheckAllVisible();
+            sort.SelectedIndex = 1;
+
+            Assert.Equal(rows[0].Id, grid.VisibleItems[0].Id);
+            Assert.Equal(10_000, grid.CheckedCount);
+            Assert.Equal(target.Id, Assert.Single(rows, item => item.MatchesSearch("download-07500")).Id);
+            Assert.DoesNotContain(rows, item => item.MatchesSearch("private-7500"));
+
+            filter.SelectedIndex = 4;
+            Assert.Equal(5_000, grid.VisibleItems.Count);
+            Assert.Contains(grid.VisibleItems, item => item.Id == target.Id);
+            Assert.True(grid.IsChecked(target));
+
+            filter.SelectedIndex = 0;
+            Assert.Equal(10_000, grid.VisibleItems.Count);
+            Assert.Contains(grid.VisibleItems, item => item.Id == target.Id);
+            Assert.True(grid.IsChecked(target));
+        });
     }
     [Fact]
     public void SearchRebuildsWhenTheSourceStartsMatching()
@@ -180,5 +285,19 @@ public sealed class DownloadGridTests
 
         Assert.Equal(focused.Id, opened?.Id);
         Assert.Equal("focused-refresh.bin", opened?.Name);
+    }
+
+    private static void RunOnSta(Action action)
+    {
+        ExceptionDispatchInfo? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { action(); }
+            catch (Exception ex) { failure = ExceptionDispatchInfo.Capture(ex); }
+        }) { IsBackground = true };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(30)), "The search test did not complete.");
+        failure?.Throw();
     }
 }

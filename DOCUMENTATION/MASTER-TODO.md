@@ -61,7 +61,7 @@
 
 ## C. P1 — Native UX, browser UI and accessibility (8 existing IDs)
 
-- [ ] **VES-019 — search at scale.** Verify debounce/virtualization when metadata changes, 10k rows, typing speed and unchanged selection.
+- [ ] **VES-019 — search at scale.** Search-field and sorted/filter-order caches are implemented; the 10k-row, metadata/source, selection and focus regression passed 9/9 (`release/audit-evidence/ves019-search-at-scale-focused-20261119.log`). Keep VES-019 open for real Windows typing-speed, paint and live-update measurement.
 - [ ] **VES-024 — butterfly behavior.** Real-browser scroll/fullscreen/player switching, hover/idle focus and reduced motion; no permanent timers at idle.
 - [ ] **VES-025 — extension remaining details.** First-run controls, keyboard focus/shortcut, timeouts, legacy message paths and error clarity.
 - [ ] **VES-040 — WinForms grid/settings rendering.** Keyboard focus now follows the same download ID after rows reorder (focused Windows regression passed 1/1). Reproduce and eliminate stale pixels, repaint ghosts, hover artifacts, clipped Settings, scrolling at 40+ and 10k rows; check light/dark/high-contrast, different refresh rates.

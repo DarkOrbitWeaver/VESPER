@@ -28,7 +28,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-016 | F, 984–1004 | HLS VOD segments are fetched serially and buffered whole (up to 64 MiB) | Partial; solution tests | `STATUS.tsv:17` |
 | VES-017 | F, 1005–1022 | The recovery-manifest import trusts the destination and file name from an unauthenticated file | Preserved + repaired | `STATUS.tsv:18` |
 | VES-018 | F, 1023–1033 | `If-Range` with a date that may not be a strong validator | Preserved | `STATUS.tsv:19` |
-| VES-019 | F, 1034–1044 | The list is refiltered and resorted on every keystroke | Partial; Windows tests | `STATUS.tsv:20` |
+| VES-019 | F, 1034–1044 | The list is refiltered and resorted on every keystroke | PARTIAL — search-key and sort-order caches plus a 10k-row regression passed 9/9; real Windows typing/paint measurement remains. See `STATUS.tsv:20`. | `STATUS.tsv:20` |
 | VES-020 | G, 1082–1106 | `webRequest` listeners wake the service worker for every XHR and media response on every site; each media response rewrites session storage | Implemented; Chrome verify | `STATUS.tsv:21` |
 | VES-021 | G, 1107–1128 | Chrome-kept downloads have no explanation, so users read correct fallbacks as failures | Partial; browser verification open | `STATUS.tsv:22` |
 | VES-022 | G, 1129–1139 | "More formats" in the in-page picker cannot be collapsed | Implemented; Chrome verify | `STATUS.tsv:23` |

@@ -40,13 +40,20 @@ internal sealed class DownloadItem
     public DateTime CreatedUtc { get; private set; } = DateTime.UtcNow;
     public long SizeBytes { get; private set; }
     private string _searchAddress = "";
+    private SearchFields _indexedSearchFields;
+    private string[] _searchTerms = [];
+    private bool _searchIndexReady;
+
+    private readonly record struct SearchFields(string Name, string Extension, string FileType, JobStatus Status,
+        string? Category, string? Provider, string? MediaId, string? Quality, string? FormatId,
+        string? ContentType, string? Reason, string SearchAddress);
 
     public static DownloadItem From(JobSnapshot s) => From(s, PublicSearchAddress(s));
 
-    private static DownloadItem From(JobSnapshot s, string searchAddress)
+    private static DownloadItem From(JobSnapshot s, string searchAddress, bool buildSearchIndex = true)
     {
         string extension = Path.GetExtension(s.FileName).TrimStart('.').ToUpperInvariant();
-        return new DownloadItem
+        var item = new DownloadItem
         {
             Id = s.Id, Snapshot = s, Name = s.FileName, Extension = extension, FileType = TypeOf(extension, s.MediaQuality, s.ContentType),
             Size = s.TotalBytes is long total ? Formatting.Bytes(total)
@@ -58,6 +65,8 @@ internal sealed class DownloadItem
                 : s.EstimatingEta && !s.WaitingForData ? "Estimating…" : "",
             Detail = s.Message, RateCap = Formatting.RateLimit(s.SpeedLimitBytes), _searchAddress = searchAddress
         };
+        if (buildSearchIndex) item.RefreshSearchIndex();
+        return item;
     }
 
     /// <summary>Refreshes this row in place so the grid keeps its references and only repaints.</summary>
@@ -65,27 +74,38 @@ internal sealed class DownloadItem
     {
         string searchAddress = Snapshot is not null && Snapshot.SourceUrl == s.SourceUrl
             && Snapshot.OriginalPageUrl == s.OriginalPageUrl ? _searchAddress : PublicSearchAddress(s);
-        DownloadItem n = From(s, searchAddress);
+        DownloadItem n = From(s, searchAddress, buildSearchIndex: false);
         (Snapshot, Name, Extension, FileType, Size, SizeBytes, SourceUrl, Destination, Status, Percent, Transfer, Eta, Detail, RateCap)
             = (n.Snapshot, n.Name, n.Extension, n.FileType, n.Size, n.SizeBytes, n.SourceUrl, n.Destination, n.Status, n.Percent, n.Transfer, n.Eta, n.Detail, n.RateCap);
         _searchAddress = n._searchAddress;
+        RefreshSearchIndex();
     }
 
     public bool MatchesSearch(string term)
     {
         if (string.IsNullOrWhiteSpace(term)) return true;
-        if (Contains(Name) || Contains(Extension) || Contains(FileType) || Contains(Status.ToString())) return true;
+        RefreshSearchIndex();
+        foreach (string value in _searchTerms)
+            if (value.Contains(term, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
 
+    private void RefreshSearchIndex()
+    {
         JobSnapshot? snapshot = Snapshot;
-        if (snapshot is null) return false;
-        if (Contains(snapshot.Category) || Contains(snapshot.MediaProvider) || Contains(snapshot.MediaId)
-            || Contains(snapshot.MediaQuality) || Contains(snapshot.MediaFormatId) || Contains(snapshot.ContentType)
-            || Contains(snapshot.Reason))
-            return true;
+        var fields = new SearchFields(Name, Extension, FileType, Status, snapshot?.Category, snapshot?.MediaProvider,
+            snapshot?.MediaId, snapshot?.MediaQuality, snapshot?.MediaFormatId, snapshot?.ContentType,
+            snapshot?.Reason, _searchAddress);
+        if (_searchIndexReady && fields == _indexedSearchFields) return;
 
-        return Contains(_searchAddress);
-
-        bool Contains(string? value) => value?.Contains(term, StringComparison.OrdinalIgnoreCase) == true;
+        _indexedSearchFields = fields;
+        _searchTerms =
+        [
+            fields.Name, fields.Extension, fields.FileType, fields.Status.ToString(),
+            fields.Category ?? "", fields.Provider ?? "", fields.MediaId ?? "", fields.Quality ?? "",
+            fields.FormatId ?? "", fields.ContentType ?? "", fields.Reason ?? "", fields.SearchAddress
+        ];
+        _searchIndexReady = true;
     }
 
     private static string PublicSearchAddress(JobSnapshot snapshot)
@@ -110,6 +130,7 @@ internal sealed class DownloadItem
         Status = file.Paused ? JobStatus.Paused : JobStatus.Downloading;
         Percent = file.Length is > 0 ? (int)Math.Clamp(100d * file.Received / file.Length.Value, 0, 99) : null;
         Transfer = file.Received > 0 ? Formatting.Bytes(file.Received) + " received" : "Waiting for data…";
+        RefreshSearchIndex();
     }
 
     private static JobStatus Map(JobSnapshot s) => s.State switch
