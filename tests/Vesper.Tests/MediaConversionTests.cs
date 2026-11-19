@@ -14,6 +14,16 @@ public sealed class MediaConversionTests
 
     public MediaConversionTests(ITestOutputHelper output) => _output = output;
 
+    [Theory]
+    [InlineData(MediaOutput.Mp3, 1, 32000, true)]
+    [InlineData(MediaOutput.Mp3, 2, 44100, true)]
+    [InlineData(MediaOutput.Mp3, 3, 32000, false)]
+    [InlineData(MediaOutput.M4a, 2, 32000, false)]
+    [InlineData(MediaOutput.M4a, 2, 48000, true)]
+    public void Audio_conversion_accepts_only_supported_channel_and_sample_rate_pairs(
+        MediaOutput output, int channels, int sampleRate, bool expected) =>
+        Assert.Equal(expected, DownloadEngine.SupportsConversionAudioFormat(output, channels, sampleRate));
+
     private static byte[] Audio()
     {
         string folder = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
@@ -195,6 +205,33 @@ public sealed class MediaConversionTests
         Assert.InRange(Math.Abs(info.Duration - sourceAudio.DurationSeconds), 0, 0.05);
     }
 
+    [WindowsFact]
+    [SupportedOSPlatform("windows")]
+    public async Task MediaFoundationEncodesMp3WhenTheNativeEncoderIsAvailable()
+    {
+        CodecCapabilities capabilities = CodecCapabilities.Current;
+        if (!capabilities.Known || !capabilities.Mp3Encoder)
+        {
+            _output.WriteLine("Skipped the real MP3 encode because Windows reported no native MP3 encoder.");
+            return;
+        }
+
+        await using var server = new FaultServer();
+        server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness(convertMedia: (source, extension, target, output, ct) =>
+            WindowsMediaConverter.Convert(source, extension, target, output, ct));
+        Guid id = AddAudio(harness, server, MediaOutput.Mp3);
+
+        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("audio.mp3", done.FileName);
+        Assert.Equal("audio/mpeg", done.ContentType);
+        Assert.Equal("MP3 audio", done.MediaQuality);
+        using var outputFile = File.OpenRead(done.FinalPath!);
+        Assert.True(Mp3MetadataWriter.IsPlayableMpegLayer3(outputFile));
+    }
+
     [Fact]
     public async Task WaveAudioWritesAndReadsRf64SizeTable()
     {
@@ -280,6 +317,48 @@ public sealed class MediaConversionTests
     }
 
     [Fact]
+    public async Task Invalid_mp3_conversion_publishes_the_original_with_its_source_name()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        using var harness = new Harness(convertMedia: (_, _, target, _, _) => File.WriteAllBytes(target, [1, 2, 3]));
+
+        Guid id = AddAudio(harness, server, MediaOutput.Mp3);
+        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+
+        Assert.Equal("saved-original", done.Reason);
+        Assert.Equal("audio.mp4", done.FileName);
+        Assert.Contains("original was saved unchanged", done.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(audio, File.ReadAllBytes(Assert.Single(harness.Files())));
+        Assert.DoesNotContain(harness.Files(), path => Path.GetExtension(path).Equals(".mp3", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Mp3_conversion_ignores_video_in_a_muxed_mp4_source()
+    {
+        await using var server = new FaultServer();
+        server.Extra["/muxed.mp4"] = MuxedMp4();
+        await server.StartAsync();
+        using var harness = new Harness(convertMedia: (_, extension, target, output, _) =>
+        {
+            Assert.Equal(".mp4", extension);
+            Assert.Equal(MediaOutput.Mp3, output);
+            File.WriteAllBytes(target, Fixture("quiet-track.mp3"));
+        });
+
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/muxed.mp4"), FileName: "muxed.mp4",
+            MediaProvider: "fixture", Output: MediaOutput.Mp3));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
+
+        Assert.Equal("muxed.mp3", done.FileName);
+        Assert.Equal("", done.Reason);
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.True(Mp3MetadataWriter.IsPlayableMpegLayer3(output));
+    }
+
+    [Fact]
     public async Task Generic_wav_failure_keeps_the_approved_saved_original_fallback()
     {
         await using var server = new FaultServer();
@@ -314,6 +393,51 @@ public sealed class MediaConversionTests
         Assert.Equal(audio, await File.ReadAllBytesAsync(failed.PartialPath));
         Assert.Equal(new byte[] { 1, 2, 3 }, await File.ReadAllBytesAsync(failed.PartialPath + ".convert.wav"));
         Assert.False(File.Exists(Path.Combine(harness.Downloads, "audio.wav")));
+    }
+
+    [Fact]
+    public async Task Mp3_conversion_publishes_a_tagged_playable_mp3_and_recovers_its_stage()
+    {
+        await using var server = new FaultServer();
+        server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+
+        using var crashed = new ManualResetEventSlim();
+        int conversions = 0;
+        using var harness = new Harness(failpoint: point =>
+        {
+            if (point != "finalize.afterMediaPrepare") return;
+            crashed.Set();
+            throw new FailpointCrash(point);
+        }, convertMedia: (_, extension, target, output, _) =>
+        {
+            Assert.Equal(".mp4", extension);
+            Assert.Equal(MediaOutput.Mp3, output);
+            Interlocked.Increment(ref conversions);
+            File.WriteAllBytes(target, Fixture("quiet-track.mp3"));
+        });
+
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/audio.mp4"), FileName: "audio.mp4",
+            MediaProvider: "fixture", Output: MediaOutput.Mp3,
+            MediaMetadataJson: System.Text.Json.JsonSerializer.Serialize(SongTags)));
+        Assert.True(added.Ok, added.Message);
+        Assert.True(crashed.Wait(TimeSpan.FromSeconds(10)), "The MP3 conversion did not reach its prepare failpoint.");
+
+        harness.Restart();
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
+
+        Assert.Equal("audio.mp3", done.FileName);
+        Assert.Equal("audio/mpeg", done.ContentType);
+        Assert.Equal("MP3 audio", done.MediaQuality);
+        Assert.Equal("", done.Reason);
+        Assert.Equal(1, conversions);
+        Assert.Single(harness.Files());
+        byte[] outputBytes = File.ReadAllBytes(done.FinalPath!);
+        Assert.True(Mp3MetadataWriter.HasId3v2Tag(new MemoryStream(outputBytes)));
+        Assert.Contains("Song One", Encoding.UTF8.GetString(outputBytes));
+        using var output = new MemoryStream(outputBytes);
+        Assert.True(Mp3MetadataWriter.IsPlayableMpegLayer3(output));
+        Assert.Empty(Directory.GetFiles(harness.Downloads, "*.convert*", SearchOption.AllDirectories));
     }
 
     [Theory]

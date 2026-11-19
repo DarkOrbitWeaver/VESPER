@@ -14,11 +14,17 @@ public sealed partial class DownloadEngine
     private readonly SemaphoreSlim _remuxSlots = new(2, 2); // Two simultaneous file copies, even with many forced jobs.
 
     private static string OutputExtension(MediaOutput output) => output switch
-    { MediaOutput.M4a => ".m4a", MediaOutput.Opus => ".opus", MediaOutput.Wav => ".wav", _ => ".mp4" };
-    private static string ConversionPath(DownloadJob job) => job.PartialPath + ".convert" + (job.Output is MediaOutput.Opus or MediaOutput.Wav ? OutputExtension(job.Output) : ".mp4");
+    { MediaOutput.M4a => ".m4a", MediaOutput.Opus => ".opus", MediaOutput.Wav => ".wav", MediaOutput.Mp3 => ".mp3", _ => ".mp4" };
+    private static string ConversionPath(DownloadJob job) => job.PartialPath + ".convert"
+        + (job.Output is MediaOutput.Opus or MediaOutput.Wav or MediaOutput.Mp3 ? OutputExtension(job.Output) : ".mp4");
     private static string ConversionAudioPath(DownloadJob job) => job.PartialPath + ".convert-audio.mp4";
     private static string ConversionTaggedPath(DownloadJob job) => job.PartialPath + ".convert-tagged.mp4";
+    private static string ConversionMp3TaggedPath(DownloadJob job) => job.PartialPath + ".convert-tagged.mp3";
     private static string AudioMetadataPath(DownloadJob job) => job.PartialPath + ".tagged" + Path.GetExtension(job.FileName);
+
+    internal static bool SupportsConversionAudioFormat(MediaOutput output, int channels, int sampleRate) =>
+        channels is 1 or 2 && (sampleRate is 44100 or 48000
+            || output == MediaOutput.Mp3 && sampleRate == 32000);
 
     internal static string PublicationStagePath(DownloadJob job) =>
         job.Output == MediaOutput.Original && job.MediaMetadataJson is not null
@@ -52,7 +58,12 @@ public sealed partial class DownloadEngine
             DemuxedTrack? audio = tracks.Find(t => t.Kind == TrackKind.Audio);
             DemuxedTrack? video = tracks.Find(t => t.Kind == TrackKind.Video);
             bool wantVideo = job.Output == MediaOutput.Mp4;
-            if (tracks.Count != (wantVideo ? 2 : 1) || audio is null || wantVideo != (video is not null))
+            bool tracksMatch = wantVideo
+                ? tracks.Count == 2 && video is not null
+                : job.Output == MediaOutput.Mp3
+                    ? tracks.Count == (video is null ? 1 : 2)
+                    : tracks.Count == 1 && video is null;
+            if (!tracksMatch || audio is null)
                 return (file, notice);
 
             file = await TryReusePreparedConversionAsync(job, source, tracks, audio, video, stage, ct).ConfigureAwait(false);
@@ -107,7 +118,7 @@ public sealed partial class DownloadEngine
             }
             else
             {
-                if (audio.Channels is not (1 or 2) || audio.SampleRate is not (44100 or 48000)
+                if (!SupportsConversionAudioFormat(job.Output, audio.Channels, audio.SampleRate)
                     || video is { Width: < 16 or > 4096 } or { Height: < 16 or > 2304 } or { BitDepth: > 8 })
                     return (file, notice);
 
@@ -191,16 +202,28 @@ public sealed partial class DownloadEngine
                     }
                 }
             }
+            else if (job.Output == MediaOutput.Mp3)
+            {
+                using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    1 << 16, FileOptions.SequentialScan))
+                {
+                    ValidatePreparedMp3(converted, stageIdentity);
+                }
+
+                (notice, stageIdentity) = await EmbedConvertedMp3TagsAsync(job, source, stage,
+                    stageIdentity ?? throw new IOException("The converted MP3 has no saved identity."), ct).ConfigureAwait(false);
+            }
             else
             {
-            using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan))
-            {
-                ValidateConvertedMp4(converted, tracks, audio, video, stageIdentity, ct);
-            }
+                using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    1 << 16, FileOptions.SequentialScan))
+                {
+                    ValidateConvertedMp4(converted, tracks, audio, video, stageIdentity, ct);
+                }
 
-            // The converter only writes audio and video. Title, artist and cover go in now, before the file is hashed.
-            (notice, stageIdentity) = await EmbedConvertedTagsAsync(job, source, stage,
-                stageIdentity ?? throw new IOException("The converted file has no saved identity."), ct).ConfigureAwait(false);
+                // The converter only writes audio and video. Title, artist and cover go in now, before the file is hashed.
+                (notice, stageIdentity) = await EmbedConvertedTagsAsync(job, source, stage,
+                    stageIdentity ?? throw new IOException("The converted file has no saved identity."), ct).ConfigureAwait(false);
             }
 
             using var output = new FileStream(stage, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
@@ -276,6 +299,10 @@ public sealed partial class DownloadEngine
             else if (job.Output == MediaOutput.Opus)
             {
                 ValidatePreparedOpus(output, source, audio, ct);
+            }
+            else if (job.Output == MediaOutput.Mp3)
+            {
+                ValidatePreparedMp3(output, identity);
             }
             else
             {
@@ -378,6 +405,13 @@ public sealed partial class DownloadEngine
         OggAudioMetadataWriter.ValidateOpus(output, audio.Samples.Count, granule);
     }
 
+    private static void ValidatePreparedMp3(FileStream output, string? identity)
+    {
+        PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, identity);
+        if (!Mp3MetadataWriter.IsPlayableMpegLayer3(output))
+            throw new MediaContainerException("The converted file is not a valid MP3 stream.");
+    }
+
     private bool WavFeaturesRequested(DownloadJob job)
     {
         if (job.Output != MediaOutput.Wav) return false;
@@ -444,6 +478,72 @@ public sealed partial class DownloadEngine
         return (music && artworkRequested && cover is null
             ? "Track details were saved, but valid source artwork was unavailable."
             : null, updatedIdentity);
+    }
+
+    private async Task<(string? Notice, string Identity)> EmbedConvertedMp3TagsAsync(DownloadJob job, Stream source,
+        string stage, string stageIdentity, CancellationToken ct)
+    {
+        MediaMergeMetadata? metadata = ConvertedFileMetadata(job);
+        bool artworkRequested = !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl);
+        MediaThumbnail? cover = null;
+        if (artworkRequested)
+        {
+            cover = job.Kind == JobKind.Merge ? ReadEmbeddedCover(source) : null;
+            cover ??= await MediaThumbnail.FetchAsync(job.MediaThumbnailUrl, _http, Options.AllowPrivateNetworks, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (metadata is null && cover is null)
+            return (artworkRequested ? "Saved without artwork because valid source artwork was unavailable." : null,
+                stageIdentity);
+
+        (bool written, string updatedIdentity) = await TryTagConvertedMp3FileAsync(job, stage, stageIdentity,
+            metadata ?? new MediaMergeMetadata(), cover, ct).ConfigureAwait(false);
+        if (!written)
+            return ("The converted MP3 was saved, but its title, artist and artwork could not be embedded.", stageIdentity);
+
+        return (artworkRequested && cover is null
+            ? "Track details were saved, but valid source artwork was unavailable."
+            : null, updatedIdentity);
+    }
+
+    private async Task<(bool Written, string Identity)> TryTagConvertedMp3FileAsync(DownloadJob job,
+        string stage, string stageIdentity, MediaMergeMetadata metadata, MediaThumbnail? cover, CancellationToken ct)
+    {
+        string tagged = ConversionMp3TaggedPath(job);
+        string? taggedIdentity = null;
+        try
+        {
+            using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read,
+                1 << 16, FileOptions.SequentialScan))
+            {
+                PathSafety.RequireTemporaryIdentity(converted.SafeFileHandle, stageIdentity);
+                if (!HasRoomFor(tagged, converted.Length + (cover?.Data.Length ?? 0) + (1 << 20)))
+                    return (false, stageIdentity);
+
+                using var output = CreateOwnedStage(tagged, FileShare.None, out taggedIdentity);
+                if (await Mp3MetadataWriter.TryWriteAsync(converted, output, metadata, cover, ct).ConfigureAwait(false)
+                    != Mp3MetadataWriteResult.Written)
+                    return (false, stageIdentity);
+
+                output.Flush(flushToDisk: true);
+                if (!Mp3MetadataWriter.IsPlayableMpegLayer3(output))
+                    throw new MediaContainerException("The tagged MP3 stage did not retain a valid audio frame.");
+            }
+
+            ReplaceFile(job, tagged, taggedIdentity, stage, stageIdentity, out string movedIdentity);
+            taggedIdentity = null;
+            return (true, movedIdentity);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MediaContainerException)
+        {
+            Log(job.Id, "media-metadata", "Tags were not embedded in the converted MP3: " + ex.Message);
+            return (false, stageIdentity);
+        }
+        finally
+        {
+            if (taggedIdentity is not null) DeleteTemporaryFile(job, tagged, taggedIdentity);
+        }
     }
 
     /// <summary>Merge jobs keep their tags in the plan; a direct download carries them in MediaMetadataJson.</summary>

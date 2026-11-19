@@ -115,6 +115,8 @@ public sealed partial class DownloadEngine
         {
             if (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan plan, out string mergeError))
                 return new AddResult(AddStatus.Invalid, Guid.Empty, mergeError);
+            if (request.Output == MediaOutput.Mp3 && plan.OutputRange is not null)
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "MP3 output does not support audio clips.");
             if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null)
                 return new AddResult(AddStatus.Invalid, Guid.Empty, "A media merge plan cannot use a file checksum or piece map.");
             if (request.Secrets is { Count: > 0 }
@@ -125,6 +127,8 @@ public sealed partial class DownloadEngine
         if (request.Kind == JobKind.Http && request.Output == MediaOutput.Wav && request.MediaPlanJson is not null
             && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "The requested WAV range is invalid.");
+        if (request.Output == MediaOutput.Mp3 && request.Kind == JobKind.Http && request.MediaPlanJson is not null)
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "MP3 output does not support audio clips.");
         MediaMergeMetadata? mediaMetadata = null;
         if (request.MediaMetadataJson is not null)
         {
@@ -138,7 +142,7 @@ public sealed partial class DownloadEngine
                 || !MediaMergePlan.TryParseMetadata(request.MediaMetadataJson, out mediaMetadata)
                 || (mediaMetadata is not null && !MediaMergePlan.HasAudioTagValues(mediaMetadata)
                     && string.IsNullOrWhiteSpace(request.MediaThumbnailUrl)))
-                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded audio metadata requires a discovered MP3, FLAC, Ogg or Opus download, or a converted M4A/MP4, without credentials or a file checksum.");
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "Embedded audio metadata requires a discovered MP3, FLAC, Ogg or Opus download, or converted M4A/MP3/MP4 output, without credentials or a file checksum.");
         }
 
         string? expected = null;

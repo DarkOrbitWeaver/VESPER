@@ -285,6 +285,23 @@ internal static class Mp3MetadataWriter
         return source.Length - offset >= frameLength;
     }
 
+    internal static bool IsPlayableMpegLayer3(Stream source)
+    {
+        long offset = 0;
+        if (HasId3v2Tag(source))
+        {
+            if (source.Length < 10) return false;
+            Span<byte> header = stackalloc byte[10];
+            MuxIo.ReadExact(source, 0, header);
+            if (header[3] is < 2 or > 4 || !TryReadSynchsafe(header[6..10], out int tagLength)
+                || tagLength > source.Length - 10)
+                return false;
+            offset = 10L + tagLength;
+        }
+
+        return IsMpegLayer3(source, offset);
+    }
+
     internal static bool HasId3v2Tag(Stream source)
     {
         if (source.Length < 3) return false;

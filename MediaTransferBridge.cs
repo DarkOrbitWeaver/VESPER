@@ -8,7 +8,7 @@ using System.Text.Json;
 
 namespace VESPER;
 
-internal enum MediaOutputPreference { Original, CompatibleVideo, M4a, Opus, Wav }
+internal enum MediaOutputPreference { Original, CompatibleVideo, M4a, Opus, Wav, Mp3 }
 
 /// <summary>Single-stream transfer handoff, including durable non-secret source provenance.</summary>
 internal sealed record MediaDownloadChoice(
@@ -27,12 +27,14 @@ internal sealed record MediaDownloadChoice(
         MediaOutput.M4a => "M4A",
         MediaOutput.Opus => "Opus",
         MediaOutput.Wav => "WAV",
+        MediaOutput.Mp3 => "MP3",
         _ => Kind == JobKind.Hls ? "HLS" : Path.GetExtension(FileName).TrimStart('.').ToUpperInvariant()
     };
     public string DisplayDetail => Output switch
     {
         MediaOutput.Opus => "Opus · copied without re-encoding",
         MediaOutput.Wav => "WAV · decoded PCM (does not improve source quality)",
+        MediaOutput.Mp3 => $"MP3 · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
         MediaOutput.M4a => $"M4A · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
         MediaOutput.Mp4 => $"MP4 · {ConvertedVideoQuality}converted so it plays everywhere",
         _ => MediaTransferBridge.DisplayQuality(Quality ?? "Available source")
@@ -110,6 +112,8 @@ internal static class MediaTransferBridge
         if (exact is not null || output == MediaOutputPreference.Original)
             return PrepareSource(item, prefs, exact, out _, clipStartSeconds, clipEndSeconds);
         bool audioOnly = prefs.Mode == QualityMode.AudioOnly || item.Representations.All(r => !r.HasVideo);
+        if (output == MediaOutputPreference.Mp3 && audioOnly)
+            return PrepareMp3(item, prefs, clipStartSeconds, clipEndSeconds);
         if (output == MediaOutputPreference.M4a && audioOnly)
             return PrepareM4a(item, prefs, clipStartSeconds, clipEndSeconds);
         if (audioOnly || output != MediaOutputPreference.CompatibleVideo)
@@ -208,6 +212,41 @@ internal static class MediaTransferBridge
         }
 
         return original;
+    }
+
+    private static (MediaDownloadChoice? Choice, string? Error) PrepareMp3(MediaItem item, FormatPreferences prefs,
+        double? clipStartSeconds, double? clipEndSeconds)
+    {
+        if (clipStartSeconds is not null)
+            return (null, "MP3 clipping isn't available; choose WAV for an exact audio clip.");
+
+        var original = PrepareSource(item, prefs with { Mode = QualityMode.AudioOnly }, exact: null,
+            out FormatSelection? source, clipStartSeconds, clipEndSeconds);
+        if (original.Choice is not { } choice || source?.Audio is not { } audio)
+            return original;
+
+        if (audio is { Container: "mp3", AudioCodec: "mp3" })
+            return (choice with { FileName = Path.ChangeExtension(choice.FileName, ".mp3") }, null);
+
+        CodecCapabilities capabilities = CodecCapabilities.Current;
+        if (!OperatingSystem.IsWindows() || !capabilities.Known || !capabilities.Mp3Encoder)
+            return (null, "MP3 conversion isn't available because this PC has no confirmed native MP3 encoder.");
+
+        string? codec = audio.AudioCodec;
+        if (codec is null || !CanConvert(choice) || choice.Kind is not (JobKind.Http or JobKind.Merge)
+            || !capabilities.CanDecode(codec)
+            || audio.AudioChannels is not (1 or 2)
+            || audio.AudioSampleRate is not (32000 or 44100 or 48000))
+            return (null, "This source doesn't have a supported track and native MP3 encoder for conversion.");
+
+        string? tags = choice.MediaMetadataJson
+            ?? (choice.Kind == JobKind.Http && item.Provider is not null ? SerializeAudioMetadata(item) : null);
+        return (choice with
+        {
+            Output = MediaOutput.Mp3,
+            ConvertedAudioCodec = codec.ToUpperInvariant(),
+            MediaMetadataJson = tags
+        }, null);
     }
 
     private static bool IsNativeAac(MediaRepresentation stream) =>

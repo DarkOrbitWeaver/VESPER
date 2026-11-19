@@ -19,7 +19,7 @@ internal static class WindowsMediaConverter
     private static readonly Guid Video = MediaGuid(0x73646976), Audio = MediaGuid(0x73647561);
     private static readonly Guid H264 = MediaGuid(0x34363248), Nv12 = MediaGuid(0x3231564e);
     private static readonly Guid I420 = MediaGuid(0x30323449), Yv12 = MediaGuid(0x32315659);
-    private static readonly Guid Aac = MediaGuid(0x1610), Pcm = MediaGuid(1);
+    private static readonly Guid Aac = MediaGuid(0x1610), Mp3 = MediaGuid(0x55), Pcm = MediaGuid(1);
     private static readonly Guid FrameSize = new("1652c33d-d6b2-4012-b834-72030849a37d");
     private static readonly Guid FrameRate = new("c459a2e8-3d2c-4e44-b132-fee5156c7bb0");
     private static readonly Guid PixelAspect = new("c6376a1e-8d0a-4027-be45-6d9a0ad39bb6");
@@ -236,7 +236,12 @@ internal static class WindowsMediaConverter
         DemuxedTrack? timing = null, MediaOutput output = MediaOutput.M4a)
     {
         Check(reader.SetStreamSelection(index, true), "enabling a source track");
-        Guid codec = video ? H264 : output == MediaOutput.Wav ? Pcm : Aac;
+        Guid codec = video ? H264 : output switch
+        {
+            MediaOutput.Wav => Pcm,
+            MediaOutput.Mp3 => Mp3,
+            _ => Aac
+        };
         Check(native.GetGUID(Subtype, out Guid sourceCodec), "identifying the source codec");
         if (!video && sourceCodec == codec)
         {
@@ -334,9 +339,13 @@ internal static class WindowsMediaConverter
         Check(decoded.GetUINT32(SampleRate, out uint rate), "reading the audio sample rate");
         Check(encoded.SetUINT32(Channels, channels), "preserving the audio channels");
         Check(encoded.SetUINT32(SampleRate, rate), "preserving the audio sample rate");
-        Check(encoded.SetUINT32(BitsPerSample, 16), "configuring the audio output");
+        if (output != MediaOutput.Mp3)
+            Check(encoded.SetUINT32(BitsPerSample, 16), "configuring the audio output");
         if (output == MediaOutput.Wav) Check(encoded.SetUINT32(BlockAlignment, channels * 2), "aligning PCM samples");
-        Check(encoded.SetUINT32(AvgBytesPerSecond, output == MediaOutput.Wav ? rate * channels * 2 : channels == 1 ? 16_000u : 24_000u), "setting the AAC bitrate");
+        if (output == MediaOutput.Mp3 && (channels is not (1 or 2) || rate is not (32_000 or 44_100 or 48_000)))
+            throw new NotSupportedException("The MP3 encoder supports mono or stereo audio at 32, 44.1, or 48 kHz.");
+        uint averageBytes = output == MediaOutput.Wav ? rate * channels * 2 : channels == 1 ? 16_000u : 24_000u;
+        Check(encoded.SetUINT32(AvgBytesPerSecond, averageBytes), "setting the audio bitrate");
     }
 
     private static IMediaType CreateType(Guid major, Guid codec)
