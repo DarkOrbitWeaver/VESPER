@@ -145,6 +145,24 @@ public class FileNameTests
 public class PathSafetyTests
 {
     [Fact]
+    public void Temporary_file_cleanup_removes_an_unlinked_file()
+    {
+        string folder = Path.Combine(Path.GetTempPath(), "vesper-path-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        string path = Path.Combine(folder, "owned.vmeta");
+        File.WriteAllText(path, "temporary data");
+        try
+        {
+            Assert.True(PathSafety.TryDeleteTemporaryFile(path, out string error), error);
+            Assert.False(File.Exists(path));
+        }
+        finally
+        {
+            if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Destination_paths_expand_environment_variables_before_validation()
     {
         string variable = "VESPER_TEST_PATH_" + Guid.NewGuid().ToString("N");
