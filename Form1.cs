@@ -269,7 +269,11 @@ public partial class Form1 : Form
         engine.JobChanged += Enqueue;
         engine.JobChanged += snapshot => { if (MediaSourceRescue.ShouldTryAutomatically(snapshot)) _ = AutoRefreshAsync(engine, snapshot); };
         engine.Progress += batch => { foreach (JobSnapshot s in batch) Enqueue(s); };
-        engine.JobRemoved += id => PostToUi(() => { _items.Remove(id); _grid.PruneChecks(_items.Keys); RefreshList(); });
+        engine.JobRemoved += id =>
+        {
+            MediaSourceRescue.ForgetAutomaticAttempt(id);
+            PostToUi(() => { _items.Remove(id); _grid.PruneChecks(_items.Keys); RefreshList(); });
+        };
         engine.ActivityChanged += active => PostToUi(() => EngineHost.HoldAwake(active && _prefs.PreventSleep));
 
         BuildTray();

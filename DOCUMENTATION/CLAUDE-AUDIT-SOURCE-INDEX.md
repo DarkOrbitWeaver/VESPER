@@ -18,7 +18,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-006 | E, 693–744 | Converted outputs ("M4A · Converts from OPUS", "Compatible MP4") lose all metadata and artwork | Partial | `STATUS.tsv:7` |
 | VES-007 | E, 745–767 | The crash-recovery test for MP3 tags is flaky under load | Preserved | `STATUS.tsv:8` |
 | VES-008 | E, 768–787 | Public documentation contradicts the implementation | Implemented with historical reports retained | `STATUS.tsv:9` |
-| VES-009 | E, 788–823 | Expired-link rescue for merge jobs exists in the engine but no UI reaches it | Partial | `STATUS.tsv:10` |
+| VES-009 | E, 788–823 | Expired-link rescue for merge jobs exists in the engine but no UI reaches it | Partial; RescueForm → shared planner → engine call chain is source-present; focused refresh/rescue tests passed 28/28, installed UI/live acceptance open | `STATUS.tsv:10`, `MASTER-TODO.md:33` |
 | VES-010 | F, 837–886 | The connect callback tries addresses one at a time under a single 20 s budget (no Happy Eyeballs) | Implemented; focused tests | `STATUS.tsv:11` |
 | VES-011 | F, 887–905 | An invalid custom proxy is silently ignored, and differently by the two stacks | Preserved | `STATUS.tsv:12` |
 | VES-012 | F, 906–934 | Checkpoint cost scales with throughput (every 4 MiB: flush, FULL-sync SQLite commit, manifest rewrite) | Preserved; not benchmarked | `STATUS.tsv:13` |
@@ -104,7 +104,7 @@ The original **ranks 1–7** are covered by existing VES/USER work rather than d
 
 | Original rank / line | Opportunity | Existing backlog coverage | Status |
 |---|---|---|---|
-| 1 / 1717 | Identity-safe expired media URL refresh | VES-009, USER-SOURCE-REFRESH | Partial; unsafe cases refused |
+| 1 / 1717 | Identity-safe expired media URL refresh | VES-009, USER-SOURCE-REFRESH | Partial; signed redirect change refusal and 28 focused refresh/rescue tests verified; live UI/overnight acceptance remains open |
 | 2 / 1718 | Explain why Chrome keeps a download | VES-021, USER-CHROME-REAL | Partial; real Chrome verification open |
 | 3 / 1719 | Intent-first shared picker | VES-045, VES-062 | Partial; shared capability document redesign open |
 | 4 / 1720 | Indexed media clips and WAV output | VES-030, VES-031 | Partial; byte-range clipping open |
