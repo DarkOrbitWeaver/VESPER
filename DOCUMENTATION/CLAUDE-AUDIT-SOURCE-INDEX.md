@@ -34,7 +34,7 @@ Original reports read contiguously in full from ChatGPT Library this takeover: `
 | VES-022 | G, 1129–1139 | "More formats" in the in-page picker cannot be collapsed | Implemented; Chrome verify | `STATUS.tsv:23` |
 | VES-023 | G, 1140–1149 | Trimming and audio-track choice are desktop-only | Implemented; Chrome verify | `STATUS.tsv:24` |
 | VES-024 | G, 1150–1159 | The butterfly detaches from the player during scroll; its rest state is fully static | Partial | `STATUS.tsv:25` |
-| VES-025 | G, 1160–1171 | Minor extension items | Partial | `STATUS.tsv:26` |
+| VES-025 | G, 1160–1171 | Minor extension items | PARTIAL — first-run, toggle, focus ring and shortcut are present; async native-request/submit status requires owner design. Legacy `describe()` remains tracked under VES-062. See `OWNER-DESIGN-REQUIRED.md`. | `STATUS.tsv:26` |
 | VES-030 | H, 1185–1194 | No WAV, FLAC, MP3 or Opus output selection | Partial | `STATUS.tsv:27` |
 | VES-031 | H, 1195–1216 | Time ranges work only for segmented HLS/DASH, but YouTube's single-file formats are indexed and could be clipped by byte range | Partial; owner design required for the indexed single-file boundary and fallback contract | `STATUS.tsv:28`, `OWNER-DESIGN-REQUIRED.md` |
 | VES-032 | H, 1217–1229 | The "M4A (AAC)" choice prefers transcoding Opus over YouTube's native AAC | Preserved | `STATUS.tsv:29` |
