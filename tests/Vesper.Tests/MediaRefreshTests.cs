@@ -319,6 +319,43 @@ public sealed class MediaRefreshTests
     }
 
     [Fact]
+    public async Task Concurrent_rescue_calls_only_commit_one_same_snapshot()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var beforeCommit = new Barrier(2);
+        using var h = new Harness(
+            failpoint: name =>
+            {
+                if (name == "rescue.beforeCommit" && !beforeCommit.SignalAndWait(TimeSpan.FromSeconds(10)))
+                    throw new TimeoutException("Both rescue attempts did not reach the commit boundary.");
+            },
+            tweak: options => options.MaxConcurrentJobs = 1);
+        Guid id = h.Add(server.Url("/expires-after-truncate"), "concurrent-rescue.bin");
+        JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        h.Engine.Options.MaxConcurrentJobs = 0;
+        byte[] savedBytes = await File.ReadAllBytesAsync(stalled.PartialPath);
+        string firstUrl = server.Url("/expires-after-truncate?token=fresh&candidate=first");
+        string secondUrl = server.Url("/expires-after-truncate?token=fresh&candidate=second");
+
+        RescueResult[] results = await Task.WhenAll(
+            h.Engine.ReplaceLinkAsync(id, firstUrl),
+            h.Engine.ReplaceLinkAsync(id, secondUrl));
+
+        Assert.Single(results, result => result.Accepted);
+        Assert.Single(results, result => !result.Accepted);
+        JobSnapshot after = Assert.IsType<JobSnapshot>(h.Engine.Snapshot(id));
+        Assert.Contains(after.SourceUrl, new[] { firstUrl, secondUrl });
+        Assert.Equal(stalled.CommittedBytes, after.CommittedBytes);
+        Assert.Equal(savedBytes, await File.ReadAllBytesAsync(after.PartialPath));
+
+        using var store = JobStore.Open(Path.Combine(h.Data, "vesper.db"));
+        DownloadJob persisted = Assert.Single(store.LoadAll());
+        Assert.Equal(after.SourceUrl, persisted.SourceUrl);
+        Assert.Equal(stalled.CommittedBytes, persisted.Extents.TotalBytes);
+    }
+
+    [Fact]
     public async Task RefreshedMediaCookiesAreScopedToTheNewOriginAndNeverSerialized()
     {
         await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
