@@ -1,4 +1,5 @@
 using VESPER;
+using Vesper.Engine;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using System.Runtime.ExceptionServices;
@@ -58,6 +59,15 @@ public sealed class MediaDiscoveryFormTests
             MediaDiscoveryForm.CollectionAvailabilityText(firstResult.Choice, null)));
         Assert.Contains("Skipped", MediaDiscoveryForm.CollectionRowText("Episode Three",
             MediaDiscoveryForm.CollectionAvailabilityText(null, incompatibleResult.Error)));
+    }
+
+    [Theory]
+    [InlineData(MediaOutput.Wav, JobKind.Http, "full source")]
+    [InlineData(MediaOutput.Wav, JobKind.Hls, "nearest segment")]
+    [InlineData(MediaOutput.Original, JobKind.Merge, "nearest segment")]
+    public void ClipNoticeMatchesTheActualRangeBehavior(MediaOutput output, JobKind kind, string expected)
+    {
+        Assert.Contains(expected, MediaDiscoveryForm.ClipBehaviorNotice(output, kind), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

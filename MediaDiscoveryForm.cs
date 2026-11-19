@@ -883,7 +883,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 : IsExactFormat ? choice.DisplayDetail : "";
             if (_clipCheck.Checked)
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
-                    + "May start a few seconds early: it cuts at the nearest segment.";
+                    + ClipBehaviorNotice(choice.Output, choice.Kind);
             if (choice.SubtitleTracks is { Count: > 0 } subtitles)
             {
                 string subtitleNotice = choice.SubtitleNotice ?? "Selected subtitles are saved as separate files.";
@@ -1313,6 +1313,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         QualityMode.Custom => preferences.TargetHeight is { } height ? $"{height}p" : "Custom",
         _ => "Best quality"
     };
+
+    internal static string ClipBehaviorNotice(MediaOutput output, JobKind kind) =>
+        output == MediaOutput.Wav && kind == JobKind.Http
+            ? "WAV keeps the selected sample range, but downloads and decodes the full source."
+            : "May start a few seconds early: it cuts at the nearest segment.";
 
     private static string Limit(string text, int length) => text.Length > length ? text[..(length - 1)] + "…" : text;
 
