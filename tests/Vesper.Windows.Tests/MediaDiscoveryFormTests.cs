@@ -112,6 +112,45 @@ public sealed class MediaDiscoveryFormTests
         });
     }
 
+    [Theory]
+    [InlineData(350)]
+    [InlineData(220)]
+    public void NarrowPickerFooterKeepsVisibleActionsSeparate(int width)
+    {
+        OnSta(() =>
+        {
+            using var form = new MediaDiscoveryForm(new VesperPreferences(),
+                [new Uri("https://example.test/episode-one")]);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+            form.ClientSize = new Size(width, form.ClientSize.Height);
+            typeof(MediaDiscoveryForm).GetMethod("FitToContent",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(form, null);
+            Application.DoEvents();
+
+            var footer = (Panel)typeof(MediaDiscoveryForm)
+                .GetField("_footer", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(form)!;
+            Control[] actions = new[] { "_cancel", "_queue", "_download", "_retry" }
+                .Select(name => (Control)typeof(MediaDiscoveryForm)
+                    .GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                    .GetValue(form)!)
+                .Where(control => control.Visible)
+                .ToArray();
+
+            Assert.Equal(3, actions.Length);
+            Assert.True(footer.Height > 62);
+            foreach (Control action in actions)
+                Assert.True(footer.ClientRectangle.Contains(action.Bounds), $"'{action.Text}' extends beyond the footer.");
+            for (int i = 0; i < actions.Length; i++)
+            for (int j = i + 1; j < actions.Length; j++)
+                Assert.False(actions[i].Bounds.IntersectsWith(actions[j].Bounds),
+                    $"'{actions[i].Text}' overlaps '{actions[j].Text}'.");
+        });
+    }
+
     private static MediaItem Item(string provider, IReadOnlyList<MediaRepresentation> formats) => new()
     {
         SourceUrl = new Uri($"https://{provider}.example.test/watch/one"),

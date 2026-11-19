@@ -112,7 +112,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _body = new VesperScrollPanel { Dock = DockStyle.Fill, BackColor = _colors.Surface, AutoScroll = true, TabIndex = 0 };
         _canvas = new Panel { Dock = DockStyle.Top, BackColor = _colors.Surface };
         _body.Controls.Add(_canvas);
-        _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
+        _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = S(62), BackColor = _colors.Surface };
         _footer.Paint += (_, e) =>
         {
             using var line = new Pen(_colors.Divider);
@@ -508,11 +508,33 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private void LayoutFooter()
     {
         int width = _footer.ClientSize.Width;
-        int margin = S(width < S(430) ? 12 : 24), y = S(13), height = S(35);
-        _cancel.SetBounds(margin, y, S(88), height);
-        _download.SetBounds(width - margin - S(130), y, S(130), height);
-        _queue.SetBounds(_download.Left - S(8 + 122), y, S(122), height);
-        _retry.SetBounds(width - margin - S(122), y, S(122), height);
+        int height = S(35);
+        if (width >= S(380))
+        {
+            int margin = S(width < S(430) ? 12 : 24), y = S(13);
+            _cancel.SetBounds(margin, y, S(88), height);
+            _download.SetBounds(width - margin - S(130), y, S(130), height);
+            _queue.SetBounds(_download.Left - S(8 + 122), y, S(122), height);
+            _retry.SetBounds(width - margin - S(122), y, S(122), height);
+            return;
+        }
+
+        int narrowMargin = S(12), top = S(8), gap = S(6);
+        _cancel.SetBounds(narrowMargin, top, S(88), height);
+        if (width >= S(242))
+        {
+            int right = width - narrowMargin;
+            _queue.SetBounds(_cancel.Right + S(8), top, S(122), height);
+            _retry.SetBounds(right - S(122), top, S(122), height);
+            _download.SetBounds(right - S(130), top + height + gap, S(130), height);
+            return;
+        }
+
+        int secondRow = top + height + gap;
+        int thirdRow = secondRow + height + gap;
+        _queue.SetBounds(width - narrowMargin - S(122), secondRow, S(122), height);
+        _retry.SetBounds(width - narrowMargin - S(122), secondRow, S(122), height);
+        _download.SetBounds(width - narrowMargin - S(130), thirdRow, S(130), height);
     }
 
     private bool IsExactFormat => _state == ViewState.Ready && _presetIndex == 4;
@@ -531,9 +553,17 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         Rectangle work = Screen.FromControl(Visible ? this : Owner ?? this).WorkingArea;
         int inset = S(12);
+        int width = Math.Min(ClientSize.Width, Math.Max(1, work.Width - 2 * inset));
+        int footerWidth = Math.Max(1, width - 2 * S(1));
+        int footerHeight = S(62);
+        if (footerWidth < S(380))
+        {
+            footerHeight = S(133);
+            if (footerWidth >= S(242)) footerHeight = S(92);
+        }
+        if (_footer.Height != footerHeight) _footer.Height = footerHeight;
         int desiredHeight = S(BodyHeight()) + _footer.Height + VesperDialogChrome.VerticalInset(this);
         int height = Math.Min(desiredHeight, Math.Max(1, work.Height - 2 * inset));
-        int width = Math.Min(ClientSize.Width, Math.Max(1, work.Width - 2 * inset));
         if (ClientSize != new Size(width, height)) ClientSize = new Size(width, height);
         if (Visible && work.IntersectsWith(Bounds))
         {
