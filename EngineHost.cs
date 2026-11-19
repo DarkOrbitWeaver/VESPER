@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using Vesper.Engine;
 using Vesper.MediaResolver.Core;
 
@@ -110,6 +111,52 @@ internal static class EngineHost
         [MarshalAs(UnmanagedType.U1)] bool forceCritical,
         [MarshalAs(UnmanagedType.U1)] bool disableWakeEvent);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ExitWindowsEx(uint flags, uint reason);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LuidAndAttributes
+    {
+        public Luid Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenPrivileges
+    {
+        public uint PrivilegeCount;
+        public LuidAndAttributes Privilege;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LookupPrivilegeValue(string? systemName, string name, out Luid luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AdjustTokenPrivileges(IntPtr token,
+        [MarshalAs(UnmanagedType.Bool)] bool disableAllPrivileges, ref TokenPrivileges newState,
+        uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
     /// <summary>Must be called from one consistent thread (the UI thread).</summary>
     public static void HoldAwake(bool hold) =>
         SetThreadExecutionState(hold ? ExecutionState.Continuous | ExecutionState.SystemRequired : ExecutionState.Continuous);
@@ -117,6 +164,81 @@ internal static class EngineHost
     /// <summary>Requests normal Windows sleep. The caller must obtain an explicit user choice first.</summary>
     internal static bool SleepComputer() =>
         OperatingSystem.IsWindows() && SetSuspendState(hibernate: false, forceCritical: false, disableWakeEvent: false);
+
+    /// <summary>Requests a normal Windows shutdown. The caller must obtain an explicit user choice first.</summary>
+    internal static bool ShutdownComputer()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        const uint tokenAdjustPrivileges = 0x0020;
+        const uint tokenQuery = 0x0008;
+        const uint privilegeEnabled = 0x00000002;
+        const uint shutdown = 0x00000001;
+        const uint powerOff = 0x00000008;
+        const uint plannedApplicationShutdown = 0x80040000;
+
+        if (!OpenProcessToken(GetCurrentProcess(), tokenAdjustPrivileges | tokenQuery, out IntPtr token))
+        {
+            TraceShutdownError("OpenProcessToken");
+            return false;
+        }
+
+        try
+        {
+            if (!LookupPrivilegeValue(null, "SeShutdownPrivilege", out Luid luid))
+            {
+                TraceShutdownError("LookupPrivilegeValue");
+                return false;
+            }
+
+            int privilegeSize = Marshal.SizeOf<TokenPrivileges>();
+            IntPtr previousState = Marshal.AllocHGlobal(privilegeSize);
+            IntPtr returnLength = Marshal.AllocHGlobal(sizeof(uint));
+            try
+            {
+                var enable = new TokenPrivileges
+                {
+                    PrivilegeCount = 1,
+                    Privilege = new LuidAndAttributes { Luid = luid, Attributes = privilegeEnabled }
+                };
+                if (!AdjustTokenPrivileges(token, false, ref enable, (uint)privilegeSize, previousState, returnLength))
+                {
+                    TraceShutdownError("AdjustTokenPrivileges");
+                    return false;
+                }
+                int privilegeError = Marshal.GetLastWin32Error();
+                if (privilegeError != 0)
+                {
+                    Trace.WriteLine($"SeShutdownPrivilege could not be enabled (Win32 error {privilegeError}).", "Queue completion shutdown");
+                    return false;
+                }
+
+                TokenPrivileges oldState = Marshal.PtrToStructure<TokenPrivileges>(previousState);
+                try
+                {
+                    bool requested = ExitWindowsEx(shutdown | powerOff, plannedApplicationShutdown);
+                    int shutdownError = requested ? 0 : Marshal.GetLastWin32Error();
+                    if (!requested)
+                        Trace.WriteLine($"ExitWindowsEx failed with Win32 error {shutdownError}.", "Queue completion shutdown");
+                    return requested;
+                }
+                finally
+                {
+                    if (oldState.PrivilegeCount > 0
+                        && !AdjustTokenPrivileges(token, false, ref oldState, 0, IntPtr.Zero, IntPtr.Zero))
+                        TraceShutdownError("RestoreTokenPrivileges");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(previousState);
+                Marshal.FreeHGlobal(returnLength);
+            }
+        }
+        finally { CloseHandle(token); }
+    }
+
+    private static void TraceShutdownError(string operation) =>
+        Trace.WriteLine($"{operation} failed with Win32 error {Marshal.GetLastWin32Error()}.", "Queue completion shutdown");
 
     /// <summary>Moves a file to the Recycle Bin so an accidental delete can be undone.</summary>
     public static void RecycleFile(string path) =>
