@@ -91,6 +91,42 @@ public sealed class QueueOrderBoundaryTests
         Assert.Equal(new long[] { 0, 1, 2 }, h.Engine.Snapshots().Select(job => job.QueueOrder));
     }
 
+    [Fact]
+    public void Duplicate_orders_are_normalized_in_creation_order_and_saved_on_restart()
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid older = h.Add("https://example.com/queue-older", "older.bin", startNow: false);
+        Guid newer = h.Add("https://example.com/queue-newer", "newer.bin", startNow: false);
+        SetQueueOrders(h, (older, 7), (newer, 7));
+        SetCreatedUtc(h, older, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        SetCreatedUtc(h, newer, new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc));
+
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+
+        IReadOnlyList<JobSnapshot> snapshots = h.Engine.Snapshots();
+        Dictionary<Guid, long> saved = SavedQueueOrders(h);
+        Assert.Equal(new[] { older, newer }, snapshots.Select(job => job.Id));
+        Assert.Equal(new long[] { 0, 1 }, snapshots.Select(job => job.QueueOrder));
+        Assert.Equal(0L, saved[older]);
+        Assert.Equal(1L, saved[newer]);
+    }
+
+    [Fact]
+    public void Signed_boundary_orders_are_rebased_on_restart()
+    {
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid first = h.Add("https://example.com/queue-first", "first.bin", startNow: false);
+        Guid last = h.Add("https://example.com/queue-last", "last.bin", startNow: false);
+        SetQueueOrders(h, (first, long.MinValue), (last, long.MaxValue));
+
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+
+        Dictionary<Guid, long> saved = SavedQueueOrders(h);
+        Assert.Equal(0L, saved[first]);
+        Assert.Equal(1L, saved[last]);
+        Assert.Equal(new long[] { 0, 1 }, h.Engine.Snapshots().Select(job => job.QueueOrder));
+    }
+
     private static void SetQueueOrders(Harness h, params (Guid JobId, long Order)[] orders)
     {
         using (JobStore store = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
@@ -100,6 +136,14 @@ public sealed class QueueOrderBoundaryTests
             .GetField("_jobs", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(h.Engine)!;
         foreach ((Guid id, long order) in orders) jobs[id].QueueOrder = order;
+    }
+
+    private static void SetCreatedUtc(Harness h, Guid id, DateTime createdUtc)
+    {
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!;
+        h.Engine.UpdateJob(jobs[id], job => job.CreatedUtc = createdUtc);
     }
 
     private static Dictionary<Guid, long> SavedQueueOrders(Harness h)

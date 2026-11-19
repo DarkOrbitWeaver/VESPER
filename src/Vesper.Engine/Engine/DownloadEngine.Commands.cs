@@ -377,9 +377,26 @@ public sealed partial class DownloadEngine
 
     // Leave room at both ends so adding or starting a job cannot wrap a signed queue order.
     // The store commits the whole rebase before any live job is changed.
-    private void RebaseQueueOrdersLocked()
+    private void NormalizeQueueOrdersOnStartup()
     {
-        DownloadJob[] ordered = [.. _jobs.Values.OrderBy(j => j.QueueOrder)];
+        lock (_lock)
+        {
+            DownloadJob[] ordered = [.. _jobs.Values.OrderBy(j => j.QueueOrder)
+                .ThenBy(j => j.CreatedUtc).ThenBy(j => j.Id)];
+            if (ordered.Length < 2) return;
+
+            bool duplicateOrders = ordered.Select(j => j.QueueOrder).Distinct().Count() != ordered.Length;
+            bool atBoundary = ordered[0].QueueOrder == long.MinValue || ordered[^1].QueueOrder == long.MaxValue;
+            if (!duplicateOrders && !atBoundary) return;
+
+            RebaseQueueOrdersLocked(publishChanges: false);
+        }
+    }
+
+    private void RebaseQueueOrdersLocked(bool publishChanges = true)
+    {
+        DownloadJob[] ordered = [.. _jobs.Values.OrderBy(j => j.QueueOrder)
+            .ThenBy(j => j.CreatedUtc).ThenBy(j => j.Id)];
         var changes = new (Guid JobId, long Order)[ordered.Length];
         for (int i = 0; i < ordered.Length; i++) changes[i] = (ordered[i].Id, i);
 
@@ -392,7 +409,7 @@ public sealed partial class DownloadEngine
         for (int i = 0; i < ordered.Length; i++)
         {
             ordered[i].QueueOrder = changes[i].Order;
-            Changed(ordered[i]);
+            if (publishChanges) Changed(ordered[i]);
         }
     }
 
