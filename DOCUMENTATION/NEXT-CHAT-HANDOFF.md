@@ -50,7 +50,7 @@ Keep outputs candid: **code implemented / automated tests / real OS-browser vali
 
 ## Latest verified checkpoint (2026-11-19)
 
-- `main` is pushed at `97625731ff844f2f5f23456176c124fb7b399759`; the tracked worktree is clean.
+- VES-054's verified source checkpoint is `97625731ff844f2f5f23456176c124fb7b399759`; a documentation-only handoff follow-up is also pushed to `main`.
 - VES-054 now requests a cooperative exit through the app's existing confirmation, cancels cleanly if Setup disconnects, waits for the app mutex before file replacement, and keeps refusal/timeout paths ahead of installation mutation. It remains partial until clean-account upgrade, repair, rollback, interruption and publication checks pass.
 - Focused Setup tests passed 8/8; Windows handoff and BrowserBridge tests passed 24/24; engine bridge regressions passed 30/30. Full logs are in `release/audit-evidence/ves054-*-20261119.log`; backlog verification is in `release/audit-evidence/ves054-backlog-verifier-20261119.log`. NuGet vulnerability metadata was unreachable (`NU1900`); builds/tests used the existing restore assets.
 - There are 96 tracked IDs, 51 unfinished. Q5 remains the only owner-approved optional deferral; the other ten release gates remain open. Real Chrome/native-host sandbox acceptance and clean-machine installer evidence remain unverified.
