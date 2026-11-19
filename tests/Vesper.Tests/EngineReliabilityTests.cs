@@ -566,12 +566,23 @@ public sealed class MediaSourceRescueTests
     {
         var expired = new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Merge, Reason = "expired",
             OriginalPageUrl = "https://www.youtube.com/watch?v=b", MediaId = "b", MediaFormatId = "251" };
+        var attempts = (Dictionary<Guid, DateTime>)typeof(VESPER.MediaSourceRescue)
+            .GetField("LastAutomaticAttempt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+            .GetValue(null)!;
+        Guid staleId = Guid.NewGuid();
+        lock (attempts) attempts[staleId] = DateTime.UtcNow.AddHours(-2);
+
         Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(expired));
+        lock (attempts) Assert.False(attempts.ContainsKey(staleId));
         Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(expired));                       // within the hour
         Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Merge, Reason = "auth",
             OriginalPageUrl = expired.OriginalPageUrl, MediaId = "b", MediaFormatId = "251" }));
         Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Http, Reason = "expired",
             OriginalPageUrl = expired.OriginalPageUrl, MediaId = "b", MediaFormatId = "251" }));
+
+        VESPER.MediaSourceRescue.ForgetAutomaticAttempt(expired.Id);
+        Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(expired));
+        VESPER.MediaSourceRescue.ForgetAutomaticAttempt(expired.Id);
     }
 
     [Fact]

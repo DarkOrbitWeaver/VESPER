@@ -287,6 +287,38 @@ public sealed class MediaRefreshTests
     }
 
     [Fact]
+    public async Task MediaRefreshDoesNotReuseAPartialAcrossAChangedSignedRedirectTarget()
+    {
+        await using var source = new FaultServer();
+        await using var oldCdn = new FaultServer();
+        await using var newCdn = new FaultServer();
+        await source.StartAsync();
+        await oldCdn.StartAsync();
+        await newCdn.StartAsync();
+        using var harness = new Harness();
+        source.Redirects["/redirect"] = oldCdn.Url("/expires-after-truncate?token=old");
+
+        AddResult added = harness.Engine.Add(new AddRequest(source.Url("/redirect?token=old"),
+            MediaProvider: "fixture", MediaId: "video", MediaFormatId: "muxed-720"));
+        JobSnapshot stalled = await harness.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.True(stalled.CommittedBytes > 0);
+        byte[] saved = await File.ReadAllBytesAsync(stalled.PartialPath);
+
+        source.Redirects["/redirect"] = newCdn.Url("/file?signature=fresh");
+        RescueResult result = await harness.Engine.RefreshMediaSourceAsync(added.JobId,
+            new ResolvedMediaSource("fixture", "video", "muxed-720", source.Url("/redirect?token=fresh"),
+                DateTimeOffset.UtcNow.AddMinutes(5)));
+
+        JobSnapshot after = harness.Engine.Snapshot(added.JobId)!;
+        Assert.False(result.Accepted);
+        Assert.Contains("different file location", result.Message);
+        Assert.Equal(stalled.SourceUrl, after.SourceUrl);
+        Assert.Equal(stalled.CommittedBytes, after.CommittedBytes);
+        Assert.Equal(saved, await File.ReadAllBytesAsync(stalled.PartialPath));
+        Assert.Equal(1, newCdn.Hits("/file"));
+    }
+
+    [Fact]
     public async Task RefreshedMediaCookiesAreScopedToTheNewOriginAndNeverSerialized()
     {
         await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();

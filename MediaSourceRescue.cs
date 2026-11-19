@@ -25,10 +25,20 @@ internal static class MediaSourceRescue
         if (job.Kind != JobKind.Merge || job.Reason != "expired" || !CanRefresh(job)) return false;
         lock (LastAutomaticAttempt)
         {
-            if (LastAutomaticAttempt.TryGetValue(job.Id, out DateTime last) && DateTime.UtcNow - last < TimeSpan.FromHours(1)) return false;
-            LastAutomaticAttempt[job.Id] = DateTime.UtcNow;
+            DateTime now = DateTime.UtcNow;
+            foreach (Guid stale in LastAutomaticAttempt
+                .Where(pair => now >= pair.Value && now - pair.Value >= TimeSpan.FromHours(1))
+                .Select(pair => pair.Key).ToArray())
+                LastAutomaticAttempt.Remove(stale);
+            if (LastAutomaticAttempt.TryGetValue(job.Id, out DateTime last) && now - last < TimeSpan.FromHours(1)) return false;
+            LastAutomaticAttempt[job.Id] = now;
             return true;
         }
+    }
+
+    internal static void ForgetAutomaticAttempt(Guid id)
+    {
+        lock (LastAutomaticAttempt) LastAutomaticAttempt.Remove(id);
     }
 
     public static async Task<RescueResult> RefreshAsync(DownloadEngine engine, JobSnapshot job, ResolverOptions network,
