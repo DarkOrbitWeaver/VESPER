@@ -21,7 +21,7 @@ public enum JobState
 
 public enum JobPriority { Low = -1, Normal = 0, High = 1 }
 public enum JobKind { Http = 0, Hls = 1, Dash = 2, Merge = 3, BrowserFile = 4 }
-public enum MediaOutput { Original = 0, Mp4 = 1, M4a = 2, Opus = 3, Wav = 4 }
+public enum MediaOutput { Original = 0, Mp4 = 1, M4a = 2, Opus = 3, Wav = 4, Mp3 = 5 }
 
 /// <summary>How strongly the remote representation can be identified across requests.</summary>
 public enum IdentityLevel

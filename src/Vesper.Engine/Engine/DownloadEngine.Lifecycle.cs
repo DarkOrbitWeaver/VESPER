@@ -557,10 +557,29 @@ public sealed partial class DownloadEngine
             }
             else
             {
-                job.ContentType = job.Output switch { MediaOutput.M4a => "audio/mp4", MediaOutput.Opus => "audio/ogg", MediaOutput.Wav => "audio/wav", _ => "video/mp4" };
-                job.MediaQuality = job.Output switch { MediaOutput.M4a => "Audio AAC", MediaOutput.Opus => "Opus · copied", MediaOutput.Wav => "PCM audio", _ => "H.264 + AAC" };
+                job.ContentType = job.Output switch
+                {
+                    MediaOutput.M4a => "audio/mp4",
+                    MediaOutput.Opus => "audio/ogg",
+                    MediaOutput.Wav => "audio/wav",
+                    MediaOutput.Mp3 => "audio/mpeg",
+                    _ => "video/mp4"
+                };
+                job.MediaQuality = job.Output switch
+                {
+                    MediaOutput.M4a => "Audio AAC",
+                    MediaOutput.Opus => "Opus · copied",
+                    MediaOutput.Wav => "PCM audio",
+                    MediaOutput.Mp3 => "MP3 audio",
+                    _ => "H.264 + AAC"
+                };
             }
             job.Category = FileNames.CategoryFor(job.FileName);
+        }
+        else if (job.Output == MediaOutput.Mp3)
+        {
+            job.Reason = "saved-original";
+            job.Message = $"Saved as {Path.GetExtension(job.FileName).TrimStart('.').ToUpperInvariant()}: an MP3 copy couldn't be created on this PC, so the original was saved unchanged.";
         }
         else if (job.Output != MediaOutput.Original)
         {

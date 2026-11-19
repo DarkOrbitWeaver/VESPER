@@ -158,6 +158,7 @@ internal sealed partial class BrowserBridgeHandler
         AudioOutput(MediaOutputPreference.Original, "Original audio");
         AudioOutput(MediaOutputPreference.Opus, "Opus — copied, no re-encoding");
         AudioOutput(MediaOutputPreference.Wav, "WAV — decoded PCM");
+        AudioOutput(MediaOutputPreference.Mp3, "MP3 — re-encode when needed");
 
         foreach (var format in playable.Representations.OrderByDescending(r => r.Height ?? 0)
                      .ThenByDescending(r => r.FrameRate ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).Take(56))

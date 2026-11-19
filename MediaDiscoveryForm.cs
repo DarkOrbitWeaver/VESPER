@@ -784,6 +784,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             audioOutputs.Add((MediaOutputPreference.Opus, "Opus — copied, no re-encoding"));
         if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Wav).Choice is not null)
             audioOutputs.Add((MediaOutputPreference.Wav, "WAV — decoded PCM"));
+        if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Mp3).Choice is not null)
+            audioOutputs.Add((MediaOutputPreference.Mp3, "MP3 — re-encode when needed"));
         _audioOutputOptions = audioOutputs.Select(o => o.Output).ToArray();
         _audioOutputChoice.SetItems(audioOutputs.Select(o => o.Label).ToArray());
         _canChooseM4a = audioOutputs.Count > 1;

@@ -162,8 +162,8 @@ public sealed partial class DownloadEngine
         string[] unprovenStages =
         [
             RecoveryManifest.PathFor(partial) + ".tmp", RecoveryManifest.PathFor(partial) + ".previous", partial + ".samples",
-            partial + ".convert.mp4", partial + ".convert.opus", partial + ".convert.wav",
-            partial + ".convert-audio.mp4", partial + ".convert-tagged.mp4",
+            partial + ".convert.mp4", partial + ".convert.opus", partial + ".convert.wav", partial + ".convert.mp3",
+            partial + ".convert-audio.mp4", partial + ".convert-tagged.mp4", partial + ".convert-tagged.mp3",
             partial + ".tagged.mp3", partial + ".tagged.flac", partial + ".tagged.ogg", partial + ".tagged.opus"
         ];
 

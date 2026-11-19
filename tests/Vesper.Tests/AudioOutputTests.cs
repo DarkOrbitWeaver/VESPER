@@ -62,6 +62,85 @@ public sealed class AudioOutputTests
         Assert.Equal("audio aac 132 kbps", exact.DisplayDetail);
     }
 
+    [WindowsFact]
+    public void Mp3_output_is_not_planned_without_a_confirmed_native_encoder()
+    {
+        CodecCapabilities? previous = CodecCapabilities.Override;
+        try
+        {
+            CodecCapabilities.Override = new CodecCapabilities(true, true, true, true, true, true, true,
+                AacEncoder: true, Mp3Encoder: false);
+            var item = Item(Opus with { AudioChannels = 2, AudioSampleRate = 48000 });
+
+            MediaDownloadChoice original = Assert.IsType<MediaDownloadChoice>(
+                MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly).Choice);
+            var mp3 = MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Mp3);
+
+            Assert.Equal(MediaOutput.Original, original.Output);
+            Assert.Null(mp3.Choice);
+            Assert.Contains("encoder", mp3.Error, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { CodecCapabilities.Override = previous; }
+    }
+
+    [WindowsFact]
+    public void Mp3_output_is_planned_as_an_encoded_mp3_when_the_native_encoder_is_available()
+    {
+        CodecCapabilities? previous = CodecCapabilities.Override;
+        try
+        {
+            CodecCapabilities.Override = new CodecCapabilities(true, true, true, true, true, true, true,
+                AacEncoder: true, Mp3Encoder: true);
+            var item = Item(Opus with { AudioChannels = 2, AudioSampleRate = 48000 });
+
+            MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(
+                MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Mp3).Choice);
+
+            Assert.Equal(MediaOutput.Mp3, choice.Output);
+            Assert.EndsWith(".webm", choice.FileName, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("OPUS", choice.ConvertedAudioCodec);
+            Assert.Equal("MP3", choice.DisplayContainer);
+            Assert.Contains("re-encoded", choice.DisplayDetail);
+        }
+        finally { CodecCapabilities.Override = previous; }
+    }
+
+    [WindowsFact]
+    public void Mp3_output_is_not_planned_when_the_native_capability_probe_is_unknown()
+    {
+        CodecCapabilities? previous = CodecCapabilities.Override;
+        try
+        {
+            CodecCapabilities.Override = CodecCapabilities.Unknown;
+            var item = Item(Opus with { AudioChannels = 2, AudioSampleRate = 48000 });
+
+            var mp3 = MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Mp3);
+
+            Assert.Null(mp3.Choice);
+            Assert.Contains("confirmed native MP3 encoder", mp3.Error, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { CodecCapabilities.Override = previous; }
+    }
+
+    [Fact]
+    public void Native_mp3_source_remains_available_without_a_native_encoder()
+    {
+        CodecCapabilities? previous = CodecCapabilities.Override;
+        try
+        {
+            CodecCapabilities.Override = CodecCapabilities.Unknown;
+            var item = Item(Audio("native-mp3", "mp3", "mp3", 128));
+
+            MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(
+                MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Mp3).Choice);
+
+            Assert.Equal(MediaOutput.Original, choice.Output);
+            Assert.EndsWith(".mp3", choice.FileName, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("MP3", choice.DisplayContainer);
+        }
+        finally { CodecCapabilities.Override = previous; }
+    }
+
     [Fact]
     public void Source_aac_in_mp4_saves_as_m4a_with_its_encoding_intact()
     {
