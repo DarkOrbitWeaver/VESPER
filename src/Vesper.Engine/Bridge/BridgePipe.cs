@@ -1,20 +1,17 @@
 using System.IO.Pipes;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
+using Vesper.Shared;
 
 namespace Vesper.Engine;
 
 public static class BridgePipe
 {
     /// <summary>Per-user pipe name, so another Windows account on the same PC can neither reach nor squat it.</summary>
-    public static string NameForCurrentUser()
-    {
-        string identity = OperatingSystem.IsWindows()
-            ? System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value ?? Environment.UserName
-            : Environment.UserName;
-        return "vesper-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..16].ToLowerInvariant();
-    }
+    public static string NameForCurrentUser() => NameForCurrentUser("vesper");
+
+    public static string NameForCurrentUser(string purpose) => WindowsObjectNames.NameForCurrentUser(purpose);
+
+    internal static string NameForIdentity(string purpose, string identity) => WindowsObjectNames.NameForIdentity(purpose, identity);
 
     /// <summary>One request, one response, then close. Used by the native-messaging host.</summary>
     public static async Task<string> RequestAsync(string pipeName, string json, TimeSpan connectTimeout, TimeSpan replyTimeout, CancellationToken ct)

@@ -59,6 +59,8 @@ public sealed record FormatPreferences
 
     public IReadOnlyList<string> SubtitleLanguages { get; init; } = [];
     public bool IncludeAutoSubtitles { get; init; }
+    /// <summary>Request embedding compatible selected subtitles in a supported native video remux.</summary>
+    public bool EmbedSubtitles { get; init; }
 
     public FallbackPolicy Fallback { get; init; } = FallbackPolicy.NearestLowerThenHigher;
 

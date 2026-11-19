@@ -42,7 +42,30 @@ internal sealed class BoxWriter
 /// </summary>
 internal static class Mp4Muxer
 {
-    private const uint MovieTimescale = 1000;
+    internal const uint MovieTimescale = 1000;
+
+    internal static byte[] Tx3gSubtitleSampleEntry(int width, int height)
+    {
+        width = Math.Clamp(width, 1, ushort.MaxValue);
+        height = Math.Clamp(height, 1, ushort.MaxValue);
+        var writer = new BoxWriter();
+        int sampleEntry = writer.Begin("tx3g");
+        writer.Zero(6);
+        writer.U16(1); // data reference index
+        writer.U32(0); // display flags
+        writer.U8(0);  // horizontal justification: left
+        writer.U8(unchecked((byte)-1)); // vertical justification: bottom
+        writer.Zero(4); // transparent background
+        writer.U16(0); writer.U16(0); writer.U16((ushort)height); writer.U16((ushort)width);
+        writer.U16(0); writer.U16(0); // default style covers all text
+        writer.U16(1); writer.U8(0); writer.U8(18); // Arial, plain, 18 px
+        writer.U8(255); writer.U8(255); writer.U8(255); writer.U8(255);
+        int fontTable = writer.Begin("ftab");
+        writer.U16(1); writer.U16(1); writer.U8(5); writer.Ascii("Arial");
+        writer.End(fontTable);
+        writer.End(sampleEntry);
+        return writer.ToArray();
+    }
 
     private sealed record ChapterSample(byte[] Data, uint Duration);
     private sealed record ChapterTrackData(IReadOnlyList<MediaMergeChapter> Chapters, IReadOnlyList<ChapterSample> Samples, long PayloadBytes);
@@ -57,12 +80,16 @@ internal static class Mp4Muxer
     public static long Write(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, Stream output,
         CancellationToken ct, MediaMergeMetadata? metadata, MediaThumbnail? thumbnail, out MediaMergeMetadata? writtenMetadata)
     {
-        if (inputs.Count is < 1 or > 8) throw new MediaContainerException("An MP4 output needs between one and eight tracks.");
+        if (inputs.Count is < 1 or > MediaMerger.MaxTrackCount)
+            throw new MediaContainerException($"An MP4 output needs between one and {MediaMerger.MaxTrackCount} tracks.");
         foreach (var (t, _) in inputs)
+        {
             if (t.Mp4SampleEntry is null || t.SourceContainer != "mp4" || t.HasLacing || t.Samples.Count == 0)
                 throw new MediaContainerException($"The {t.Codec} track cannot be written to MP4 without conversion.");
+            ValidateEditListForMp4(t);
+        }
 
-        ulong movieDuration = inputs.Max(input => ToMovie(MediaDuration(input.Track) - Math.Max(0, input.Track.EditMediaTime), input.Track.Timescale));
+        ulong movieDuration = inputs.Max(input => MoviePresentationDuration(input.Track));
         ChapterTrackData chapterTrack = BuildChapterTrack(metadata?.Chapters ?? [], movieDuration);
         writtenMetadata = metadata is null ? null : metadata with { Chapters = chapterTrack.Chapters };
 
@@ -168,6 +195,81 @@ internal static class Mp4Muxer
         long sum = 0;
         foreach (var s in t.Samples) sum += s.Duration;
         return sum;
+    }
+
+    private static long PresentationDuration(DemuxedTrack track)
+    {
+        long end = 0;
+        foreach (TrackSample sample in track.Samples)
+            end = Math.Max(end, checked(sample.Dts + sample.CtsOffset + sample.Duration));
+        return Math.Max(0, checked(end - Math.Max(0, track.EditMediaTime)));
+    }
+
+    internal static ulong MoviePresentationDuration(DemuxedTrack track)
+    {
+        if (track.EditList is { } edits)
+            return ConvertEditDuration(edits[0].SegmentDuration, track.EditMovieTimescale);
+        return ToMovie(PresentationDuration(track), track.Timescale);
+    }
+
+    private static ulong ConvertEditDuration(ulong duration, uint sourceMovieTimescale)
+    {
+        if (sourceMovieTimescale == 0)
+            throw new MediaContainerException("The MP4 edit list has no movie timescale.");
+
+        Int128 scaledDuration = (Int128)duration * MovieTimescale;
+        if (scaledDuration % sourceMovieTimescale != 0)
+            throw new MediaContainerException("The MP4 edit duration cannot be represented exactly in the output time scale.");
+        Int128 outputDuration = scaledDuration / sourceMovieTimescale;
+        if (outputDuration > ulong.MaxValue)
+            throw new MediaContainerException("The MP4 edit duration is too large for the output movie.");
+        return (ulong)outputDuration;
+    }
+
+    private static void ValidateEditListForMp4(DemuxedTrack track)
+    {
+        if (track.EditList is not { } edits) return;
+        if (edits.Count != 1)
+            throw new MediaContainerException("MP4 output supports one media edit per track; empty or multiple edit lists are not supported.");
+
+        Mp4EditListEntry edit = edits[0];
+        if (edit.MediaTime < 0 || edit.MediaRateInteger != 1 || edit.MediaRateFraction != 0)
+            throw new MediaContainerException("MP4 output supports only a rate-1 media edit with a nonnegative start time.");
+        if (edit.SegmentDuration == 0)
+            throw new MediaContainerException("MP4 output does not support a zero-length media edit.");
+
+        _ = ConvertEditDuration(edit.SegmentDuration, track.EditMovieTimescale);
+    }
+
+    internal static bool EditListsMatch(DemuxedTrack expected, DemuxedTrack actual)
+    {
+        (IReadOnlyList<Mp4EditListEntry> expectedEdits, uint expectedScale) = EffectiveEditList(expected);
+        (IReadOnlyList<Mp4EditListEntry> actualEdits, uint actualScale) = EffectiveEditList(actual);
+        if (expectedEdits.Count != actualEdits.Count) return false;
+        if (expectedEdits.Count == 0) return true;
+        if (expectedScale == 0 || actualScale == 0) return false;
+
+        for (int i = 0; i < expectedEdits.Count; i++)
+        {
+            Mp4EditListEntry expectedEdit = expectedEdits[i];
+            Mp4EditListEntry actualEdit = actualEdits[i];
+            if (expectedEdit.MediaTime != actualEdit.MediaTime
+                || expectedEdit.MediaRateInteger != actualEdit.MediaRateInteger
+                || expectedEdit.MediaRateFraction != actualEdit.MediaRateFraction
+                || (Int128)expectedEdit.SegmentDuration * actualScale
+                    != (Int128)actualEdit.SegmentDuration * expectedScale)
+                return false;
+        }
+        return true;
+    }
+
+    private static (IReadOnlyList<Mp4EditListEntry> Edits, uint Timescale) EffectiveEditList(DemuxedTrack track)
+    {
+        if (track.EditList is { } edits) return (edits, track.EditMovieTimescale);
+        if (track.EditMediaTime <= 0) return (Array.Empty<Mp4EditListEntry>(), 0);
+
+        ulong duration = ToMovie(PresentationDuration(track), track.Timescale);
+        return ([new Mp4EditListEntry(duration, track.EditMediaTime, 1, 0)], MovieTimescale);
     }
 
     private static ChapterTrackData BuildChapterTrack(IReadOnlyList<MediaMergeChapter> chapters, ulong movieDuration)
@@ -337,7 +439,7 @@ internal static class Mp4Muxer
         for (int i = 0; i < inputs.Count; i++)
         {
             var t = inputs[i].Track;
-            presentation[i] = ToMovie(MediaDuration(t) - Math.Max(0, t.EditMediaTime), t.Timescale);
+            presentation[i] = MoviePresentationDuration(t);
             movieDuration = Math.Max(movieDuration, presentation[i]);
         }
 
@@ -353,6 +455,8 @@ internal static class Mp4Muxer
         {
             var t = inputs[ti].Track;
             bool video = t.Kind == TrackKind.Video;
+            bool audio = t.Kind == TrackKind.Audio;
+            bool subtitle = t.Kind == TrackKind.Subtitle;
             long mediaDuration = MediaDuration(t);
             int trak = w.Begin("trak");
 
@@ -360,9 +464,9 @@ internal static class Mp4Muxer
             int tkhd = w.BeginFull("tkhd", (byte)(tv1 ? 1 : 0), 0x000003);
             if (tv1) { w.U64(0); w.U64(0); w.U32((uint)ti + 1); w.U32(0); w.U64(presentation[ti]); }
             else { w.U32(0); w.U32(0); w.U32((uint)ti + 1); w.U32(0); w.U32((uint)presentation[ti]); }
-            w.Zero(8); w.U16(0); w.U16((ushort)(video ? 0 : 1)); w.U16((ushort)(video ? 0 : 0x0100)); w.U16(0);
+            w.Zero(8); w.U16(0); w.U16((ushort)(audio ? 1 : 0)); w.U16((ushort)(audio ? 0x0100 : 0)); w.U16(0);
             w.Matrix();
-            w.U32(video ? (uint)t.Width << 16 : 0); w.U32(video ? (uint)t.Height << 16 : 0);
+            w.U32(video || subtitle ? (uint)t.Width << 16 : 0); w.U32(video || subtitle ? (uint)t.Height << 16 : 0);
             w.End(tkhd);
 
             if (ti == 0 && chapterTrack.Samples.Count > 0)
@@ -372,15 +476,41 @@ internal static class Mp4Muxer
                 w.End(tref);
             }
 
-            if (t.EditMediaTime > 0)
+            IReadOnlyList<Mp4EditListEntry> edits;
+            if (t.EditList is { } explicitEdits)
+                edits = explicitEdits;
+            else if (t.EditMediaTime > 0)
+                edits = [new Mp4EditListEntry(presentation[ti], t.EditMediaTime, 1, 0)];
+            else
+                edits = Array.Empty<Mp4EditListEntry>();
+
+            if (edits.Count > 0)
             {
+                Mp4EditListEntry[] outputEdits = edits.Select(edit => edit with
+                {
+                    SegmentDuration = t.EditList is null ? edit.SegmentDuration
+                        : ConvertEditDuration(edit.SegmentDuration, t.EditMovieTimescale)
+                }).ToArray();
                 int edts = w.Begin("edts");
-                bool ev1 = presentation[ti] > uint.MaxValue || t.EditMediaTime > int.MaxValue;
+                bool ev1 = outputEdits.Any(edit => edit.SegmentDuration > uint.MaxValue
+                    || edit.MediaTime is < int.MinValue or > int.MaxValue);
                 int elst = w.BeginFull("elst", (byte)(ev1 ? 1 : 0), 0);
-                w.U32(1);
-                if (ev1) { w.U64(presentation[ti]); w.U64((ulong)t.EditMediaTime); }
-                else { w.U32((uint)presentation[ti]); w.U32((uint)t.EditMediaTime); }
-                w.U16(1); w.U16(0);
+                w.U32((uint)outputEdits.Length);
+                foreach (Mp4EditListEntry edit in outputEdits)
+                {
+                    if (ev1)
+                    {
+                        w.U64(edit.SegmentDuration);
+                        w.U64(unchecked((ulong)edit.MediaTime));
+                    }
+                    else
+                    {
+                        w.U32((uint)edit.SegmentDuration);
+                        w.U32(unchecked((uint)(int)edit.MediaTime));
+                    }
+                    w.U16(unchecked((ushort)edit.MediaRateInteger));
+                    w.U16(unchecked((ushort)edit.MediaRateFraction));
+                }
                 w.End(elst);
                 w.End(edts);
             }
@@ -394,12 +524,14 @@ internal static class Mp4Muxer
             w.End(mdhd);
 
             int hdlr = w.BeginFull("hdlr", 0, 0);
-            w.U32(0); w.Ascii(video ? "vide" : "soun"); w.Zero(12); w.Ascii(video ? "VideoHandler" : "SoundHandler"); w.U8(0);
+            w.U32(0); w.Ascii(video ? "vide" : audio ? "soun" : "sbtl"); w.Zero(12);
+            w.Ascii(video ? "VideoHandler" : audio ? "SoundHandler" : "SubtitleHandler"); w.U8(0);
             w.End(hdlr);
 
             int minf = w.Begin("minf");
             if (video) { int vmhd = w.BeginFull("vmhd", 0, 1); w.Zero(8); w.End(vmhd); }
-            else { int smhd = w.BeginFull("smhd", 0, 0); w.Zero(4); w.End(smhd); }
+            else if (audio) { int smhd = w.BeginFull("smhd", 0, 0); w.Zero(4); w.End(smhd); }
+            else { int nmhd = w.BeginFull("nmhd", 0, 0); w.End(nmhd); }
             int dinf = w.Begin("dinf");
             int dref = w.BeginFull("dref", 0, 0); w.U32(1);
             int url = w.BeginFull("url ", 0, 1); w.End(url);
@@ -470,6 +602,16 @@ internal static class Mp4Muxer
     private static void WriteTables(BoxWriter w, DemuxedTrack t, List<Chunk> chunks, long baseOffset, bool co64)
     {
         var samples = t.Samples;
+        // Flat MP4 sample tables start DTS at zero. Carry the source decode origin in ctts so PTS stays absolute.
+        long decodeOrigin = samples[0].Dts;
+        int CompositionOffset(TrackSample sample)
+        {
+            long offset = checked(sample.CtsOffset + decodeOrigin);
+            if (offset is < int.MinValue or > int.MaxValue)
+                throw new MediaContainerException("The MP4 composition offset cannot preserve the source decode origin.");
+            return (int)offset;
+        }
+
         // stts
         var stts = new List<(uint Count, uint Delta)>();
         foreach (var s in samples)
@@ -483,14 +625,15 @@ internal static class Mp4Muxer
         w.End(box);
 
         // ctts (only when composition offsets exist; version 1 permits negative offsets)
-        if (samples.Exists(s => s.CtsOffset != 0))
+        if (samples.Exists(s => CompositionOffset(s) != 0))
         {
-            bool negative = samples.Exists(s => s.CtsOffset < 0);
+            bool negative = samples.Exists(s => CompositionOffset(s) < 0);
             var ctts = new List<(uint Count, int Offset)>();
             foreach (var s in samples)
             {
-                if (ctts.Count > 0 && ctts[^1].Offset == s.CtsOffset) ctts[^1] = (ctts[^1].Count + 1, s.CtsOffset);
-                else ctts.Add((1, s.CtsOffset));
+                int offset = CompositionOffset(s);
+                if (ctts.Count > 0 && ctts[^1].Offset == offset) ctts[^1] = (ctts[^1].Count + 1, offset);
+                else ctts.Add((1, offset));
             }
             box = w.BeginFull("ctts", (byte)(negative ? 1 : 0), 0); w.U32((uint)ctts.Count);
             foreach (var e in ctts) { w.U32(e.Count); w.U32((uint)e.Offset); }

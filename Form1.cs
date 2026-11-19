@@ -5,6 +5,133 @@ namespace VESPER;
 
 public partial class Form1 : Form
 {
+    internal enum SleepPromptResult { Skipped, Slept, Failed }
+
+    internal sealed class QueueSleepPrompt : VesperPopupForm
+    {
+        private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+        private readonly Label _countdown;
+        private readonly VesperButton _sleep;
+        private readonly VesperButton _cancel;
+        private readonly Action<QueueSleepPrompt, bool> _completed;
+        private int _secondsRemaining;
+        private bool _finished;
+        private bool _approved;
+
+        internal QueueSleepPrompt(VesperPalette colors, int countdownSeconds, Action<QueueSleepPrompt, bool> completed)
+        {
+            if (countdownSeconds < 1) throw new ArgumentOutOfRangeException(nameof(countdownSeconds));
+            _secondsRemaining = countdownSeconds;
+            _completed = completed;
+            VesperWindowChrome.Brand(this);
+            Text = "Sleep when the queue finishes — VESPER";
+            AutoScaleDimensions = new SizeF(96, 96);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            ClientSize = new Size(500, 300 + VesperDialogChrome.HeaderHeight);
+            MaximizeBox = MinimizeBox = false;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Segoe UI", 9F);
+            BackColor = colors.Surface;
+            ForeColor = colors.Text;
+            AccessibleRole = AccessibleRole.Dialog;
+
+            var body = new Panel { Dock = DockStyle.Fill, BackColor = colors.Surface };
+            var heading = SleepLabel("The download queue is finished", 12, colors, bold: true);
+            heading.SetBounds(24, 20, 450, 30);
+            var explanation = SleepLabel($"VESPER will put this PC to sleep only if you choose Sleep now. The prompt closes after {countdownSeconds} seconds without sleeping.", 9, colors);
+            explanation.SetBounds(24, 62, 450, 54);
+            explanation.AutoEllipsis = false;
+            _countdown = SleepLabel($"This prompt cancels in {countdownSeconds} seconds.", 9, colors, bold: true);
+            _countdown.Name = "queueSleepCountdown";
+            _countdown.AccessibleName = "Sleep prompt countdown";
+            _countdown.SetBounds(24, 128, 450, 25);
+            AccessibleName = "Sleep prompt. " + _countdown.Text;
+            var cancellationNote = SleepLabel("New downloads or exiting VESPER cancels this prompt.", 8.5F, colors, muted: true);
+            cancellationNote.SetBounds(24, 160, 450, 25);
+            body.Controls.AddRange([heading, explanation, _countdown, cancellationNote]);
+
+            var footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = colors.Surface };
+            footer.Paint += (_, e) =>
+            {
+                using var pen = new Pen(colors.Divider);
+                e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
+            };
+            _sleep = SleepButton("Sleep now", 116, colors, primary: true, symbol: VesperIcon.Clock);
+            _sleep.Click += (_, _) => Finish(approved: true);
+            _cancel = SleepButton("Cancel", 88, colors);
+            _cancel.Click += (_, _) => Finish(approved: false);
+            footer.Controls.AddRange([_sleep, _cancel]);
+            footer.Resize += (_, _) => LayoutFooter(footer);
+
+            Controls.Add(body);
+            Controls.Add(footer);
+            VesperDialogChrome.Attach(this, "VESPER  /  Queue finished", colors, VesperIcon.Clock);
+            StartPosition = FormStartPosition.CenterScreen;
+            CancelButton = _cancel;
+            FormClosing += (_, _) =>
+            {
+                if (_finished) return;
+                _finished = true;
+                _approved = false;
+                _timer.Stop();
+            };
+            FormClosed += (_, _) =>
+            {
+                _timer.Stop();
+                _timer.Dispose();
+                _completed(this, _approved);
+            };
+            _timer.Tick += (_, _) =>
+            {
+                _secondsRemaining--;
+                if (_secondsRemaining <= 0)
+                {
+                    Finish(approved: false);
+                    return;
+                }
+                _countdown.Text = $"This prompt cancels in {_secondsRemaining} seconds.";
+                AccessibleName = "Sleep prompt. " + _countdown.Text;
+            };
+            Shown += (_, _) => _timer.Start();
+            LayoutFooter(footer);
+        }
+
+        internal void Cancel() => Finish(approved: false);
+
+        private void Finish(bool approved)
+        {
+            if (_finished) return;
+            _finished = true;
+            _approved = approved;
+            _timer.Stop();
+            Close();
+        }
+
+        private static Label SleepLabel(string text, float size, VesperPalette colors, bool bold = false, bool muted = false) => new()
+        {
+            Text = text, AutoSize = false, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = muted ? colors.Muted : colors.Text,
+            Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
+        };
+
+        private static VesperButton SleepButton(string text, int width, VesperPalette colors,
+            bool primary = false, VesperIcon symbol = VesperIcon.None)
+        {
+            var button = new VesperButton { Text = text, Width = width, Height = 34, Primary = primary, Symbol = symbol };
+            button.ApplyPalette(colors);
+            return button;
+        }
+
+        private void LayoutFooter(VesperPanel footer)
+        {
+            int scale = IsHandleCreated ? UiKit.Scale(this, 1) : 1;
+            _sleep.SetBounds(footer.Width - 23 * scale - 116 * scale, 14 * scale, 116 * scale, 34 * scale);
+            _cancel.SetBounds(_sleep.Left - 8 * scale - 88 * scale, 14 * scale, 88 * scale, 34 * scale);
+        }
+    }
+
     internal VesperPalette CurrentPalette => _colors;
     private readonly Dictionary<Guid, DownloadItem> _items = [];
     private readonly Dictionary<string, DownloadItem> _browserItems = new(StringComparer.Ordinal);
@@ -12,7 +139,18 @@ public partial class Form1 : Form
     private readonly VesperPreferences _prefs;
     private readonly DownloadEngine? _engine;
     private readonly DownloadActions? _actions;
+    private readonly Func<bool> _requestSleep;
     private readonly ContextMenuStrip _rowMenu = new() { ShowImageMargin = true };
+    private readonly ContextMenuStrip _listMenu = new() { ShowImageMargin = true };
+    private readonly VesperButton _listButton = new()
+    {
+        Name = "downloadListActionsButton",
+        Text = "List",
+        Symbol = VesperIcon.Queue,
+        TrailingChevron = true,
+        Anchor = AnchorStyles.Top | AnchorStyles.Right,
+        Size = new Size(86, 34)
+    };
     private readonly Dictionary<string, ToolStripMenuItem> _menuCommands = [];
     private readonly Dictionary<ToolStripMenuItem, VesperIcon> _menuSymbols = [];
     private readonly List<ToolStripMenuItem> _rateOptions = [];
@@ -21,6 +159,7 @@ public partial class Form1 : Form
     private ToolStripMenuItem _priorityMenu = null!;
     private readonly ToolTip _tooltips = new() { InitialDelay = 450, ReshowDelay = 100 };
     private readonly System.Windows.Forms.Timer _diskForecastTimer = new() { Interval = 60_000 };
+    private readonly System.Windows.Forms.Timer _announcementTimer = new() { Interval = 1_000 };
     private Dictionary<string, long?> _availableDiskSpace = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastDiskProbeUtc = DateTime.MinValue;
     private bool _diskProbeRunning;
@@ -42,31 +181,45 @@ public partial class Form1 : Form
     private BotanicalArt? _botanicalArt;
     private bool _allowVisible;
     private bool _exiting;
+    private QueueSleepPrompt? _sleepPrompt;
+    private bool _unfinishedWorkArrived;
     private string? _lastClipboard;
     private DateTime _lastAvailabilityCheck = DateTime.MinValue;
 
     /// <summary>Visual Studio designer entry point. Never starts an engine.</summary>
     public Form1() : this(new VesperPreferences(), null, false) { }
 
-    internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden, bool botanicalPreview = false)
+    internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden, bool botanicalPreview = false,
+        Func<bool>? requestSleep = null)
     {
         _prefs = preferences;
+        _requestSleep = requestSleep ?? EngineHost.SleepComputer;
         Disposed += (_, _) =>
         {
+            CancelQueueSleepPrompt();
             _browserHandler?.CloseBrowserActivity();
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _botanicalArt?.Dispose();
             _rowMenu.Dispose();
+            _listMenu.Dispose();
             _tooltips.Dispose();
             _diskForecastTimer.Dispose();
+            _announcementTimer.Dispose();
         };
         _engine = engine;
         _startHidden = startHidden;
         _allowVisible = !startHidden;
         InitializeComponent();
+        _listButton.AccessibleName = "Download lists and podcast feeds";
+        _listButton.TabIndex = 1;
+        _settings.TabIndex = 2;
+        _listButton.Visible = engine is not null;
+        _mast.Controls.Add(_listButton);
+        _listButton.BringToFront();
         _footerLabel.AutoEllipsis = true;
         _footerLabel.AccessibleName = "Download and storage status";
         _diskForecastTimer.Tick += (_, _) => _ = RefreshDiskSpaceAsync();
+        _announcementTimer.Tick += (_, _) => FlushScreenReaderAnnouncement();
         Move += (_, _) => RememberNoticeMonitor();
         FormWindowState previousState = WindowState;
         Resize += (_, _) =>
@@ -212,6 +365,7 @@ public partial class Form1 : Form
         bool post;
         lock (_inboxLock)
         {
+            if (IsUnfinishedQueueWork(snapshot)) _unfinishedWorkArrived = true;
             _inbox[snapshot.Id] = snapshot;
             post = !_inboxQueued;
             _inboxQueued = true;
@@ -222,16 +376,23 @@ public partial class Form1 : Form
     private void DrainInbox()
     {
         List<JobSnapshot> batch;
+        bool unfinishedWorkArrived;
         lock (_inboxLock)
         {
             batch = [.. _inbox.Values];
             _inbox.Clear();
             _inboxQueued = false;
+            unfinishedWorkArrived = _unfinishedWorkArrived;
+            _unfinishedWorkArrived = false;
         }
+
+        bool cancelledSleepPrompt = _sleepPrompt is not null && unfinishedWorkArrived;
+        if (cancelledSleepPrompt) CancelQueueSleepPrompt();
 
         string searchTerm = _search.Text.Trim();
         bool sortBySize = _sort.SelectedText == "Size";
         bool structural = false;
+        var queueTerminations = new List<JobSnapshot>();
         foreach (JobSnapshot snapshot in batch)
         {
             if (snapshot.IsUnacceptedBrowserCapture)
@@ -246,10 +407,13 @@ public partial class Form1 : Form
             if (_items.TryGetValue(snapshot.Id, out DownloadItem? item))
             {
                 JobStatus before = item.Status;
+                JobState? previousState = item.Snapshot?.State;
                 string name = item.Name;
                 long size = item.SizeBytes;
                 bool matched = searchTerm.Length > 0 && item.MatchesSearch(searchTerm);
                 item.UpdateFrom(snapshot);
+                if (IsQueueTermination(snapshot) && previousState != snapshot.State)
+                    queueTerminations.Add(snapshot);
                 structural |= NeedsListRefresh(item, before, name, size, matched, searchTerm, sortBySize);
                 Announce(before, item);
             }
@@ -258,11 +422,113 @@ public partial class Form1 : Form
                 var added = DownloadItem.From(snapshot);
                 _items[snapshot.Id] = added;
                 if (added.Status == JobStatus.Completed) Announce(JobStatus.Queued, added);
+                if (IsQueueTermination(snapshot))
+                    queueTerminations.Add(snapshot);
                 structural = true;
             }
         }
         if (structural) RefreshList();
         else { _grid.RefreshRows(batch, static row => row.Id); UpdateFooter(); }
+        if (!cancelledSleepPrompt && queueTerminations.Count > 0) HandleQueueFinished(queueTerminations);
+    }
+
+    private static bool IsUnfinishedQueueWork(JobSnapshot snapshot) =>
+        snapshot.Kind != JobKind.BrowserFile && !snapshot.IsUnacceptedBrowserCapture
+        && snapshot.State is not (JobState.Completed or JobState.Cancelled);
+
+    internal static bool HasUnfinishedQueueWork(IEnumerable<JobSnapshot> snapshots) =>
+        snapshots.Any(IsUnfinishedQueueWork);
+
+    private static bool IsQueueTermination(JobSnapshot snapshot) =>
+        snapshot.Kind != JobKind.BrowserFile && !snapshot.IsUnacceptedBrowserCapture
+        && snapshot.State is (JobState.Completed or JobState.Cancelled);
+
+    internal static bool QueueFinishedAfterTransitions(IEnumerable<JobSnapshot> transitions,
+        IEnumerable<JobSnapshot> currentSnapshots) =>
+        transitions.Any(IsQueueTermination) && !HasUnfinishedQueueWork(currentSnapshots);
+
+    private bool HasUnprocessedUnfinishedWork()
+    {
+        lock (_inboxLock) return _unfinishedWorkArrived;
+    }
+
+    private void HandleQueueFinished(IReadOnlyList<JobSnapshot> queueTerminations)
+    {
+        if (_engine is null) return;
+        JobSnapshot[] currentSnapshots = _engine.Snapshots().ToArray();
+        if (!QueueFinishedAfterTransitions(queueTerminations, currentSnapshots) || HasUnprocessedUnfinishedWork()) return;
+
+        JobSnapshot? latest = LatestCompletedQueueJob(currentSnapshots);
+
+        if (latest is not null && _prefs.OpenFolderWhenQueueFinishes)
+            _actions?.ShowFolder(latest);
+        if (_prefs.SleepWhenQueueFinishes) StartQueueSleepPrompt();
+    }
+
+    internal static JobSnapshot? LatestCompletedQueueJob(IEnumerable<JobSnapshot> snapshots) =>
+        snapshots
+            .Where(snapshot => snapshot.State == JobState.Completed && !snapshot.IsUnacceptedBrowserCapture
+                && snapshot.Kind != JobKind.BrowserFile)
+            .OrderByDescending(snapshot => snapshot.CompletedUtc ?? DateTime.MinValue)
+            .FirstOrDefault();
+
+    private void StartQueueSleepPrompt()
+    {
+        if (_sleepPrompt is not null || _engine is null || _exiting || IsDisposed
+            || !_prefs.SleepWhenQueueFinishes || HasUnfinishedQueueWork(_engine.Snapshots())
+            || HasUnprocessedUnfinishedWork())
+            return;
+
+        var prompt = new QueueSleepPrompt(_colors, 60, OnQueueSleepPromptClosed);
+        _sleepPrompt = prompt;
+        try { prompt.Show(); }
+        catch (Exception ex) when (ex is InvalidOperationException)
+        {
+            _sleepPrompt = null;
+            prompt.Dispose();
+            System.Diagnostics.Trace.WriteLine(ex.Message, "Queue completion action");
+        }
+    }
+
+    private void CancelQueueSleepPrompt()
+    {
+        QueueSleepPrompt? prompt = _sleepPrompt;
+        _sleepPrompt = null;
+        prompt?.Cancel();
+    }
+
+    private void OnQueueSleepPromptClosed(QueueSleepPrompt prompt, bool approved)
+    {
+        if (!ReferenceEquals(_sleepPrompt, prompt)) return;
+        _sleepPrompt = null;
+        if (!approved || _engine is null || _exiting || IsDisposed) return;
+
+        SleepPromptResult result;
+        try
+        {
+            result = RequestSleepAfterPrompt(approved, shuttingDown: _exiting || IsDisposed,
+                hasUnfinishedWork: () => _engine is null
+                    || HasUnfinishedQueueWork(_engine.Snapshots()) || HasUnprocessedUnfinishedWork(),
+                releaseSleepLock: () => EngineHost.HoldAwake(false),
+                requestSleep: _requestSleep);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.WriteLine(ex.Message, "Queue completion sleep");
+            result = SleepPromptResult.Failed;
+        }
+
+        if (result == SleepPromptResult.Failed)
+            PresentNotice("Sleep did not start", "Windows could not put the PC to sleep", VesperIcon.Warning, ShowFromTray);
+    }
+
+    internal static SleepPromptResult RequestSleepAfterPrompt(bool approved, bool shuttingDown,
+        Func<bool> hasUnfinishedWork, Action releaseSleepLock, Func<bool> requestSleep)
+    {
+        if (!approved || shuttingDown || hasUnfinishedWork()) return SleepPromptResult.Skipped;
+        releaseSleepLock();
+        if (shuttingDown || hasUnfinishedWork()) return SleepPromptResult.Skipped;
+        return requestSleep() ? SleepPromptResult.Slept : SleepPromptResult.Failed;
     }
 
     internal static bool NeedsListRefresh(DownloadItem item, JobStatus previousStatus, string previousName,
@@ -321,6 +587,7 @@ public partial class Form1 : Form
     // Narrator and other screen readers hear outcomes (finished, failed, needs attention) without the
     // user having to tab into the list. Throttled: one announcement per second, most recent wins.
     private DateTime _lastAnnouncement;
+    private string? _pendingAnnouncement;
     private void AnnounceToScreenReader(JobStatus before, DownloadItem item)
     {
         if (!IsHandleCreated) return;
@@ -334,8 +601,32 @@ public partial class Form1 : Form
         };
         if (text is null) return;
         DateTime now = DateTime.UtcNow;
-        if (now - _lastAnnouncement < TimeSpan.FromSeconds(1)) return;
-        _lastAnnouncement = now;
+        TimeSpan elapsed = now - _lastAnnouncement;
+        if (_lastAnnouncement != DateTime.MinValue && elapsed < TimeSpan.FromSeconds(1))
+        {
+            _pendingAnnouncement = text;
+            _announcementTimer.Stop();
+            _announcementTimer.Interval = Math.Max(1, (int)Math.Ceiling(1_000 - elapsed.TotalMilliseconds));
+            _announcementTimer.Start();
+            return;
+        }
+
+        _announcementTimer.Stop();
+        _pendingAnnouncement = null;
+        RaiseScreenReaderAnnouncement(text);
+    }
+
+    private void FlushScreenReaderAnnouncement()
+    {
+        _announcementTimer.Stop();
+        if (_pendingAnnouncement is not { } text) return;
+        _pendingAnnouncement = null;
+        RaiseScreenReaderAnnouncement(text);
+    }
+
+    private void RaiseScreenReaderAnnouncement(string text)
+    {
+        _lastAnnouncement = DateTime.UtcNow;
         try
         {
             AccessibilityObject.RaiseAutomationNotification(System.Windows.Forms.Automation.AutomationNotificationKind.ActionCompleted,
@@ -391,6 +682,37 @@ public partial class Form1 : Form
         VesperMenuTheme.FormatItems(menu.Items, _colors, itemWidth: 180, dpi: DeviceDpi);
     }
 
+    private void BuildListMenu()
+    {
+        _listMenu.Items.Add(new ToolStripMenuItem("Import download list…", null, (_, _) => ImportDownloadList())
+        {
+            Tag = VesperIcon.Folder
+        });
+        _listMenu.Items.Add(new ToolStripMenuItem("Export list as JSON…", null, (_, _) => ExportDownloadList(".json"))
+        {
+            Tag = VesperIcon.Clipboard
+        });
+        _listMenu.Items.Add(new ToolStripMenuItem("Export list as CSV…", null, (_, _) => ExportDownloadList(".csv"))
+        {
+            Tag = VesperIcon.Clipboard
+        });
+        _listMenu.Items.Add(new ToolStripSeparator());
+        _listMenu.Items.Add(new ToolStripMenuItem("Podcast feeds…", null, (_, _) => OpenPodcastFeeds())
+        {
+            Tag = VesperIcon.Audio
+        });
+        ApplyListMenuAppearance();
+    }
+
+    private void ApplyListMenuAppearance()
+    {
+        foreach (ToolStripMenuItem item in _listMenu.Items.OfType<ToolStripMenuItem>())
+            if (item.Tag is VesperIcon icon)
+                item.Image = VesperMenuTheme.IconImage(icon, _colors, DeviceDpi);
+        VesperMenuTheme.Apply(_listMenu, _colors, withIcons: true);
+        VesperMenuTheme.FormatItems(_listMenu.Items, _colors, itemWidth: 220, dpi: DeviceDpi);
+    }
+
     internal void RequestShow() => PostToUi(ShowFromTray);
 
     private void ShowFromTray()
@@ -405,6 +727,7 @@ public partial class Form1 : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (_exiting || e.CloseReason != CloseReason.UserClosing) CancelQueueSleepPrompt();
         if (_engine is not null && !_exiting && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
@@ -426,12 +749,14 @@ public partial class Form1 : Form
             if (choice != DialogResult.Yes) return;
         }
         _exiting = true;
+        CancelQueueSleepPrompt();
         _allowVisible = true;
         Close();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        CancelQueueSleepPrompt();
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _bridge?.Dispose();
         _notice?.Dispose();
@@ -595,7 +920,13 @@ public partial class Form1 : Form
 #endif
         };
         BuildMenuOnce();
+        BuildListMenu();
         _rowMenu.Opening += ConfigureRowMenu;
+        _listButton.Click += (_, _) =>
+        {
+            ApplyListMenuAppearance();
+            _listMenu.Show(_listButton, new Point(0, _listButton.Height));
+        };
         // Create the native menu handles right after the window exists, without a timer, so the first right-click is instant.
         HandleCreated += (_, _) => BeginInvoke((Action)(() =>
         {
@@ -603,6 +934,7 @@ public partial class Form1 : Form
         }));
         _tooltips.SetToolTip(_settings, "Settings");
         _tooltips.SetToolTip(_add, "Add download (Ctrl+N)");
+        _tooltips.SetToolTip(_listButton, "Import or export download lists and manage podcast feeds");
         _tooltips.SetToolTip(_searchFrame, "Search downloads");
         _add.Click += (_, _) => AddDownload();
         _settings.Click += (_, _) => OpenSettings();
@@ -686,7 +1018,16 @@ public partial class Form1 : Form
         int edge = UiKit.Scale(this, 20);
         int y = Math.Max(0, (_mast.Height - _add.Height) / 2);
         _settings.SetBounds(_mast.ClientSize.Width - edge - _settings.Width, y, _settings.Width, _settings.Height);
-        _add.Location = new Point(_settings.Left - UiKit.Scale(this, 12) - _add.Width, y);
+        int gap = UiKit.Scale(this, 12);
+        if (_listButton.Visible)
+        {
+            _listButton.SetBounds(_settings.Left - gap - _listButton.Width, y, _listButton.Width, _add.Height);
+            _add.Location = new Point(_listButton.Left - gap - _add.Width, y);
+        }
+        else
+        {
+            _add.Location = new Point(_settings.Left - gap - _add.Width, y);
+        }
         _brandIcon.SetBounds(edge, UiKit.Scale(this, 10), UiKit.Scale(this, 62), UiKit.Scale(this, 55));
         int brandX = _botanicalArt is null ? edge : _brandIcon.Right + UiKit.Scale(this, 9);
         _brandText.Location = new Point(brandX, UiKit.Scale(this, 12));
@@ -779,7 +1120,7 @@ public partial class Form1 : Form
         _brandCaption.ForeColor = _colors.Muted;
         _selectedLabel.ForeColor = _colors.Text;
 
-        foreach (var button in new[] { _add, _settings, _pause, _resume, _remove, _clear })
+        foreach (var button in new[] { _add, _settings, _listButton, _pause, _resume, _remove, _clear })
             button.ApplyPalette(_colors);
         _searchFrame.FillColor = _colors.Surface;
         _searchFrame.OutlineColor = _colors.Border;
@@ -792,6 +1133,7 @@ public partial class Form1 : Form
         _grid.ApplyAppearance(_colors, _prefs.Density);
         VesperMenuTheme.Apply(_rowMenu, _colors, withIcons: true);
         RefreshMenuStyle();
+        ApplyListMenuAppearance();
         ApplyTrayAppearance();
         LayoutMast();
         _searchFrame.Invalidate();
@@ -1008,6 +1350,219 @@ public partial class Form1 : Form
             VesperMessageBox.Show(this, "Some links were not added:\n\n" + string.Join("\n\n", problems), "Add download", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
+    private void ImportDownloadList()
+    {
+        if (_engine is null) return;
+        using var picker = new OpenFileDialog
+        {
+            Title = "Import download list",
+            Filter = "VESPER lists (*.json;*.csv)|*.json;*.csv",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        if (!TryReadDownloadListFile(picker.FileName, out string contents, out string readError))
+        {
+            VesperMessageBox.Show(this, readError, "Import download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        DownloadListReadResult parsed = DownloadListTransfer.Read(contents, Path.GetExtension(picker.FileName));
+        if (!parsed.Success)
+        {
+            VesperMessageBox.Show(this, parsed.Error ?? "The list could not be imported.", "Import download list",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (parsed.Entries.Count == 0)
+        {
+            VesperMessageBox.Show(this, "The list contains no downloads.", "Import download list",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        int queued = parsed.Entries.Count(entry => entry.State == DownloadListState.Queued);
+        int paused = parsed.Entries.Count - queued;
+        string prompt = $"Import {parsed.Entries.Count} downloads? Queued items may start after import. {paused} paused item{(paused == 1 ? " stays" : "s stay")} paused.";
+        if (VesperMessageBox.Show(this, prompt, "Import download list", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        int added = 0;
+        int duplicates = 0;
+        int errorCount = 0;
+        var problems = new List<string>();
+        var importedQueuedJobs = new List<Guid>();
+        for (int i = 0; i < parsed.Entries.Count; i++)
+        {
+            DownloadListEntry entry = parsed.Entries[i];
+            AddResult result;
+            try
+            {
+                result = _engine.Add(new AddRequest(entry.Url, DestinationFolder: ImportSiteFolder(_prefs, entry),
+                    StartNow: false, Kind: entry.Kind, InitiallyPaused: true));
+            }
+            catch (IOException ex)
+            {
+                errorCount++;
+                problems.Add($"Import stopped at entry {i + 1}: {ex.Message}");
+                break;
+            }
+            if (result.Status == AddStatus.Added)
+            {
+                added++;
+                if (entry.State == DownloadListState.Queued) importedQueuedJobs.Add(result.JobId);
+            }
+            else if (result.Status == AddStatus.Duplicate)
+                duplicates++;
+            else
+            {
+                errorCount++;
+                if (problems.Count < 8) problems.Add($"Entry {i + 1}: {result.Message}");
+            }
+        }
+
+        if (errorCount == 0)
+        {
+            foreach (Guid id in importedQueuedJobs)
+            {
+                try { _engine.Resume(id); }
+                catch (IOException ex)
+                {
+                    errorCount++;
+                    problems.Add($"An imported item remains paused because it could not be saved: {ex.Message}");
+                    break;
+                }
+            }
+        }
+
+        string summary = $"{added} added; {duplicates} already in the list.";
+        if (errorCount > 0)
+        {
+            summary += "\n\nSome entries were not imported or started. Check the list before retrying:\n"
+                + string.Join("\n", problems);
+            if (errorCount > problems.Count) summary += $"\nAnd {errorCount - problems.Count} more.";
+        }
+        VesperMessageBox.Show(this, summary, "Import download list", MessageBoxButtons.OK,
+            errorCount > 0 ? MessageBoxIcon.Information : MessageBoxIcon.None);
+    }
+
+    private void OpenPodcastFeeds()
+    {
+        if (_engine is null) return;
+        using var dialog = new PodcastFollowForm(_engine, _prefs);
+        dialog.ShowDialog(this);
+    }
+
+    internal static string? ImportSiteFolder(VesperPreferences preferences, DownloadListEntry entry) =>
+        SiteRule.ForPage(preferences.SiteRules, entry.Url)?.Folder;
+
+    private void ExportDownloadList(string extension)
+    {
+        if (_engine is null) return;
+        if (extension is not (".json" or ".csv")) return;
+        DownloadListExportResult export = DownloadListTransfer.CreateExport(_engine.Snapshots());
+        if (export.Entries.Count == 0)
+        {
+            VesperMessageBox.Show(this, "There are no transferable downloads in the list.", "Export download list",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        using var picker = new SaveFileDialog
+        {
+            Title = "Export download list",
+            Filter = extension == ".csv" ? "CSV list (*.csv)|*.csv" : "JSON list (*.json)|*.json",
+            DefaultExt = extension[1..],
+            AddExtension = true,
+            OverwritePrompt = true,
+            FileName = "vesper-download-list" + extension
+        };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+
+        if (!Path.GetExtension(picker.FileName).Equals(extension, StringComparison.OrdinalIgnoreCase))
+        {
+            VesperMessageBox.Show(this, $"Choose a {extension} filename.", "Export download list",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        try
+        {
+            string contents = extension == ".csv"
+                ? DownloadListTransfer.WriteCsv(export.Entries)
+                : DownloadListTransfer.WriteJson(export.Entries);
+            File.WriteAllText(picker.FileName, contents, new System.Text.UTF8Encoding(false));
+            string summary = $"Exported {export.Entries.Count} downloads. Waiting or running items are marked Queued; items needing your action are marked Paused.";
+            if (export.Skipped > 0)
+            {
+                var reasons = new List<string>();
+                if (export.CompletedSkipped > 0) reasons.Add($"{export.CompletedSkipped} completed");
+                if (export.BrowserOwnedSkipped > 0) reasons.Add($"{export.BrowserOwnedSkipped} Chrome-owned");
+                if (export.UnsupportedSkipped > 0) reasons.Add($"{export.UnsupportedSkipped} unsupported");
+                if (export.UnsafeUrlSkipped > 0) reasons.Add($"{export.UnsafeUrlSkipped} with a URL that may contain access credentials");
+                if (export.DuplicateSkipped > 0) reasons.Add($"{export.DuplicateSkipped} duplicate links");
+                if (export.LimitSkipped > 0) reasons.Add($"{export.LimitSkipped} over the export limit");
+                summary += $" {export.Skipped} items were omitted: {string.Join(", ", reasons)}.";
+            }
+            VesperMessageBox.Show(this, summary, "Export download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or System.Security.SecurityException or NotSupportedException)
+        {
+            VesperMessageBox.Show(this, "The list could not be written: " + ex.Message, "Export download list",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private static bool TryReadDownloadListFile(string path, out string contents, out string error)
+    {
+        contents = "";
+        error = "";
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length <= 0)
+            {
+                error = "The list file is empty.";
+                return false;
+            }
+            if (stream.Length > DownloadListTransfer.MaxInputBytes)
+            {
+                error = "The list is too large to import.";
+                return false;
+            }
+
+            byte[] bytes = new byte[DownloadListTransfer.MaxInputBytes + 1];
+            int total = 0;
+            while (total < bytes.Length)
+            {
+                int read = stream.Read(bytes, total, bytes.Length - total);
+                if (read == 0) break;
+                total += read;
+            }
+            if (total > DownloadListTransfer.MaxInputBytes)
+            {
+                error = "The list is too large to import.";
+                return false;
+            }
+
+            contents = new System.Text.UTF8Encoding(false, true).GetString(bytes, 0, total);
+            return true;
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            error = "The list is not valid UTF-8 text.";
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+            or System.Security.SecurityException or NotSupportedException)
+        {
+            error = "The list could not be read: " + ex.Message;
+            return false;
+        }
+    }
+
     private void RevealDownload(JobSnapshot snapshot)
     {
         if (snapshot.IsUnacceptedBrowserCapture) return;
@@ -1029,11 +1584,12 @@ public partial class Form1 : Form
         bool restartNeeded = updated.AllowPrivateNetworks != _prefs.AllowPrivateNetworks
             || updated.ProxyMode != _prefs.ProxyMode || updated.ProxyAddress != _prefs.ProxyAddress;
         CopyPreferences(updated, _prefs);
+        if (!_prefs.SleepWhenQueueFinishes) CancelQueueSleepPrompt();
 
         BuildRateOptions();
         if (SettingsStore.Save(_prefs) is { } saveError)
             VesperMessageBox.Show(this, "Settings could not be saved and will be lost when VESPER closes:\n" + saveError, "Settings", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        EngineHost.Apply(_engine, _prefs);        // running downloads keep running; limits and queue rules update
+        EngineHost.Apply(_engine, _prefs);        // network policy, limits and queue rules update
         ApplyAppearance();
         RefreshList();
         if (restartNeeded)
@@ -1045,11 +1601,15 @@ public partial class Form1 : Form
         to.Theme = from.Theme; to.Density = from.Density; to.Motion = from.Motion; to.Botanical = from.Botanical;
         to.HideMissingCompleted = from.HideMissingCompleted; to.CategoryFolders = from.CategoryFolders; to.DefaultFolder = from.DefaultFolder;
         to.FileNameTemplate = from.FileNameTemplate;
+        to.SiteRules = SiteRule.Normalize(from.SiteRules);
         to.ConcurrentTransfers = from.ConcurrentTransfers; to.GlobalRateLimitKbs = from.GlobalRateLimitKbs;
         to.PerTransferRateLimitKbs = from.PerTransferRateLimitKbs; to.BandwidthPresetsKbs = [.. from.BandwidthPresetsKbs];
         to.MaxConnectionsPerJob = from.MaxConnectionsPerJob; to.NotifyOnFinish = from.NotifyOnFinish; to.WatchClipboard = from.WatchClipboard;
         to.PlayCompletionSound = from.PlayCompletionSound;
-        to.PreventSleep = from.PreventSleep; to.CloseToTray = from.CloseToTray; to.AllowPrivateNetworks = from.AllowPrivateNetworks;
+        to.OpenFolderWhenQueueFinishes = from.OpenFolderWhenQueueFinishes;
+        to.SleepWhenQueueFinishes = from.SleepWhenQueueFinishes;
+        to.PreventSleep = from.PreventSleep; to.PauseOnMeteredNetwork = from.PauseOnMeteredNetwork;
+        to.CloseToTray = from.CloseToTray; to.AllowPrivateNetworks = from.AllowPrivateNetworks;
         to.ProxyMode = from.ProxyMode; to.ProxyAddress = from.ProxyAddress; to.ScheduleEnabled = from.ScheduleEnabled;
         to.ScheduleStart = from.ScheduleStart; to.ScheduleEnd = from.ScheduleEnd; to.BrowserAction = from.BrowserAction;
     }

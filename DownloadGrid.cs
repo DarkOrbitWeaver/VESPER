@@ -97,10 +97,24 @@ public sealed class DownloadGrid : ScrollableControl
 
     internal void SetItems(IReadOnlyList<DownloadItem> items)
     {
+        Guid? focusedId = _focusRow >= 0 && _focusRow < _items.Count ? _items[_focusRow].Id : null;
+        int previousFocus = _focusRow;
+        var checkedItems = new HashSet<Guid>();
+        int focusedIndex = -1;
+        for (int i = 0; i < items.Count; i++)
+        {
+            Guid id = items[i].Id;
+            if (focusedId == id) focusedIndex = i;
+            if (_checked.Contains(id)) checkedItems.Add(id);
+        }
+
         _items = items;
-        var ids = items.Select(item => item.Id).ToHashSet();
-        bool changed = _checked.RemoveWhere(id => !ids.Contains(id)) > 0;
-        _focusRow = Math.Clamp(_focusRow, 0, Math.Max(0, _items.Count - 1));
+        bool changed = checkedItems.Count != _checked.Count;
+        _checked.Clear();
+        _checked.UnionWith(checkedItems);
+        _focusRow = focusedIndex >= 0
+            ? focusedIndex
+            : Math.Clamp(previousFocus, 0, Math.Max(0, _items.Count - 1));
         UpdateScrollArea();
         Invalidate();
         if (changed) CheckStateChanged?.Invoke();

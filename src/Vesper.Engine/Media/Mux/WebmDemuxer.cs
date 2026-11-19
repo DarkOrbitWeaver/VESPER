@@ -135,11 +135,13 @@ internal static class WebmDemuxer
             t.Timescale = scale;
             // Fill unknown durations from the next block time; the last block uses the default/previous duration.
             long defaultTicks = t.DefaultDurationNs > 0 ? Math.Max(1, t.DefaultDurationNs / (long)timecodeScale) : 0;
+            if (defaultTicks > int.MaxValue) throw Bad("a track's default frame duration exceeds the supported range");
             for (int i = 0; i < t.Samples.Count; i++)
             {
                 var smp = t.Samples[i];
                 if (smp.Duration > 0) continue;
                 long d = i + 1 < t.Samples.Count ? t.Samples[i + 1].Dts - smp.Dts : defaultTicks > 0 ? defaultTicks : (i > 0 ? t.Samples[i - 1].Duration : 0);
+                if (d > int.MaxValue) throw Bad("a frame duration exceeds the supported range");
                 smp.Duration = (int)Math.Clamp(d, 0, int.MaxValue);
                 t.Samples[i] = smp;
             }
@@ -351,7 +353,14 @@ internal static class WebmDemuxer
                         if (cs + c.Size > dataEnd) throw Bad("a block group is truncated");
                         if (c.Id == 0xA1) { blockPos = cs; blockSize = c.Size; }
                         else if (c.Id == 0xFB) referenced = true;
-                        else if (c.Id == 0x9B && c.Size <= 8) duration = (long)UInt(r.Read(cs, (int)c.Size), 0, (int)c.Size);
+                        else if (c.Id == 0x9B)
+                        {
+                            if (c.Size > 8) throw Bad("a block duration exceeds the supported range");
+                            ulong ticks = UInt(r.Read(cs, (int)c.Size), 0, (int)c.Size);
+                            if (ticks > int.MaxValue)
+                                throw Bad("a block duration exceeds the supported range");
+                            duration = (long)ticks;
+                        }
                         p = cs + c.Size;
                     }
                     if (blockPos < 0) throw Bad("a block group has no block");
@@ -396,7 +405,7 @@ internal static class WebmDemuxer
         ulong number = 0, type = 0, defaultDuration = 0, codecDelay = 0, seekPreRoll = 0;
         string codecId = "", language = "eng";
         bool languageSet = false;
-        byte[]? priv = null, video = null, audio = null;
+        byte[]? priv = null, video = null, audio = null, languageIetfBytes = null, nameBytes = null;
         foreach (var c in Elements(b, start, end))
         {
             switch (c.Id)
@@ -409,13 +418,36 @@ internal static class WebmDemuxer
                 case 0x56AA: codecDelay = UInt(b, c.Start, c.Length); break;
                 case 0x56BB: seekPreRoll = UInt(b, c.Start, c.Length); break;
                 case 0x22B59C: language = Encoding.ASCII.GetString(b, c.Start, c.Length).TrimEnd('\0'); languageSet = true; break;
+                case 0x22B59D: languageIetfBytes = b.AsSpan(c.Start, c.Length).ToArray(); break;
+                case 0x536E: nameBytes = b.AsSpan(c.Start, c.Length).ToArray(); break;
                 case 0xE0: video = b.AsSpan(c.Start, c.Length).ToArray(); break;
                 case 0xE1: audio = b.AsSpan(c.Start, c.Length).ToArray(); break;
                 case 0x6D80:
                     throw new MediaContainerException("The WebM track uses content encoding or encryption, which VESPER does not process.");
             }
         }
-        if (type is not (1 or 2) || number == 0) return null;
+        if (number == 0 || type is not (1 or 2 or 17)) return null;
+        if (type == 17)
+        {
+            if (codecId != "S_TEXT/UTF8") return null;
+            string languageIetf = languageIetfBytes is null ? "" : DecodeTrackText(languageIetfBytes, "a subtitle language");
+            string name = nameBytes is null ? "" : DecodeTrackText(nameBytes, "a track name");
+            if (priv is { Length: > 0 } || video is not null || audio is not null
+                || name.Length > 128 || name.Any(char.IsControl))
+                throw Bad("a UTF-8 text subtitle track has invalid initialization or metadata");
+            string subtitleLanguage = languageIetf.Length > 0 ? languageIetf : languageSet ? language : "und";
+            if (!ValidTrackLanguage(subtitleLanguage))
+                throw Bad("a UTF-8 text subtitle track has an invalid language");
+            return (number, new DemuxedTrack
+            {
+                Kind = TrackKind.Subtitle,
+                SourceContainer = "webm",
+                MatroskaCodecId = codecId,
+                Language = subtitleLanguage,
+                Name = name,
+                Codec = "utf8"
+            });
+        }
         var t = new DemuxedTrack
         {
             Kind = type == 1 ? TrackKind.Video : TrackKind.Audio,
@@ -448,6 +480,20 @@ internal static class WebmDemuxer
                 else if (c.Id == 0x6264) t.BitDepth = (int)Math.Min(UInt(audio, c.Start, c.Length), 64);
             }
         return (number, t);
+    }
+
+    private static string DecodeTrackText(byte[] bytes, string field)
+    {
+        try { return new UTF8Encoding(false, true).GetString(bytes).TrimEnd('\0'); }
+        catch (DecoderFallbackException) { throw Bad($"{field} is not valid UTF-8"); }
+    }
+
+    private static bool ValidTrackLanguage(string value)
+    {
+        if (value.Length is < 2 or > 35) return false;
+        string[] parts = value.Split('-');
+        if (parts[0].Length is < 2 or > 3 || parts[0].Any(character => !char.IsAsciiLetter(character))) return false;
+        return parts.Skip(1).All(part => part.Length is >= 1 and <= 8 && part.All(char.IsAsciiLetterOrDigit));
     }
 
     internal readonly record struct Element(uint Id, int Start, int Length);

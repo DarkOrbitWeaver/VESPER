@@ -110,6 +110,8 @@ public sealed class ExtentSet
     {
         set = new ExtentSet();
         if (string.IsNullOrWhiteSpace(text)) return true;
+
+        var ranges = new List<ByteRange>();
         foreach (string part in text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             int dash = part.IndexOf('-');
@@ -118,11 +120,45 @@ public sealed class ExtentSet
                 || !long.TryParse(part.AsSpan(dash + 1), NumberStyles.None, CultureInfo.InvariantCulture, out long end)
                 || end <= start)
             {
-                set = new ExtentSet();
                 return false;
             }
-            set.Add(new ByteRange(start, end));
+            ranges.Add(new ByteRange(start, end));
         }
+
+        ranges.Sort(static (left, right) =>
+        {
+            int byStart = left.Start.CompareTo(right.Start);
+            return byStart != 0 ? byStart : left.End.CompareTo(right.End);
+        });
+
+        var normalized = new List<ByteRange>(ranges.Count);
+        foreach (ByteRange range in ranges)
+        {
+            if (normalized.Count == 0 || range.Start > normalized[^1].End)
+            {
+                normalized.Add(range);
+                continue;
+            }
+
+            ByteRange previous = normalized[^1];
+            normalized[^1] = new ByteRange(previous.Start, Math.Max(previous.End, range.End));
+        }
+
+        long total = 0;
+        try
+        {
+            checked
+            {
+                foreach (ByteRange range in normalized) total += range.Length;
+            }
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+
+        set._ranges = normalized;
+        set.TotalBytes = total;
         return true;
     }
 

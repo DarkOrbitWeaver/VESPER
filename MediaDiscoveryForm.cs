@@ -47,6 +47,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly VesperChoice _audioTrack;
     private readonly VesperButton _subtitleChoice;
     private readonly CheckedListBox _subtitleLanguages;
+    private readonly CheckBox _embedSubtitles;
     private readonly ContextMenuStrip _subtitleMenu;
     private readonly ToolStripControlHost _subtitleHost;
     private readonly VesperChoice _customFormat;
@@ -91,6 +92,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         _url = url;
         _sample = sample;
+        if (SiteRule.ForPage(preferences.SiteRules, url.AbsoluteUri)?.AlwaysAudio == true)
+            _presetIndex = 3;
         _colors = UiKit.Palette(preferences);
         VesperWindowChrome.Brand(this);
         Text = "Discover media — VESPER";
@@ -184,6 +187,27 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Padding = Padding.Empty
         };
         _subtitleMenu.Items.Add(_subtitleHost);
+        _embedSubtitles = new CheckBox
+        {
+            Text = "Embed selected subtitles",
+            AccessibleName = "Embed selected subtitles",
+            AccessibleDescription = "Tries to embed supported SRT or WebVTT subtitles in MP4 or Matroska. Separate subtitle files are still queued; live, segmented, styled, or unsupported subtitles remain separate.",
+            AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft,
+            BackColor = _colors.Surface,
+            ForeColor = _colors.Text,
+            Font = new Font("Segoe UI", 9),
+            Visible = false
+        };
+        _embedSubtitles.CheckedChanged += (_, _) =>
+        {
+            if (_state == ViewState.Ready && _item is not null)
+            {
+                RefreshPresets(_item);
+                UpdateChoiceSummary();
+                FitToContent();
+            }
+        };
         _subtitleChoice.Click += (_, _) =>
         {
             if (_state == ViewState.Ready && _subtitleTrackOptions.Length > 0)
@@ -197,8 +221,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                     UpdateSubtitleSummary();
                     if (_state == ViewState.Ready && _item is not null)
                     {
+                        UpdateQualityUi();
                         RefreshPresets(_item);
-                        UpdateChoiceSummary();
+                        FitToContent();
                     }
                 });
         };
@@ -207,7 +232,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _customFormat.ApplyPalette(_colors);
         _customFormat.SelectedIndexChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
         _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice,
-            _audioTrack, _subtitleChoice, _customLabel, _customFormat]);
+            _audioTrack, _subtitleChoice, _embedSubtitles, _customLabel, _customFormat]);
         _clipCheck = new CheckBox
         {
             Text = "Download part", AccessibleName = "Download only part of the media", AutoSize = false,
@@ -235,7 +260,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _presets.Add(option);
             _presetOptions.Controls.Add(option);
         }
-        _presets[0].Checked = true;
+        _presets[_presetIndex].Checked = true;
         _canvas.Controls.Add(_presetOptions);
         void OutputChanged(object? sender, EventArgs e)
         {
@@ -390,6 +415,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
             shift = _statusExtra;                       // everything below the status text moves down with it
             int outputWidth = Math.Min(S(132), contentWidth / 2);
+            int subtitleShift = _embedSubtitles.Visible ? 29 : 0;
             Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             if (_audioTrack.Visible && _subtitleChoice.Visible)
@@ -412,14 +438,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             }
             else
                 Place(_qualityLabel, margin, 181, contentWidth - outputWidth - S(8), 26);
-            Place(_quality, margin, 211, contentWidth, 34);
-            Place(_entries, margin, 256, contentWidth, 152);
-            Place(_presetOptions, margin, 211, contentWidth, 181);
+            Place(_embedSubtitles, margin, 211, contentWidth, 25);
+            Place(_quality, margin, 211 + subtitleShift, contentWidth, 34);
+            Place(_entries, margin, 256 + subtitleShift, contentWidth, 152);
+            Place(_presetOptions, margin, 211 + subtitleShift, contentWidth, 181);
             for (int i = 0; i < _presets.Count; i++)
                 _presets[i].SetBounds(0, S(i * 37), contentWidth, S(i < 4 ? 37 : 33));
-            Place(_customLabel, margin, 398, contentWidth, 18);
-            Place(_customFormat, margin, 419, contentWidth, 34);
-            int clipY = IsExactFormat ? 457 : 402;
+            Place(_customLabel, margin, 398 + subtitleShift, contentWidth, 18);
+            Place(_customFormat, margin, 419 + subtitleShift, contentWidth, 34);
+            int clipY = (IsExactFormat ? 457 : 402) + subtitleShift;
             Place(_clipCheck, margin, clipY, S(126), 29);
             Place(_clipStartLabel, margin + S(134), clipY, S(40), 29);
             Place(_clipStart, margin + S(174), clipY + 2, S(86), 25);
@@ -432,6 +459,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 ViewState.Unavailable => 213,
                 _ => 191
             };
+            if (_state == ViewState.Ready) noticeY += subtitleShift;
             Place(_notice, margin, noticeY, contentWidth, 40 + _noticeExtra);
         }
         finally { _arranging = false; }
@@ -453,8 +481,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private int BodyHeight() => _statusExtra + _noticeExtra + _state switch
     {
-        ViewState.Ready => IsExactFormat ? (_clipCheck.Visible ? 541 : 510)
-            : _clipCheck.Visible ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448,
+        ViewState.Ready => (IsExactFormat ? (_clipCheck.Visible ? 541 : 510)
+            : _clipCheck.Visible ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448)
+            + (_embedSubtitles.Visible ? 29 : 0),
         ViewState.Collection => 464,
         ViewState.Unavailable => 260,
         _ => 214
@@ -779,8 +808,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         bool custom = IsExactFormat && _playableFormats.Count > 0;
         bool hasTrackChoice = _state == ViewState.Ready && _audioTrackOptions.Length > 1;
         bool hasSubtitleChoice = _state == ViewState.Ready && _subtitleTrackOptions.Length > 0;
+        bool hasSelectedSubtitle = _state == ViewState.Ready && _subtitleLanguages.CheckedIndices.Count > 0;
         _audioTrack.Visible = hasTrackChoice;
         _subtitleChoice.Visible = hasSubtitleChoice;
+        if (!hasSelectedSubtitle) _embedSubtitles.Checked = false;
+        _embedSubtitles.Visible = hasSelectedSubtitle;
+        _embedSubtitles.Enabled = !_busy;
         _qualityLabel.Visible = (_state == ViewState.Ready || _state == ViewState.Collection) && !hasSubtitleChoice;
         _qualityLabel.Text = hasTrackChoice ? "Audio track" : "Quality";
         _customLabel.Visible = _customFormat.Visible = custom;
@@ -814,9 +847,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                     + "May start a few seconds early: it cuts at the nearest segment.";
             if (choice.SubtitleTracks is { Count: > 0 } subtitles)
             {
-                string subtitleNotice = subtitles.Any(subtitle => string.Equals(subtitle.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase))
-                    ? "Selected subtitles save as separate files. Some streamed captions are saved as SRT."
-                    : "Selected subtitles save as separate files.";
+                string subtitleNotice = choice.SubtitleNotice ?? "Selected subtitles are saved as separate files.";
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "") + subtitleNotice;
             }
         }
@@ -897,7 +928,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _state == ViewState.Ready ? _subtitleLanguages.CheckedIndices.Cast<int>() : []);
         return subtitlePreferences with
         {
-            AudioTrackId = trackId
+            AudioTrackId = trackId,
+            EmbedSubtitles = _state == ViewState.Ready && _embedSubtitles.Checked
         };
     }
 
@@ -947,15 +979,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private void ConfigureSubtitleTracks(MediaItem item)
     {
-        _subtitleTrackOptions = item.Subtitles
-            .Where(MediaTransferBridge.IsSelectableSubtitle)
-            .GroupBy(subtitle => TextUtil.NormalizeLang(subtitle.Language), StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.OrderBy(subtitle => subtitle.IsAutoGenerated)
-                .ThenBy(subtitle => subtitle.Name, StringComparer.OrdinalIgnoreCase)
-                .ThenBy(subtitle => subtitle.Url.AbsoluteUri, StringComparer.Ordinal)
-                .First())
-            .OrderBy(subtitle => TextUtil.NormalizeLang(subtitle.Language), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        _subtitleTrackOptions = MediaTransferBridge.SelectableSubtitleTracks(item.Subtitles);
         _subtitleLanguages.BeginUpdate();
         _subtitleLanguages.Items.Clear();
         foreach (SubtitleTrack subtitle in _subtitleTrackOptions)
@@ -1189,6 +1213,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _audioTrack.Enabled = !_busy;
         _subtitleChoice.Enabled = !_busy;
         _subtitleLanguages.Enabled = !_busy;
+        _embedSubtitles.Enabled = !_busy;
         _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
         _outputChoice.Enabled = !_busy;
         _audioOutputChoice.Enabled = !_busy;

@@ -4,6 +4,8 @@
 .EXAMPLE   .\scripts\Build-Release.ps1 -PortableOnly -AllowUnsigned
 .NOTES     Output: release\setup-<version>\VESPER-Setup.exe and release\VESPER-<version>.zip.
            Signing requires VESPER_SIGN_CERT_SHA1 (Windows certificate store). Use -AllowUnsigned only for development.
+           Release packages require a clean Git tree. Use -AllowDirtyWorkingTreeForDevelopment only for local tests;
+           those binaries are stamped `local-dirty`, never with the current commit ID.
            The setup is self-contained. The ZIP is a portable app payload; use -SelfContained to bundle
            the .NET runtime in that payload as well.
 #>
@@ -16,6 +18,7 @@ param(
     [switch]$AllowUnsigned,
     [switch]$SelfContained,
     [switch]$PortableOnly,
+    [switch]$AllowDirtyWorkingTreeForDevelopment,
     [ValidatePattern('^10\.0\.[0-9]+$')][string]$RuntimeVersion
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +30,27 @@ function Run($label, [scriptblock]$block) {
     & $block
     if ($LASTEXITCODE -ne 0) { throw "$label failed (exit code $LASTEXITCODE)" }
 }
+
+function Resolve-SourceRevision([string]$revision, [string[]]$status, [bool]$allowDirty) {
+    if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'Release packaging requires a valid Git commit.' }
+    if ($status.Count -gt 0) {
+        if (-not $allowDirty) { throw 'Release packaging requires a clean Git tree. Commit the candidate or use -AllowDirtyWorkingTreeForDevelopment for local testing.' }
+        Write-Warning 'Packaging a dirty working tree for development; binaries will be stamped local-dirty.'
+        return 'local-dirty'
+    }
+    return $revision
+}
+
+function Get-SourceRevision([bool]$allowDirty) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Release packaging requires Git to identify the source revision.' }
+    $revision = (& git -C $root rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Git could not identify the current source revision.' }
+    $status = @(& git -C $root status --porcelain --untracked-files=all)
+    if ($LASTEXITCODE -ne 0) { throw 'Git could not verify the working tree state.' }
+    return Resolve-SourceRevision $revision $status $allowDirty
+}
+
+$sourceRevision = Get-SourceRevision ([bool]$AllowDirtyWorkingTreeForDevelopment)
 
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     [xml]$props = Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw
@@ -44,10 +68,10 @@ function Sign-ReleaseFile([string]$path) {
 }
 
 if (-not $SkipTests) {
-    Run "Engine, bridge and storage tests" { dotnet test tests/Vesper.Tests -c Release --nologo }
-    Run "Media resolver tests" { dotnet test tests/Vesper.MediaResolver.Tests -c Release --nologo }
-    Run "Setup and recovery tests" { dotnet test tests/Vesper.Setup.Tests -c Release --nologo }
-    Run "Desktop persistence tests" { dotnet test tests/Vesper.Windows.Tests -c Release --nologo }
+    Run "Engine, bridge and storage tests" { dotnet test tests/Vesper.Tests/Vesper.Tests.csproj -c Release --nologo }
+    Run "Media resolver tests" { dotnet test tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj -c Release --nologo }
+    Run "Setup and recovery tests" { dotnet test tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj -c Release --nologo }
+    Run "Desktop persistence tests" { dotnet test tests/Vesper.Windows.Tests/Vesper.Windows.Tests.csproj -c Release --nologo }
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $extensionTests = @(Get-ChildItem (Join-Path $root 'tests/extension') -Filter '*.test.mjs' -File | ForEach-Object FullName)
         if ($extensionTests.Count -eq 0) { throw 'No extension regression tests were found.' }
@@ -56,18 +80,15 @@ if (-not $SkipTests) {
 }
 
 $out = Join-Path $root "release\VESPER-$Version"
-if ((Test-Path $out) -or (Test-Path "$out.zip")) { throw "Release output already exists: $out. Archive it or choose another version; nothing was overwritten." }
+$zip = "$out.zip"
+$zipChecksumPath = "$zip.sha256"
+if ((Test-Path $out) -or (Test-Path $zip) -or (Test-Path $zipChecksumPath)) { throw "Release output already exists: $out. Archive it or choose another version; nothing was overwritten." }
 $setupOut = Join-Path $root "release\setup-$Version"
 if (-not $PortableOnly -and (Test-Path -LiteralPath $setupOut)) { throw "Setup output already exists: $setupOut." }
 $sc = if ($SelfContained -or -not $PortableOnly) { "--self-contained" } else { "--no-self-contained" }
 $buildArgs = @("-p:Version=$Version", "-p:DebugType=none")
+$buildArgs += "-p:SourceRevisionId=$sourceRevision"
 if ($RuntimeVersion) { $buildArgs += "-p:RuntimeFrameworkVersion=$RuntimeVersion" }
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $revision = git -C $root rev-parse --verify HEAD 2>$null
-    if ($LASTEXITCODE -eq 0 -and $revision -match '^[0-9a-f]{40}$') {
-        $buildArgs += "-p:SourceRevisionId=$revision"
-    }
-}
 
 Run "Publish desktop app" { dotnet publish VESPER.csproj -c Release -r win-x64 $sc @buildArgs -o $out }
 Run "Publish native-messaging host" { dotnet publish src/Vesper.NativeHost/Vesper.NativeHost.csproj -c Release -r win-x64 $sc @buildArgs -o $out }
@@ -123,11 +144,15 @@ if (-not $PortableOnly) {
 }
 Copy-Item (Join-Path $root "DOCUMENTATION\RELEASE.md") (Join-Path $out "RELEASE.md")
 
-$zip = "$out.zip"
-if (Test-Path $zip) { throw "Release ZIP already exists: $zip. Nothing was overwritten." }
 Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" } | Set-Content (Join-Path $out "SHA256SUMS.txt")
 Compress-Archive -Path "$out\*" -DestinationPath $zip
+$zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+"$zipHash  $(Split-Path -Leaf $zip)" | Set-Content -LiteralPath $zipChecksumPath -Encoding ascii
+if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $zipHash) {
+    throw "The portable ZIP checksum did not verify: $zip"
+}
 Write-Host "Done: $zip" -ForegroundColor Green
+Write-Host "ZIP checksum: $zipChecksumPath"
 if (-not $PortableOnly) { Write-Host "First Flight: $(Join-Path $setupOut 'VESPER-Setup.exe')" }
 else { Write-Host "Portable ZIP only. It does not register VESPER's browser helper." }

@@ -199,14 +199,326 @@ public class HlsTests
     public async Task Unsupported_hls_features_are_not_reported_as_drm()
     {
         await using var server = new FaultServer(); await server.StartAsync();
-        server.HlsPlaylists["/hls/discontinuous/index.m3u8"] =
-            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:4,\ns1.ts\n#EXT-X-ENDLIST\n";
+        server.HlsPlaylists["/hls/unsupported/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-I-FRAMES-ONLY\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n";
         using var h = new Harness();
 
-        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, "/hls/discontinuous/index.m3u8"),
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, "/hls/unsupported/index.m3u8"),
             state => state.State == JobState.NeedsAttention);
         Assert.Equal("unsupported", stopped.Reason);
         Assert.Equal(0, stopped.CommittedBytes);
+    }
+
+    [Fact]
+    public async Task Compatible_ts_epochs_are_rebased_and_accept_aes_key_rotation()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-keys";
+        byte[] keyA = FaultServer.HlsKey;
+        byte[] keyB = Payloads.Make(16, 902);
+        byte[] ivA = Convert.FromHexString("000102030405060708090A0B0C0D0E0F");
+        byte[] ivB = Convert.FromHexString("101112131415161718191A1B1C1D1E1F");
+        byte[] first = FaultServer.HlsSegment(0), second = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/key-a.bin"] = keyA;
+        server.HlsFiles[$"{root}/key-b.bin"] = keyB;
+        server.HlsFiles[$"{root}/s0.ts"] = Encrypt(first, keyA, ivA);
+        server.HlsFiles[$"{root}/s1.ts"] = Encrypt(second, keyB, ivB);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXT-X-MEDIA-SEQUENCE:20", "#EXT-X-DISCONTINUITY-SEQUENCE:5",
+            $"#EXT-X-KEY:METHOD=AES-128,URI=\"key-a.bin\",IV=0x{Convert.ToHexString(ivA)}",
+            "#EXTINF:4.0,", "s0.ts", "#EXT-X-DISCONTINUITY",
+            $"#EXT-X-KEY:METHOD=AES-128,URI=\"key-b.bin\",IV=0x{Convert.ToHexString(ivB)}",
+            "#EXTINF:4.0,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.Completed);
+        byte[] output = await File.ReadAllBytesAsync(done.FinalPath!);
+        Assert.EndsWith(".ts", done.FinalPath);
+        Assert.Equal(first.Length + second.Length, output.Length);
+        Assert.NotEqual(first.Concat(second).ToArray(), output);
+        Assert.Equal(1, server.Hits($"{root}/key-a.bin"));
+        Assert.Equal(1, server.Hits($"{root}/key-b.bin"));
+
+        using var input = new MemoryStream(output);
+        using var payloads = new MemoryStream();
+        List<DemuxedTrack> tracks = MpegTsDemuxer.Read(input, input.Length, payloads, CancellationToken.None);
+        Assert.Contains(tracks, track => track.Kind == TrackKind.Video);
+        Assert.Contains(tracks, track => track.Kind == TrackKind.Audio);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_a_changed_track_map_is_refused_before_its_bytes_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-track-change";
+        byte[] first = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = ChangeVideoStreamType(FaultServer.HlsSegment(0), 0x24);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_a_changed_ignored_stream_pid_is_refused_before_its_bytes_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-data-stream-change";
+        byte[] first = AddIgnoredStream(FaultServer.HlsSegment(0), 0x1e0, 0x06);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = AddIgnoredStream(FaultServer.HlsSegment(0), 0x1e1, 0x06);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Theory]
+    [InlineData(0x1e0, true)]
+    [InlineData(0, false)]
+    [InlineData(0x1fff, false)]
+    public async Task Hls_pmt_rejects_duplicate_or_reserved_ignored_stream_pids_before_commit(int pid, bool duplicate)
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/malformed-ignored-pid";
+        byte[] segment = AddIgnoredStream(FaultServer.HlsSegment(0), pid, 0x06);
+        if (duplicate) segment = AddIgnoredStream(segment, pid, 0x06);
+        server.HlsFiles[$"{root}/s0.ts"] = segment;
+        server.HlsPlaylists[$"{root}/index.m3u8"] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n";
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_a_changed_program_descriptor_is_refused_before_its_bytes_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-program-descriptor-change";
+        byte[] first = AddProgramDescriptor(FaultServer.HlsSegment(0), 0x11);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = AddProgramDescriptor(FaultServer.HlsSegment(0), 0x22);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_a_changed_transport_stream_identity_is_refused_before_its_bytes_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-transport-identity-change";
+        byte[] first = ChangeTransportStreamId(FaultServer.HlsSegment(0), 11);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = ChangeTransportStreamId(FaultServer.HlsSegment(0), 12);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_same_pmt_but_changed_h264_profile_is_refused_before_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-codec-config-change";
+        byte[] first = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = ChangeH264ProfileIdc(FaultServer.HlsSegment(0));
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Hls_epoch_with_a_malformed_timestamp_is_refused_before_its_bytes_commit()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-invalid-time";
+        byte[] first = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = CorruptFirstPresentationTimestamp(FaultServer.HlsSegment(0));
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Hls_epoch_with_a_short_declared_pes_header_is_refused_before_commit(int pesOrdinal)
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-short-pes-header";
+        byte[] first = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = ShortenPresentationHeader(FaultServer.HlsSegment(0), pesOrdinal);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("invalid-container", stopped.Reason);
+        Assert.Equal(first.Length, stopped.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Null(stopped.FinalPath);
+    }
+
+    [Fact]
+    public async Task Fragmented_mp4_discontinuity_is_refused_before_fetching_media()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/fmp4-discontinuity";
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-MAP:URI=\"init.mp4\"",
+            "#EXTINF:1,", "av-1.m4s", "#EXT-X-DISCONTINUITY", "#EXTINF:1,", "av-2.m4s", "#EXT-X-ENDLIST", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitForStateAsync(AddHls(h, server, $"{root}/index.m3u8"), JobState.NeedsAttention);
+
+        Assert.Equal("discontinuity", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Equal(0, server.Hits($"{root}/init.mp4"));
+        Assert.Equal(0, server.Hits($"{root}/av-1.m4s"));
+    }
+
+    [Fact]
+    public async Task Hls_epoch_cursor_restores_rebased_timing_without_redownloading_the_committed_prefix()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-restart";
+        byte[] first = FaultServer.HlsSegment(0), second = FaultServer.HlsSegment(0), third = FaultServer.HlsSegment(1);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = second;
+        server.HlsFiles[$"{root}/s2.ts"] = third;
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXTINF:4,", "s2.ts", "#EXT-X-ENDLIST", "");
+        var crashed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int commits = 0;
+        using var h = new Harness(point =>
+        {
+            if (point == "checkpoint.afterCommit" && Interlocked.Increment(ref commits) == 2)
+            {
+                crashed.TrySetResult();
+                throw new FailpointCrash(point);
+            }
+        });
+        Guid id = AddHls(h, server, $"{root}/index.m3u8");
+        await crashed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        h.Restart();
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(first.Length + second.Length + third.Length, done.CommittedBytes);
+        Assert.Equal(1, server.Hits($"{root}/s0.ts"));
+        Assert.Equal(1, server.Hits($"{root}/s1.ts"));
+        using var input = File.OpenRead(done.FinalPath!);
+        using var payloads = new MemoryStream();
+        Assert.Equal(2, MpegTsDemuxer.Read(input, input.Length, payloads, CancellationToken.None).Count);
+    }
+
+    [Fact]
+    public async Task Hls_resume_rejects_a_changed_discontinuity_sequence_before_appending()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string root = "/hls/epoch-sequence-change";
+        byte[] first = FaultServer.HlsSegment(0);
+        server.HlsFiles[$"{root}/s0.ts"] = first;
+        server.HlsFiles[$"{root}/s1.ts"] = FaultServer.HlsSegment(1);
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXT-X-DISCONTINUITY-SEQUENCE:0",
+            "#EXTINF:4,", "s0.ts", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        var crashed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int commits = 0;
+        using var h = new Harness(point =>
+        {
+            if (point == "checkpoint.afterCommit" && Interlocked.Increment(ref commits) == 1)
+            {
+                crashed.TrySetResult();
+                throw new FailpointCrash(point);
+            }
+        });
+        Guid id = AddHls(h, server, $"{root}/index.m3u8");
+        await crashed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        int priorSecondHits = server.Hits($"{root}/s1.ts");
+
+        server.HlsPlaylists[$"{root}/index.m3u8"] = string.Join('\n',
+            "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXT-X-DISCONTINUITY-SEQUENCE:1",
+            "#EXTINF:4,", "s0.ts", "#EXTINF:4,", "s1.ts", "#EXT-X-ENDLIST", "");
+        h.Restart();
+        JobSnapshot refused = await h.WaitForStateAsync(id, JobState.NeedsAttention);
+
+        Assert.Equal("source-changed", refused.Reason);
+        Assert.Equal(first.Length, refused.CommittedBytes);
+        Assert.Equal(first, await File.ReadAllBytesAsync(refused.PartialPath));
+        Assert.Equal(priorSecondHits, server.Hits($"{root}/s1.ts"));
+    }
+
+    [Fact]
+    public void Epoch_rewrite_honors_cancellation_before_returning_a_segment()
+    {
+        byte[] original = FaultServer.HlsSegment(0);
+        byte[] saved = [.. original];
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var timeline = new HlsTransportTimeline();
+
+        Assert.Throws<OperationCanceledException>(() => timeline.Rewrite(original, 90_000, startEpoch: true,
+            ct: cancellation.Token));
+        Assert.Equal(saved, original);
     }
 
     [Fact]
@@ -621,6 +933,36 @@ public class HlsTests
         Assert.Equal(FaultServer.HlsExpected(), await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.True(server.Hits("/hls/plain/s0.ts") <= 1, "a committed segment must not be downloaded again");
     }
+
+    [Fact]
+    public async Task HlsResume_discards_uncommitted_bytes_before_fetching_the_next_segment()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/resume-tail/index.m3u8";
+        server.HlsPlaylists[path] = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns0.ts\n#EXTINF:4,\nmissing.ts\n#EXT-X-ENDLIST\n";
+        server.HlsFiles["/hls/resume-tail/s0.ts"] = FaultServer.HlsSegment(0);
+        using var h = new Harness();
+
+        Guid id = AddHls(h, server, path);
+        JobSnapshot waiting = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(waiting.CommittedBytes > 0);
+
+        h.Restart();
+        await AppendUncommittedTailAsync(waiting.PartialPath);
+        h.Engine.Resume(id);
+        await h.WaitAsync(id, job => job.State == JobState.NeedsLink
+            && server.Hits("/hls/resume-tail/missing.ts") >= 2);
+
+        Assert.Equal(waiting.CommittedBytes, new FileInfo(waiting.PartialPath).Length);
+    }
+
+    private static async Task AppendUncommittedTailAsync(string path)
+    {
+        await using var file = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        byte[] tail = [0xA5, 0x5A, 0xC3, 0x3C];
+        await file.WriteAsync(tail);
+    }
+
     [Fact]
     public async Task FragmentedMp4Hls_UsesValidatedInitAndFragmentsInsteadOfArbitraryConcatenation()
     {
@@ -813,6 +1155,310 @@ public class HlsTests
         using var output = File.OpenRead(done.FinalPath!);
         Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
         Assert.Equal(1, server.Hits(keyPath));
+    }
+
+    private static byte[] Encrypt(byte[] data, byte[] key, byte[] iv)
+    {
+        using var aes = System.Security.Cryptography.Aes.Create();
+        aes.Key = key;
+        return aes.EncryptCbc(data, iv, System.Security.Cryptography.PaddingMode.PKCS7);
+    }
+
+    private static byte[] CorruptFirstPresentationTimestamp(byte[] transport)
+    {
+        for (int packetOffset = 0; packetOffset < transport.Length; packetOffset += 188)
+        {
+            Span<byte> packet = transport.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset + 14 > packet.Length
+                || packet[payloadOffset] != 0 || packet[payloadOffset + 1] != 0 || packet[payloadOffset + 2] != 1)
+                continue;
+            int flags = (packet[payloadOffset + 7] >> 6) & 3;
+            if (flags is not (2 or 3)) continue;
+            packet[payloadOffset + 11] &= 0xfe;
+            return transport;
+        }
+        throw new InvalidOperationException("The transport fixture has no presentation timestamp.");
+    }
+
+    private static byte[] ShortenPresentationHeader(byte[] transport, int pesOrdinal)
+    {
+        int seen = 0;
+        for (int packetOffset = 0; packetOffset < transport.Length; packetOffset += 188)
+        {
+            Span<byte> packet = transport.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset + 14 > packet.Length
+                || packet[payloadOffset] != 0 || packet[payloadOffset + 1] != 0 || packet[payloadOffset + 2] != 1)
+                continue;
+            int flags = (packet[payloadOffset + 7] >> 6) & 3;
+            if (flags is not (2 or 3) || ++seen != pesOrdinal) continue;
+            packet[payloadOffset + 8] = (byte)(flags == 3 ? 5 : 0);
+            return transport;
+        }
+        throw new InvalidOperationException("The transport fixture has too few timestamped PES packets.");
+    }
+
+    private static byte[] ChangeVideoStreamType(byte[] transport, byte streamType)
+    {
+        byte[] result = [.. transport];
+        int? pmtPid = null;
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != 0
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 12 > packet.Length || packet[sectionStart] != 0) continue;
+            int sectionLength = 3 + (((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2]);
+            int sectionEnd = sectionStart + sectionLength;
+            if (sectionEnd > packet.Length) continue;
+            for (int entry = sectionStart + 8; entry + 4 <= sectionEnd - 4; entry += 4)
+            {
+                if (packet[entry] == 0 && packet[entry + 1] == 0) continue;
+                pmtPid = ((packet[entry + 2] & 0x1f) << 8) | packet[entry + 3];
+                break;
+            }
+            if (pmtPid is not null) break;
+        }
+        if (pmtPid is null) throw new InvalidOperationException("The transport fixture has no program map PID.");
+
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != pmtPid.Value
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 16 > packet.Length || packet[sectionStart] != 2) continue;
+            int sectionLength = 3 + (((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2]);
+            int sectionEnd = sectionStart + sectionLength;
+            if (sectionEnd > packet.Length) continue;
+            int programInfoLength = ((packet[sectionStart + 10] & 0x0f) << 8) | packet[sectionStart + 11];
+            for (int entry = sectionStart + 12 + programInfoLength; entry + 5 <= sectionEnd - 4;)
+            {
+                int descriptorsLength = ((packet[entry + 3] & 0x0f) << 8) | packet[entry + 4];
+                if (packet[entry] == 0x1b)
+                {
+                    packet[entry] = streamType;
+                    uint crc = Mpeg2Crc(packet.Slice(sectionStart, sectionLength - 4));
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.Slice(sectionEnd - 4, 4), crc);
+                    return result;
+                }
+                entry += 5 + descriptorsLength;
+            }
+        }
+        throw new InvalidOperationException("The transport fixture has no H.264 program entry.");
+    }
+
+    private static byte[] AddIgnoredStream(byte[] transport, int pid, byte streamType)
+    {
+        byte[] result = [.. transport];
+        int? pmtPid = null;
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != 0
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 12 > packet.Length || packet[sectionStart] != 0) continue;
+            int sectionLength = 3 + (((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2]);
+            int sectionEnd = sectionStart + sectionLength;
+            if (sectionEnd > packet.Length) continue;
+            for (int entry = sectionStart + 8; entry + 4 <= sectionEnd - 4; entry += 4)
+            {
+                if (packet[entry] == 0 && packet[entry + 1] == 0) continue;
+                pmtPid = ((packet[entry + 2] & 0x1f) << 8) | packet[entry + 3];
+                break;
+            }
+            if (pmtPid is not null) break;
+        }
+        if (pmtPid is null) throw new InvalidOperationException("The transport fixture has no program map PID.");
+
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != pmtPid.Value
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 16 > packet.Length || packet[sectionStart] != 2) continue;
+            int sectionLengthField = ((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2];
+            int sectionLength = 3 + sectionLengthField;
+            int sectionEnd = sectionStart + sectionLength;
+            int newSectionEnd = sectionEnd + 5;
+            if (newSectionEnd > packet.Length) continue;
+
+            packet.Slice(sectionEnd - 4, 4).CopyTo(packet.Slice(sectionEnd + 1, 4));
+            packet[sectionEnd - 4] = streamType;
+            packet[sectionEnd - 3] = (byte)(0xe0 | (pid >> 8));
+            packet[sectionEnd - 2] = (byte)pid;
+            packet[sectionEnd - 1] = 0xf0;
+            packet[sectionEnd] = 0;
+
+            int newSectionLengthField = sectionLengthField + 5;
+            packet[sectionStart + 1] = (byte)((packet[sectionStart + 1] & 0xf0) | (newSectionLengthField >> 8));
+            packet[sectionStart + 2] = (byte)newSectionLengthField;
+            uint crc = Mpeg2Crc(packet.Slice(sectionStart, newSectionEnd - sectionStart - 4));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.Slice(newSectionEnd - 4, 4), crc);
+            return result;
+        }
+        throw new InvalidOperationException("The transport fixture has no room for another program entry.");
+    }
+
+    private static byte[] AddProgramDescriptor(byte[] transport, byte value)
+    {
+        byte[] result = [.. transport];
+        int? pmtPid = null;
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != 0
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 12 > packet.Length || packet[sectionStart] != 0) continue;
+            int sectionLength = 3 + (((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2]);
+            int sectionEnd = sectionStart + sectionLength;
+            if (sectionEnd > packet.Length) continue;
+            for (int entry = sectionStart + 8; entry + 4 <= sectionEnd - 4; entry += 4)
+            {
+                if (packet[entry] == 0 && packet[entry + 1] == 0) continue;
+                pmtPid = ((packet[entry + 2] & 0x1f) << 8) | packet[entry + 3];
+                break;
+            }
+            if (pmtPid is not null) break;
+        }
+        if (pmtPid is null) throw new InvalidOperationException("The transport fixture has no program map PID.");
+
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != pmtPid.Value
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 16 > packet.Length || packet[sectionStart] != 2) continue;
+            int sectionLengthField = ((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2];
+            int sectionLength = 3 + sectionLengthField;
+            int sectionEnd = sectionStart + sectionLength;
+            int programInfoLength = ((packet[sectionStart + 10] & 0x0f) << 8) | packet[sectionStart + 11];
+            int insertAt = sectionStart + 12 + programInfoLength;
+            int newSectionEnd = sectionEnd + 3;
+            if (newSectionEnd > packet.Length || programInfoLength > 0x0ffc) continue;
+
+            packet.Slice(insertAt, sectionEnd - insertAt).CopyTo(packet.Slice(insertAt + 3, sectionEnd - insertAt));
+            packet[insertAt] = 0x80;
+            packet[insertAt + 1] = 1;
+            packet[insertAt + 2] = value;
+            int newProgramInfoLength = programInfoLength + 3;
+            packet[sectionStart + 10] = (byte)((packet[sectionStart + 10] & 0xf0) | (newProgramInfoLength >> 8));
+            packet[sectionStart + 11] = (byte)newProgramInfoLength;
+            int newSectionLengthField = sectionLengthField + 3;
+            packet[sectionStart + 1] = (byte)((packet[sectionStart + 1] & 0xf0) | (newSectionLengthField >> 8));
+            packet[sectionStart + 2] = (byte)newSectionLengthField;
+            uint crc = Mpeg2Crc(packet.Slice(sectionStart, newSectionEnd - sectionStart - 4));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.Slice(newSectionEnd - 4, 4), crc);
+            return result;
+        }
+        throw new InvalidOperationException("The transport fixture has no room for another program descriptor.");
+    }
+
+    private static byte[] ChangeTransportStreamId(byte[] transport, ushort id)
+    {
+        byte[] result = [.. transport];
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != 0
+                || (packet[1] & 0x40) == 0) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0 || payloadOffset >= packet.Length) continue;
+            int sectionStart = payloadOffset + 1 + packet[payloadOffset];
+            if (sectionStart + 12 > packet.Length || packet[sectionStart] != 0) continue;
+            int sectionLength = 3 + (((packet[sectionStart + 1] & 0x0f) << 8) | packet[sectionStart + 2]);
+            int sectionEnd = sectionStart + sectionLength;
+            if (sectionEnd > packet.Length) continue;
+            packet[sectionStart + 3] = (byte)(id >> 8);
+            packet[sectionStart + 4] = (byte)id;
+            uint crc = Mpeg2Crc(packet.Slice(sectionStart, sectionLength - 4));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.Slice(sectionEnd - 4, 4), crc);
+            return result;
+        }
+        throw new InvalidOperationException("The transport fixture has no program association table.");
+    }
+
+    private static byte[] ChangeH264ProfileIdc(byte[] transport)
+    {
+        byte[] result = [.. transport];
+        for (int packetOffset = 0; packetOffset < result.Length; packetOffset += 188)
+        {
+            Span<byte> packet = result.AsSpan(packetOffset, 188);
+            if (packet[0] != 0x47 || ((packet[1] & 0x1f) << 8 | packet[2]) != 0x100) continue;
+            int payloadOffset = PayloadOffset(packet);
+            if (payloadOffset < 0) continue;
+            if ((packet[1] & 0x40) != 0 && payloadOffset + 9 <= packet.Length
+                && packet[payloadOffset] == 0 && packet[payloadOffset + 1] == 0 && packet[payloadOffset + 2] == 1)
+                payloadOffset += 9 + packet[payloadOffset + 8];
+            for (int i = payloadOffset; i + 4 < packet.Length; i++)
+            {
+                int nal = packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1 ? i + 3
+                    : packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 0 && packet[i + 3] == 1 ? i + 4 : -1;
+                if (nal < 0 || nal + 1 >= packet.Length || (packet[nal] & 0x1f) != 7) continue;
+                packet[nal + 1] = packet[nal + 1] switch
+                {
+                    66 => 77,
+                    77 => 66,
+                    100 => 110,
+                    110 => 100,
+                    122 => 244,
+                    244 => 122,
+                    44 => 83,
+                    83 => 44,
+                    86 => 118,
+                    118 => 86,
+                    128 => 138,
+                    138 => 128,
+                    139 => 134,
+                    134 => 139,
+                    135 => 100,
+                    _ => throw new InvalidOperationException("The H.264 fixture uses a profile without a compatible test alternate.")
+                };
+                return result;
+            }
+        }
+        throw new InvalidOperationException("The transport fixture has no H.264 sequence parameter set.");
+    }
+
+    private static int PayloadOffset(Span<byte> packet)
+    {
+        int control = (packet[3] >> 4) & 3;
+        if (control == 0 || (control & 1) == 0) return -1;
+        int offset = 4;
+        if ((control & 2) != 0) offset += 1 + packet[4];
+        return offset < 188 ? offset : -1;
+    }
+
+    private static uint Mpeg2Crc(ReadOnlySpan<byte> bytes)
+    {
+        uint value = uint.MaxValue;
+        foreach (byte b in bytes)
+        {
+            value ^= (uint)b << 24;
+            for (int i = 0; i < 8; i++)
+                value = (value << 1) ^ ((value & 0x80000000) != 0 ? 0x04c11db7u : 0u);
+        }
+        return value;
     }
 
 }

@@ -145,7 +145,15 @@ public sealed class MediaProvenanceTests
             {
                 raw.Open();
                 using var command = raw.CreateCommand();
-                command.CommandText = "ALTER TABLE jobs DROP COLUMN partial_identity; ALTER TABLE jobs DROP COLUMN published_sha256; ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5;";
+                command.CommandText = """
+                    ALTER TABLE jobs DROP COLUMN published_file_identity;
+                    ALTER TABLE jobs DROP COLUMN final_resource_identity;
+                    ALTER TABLE jobs DROP COLUMN pending_conversion_identity;
+                    ALTER TABLE jobs DROP COLUMN partial_identity;
+                    ALTER TABLE jobs DROP COLUMN published_sha256;
+                    ALTER TABLE jobs DROP COLUMN media_metadata_json;
+                    PRAGMA user_version = 5;
+                    """;
                 command.ExecuteNonQuery();
             }
 
@@ -155,11 +163,17 @@ public sealed class MediaProvenanceTests
             Assert.Equal("bandcamp", retained.MediaProvider);
             Assert.Null(retained.MediaMetadataJson);
             retained.MediaMetadataJson = "{\"Title\":\"Song\",\"Artist\":\"Band\",\"Album\":\"Record\"}";
+            retained.PartialIdentity = "partial-id";
+            retained.FinalResourceIdentity = "resource-id";
+            retained.PublishedFileIdentity = "file-id";
             migrated.Save(retained);
 
             DownloadJob roundTrip = Assert.Single(migrated.LoadAll());
             Assert.Equal(retained.MediaMetadataJson, roundTrip.MediaMetadataJson);
-            Assert.Equal(8, JobStore.SchemaVersion);
+            Assert.Equal(retained.PartialIdentity, roundTrip.PartialIdentity);
+            Assert.Equal(retained.FinalResourceIdentity, roundTrip.FinalResourceIdentity);
+            Assert.Equal(retained.PublishedFileIdentity, roundTrip.PublishedFileIdentity);
+            Assert.Equal(10, JobStore.SchemaVersion);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

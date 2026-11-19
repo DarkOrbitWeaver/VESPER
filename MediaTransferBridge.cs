@@ -1,6 +1,9 @@
 using Vesper.Engine;
+using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
+using Vesper.MediaResolver.Security;
+using Vesper.MediaResolver.Utilities;
 using System.Text.Json;
 
 namespace VESPER;
@@ -15,6 +18,7 @@ internal sealed record MediaDownloadChoice(
     string? MediaPlanJson = null, string? FormatId = null, MediaOutput Output = MediaOutput.Original,
     string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null,
     IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null,
+    int EmbeddedSubtitleCount = 0, string? SubtitleNotice = null,
     [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null)
 {
     public string DisplayContainer => Output switch
@@ -42,6 +46,8 @@ internal sealed record MediaDownloadChoice(
 /// </summary>
 internal static class MediaTransferBridge
 {
+    private const int MaxEmbeddedSubtitleTracks = 25;
+    private static readonly ResolverOptions SubtitleUrlOptions = new();
 
     internal static string DisplayQuality(string quality) => quality
         .Replace("+ separate audio (merge required)", "+ audio", StringComparison.OrdinalIgnoreCase)
@@ -125,6 +131,7 @@ internal static class MediaTransferBridge
         var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
             clipStartSeconds, clipEndSeconds);
         if (original.Choice is { } choice && CanConvert(choice)
+            && !prefs.EmbedSubtitles
             && source is { HasAudio: true, Video: { VideoCodec: not null, Hdr: HdrKind.Sdr, Height: null or <= 2304, Width: null or <= 4096 } video }
             && (source.Audio ?? video).AudioCodec is not null
             && CodecCapabilities.Current.CanDecode(video.VideoCodec) && CodecCapabilities.Current.CanDecode((source.Audio ?? video).AudioCodec))
@@ -214,6 +221,8 @@ internal static class MediaTransferBridge
     private static (MediaDownloadChoice? Choice, string? Error) PrepareSource(MediaItem item, FormatPreferences prefs,
         MediaRepresentation? exact, out FormatSelection? selection, double? clipStartSeconds = null, double? clipEndSeconds = null)
     {
+        int unsupportedSubtitleCount = UnsupportedSelectedSubtitleCount(item, prefs);
+        item = item with { Subtitles = SelectableSubtitleTracks(item.Subtitles) };
         prefs = prefs with { NativeMergeOnly = true };
         if (exact is not null && exact.Content == StreamContent.VideoOnly)
         {
@@ -260,23 +269,30 @@ internal static class MediaTransferBridge
         if (planResult.Plan is not { } plan)
             return (null, planResult.Error?.UserMessage ?? "This format isn't ready to download.");
         IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
-        if (subtitles.Count != selection.Subtitles.Count)
-            return (null, "A selected subtitle link failed source validation.");
-        if (subtitles.Any(subtitle => !IsSupportedSubtitle(subtitle)))
-            return (null, "This subtitle uses a transport or format that VESPER can't save as a sidecar yet.");
+        unsupportedSubtitleCount += selection.Subtitles.Count - subtitles.Count;
 
         if (selection.NeedsMuxing)
         {
             if (selection.Video is not { } video || selection.Audio is not { } audio
                 || MergeCapability.MergeContainer(video, audio, selection.OutputContainer) is not { } container)
                 return (null, "VESPER cannot merge this video/audio combination without transcoding.");
-            return BuildMerge(item, selection, plan, [video, audio], container, clipStartSeconds, clipEndSeconds);
+            return BuildMerge(item, selection, plan, [video, audio], container, clipStartSeconds, clipEndSeconds,
+                prefs.EmbedSubtitles, unsupportedSubtitleCount);
         }
+        if (prefs.EmbedSubtitles && clipStartSeconds is null && selection.Video is { } muxedVideo
+            && selection.Audio is null && HasEmbeddableSubtitle(subtitles, muxedVideo)
+            && muxedVideo.Protocol == StreamProtocol.Http && muxedVideo.ContentIdentity is { Length: > 0 }
+            && !muxedVideo.FileSizeIsEstimate
+            && MergeCapability.MuxedContainer(muxedVideo, prefs.Container) is { } muxedContainer)
+            return BuildMerge(item, selection, plan, [muxedVideo], muxedContainer, null, null,
+                embedSubtitles: true, unsupportedSubtitleCount: unsupportedSubtitleCount);
+
         // Audio with provider byte identity goes through the native job: bounded range requests, container validation,
         // a clean non-fragmented M4A/WebM output and identity-checked continuation after a link refresh.
         if (selection.Video is null && selection.Audio is { ContentIdentity: not null } only
             && MergeCapability.AudioContainer(only) is { } audioContainer)
-            return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds);
+            return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds,
+                unsupportedSubtitleCount: unsupportedSubtitleCount);
 
         if (clipStartSeconds is not null)
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
@@ -320,6 +336,8 @@ internal static class MediaTransferBridge
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
             item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
             SubtitleTracks: subtitles, Secrets: TransferSecrets(step.Context, step.Url),
+            SubtitleNotice: SubtitleNotice(prefs.EmbedSubtitles, subtitles.Count, 0,
+                unsupportedSubtitleCount: unsupportedSubtitleCount),
             MediaMetadataJson: step.Protocol == StreamProtocol.Http && item.Kind == MediaKind.Audio
                 && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
                     ? SerializeAudioMetadata(item) : null), null);
@@ -328,13 +346,13 @@ internal static class MediaTransferBridge
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
     private static (MediaDownloadChoice? Choice, string? Error) BuildMerge(MediaItem item, FormatSelection selection,
         DownloadPlan plan, IReadOnlyList<MediaRepresentation> tracks, string container,
-        double? clipStartSeconds, double? clipEndSeconds)
+        double? clipStartSeconds, double? clipEndSeconds, bool embedSubtitles = false,
+        int unsupportedSubtitleCount = 0)
     {
-        IReadOnlyList<SubtitleTrack> subtitles = ValidatedSubtitles(selection, plan);
-        if (subtitles.Count != selection.Subtitles.Count)
-            return (null, "A selected subtitle link failed source validation.");
-        if (subtitles.Any(subtitle => !IsSupportedSubtitle(subtitle)))
-            return (null, "This subtitle uses a transport or format that VESPER can't save as a sidecar yet.");
+        IReadOnlyList<SubtitleTrack> validatedSubtitles = ValidatedSubtitles(selection, plan);
+        unsupportedSubtitleCount += selection.Subtitles.Count - validatedSubtitles.Count;
+        SubtitleTrack[] subtitles = validatedSubtitles.Where(IsSupportedSubtitle).ToArray();
+        unsupportedSubtitleCount += validatedSubtitles.Count - subtitles.Length;
         if (clipStartSeconds is not null && (tracks.Count != 2
             || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
             return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
@@ -357,10 +375,29 @@ internal static class MediaTransferBridge
             || t.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash)))
             return (null, "A selected stream has no complete native download plan.");
 
+        SubtitleTrack[] embeddedSubtitles = [];
+        bool subtitleLimitReached = false;
+        if (embedSubtitles && clipStartSeconds is null && selection.HasVideo
+            && tracks.All(track => track.Protocol == StreamProtocol.Http && !track.FileSizeIsEstimate
+                && track.ContentIdentity is { Length: > 0 }))
+        {
+            IEnumerable<SubtitleTrack> candidates = subtitles.Where(IsEmbeddableSubtitle);
+            if (secrets is not null)
+                candidates = candidates.Where(subtitle => UrlPolicy.IsSameOrigin(tracks[0].Url, subtitle.Url));
+            SubtitleTrack[] selected = candidates.ToArray();
+            subtitleLimitReached = selected.Length > MaxEmbeddedSubtitleTracks;
+            string output = container == "webm" ? "mkv" : container;
+            if (selected.Length is > 0 and <= MaxEmbeddedSubtitleTracks && output is ("mp4" or "mkv"))
+            {
+                embeddedSubtitles = selected;
+                container = output;
+            }
+        }
+
         var mergeTracks = new List<MergeTrack>(tracks.Count);
         foreach (MediaRepresentation track in tracks)
         {
-            string role = track.HasVideo ? "video" : "audio";
+            string role = track.HasVideo && track.HasAudio ? "muxed" : track.HasVideo ? "video" : "audio";
             MergeMediaSource? source = null;
             if (track.Protocol == StreamProtocol.Hls)
                 source = new MergeMediaSource("hls", PlaylistUrl: track.Url.AbsoluteUri);
@@ -386,7 +423,8 @@ internal static class MediaTransferBridge
         }
         var merge = new MediaMergePlan
         {
-            Version = mergeTracks.Any(track => track.Source is not null) ? 2 : 1,
+            Version = mergeTracks.Any(track => track.Source is not null) ? 2
+                : embeddedSubtitles.Length > 0 || mergeTracks.Any(track => track.Role == "muxed") ? 3 : 1,
             Provider = item.Provider,
             MediaId = item.MediaId,
             OutputContainer = container,
@@ -394,13 +432,19 @@ internal static class MediaTransferBridge
             RequireVideo = tracks.Any(t => t.HasVideo),
             Metadata = MergeMetadata(item, includeChapters: clipStartSeconds is null),
             ClipRange = clipStartSeconds is double start ? new MediaTimeRange(start, clipEndSeconds!.Value) : null,
-            Tracks = mergeTracks
+            Tracks = mergeTracks,
+            Subtitles = embeddedSubtitles.Select(subtitle => new MergeSubtitle(subtitle.Url.AbsoluteUri,
+                subtitle.Format.ToLowerInvariant(), TextUtil.NormalizeLang(subtitle.Language),
+                SubtitleName(subtitle.Name, subtitle.Language))).ToArray()
         };
         string name = Path.ChangeExtension(plan.SuggestedFileName, container);
         string summary = DisplayQuality(selection.Summary);
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
             item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
             merge.ToJson(), string.Join("+", tracks.Select(t => t.Id)), SubtitleTracks: subtitles,
+            EmbeddedSubtitleCount: embeddedSubtitles.Length,
+            SubtitleNotice: SubtitleNotice(embedSubtitles, subtitles.Length, embeddedSubtitles.Length,
+                subtitleLimitReached, unsupportedSubtitleCount),
             Secrets: secrets), null);
     }
 
@@ -482,13 +526,77 @@ internal static class MediaTransferBridge
         selection.Subtitles.Where(subtitle => plan.Subtitles.Any(step => step.Url == subtitle.Url
             && step.Container == subtitle.Format)).ToArray();
 
+    internal static bool IsEmbeddableSubtitle(SubtitleTrack track) =>
+        track.Format.Equals("srt", StringComparison.OrdinalIgnoreCase)
+        || track.Format.Equals("vtt", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasEmbeddableSubtitle(IReadOnlyList<SubtitleTrack> subtitles, MediaRepresentation track)
+    {
+        bool credentials = TransferSecrets(track.Context, track.Url) is not null;
+        return subtitles.Any(subtitle => IsEmbeddableSubtitle(subtitle)
+            && (!credentials || UrlPolicy.IsSameOrigin(track.Url, subtitle.Url)));
+    }
+
+    private static string SubtitleName(string? name, string language)
+    {
+        string? cleaned = LimitMetadata(name, 128);
+        return cleaned is { Length: > 0 } && !cleaned.Any(char.IsControl) ? cleaned : TextUtil.NormalizeLang(language);
+    }
+
+    private static string? SubtitleNotice(bool requested, int selectedCount, int embeddedCount,
+        bool subtitleLimitReached = false, int unsupportedSubtitleCount = 0)
+    {
+        string? message = selectedCount == 0 ? null : !requested
+            ? "Selected subtitles are also saved as separate files."
+            : subtitleLimitReached
+                ? $"At most {MaxEmbeddedSubtitleTracks} supported subtitles can be embedded per job. Separate files for every selected subtitle are still queued."
+                : embeddedCount == selectedCount
+                    ? "VESPER will embed supported SRT/WebVTT subtitles when their content validates. Separate subtitle files are also queued."
+                    : embeddedCount > 0
+                        ? "VESPER will try to embed supported SRT/WebVTT subtitles. Other selected subtitles remain separate files."
+                        : "Selected subtitles remain separate files for this source, format, or transport.";
+        if (unsupportedSubtitleCount > 0)
+        {
+            const string unavailable = "Some selected captions were unsupported or failed source validation; media and supported sidecars remain queued.";
+            message = message is null ? unavailable : message + " " + unavailable;
+        }
+        return message;
+    }
+
     internal static bool IsDirectSubtitle(SubtitleTrack track) =>
         track.Format.ToLowerInvariant() is "vtt" or "srt" or "ttml";
 
-    internal static bool IsSelectableSubtitle(SubtitleTrack track) => IsSupportedSubtitle(track);
+    internal static bool IsSelectableSubtitle(SubtitleTrack track) =>
+        IsSupportedSubtitle(track) && UrlValidator.IsAllowed(track.Url, SubtitleUrlOptions, out _);
 
     private static bool IsSupportedSubtitle(SubtitleTrack track) => IsDirectSubtitle(track)
         || string.Equals(track.Format, "hls-webvtt", StringComparison.OrdinalIgnoreCase);
+
+    internal static SubtitleTrack[] SelectableSubtitleTracks(IEnumerable<SubtitleTrack> tracks) => tracks
+        .Where(IsSelectableSubtitle)
+        .GroupBy(track => TextUtil.NormalizeLang(track.Language), StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.OrderBy(track => track.IsAutoGenerated)
+            .ThenBy(track => track.Url.AbsoluteUri, StringComparer.Ordinal)
+            .First())
+        .OrderBy(track => TextUtil.NormalizeLang(track.Language), StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+    private static int UnsupportedSelectedSubtitleCount(MediaItem item, FormatPreferences preferences)
+    {
+        int unavailable = 0;
+        foreach (string language in preferences.SubtitleLanguages)
+        {
+            string wanted = TextUtil.NormalizeLang(language);
+            SubtitleTrack[] matches = item.Subtitles.Where(track =>
+            {
+                if (!preferences.IncludeAutoSubtitles && track.IsAutoGenerated) return false;
+                string actual = TextUtil.NormalizeLang(track.Language);
+                return actual == wanted || TextUtil.PrimaryLang(actual) == TextUtil.PrimaryLang(wanted);
+            }).ToArray();
+            if (matches.Length > 0 && !matches.Any(IsSelectableSubtitle)) unavailable++;
+        }
+        return unavailable;
+    }
 
     internal static IReadOnlyList<MediaDownloadChoice> ExpandSubtitleChoices(IEnumerable<MediaDownloadChoice> choices)
     {
@@ -525,6 +633,8 @@ internal static class MediaTransferBridge
                     ConvertedVideoQuality = null,
                     ConvertedAudioCodec = null,
                     SubtitleTracks = null,
+                    EmbeddedSubtitleCount = 0,
+                    SubtitleNotice = null,
                     MediaMetadataJson = null
                 });
             }

@@ -26,6 +26,8 @@ internal sealed class AddDownloadForm : VesperPopupForm
     private bool _folderExpanded;
     private bool _multiLine;
     private bool _layingOut;
+    private bool _destinationWasChosen;
+    private bool _suggestingDestination;
 
     public IReadOnlyList<string> DownloadUrls { get; private set; } = [];
     public IReadOnlyList<MediaDownloadChoice> MediaJobs { get; private set; } = [];
@@ -148,7 +150,11 @@ internal sealed class AddDownloadForm : VesperPopupForm
             Name = "destinationFolder", Text = _prefs.DefaultFolder, BorderStyle = BorderStyle.None,
             Location = new Point(9, 8), Width = 332, BackColor = _colors.Surface, ForeColor = _colors.Text
         };
-        _destinationInput.TextChanged += (_, _) => UpdateDestinationText();
+        _destinationInput.TextChanged += (_, _) =>
+        {
+            if (!_suggestingDestination) _destinationWasChosen = true;
+            UpdateDestinationText();
+        };
         _destinationInput.GotFocus += (_, _) => { destinationFrame.Active = true; destinationFrame.Invalidate(); };
         _destinationInput.LostFocus += (_, _) => { destinationFrame.Active = false; destinationFrame.Invalidate(); };
         destinationFrame.Controls.Add(_destinationInput);
@@ -159,15 +165,23 @@ internal sealed class AddDownloadForm : VesperPopupForm
             using var chooser = new FolderBrowserDialog { Description = "Choose a folder for this download", UseDescriptionForTitle = true };
             if (Vesper.Engine.PathSafety.TryGetFullPath(_destinationInput.Text, out string selected, out _) && Directory.Exists(selected))
                 chooser.SelectedPath = selected;
-            if (chooser.ShowDialog(this) == DialogResult.OK) _destinationInput.Text = chooser.SelectedPath;
+            if (chooser.ShowDialog(this) == DialogResult.OK)
+            {
+                _destinationWasChosen = true;
+                _destinationInput.Text = chooser.SelectedPath;
+            }
         };
         var reset = new LinkLabel
         {
-            Text = "Use default folder", AutoSize = true, Location = new Point(0, 60),
+            Name = "resetDestination", Text = "Use default folder", AutoSize = true, Location = new Point(0, 60),
             LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
             Font = new Font("Segoe UI", 8F)
         };
-        reset.Click += (_, _) => _destinationInput.Text = _prefs.DefaultFolder;
+        reset.Click += (_, _) =>
+        {
+            _destinationWasChosen = true;
+            _destinationInput.Text = _prefs.DefaultFolder;
+        };
         _destinationPanel.Controls.AddRange([folderLabel, destinationFrame, browse, reset]);
 
         _footer = new VesperPanel { Dock = DockStyle.Bottom, Height = 62, BackColor = _colors.Surface };
@@ -299,6 +313,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
     private void InspectUrl()
     {
         string[] links = SplitLinks();
+        ApplySiteFolderSuggestion(links);
         _paste.Symbol = _url.TextLength > 0 ? VesperIcon.Close : VesperIcon.Clipboard;
         _paste.AccessibleName = _url.TextLength > 0 ? "Clear links" : "Paste link from clipboard";
         _paste.Invalidate();
@@ -354,6 +369,33 @@ internal sealed class AddDownloadForm : VesperPopupForm
     }
 
     private string[] SplitLinks() => SplitLines(_url.Text);
+
+    internal static string? SuggestedSiteFolder(VesperPreferences preferences, IReadOnlyList<string> links)
+    {
+        if (links.Count == 0 || links.Any(link => !Vesper.Engine.UrlPolicy.TryParse(link, out _, out _)))
+            return null;
+
+        SiteRule? first = SiteRule.ForPage(preferences.SiteRules, links[0]);
+        if (first?.Folder is not { Length: > 0 } folder) return null;
+        foreach (string link in links)
+        {
+            SiteRule? rule = SiteRule.ForPage(preferences.SiteRules, link);
+            if (!string.Equals(rule?.Host, first.Host, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(rule?.Folder, folder, StringComparison.OrdinalIgnoreCase))
+                return null;
+        }
+        return folder;
+    }
+
+    private void ApplySiteFolderSuggestion(IReadOnlyList<string> links)
+    {
+        if (_destinationWasChosen) return;
+        string suggestion = SuggestedSiteFolder(_prefs, links) ?? _prefs.DefaultFolder;
+        if (string.Equals(_destinationInput.Text, suggestion, StringComparison.OrdinalIgnoreCase)) return;
+        _suggestingDestination = true;
+        try { _destinationInput.Text = suggestion; }
+        finally { _suggestingDestination = false; }
+    }
 
     private static bool IsSupportedUrl(string text) =>
         Vesper.Engine.UrlPolicy.TryParse(text, out Uri url, out _)

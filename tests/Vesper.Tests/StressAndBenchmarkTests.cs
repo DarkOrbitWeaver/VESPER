@@ -382,7 +382,7 @@ public class BenchmarkTests(ITestOutputHelper output)
         await server.StartAsync();
         using var h = new Harness();
 
-        var proof = new BrowserTransferProof(1, null, "application/octet-stream");
+        var proof = new BrowserTransferProof(1, "\"fixture-v1\"", "application/octet-stream");
         AddResult first = h.Engine.Add(new AddRequest(server.Url("/file"), FileName: "first.bin",
             RequestId: "queue-index:1", BrowserProof: proof));
         Assert.Equal(AddStatus.Added, first.Status);

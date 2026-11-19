@@ -67,18 +67,70 @@ internal sealed class JobSession : IDisposable
         if (!create || Job.PartialIdentity is not null || !Job.Extents.IsEmpty)
             return File = PartialFile.OpenOwned(Job);
 
-        PartialFile created = PartialFile.Open(Job.PartialPath, FileMode.CreateNew);
+        PartialFile created = PartialFile.Open(Job.PartialPath, FileMode.CreateNew, allowDelete: true);
+        string? identity;
         try
         {
-            string? identity = created.CaptureIdentity();
+            identity = created.CaptureIdentity();
+        }
+        catch (Exception ex)
+        {
+            string? cleanupError = DeleteUnclaimedFile(created);
+            if (cleanupError is not null)
+                throw CleanupFailure(ex, cleanupError);
+            throw;
+        }
+
+        try
+        {
             _engine.UpdateJob(Job, pending => pending.PartialIdentity = identity);
+            created.MarkIdentitySaved();
             return File = created;
+        }
+        catch (LocalStorageException ex)
+        {
+            string? cleanupError = DeleteUnclaimedFile(created);
+            if (cleanupError is not null)
+                throw CleanupFailure(ex, cleanupError);
+            throw;
         }
         catch
         {
-            created.Dispose();
+            // A non-storage exception may occur after SQLite accepted the identity. Keep the
+            // file rather than risk deleting a path that durable state may now own.
+            if (identity is not null && Job.PartialIdentity == identity)
+            {
+                created.MarkIdentitySaved();
+                File = created;
+            }
+            else created.Dispose();
             throw;
         }
+    }
+
+    private string? DeleteUnclaimedFile(PartialFile file)
+    {
+        try
+        {
+            file.DeleteUnclaimedNewFile();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _engine.Log(Job.Id, "partial-cleanup-failed", ex.Message);
+            return ex.Message;
+        }
+        finally { file.Dispose(); }
+    }
+
+    private static LocalStorageException CleanupFailure(Exception failure, string cleanupError)
+    {
+        Exception cause = failure is LocalStorageException storage
+            ? storage.InnerException ?? failure
+            : failure;
+        return new LocalStorageException(failure.Message
+            + " The unclaimed partial could not be removed safely; move it to another folder before retrying. "
+            + cleanupError, cause);
     }
 
     public void CloseFile()
@@ -158,13 +210,15 @@ internal sealed class JobSession : IDisposable
                     if (_pending.IsEmpty) _pendingMediaState = null;
                 }
             });
+            Debug.Assert(Job.Extents.Ranges.SequenceEqual(committed.Extents.Ranges),
+                "The live job must match the extent set saved by this checkpoint.");
             _engine.Failpoint("checkpoint.afterCommit");
             Volatile.Write(ref _lastCheckpointTicks, Stopwatch.GetTimestamp());
             // The manifest is a temp-file write plus a rename, which sync folders and antivirus notice.
             // The database commit above is the real checkpoint; the manifest only needs to be recent.
             if (force || Stopwatch.GetElapsedTime(Volatile.Read(ref _lastManifestTicks)) >= TimeSpan.FromSeconds(10))
             {
-                _engine.WriteManifest(committed);
+                _engine.WriteManifest(committed, File?.Handle);
                 Volatile.Write(ref _lastManifestTicks, Stopwatch.GetTimestamp());
             }
         }

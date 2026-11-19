@@ -14,7 +14,7 @@ public static class FormatDeduplicator
         string? DeliveryId,
         int? Width,
         int? Height,
-        int? FrameRate,
+        double? FrameRate,
         HdrKind Hdr,
         string? VideoCodec,
         string? AudioCodec,
@@ -56,10 +56,9 @@ public static class FormatDeduplicator
 
     private static FormatKey KeyOf(MediaRepresentation r)
     {
-        int? frameRate = r.FrameRate is { } fps ? (int)Math.Round(fps) : null;
         int? audioBitrate = r.Content == StreamContent.AudioOnly ? (r.BitrateKbps ?? 0) / 16 : null;
         var requirements = r.Requirements & ~(ProcessingRequirement.HlsSegmentAssembly | ProcessingRequirement.DashSegmentAssembly);
-        return new(r.Content, r.DeliveryId, r.Width, r.Height, frameRate, r.Hdr, r.VideoCodec, r.AudioCodec, r.Container,
+        return new(r.Content, r.DeliveryId, r.Width, r.Height, r.FrameRate, r.Hdr, r.VideoCodec, r.AudioCodec, r.Container,
             r.AudioLanguage, r.AudioChannels, r.AudioSampleRate, r.AudioTrackId, r.IsDefaultAudio,
             r.IsAudioDescription, r.IsDrc, r.AudioGroupId, r.AudioUnverified, r.ContentIdentity,
             requirements, r.Context, audioBitrate);

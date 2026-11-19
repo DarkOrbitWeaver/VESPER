@@ -15,6 +15,7 @@
     <Compile Include="..\Shared\OriginAwareProxy.cs" Link="Http\OriginAwareProxy.cs" />
     <Compile Include="..\Shared\NetworkAddressPolicy.cs" Link="Http\NetworkAddressPolicy.cs" />
     <Compile Include="..\Shared\FileNameRules.cs" Link="Files\FileNameRules.cs" />
+    <Compile Include="..\Shared\WindowsObjectNames.cs" Link="WindowsObjectNames.cs" />
     <!-- The only third-party dependency: SQLite (MIT) for transactional job state. -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
   </ItemGroup>

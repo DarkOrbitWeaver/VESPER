@@ -57,6 +57,8 @@ public sealed class DownloadJob
     public JobKind Kind { get; set; }
 
     public string SourceUrl { get; set; } = "";
+    /// <summary>Hash of the final HTTP origin and path that supplied the saved bytes.</summary>
+    public string? FinalResourceIdentity { get; set; }
     /// <summary>Links this job used before a Replace Link. Newline separated, newest last.</summary>
     public string PreviousUrls { get; set; } = "";
 
@@ -70,7 +72,10 @@ public sealed class DownloadJob
     public long? PendingConversionBytes { get; set; }
     // The existing digest also records publication proof for original files.
     public string? PendingConversionDigest { get; set; }
+    public string? PendingConversionIdentity { get; set; }
     public string? PublishedSha256 { get; set; }
+    /// <summary>Windows file identity captured when the published output was verified.</summary>
+    public string? PublishedFileIdentity { get; set; }
     public string? PartialIdentity { get; set; }
 
     public long? TotalBytes { get; set; }
@@ -159,6 +164,7 @@ public sealed class DownloadJob
         if (saved.Id != Id) throw new InvalidOperationException("Cannot copy a different download's state.");
         Kind = saved.Kind;
         SourceUrl = saved.SourceUrl;
+        FinalResourceIdentity = saved.FinalResourceIdentity;
         PreviousUrls = saved.PreviousUrls;
         FileName = saved.FileName;
         NameLocked = saved.NameLocked;
@@ -168,7 +174,9 @@ public sealed class DownloadJob
         PendingFinalPath = saved.PendingFinalPath;
         PendingConversionBytes = saved.PendingConversionBytes;
         PendingConversionDigest = saved.PendingConversionDigest;
+        PendingConversionIdentity = saved.PendingConversionIdentity;
         PublishedSha256 = saved.PublishedSha256;
+        PublishedFileIdentity = saved.PublishedFileIdentity;
         PartialIdentity = saved.PartialIdentity;
         TotalBytes = saved.TotalBytes;
         Extents = saved.Extents;

@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vesper.Engine;
 
@@ -25,7 +27,16 @@ public sealed partial class DownloadEngine
         file.Flush();
         if (!HttpFacts.IsHtmlFileName(job.FileName) && LooksLikeHtmlFile(file, total))
             return RunOutcome.NeedsAttention("html", "The server sent a web page instead of the selected file. Saved data was kept; nothing was published.");
-        UpdateJob(job, j => { j.TotalBytes = total; j.State = JobState.Finalizing; j.Message = ""; ClearPendingPublication(j); });
+        bool hasPreparedConversion = job.PendingConversionBytes is not null
+            && job.PendingConversionDigest is { Length: 64 }
+            && job.PendingConversionIdentity is { Length: 64 };
+        UpdateJob(job, j =>
+        {
+            j.TotalBytes = total;
+            j.State = JobState.Finalizing;
+            j.Message = "";
+            if (!hasPreparedConversion) ClearPendingPublication(j);
+        });
         Failpoint("finalize.afterFlush");
 
         if (job.Kind == JobKind.Http && job.MediaProvider is not null)
@@ -64,11 +75,11 @@ public sealed partial class DownloadEngine
             (prepared, completionNotice) = await PrepareAudioMetadataAsync(job, ct).ConfigureAwait(false);
         else (prepared, completionNotice) = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
         if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
-        if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path);
+        if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
         ct.ThrowIfCancellationRequested();
         RunOutcome outcome = await PublishAsync(job, prepared, completionNotice, ct).ConfigureAwait(false);
         if (prepared is not null && job.PendingFinalPath is null && outcome.State != JobState.Completed)
-            DeleteTemporaryFile(job, prepared.Path);
+            DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
         return outcome;
     }
 
@@ -112,89 +123,173 @@ public sealed partial class DownloadEngine
 
         const FileShare share = FileShare.Read | FileShare.Delete;
         const FileOptions options = FileOptions.Asynchronous | FileOptions.SequentialScan;
-        using FileStream file = prepared is null
+        FileStream file = prepared is null
             ? PartialFile.OpenOwnedRead(job, share, options)
             : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
-        if (file.Length != expectedLength)
-            return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed size.");
-        string digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
-        string? expectedDigest = prepared?.Digest ?? (job.Sha256Verified ? job.ExpectedSha256 : null);
-        if (expectedDigest is not null && !digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase))
-            return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published failed its saved validation.");
-
-        string fileName = job.Output == MediaOutput.Original ? job.FileName : prepared?.FileName ?? job.FileName;
-        WriteMarkOfTheWeb(job, source);
-
-        for (int attempt = 0; attempt < 50; attempt++)
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            string target = FileNames.UniquePath(job.DestinationFolder, fileName);
-            UpdateJob(job, j =>
+            if (file.Length != expectedLength)
+                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed size.");
+            if (prepared is not null)
             {
-                j.State = JobState.Finalizing;
-                j.PendingFinalPath = target;
-                j.PendingConversionBytes = prepared?.Bytes;
-                j.PendingConversionDigest = digest;
-            });
-            Failpoint("finalize.beforeMove");
+                try { PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, prepared.Identity); }
+                catch (IOException)
+                {
+                    return RunOutcome.NeedsAttention("publication-file", "The prepared file changed before it could be published.");
+                }
+            }
+            string digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
+            Debug.Assert(expectedLength is >= 0 && file.Length == expectedLength.Value,
+                "The publication handle must retain the validated file length.");
+            string? expectedDigest = prepared?.Digest ?? (job.Sha256Verified ? job.ExpectedSha256 : null);
+            if (expectedDigest is not null && !digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase))
+                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published failed its saved validation.");
+
+            string? sourceIdentity = TryGetPublishedFileIdentity(file.SafeFileHandle);
+            string? expectedSourceIdentity = prepared?.Identity ?? job.PartialIdentity;
+            if (OperatingSystem.IsWindows()
+                && (sourceIdentity is null || expectedSourceIdentity is null
+                    || !sourceIdentity.Equals(expectedSourceIdentity, StringComparison.Ordinal)))
+                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published no longer has its saved identity.");
+
+            string fileName = job.Output == MediaOutput.Original ? job.FileName : prepared?.FileName ?? job.FileName;
             if (!PathSafety.PathStillNamesFile(source, file, digest))
                 return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
-            try
-            {
-                File.Move(source, target, overwrite: false);
-            }
-            catch (IOException) when (File.Exists(target) && IsPublicationFile(job, source, expectedLength))
-            {
-                continue;   // someone created that name in the meantime: pick the next free one
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                if (!IsPublicationFile(job, source, expectedLength))
-                    return RunOutcome.NeedsAttention("publication-pending", "Could not confirm where the file was saved. Resume to check publication again.");
 
-                UpdateJob(job, ClearPendingPublication);
-                return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + ex.Message);
-            }
-
-            Failpoint("finalize.afterMove");
-            if (!PathSafety.PathStillNamesFile(target, file, digest))
-                return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
-            try
+            // Zone.Identifier is path-based. Reopen and pin the identity after writing it,
+            // before the handle-bound rename below.
+            file.Dispose();
+            WriteMarkOfTheWeb(job, source, expectedSourceIdentity);
+            file = prepared is null
+                ? PartialFile.OpenOwnedRead(job, share, options)
+                : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
+            if (file.Length != expectedLength
+                || OperatingSystem.IsWindows() && !string.Equals(sourceIdentity,
+                    TryGetPublishedFileIdentity(file.SafeFileHandle), StringComparison.Ordinal))
+                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
+            if (prepared is not null)
             {
+                try { PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, prepared.Identity); }
+                catch (IOException)
+                { return RunOutcome.NeedsAttention("publication-file", "The prepared file changed before it could be published."); }
+            }
+            if (!Convert.ToHexString(SHA256.HashData(file)).Equals(digest, StringComparison.OrdinalIgnoreCase))
+                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
+
+            for (int attempt = 0; attempt < 50; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+                string target = FileNames.UniquePath(job.DestinationFolder, fileName);
                 UpdateJob(job, j =>
                 {
-                    MarkPublished(j, target);
-                    if (completionNotice is { Length: > 0 })
-                    {
-                        j.Reason = "media-metadata";
-                        j.Message = completionNotice;
-                    }
+                    j.State = JobState.Finalizing;
+                    j.PendingFinalPath = target;
+                    j.PendingConversionBytes = prepared?.Bytes;
+                    j.PendingConversionDigest = digest;
+                    j.PendingConversionIdentity = prepared?.Identity;
                 });
+                Failpoint("finalize.beforeMove");
+                if (!PathSafety.PathStillNamesFile(source, file, digest))
+                    return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
+
+                if (OperatingSystem.IsWindows())
+                {
+                    if (!PathSafety.TryMoveTemporaryFile(source, target, expectedSourceIdentity, out string moveError))
+                    {
+                        bool sourceStillMatches = PathSafety.PathStillNamesFile(source, file, digest);
+                        if (File.Exists(target) && sourceStillMatches) continue;
+                        if (!sourceStillMatches)
+                            return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
+                        return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + moveError);
+                    }
+                }
+                else
+                {
+                    try { File.Move(source, target, overwrite: false); }
+                    catch (IOException) when (File.Exists(target) && IsPublicationFile(job, source, expectedLength))
+                    {
+                        continue;   // someone created that name in the meantime: pick the next free one
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        if (!IsPublicationFile(job, source, expectedLength))
+                            return RunOutcome.NeedsAttention("publication-pending", "Could not confirm where the file was saved. Resume to check again.");
+
+                        return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + ex.Message);
+                    }
+                }
+
+                Failpoint("finalize.afterMove");
+                if (!PathSafety.PathStillNamesFile(target, file, digest))
+                    return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
+                long publishedLength = file.Length;
+                file.Dispose();
+                try
+                {
+                    // The transfer handle allows rename/delete. Reopen the final path with sharing
+                    // that pins it until the completed row has been saved.
+                    using var published = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        1 << 16, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    if (published.Length != publishedLength || !IsPublicationFile(job, target, expectedLength))
+                        return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
+
+                    string? fileIdentity = TryGetPublishedFileIdentity(published.SafeFileHandle);
+                    if (sourceIdentity is not null && fileIdentity is not null
+                        && !sourceIdentity.Equals(fileIdentity, StringComparison.Ordinal))
+                        return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
+                    if (!PathSafety.PathStillNamesFile(target, published, digest))
+                        return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
+
+                    fileIdentity ??= sourceIdentity;
+                    try
+                    {
+                        UpdateJob(job, j =>
+                        {
+                            MarkPublished(j, target, fileIdentity);
+                            if (completionNotice is { Length: > 0 })
+                            {
+                                j.Reason = "media-metadata";
+                                j.Message = completionNotice;
+                            }
+                        });
+                    }
+                    catch (LocalStorageException ex)
+                    {
+                        Log(job.Id, "publication-pending", ex.Message);
+                        return RunOutcome.NeedsAttention("publication-pending", "The file was saved, but VESPER could not update the download record. Resume to finish checking it.");
+                    }
+
+                    FinishPublication(job);
+                    Log(job.Id, "completed", job.FileName);
+                    return job.Reason.Length == 0 ? RunOutcome.Done() : new RunOutcome(JobState.Completed, job.Reason, job.Message);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+                {
+                    return RunOutcome.NeedsAttention("publication-pending", "The saved file could not be pinned safely. Resume to verify where it was saved.");
+                }
             }
-            catch (LocalStorageException ex)
-            {
-                Log(job.Id, "publication-pending", ex.Message);
-                return RunOutcome.NeedsAttention("publication-pending", "The file was saved, but VESPER could not update the download record. Resume to finish checking it.");
-            }
-            FinishPublication(job);
-            Log(job.Id, "completed", job.FileName);
-            return job.Reason.Length == 0 ? RunOutcome.Done() : new RunOutcome(JobState.Completed, job.Reason, job.Message);
+            return RunOutcome.NeedsAttention("name", "No free file name could be found in the destination folder.");
         }
-        if (IsPublicationFile(job, source, expectedLength))
-            UpdateJob(job, ClearPendingPublication);
-        return RunOutcome.NeedsAttention("name", "No free file name could be found in the destination folder.");
+        finally { file.Dispose(); }
     }
 
     /// <summary>Marks the file as downloaded from the internet so Windows applies SmartScreen/Office protections.</summary>
-    private void WriteMarkOfTheWeb(DownloadJob job, string path)
+    private void WriteMarkOfTheWeb(DownloadJob job, string path, string? expectedIdentity)
     {
         if (!OperatingSystem.IsWindows()) return;
         try
         {
+            string directoryPath = Path.GetDirectoryName(Path.GetFullPath(path))
+                ?? throw new IOException("The download folder is unavailable.");
+            using SafeFileHandle directory = PathSafety.OpenTemporaryDirectoryHandle(directoryPath);
+            using SafeFileHandle file = PathSafety.OpenTemporaryHandle(path, FileMode.Open,
+                FileAccess.Read, FileShare.Read | FileShare.Write);
+            PathSafety.RequireTemporaryIdentity(file, expectedIdentity);
             string host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? source) ? source.GetLeftPart(UriPartial.Path) : "";
             string referrer = Uri.TryCreate(job.Referer, UriKind.Absolute, out Uri? r) ? r.GetLeftPart(UriPartial.Path) : "";
             File.WriteAllText(path + ":Zone.Identifier",
                 $"[ZoneTransfer]\r\nZoneId=3\r\n{(referrer.Length > 0 ? $"ReferrerUrl={referrer}\r\n" : "")}HostUrl={host}\r\n");
+            PathSafety.RequireTemporaryIdentity(file, expectedIdentity);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
@@ -206,6 +301,17 @@ public sealed partial class DownloadEngine
 
     private void Recover()
     {
+        var manifestFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Options.DefaultFolder };
+        if (Directory.Exists(Options.DefaultFolder))
+        {
+            try { foreach (string sub in Directory.EnumerateDirectories(Options.DefaultFolder)) manifestFolders.Add(sub); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { Log(null, "manifest-replacement", "Recovery folders could not be fully scanned: " + ex.Message); }
+        }
+        foreach (string folder in manifestFolders.Where(Directory.Exists))
+            RecoveryManifest.RecoverInterruptedReplacements(folder,
+                message => Log(null, "manifest-replacement", message));
+
         lock (_lock)
         {
             if (_store.RecoveredFromCorruption)
@@ -246,7 +352,19 @@ public sealed partial class DownloadEngine
                         break;
                     case JobState.Completed when job.PendingConversionBytes is not null && job.FinalPath is { } final:
                         using (FileStream? published = OpenPublicationFile(job, final, out bool matches))
-                            if (matches) FinishPublication(job, recovering: true);
+                        {
+                            if (matches && published is not null)
+                            {
+                                string? fileIdentity = TryGetPublishedFileIdentity(published.SafeFileHandle);
+                                if (fileIdentity is not null && job.PublishedFileIdentity is null)
+                                {
+                                    DownloadJob saved = job.CopyForUpdate();
+                                    saved.PublishedFileIdentity = fileIdentity;
+                                    SaveRecoveredJob(job, saved);
+                                }
+                                FinishPublication(job, recovering: true);
+                            }
+                        }
                         break;
                 }
                 ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
@@ -265,7 +383,8 @@ public sealed partial class DownloadEngine
         using FileStream? published = target is null ? null : OpenPublicationFile(job, target, out targetMatches);
         if (target is not null && targetMatches && PublicationPathIsMissing(job, stage))
         {
-            MarkPublished(saved, target);
+            string? fileIdentity = published is null ? null : TryGetPublishedFileIdentity(published.SafeFileHandle);
+            MarkPublished(saved, target, fileIdentity);
             SaveRecoveredJob(job, saved);
             FinishPublication(job, recovering: true);
             Log(job.Id, "reconciled", "Rename had completed before the interruption.");
@@ -273,7 +392,7 @@ public sealed partial class DownloadEngine
         }
 
         long? expectedLength = job.PendingConversionBytes ?? job.TotalBytes;
-        bool targetAvailable = target is null || PublicationPathIsMissing(job, target) || (published is not null && !targetMatches);
+        bool targetAvailable = target is null || PublicationPathIsMissing(job, target) || !targetMatches;
         bool stageMatches = false;
         if (targetAvailable)
         {
@@ -289,7 +408,6 @@ public sealed partial class DownloadEngine
             saved.State = JobState.Queued;
             saved.Message = "Finishing after an interrupted publication.";
             saved.NextRetryUtc = null;
-            ClearPendingPublication(saved);
         }
         else
         {
@@ -297,6 +415,7 @@ public sealed partial class DownloadEngine
             saved.Reason = "finalize-lost";
             saved.Message = "VESPER could not verify which file was saved. Check the destination folder, then resume to check again.";
             saved.NextRetryUtc = null;
+            ClearPendingPublication(saved);
         }
         SaveRecoveredJob(job, saved);
     }
@@ -328,6 +447,17 @@ public sealed partial class DownloadEngine
         && PathSafety.Inspect(path) is { Exists: true, IsReparsePoint: false, IsCloudPlaceholder: false, IsDirectory: false } file
         && (length is null || file.Length == length);
 
+    private static bool SamePublicationPath(string left, string right)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right),
+                OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        { return false; }
+    }
+
     private static bool PublicationPathIsMissing(DownloadJob job, string path)
     {
         if (!IsPublicationPath(job, path)) return false;
@@ -340,6 +470,13 @@ public sealed partial class DownloadEngine
     private static string? PublicationDigest(DownloadJob job) =>
         job.PendingConversionDigest ?? (job.PendingConversionBytes is null && job.Sha256Verified ? job.ExpectedSha256 : null);
 
+    private static string? TryGetPublishedFileIdentity(Microsoft.Win32.SafeHandles.SafeFileHandle handle)
+    {
+        try { return PathSafety.TemporaryFileIdentity(handle); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        { return null; }
+    }
+
     // Keep the verified output open until the completion row commits.
     private static FileStream? OpenPublicationFile(DownloadJob job, string path, out bool matches)
     {
@@ -348,10 +485,36 @@ public sealed partial class DownloadEngine
         long? length = job.PendingConversionBytes ?? job.TotalBytes;
         if (digest is null || length is null || !IsPublicationFile(job, path)) return null;
 
+        bool isConversionStage = job.PendingConversionBytes is not null
+            && SamePublicationPath(path, PublicationStagePath(job));
+        bool isPendingTarget = job.PendingFinalPath is { Length: > 0 } pendingPath
+            && SamePublicationPath(path, pendingPath);
+        bool isCompletedTarget = job.FinalPath is { Length: > 0 } finalPath
+            && SamePublicationPath(path, finalPath);
+        string? expectedIdentity = null;
+        if (isConversionStage)
+        {
+            expectedIdentity = job.PendingConversionIdentity;
+        }
+        else if (isPendingTarget)
+        {
+            expectedIdentity = job.PendingConversionBytes is not null
+                ? job.PendingConversionIdentity : job.PartialIdentity;
+        }
+        else if (isCompletedTarget)
+        {
+            expectedIdentity = job.PublishedFileIdentity
+                ?? (job.PendingConversionBytes is not null ? job.PendingConversionIdentity : job.PartialIdentity);
+        }
+        if (OperatingSystem.IsWindows() && (isConversionStage || isPendingTarget || isCompletedTarget)
+            && expectedIdentity is null) return null;
+
         FileStream? file = null;
         try
         {
             file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+            if (expectedIdentity is not null)
+                PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, expectedIdentity);
             if (IsPublicationFile(job, path))
             {
                 matches = file.Length == length
@@ -364,10 +527,11 @@ public sealed partial class DownloadEngine
         return null;
     }
 
-    private static void MarkPublished(DownloadJob job, string target)
+    private static void MarkPublished(DownloadJob job, string target, string? fileIdentity)
     {
         job.FinalPath = target;
         job.PublishedSha256 = PublicationDigest(job);
+        job.PublishedFileIdentity = fileIdentity;
         job.PendingFinalPath = null;
         if (job.PendingConversionBytes is null) job.PendingConversionDigest = null;
         job.State = JobState.Completed;
@@ -408,7 +572,8 @@ public sealed partial class DownloadEngine
 
     private void FinishPublication(DownloadJob job, bool recovering = false)
     {
-        RecoveryManifest.Delete(job.PartialPath);
+        if (!RecoveryManifest.Delete(job))
+            Log(job.Id, "publication-cleanup", "A recovery file was kept because it did not match this download.");
         if (recovering && job.Kind == JobKind.Merge && !MergeTransfer.DeleteSidecars(job))
             Log(job.Id, "publication-cleanup", "A merge sidecar was kept because it could not be verified or removed.");
         if (job.PendingConversionBytes is null || !DeleteTemporaryFile(job, job.PartialPath)) return;
@@ -433,6 +598,7 @@ public sealed partial class DownloadEngine
         job.PendingFinalPath = null;
         job.PendingConversionBytes = null;
         job.PendingConversionDigest = null;
+        job.PendingConversionIdentity = null;
     }
 
     /// <summary>After a database loss, partial files with a valid recovery manifest come back as "needs link" entries.</summary>

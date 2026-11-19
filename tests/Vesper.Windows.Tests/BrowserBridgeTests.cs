@@ -14,6 +14,16 @@ namespace Vesper.Windows.Tests;
 public sealed class BrowserBridgeTests
 {
     [Fact]
+    public void App_mutex_and_show_event_are_scoped_to_the_current_user()
+    {
+        string currentPipe = BridgePipe.NameForCurrentUser();
+        string identityHash = currentPipe["vesper-".Length..];
+
+        Assert.Equal(@"Local\VESPER.SingleInstance-" + identityHash, Program.InstanceMutexName);
+        Assert.Equal(@"Local\VESPER.Show-" + identityHash, Program.ShowEventName);
+    }
+
+    [Fact]
     public async Task NativeHelperCompletesAStagedDownloadThroughTheRealDesktopBridge()
     {
         string? helper = Environment.GetEnvironmentVariable("VESPER_QA_NATIVE_HOST");
@@ -127,6 +137,59 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public async Task Browser_auto_capture_refuses_every_known_host_before_engine_submission()
+    {
+        var preferences = new VesperPreferences
+        {
+            SiteRules =
+            [
+                new SiteRule { Host = "blocked-origin.example", NeverCapture = true },
+                new SiteRule { Host = "blocked-final.example", NeverCapture = true },
+                new SiteRule { Host = "blocked-page.example", NeverCapture = true }
+            ]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => preferences);
+        var cases = new[]
+        {
+            (Original: "https://blocked-origin.example/start?token=private", Final: "https://cdn.example/file.zip?token=private", Referrer: "https://safe.example/page"),
+            (Original: "https://origin.example/start?token=private", Final: "https://blocked-final.example/file.zip?token=private", Referrer: "https://safe.example/page"),
+            (Original: "https://origin.example/start?token=private", Final: "https://cdn.example/file.zip?token=private", Referrer: "https://blocked-page.example/watch")
+        };
+
+        for (int i = 0; i < cases.Length; i++)
+        {
+            var testCase = cases[i];
+            string json = JsonSerializer.Serialize(new
+            {
+                v = BridgeProtocol.Version,
+                id = $"browser-host-check-{i}",
+                type = "browser-submit",
+                mode = "download",
+                items = new[]
+                {
+                    new
+                    {
+                        url = testCase.Final,
+                        originalUrl = testCase.Original,
+                        referer = testCase.Referrer,
+                        fileName = "video.zip",
+                        kind = "http"
+                    }
+                },
+                browserProof = new { length = 1000, etag = "\"fixture\"", contentType = "application/zip" }
+            });
+
+            Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out string error), error);
+            Assert.Equal(testCase.Original, Assert.Single(request.Items).OriginalUrl);
+            BridgeResponse response = await bridge.HandleAsync(request, CancellationToken.None);
+
+            Assert.False(response.Ok);
+            Assert.Equal("site-capture-disabled", response.Code);
+            Assert.DoesNotContain("private", response.Message, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
     public void NativeMediaQueuePersistsDirectMp3Metadata()
     {
         string root = Path.Combine(Path.GetTempPath(), "vesper-browser-mp3-" + Guid.NewGuid().ToString("N"));
@@ -140,7 +203,7 @@ public sealed class BrowserBridgeTests
             var options = new EngineOptions { DataDirectory = data, DefaultFolder = downloads };
             using (var engine = DownloadEngine.Start(options))
             {
-                var bridge = new BrowserBridgeHandler(null!, engine, () => null!);
+                var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
                 var choice = new MediaDownloadChoice("https://cdn.example.test/song.mp3", "song.mp3", JobKind.Http,
                     null, null, Provider: "bandcamp", MediaId: "track-1", MediaMetadataJson: metadata);
 

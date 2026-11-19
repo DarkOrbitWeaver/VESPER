@@ -665,6 +665,21 @@ public class CrashRecoveryTests
         Assert.False(File.Exists(Path.Combine(h.Downloads, "kept.bin")));
     }
 
+    [WindowsFact]
+    public async Task Completed_file_keeps_its_mark_of_the_web_after_handle_bound_publication()
+    {
+        await using var server = new FaultServer(64 * 1024);
+        await server.StartAsync();
+        using var h = new Harness();
+        Guid id = h.Add(server.Url("/file"), "marked.bin");
+
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        string zone = File.ReadAllText(done.FinalPath! + ":Zone.Identifier");
+
+        Assert.Contains("ZoneId=3", zone, StringComparison.Ordinal);
+        Assert.Contains("HostUrl=" + server.Url("/file"), zone, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -716,7 +731,8 @@ public class CrashRecoveryTests
         h.Engine.Dispose();
         string published = Path.Combine(h.Downloads, "published.bin");
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(published));
-        await File.WriteAllBytesAsync(published, server.V2);
+        File.Delete(published);
+        await File.WriteAllBytesAsync(published, server.V1);
         int requests = server.Hits("/file");
 
         h.Restart();
@@ -724,8 +740,9 @@ public class CrashRecoveryTests
         Assert.Null(pending.FinalPath);
         Assert.Equal("finalize-lost", pending.Reason);
         h.Engine.Resume(id);
+        await Task.Delay(250);
         Assert.Equal(JobState.NeedsAttention, h.Engine.Snapshot(id)!.State);
-        Assert.Equal(server.V2, await File.ReadAllBytesAsync(published));
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(published));
         Assert.Equal(published, Assert.Single(Directory.GetFiles(h.Downloads, "*.bin")));
         Assert.Equal(requests, server.Hits("/file"));
     }

@@ -19,13 +19,14 @@ public sealed class JobStoreRecoveryTests
             {
                 connection.Open();
                 using var command = connection.CreateCommand();
-                command.CommandText = "PRAGMA user_version = 4; PRAGMA wal_checkpoint(TRUNCATE);";
+                command.CommandText = $"PRAGMA user_version = {JobStore.SchemaVersion - 2}; PRAGMA wal_checkpoint(TRUNCATE);";
                 command.ExecuteNonQuery();
             }
 
             string originalHash = Hash(path);
             SqliteException error = Assert.Throws<SqliteException>(() => JobStore.Open(path));
 
+            Assert.Contains("duplicate column name: final_resource_identity", error.Message, StringComparison.OrdinalIgnoreCase);
             Assert.NotEqual(11, error.SqliteErrorCode);
             Assert.NotEqual(26, error.SqliteErrorCode);
             Assert.True(File.Exists(path));
@@ -183,7 +184,16 @@ public sealed class JobStoreRecoveryTests
         string path = Path.Combine(h.Data, "vesper.db");
         using var writer = new SqliteConnection($"Data Source={path};Pooling=False");
         writer.Open();
-        Execute(writer, "ALTER TABLE jobs DROP COLUMN partial_identity; ALTER TABLE jobs DROP COLUMN published_sha256; ALTER TABLE jobs DROP COLUMN media_metadata_json; PRAGMA user_version = 5; PRAGMA wal_checkpoint(TRUNCATE);");
+        Execute(writer, """
+            ALTER TABLE jobs DROP COLUMN published_file_identity;
+            ALTER TABLE jobs DROP COLUMN final_resource_identity;
+            ALTER TABLE jobs DROP COLUMN pending_conversion_identity;
+            ALTER TABLE jobs DROP COLUMN partial_identity;
+            ALTER TABLE jobs DROP COLUMN published_sha256;
+            ALTER TABLE jobs DROP COLUMN media_metadata_json;
+            PRAGMA user_version = 5;
+            PRAGMA wal_checkpoint(TRUNCATE);
+            """);
 
         using var reader = new SqliteConnection($"Data Source={path};Pooling=False");
         reader.Open();

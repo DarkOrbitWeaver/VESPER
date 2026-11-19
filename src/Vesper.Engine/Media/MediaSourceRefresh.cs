@@ -186,6 +186,7 @@ public sealed partial class DownloadEngine
             updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
+            ct.ThrowIfCancellationRequested();
             SaveRefreshedJobLocked(job, updated);
             _credentials[id] = credentials!;
         }
@@ -258,6 +259,9 @@ public sealed partial class DownloadEngine
         }
         if (nextState is null) return Rejected(error ?? "The refreshed live playlist could not continue the saved recording.");
 
+        Failpoint("refresh.live.beforeCommit");
+        ct.ThrowIfCancellationRequested();
+
         long retained;
         lock (_lock)
         {
@@ -283,6 +287,7 @@ public sealed partial class DownloadEngine
             bool removeCredentials = credentials is null && _credentials.TryGetValue(job.Id, out RequestCredentials? prior)
                 && Uri.TryCreate(replacement.Url, UriKind.Absolute, out Uri? replacementUri)
                 && !UrlPolicy.IsSameOrigin(prior.Origin, replacementUri);
+            ct.ThrowIfCancellationRequested();
             SaveRefreshedJobLocked(job, updated);
             if (credentials is not null) _credentials[job.Id] = credentials;
             else if (removeCredentials) _credentials.Remove(job.Id);
@@ -385,6 +390,7 @@ public sealed partial class DownloadEngine
             updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
+            ct.ThrowIfCancellationRequested();
             SaveRefreshedJobLocked(job, updated);
             _credentials.Remove(id);
         }

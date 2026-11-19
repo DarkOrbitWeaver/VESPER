@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net.NetworkInformation;
 using Microsoft.Data.Sqlite;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vesper.Engine;
 
@@ -80,6 +81,7 @@ public sealed partial class DownloadEngine : IDisposable
         try
         {
             engine.Recover();
+            engine.MeteredNetworkPreferenceChanged();
             engine.ScheduleNext();
             _ = Task.Run(engine.RefreshAvailability);
             return engine;
@@ -296,9 +298,9 @@ public sealed partial class DownloadEngine : IDisposable
         }
     }
 
-    internal void WriteManifest(DownloadJob committed)
+    internal void WriteManifest(DownloadJob committed, SafeFileHandle? livePartial = null)
     {
-        try { RecoveryManifest.Write(committed); }
+        try { RecoveryManifest.Write(committed, livePartial); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             Log(committed.Id, "manifest", "Recovery file could not be written: " + ex.Message);   // auxiliary: never fatal
@@ -321,6 +323,8 @@ public sealed partial class DownloadEngine : IDisposable
         {
             if (_disposed || _crashed) return;
 
+            bool networkCostBlocked = UpdateMeteredNetworkWaitsLocked();
+
             foreach (Guid id in _forced.ToArray())
             {
                 if (_cancelling.Contains(id)) continue;
@@ -328,7 +332,7 @@ public sealed partial class DownloadEngine : IDisposable
                 else if (!_sessions.ContainsKey(id)) _forced.Remove(id);
             }
 
-            if (Options.Schedule.IsOpen(DateTime.Now))
+            if (!networkCostBlocked && Options.Schedule.IsOpen(DateTime.Now))
             {
                 while (_sessions.Count(s => !_forced.Contains(s.Key)) < Options.MaxConcurrentJobs && PickNext() is { } next)
                     StartSession(next);
@@ -339,7 +343,7 @@ public sealed partial class DownloadEngine : IDisposable
                     && s.Intent == StopIntent.None
                     && s.Job.State is not (JobState.Verifying or JobState.Converting or JobState.Finalizing)))
                 {
-                    session.Intent = StopIntent.Window;
+                    session.Intent = networkCostBlocked ? StopIntent.MeteredNetwork : StopIntent.Window;
                     session.Cts.Cancel();
                 }
             }
@@ -484,7 +488,8 @@ public sealed partial class DownloadEngine : IDisposable
                 break;
             case JobState.WaitingForNetwork:
                 job.State = JobState.WaitingForNetwork;
-                job.NextRetryUtc = DateTime.UtcNow.AddMinutes(2);   // safety net if the network event is missed
+                job.NextRetryUtc = outcome.Reason is "metered-network" or "network-cost-unknown"
+                    ? null : DateTime.UtcNow.AddMinutes(2);   // safety net if the network event is missed
                 break;
             default:
                 job.State = outcome.State;
@@ -616,6 +621,7 @@ public sealed partial class DownloadEngine : IDisposable
             running = [.. _sessions.Values.Select(s => { s.Intent = StopIntent.Shutdown; s.Cts.Cancel(); return s.RunTask ?? Task.CompletedTask; })];
         }
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
+        DisposeMeteredNetworkWatcher();
         try { Task.WaitAll(running, TimeSpan.FromSeconds(20)); }
         catch (AggregateException) { /* each run reports its own failure through OnRunFinished */ }
 

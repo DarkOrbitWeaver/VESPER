@@ -2,6 +2,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using VESPER;
 using Vesper.Setup;
 
 namespace Vesper.Setup.Tests;
@@ -10,14 +11,20 @@ public sealed class InstallTests : IDisposable
 {
     private readonly string _root = Directory.CreateTempSubdirectory("vesper-install-tests-").FullName;
     private readonly Registration _registration = new();
-    private InstallPaths Paths => new(Path.Combine(_root, "Programs"), Path.Combine(_root, "Data"), Path.Combine(_root, "StartMenu"));
+    private InstallPaths Paths => new(Path.Combine(_root, "Programs"), Path.Combine(_root, "VESPER"), Path.Combine(_root, "StartMenu"));
 
     [Fact]
     public void InstallRepairAndUninstallKeepUserFiles()
     {
         Directory.CreateDirectory(Paths.Data);
         string data = Path.Combine(Paths.Data, "settings.json");
+        string history = Path.Combine(Paths.Data, "vesper.db");
+        string subscriptions = Path.Combine(Paths.Data, "podcast-feeds.json");
+        string media = Path.Combine(Paths.Data, "downloaded.mp4");
         File.WriteAllText(data, "user settings");
+        File.WriteAllText(history, "user history");
+        File.WriteAllText(subscriptions, "user subscriptions");
+        File.WriteAllText(media, "downloaded media");
         var setup = new InstallTransaction(Paths, _registration);
         string source = SetupSource();
         RunPackage(setup, SetupMode.Install, source);
@@ -31,6 +38,116 @@ public sealed class InstallTests : IDisposable
         Assert.Null(_registration.Version);
         Assert.False(Directory.Exists(Paths.App));
         Assert.Equal("user settings", File.ReadAllText(data));
+        Assert.Equal("user history", File.ReadAllText(history));
+        Assert.Equal("user subscriptions", File.ReadAllText(subscriptions));
+        Assert.Equal("downloaded media", File.ReadAllText(media));
+        Assert.False(File.Exists(Paths.Journal));
+    }
+
+    [Fact]
+    public void OptInUninstallDeletesOnlySettingsHistoryAndSubscriptionFiles()
+    {
+        ExistingInstallation();
+        Directory.CreateDirectory(Paths.Data);
+        File.WriteAllText(Path.Combine(Paths.Data, "settings.json"), "settings");
+        File.WriteAllText(Path.Combine(Paths.Data, "settings.json.bad.1"), "old settings");
+        File.WriteAllText(Path.Combine(Paths.Data, "ui-preview-settings.json"), "legacy settings");
+        File.WriteAllText(Path.Combine(Paths.Data, "podcast-feeds.json"), "subscriptions");
+        File.WriteAllText(Path.Combine(Paths.Data, "vesper.db"), "history");
+        File.WriteAllText(Path.Combine(Paths.Data, "vesper.db-wal"), "history journal");
+        File.WriteAllText(Path.Combine(Paths.Data, "vesper.db.bak-v8"), "history backup");
+        File.WriteAllText(Path.Combine(Paths.Data, "vesper.db.bak-v8-20261119120000-1234abcd"), "older history backup");
+        File.WriteAllText(Path.Combine(Paths.Data, "vesper.db.corrupt-20261119120000-00112233445566778899aabbccddeeff"), "corrupt history backup");
+        File.WriteAllText(Path.Combine(Paths.Data, "notes.txt"), "unrelated data");
+        string media = Path.Combine(Paths.Data, "downloaded.mp4");
+        File.WriteAllText(media, "downloaded media");
+        string nestedMedia = Path.Combine(Paths.Data, "Downloads", "movie.mkv");
+        Directory.CreateDirectory(Path.GetDirectoryName(nestedMedia)!);
+        File.WriteAllText(nestedMedia, "another downloaded file");
+
+        new InstallTransaction(Paths, _registration).Run(SetupMode.Uninstall, null, null, null,
+            CancellationToken.None, deleteUserData: true);
+
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "settings.json")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "settings.json.bad.1")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "ui-preview-settings.json")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "podcast-feeds.json")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db-wal")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db.bak-v8")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db.bak-v8-20261119120000-1234abcd")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db.corrupt-20261119120000-00112233445566778899aabbccddeeff")));
+        Assert.Equal("unrelated data", File.ReadAllText(Path.Combine(Paths.Data, "notes.txt")));
+        Assert.Equal("downloaded media", File.ReadAllText(media));
+        Assert.Equal("another downloaded file", File.ReadAllText(nestedMedia));
+    }
+
+    [Fact]
+    public void OptInUninstallRestoresSettingsHistoryAndSubscriptionsWhenCancelled()
+    {
+        ExistingInstallation();
+        Directory.CreateDirectory(Paths.Data);
+        string settings = Path.Combine(Paths.Data, "settings.json");
+        string history = Path.Combine(Paths.Data, "vesper.db");
+        string subscriptions = Path.Combine(Paths.Data, "podcast-feeds.json");
+        File.WriteAllText(settings, "settings");
+        File.WriteAllText(history, "history");
+        File.WriteAllText(subscriptions, "subscriptions");
+        using var cancellation = new CancellationTokenSource();
+        _registration.AfterUninstall = cancellation.Cancel;
+
+        Assert.ThrowsAny<OperationCanceledException>(() => new InstallTransaction(Paths, _registration).Run(
+            SetupMode.Uninstall, null, null, null, cancellation.Token, deleteUserData: true));
+
+        Assert.Equal("old app", File.ReadAllText(Paths.Executable));
+        Assert.Equal("1.0.0", _registration.Version);
+        Assert.Equal("settings", File.ReadAllText(settings));
+        Assert.Equal("history", File.ReadAllText(history));
+        Assert.Equal("subscriptions", File.ReadAllText(subscriptions));
+        Assert.Empty(Directory.EnumerateDirectories(Paths.Data));
+        Assert.False(File.Exists(Paths.Journal));
+    }
+
+    [Fact]
+    public void OptInUninstallRejectsADataRootOutsideTheUserStore()
+    {
+        ExistingInstallation();
+        string outsideRoot = Path.Combine(_root, "Outside");
+        Directory.CreateDirectory(outsideRoot);
+        string outside = Path.Combine(outsideRoot, "settings.json");
+        File.WriteAllText(outside, "leave this file alone");
+        var unsafePaths = Paths with { Data = outsideRoot };
+
+        Assert.Throws<IOException>(() => new InstallTransaction(unsafePaths, _registration).Run(
+            SetupMode.Uninstall, null, null, null, CancellationToken.None, deleteUserData: true));
+
+        Assert.Equal("old app", File.ReadAllText(Paths.Executable));
+        Assert.Equal("1.0.0", _registration.Version);
+        Assert.Equal("leave this file alone", File.ReadAllText(outside));
+    }
+
+    [Fact]
+    public void NextAttemptFinishesOptInDataDeletionAfterCommittedUninstall()
+    {
+        Directory.CreateDirectory(Paths.Programs);
+        Guid id = Guid.NewGuid();
+        string backup = Paths.App + $".rollback-{id:N}";
+        Directory.CreateDirectory(backup);
+        Directory.CreateDirectory(Paths.Data);
+        string dataStage = Path.Combine(Paths.Data, ".vesper-uninstall-" + id.ToString("N"));
+        Directory.CreateDirectory(dataStage);
+        File.WriteAllText(Path.Combine(dataStage, "settings.json"), "settings");
+        File.WriteAllText(Path.Combine(dataStage, "vesper.db"), "history");
+        InstallTransaction.WriteAtomic(Paths.Journal, JsonSerializer.SerializeToUtf8Bytes(
+            new InstallJournal(id, SetupMode.Uninstall, InstallPhase.Committed, true, DeleteUserData: true)));
+
+        Assert.ThrowsAny<OperationCanceledException>(() => new InstallTransaction(Paths, _registration).Run(
+            SetupMode.Uninstall, null, null, null, new CancellationToken(canceled: true)));
+
+        Assert.False(Directory.Exists(backup));
+        Assert.False(Directory.Exists(dataStage));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "settings.json")));
+        Assert.False(File.Exists(Path.Combine(Paths.Data, "vesper.db")));
         Assert.False(File.Exists(Paths.Journal));
     }
 
@@ -151,13 +268,20 @@ public sealed class InstallTests : IDisposable
     {
         public string? Version { get; set; }
         public Action? AfterRegister { get; set; }
-        public RegistrationSnapshot Capture() => new(Version is null ? null : Encoding.UTF8.GetBytes(Version), null, []);
+        public Action? AfterUninstall { get; set; }
+        public RegistrationSnapshot Capture() => new(Version is null ? null : Encoding.UTF8.GetBytes(Version), null,
+            Enumerable.Range(0, NativeHostRegistration.BrowserKeys.Length + 9)
+                .Select(_ => new SavedValue(Microsoft.Win32.RegistryValueKind.Unknown, null)).ToArray());
         public void Install(string version)
         {
             Version = version;
             AfterRegister?.Invoke();
         }
-        public void Uninstall() => Version = null;
+        public void Uninstall()
+        {
+            Version = null;
+            AfterUninstall?.Invoke();
+        }
         public void Restore(RegistrationSnapshot snapshot) => Version = snapshot.Manifest is null ? null : Encoding.UTF8.GetString(snapshot.Manifest);
     }
 }

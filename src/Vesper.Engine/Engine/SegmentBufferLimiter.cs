@@ -29,7 +29,8 @@ internal sealed class SegmentBufferLimiter
         if (knownCapacity is null) return CapacityReservation(maxCapacity, copies);
         long wanted = Math.Max(knownCapacity.Value, Math.Min(maxCapacity, DefaultBufferCapacity));
         long capacity = Math.Min(maxCapacity, DefaultBufferCapacity);
-        while (capacity < wanted && capacity < maxCapacity) capacity = Math.Min(maxCapacity, capacity * 2);
+        while (capacity < wanted && capacity < maxCapacity)
+            capacity = capacity >= maxCapacity / 2 ? maxCapacity : capacity * 2;
         return CapacityReservation(capacity, copies);
     }
 

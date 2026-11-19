@@ -47,6 +47,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
         long offset = Job.Extents.ContiguousFromZero();
         if ((cursor is null && offset != 0) || Job.Extents.TotalBytes != offset || file.Length < offset)
             return Stop("The saved fragment cursor does not match committed file bytes.");
+        if (cursor is null && file.Length > 0) file.Truncate(0);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         FragmentedMp4 mp4;
         int next = 0, initLength;
@@ -61,6 +62,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 MediaPartialIntegrity.HashPrefix(file, offset, hash, ct);
                 if (!Convert.ToHexString(hash.GetCurrentHash()).Equals(cursor.PrefixHash, StringComparison.Ordinal))
                     return Stop("The committed partial file failed SHA-256 validation. It was not changed.");
+                if (file.Length > offset) file.Truncate(offset);
                 byte[] init = MediaPartialIntegrity.ReadInitialization(file, cursor.InitLength, ct);
                 mp4 = FragmentedMp4.Open(init);
                 mp4.Restore(cursor.Progress);

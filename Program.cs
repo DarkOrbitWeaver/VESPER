@@ -6,7 +6,8 @@ namespace VESPER
 {
     internal static class Program
     {
-        private const string ShowEventName = @"Local\VESPER.Show";
+        internal static string InstanceMutexName => @"Local\" + BridgePipe.NameForCurrentUser("VESPER.SingleInstance");
+        internal static string ShowEventName => @"Local\" + BridgePipe.NameForCurrentUser("VESPER.Show");
 
         [STAThread]
         static void Main(string[] args)
@@ -20,7 +21,7 @@ namespace VESPER
 
             bool background = args.Contains("--background", StringComparer.OrdinalIgnoreCase);
             // Background launches can race while Chrome sends several requests.
-            using var mutex = new Mutex(true, @"Local\VESPER.SingleInstance", out bool firstInstance);
+            using var mutex = new Mutex(true, InstanceMutexName, out bool firstInstance);
             if (!firstInstance)
             {
                 if (!background) SignalRunningInstance();

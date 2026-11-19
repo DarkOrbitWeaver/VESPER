@@ -18,6 +18,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private readonly EngineOptions _o = engine.Options;
     private DownloadJob Job => session.Job;
     private Uri _url = null!;
+    private string? _runResourceIdentity;
     private PieceMap? _pieces;
     private bool _singleConnection;
 
@@ -61,6 +62,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 StopIntent.Cancel => new RunOutcome(JobState.Cancelled, "cancelled", "Cancelling download."),
                 StopIntent.BrowserFallback => DownloadEngine.BrowserFallbackOutcome,
                 StopIntent.Window => new RunOutcome(JobState.Queued, "schedule", "Waiting for the scheduled download window."),
+                StopIntent.MeteredNetwork => engine.MeteredNetworkStopOutcome(),
                 _ => new RunOutcome(JobState.Queued, "shutdown", "Will resume when VESPER starts.")
             };
         }
@@ -114,6 +116,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         if (!UrlPolicy.TryParse(Job.SourceUrl, out _url, out string urlError))
             throw Stop(RunOutcome.NeedsLink("bad-url", urlError));
 
+        if (!Job.Extents.IsEmpty && !HttpTransport.IsResourceIdentity(Job.FinalResourceIdentity))
+            throw Stop(RunOutcome.NeedsAttention("redirect-identity-missing",
+                "This saved download does not include a verified redirect destination. Its existing bytes were kept. Use a trusted checksum or piece list to verify them, or start a fresh copy."));
+
         PartialFile file = session.OpenFile();
         ReconcileWithFile(file);
         if (Job.PieceMapJson is not null) LoadPieces(file, ct);
@@ -160,9 +166,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     {
         if (Job.BrowserProof is not { } proof) return;
         HttpResponseMessage response = first.Response;
+        if (string.IsNullOrEmpty(proof.ETag)
+            || !string.Equals(HttpFacts.StrongEtag(response), proof.ETag, StringComparison.Ordinal))
+            throw Stop(DownloadEngine.BrowserFallbackOutcome);
         if (first.Decoded
             || proof.Length is long length && first.Total != length
-            || proof.ETag is { } etag && HttpFacts.StrongEtag(response) != etag
             || proof.ContentType is { } mime && !string.Equals(HttpFacts.ContentType(response), mime, StringComparison.OrdinalIgnoreCase)
             || response.RequestMessage?.RequestUri is { } final && UrlPolicy.Normalize(final) != UrlPolicy.Normalize(_url))
             throw Stop(DownloadEngine.BrowserFallbackOutcome);
@@ -223,11 +231,15 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private RequestSpec BuildSpec(long? start, long? endInclusive)
     {
         RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+        string? expectedResourceIdentity = _runResourceIdentity;
+        if (expectedResourceIdentity is null && !Job.Extents.IsEmpty)
+            expectedResourceIdentity = Job.FinalResourceIdentity;
         return new RequestSpec(start, endInclusive,
             IfRangeEtag: Job.Identity == IdentityLevel.StrongEtag ? Job.ETag : null,
             IfRangeDate: Job.Identity == IdentityLevel.LastModified ? Job.LastModified : null,
             Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
-            CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
+            CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl,
+            ExpectedResourceIdentity: expectedResourceIdentity);
     }
 
     private async Task<FirstResult> OpenFirstAsync(long start, CancellationToken ct)
@@ -323,10 +335,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     {
         HttpResponseMessage r = first.Response;
         bool fresh = Job.Extents.IsEmpty;
+        if (r.RequestMessage?.RequestUri is not { } finalUri)
+            throw Stop(RunOutcome.NeedsAttention("redirect-identity-missing",
+                "The server response did not identify the final file location. No new bytes were saved."));
+        string finalResourceIdentity = HttpTransport.ResourceIdentity(finalUri);
+        _runResourceIdentity = finalResourceIdentity;
+
         engine.UpdateJob(Job, j =>
         {
             if (fresh)
             {
+                j.FinalResourceIdentity = finalResourceIdentity;
                 j.ETag = HttpFacts.StrongEtag(r);
                 j.LastModified = HttpFacts.LastModified(r);
                 // RFC 9110 13.1.5: a Last-Modified date may be used in If-Range only when it is strong, which means

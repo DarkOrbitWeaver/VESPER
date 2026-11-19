@@ -10,6 +10,9 @@ internal sealed record TransportStreamInfo(int Pid, byte StreamType, string Lang
 }
 
 internal sealed record TransportPes(TransportStreamInfo Stream, byte[] Data);
+internal sealed record TransportStreamEntry(int Pid, byte StreamType, string Language, byte[] Descriptors);
+internal sealed record TransportStreamLayout(int TransportStreamId, int Program, int PmtPid, int PcrPid,
+    byte[] ProgramDescriptors, IReadOnlyList<TransportStreamEntry> Streams);
 
 /// <summary>
 /// Bounded single-program MPEG-TS structural validation: 188-byte packets, clear payloads, CRC-checked PAT/PMT,
@@ -24,14 +27,36 @@ internal sealed class TransportStreamValidator
         internal void Reset() { Count = Expected = 0; }
     }
     private readonly Section _pat = new(), _pmt = new();
+    private int? _transportStreamId;
     private int? _program, _pmtPid;
     private readonly Dictionary<int, TransportStreamInfo> _media = [];
+    private readonly List<TransportStreamEntry> _streams = [];
     private readonly HashSet<int> _observed = [];
     private readonly Dictionary<int, MemoryStream> _pendingPes = [];
     private readonly Action<TransportPes>? _onPes;
+    private readonly TransportStreamLayout? _expectedLayout;
+    private int? _pcrPid;
+    private byte[]? _programDescriptors;
     private long _pendingPesBytes;
 
-    internal TransportStreamValidator(Action<TransportPes>? onPes = null) => _onPes = onPes;
+    internal TransportStreamValidator(Action<TransportPes>? onPes = null, TransportStreamLayout? expectedLayout = null)
+    {
+        _onPes = onPes;
+        _expectedLayout = expectedLayout;
+    }
+
+    internal TransportStreamLayout? SnapshotLayout()
+    {
+        if (_transportStreamId is not int transportStreamId || _program is not int program
+            || _pmtPid is not int pmtPid || _pcrPid is not int pcrPid
+            || _programDescriptors is null || _media.Count == 0) return null;
+        byte[] programDescriptors = [.. _programDescriptors];
+        TransportStreamEntry[] streams = [.. _streams
+            .OrderBy(stream => stream.Pid).ThenBy(stream => stream.StreamType)
+            .Select(stream => stream with { Descriptors = [.. stream.Descriptors] })];
+        return new TransportStreamLayout(transportStreamId, program, pmtPid, pcrPid,
+            programDescriptors, streams);
+    }
 
     internal void Validate(ReadOnlySpan<byte> bytes)
     {
@@ -174,6 +199,7 @@ internal sealed class TransportStreamValidator
     {
         if (s[0] != 0 || s[6] != 0 || s[7] != 0 || (s.Length - 12) % 4 != 0)
             throw Bad("Only complete single-section program association tables are supported.");
+        int transportStreamId = BinaryPrimitives.ReadUInt16BigEndian(s[3..]);
         int? program = null, pid = null;
         for (int i = 8; i < s.Length - 4; i += 4)
         {
@@ -182,8 +208,13 @@ internal sealed class TransportStreamValidator
             if (program is not null) throw Bad("Multiple transport programs require explicit selection and are unsupported.");
             program = number; pid = ((s[i + 2] & 0x1f) << 8) | s[i + 3];
         }
-        if (program is null || pid is null or 0 or 0x1fff || (_program is not null && (_program != program || _pmtPid != pid)))
+        if (program is null || pid is null or 0 or 0x1fff
+            || (_transportStreamId is not null && _transportStreamId != transportStreamId)
+            || (_program is not null && (_program != program || _pmtPid != pid))
+            || (_expectedLayout is { } expected && (expected.TransportStreamId != transportStreamId
+                || expected.Program != program || expected.PmtPid != pid)))
             throw Bad("Missing or changed transport program identity.");
+        _transportStreamId = transportStreamId;
         _program = program; _pmtPid = pid;
     }
 
@@ -191,10 +222,15 @@ internal sealed class TransportStreamValidator
     {
         if (s[0] != 2 || s.Length < 16 || s[6] != 0 || s[7] != 0 || BinaryPrimitives.ReadUInt16BigEndian(s[3..]) != _program)
             throw Bad("Invalid or changed program map table.");
-        int offset = 12 + (((s[10] & 0x0f) << 8) | s[11]);
+        int pcrPid = ((s[8] & 0x1f) << 8) | s[9];
+        int programInfoLength = ((s[10] & 0x0f) << 8) | s[11];
+        int offset = 12 + programInfoLength;
         int end = s.Length - 4;
         if (offset > end) throw Bad("Program descriptors exceed the program table.");
+        byte[] programDescriptors = s.Slice(12, programInfoLength).ToArray();
         var media = new Dictionary<int, TransportStreamInfo>();
+        var streams = new List<TransportStreamEntry>();
+        var elementaryPids = new HashSet<int>();
         while (offset < end)
         {
             if (end - offset < 5) throw Bad("Truncated elementary-stream entry.");
@@ -202,21 +238,54 @@ internal sealed class TransportStreamValidator
             int descriptors = ((s[offset + 3] & 0x0f) << 8) | s[offset + 4];
             int descriptorStart = offset + 5, descriptorEnd = descriptorStart + descriptors;
             if (descriptorEnd > end) throw Bad("Elementary descriptors exceed the program table.");
+            if (pid is 0 or 0x1fff || !elementaryPids.Add(pid))
+                throw Bad("The program map contains a reserved or duplicate elementary PID.");
             bool video = type is 0x01 or 0x02 or 0x10 or 0x1b or 0x24;
             bool audio = type is 0x03 or 0x04 or 0x0f or 0x11 or 0x81 or 0x87;
+            ReadOnlySpan<byte> descriptorBytes = s.Slice(descriptorStart, descriptors);
+            string language = video || audio ? ReadLanguage(descriptorBytes) : ReadLanguageIfValid(descriptorBytes);
+            streams.Add(new TransportStreamEntry(pid, (byte)type, language, descriptorBytes.ToArray()));
             if (video || audio)
             {
-                string language = ReadLanguage(s.Slice(descriptorStart, descriptors));
                 if (!media.TryAdd(pid, new TransportStreamInfo(pid, (byte)type, language)) || pid is 0 or 0x1fff)
                     throw Bad("Invalid or duplicate elementary PID.");
             }
             offset = descriptorEnd;
         }
-        if (_media.Count > 0 && (_media.Count != media.Count || _media.Any(p =>
-            !media.TryGetValue(p.Key, out TransportStreamInfo? stream) || stream.StreamType != p.Value.StreamType)))
+        if (_media.Count > 0 && (_media.Count != media.Count || _pcrPid != pcrPid || _media.Any(p =>
+            !media.TryGetValue(p.Key, out TransportStreamInfo? stream)
+            || stream.StreamType != p.Value.StreamType || stream.Language != p.Value.Language)))
+            throw Bad("Track layout changed; concatenation would need remuxing.");
+        if (_expectedLayout is { } expected
+            && (expected.PcrPid != pcrPid
+                || !expected.ProgramDescriptors.AsSpan().SequenceEqual(programDescriptors)
+                || !SameStreamMap(expected.Streams, streams)))
+            throw Bad("The discontinuity changes the program clock or track layout; a remux is required.");
+        if (_streams.Count > 0 && (!SameStreamMap(_streams, streams)
+            || _programDescriptors is null || !_programDescriptors.AsSpan().SequenceEqual(programDescriptors)))
             throw Bad("Track layout changed; concatenation would need remuxing.");
         if (media.Count is < 1 or > 16) throw Bad("No supported media or excessive track count in the program table.");
+        _pcrPid = pcrPid;
+        _programDescriptors = programDescriptors;
         foreach (var pair in media) _media[pair.Key] = pair.Value;
+        _streams.Clear();
+        _streams.AddRange(streams);
+    }
+
+    private static bool SameStreamMap(IReadOnlyList<TransportStreamEntry> left,
+        IReadOnlyList<TransportStreamEntry> right)
+    {
+        if (left.Count != right.Count) return false;
+        TransportStreamEntry[] orderedLeft = [.. left.OrderBy(stream => stream.Pid).ThenBy(stream => stream.StreamType)];
+        TransportStreamEntry[] orderedRight = [.. right.OrderBy(stream => stream.Pid).ThenBy(stream => stream.StreamType)];
+        for (int i = 0; i < orderedLeft.Length; i++)
+        {
+            TransportStreamEntry a = orderedLeft[i], b = orderedRight[i];
+            if (a.Pid != b.Pid || a.StreamType != b.StreamType
+                || a.Language != b.Language
+                || !a.Descriptors.AsSpan().SequenceEqual(b.Descriptors)) return false;
+        }
+        return true;
     }
 
     private static string ReadLanguage(ReadOnlySpan<byte> descriptors)
@@ -237,6 +306,12 @@ internal sealed class TransportStreamValidator
             offset += length;
         }
         return "und";
+    }
+
+    private static string ReadLanguageIfValid(ReadOnlySpan<byte> descriptors)
+    {
+        try { return ReadLanguage(descriptors); }
+        catch (MediaContainerException) { return "und"; }
     }
 
     private static uint Crc(ReadOnlySpan<byte> bytes)

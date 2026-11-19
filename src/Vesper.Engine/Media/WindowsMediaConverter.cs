@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using Microsoft.Win32.SafeHandles;
 
 namespace Vesper.Engine;
 
@@ -43,19 +44,93 @@ internal static class WindowsMediaConverter
     public static void Convert(string source, string extension, string destination, MediaOutput output, CancellationToken ct,
         DemuxedTrack? timing = null, Action<double>? progress = null)
     {
+        using var destinationOwner = CreateOwnedOutputStage(destination, out string identity);
+        ConvertOwnedStage(source, extension, destination, output, ct, destinationOwner, identity, timing, progress);
+    }
+
+    internal static void ConvertOwnedStage(string source, string extension, string destination, MediaOutput output,
+        CancellationToken ct, FileStream destinationOwner, string expectedIdentity, DemuxedTrack? timing = null,
+        Action<double>? progress = null)
+    {
+        PathSafety.RequireTemporaryIdentity(destinationOwner.SafeFileHandle, expectedIdentity);
+        RequireOwnedPathIdentity(destination, expectedIdentity);
+        ConvertCore(source, extension, destination, output, timing, ct, progress, destinationOwner, expectedIdentity);
+        PathSafety.RequireTemporaryIdentity(destinationOwner.SafeFileHandle, expectedIdentity);
+        RequireOwnedPathIdentity(destination, expectedIdentity);
+    }
+
+    internal static FileStream CreateOwnedOutputStage(string path, out string identity,
+        Func<SafeFileHandle, string?>? identityReader = null)
+    {
+        SafeFileHandle created = PathSafety.OpenTemporaryHandle(path, FileMode.CreateNew, FileAccess.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete, allowDelete: true);
+        FileStream? owner = null;
+        string? createdIdentity = null;
+        bool creatorClosed = false;
+        try
+        {
+            createdIdentity = (identityReader ?? PathSafety.TemporaryFileIdentity)(created)
+                ?? throw new IOException("The drive did not provide a stable temporary file ID.");
+            identity = createdIdentity;
+            created.Dispose();
+            creatorClosed = true;
+            owner = PathSafety.OpenTemporaryStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete, 1 << 16);
+            PathSafety.RequireTemporaryIdentity(owner.SafeFileHandle, identity);
+            return owner;
+        }
+        catch (Exception creationError)
+        {
+            owner?.Dispose();
+            try
+            {
+                if (!creatorClosed)
+                {
+                    PathSafety.DeleteOpenTemporaryFile(created, path);
+                }
+                else if (createdIdentity is null)
+                {
+                    throw new IOException("The stage identity was not available for safe cleanup.");
+                }
+                else if (!PathSafety.TryDeleteTemporaryFile(path, createdIdentity, out string cleanupError))
+                    throw new IOException(cleanupError);
+            }
+            catch (Exception cleanupError)
+            {
+                throw new IOException("A newly created Media Foundation stage could not be removed after identity capture failed.",
+                    new AggregateException(creationError, cleanupError));
+            }
+            finally
+            {
+                created.Dispose();
+            }
+            throw;
+        }
+    }
+
+    private static void RequireOwnedPathIdentity(string path, string expectedIdentity)
+    {
+        using var current = PathSafety.OpenTemporaryHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        PathSafety.RequireTemporaryIdentity(current, expectedIdentity);
+    }
+
+    private static void ConvertCore(string source, string extension, string destination, MediaOutput output,
+        DemuxedTrack? timing, CancellationToken ct, Action<double>? progress, FileStream destinationOwner,
+        string expectedIdentity)
+    {
         ct.ThrowIfCancellationRequested();
         Check(CoInitializeEx(IntPtr.Zero, 0), "initializing COM");
         try
         {
             Check(MFStartup(0x20070, 1), "starting Media Foundation"); // MFSTARTUP_NOSOCKET
-            try { Encode(source, extension, destination, output, timing, ct, progress); }
+            try { Encode(source, extension, destination, output, timing, ct, progress, destinationOwner, expectedIdentity); }
             finally { MFShutdown(); }
         }
         finally { CoUninitialize(); }
     }
 
     private static void Encode(string source, string extension, string destination, MediaOutput output, DemuxedTrack? timing,
-        CancellationToken ct, Action<double>? progress)
+        CancellationToken ct, Action<double>? progress, FileStream destinationOwner, string expectedIdentity)
     {
         IByteStream? input = null, target = null;
         IAttributes? settings = null, writerSettings = null;
@@ -73,7 +148,9 @@ internal static class WindowsMediaConverter
                 Check(settings.SetUINT32(AdvancedVideoProcessing, 1), "preserving the source display size");
             }
             Check(MFCreateSourceReaderFromByteStream(input, settings, out reader), "opening a decoder for the source container");
-            Check(MFCreateFile(3, 1, 0, destination, out target), "creating the MP4 output");
+            PathSafety.RequireTemporaryIdentity(destinationOwner.SafeFileHandle, expectedIdentity);
+            Check(MFCreateFile(3, 2, 0, destination, out target), "opening the owned MP4 output");
+            PathSafety.RequireTemporaryIdentity(destinationOwner.SafeFileHandle, expectedIdentity);
             Check(MFCreateAttributes(out writerSettings, 2), "creating encoder settings");
             Check(writerSettings.SetUINT32(EnableHardwareTransforms, 1), "enabling available hardware encoders");
             Check(writerSettings.SetUINT32(DisableThrottling, 1), "enabling offline conversion speed");

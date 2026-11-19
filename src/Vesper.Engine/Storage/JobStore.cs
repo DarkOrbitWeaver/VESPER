@@ -63,6 +63,13 @@ public sealed class JobStore : IDisposable
         """,
         """
         ALTER TABLE jobs ADD COLUMN partial_identity TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN final_resource_identity TEXT;
+        ALTER TABLE jobs ADD COLUMN published_file_identity TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN pending_conversion_identity TEXT;
         """
     ];
 
@@ -291,7 +298,7 @@ public sealed class JobStore : IDisposable
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
         "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
         "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json", "published_sha256",
-        "partial_identity"
+        "partial_identity", "final_resource_identity", "published_file_identity", "pending_conversion_identity"
     ];
 
     private static readonly string UpsertSql =
@@ -325,14 +332,14 @@ public sealed class JobStore : IDisposable
     }
 
     /// <summary>
-    /// Reorder one or two existing jobs atomically. Only queue_order may change:
+    /// Reorder existing jobs atomically. Only queue_order may change:
     /// a full-row save could overwrite a newer download checkpoint from another caller.
     /// Caller holds DownloadEngine._lock until the committed positions become live.
     /// </summary>
     public void SaveQueueOrders(IReadOnlyList<(Guid JobId, long Order)> changes)
     {
-        if (changes.Count is < 1 or > 2 || changes.Select(c => c.JobId).Distinct().Count() != changes.Count)
-            throw new ArgumentException("A queue move needs one or two distinct existing jobs.", nameof(changes));
+        if (changes.Count < 1 || changes.Select(c => c.JobId).Distinct().Count() != changes.Count)
+            throw new ArgumentException("A queue update needs distinct existing jobs.", nameof(changes));
 
         lock (_gate)
         {
@@ -430,8 +437,11 @@ public sealed class JobStore : IDisposable
         yield return ("media_output", (int)j.Output);
         yield return ("pending_conversion_bytes", j.PendingConversionBytes);
         yield return ("pending_conversion_digest", j.PendingConversionDigest);
+        yield return ("pending_conversion_identity", j.PendingConversionIdentity);
         yield return ("published_sha256", j.PublishedSha256);
         yield return ("partial_identity", j.PartialIdentity);
+        yield return ("final_resource_identity", j.FinalResourceIdentity);
+        yield return ("published_file_identity", j.PublishedFileIdentity);
         yield return ("browser_proof", j.BrowserProof is null ? null : JsonSerializer.Serialize(j.BrowserProof));
         yield return ("media_metadata_json", ProtectedMediaState.Protect(j.MediaMetadataJson));
         yield return ("generation", j.Generation);
@@ -466,8 +476,11 @@ public sealed class JobStore : IDisposable
             PendingFinalPath = NStr("pending_final_path"),
             PendingConversionBytes = NInt("pending_conversion_bytes"),
             PendingConversionDigest = NStr("pending_conversion_digest"),
+            PendingConversionIdentity = NStr("pending_conversion_identity"),
             PublishedSha256 = NStr("published_sha256"),
             PartialIdentity = NStr("partial_identity"),
+            FinalResourceIdentity = NStr("final_resource_identity"),
+            PublishedFileIdentity = NStr("published_file_identity"),
             BrowserProof = NStr("browser_proof") is { } proof ? JsonSerializer.Deserialize<BrowserTransferProof>(proof) : null,
             TotalBytes = NInt("total_bytes"),
             Extents = extents,

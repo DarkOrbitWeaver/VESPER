@@ -5,6 +5,8 @@
 // Actions: sign-in = enable site sign-in, download-now = stop queueing, check-app = check native connection.
 const VesperCaptureReasons = {
   'moved': { text: 'VESPER accepted the download before Chrome saved any of the file.' },
+  'site-rule': { text: 'This site is set to keep automatic downloads in Chrome.' },
+  'policy-unavailable': { text: 'VESPER could not confirm the site’s automatic download rule.' },
   'chrome-finished': { text: 'Chrome finished this file. It stays in Chrome, not VESPER.' },
   'sign-in': { text: 'This site needs your sign-in to download this file.', action: 'sign-in' },
   'different-signed-out': { text: 'The site offered VESPER something else than it gave Chrome. It may need your sign-in.', action: 'sign-in' },
@@ -14,6 +16,7 @@ const VesperCaptureReasons = {
   'page-made': { text: 'This file was put together inside the page, so only Chrome can save it.' },
   'compressed': { text: 'The site sent this file compressed, so VESPER couldn’t confirm it would get the same file.' },
   'no-size': { text: 'The site didn’t say how big this file is, so VESPER couldn’t confirm it would get the same file.' },
+  'no-validator': { text: 'The site did not provide a strong file identifier, so VESPER left the download in Chrome.' },
   'changed': { text: 'The file changed while VESPER was checking it.' },
   'unseen': { text: 'VESPER could not identify the request early enough. Chrome owns this download.' },
   'queued': { text: 'VESPER is set to queue new downloads, so Chrome kept this one going.', action: 'download-now' },
