@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using Vesper.Engine;
+using Vesper.Shared;
 
 namespace VESPER;
 
@@ -144,6 +145,8 @@ public partial class Form1 : Form
     private readonly DownloadEngine? _engine;
     private readonly DownloadActions? _actions;
     private readonly Func<bool> _requestSleep;
+    private readonly Func<bool> _hasActiveDownloads;
+    private readonly Func<DialogResult> _confirmExitWithDownloads;
     private readonly ContextMenuStrip _rowMenu = new() { ShowImageMargin = true };
     private readonly ContextMenuStrip _listMenu = new() { ShowImageMargin = true };
     private readonly VesperButton _listButton = new()
@@ -194,10 +197,13 @@ public partial class Form1 : Form
     public Form1() : this(new VesperPreferences(), null, false) { }
 
     internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden, bool botanicalPreview = false,
-        Func<bool>? requestSleep = null)
+        Func<bool>? requestSleep = null, Func<bool>? hasActiveDownloads = null,
+        Func<DialogResult>? confirmExitWithDownloads = null)
     {
         _prefs = preferences;
         _requestSleep = requestSleep ?? EngineHost.SleepComputer;
+        _hasActiveDownloads = hasActiveDownloads ?? (() => engine is not null && engine.Snapshots().Any(s => s.IsActive));
+        _confirmExitWithDownloads = confirmExitWithDownloads ?? ConfirmExitWithDownloads;
         Disposed += (_, _) =>
         {
             CancelQueueSleepPrompt();
@@ -289,7 +295,9 @@ public partial class Form1 : Form
         _browserHandler = new BrowserBridgeHandler(this, engine, () => _prefs);
         try
         {
-            _bridge = new BridgeServer(BridgePipe.NameForCurrentUser(), _browserHandler.HandleAsync);
+            if (!IsHandleCreated) _ = Handle;
+            _bridge = new BridgeServer(BridgePipe.NameForCurrentUser(), _browserHandler.HandleAsync,
+                HandleSetupExitRequestAsync, SetupExitResponseWritten);
             _bridge.Start();
         }
         catch (IOException ex)
@@ -766,7 +774,7 @@ public partial class Form1 : Form
         Activate();
     }
 
-    private bool HasActiveDownloads() => _engine is not null && _engine.Snapshots().Any(s => s.IsActive);
+    private bool HasActiveDownloads() => _hasActiveDownloads();
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
@@ -784,17 +792,71 @@ public partial class Form1 : Form
     /// <summary>Exits explicitly. Active downloads are never abandoned silently: the user decides.</summary>
     private void ExitApplication()
     {
-        if (HasActiveDownloads())
-        {
-            var choice = VesperMessageBox.Show(this,
-                "Downloads are still running.\n\nExit now? Running downloads will be paused safely and resume next time VESPER starts.",
-                "Exit VESPER", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-            if (choice != DialogResult.Yes) return;
-        }
+        if (!ConfirmExitApplication(HasActiveDownloads())) return;
+        BeginExitApplication();
+    }
+
+    private bool ConfirmExitApplication(bool activeDownloads) =>
+        !activeDownloads || _confirmExitWithDownloads() == DialogResult.Yes;
+
+    private DialogResult ConfirmExitWithDownloads() => VesperMessageBox.Show(this,
+        "Downloads are still running.\n\nExit now? Running downloads will be paused safely and resume next time VESPER starts.",
+        "Exit VESPER", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+
+    private void BeginExitApplication()
+    {
+        if (_exiting || IsDisposed) return;
         _exiting = true;
         CancelQueueSleepPrompt();
         _allowVisible = true;
         Close();
+    }
+
+    internal async Task<string?> HandleSetupExitRequestAsync(string json, CancellationToken ct)
+    {
+        if (!SetupExitProtocol.TryReadRequest(json, out string id)) return null;
+        if (ct.IsCancellationRequested || IsDisposed || !IsHandleCreated)
+            return SetupExitProtocol.CreateResponse(id, accepted: false);
+
+        var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    decision.TrySetResult(false);
+                    return;
+                }
+                if (_exiting || IsDisposed)
+                {
+                    decision.TrySetResult(true);
+                    return;
+                }
+
+                bool activeDownloads = HasActiveDownloads();
+                if (activeDownloads) ShowFromTray();
+                decision.TrySetResult(ConfirmExitApplication(activeDownloads));
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            return SetupExitProtocol.CreateResponse(id, accepted: false);
+        }
+
+        bool accepted;
+        using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            timeout.CancelAfter(TimeSpan.FromMinutes(5));
+            try { accepted = await decision.Task.WaitAsync(timeout.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { accepted = false; }
+        }
+        return SetupExitProtocol.CreateResponse(id, accepted);
+    }
+
+    internal void SetupExitResponseWritten()
+    {
+        PostToUi(BeginExitApplication);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

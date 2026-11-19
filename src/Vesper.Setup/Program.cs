@@ -9,6 +9,10 @@ namespace Vesper.Setup;
 internal static class Program
 {
     private const uint SpiGetClientAreaAnimation = 0x1042;
+    private static readonly TimeSpan ExitRequestConnectTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ExitRequestReplyTimeout = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan InstanceReleaseTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan InstancePollInterval = TimeSpan.FromMilliseconds(100);
 
     internal static string InstanceMutexName => WindowsObjectNames.LocalNameForCurrentUser("VESPER.SingleInstance");
 
@@ -48,12 +52,62 @@ internal static class Program
         }
     }
 
-    private static IDisposable AcquireAppLock()
+    internal static IDisposable AcquireAppLock(CancellationToken ct) => AcquireAppLock(InstanceMutexName,
+        token => SetupExitProtocol.RequestExitAsync(ExitRequestConnectTimeout, ExitRequestReplyTimeout, token),
+        InstanceReleaseTimeout, ct);
+
+    internal static IDisposable AcquireAppLock(string mutexName, Func<CancellationToken, Task<bool>> requestExit,
+        TimeSpan releaseTimeout, CancellationToken ct = default)
     {
-        var mutex = new Mutex(true, InstanceMutexName, out bool acquired);
-        if (acquired) return new AppLock(mutex);
-        mutex.Dispose();
-        throw new IOException("Exit VESPER from its tray menu, then try again.");
+        ct.ThrowIfCancellationRequested();
+        if (TryAcquireAppLock(mutexName) is { } appLock) return appLock;
+
+        bool accepted;
+        try { accepted = requestExit(ct).GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex) when (ex is IOException || ex is TimeoutException || ex is OperationCanceledException
+            || ex.GetType() == typeof(InvalidDataException))
+        {
+            if (TryAcquireAppLock(mutexName) is { } releasedLock) return releasedLock;
+            throw new IOException("Setup could not confirm a cooperative VESPER shutdown. Close VESPER from its tray menu, then try again.", ex);
+        }
+
+        ct.ThrowIfCancellationRequested();
+        if (!accepted)
+            throw new IOException("VESPER is still running. Accept its exit prompt or close VESPER from its tray menu, then try setup again.");
+
+        Stopwatch wait = Stopwatch.StartNew();
+        do
+        {
+            if (ct.WaitHandle.WaitOne(InstancePollInterval)) ct.ThrowIfCancellationRequested();
+            if (TryAcquireAppLock(mutexName) is { } releasedLock) return releasedLock;
+        }
+        while (wait.Elapsed < releaseTimeout);
+
+        throw new IOException("VESPER accepted the exit request but has not released its running lock. Wait for VESPER to finish closing, then try setup again.");
+    }
+
+    private static AppLock? TryAcquireAppLock(string mutexName)
+    {
+        var mutex = new Mutex(initiallyOwned: false, mutexName);
+        try
+        {
+            bool acquired;
+            try { acquired = mutex.WaitOne(0); }
+            catch (AbandonedMutexException)
+            {
+                // WaitOne grants ownership when the previous owner exited without releasing.
+                acquired = true;
+            }
+            if (acquired) return new AppLock(mutex);
+            mutex.Dispose();
+            return null;
+        }
+        catch
+        {
+            mutex.Dispose();
+            throw;
+        }
     }
 
     private sealed class AppLock(Mutex mutex) : IDisposable

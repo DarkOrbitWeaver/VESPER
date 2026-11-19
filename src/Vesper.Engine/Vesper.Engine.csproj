@@ -16,6 +16,7 @@
     <Compile Include="..\Shared\NetworkAddressPolicy.cs" Link="Http\NetworkAddressPolicy.cs" />
     <Compile Include="..\Shared\FileNameRules.cs" Link="Files\FileNameRules.cs" />
     <Compile Include="..\Shared\WindowsObjectNames.cs" Link="WindowsObjectNames.cs" />
+    <Compile Include="..\Shared\SetupExitProtocol.cs" Link="SetupExitProtocol.cs" />
     <!-- The only third-party dependency: SQLite (MIT) for transactional job state. -->
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
   </ItemGroup>

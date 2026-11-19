@@ -12,7 +12,8 @@ internal enum InstallPhase { Staging, Switching, Committed }
 internal sealed record InstallJournal(Guid Id, SetupMode Mode, InstallPhase Phase, bool HadApp,
     RegistrationSnapshot? Registration = null, bool DeleteUserData = false);
 
-internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistration registration, Func<IDisposable>? lockApp = null)
+internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistration registration,
+    Func<CancellationToken, IDisposable>? lockApp = null)
 {
     private const int MaxJournalBytes = 64 * 1024 * 1024;
     private const int AppRegistrationValueCount = 9;
@@ -30,14 +31,15 @@ internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistratio
         Directory.CreateDirectory(paths.Programs);
         using var setupLock = new FileStream(paths.Lock, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None,
             1, FileOptions.DeleteOnClose);
-        RecoverPending();
+        RecoverPending(ct);
         ct.ThrowIfCancellationRequested();
         CheckPath(paths.App);
         bool hadApp = Directory.Exists(paths.App);
         if (hadApp && !File.Exists(paths.Executable) && !File.Exists(Path.Combine(paths.App, InstallPayload.Marker)))
             throw new IOException("The installation folder contains files from another application.");
         // Catch a running instance before verifying the package. Recheck under the swap lock below.
-        lockApp?.Invoke().Dispose();
+        lockApp?.Invoke(ct).Dispose();
+        ct.ThrowIfCancellationRequested();
 
         bool removeUserData = mode == SetupMode.Uninstall && deleteUserData;
         var journal = new InstallJournal(Guid.NewGuid(), mode, InstallPhase.Staging, hadApp,
@@ -60,7 +62,8 @@ internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistratio
             }
 
             ct.ThrowIfCancellationRequested();
-            appLock = lockApp?.Invoke();
+            appLock = lockApp?.Invoke(ct);
+            ct.ThrowIfCancellationRequested();
             CheckPath(backup);
             journal = journal with
             {
@@ -100,10 +103,11 @@ internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistratio
         catch (UnauthorizedAccessException) when (!removeUserData) { }
     }
 
-    private void RecoverPending()
+    private void RecoverPending(CancellationToken ct)
     {
         if (!File.Exists(paths.Journal)) return;
-        using var appLock = lockApp?.Invoke();
+        using var appLock = lockApp?.Invoke(ct);
+        ct.ThrowIfCancellationRequested();
         Recover();
     }
 

@@ -7,7 +7,7 @@ namespace Vesper.Engine;
 public static class BridgePipe
 {
     /// <summary>Per-user pipe name, so another Windows account on the same PC can neither reach nor squat it.</summary>
-    public static string NameForCurrentUser() => NameForCurrentUser("vesper");
+    public static string NameForCurrentUser() => SetupExitProtocol.PipeNameForCurrentUser();
 
     public static string NameForCurrentUser(string purpose) => WindowsObjectNames.NameForCurrentUser(purpose);
 
@@ -42,13 +42,19 @@ public sealed class BridgeServer : IDisposable
 {
     private readonly string _pipeName;
     private readonly Func<BridgeRequest, CancellationToken, Task<BridgeResponse>> _handler;
+    private readonly Func<string, CancellationToken, Task<string?>>? _setupExitHandler;
+    private readonly Action? _setupExitResponseWritten;
     private readonly CancellationTokenSource _stop = new();
     private Task? _loop;
 
-    public BridgeServer(string pipeName, Func<BridgeRequest, CancellationToken, Task<BridgeResponse>> handler)
+    public BridgeServer(string pipeName, Func<BridgeRequest, CancellationToken, Task<BridgeResponse>> handler,
+        Func<string, CancellationToken, Task<string?>>? setupExitHandler = null,
+        Action? setupExitResponseWritten = null)
     {
         _pipeName = pipeName;
         _handler = handler;
+        _setupExitHandler = setupExitHandler;
+        _setupExitResponseWritten = setupExitResponseWritten;
     }
 
     public void Start() => _loop ??= Task.Run(AcceptLoopAsync);
@@ -99,6 +105,34 @@ public sealed class BridgeServer : IDisposable
                 string? json = await BridgeProtocol.ReadFrameAsync(pipe, timeout.Token).ConfigureAwait(false);
                 if (json is null) return;
 
+                if (SetupExitProtocol.TryReadRequest(json, out string setupRequestId))
+                {
+                    id = setupRequestId;
+                    using var setupRequest = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                    Task<bool> clientClosed = WaitForSetupClientCloseAsync(pipe, setupRequest.Token);
+                    Task<string?> setupResponse = _setupExitHandler is null
+                        ? Task.FromResult<string?>(SetupExitProtocol.CreateResponse(id, accepted: false))
+                        : _setupExitHandler(json, setupRequest.Token);
+                    Task finished = await Task.WhenAny(setupResponse, clientClosed).ConfigureAwait(false);
+                    if (finished == clientClosed && await clientClosed.ConfigureAwait(false))
+                    {
+                        setupRequest.Cancel();
+                        try { _ = await setupResponse.ConfigureAwait(false); }
+                        catch (OperationCanceledException) { }
+                        return;
+                    }
+
+                    string responseJson = await setupResponse.ConfigureAwait(false)
+                        ?? SetupExitProtocol.CreateResponse(id, accepted: false);
+                    setupRequest.Cancel();
+                    try { await clientClosed.ConfigureAwait(false); }
+                    catch (OperationCanceledException) { }
+                    bool accepted = SetupExitProtocol.TryReadResponse(responseJson, id, out bool decision) && decision;
+                    await SetupExitProtocol.WriteFrameAsync(pipe, responseJson, timeout.Token).ConfigureAwait(false);
+                    if (accepted) _setupExitResponseWritten?.Invoke();
+                    return;
+                }
+
                 BridgeResponse response;
                 if (!BridgeProtocol.TryParse(json, out BridgeRequest request, out string error))
                 {
@@ -116,6 +150,20 @@ public sealed class BridgeServer : IDisposable
             {
                 // The peer went away or sent garbage. Nothing to recover; the connection is simply dropped.
             }
+        }
+    }
+
+    private static async Task<bool> WaitForSetupClientCloseAsync(Stream pipe, CancellationToken ct)
+    {
+        byte[] buffer = new byte[256];
+        try
+        {
+            while (await pipe.ReadAsync(buffer, ct).ConfigureAwait(false) != 0) { }
+            return true;
+        }
+        catch (IOException)
+        {
+            return true;
         }
     }
 

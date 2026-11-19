@@ -1,6 +1,6 @@
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Vesper.Shared;
 
 namespace Vesper.Engine;
 
@@ -36,8 +36,8 @@ public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, stri
 /// </summary>
 public static class BridgeProtocol
 {
-    public const int Version = 1;
-    public const int MaxMessageBytes = 1024 * 1024;
+    public const int Version = SetupExitProtocol.Version;
+    public const int MaxMessageBytes = SetupExitProtocol.MaxMessageBytes;
     public const int MaxItems = 50;
 
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
@@ -47,41 +47,9 @@ public static class BridgeProtocol
 
     // ---- framing: 4-byte little-endian length, then UTF-8 JSON -------------------------------------------------------
 
-    public static async Task<string?> ReadFrameAsync(Stream stream, CancellationToken ct)
-    {
-        var header = new byte[4];
-        int got = await ReadExactAsync(stream, header, ct).ConfigureAwait(false);
-        if (got == 0) return null;                                       // clean end of input
-        if (got < 4) throw new InvalidDataException("Truncated message header.");
+    public static Task<string?> ReadFrameAsync(Stream stream, CancellationToken ct) => SetupExitProtocol.ReadFrameAsync(stream, ct);
 
-        int length = BitConverter.ToInt32(header, 0);
-        if (length <= 0 || length > MaxMessageBytes) throw new InvalidDataException($"Message length {length} is not allowed.");
-
-        var body = new byte[length];
-        if (await ReadExactAsync(stream, body, ct).ConfigureAwait(false) < length) throw new InvalidDataException("Truncated message body.");
-        return Encoding.UTF8.GetString(body);
-    }
-
-    public static async Task WriteFrameAsync(Stream stream, string json, CancellationToken ct)
-    {
-        byte[] body = Encoding.UTF8.GetBytes(json);
-        if (body.Length > MaxMessageBytes) throw new InvalidDataException("Response too large.");
-        await stream.WriteAsync(BitConverter.GetBytes(body.Length), ct).ConfigureAwait(false);
-        await stream.WriteAsync(body, ct).ConfigureAwait(false);
-        await stream.FlushAsync(ct).ConfigureAwait(false);
-    }
-
-    private static async Task<int> ReadExactAsync(Stream stream, byte[] buffer, CancellationToken ct)
-    {
-        int total = 0;
-        while (total < buffer.Length)
-        {
-            int n = await stream.ReadAsync(buffer.AsMemory(total), ct).ConfigureAwait(false);
-            if (n == 0) break;
-            total += n;
-        }
-        return total;
-    }
+    public static Task WriteFrameAsync(Stream stream, string json, CancellationToken ct) => SetupExitProtocol.WriteFrameAsync(stream, json, ct);
 
     // ---- validation ---------------------------------------------------------------------------------------------------
 
