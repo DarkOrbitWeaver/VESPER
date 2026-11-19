@@ -14,6 +14,9 @@ internal sealed partial class BrowserBridgeHandler
     private readonly Dictionary<Guid, MediaSession> _mediaSessions = [];
     private readonly object _mediaSessionsLock = new();
 
+    internal static bool HasRelatedCollection(MediaItem item) => item.Related is
+        { Url: { IsAbsoluteUri: true, Scheme: "http" or "https" } };
+
     internal static string MapResolverError(MediaErrorCode? code) => code switch
     {
         MediaErrorCode.NoDownloadableMedia => "no-media",
@@ -63,6 +66,15 @@ internal sealed partial class BrowserBridgeHandler
             Url = page, Browser = MediaHints(request, page),
             Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly }
         }, discovery.Token);
+        if (resolved.Collection is { } collection)
+            return BridgeResponse.Success(request.Id, data: new
+            {
+                title = collection.Title,
+                provider = collection.Provider,
+                hasRelatedCollection = true,
+                collectionIsDynamic = collection.IsDynamic,
+                collectionIsComplete = collection.IsComplete
+            });
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
@@ -159,9 +171,20 @@ internal sealed partial class BrowserBridgeHandler
                 string.Join(" · ", parts.Where(part => part is not null)), exact);
         }
 
-        if (jobs.Count == 0) return BridgeResponse.Fail(requestId, "unavailable", playable.Representations.Count == 0
-            ? "The page supplied metadata but no supported clear media address. Play the video and refresh formats; sign-in, DRM or a changed provider response may prevent access."
-            : problems.FirstOrDefault() ?? "All source addresses have expired. Refresh the page and try again.");
+        if (jobs.Count == 0)
+        {
+            if (HasRelatedCollection(item))
+                return BridgeResponse.Success(requestId, data: new
+                {
+                    item.Title,
+                    item.Provider,
+                    hasRelatedCollection = true,
+                    collectionIsDynamic = item.Related!.IsDynamic
+                });
+            return BridgeResponse.Fail(requestId, "unavailable", playable.Representations.Count == 0
+                ? "The page supplied metadata but no supported clear media address. Play the video and refresh formats; sign-in, DRM or a changed provider response may prevent access."
+                : problems.FirstOrDefault() ?? "All source addresses have expired. Refresh the page and try again.");
+        }
         if (presets.Count == 0)
         {
             if (originalPresets.Count > 0) presets.AddRange(originalPresets);
@@ -196,6 +219,7 @@ internal sealed partial class BrowserBridgeHandler
             mediaSession = session.ToString("N"), item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
             choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,
+            hasRelatedCollection = HasRelatedCollection(item),
             audioTracks = item.AudioTracks.Select((track, index) => new { track.Id,
                 label = (track.Name ?? track.Language ?? "Audio") + (track.IsDefault ? " · original" : "") + " · " + (index + 1) }),
             subtitleOptions = SelectableSubtitleTracks(item.Subtitles)

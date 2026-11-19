@@ -68,7 +68,7 @@ internal sealed class SetupWindow : Form
         _cancel.Click += (_, _) => RequestCancellation();
         _extension.Click += (_, _) => OpenPath(Path.Combine(_paths.App, "extension"), shell: true);
         _deleteUserData.CheckedChanged += (_, _) => RefreshControls();
-        _tips.SetToolTip(_extension, "In Chrome, open Extensions, turn on Developer mode, and choose Load unpacked.");
+        _tips.SetToolTip(_extension, "Opens the bundled extension files. Setup does not enable the browser extension or verify its connection to VESPER.");
         _tips.SetToolTip(_deleteUserData, "This removes VESPER settings, download history, and podcast subscriptions. Downloaded files are never deleted.");
         AcceptButton = _action;
         ApplyPalette();
@@ -169,7 +169,8 @@ internal sealed class SetupWindow : Form
                 "Settings, download history, and podcast subscriptions will be deleted. Downloaded files are never deleted.",
             View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and podcast subscriptions will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
-            View.Complete when _mode != SetupMode.Uninstall => "In Chrome, use Developer mode → Load unpacked to enable the bundled extension.",
+            View.Complete when _mode != SetupMode.Uninstall =>
+                "Native host files and browser registration were installed. Setup has not verified that the extension can connect to VESPER.",
             View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
                 "Settings, download history, and podcast subscriptions were deleted. Downloaded files were kept.",
             View.Complete => "Your downloads, settings, download history, and podcast subscriptions were kept.",

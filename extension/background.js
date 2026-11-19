@@ -864,7 +864,7 @@ async function describe(url, durationSeconds) {
 // Content scripts run inside web pages, and a page that breaks out of its sandbox can forge their messages.
 // They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
-const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select']);
+const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit']);
 
@@ -952,13 +952,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'native-picker': {
         const tabId = sender.tab?.id ?? message.tabId;
         const state = await tabState(tabId);
-        const pageUrl = message.pageUrl || (await chrome.tabs.get(tabId))?.url;
+        const trustedContentPage = sender.tab ? mediaPage({}, sender)?.href : null;
+        const pageUrl = trustedContentPage || message.pageUrl || (await chrome.tabs.get(tabId))?.url;
         if (!/^https?:/i.test(pageUrl || ''))
           return { ok: false, code: 'invalid', message: 'This page address cannot be inspected.' };
-        // No cookies or hidden credentials are sent by this command. The native resolver
-        // validates and probes each supplied media hint before it can be selected.
+        // Media authorization follows the same approved, page-scoped path as media options.
         return nativeRequest(envelope('media-picker', {
-          ...await mediaAuthorization(pageUrl, sender), url: pageUrl, pageTitle: message.title || state.title || '',
+          ...await mediaAuthorization(pageUrl, sender, { userGesture: !!trustedContentPage }),
+          url: pageUrl, pageTitle: message.title || state.title || '',
           candidates: []
         }));
       }

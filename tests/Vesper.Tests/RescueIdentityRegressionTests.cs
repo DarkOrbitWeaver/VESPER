@@ -39,6 +39,54 @@ public sealed class RescueIdentityRegressionTests
     }
 
     [Fact]
+    public async Task A_cross_origin_mirror_with_a_matching_etag_is_refused_without_trusted_content_proof()
+    {
+        await using var original = new FaultServer();
+        await using var mirror = new FaultServer();
+        await original.StartAsync();
+        await mirror.StartAsync();
+        using var harness = new Harness();
+
+        Guid id = harness.Add(original.Url("/expires-after-truncate"), "unproven-mirror.bin");
+        JobSnapshot stalled = await harness.WaitForStateAsync(id, JobState.NeedsLink);
+        byte[] saved = await File.ReadAllBytesAsync(stalled.PartialPath);
+
+        RescueResult refused = await harness.Engine.ReplaceLinkAsync(id, mirror.Url("/file"));
+        JobSnapshot after = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(id));
+
+        Assert.False(refused.Accepted);
+        Assert.Equal(RescueMode.R4, refused.Mode);
+        Assert.Equal(JobState.NeedsLink, after.State);
+        Assert.Equal(stalled.SourceUrl, after.SourceUrl);
+        Assert.Equal(stalled.CommittedBytes, after.CommittedBytes);
+        Assert.Equal(saved, await File.ReadAllBytesAsync(stalled.PartialPath));
+    }
+
+    [Fact]
+    public async Task A_cross_origin_mirror_with_a_trusted_full_hash_reuses_and_verifies_the_saved_prefix()
+    {
+        await using var original = new FaultServer();
+        await using var mirror = new FaultServer();
+        await original.StartAsync();
+        await mirror.StartAsync();
+        using var harness = new Harness();
+
+        Guid id = harness.Add(original.Url("/expires-after-truncate"), "verified-mirror.bin");
+        JobSnapshot stalled = await harness.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(stalled.CommittedBytes > 0);
+
+        RescueResult rescued = await harness.Engine.ReplaceLinkAsync(id, mirror.Url("/file"),
+            new RescueInput(Sha256: Payloads.Sha256(mirror.V1)));
+        Assert.True(rescued.Accepted, rescued.Message);
+        Assert.Equal(RescueMode.R1, rescued.Mode);
+        Assert.Equal(stalled.CommittedBytes, rescued.RetainedBytes);
+
+        JobSnapshot completed = await harness.WaitForStateAsync(id, JobState.Completed);
+        Assert.True(completed.Sha256Verified);
+        Assert.Equal(mirror.V1, await File.ReadAllBytesAsync(completed.FinalPath!));
+    }
+
+    [Fact]
     public async Task Replacing_a_partial_strong_etag_download_without_an_etag_keeps_all_saved_bytes()
     {
         await using var server = new FaultServer();

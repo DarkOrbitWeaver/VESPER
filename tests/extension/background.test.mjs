@@ -1930,6 +1930,16 @@ test('sign-in context is used only during a fresh capture and a failed attempt d
 // The browser stamps this sender; a web page cannot forge the extension's own origin.
 const contentScript = { tab: { id: 7, url: 'https://shop.example/item' }, url: 'https://shop.example/item', frameId: 0, documentId: 'doc-1' };
 
+test('the native collection picker ignores a page-supplied URL from content scripts', async () => {
+  const app = load({ 'media-picker': { ok: true } });
+  const result = await app.message({ type: 'native-picker', pageUrl: 'https://attacker.example/playlist' }, contentScript);
+
+  assert.equal(result.ok, true);
+  const request = app.sent.find(message => message.type === 'media-picker');
+  assert.equal(request.url, contentScript.url);
+  assert.notEqual(request.url, 'https://attacker.example/playlist');
+});
+
 test('a content script cannot use the commands reserved for VESPER pages', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active'), hello: { ok: true },
@@ -1939,7 +1949,7 @@ test('a content script cannot use the commands reserved for VESPER pages', async
   const privileged = [
     { type: 'tab-state', tabId: 99 }, { type: 'chrome-downloads' }, { type: 'move-download', downloadId: file.id },
     { type: 'retry', id: 'anything' }, { type: 'submit', items: [{ url: 'https://bank.example/export.csv' }] },
-    { type: 'describe', url: 'https://example.com/a.mp4' }, { type: 'hello' }, { type: 'native-picker', pageUrl: 'https://example.com/' },
+    { type: 'describe', url: 'https://example.com/a.mp4' }, { type: 'hello' },
     { type: 'not-a-command' }
   ];
   for (const message of privileged)

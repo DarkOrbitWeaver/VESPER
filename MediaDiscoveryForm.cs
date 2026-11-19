@@ -69,9 +69,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly Panel _presetOptions;
     private readonly List<MediaQualityOption> _presets = [];
     private readonly MediaItem? _sample;
+    private readonly Dictionary<int, string> _collectionAvailability = [];
+    private string[] _collectionLabels = [];
 
     private MediaItem? _item;
     private List<CollectionEntry>? _collection;
+    private bool _updatingCollectionRows;
     private ViewState _state = ViewState.Inspecting;
     private bool _busy;
     private bool _truncated;
@@ -145,7 +148,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _canvas.Controls.Add(_viewPage);
 
         _qualityLabel = L("Quality", 9, bold: true);
-        _quality = new VesperChoice { AccessibleName = "Playlist quality", Symbol = VesperIcon.Quality };
+        _quality = new VesperChoice
+        {
+            AccessibleName = "Quality for selected collection items",
+            AccessibleDescription = "The same quality preference is matched independently to each checked entry. Entries without a compatible format are skipped.",
+            Symbol = VesperIcon.Quality
+        };
         _quality.ApplyPalette(_colors);
         _quality.SetItems("Best", "Balanced", "Smallest", "Audio only");
         _outputChoice = new VesperChoice { AccessibleName = "Output format preference" };
@@ -264,6 +272,14 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _canvas.Controls.Add(_presetOptions);
         void OutputChanged(object? sender, EventArgs e)
         {
+            if (_state == ViewState.Collection)
+            {
+                ClearCollectionAvailability();
+                _status.Text = "Output preference changed. Check the selected entries again.";
+                _notice.Text = "No entries are added until you confirm; updated Ready or Skipped results will appear in the list.";
+                FitToContent();
+                return;
+            }
             if (_state != ViewState.Ready || _item is null) return;
             RefreshPresets(_item);
             UpdateChoiceSummary();
@@ -271,7 +287,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         }
         _outputChoice.SelectedIndexChanged += OutputChanged;
         _audioOutputChoice.SelectedIndexChanged += OutputChanged;
-        _quality.SelectedIndexChanged += (_, _) => { if (_state == ViewState.Collection) UpdateQualityUi(); };
+        _quality.SelectedIndexChanged += (_, _) =>
+        {
+            if (_state != ViewState.Collection) return;
+            ClearCollectionAvailability();
+            _status.Text = "Check the selected entries to see which formats are available.";
+            _notice.Text = "The quality preference is applied separately to checked entries. Nothing is added until you confirm.";
+            UpdateQualityUi();
+            FitToContent();
+        };
 
         _collectionButton = B("Browse playlist", 152, VesperIcon.Queue);
         _collectionButton.Click += async (_, _) => await LoadCollectionAsync();
@@ -283,7 +307,21 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             BackColor = _colors.Surface, ForeColor = _colors.Text,
             Font = new Font("Segoe UI", 9), IntegralHeight = false, HorizontalScrollbar = true
         };
-        _entries.ItemCheck += (_, _) => BeginInvoke(() => UpdateCollectionActions());
+        _entries.ItemCheck += (_, _) =>
+        {
+            if (_updatingCollectionRows) return;
+            BeginInvoke(() =>
+            {
+                if (_state == ViewState.Collection)
+                {
+                    ClearCollectionAvailability();
+                    _status.Text = "Selection changed. Check the selected entries again.";
+                    _notice.Text = "No entries are added until you confirm; updated Ready or Skipped results will appear in the list.";
+                    UpdateCollectionActions();
+                    FitToContent();
+                }
+            });
+        };
         _canvas.Controls.Add(_entries);
 
         _cancel = B("Cancel", 88);
@@ -815,7 +853,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _embedSubtitles.Visible = hasSelectedSubtitle;
         _embedSubtitles.Enabled = !_busy;
         _qualityLabel.Visible = (_state == ViewState.Ready || _state == ViewState.Collection) && !hasSubtitleChoice;
-        _qualityLabel.Text = hasTrackChoice ? "Audio track" : "Quality";
+        _qualityLabel.Text = _state == ViewState.Collection ? "Quality for selected items"
+            : hasTrackChoice ? "Audio track" : "Quality";
         _customLabel.Visible = _customFormat.Visible = custom;
         _customFormat.Enabled = custom && !_busy;
         _quality.Enabled = !_busy && _state == ViewState.Collection;
@@ -1098,18 +1137,70 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _playableFormats.Clear();
         _collection = collection.Entries.Take(200).ToList();
         _truncated = !collection.IsComplete || collection.Entries.Count > 200;
+        _collectionLabels = _collection.Select(entry => Limit(entry.Title ?? entry.MediaId, 105)).ToArray();
+        _collectionAvailability.Clear();
         _title.Text = string.IsNullOrWhiteSpace(collection.Title) ? "Media collection" : collection.Title;
         _source.Text = $"{collection.Provider} · {_collection.Count} items";
         _status.Text = _collection.Count == 0 ? "No accessible entries were listed."
-            : "Select the items you want. One quality preference applies across the selection.";
+            : "Choose entries and one quality. VESPER finds each selected entry's best matching format.";
         _entries.Items.Clear();
-        foreach (var entry in _collection)
-            _entries.Items.Add(Limit(entry.Title ?? entry.MediaId, 105), false);
+        foreach (string label in _collectionLabels)
+            _entries.Items.Add(label, false);
         _notice.Text = _truncated ? "Showing up to 200 entries; this may be a partial collection snapshot."
-            : "Each selected item is checked before entering the download queue.";
+            : "Only checked entries are prepared. Incompatible entries are labeled and skipped unless you confirm the available items.";
         Render(_collection.Count > 0 ? ViewState.Collection : ViewState.Unavailable);
         return Task.CompletedTask;
     }
+
+    private void SetCollectionAvailability(int[] selected, (MediaDownloadChoice? Choice, string? Error)[] prepared)
+    {
+        if (_collection is null) return;
+        for (int i = 0; i < selected.Length; i++)
+        {
+            var result = prepared[i];
+            _collectionAvailability[selected[i]] = CollectionAvailabilityText(result.Choice, result.Error);
+        }
+        RefreshCollectionRows();
+    }
+
+    private void ClearCollectionAvailability()
+    {
+        _collectionAvailability.Clear();
+        RefreshCollectionRows();
+    }
+
+    private void RefreshCollectionRows()
+    {
+        if (_collection is null || _entries.Items.Count != _collectionLabels.Length) return;
+        bool[] checkedItems = Enumerable.Range(0, _entries.Items.Count).Select(_entries.GetItemChecked).ToArray();
+        _updatingCollectionRows = true;
+        _entries.BeginUpdate();
+        try
+        {
+            for (int i = 0; i < _collectionLabels.Length; i++)
+            {
+                string label = _collectionAvailability.TryGetValue(i, out string? status)
+                    ? CollectionRowText(_collectionLabels[i], status) : _collectionLabels[i];
+                _entries.Items[i] = label;
+            }
+            for (int i = 0; i < checkedItems.Length; i++) _entries.SetItemChecked(i, checkedItems[i]);
+        }
+        finally
+        {
+            _entries.EndUpdate();
+            _updatingCollectionRows = false;
+        }
+    }
+
+    internal static (MediaDownloadChoice? Choice, string? Error) PrepareCollectionEntry(MediaItem item,
+        FormatPreferences preferences, MediaOutputPreference output) => Prepare(item, preferences, output: output);
+
+    internal static string CollectionAvailabilityText(MediaDownloadChoice? choice, string? error) => choice is { } job
+        ? $"Ready · {job.DisplayContainer} · {job.DisplayDetail}"
+        : $"Skipped · {Limit(error ?? "No matching format", 75)}";
+
+    internal static string CollectionRowText(string title, string availability) =>
+        $"{Limit(title, 54)} · {Limit(availability, 90)}";
 
     private void UpdateCollectionActions()
     {
@@ -1119,12 +1210,13 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private async Task MakeSelectionsAsync(bool queueOnly)
     {
         if (_busy) return;
-        SetBusy(true, "Checking selected formats…");
+        SetBusy(true, _collection is null ? "Checking selected format…" : "Preparing selected entries under the chosen quality…");
         try
         {
             var prefs = CurrentPreferences();
             MediaOutputPreference output = OutputPreference(prefs);
             var jobs = new List<MediaDownloadChoice>();
+            var available = new List<string>();
             var errors = new List<string>();
             if (_collection is null && _item is { } single)
             {
@@ -1149,7 +1241,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                         MediaDiscoveryResult result = entry.Resolved is { } ready ? MediaDiscoveryResult.FromItem(ready)
                             : await _resolver.ResolveAsync(new MediaDiscoveryRequest
                             { Url = entry.Url, Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, token);
-                        preparedItems[i] = result.Item is { } item ? Prepare(item, prefs, output: output)
+                        preparedItems[i] = result.Item is { } item ? PrepareCollectionEntry(item, prefs, output)
                             : (null, result.Error?.UserMessage ?? "Unavailable");
                     }
                     catch (OperationCanceledException) { throw; }
@@ -1158,21 +1250,41 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 }), _lifetime.Token);
                 for (int i = 0; i < preparedItems.Length; i++)
                 {
-                    if (preparedItems[i].Choice is { } choice) jobs.Add(choice);
-                    else errors.Add($"{Limit(collection[selected[i]].Title ?? collection[selected[i]].MediaId, 35)}: {preparedItems[i].Error}");
+                    string title = Limit(collection[selected[i]].Title ?? collection[selected[i]].MediaId, 35);
+                    if (preparedItems[i].Choice is { } choice)
+                    {
+                        jobs.Add(choice);
+                        available.Add($"{title}: {choice.DisplayContainer} · {Limit(choice.DisplayDetail, 48)}");
+                    }
+                    else errors.Add($"{title}: {Limit(preparedItems[i].Error ?? "Unavailable", 120)}");
                 }
+                SetCollectionAvailability(selected, preparedItems);
             }
             if (IsDisposed || _lifetime.IsCancellationRequested) return;
             if (jobs.Count == 0)
             {
-                _status.Text = "No selected media could be prepared.";
-                _notice.Text = errors.Count > 0 ? Limit(errors[0], 150) : "Try a different quality or source.";
+                _status.Text = _collection is null ? "The selected format isn't available." : "No selected entries match this quality.";
+                _notice.Text = _collection is null
+                    ? Limit(errors.FirstOrDefault() ?? "Try a different quality or source.", 150)
+                    : "Skipped entries are marked in the list. Change the quality or selection and try again.";
                 return;
             }
-            if (errors.Count > 0 && VesperMessageBox.Show(this,
-                    $"{jobs.Count} supported item(s); {errors.Count} could not be prepared.\n\n" +
-                    string.Join("\n", errors.Take(4)) + "\n\nAdd the supported items?",
-                    "Partial media selection", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (_collection is not null)
+            {
+                _status.Text = $"{jobs.Count} ready; {errors.Count} will be skipped under {QualityName(prefs)}.";
+                _notice.Text = "Each checked entry uses its best matching format. Rows show which entries are ready or skipped.";
+                if (errors.Count > 0)
+                {
+                    string availableSummary = string.Join("\n", available.Take(4));
+                    string skippedSummary = string.Join("\n", errors.Take(4));
+                    if (available.Count > 4) availableSummary += $"\n…and {available.Count - 4} more ready entries; see the list.";
+                    if (errors.Count > 4) skippedSummary += $"\n…and {errors.Count - 4} more skipped entries; see the list.";
+                    string message = $"{jobs.Count} selected item(s) are ready; {errors.Count} will be skipped. Quality is matched separately for each item.\n\n" +
+                        $"Ready:\n{availableSummary}\n\nSkipped:\n{skippedSummary}\n\nAdd only the ready items?";
+                    if (VesperMessageBox.Show(this, message, "Partial media selection",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                }
+            }
             // ExpiresAt is retained with each job. Never promise future URL refresh here.
             if (queueOnly && jobs.Any(j => j.ExpiresAt is { } expiry && expiry < DateTimeOffset.UtcNow.AddHours(1)) &&
                 VesperMessageBox.Show(this,
@@ -1192,6 +1304,15 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         catch (Exception) { if (!IsDisposed) _status.Text = "The selected media couldn't be prepared."; }
         finally { if (!IsDisposed) SetBusy(false); }
     }
+
+    private static string QualityName(FormatPreferences preferences) => preferences.Mode switch
+    {
+        QualityMode.Balanced => "Balanced",
+        QualityMode.Smallest => "Smallest",
+        QualityMode.AudioOnly => "Audio only",
+        QualityMode.Custom => preferences.TargetHeight is { } height ? $"{height}p" : "Custom",
+        _ => "Best quality"
+    };
 
     private static string Limit(string text, int length) => text.Length > length ? text[..(length - 1)] + "…" : text;
 
