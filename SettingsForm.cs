@@ -313,10 +313,14 @@ internal sealed class SettingsForm : VesperPopupForm
             _draft.SleepWhenQueueFinishes, value => _draft.SleepWhenQueueFinishes = value);
         var sleepNote = Label("Choose Sleep now within 60 seconds. New downloads or exiting VESPER cancels the prompt.", 8, muted: true);
         sleepNote.SetBounds(45, 804, 470, 36);
+        var shutdownQueue = Check("Ask before shutting down the PC when the queue finishes", 25, 848,
+            _draft.ShutdownWhenQueueFinishes, value => _draft.ShutdownWhenQueueFinishes = value);
+        var shutdownNote = Label("Choose Shut down now within 60 seconds. New downloads or exiting VESPER cancels the prompt.", 8, muted: true);
+        shutdownNote.SetBounds(45, 876, 470, 36);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
             separator4, notify, sound, previewSound, clipboard, tray, collisions, separator5, openFolder,
-            openFolderNote, sleepQueue, sleepNote]);
+            openFolderNote, sleepQueue, sleepNote, shutdownQueue, shutdownNote]);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
@@ -324,7 +328,7 @@ internal sealed class SettingsForm : VesperPopupForm
             frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
             int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
             categoryNote.Width = missingNote.Width = collisions.Width = templateNote.Width = templatePreview.Width
-                = openFolderNote.Width = sleepNote.Width = noteWidth;
+                = openFolderNote.Width = sleepNote.Width = shutdownNote.Width = noteWidth;
             templateFrame.Width = Math.Max(UiKit.Scale(this, 180), right - 50);
         }
         page.Resize += (_, _) => Layout();

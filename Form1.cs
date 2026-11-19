@@ -6,26 +6,30 @@ namespace VESPER;
 
 public partial class Form1 : Form
 {
-    internal enum SleepPromptResult { Skipped, Slept, Failed }
+    internal enum QueuePowerAction { None, Sleep, Shutdown }
+    internal enum QueueActionResult { Skipped, Requested, Failed }
 
-    internal sealed class QueueSleepPrompt : VesperPopupForm
+    internal sealed class QueueCompletionPrompt : VesperPopupForm
     {
         private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
         private readonly Label _countdown;
-        private readonly VesperButton _sleep;
+        private readonly VesperButton? _sleep;
+        private readonly VesperButton? _shutdown;
         private readonly VesperButton _cancel;
-        private readonly Action<QueueSleepPrompt, bool> _completed;
+        private readonly Action<QueueCompletionPrompt, QueuePowerAction> _completed;
         private int _secondsRemaining;
         private bool _finished;
-        private bool _approved;
+        private QueuePowerAction _selectedAction;
 
-        internal QueueSleepPrompt(VesperPalette colors, int countdownSeconds, Action<QueueSleepPrompt, bool> completed)
+        internal QueueCompletionPrompt(VesperPalette colors, int countdownSeconds, bool allowSleep, bool allowShutdown,
+            Action<QueueCompletionPrompt, QueuePowerAction> completed)
         {
             if (countdownSeconds < 1) throw new ArgumentOutOfRangeException(nameof(countdownSeconds));
+            if (!allowSleep && !allowShutdown) throw new ArgumentException("At least one power action must be enabled.");
             _secondsRemaining = countdownSeconds;
             _completed = completed;
             VesperWindowChrome.Brand(this);
-            Text = "Sleep when the queue finishes — VESPER";
+            Text = "Queue completion action — VESPER";
             AutoScaleDimensions = new SizeF(96, 96);
             AutoScaleMode = AutoScaleMode.Dpi;
             ClientSize = new Size(500, 300 + VesperDialogChrome.HeaderHeight);
@@ -41,15 +45,17 @@ public partial class Form1 : Form
             var body = new Panel { Dock = DockStyle.Fill, BackColor = colors.Surface };
             var heading = SleepLabel("The download queue is finished", 12, colors, bold: true);
             heading.SetBounds(24, 20, 450, 30);
-            var explanation = SleepLabel($"VESPER will put this PC to sleep only if you choose Sleep now. The prompt closes after {countdownSeconds} seconds without sleeping.", 9, colors);
+            string choices = allowSleep && allowShutdown ? "Sleep now or Shut down now"
+                : allowSleep ? "Sleep now" : "Shut down now";
+            var explanation = SleepLabel($"Choose {choices}. The prompt closes after {countdownSeconds} seconds without taking action.", 9, colors);
             explanation.SetBounds(24, 62, 450, 54);
             explanation.AutoEllipsis = false;
             _countdown = SleepLabel($"This prompt cancels in {countdownSeconds} seconds.", 9, colors, bold: true);
             _countdown.Name = "queueSleepCountdown";
-            _countdown.AccessibleName = "Sleep prompt countdown";
+            _countdown.AccessibleName = "Queue completion prompt countdown";
             _countdown.SetBounds(24, 128, 450, 25);
-            AccessibleName = "Sleep prompt. " + _countdown.Text;
-            var cancellationNote = SleepLabel("New downloads or exiting VESPER cancels this prompt.", 8.5F, colors, muted: true);
+            AccessibleName = "Queue completion action prompt. " + _countdown.Text;
+            var cancellationNote = SleepLabel("New downloads, disabled actions, or exiting VESPER cancels this prompt.", 8.5F, colors, muted: true);
             cancellationNote.SetBounds(24, 160, 450, 25);
             body.Controls.AddRange([heading, explanation, _countdown, cancellationNote]);
 
@@ -59,11 +65,21 @@ public partial class Form1 : Form
                 using var pen = new Pen(colors.Divider);
                 e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0);
             };
-            _sleep = SleepButton("Sleep now", 116, colors, primary: true, symbol: VesperIcon.Clock);
-            _sleep.Click += (_, _) => Finish(approved: true);
+            if (allowSleep)
+            {
+                _sleep = SleepButton("Sleep now", 116, colors, primary: true, symbol: VesperIcon.Clock);
+                _sleep.Click += (_, _) => Finish(QueuePowerAction.Sleep);
+                footer.Controls.Add(_sleep);
+            }
+            if (allowShutdown)
+            {
+                _shutdown = SleepButton("Shut down now", 128, colors);
+                _shutdown.Click += (_, _) => Finish(QueuePowerAction.Shutdown);
+                footer.Controls.Add(_shutdown);
+            }
             _cancel = SleepButton("Cancel", 88, colors);
-            _cancel.Click += (_, _) => Finish(approved: false);
-            footer.Controls.AddRange([_sleep, _cancel]);
+            _cancel.Click += (_, _) => Finish(QueuePowerAction.None);
+            footer.Controls.Add(_cancel);
             footer.Resize += (_, _) => LayoutFooter(footer);
 
             Controls.Add(body);
@@ -75,37 +91,37 @@ public partial class Form1 : Form
             {
                 if (_finished) return;
                 _finished = true;
-                _approved = false;
+                _selectedAction = QueuePowerAction.None;
                 _timer.Stop();
             };
             FormClosed += (_, _) =>
             {
                 _timer.Stop();
                 _timer.Dispose();
-                _completed(this, _approved);
+                _completed(this, _selectedAction);
             };
             _timer.Tick += (_, _) =>
             {
                 _secondsRemaining--;
                 if (_secondsRemaining <= 0)
                 {
-                    Finish(approved: false);
+                    Finish(QueuePowerAction.None);
                     return;
                 }
                 _countdown.Text = $"This prompt cancels in {_secondsRemaining} seconds.";
-                AccessibleName = "Sleep prompt. " + _countdown.Text;
+                AccessibleName = "Queue completion action prompt. " + _countdown.Text;
             };
             Shown += (_, _) => _timer.Start();
             LayoutFooter(footer);
         }
 
-        internal void Cancel() => Finish(approved: false);
+        internal void Cancel() => Finish(QueuePowerAction.None);
 
-        private void Finish(bool approved)
+        private void Finish(QueuePowerAction action)
         {
             if (_finished) return;
             _finished = true;
-            _approved = approved;
+            _selectedAction = action;
             _timer.Stop();
             Close();
         }
@@ -128,8 +144,18 @@ public partial class Form1 : Form
         private void LayoutFooter(VesperPanel footer)
         {
             int scale = IsHandleCreated ? UiKit.Scale(this, 1) : 1;
-            _sleep.SetBounds(footer.Width - 23 * scale - 116 * scale, 14 * scale, 116 * scale, 34 * scale);
-            _cancel.SetBounds(_sleep.Left - 8 * scale - 88 * scale, 14 * scale, 88 * scale, 34 * scale);
+            int right = footer.Width - 23 * scale;
+            if (_sleep is not null)
+            {
+                _sleep.SetBounds(right - 116 * scale, 14 * scale, 116 * scale, 34 * scale);
+                right = _sleep.Left - 8 * scale;
+            }
+            if (_shutdown is not null)
+            {
+                _shutdown.SetBounds(right - 128 * scale, 14 * scale, 128 * scale, 34 * scale);
+                right = _shutdown.Left - 8 * scale;
+            }
+            _cancel.SetBounds(right - 88 * scale, 14 * scale, 88 * scale, 34 * scale);
         }
     }
 
@@ -145,6 +171,7 @@ public partial class Form1 : Form
     private readonly DownloadEngine? _engine;
     private readonly DownloadActions? _actions;
     private readonly Func<bool> _requestSleep;
+    private readonly Func<bool> _requestShutdown;
     private readonly Func<bool> _hasActiveDownloads;
     private readonly Func<DialogResult> _confirmExitWithDownloads;
     private readonly ContextMenuStrip _rowMenu = new() { ShowImageMargin = true };
@@ -188,7 +215,7 @@ public partial class Form1 : Form
     private BotanicalArt? _botanicalArt;
     private bool _allowVisible;
     private bool _exiting;
-    private QueueSleepPrompt? _sleepPrompt;
+    private QueueCompletionPrompt? _completionPrompt;
     private bool _unfinishedWorkArrived;
     private string? _lastClipboard;
     private DateTime _lastAvailabilityCheck = DateTime.MinValue;
@@ -198,15 +225,16 @@ public partial class Form1 : Form
 
     internal Form1(VesperPreferences preferences, DownloadEngine? engine, bool startHidden, bool botanicalPreview = false,
         Func<bool>? requestSleep = null, Func<bool>? hasActiveDownloads = null,
-        Func<DialogResult>? confirmExitWithDownloads = null)
+        Func<DialogResult>? confirmExitWithDownloads = null, Func<bool>? requestShutdown = null)
     {
         _prefs = preferences;
         _requestSleep = requestSleep ?? EngineHost.SleepComputer;
+        _requestShutdown = requestShutdown ?? EngineHost.ShutdownComputer;
         _hasActiveDownloads = hasActiveDownloads ?? (() => engine is not null && engine.Snapshots().Any(s => s.IsActive));
         _confirmExitWithDownloads = confirmExitWithDownloads ?? ConfirmExitWithDownloads;
         Disposed += (_, _) =>
         {
-            CancelQueueSleepPrompt();
+            CancelQueueCompletionPrompt();
             _browserHandler?.CloseBrowserActivity();
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _botanicalArt?.Dispose();
@@ -418,8 +446,8 @@ public partial class Form1 : Form
             _unfinishedWorkArrived = false;
         }
 
-        bool cancelledSleepPrompt = _sleepPrompt is not null && unfinishedWorkArrived;
-        if (cancelledSleepPrompt) CancelQueueSleepPrompt();
+        bool cancelledCompletionPrompt = _completionPrompt is not null && unfinishedWorkArrived;
+        if (cancelledCompletionPrompt) CancelQueueCompletionPrompt();
 
         string searchTerm = _search.Text.Trim();
         bool sortBySize = _sort.SelectedText == "Size";
@@ -466,7 +494,7 @@ public partial class Form1 : Form
         }
         if (structural) RefreshList();
         else { _grid.RefreshRows(batch, static row => row.Id); UpdateFooter(); }
-        if (!cancelledSleepPrompt && queueTerminations.Count > 0) HandleQueueFinished(queueTerminations);
+        if (!cancelledCompletionPrompt && queueTerminations.Count > 0) HandleQueueFinished(queueTerminations);
     }
 
     private static bool IsUnfinishedQueueWork(JobSnapshot snapshot) =>
@@ -499,7 +527,7 @@ public partial class Form1 : Form
 
         if (latest is not null && _prefs.OpenFolderWhenQueueFinishes)
             _actions?.ShowFolder(latest);
-        if (_prefs.SleepWhenQueueFinishes) StartQueueSleepPrompt();
+        if (HasQueuePowerActionPreference()) StartQueueCompletionPrompt();
     }
 
     internal static JobSnapshot? LatestCompletedQueueJob(IEnumerable<JobSnapshot> snapshots) =>
@@ -509,63 +537,92 @@ public partial class Form1 : Form
             .OrderByDescending(snapshot => snapshot.CompletedUtc ?? DateTime.MinValue)
             .FirstOrDefault();
 
-    private void StartQueueSleepPrompt()
+    private bool HasQueuePowerActionPreference() =>
+        _prefs.SleepWhenQueueFinishes || _prefs.ShutdownWhenQueueFinishes;
+
+    private bool IsQueuePowerActionEnabled(QueuePowerAction action) => action switch
     {
-        if (_sleepPrompt is not null || _engine is null || _exiting || IsDisposed
-            || !_prefs.SleepWhenQueueFinishes || HasUnfinishedQueueWork(_engine.Snapshots())
+        QueuePowerAction.Sleep => _prefs.SleepWhenQueueFinishes,
+        QueuePowerAction.Shutdown => _prefs.ShutdownWhenQueueFinishes,
+        _ => false
+    };
+
+    private void StartQueueCompletionPrompt()
+    {
+        if (_completionPrompt is not null || _engine is null || _exiting || IsDisposed
+            || !HasQueuePowerActionPreference() || HasUnfinishedQueueWork(_engine.Snapshots())
             || HasUnprocessedUnfinishedWork())
             return;
 
-        var prompt = new QueueSleepPrompt(_colors, 60, OnQueueSleepPromptClosed);
-        _sleepPrompt = prompt;
+        var prompt = new QueueCompletionPrompt(_colors, 60, _prefs.SleepWhenQueueFinishes,
+            _prefs.ShutdownWhenQueueFinishes, OnQueueCompletionPromptClosed);
+        _completionPrompt = prompt;
         try { prompt.Show(); }
         catch (Exception ex) when (ex is InvalidOperationException)
         {
-            _sleepPrompt = null;
+            _completionPrompt = null;
             prompt.Dispose();
             System.Diagnostics.Trace.WriteLine(ex.Message, "Queue completion action");
         }
     }
 
-    private void CancelQueueSleepPrompt()
+    private void CancelQueueCompletionPrompt()
     {
-        QueueSleepPrompt? prompt = _sleepPrompt;
-        _sleepPrompt = null;
+        QueueCompletionPrompt? prompt = _completionPrompt;
+        _completionPrompt = null;
         prompt?.Cancel();
     }
 
-    private void OnQueueSleepPromptClosed(QueueSleepPrompt prompt, bool approved)
+    private void OnQueueCompletionPromptClosed(QueueCompletionPrompt prompt, QueuePowerAction action)
     {
-        if (!ReferenceEquals(_sleepPrompt, prompt)) return;
-        _sleepPrompt = null;
-        if (!approved || _engine is null || _exiting || IsDisposed) return;
+        if (!ReferenceEquals(_completionPrompt, prompt)) return;
+        _completionPrompt = null;
+        if (action == QueuePowerAction.None || _engine is null) return;
 
-        SleepPromptResult result;
+        QueueActionResult result;
         try
         {
-            result = RequestSleepAfterPrompt(approved, shuttingDown: _exiting || IsDisposed,
+            result = RequestQueuePowerAction(action,
+                actionEnabled: () => IsQueuePowerActionEnabled(action),
+                isShuttingDown: () => _exiting || IsDisposed,
                 hasUnfinishedWork: () => _engine is null
                     || HasUnfinishedQueueWork(_engine.Snapshots()) || HasUnprocessedUnfinishedWork(),
                 releaseSleepLock: () => EngineHost.HoldAwake(false),
-                requestSleep: _requestSleep);
+                requestSleep: _requestSleep,
+                requestShutdown: _requestShutdown);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            System.Diagnostics.Trace.WriteLine(ex.Message, "Queue completion sleep");
-            result = SleepPromptResult.Failed;
+            System.Diagnostics.Trace.WriteLine(ex.Message, "Queue completion action");
+            result = QueueActionResult.Failed;
         }
 
-        if (result == SleepPromptResult.Failed)
-            PresentNotice("Sleep did not start", "Windows could not put the PC to sleep", VesperIcon.Warning, ShowFromTray);
+        if (result == QueueActionResult.Failed)
+        {
+            string actionName = action == QueuePowerAction.Sleep ? "sleep" : "shut down";
+            string detail = action == QueuePowerAction.Sleep
+                ? "Windows refused or could not start sleep. Check the PC's power settings."
+                : "Windows refused or could not start shutdown. Check shutdown permissions and apps that may block shutdown.";
+            PresentNotice($"Could not {actionName} the PC", detail, VesperIcon.Warning, ShowFromTray);
+        }
     }
 
-    internal static SleepPromptResult RequestSleepAfterPrompt(bool approved, bool shuttingDown,
-        Func<bool> hasUnfinishedWork, Action releaseSleepLock, Func<bool> requestSleep)
+    internal static QueueActionResult RequestQueuePowerAction(QueuePowerAction action,
+        Func<bool> actionEnabled, Func<bool> isShuttingDown, Func<bool> hasUnfinishedWork,
+        Action releaseSleepLock, Func<bool> requestSleep, Func<bool> requestShutdown)
     {
-        if (!approved || shuttingDown || hasUnfinishedWork()) return SleepPromptResult.Skipped;
+        if (action == QueuePowerAction.None || !actionEnabled() || isShuttingDown() || hasUnfinishedWork())
+            return QueueActionResult.Skipped;
         releaseSleepLock();
-        if (shuttingDown || hasUnfinishedWork()) return SleepPromptResult.Skipped;
-        return requestSleep() ? SleepPromptResult.Slept : SleepPromptResult.Failed;
+        if (!actionEnabled() || isShuttingDown() || hasUnfinishedWork()) return QueueActionResult.Skipped;
+
+        bool requested = action switch
+        {
+            QueuePowerAction.Sleep => requestSleep(),
+            QueuePowerAction.Shutdown => requestShutdown(),
+            _ => false
+        };
+        return requested ? QueueActionResult.Requested : QueueActionResult.Failed;
     }
 
     internal static bool NeedsListRefresh(DownloadItem item, JobStatus previousStatus, string previousName,
@@ -778,7 +835,7 @@ public partial class Form1 : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (_exiting || e.CloseReason != CloseReason.UserClosing) CancelQueueSleepPrompt();
+        if (_exiting || e.CloseReason != CloseReason.UserClosing) CancelQueueCompletionPrompt();
         if (_engine is not null && !_exiting && e.CloseReason == CloseReason.UserClosing)
         {
             e.Cancel = true;
@@ -807,7 +864,7 @@ public partial class Form1 : Form
     {
         if (_exiting || IsDisposed) return;
         _exiting = true;
-        CancelQueueSleepPrompt();
+        CancelQueueCompletionPrompt();
         _allowVisible = true;
         Close();
     }
@@ -861,7 +918,7 @@ public partial class Form1 : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
-        CancelQueueSleepPrompt();
+        CancelQueueCompletionPrompt();
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _bridge?.Dispose();
         _notice?.Dispose();
@@ -1716,8 +1773,10 @@ public partial class Form1 : Form
         VesperPreferences updated = dialog.Result;
         bool restartNeeded = updated.AllowPrivateNetworks != _prefs.AllowPrivateNetworks
             || updated.ProxyMode != _prefs.ProxyMode || updated.ProxyAddress != _prefs.ProxyAddress;
+        bool disabledPowerAction = (_prefs.SleepWhenQueueFinishes && !updated.SleepWhenQueueFinishes)
+            || (_prefs.ShutdownWhenQueueFinishes && !updated.ShutdownWhenQueueFinishes);
         CopyPreferences(updated, _prefs);
-        if (!_prefs.SleepWhenQueueFinishes) CancelQueueSleepPrompt();
+        if (disabledPowerAction) CancelQueueCompletionPrompt();
 
         BuildRateOptions();
         if (SettingsStore.Save(_prefs) is { } saveError)
@@ -1741,6 +1800,7 @@ public partial class Form1 : Form
         to.PlayCompletionSound = from.PlayCompletionSound;
         to.OpenFolderWhenQueueFinishes = from.OpenFolderWhenQueueFinishes;
         to.SleepWhenQueueFinishes = from.SleepWhenQueueFinishes;
+        to.ShutdownWhenQueueFinishes = from.ShutdownWhenQueueFinishes;
         to.PreventSleep = from.PreventSleep; to.PauseOnMeteredNetwork = from.PauseOnMeteredNetwork;
         to.CloseToTray = from.CloseToTray; to.AllowPrivateNetworks = from.AllowPrivateNetworks;
         to.ProxyMode = from.ProxyMode; to.ProxyAddress = from.ProxyAddress; to.ScheduleEnabled = from.ScheduleEnabled;

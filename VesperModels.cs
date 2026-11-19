@@ -213,6 +213,7 @@ internal sealed class VesperPreferences
     public bool PlayCompletionSound { get; set; } = true;
     public bool OpenFolderWhenQueueFinishes { get; set; }
     public bool SleepWhenQueueFinishes { get; set; }
+    public bool ShutdownWhenQueueFinishes { get; set; }
     public bool WatchClipboard { get; set; }
     public bool PreventSleep { get; set; }
     public bool PauseOnMeteredNetwork { get; set; }
