@@ -29,6 +29,7 @@ public sealed partial class DownloadEngine : IDisposable
     private readonly HashSet<Guid> _missing = [];
     private readonly ConcurrentQueue<JobSnapshot> _outbox = new();
     private readonly object _outboxLock = new();
+    private readonly Dictionary<Guid, PendingRunOutcome> _pendingRunOutcomes = [];
     private Timer? _wakeTimer;
     private Timer? _pumpTimer;
     private volatile bool _crashed;
@@ -37,6 +38,8 @@ public sealed partial class DownloadEngine : IDisposable
     private readonly Dictionary<DuplicateKey, List<DownloadJob>> _duplicateCandidates = [];
 
     private readonly record struct DuplicateKey(string Url, MediaOutput Output);
+    private sealed record PendingRunOutcome(DownloadJob Job, DownloadJob Expected, RunOutcome Outcome, bool Progressed,
+        DateTime RetryAt, int Failures);
 
     /// <summary>Raised after any durable or visible change of one job (add, state change, rename…).</summary>
     public event Action<JobSnapshot>? JobChanged;
@@ -447,8 +450,14 @@ public sealed partial class DownloadEngine : IDisposable
                 catch (LocalStorageException ex)
                 {
                     // Keep the live record at its last committed state. Startup will recover
-                    // the durable active state and retry the unfinished transfer.
+                    // the durable active state if the database stays unavailable.
                     Log(job.Id, "save-failed", ex.Message);
+                    if (!_disposed && !_crashed)
+                    {
+                        _pendingRunOutcomes[job.Id] = new PendingRunOutcome(job, job.CopyForUiMutation(), outcome,
+                            progressed, DateTime.UtcNow.AddSeconds(1), Failures: 0);
+                        ArmWakeTimer();
+                    }
                 }
             }
         }
@@ -506,6 +515,10 @@ public sealed partial class DownloadEngine : IDisposable
         DateTime? next = _jobs.Values.Where(j => j.State is JobState.WaitingForRetry or JobState.WaitingForNetwork && j.NextRetryUtc is not null)
             .Select(j => j.NextRetryUtc!.Value).DefaultIfEmpty(DateTime.MaxValue).Min();
         if (next == DateTime.MaxValue) next = null;
+        DateTime? pendingRunOutcome = _pendingRunOutcomes.Values.Select(pending => pending.RetryAt)
+            .DefaultIfEmpty(DateTime.MaxValue).Min();
+        if (pendingRunOutcome != DateTime.MaxValue && (next is null || pendingRunOutcome < next))
+            next = pendingRunOutcome;
         if (Options.Schedule.NextBoundary(DateTime.Now) is { } boundary)
         {
             DateTime boundaryUtc = boundary.ToUniversalTime();
@@ -524,6 +537,7 @@ public sealed partial class DownloadEngine : IDisposable
             if (_disposed || _crashed) return;
 
             DateTime now = DateTime.UtcNow;
+            RetryPendingRunOutcomesLocked(now);
             foreach (DownloadJob job in _jobs.Values.Where(j => j.State is JobState.WaitingForRetry or JobState.WaitingForNetwork
                 && j.NextRetryUtc is { } due && due <= now && !_sessions.ContainsKey(j.Id)))
             {
@@ -553,6 +567,55 @@ public sealed partial class DownloadEngine : IDisposable
             FlushOutbox();
         }
     }
+
+    private void RetryPendingRunOutcomesLocked(DateTime now)
+    {
+        foreach ((Guid id, PendingRunOutcome pending) in _pendingRunOutcomes
+            .Where(pair => pair.Value.RetryAt <= now).ToArray())
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, pending.Job)
+                || _sessions.ContainsKey(id) || _cancelling.Contains(id) || IsCleanupPending(job)
+                || !SamePendingRunState(job, pending.Expected))
+            {
+                _pendingRunOutcomes.Remove(id);
+                continue;
+            }
+
+            DownloadJob updated = job.CopyForUpdate();
+            ApplyOutcome(updated, pending.Outcome, pending.Progressed);
+            try { SaveLocked(updated); }
+            catch (LocalStorageException ex)
+            {
+                int failures = Math.Min(pending.Failures + 1, 6);
+                int seconds = Math.Min(60, 1 << failures);
+                _pendingRunOutcomes[id] = pending with { RetryAt = now.AddSeconds(seconds), Failures = failures };
+                Log(id, "run-outcome-save-retry", ex.Message);
+                continue;
+            }
+
+            bool wasCandidate = IsDuplicateCandidate(job);
+            string previousSourceUrl = job.SourceUrl;
+            _pendingRunOutcomes.Remove(id);
+            job.ApplyPersistedState(updated);
+            ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
+            Changed(job);
+            Log(id, "run-ended", $"{job.State} {job.Reason} {pending.Outcome.Message}");
+        }
+    }
+
+    private static bool SamePendingRunState(DownloadJob current, DownloadJob expected) =>
+        current.State == expected.State && current.Reason == expected.Reason
+        && current.SourceUrl == expected.SourceUrl && current.FinalResourceIdentity == expected.FinalResourceIdentity
+        && ReferenceEquals(current.Extents, expected.Extents) && current.Generation == expected.Generation
+        && current.TotalBytes == expected.TotalBytes && current.PartialIdentity == expected.PartialIdentity
+        && current.MediaPlanJson == expected.MediaPlanJson && current.MediaState == expected.MediaState
+        && current.MediaExpiresAt == expected.MediaExpiresAt && current.ExpectedSha256 == expected.ExpectedSha256
+        && current.PieceMapJson == expected.PieceMapJson && current.Output == expected.Output
+        && current.PendingFinalPath == expected.PendingFinalPath
+        && current.PendingConversionBytes == expected.PendingConversionBytes
+        && current.PendingConversionDigest == expected.PendingConversionDigest
+        && current.PendingConversionIdentity == expected.PendingConversionIdentity
+        && current.RetryCount == expected.RetryCount && current.NextRetryUtc == expected.NextRetryUtc;
 
     private void OnNetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e)
     {

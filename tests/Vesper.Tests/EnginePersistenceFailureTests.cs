@@ -6,7 +6,7 @@ namespace Vesper.Tests;
 public sealed class EnginePersistenceFailureTests
 {
     [Fact]
-    public async Task Failed_run_completion_write_does_not_publish_unsaved_state()
+    public async Task Failed_run_completion_write_retries_after_database_recovers()
     {
         await using var server = new FaultServer(16 * 1024 * 1024);
         await server.StartAsync();
@@ -23,7 +23,8 @@ public sealed class EnginePersistenceFailureTests
 
         harness.Engine.Pause(id);
         JobSnapshot stopped = await harness.WaitAsync(id,
-            job => job.State == JobState.Downloading && job.Connections == 0, seconds: 15);
+            job => job.State == JobState.Downloading && job.Connections == 0
+                && harness.Engine.ReadLog().Any(line => line.Contains("save-failed", StringComparison.Ordinal)), seconds: 15);
         using (var store = JobStore.Open(database))
         {
             DownloadJob saved = Assert.Single(store.LoadAll());
@@ -34,11 +35,14 @@ public sealed class EnginePersistenceFailureTests
 
         command.CommandText = "DROP TRIGGER refuse_pause";
         command.ExecuteNonQuery();
-        harness.Restart(tweak: options => options.MaxConcurrentJobs = 0);
 
-        JobSnapshot recovered = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(id));
-        Assert.Equal(JobState.Queued, recovered.State);
-        Assert.True(File.Exists(recovered.PartialPath));
+        JobSnapshot paused = await harness.WaitForStateAsync(id, JobState.Paused, seconds: 10);
+        Assert.Equal(stopped.CommittedBytes, paused.CommittedBytes);
+        Assert.True(File.Exists(paused.PartialPath));
+        using var recoveredStore = JobStore.Open(database);
+        DownloadJob recovered = Assert.Single(recoveredStore.LoadAll());
+        Assert.Equal(JobState.Paused, recovered.State);
+        Assert.Equal(paused.CommittedBytes, recovered.Extents.TotalBytes);
     }
 
     [Fact]
