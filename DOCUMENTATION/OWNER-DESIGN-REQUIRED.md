@@ -144,6 +144,38 @@ The available local remux timing log (`release/audit-evidence/full-engine-batch-
 
 **Status:** OWNER DESIGN REQUIRED
 
+## Extension native-request lifecycle and submission progress
+
+**System name and affected workstream:** Extension native-request lifecycle and submission progress; Chrome MV3 service worker, native messaging host, desktop bridge, and browser-facing feedback.
+
+**Related requirements and sources:** VES-025 (OPUS section G, lines 1160–1171), VES-062 (OPUS section O, line 1748, for the separate legacy `describe` path), and `USER-CHROME-REAL` worker-restart, duplicate-submission, and native-response acceptance. See `STATUS.tsv`, `MASTER-TODO.md`, and `CLAUDE-AUDIT-SOURCE-INDEX.md`. These requirements remain open.
+
+**What VESPER must ultimately accomplish:** Ordinary browser-to-native requests must return or fail within a short, clear bound. A download submission that needs desktop confirmation must acknowledge receipt quickly, then report whether the user accepted, declined, or could not complete it through an explicit progress/status flow. A timeout or worker restart must never look like a successful queue operation, lose the user's recoverable request, or create a duplicate job. User-facing format descriptions must ultimately use the same capability meanings as the native picker; that cleanup remains tracked separately under VES-062.
+
+**What exists now:** `extension/background.js` implements `nativeRequest` with `chrome.runtime.sendNativeMessage` and a default timeout of 330,000 ms. `submit` saves a bounded, secret-stripped request in session storage, waits for the one native reply, and keeps the request available for manual retry when the reply fails. The Transfers page lists those unconfirmed requests and offers “Send again”; it does not show in-progress status. The native host routes each message through `BridgePipe` and `BridgeProtocol`; the current extension message surface has no correlated submission-status command. Several non-submit callers override the 330-second default, but others inherit it. The legacy `describe()` function remains in the extension and generates “Best”, “Balanced”, “Smaller”, and raw-kbps labels; VES-062 records that this path must not be removed until its shared capability replacement is available.
+
+**Concrete gap and uncertainty:** One-shot `sendNativeMessage` returns only a single final reply, while a submission can wait on desktop UI. Returning early without a durable correlation/status path would tell Chrome that a job was accepted before VESPER knows whether the user accepted it. Leaving the one-shot request open can hold extension UI for 5.5 minutes and gives no progress. The project does not define whether status should be polled while a relevant page is open or streamed over a native port, what state survives desktop/service-worker restart, or when an unanswered request expires.
+
+**Why owner design is required:** The audit identifies the desired direction (short ordinary timeouts, early submit acknowledgement, then progress/status) but does not specify the acknowledgement contract, status owner, retention, cancellation, or restart semantics. Choosing those details affects Chrome ownership, duplicate prevention, durable job creation, extension lifecycle, and whether the UI may truthfully say “accepted”. This is a cross-process protocol and recovery-state change, not a local timeout constant.
+
+**Quality requirements:** Never show “added” or “accepted” until the defined acceptance point is durable and attributable to the same request ID. Preserve idempotency across retries and worker restarts. Keep user credentials and signed request data in session memory only; do not persist them for progress tracking. Bound ordinary request waits, status lifetime, storage, and polling or port lifetime. Keep idle Chrome and VESPER free of timers or open connections. Provide clear waiting, accepted, declined, timed-out, and retry states without blocking the browser UI.
+
+**Constraints and existing decisions:** Keep Chrome MV3, the current extension and C#/.NET 10 native host, the current per-user desktop bridge, Chrome ownership rules, and the lightweight privacy-first design. Preserve explicit user confirmation, native request identity, and the existing recoverable retry behavior. Do not add a background service or leave a persistent port open while idle. Keep VES-062's legacy `describe` replacement separate from this request-lifecycle decision.
+
+**Questions for the owner and design engineer:**
+
+1. Does “accepted” mean the desktop received the request, the user confirmed it, or the durable job row was committed? What exact wording should appear at each stage?
+2. Should final state use short-lived polling while the Transfers page is open, a request-scoped native port, or another event-driven mechanism? Which process is authoritative for that state?
+3. Which submission state must survive a Chrome worker restart, a VESPER restart, or both, and for how long? When may stale requests be discarded?
+4. How should user cancellation, duplicate clicks, unavailable native host, lost final reply, and a second extension profile behave without creating duplicates or false success?
+5. Which current commands may wait for an interactive desktop picker, and what bounded timeout/error should each show? The audit says long waits belong to submissions with progress, but the picker request's user-visible completion contract is not defined.
+
+**Integration and acceptance:** In disposable Chrome profiles, verify ordinary `hello`, probe, options, picker, and submission requests return the specified result within their bounds. Keep a desktop confirmation open past the ordinary timeout and show responsive, truthful browser state; then accept and decline it and verify the correlated durable job/status result. Repeat with a lost reply, duplicate submission, two browser profiles, MV3 worker restart before and after acceptance, VESPER restart, native-host absence, user cancellation, and stale-status expiry. Prove no duplicate job, no false acceptance, no credential or signed URL persisted for polling, and no idle connection/timer. Run the extension suite and registered-host Windows Chrome scenarios on the exact candidate. VES-062 label parity requires its own native-picker/legacy-path tests before removing `describe()`.
+
+**Dependencies and independent work:** This design blocks closing the VES-025 long-timeout/progress requirement and the related runtime portion of `USER-CHROME-REAL`; it does not block normal download, media-picker, manual handoff, or unrelated UI and installer work. VES-062's legacy label replacement remains a separately tracked dependency for deleting `describe()`.
+
+**Status:** OWNER DESIGN REQUIRED
+
 ## Recovery manifest identity and legacy V1 handling
 
 **System name and affected workstream:** Recovery manifest identity and legacy V1 handling; temporary-file ownership, crash recovery, conversion/merge cleanup, and upgrade compatibility.
