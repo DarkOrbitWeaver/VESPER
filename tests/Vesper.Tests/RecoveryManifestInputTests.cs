@@ -415,6 +415,65 @@ public sealed class RecoveryManifestInputTests
     }
 
     [WindowsFact]
+    public void New_recovery_manifest_recovers_and_cleans_with_its_saved_file_identity()
+    {
+        string directory = CreateDirectory("vesper-manifest-self-identity-");
+        string partial = CreatePartial(directory);
+        string manifest = RecoveryManifest.PathFor(partial);
+        try
+        {
+            DownloadJob owner = WriteJob(directory, partial);
+            owner.PartialIdentity = TemporaryIdentity(partial);
+            RecoveryManifest.Write(owner);
+
+            using JsonDocument envelope = JsonDocument.Parse(File.ReadAllText(manifest));
+            string bodyJson = envelope.RootElement.GetProperty("Body").GetString()!;
+            using JsonDocument body = JsonDocument.Parse(bodyJson);
+            Assert.Equal(TemporaryIdentity(manifest), body.RootElement.GetProperty("ManifestIdentity").GetString());
+
+            Assert.True(RecoveryManifest.TryRecover(manifest, out DownloadJob recovered, out string problem), problem);
+            Assert.Equal(owner.Id, recovered.Id);
+            Assert.True(RecoveryManifest.Delete(owner));
+            Assert.False(File.Exists(manifest));
+            Assert.Equal([1, 2, 3], File.ReadAllBytes(partial));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [WindowsFact]
+    public void Copied_recovery_manifest_is_rejected_and_preserved_when_its_file_identity_changes()
+    {
+        string directory = CreateDirectory("vesper-manifest-identity-copy-");
+        string partial = CreatePartial(directory);
+        string manifest = RecoveryManifest.PathFor(partial);
+        string original = manifest + ".original";
+        try
+        {
+            DownloadJob owner = WriteJob(directory, partial);
+            owner.PartialIdentity = TemporaryIdentity(partial);
+            RecoveryManifest.Write(owner);
+            byte[] manifestBytes = File.ReadAllBytes(manifest);
+            string savedIdentity = TemporaryIdentity(manifest);
+
+            File.Move(manifest, original);
+            File.WriteAllBytes(manifest, manifestBytes);
+
+            Assert.NotEqual(savedIdentity, TemporaryIdentity(manifest));
+            Assert.False(RecoveryManifest.TryRecover(manifest, out _, out string problem));
+            Assert.Equal("recovery file identity mismatch", problem);
+            Assert.False(RecoveryManifest.Delete(owner));
+            Assert.Equal(manifestBytes, File.ReadAllBytes(manifest));
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [WindowsFact]
     public void Recovery_delete_accepts_the_same_partial_after_publication_move()
     {
         string directory = CreateDirectory("vesper-published-manifest-delete-");

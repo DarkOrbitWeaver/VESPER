@@ -144,6 +144,68 @@ The available local remux timing log (`release/audit-evidence/full-engine-batch-
 
 **Status:** OWNER DESIGN REQUIRED
 
+## Recovery manifest identity and legacy V1 handling
+
+**System name and affected workstream:** Recovery manifest identity and legacy V1 handling; temporary-file ownership, crash recovery, conversion/merge cleanup, and upgrade compatibility.
+
+**Related requirements and sources:** `USER-ATOMIC-STATE`, VES-017 (OPUS section F, lines 1005–1022), and AUDIT-EXTRA-004 (Audit B section D, lines 288–406). See `STATUS.tsv`, `MASTER-TODO.md`, `CLAUDE-AUDIT-SOURCE-INDEX.md`, `AUDIT-RECONCILIATION.md`, and the relevant implementation rows in `IMPLEMENTATION-2026-11.md`. These requirements remain open.
+
+**What VESPER must ultimately accomplish:** Recovery and cleanup may use a `.vmeta` sidecar only when it is the exact sidecar VESPER created for that job. Persist a stable identity for the manifest file itself, verify it across restart and before any replace/delete, and preserve the current `.vpart`/`.vmeta` filenames and recoverable progress. Never delete a user replacement just because its body is valid or byte-for-byte copied from an older VESPER manifest.
+
+**What exists now:** `RecoveryManifest.cs` keeps the existing body version/path layout and now writes an additive `ManifestIdentity` field from the `.vmeta.tmp` file handle. Recovery, prior-manifest checks, and cleanup compare it to the opened sidecar handle. `RecoveryManifestInputTests`, `TemporaryFileIdentityDeletionTests`, `MediaConversionStageOwnershipTests`, and `MergeStageOwnershipTests` passed **52/52** in Release (`release/audit-evidence/atomic-sidecar-identity-focused-20261119.log`), including refusal/preservation of a byte-for-byte copied new manifest at a different file ID. Bodies created before this field still have no sidecar identity and follow the legacy path. The tests do not prove ownership of a valid legacy V1 `.vmeta` already replaced before restart/open.
+
+**Concrete gap and uncertainty:** New manifests bind their body to the sidecar file ID. A replacement `.vmeta` containing a copied valid body created before this field was added can still match the job, path, checksum, and partial identity when VESPER first opens it after restart. The old body cannot distinguish the original sidecar from that copy. The additive new-write field closes the gap only for new manifests; it does not define whether a valid legacy V1 file may be adopted, rewritten, used read-only, or cleaned.
+
+**Quality requirements:** Recovery must preserve committed bytes and refuse destructive action when file ownership is uncertain. The body checksum remains unkeyed and must not be described as protection from a same-user process able to rewrite the body and recompute its checksum. Keep parsing bounded and avoid rereading or copying the media file to establish sidecar identity. Preserve usable recovery for valid existing downloads where the chosen policy can do so, with a clear action when recovery is refused. Identity lookup and manifest verification must not add unbounded work to checkpoint or startup paths.
+
+**Why owner design is required:** The new-manifest identity field and verification are implemented. The remaining decision changes whether interrupted downloads with existing identity-less V1 sidecars remain resumable and whether VESPER may replace or clean those sidecars. Silently accepting V1 for destructive cleanup weakens the approved ownership rule; silently refusing V1 can strand existing progress. The owner must choose the compatibility behavior for identity evidence that cannot be reconstructed after the fact.
+
+**Constraints and existing decisions:** Keep the existing temporary-file layout and Windows C#/.NET 10 implementation. The additive field is part of the existing V1 body; it does not change the serialized body version. Never let a V1 migration or a future format change delete/truncate a foreign or user-replaced file. Keep the current bounded parsing, job/path binding, partial-file identity checks, durable flush/commit order, cancellation, retry, conversion, merge, and recovery behavior. No new service or heavy dependency.
+
+**Questions for the owner and design engineer:**
+
+1. For a valid legacy V1 manifest whose job, path, checksum, and partial-file identity match, may VESPER adopt and rewrite it with `ManifestIdentity` after opening and validating it, or must it preserve the V1 sidecar and leave the job in an actionable attention state?
+2. If V1 is kept read-only, may VESPER use its data to resume while refusing to replace/delete the manifest file, or must it refuse recovery entirely?
+3. May a user explicitly choose to restart from scratch when a valid V1 manifest cannot prove its own identity, and how should VESPER preserve its partial and unrelated files during that choice?
+4. Which Windows file identity is authoritative across rename and restart, and what should happen on filesystems that cannot supply it?
+
+**Integration and acceptance:** The additive identity field is implemented for new manifests. In a disposable directory, the focused tests prove an untouched manifest recovers/cleans and a same-body copy with a different file ID is refused and preserved. Full acceptance still requires interruption while creating/flushing/renaming `.vmeta.tmp`, after job-store commit, during restart, and during cleanup. Add V1 fixtures for the owner-approved adoption/read-only/refusal behavior; prove saved partial bytes remain recoverable or safely actionable without deleting a copied or foreign sidecar. Run focused RecoveryManifest, sidecar identity, conversion ownership, and merge ownership tests, then the full Release suite on the exact candidate.
+
+**Dependencies and independent work:** The V1 adoption/cleanup policy blocks a complete ownership claim for already-existing V1 sidecars. New manifests now carry a sidecar identity without changing the temp-file name; validate this implementation on the exact candidate. Downloads, installer work, browser integration, queue workflows, and other independent tasks continue.
+
+**Status:** OWNER DESIGN REQUIRED
+
+## Completed-file Recycle Bin handoff and file identity
+
+**System name and affected workstream:** Completed-file Recycle Bin handoff and file identity; completed-file deletion, Windows Shell integration, and saved job state.
+
+**Related requirements and sources:** `USER-ATOMIC-STATE` (final Recycle Bin path race), VSP-004 (Rescue and durable atomicity, related identity precedent), and the completed-file rows in `STATUS.tsv`, `MASTER-TODO.md`, `AUDIT-RECONCILIATION.md`, and `QUALITY-RELEASE-GATES.md`. The requirement to preserve the Recycle Bin/undo behavior remains in force.
+
+**What VESPER must ultimately accomplish:** When the user confirms deletion of a VESPER-completed file, move that exact verified file object to the Recycle Bin and then update the job to File missing. A path replacement between verification and shell execution must never cause VESPER to recycle a different file. If ownership cannot be confirmed, keep the job and file and show an actionable error.
+
+**What exists now:** `DownloadEngine.Commands.ChangeCompletedFileAsync` opens the saved file, checks its length and SHA-256, then calls `PathStillNamesFile` before invoking the supplied remove callback. `EngineHost.RecycleFile` calls `Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(path, ..., RecycleOption.SendToRecycleBin)`, which accepts a path. `DownloadActions.DeleteFile` supplies that path after the engine's identity checks. Existing `EngineTests` cover a same-size replacement before the post-hash check and prove it is not deleted; there is no regression for replacement in the interval between that final check and the shell call.
+
+**Concrete gap and technical evidence:** The final operation is path-based after the identity-checking handle is opened with delete sharing so the Shell can move the file. That leaves a time-of-check/time-of-use interval in which the path could identify another object. Microsoft documents [`IFileOperation::DeleteItem`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-deleteitem) as accepting an `IShellItem` and performing the operation later through the shell operation. [`IFileSystemBindData2`](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifilesystembinddata2) can supply a file ID during shell parsing, but the documentation does not state that the file ID pins the object through the later delete. [`SetFileInformationByHandle`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle) supports handle-based rename/disposition, but disposition marks the file for deletion on close and does not provide Recycle Bin undo semantics.
+
+**Quality requirements:** The operation must never recycle a replacement or report success before the intended item is in the Recycle Bin. Preserve restore/undo behavior and leave both the file and job state intact on uncertainty or failure. The normal path should not add unbounded scans, retries, or memory use; any identity checks and shell work should remain responsive and report a useful result. Do not expose unrelated file details in logs or UI errors.
+
+**Why owner design is required:** The current contract requires both exact-object safety and an undoable Recycle Bin move. The available call paths are handle-bound permanent deletion or shell operations resolved through an item/path; the cited Windows documentation does not establish an object-bound Recycle Bin operation for this architecture. Adding a broker/shell layer, accepting a residual race, or changing to permanent deletion affects data safety and the approved user experience.
+
+**Constraints and existing decisions:** Never delete or recycle a Chrome-owned, unrelated, completed replacement, or user-created file. Keep explicit confirmation, the Recycle Bin restore path, job/file consistency, and per-user Windows behavior. Preserve the current C#/.NET 10 native app, avoid a service or administrator requirement, and do not change the action to permanent deletion without owner approval.
+
+**Questions for the owner and design engineer:**
+
+1. Is an additional per-user shell helper/broker acceptable if it can prove the opened file identity through the Recycle Bin operation? If so, what signing, installation, repair, and uninstall constraints apply?
+2. If no identity-bound Recycle Bin operation can be demonstrated, may the product retain the current path-based Recycle Bin behavior with the exact residual race stated, or must Delete be unavailable for that file?
+3. Would the owner ever approve a separate handle-bound permanent-delete action, and if so, what distinct confirmation and UI language would it require? No such approval is assumed.
+4. What should happen when the file is locked, the Recycle Bin is unavailable, or the file identity cannot be read: keep the row and file, offer a retry, or direct the user to File Explorer?
+
+**Integration and acceptance:** The approved solution must pass a deterministic disposable-file race test that replaces the target after VESPER's last identity check but before Shell handoff. The replacement must remain untouched, the job must not report File missing, and the originally confirmed item must either be moved to the Recycle Bin or remain intact with a clear failure. A normal operation must allow the user to restore the exact file from the Recycle Bin. Test hard links/reparse points, locked files, shell errors, retry, and restart/job-state consistency in a disposable Windows account. Run the completed-file and Windows integration tests on the exact candidate.
+
+**Dependencies and independent work:** This decision blocks a proof of the completed-file Recycle Bin race requirement. It does not block safe Open/Locate behavior, normal downloads, unfinished-job Cancel, or independent product and packaging work. Preserve the current Recycle Bin behavior until the owner approves an alternative.
+
+**Status:** OWNER DESIGN REQUIRED
+
 ## Windows Share target and playlist Open With
 
 **Affected workstream:** Windows shell integration, startup activation, First Flight registration, and local HLS/DASH manifest handling.
