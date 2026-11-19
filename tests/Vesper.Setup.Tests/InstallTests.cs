@@ -165,6 +165,41 @@ public sealed class InstallTests : IDisposable
     }
 
     [Fact]
+    public void RefusedInitialAppExitLeavesTheInstallAndRegistrationUntouched()
+    {
+        ExistingInstallation();
+        var setup = new InstallTransaction(Paths, _registration,
+            _ => throw new IOException("VESPER is still running."));
+
+        Assert.Throws<IOException>(() => RunPackage(setup, SetupMode.Install, SetupSource()));
+
+        Assert.Equal("old app", File.ReadAllText(Paths.Executable));
+        Assert.Equal("1.0.0", _registration.Version);
+        Assert.False(File.Exists(Paths.Journal));
+        Assert.Single(Directory.EnumerateDirectories(Paths.Programs));
+    }
+
+    [Fact]
+    public void RefusedSecondAppExitCheckRollsBackStagingWithoutChangingTheInstall()
+    {
+        ExistingInstallation();
+        int lockChecks = 0;
+        var setup = new InstallTransaction(Paths, _registration, _ =>
+        {
+            if (Interlocked.Increment(ref lockChecks) == 1) return new EmptyLock();
+            throw new IOException("VESPER is still running.");
+        });
+
+        Assert.Throws<IOException>(() => RunPackage(setup, SetupMode.Install, SetupSource()));
+
+        Assert.Equal(2, lockChecks);
+        Assert.Equal("old app", File.ReadAllText(Paths.Executable));
+        Assert.Equal("1.0.0", _registration.Version);
+        Assert.False(File.Exists(Paths.Journal));
+        Assert.Single(Directory.EnumerateDirectories(Paths.Programs));
+    }
+
+    [Fact]
     public void CancellationDuringSwitchRollsBack()
     {
         ExistingInstallation();
@@ -263,6 +298,11 @@ public sealed class InstallTests : IDisposable
     }
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
+
+    private sealed class EmptyLock : IDisposable
+    {
+        public void Dispose() { }
+    }
 
     private sealed class Registration : IInstallRegistration
     {

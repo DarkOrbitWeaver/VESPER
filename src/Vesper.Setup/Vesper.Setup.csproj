@@ -18,7 +18,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Vesper.Setup.Tests" />
-    <Compile Include="..\..\VesperTheme.cs;..\..\VesperVisuals.cs;..\..\VesperPanel.cs;..\..\VesperMenuTheme.cs;..\..\VesperWindowChrome.cs;..\..\NativeHostRegistration.cs;..\Shared\WindowsObjectNames.cs" Link="%(Filename)%(Extension)" />
+    <Compile Include="..\..\VesperTheme.cs;..\..\VesperVisuals.cs;..\..\VesperPanel.cs;..\..\VesperMenuTheme.cs;..\..\VesperWindowChrome.cs;..\..\NativeHostRegistration.cs;..\Shared\WindowsObjectNames.cs;..\Shared\SetupExitProtocol.cs" Link="%(Filename)%(Extension)" />
     <EmbeddedResource Include="Art\**\*.png" />
     <EmbeddedResource Include="..\..\extension\icons\vesper-companion-atlas.png" LogicalName="Vesper.Setup.Art.atlas.png" />
     <EmbeddedResource Include="..\..\Assets\VESPER-Illustrated.ico" LogicalName="Vesper.Setup.App.ico" />
