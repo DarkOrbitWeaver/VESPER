@@ -8,6 +8,8 @@ The standalone First Flight Studio timeline or manifest was not present with the
 
 2026-11-18 at ae9b091 (Windows build 26200): 10 First Flight UI tests passed with the visible capture option enabled. Light and dark captures show the intro, publisher reveal, and completion with Open VESPER available during the intro. This run used an injected install operation. Packaged install, cancellation, live reduced motion and mixed DPI remain in the manual check below.
 
+2026-11-20, preview `1.0.2-firstflight.8` at `3da0d28`: the packaged app and native helper passed abrupt HTTP interruption and restart in a disposable Windows account. One run resumed at the saved offset, published a byte-exact file and rejected duplicate submission. A second run preserved saved bytes and refused publication after the server changed its ETag. The .8 setup assembly used its embedded payload and real per-user Windows registration to pass clean install, .7-to-.8 running-app upgrade, rollback after registration, repair and both uninstall modes in isolated folders. The First Flight window and real power-loss cases are still open. Local scripts and logs are under `release/audit-evidence/packaged-http-recovery` and `release/audit-evidence/packaged-setup-transaction`.
+
 - [ ] `dotnet restore` + Release build on Windows 11 with .NET 10.
 - [ ] Form has real Windows caption, usable minimize/maximize/resize, no custom titlebar.
 - [ ] Default v8.3 clean light surface shows list; footer always 30 logical pixels.
