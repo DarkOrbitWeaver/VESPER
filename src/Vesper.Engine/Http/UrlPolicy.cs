@@ -58,7 +58,7 @@ public static class UrlPolicy
     {
         if (allowPrivate) return;
         string host = uri.DnsSafeHost;
-        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase))
+        if (Vesper.Shared.NetworkAddressPolicy.IsBlockedLocalHostName(host))
             throw new BlockedAddressException(host);
         if (IPAddress.TryParse(host, out IPAddress? literal) && !IsPublicAddress(literal))
             throw new BlockedAddressException(host);
