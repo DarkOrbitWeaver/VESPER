@@ -259,6 +259,44 @@ public sealed class DownloadGridTests
         Assert.False(grid.Reveal(Guid.NewGuid()));
     }
 
+    // A wheel step must not leave the scrolled copy of the header waiting for a queued repaint:
+    // the grid repaints before the message returns, so no update region is left behind.
+    [Fact]
+    public void A_wheel_step_scrolls_and_repaints_before_the_message_returns()
+    {
+        RunOnSta(() =>
+        {
+            using var form = new Form { ClientSize = new Size(640, 320), StartPosition = FormStartPosition.Manual,
+                Location = new Point(-2000, -2000), ShowInTaskbar = false };
+            using var grid = new DownloadGrid { Dock = DockStyle.Fill };
+            form.Controls.Add(grid);
+            var items = new List<DownloadItem>();
+            for (int i = 0; i < 200; i++)
+                items.Add(DownloadItem.From(new Vesper.Engine.JobSnapshot { FileName = $"file-{i}.bin" }));
+            grid.SetItems(items);
+            form.Show();
+            Application.DoEvents();
+
+            const int WM_MOUSEWHEEL = 0x020A;
+            IntPtr oneNotchDown = unchecked((IntPtr)(int)0xFF880000); // wheel delta -120 in the high word
+            SendMessage(grid.Handle, WM_MOUSEWHEEL, oneNotchDown, IntPtr.Zero);
+
+            Assert.True(DownloadGrid.IsScrollMessage(WM_MOUSEWHEEL));
+            Assert.True(grid.AutoScrollPosition.Y < 0);
+            Assert.True(IsWindowVisible(grid.Handle));
+            Assert.False(GetUpdateRect(grid.Handle, IntPtr.Zero, false));
+        });
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetUpdateRect(IntPtr handle, IntPtr rect, bool erase);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr handle);
+
     [Fact]
     public void Keyboard_focus_stays_with_the_same_download_when_rows_reorder()
     {

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using Vesper.Engine;
@@ -129,7 +130,7 @@ public sealed class DownloadGrid : ScrollableControl
         if (index < 0) return false;
 
         _focusRow = index;
-        AutoScrollPosition = new Point(0, index * _rowHeight);
+        ScrollToOffset(index * _rowHeight);
         Focus();
         Invalidate();
         return true;
@@ -240,16 +241,71 @@ public sealed class DownloadGrid : ScrollableControl
         if (AutoScrollPosition.Y != before) { Invalidate(); LoadVisiblePosters(); }
     }
 
-    // ScrollableControl scrolls by blitting the client pixels (ScrollWindowEx) and invalidating only the newly
-    // exposed strip. That moves the fixed header into the body and rows under the header, and OnPaint only
-    // repaints the strip, so the stale copies stay on screen: the "duplicate Name/Activity/Transfer/Size"
-    // artifacts. After any scroll message the whole client area is repainted from the back buffer.
-    private const int WM_HSCROLL = 0x0114, WM_VSCROLL = 0x0115, WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
+    // ScrollableControl scrolls by copying the pixels already on screen (ScrollWindowEx) and only then asks
+    // for a repaint. The copy is visible at once: it moves the fixed header into the body and rows under the
+    // header. The repaint that fixes it is a queued WM_PAINT, which waits behind every posted progress update,
+    // so one stepped wheel notch (a 120 px jump) left a second Name/Activity/Transfer/Size header on screen
+    // until the queue drained. Redraw is switched off while the base class moves the scroll position, so
+    // nothing is copied, and the client area and scrollbar are then painted once, immediately.
+    private const int WM_SETREDRAW = 0x000B, WM_HSCROLL = 0x0114, WM_VSCROLL = 0x0115,
+        WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
+    private const uint RDW_INVALIDATE = 0x0001, RDW_UPDATENOW = 0x0100, RDW_FRAME = 0x0400;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool RedrawWindow(IntPtr handle, IntPtr updateRect, IntPtr updateRegion, uint flags);
+
+    internal static bool IsScrollMessage(int message) =>
+        message is WM_HSCROLL or WM_VSCROLL or WM_MOUSEWHEEL or WM_MOUSEHWHEEL;
 
     protected override void WndProc(ref Message m)
     {
-        base.WndProc(ref m);
-        if (m.Msg is WM_HSCROLL or WM_VSCROLL or WM_MOUSEWHEEL or WM_MOUSEHWHEEL) Invalidate();
+        if (!IsScrollMessage(m.Msg) || !IsHandleCreated || !Visible)
+        {
+            base.WndProc(ref m);
+            return;
+        }
+
+        bool quiet = BeginQuietScroll();
+        try
+        {
+            base.WndProc(ref m);
+        }
+        finally
+        {
+            EndQuietScroll(quiet);
+        }
+    }
+
+    private bool BeginQuietScroll()
+    {
+        if (!IsHandleCreated || !Visible) return false;
+        SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
+        return true;
+    }
+
+    private void EndQuietScroll(bool quiet)
+    {
+        if (!quiet || !IsHandleCreated) return;
+        SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
+        // RDW_FRAME repaints the scrollbar too: its thumb moved while redraw was off.
+        RedrawWindow(Handle, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    }
+
+    // Keyboard navigation and "show this row" move the scroll position through the same pixel-copying path.
+    private void ScrollToOffset(int y)
+    {
+        bool quiet = BeginQuietScroll();
+        try
+        {
+            AutoScrollPosition = new Point(0, y);
+        }
+        finally
+        {
+            EndQuietScroll(quiet);
+        }
     }
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -804,9 +860,9 @@ public sealed class DownloadGrid : ScrollableControl
             {
                 int desired = _focusRow * _rowHeight;
                 int scroll = -AutoScrollPosition.Y;
-                if (desired < scroll) AutoScrollPosition = new Point(0, desired);
+                if (desired < scroll) ScrollToOffset(desired);
                 else if (desired + _rowHeight > scroll + ClientSize.Height - _headerHeight)
-                    AutoScrollPosition = new Point(0, desired + _rowHeight - (ClientSize.Height - _headerHeight));
+                    ScrollToOffset(desired + _rowHeight - (ClientSize.Height - _headerHeight));
                 if (scroll == -AutoScrollPosition.Y)
                 {
                     Invalidate(RowRectangle(old));
