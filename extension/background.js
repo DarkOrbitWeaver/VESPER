@@ -481,7 +481,8 @@ async function pruneObservedSources() {
 }
 
 function rememberMediaOptions(key, tab, reply) {
-  if (!reply?.ok || (!reply.data?.choices?.length && !reply.data?.sourceChoices?.length)) return;
+  // Source choices are single-use. A new picker request needs fresh tokens.
+  if (!reply?.ok || !reply.data?.choices?.length) return;
   while (mediaPrefetchCache.size >= MEDIA_PREFETCH_LIMIT)
     mediaPrefetchCache.delete(mediaPrefetchCache.keys().next().value);
   mediaPrefetchCache.set(key, { tab, reply, expires: Date.now() + MEDIA_PREFETCH_TTL });
@@ -572,14 +573,13 @@ async function addSource(tabId, source) {
 }
 
 function sourceLabel(source, index) {
-  const url = new URL(source.url);
-  const label = source.kind === 'direct' ? `${typeName(source.mime)} stream ${index + 1}`
-    : `${source.kind.toUpperCase()} stream ${index + 1}`;
+  const media = source.kind === 'direct' && source.mime.startsWith('audio/') ? 'Audio' : 'Video';
+  const format = source.kind === 'direct' ? typeName(source.mime) : source.kind.toUpperCase();
   const size = Number.isSafeInteger(source.bytes) && source.bytes >= 524288 ? mb(source.bytes) : '';
   return {
     token: source.token,
-    label,
-    detail: [url.hostname, size].filter(Boolean).join(' · ')
+    label: `${media} source ${index + 1}`,
+    detail: size ? `${format} · ${size}` : format
   };
 }
 
@@ -720,12 +720,6 @@ async function playerOptions(message, sender) {
         return { ok: true, data: { prefetchSkipped: true } };
       mediaPrefetchAt.set(tab, now);
     }
-    if (route !== 'chrome' && possibleSources.length > 0) {
-      const sources = possibleSources.sort((a, b) => b.seen - a.seen);
-      const sourceChoices = rememberSourceSelections(sources, { identity, tab, frame, documentId: sender.documentId,
-        generation: message.generation, playerUrl: source?.href || message.playerUrl, title: binding ? message.title : undefined });
-      return { ok: true, data: { title: binding ? message.title : undefined, sourceChoices } };
-    }
     const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
       .filter(Boolean).map(candidate);
     const wholeRepresentation = source && matching?.kind === 'direct' && matching.wholeRepresentation && /^(?:audio|video)\//.test(matching.mime)
@@ -733,9 +727,26 @@ async function playerOptions(message, sender) {
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
-      const reply = await nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender, { userGesture: !prefetch }), url: page.href, pageTitle: title,
-        candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
-      if (reply.ok || !wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
+      // A single-video page can give the resolver a better identity than nearby network traffic.
+      const singleVideo = binding && identity && (identity.startsWith('tiktok:')
+        || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
+      if (possibleSources.length === 0 || singleVideo) {
+        const reply = await nativeRequest(envelope('media-options', {
+          ...await mediaAuthorization(page.href, sender, { userGesture: !prefetch }),
+          url: page.href, pageTitle: title, candidates: !youTube || candidates.length ? candidates : undefined
+        }), 60000);
+        if (possibleSources.length === 0) {
+          if (reply.ok || !wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
+        } else if (reply.ok || !['browser-context', 'sign-in', 'no-media', 'unavailable', 'source-expired'].includes(reply.code)) {
+          return reply;
+        }
+      }
+      if (possibleSources.length > 0) {
+        const sources = possibleSources.sort((a, b) => b.seen - a.seen);
+        const sourceChoices = rememberSourceSelections(sources, { identity, tab, frame, documentId: sender.documentId,
+          generation: message.generation, playerUrl: message.playerUrl, title: binding ? message.title : undefined });
+        return { ok: true, data: { title: binding ? message.title : undefined, sourceChoices } };
+      }
     }
     if (!wholeRepresentation) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
     await browserChoicesReady;
@@ -791,7 +802,8 @@ async function selectMediaSource(message, sender) {
   sourceSelections.delete(token);
   const state = await tabState(selection.tab);
   const evidence = state.sources.find(source => source.url === selection.url && source.documentId === selection.documentId
-    && (source.frameId ?? 0) === selection.frame && source.seen === selection.seen);
+    && (source.frameId ?? 0) === selection.frame && source.seen >= selection.seen && source.kind === selection.kind
+    && (source.kind !== 'direct' || isWholeDirectSource(source)));
   if (!evidence || evidence.seen < Date.now() - 120_000 || evidence.seen > Date.now() + 1000)
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   const { route } = await settings();

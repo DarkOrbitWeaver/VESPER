@@ -2,6 +2,32 @@
 
 This document holds only systems that need a product or architecture decision from the owner. Their approved requirements remain open until the accepted design is implemented and verified.
 
+## Browser media identity and format choices
+
+**Workstream and scope:** Browser player detection, media discovery, and the shared desktop and extension picker.
+
+**Requirements and sources:** VES-024, VES-037, VES-062, USER-INSTAGRAM, USER-UI-CHROME, AUDIT-EXTRA-021. The owner's 2026-11-20 screenshots show a missing butterfly after entering Reels, many numbered MP4 sources for one Reel, and a failed choice for TikTok video 7688010685061664021. The TikTok tab separately showed HTTP 403 on refresh.
+
+**Expected workflow:** Opening the butterfly on the current video shows real choices such as Best quality, Smallest and Audio only when supported. A scroll, in-page navigation, pause, temporary preview, ad, or iframe should never cause a download of a different video.
+
+**Current behavior:** `extension/content.js` selects visible video elements and binds activations to a page and player generation. `extension/background.js` observes media responses and asks the native resolver for options. Only fallback sources are numbered. `BrowserMediaOptions.cs` and the shared media planner already supply validated choices. The extension fixtures cover page binding, late responses, partial ranges and carousel alternatives.
+
+**What is missing:** Timing, frame and MIME type alone do not prove that a request belongs to a particular blob or Media Source player, that two CDN URLs represent the same version, or that a response includes audio. A working page can therefore produce a long fallback list or an option that expires before selection. A signed-in browser and desktop probe can also receive different server responses.
+
+**Why owner design is required:** A common browser-to-desktop evidence model is needed to match observed responses to individual players, group representations and choose when a provider adapter is necessary. Provider-specific sleeps, CDN guesses, and size-based ranking would leave the same failure unresolved.
+
+**Quality requirements:** Bound lookup latency, memory, requests, and concurrent probes. Keep idle work low. Maintain truthful format labels, player identity through scroll and navigation, and explicit uncertainty when a source cannot be verified.
+
+**Constraints:** Keep Chrome MV3, the custom C# engine, existing permissions and credential scope, the butterfly and desktop workflow, and Chrome's ownership of its downloads. Preserve signed URLs only for their bounded lifetimes and keep secrets out of logs and storage. Respect DRM and site access refusals.
+
+**Design questions:** What evidence binds a player to its asset across preloading, ads, adaptive tracks, and frame changes? How do desktop and browser share verified choices and refresh an expired URL safely? Which common checks replace site-specific rules, and which cases still require provider adapters?
+
+**Integration and acceptance:** Test public and authorized TikTok/Instagram videos and carousels, YouTube previews, and a generic HLS/DASH/direct-video corpus in disposable Chrome. Verify the selected item, advertised quality and tracks, playable output, ambiguity and server refusal, and bounded latency and resource use. Include cases where the visible video changes during a lookup.
+
+**Dependencies and independent work:** The design blocks robust automatic identification and grouping of ambiguous network sources. Known navigation, retry and error handling fixes, current Chrome/native verification, desktop workflows and installer checks can proceed independently.
+
+**Status:** OWNER DESIGN REQUIRED
+
 ## Media processing performance and architecture
 
 **Affected workstream:** media conversion, remux and merge, output validation, memory and disk use, and performance measurement.

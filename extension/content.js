@@ -76,8 +76,8 @@
     if (panelMedia || receiptTimer) closePanel();
     if (video && !video.isConnected) detach();
   }
-  window.navigation?.addEventListener('currententrychange', syncPage, { signal });
-  window.addEventListener('popstate', syncPage, { signal });
+  window.navigation?.addEventListener('currententrychange', refreshPlayers, { signal });
+  window.addEventListener('popstate', refreshPlayers, { signal });
 
   function playerSource(player) {
     return player.currentSrc || player.src || '';
@@ -162,7 +162,7 @@
     return preview?.player === player && activatePreview(preview);
   }
 
-  function handlePlayerPlaying(el) {
+  function refreshPlayer(el) {
     if (!observed.has(el)) return;
     refreshHoveredPreview(el);
     selectPlayer();
@@ -218,6 +218,13 @@
     }
   }
 
+  function refreshPlayers() {
+    if (!alive()) return;
+    syncPage();
+    document.querySelectorAll('video').forEach(consider);
+    selectPlayer();
+  }
+
   function prefetchPlayer(el) {
     if (!alive() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
         || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
@@ -244,7 +251,7 @@
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
   for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
     consider(e.target);
-    if (type === 'playing') handlePlayerPlaying(e.target);
+    refreshPlayer(e.target);
     if (e.target === video) prefetchPlayer(e.target);
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
@@ -940,7 +947,7 @@
       option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds); };
       list.append(option);
     }
-    renderShell(title, poster, seconds, element('div', 'msg', 'Choose the stream to inspect.'), list);
+    renderShell(title, poster, seconds, element('div', 'msg', 'Check a source to see its download options.'), list);
   }
 
   async function inspectSource(token, title, poster, seconds) {
@@ -958,8 +965,10 @@
       return renderChoices(formats.title || title, formats.thumbnail || poster,
         formats.duration ?? seconds, formats);
     }
-    const message = errorMessage(result);
-    appendRetry(message, loadFormats);
+    const message = result?.code === 'unavailable'
+      ? element('div', 'msg bad', 'This source couldn’t be opened.')
+      : errorMessage(result);
+    appendRetry(message, loadFormats, result?.data?.retryAt, 'Back to sources');
     renderShell(title, poster, seconds, message);
   }
 
@@ -1003,8 +1012,8 @@
     place();
   }
 
-  function appendRetry(message, action, when) {
-    const retry = element('button', 'link', 'Try again');
+  function appendRetry(message, action, when, label = 'Try again') {
+    const retry = element('button', 'link', label);
     retry.onclick = action;
     const retryAt = Date.parse(when);
     if (retryAt > Date.now()) {
@@ -1070,10 +1079,10 @@
     return false;
   });
   window.addEventListener('pagehide', e => { if (e.persisted) companion?.setVisible(false); else retire(); }, { signal });
-  window.addEventListener('pageshow', selectPlayer, { signal });
+  window.addEventListener('pageshow', refreshPlayers, { signal });
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;
     applyMotion();
   });
-  document.querySelectorAll('video').forEach(consider);
+  refreshPlayers();
 })();
