@@ -81,7 +81,10 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 string reasonCode = sessionKeys.Any(HlsParser.IsDrmSessionKey) ? "drm" : "unsupported";
                 return RunOutcome.NeedsAttention(reasonCode, "Master session keys are not supported.");
             }
-            IReadOnlyList<HlsVariant> usable = [.. HlsParser.ParseMaster(text, baseUri).Where(v => !v.NeedsSeparateAudio)];
+            IReadOnlyList<HlsVariant> listed = HlsParser.ParseMaster(text, baseUri);
+            if (listed.Count == 0)
+                return RunOutcome.NeedsAttention("unsupported", "The playlist lists no quality with a usable address.");
+            IReadOnlyList<HlsVariant> usable = [.. listed.Where(v => !v.NeedsSeparateAudio)];
             if (usable.Count == 0)
                 return RunOutcome.NeedsAttention("separate-audio", "Every quality keeps audio separate; VESPER does not include a verified muxer for this combination.");
             HlsVariant best = usable.OrderByDescending(v => v.Bandwidth).First();
@@ -996,7 +999,10 @@ public sealed partial class DownloadEngine
                 if (!HlsParser.IsPlaylist(text)) return new MediaProbeResult("unsupported", "That address is not a playlist VESPER understands.", type, null, null, []);
                 if (HlsParser.IsMaster(text))
                 {
-                    var variants = HlsParser.ParseMaster(text, uri).Where(v => !v.NeedsSeparateAudio)
+                    IReadOnlyList<HlsVariant> listed = HlsParser.ParseMaster(text, uri);
+                    if (listed.Count == 0)
+                        return new MediaProbeResult("unsupported", "The playlist lists no quality with a usable address.", type, null, null, []);
+                    var variants = listed.Where(v => !v.NeedsSeparateAudio)
                         .Select(v => new MediaVariant(v.Uri, v.Bandwidth, v.Width, v.Height, v.AudioOnly, v.Codecs)).ToList();
                     return variants.Count == 0
                         ? new MediaProbeResult("unsupported", "Every quality keeps its audio in a separate track, which VESPER cannot join.", type, null, null, [])

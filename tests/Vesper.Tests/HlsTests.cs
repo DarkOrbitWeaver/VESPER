@@ -590,6 +590,25 @@ public class HlsTests
     }
 
     [Fact]
+    public async Task Master_playlist_without_a_usable_address_says_so()
+    {
+        // The only quality has an address that cannot be resolved. This used to end as "Unexpected error: Invalid URI".
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string path = "/hls/no-usable-address/index.m3u8";
+        server.HlsPlaylists[path] = string.Join('\n', "#EXTM3U",
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000000", "https://[broken/variant.m3u8", "");
+        using var h = new Harness();
+
+        JobSnapshot stopped = await h.WaitAsync(AddHls(h, server, path), state => state.State == JobState.NeedsAttention);
+        MediaProbeResult probe = await h.Engine.ProbeMediaAsync(server.Url(path));
+
+        Assert.Equal("unsupported", stopped.Reason);
+        Assert.Equal("The playlist lists no quality with a usable address.", stopped.Message);
+        Assert.Equal("unsupported", probe.Kind);
+        Assert.Equal("The playlist lists no quality with a usable address.", probe.Message);
+    }
+
+    [Fact]
     public async Task Invalid_hls_key_uri_is_rejected_before_any_media_request()
     {
         await using var server = new FaultServer(); await server.StartAsync();

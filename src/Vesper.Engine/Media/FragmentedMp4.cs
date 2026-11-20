@@ -81,7 +81,10 @@ internal sealed class FragmentedMp4
             var minf = One(md, "minf"); var stbl = One(Boxes(data, minf.Payload, minf.End), "stbl");
             var st = Boxes(data, stbl.Payload, stbl.End); var stsd = One(st, "stsd"); Need(stsd, 8);
             if (U32(data, stsd.Payload) != 0 || U32(data, stsd.Payload + 4) != 1) throw Bad("Exactly one clear sample description is required.");
-            var entry = Boxes(data, stsd.Payload + 8, stsd.End).SingleOrDefault();
+            // The entry count above is only a field; a damaged size can still split the payload into several boxes.
+            var entries = Boxes(data, stsd.Payload + 8, stsd.End);
+            if (entries.Count != 1) throw Bad("Exactly one clear sample description is required.");
+            var entry = entries[0];
             int prefix; string config;
             switch (entry.Type)
             {
