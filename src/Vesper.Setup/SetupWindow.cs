@@ -93,14 +93,7 @@ internal sealed class SetupWindow : Form
         _cancellation = cancellation;
         _view = View.Working;
         _progress = new(_mode == SetupMode.Uninstall ? "Preparing to remove VESPER…" : "Preparing VESPER…");
-        if (_mode == SetupMode.Install && animate)
-        {
-            _canvas.StartIntro(holdForSetup: true);
-            _canvas.SetHoldMessage(_progress.Activity);
-        }
         RefreshControls();
-        if (_canvas.Playing) _skip.Focus();
-        else _cancel.Focus();
 
         var progress = new Progress<InstallProgress>(update =>
         {
@@ -109,17 +102,33 @@ internal sealed class SetupWindow : Form
             if (_canvas.Playing) _canvas.SetHoldMessage(HoldText(update));
             else RefreshControls();
         });
+        Task? setup = null;
         try
         {
             bool deleteUserData = _mode == SetupMode.Uninstall && _deleteUserData.Checked;
-            await Task.Run(() => _work(progress, cancellation.Token, deleteUserData));
+            setup = Task.Run(() => _work(progress, cancellation.Token, deleteUserData));
+            if (_mode == SetupMode.Install && animate && _canvas.TryStartIntro(holdForSetup: true))
+                _canvas.SetHoldMessage(HoldText(_progress));
+
+            RefreshControls();
+            if (_canvas.Playing) _skip.Focus();
+            else _cancel.Focus();
+            await setup;
             _view = View.Complete;
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { _view = View.Cancelled; }
         catch (Exception ex)
         {
+            Exception failure = ex;
+            if (setup is not null)
+            {
+                if (!setup.IsCompleted) cancellation.Cancel();
+                try { await setup; }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+                catch (Exception setupError) { failure = setupError; }
+            }
             _view = View.Failed;
-            _error = ex.Message;
+            _error = failure.Message;
         }
         finally
         {
@@ -180,7 +189,7 @@ internal sealed class SetupWindow : Form
             View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and podcast subscriptions will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
             View.Complete when _mode != SetupMode.Uninstall =>
-                "Native host files and browser registration were installed. Setup has not verified that the extension can connect to VESPER.",
+                "Open VESPER to get started. Enable the extension in Chrome to send downloads.",
             View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
                 "Settings, download history, and podcast subscriptions were deleted. Downloaded files were kept.",
             View.Complete => "Your downloads, settings, download history, and podcast subscriptions were kept.",

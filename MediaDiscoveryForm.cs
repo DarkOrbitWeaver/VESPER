@@ -162,12 +162,20 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         };
         _quality.ApplyPalette(_colors);
         _quality.SetItems("Best", "Balanced", "Smallest", "Audio only");
-        _outputChoice = new VesperChoice { AccessibleName = "Output format preference" };
+        _outputChoice = new VesperChoice
+        {
+            AccessibleName = "Video output format",
+            AccessibleDescription = "MP4 makes a compatible copy when needed. Original format keeps the selected source format where supported."
+        };
         _outputChoice.ApplyPalette(_colors);
-        _outputChoice.SetItems("Plays everywhere (MP4)", "Original (best quality)");
-        _audioOutputChoice = new VesperChoice { AccessibleName = "Audio output format" };
+        _outputChoice.SetItems("MP4 (compatible)", "Original format");
+        _audioOutputChoice = new VesperChoice
+        {
+            AccessibleName = "Audio output format",
+            AccessibleDescription = "M4A makes a compatible copy when needed. Original audio keeps the selected source format where supported."
+        };
         _audioOutputChoice.ApplyPalette(_colors);
-        _audioOutputChoice.SetItems("M4A — plays everywhere", "Original audio");
+        _audioOutputChoice.SetItems("M4A (compatible)", "Original audio");
         _audioTrack = new VesperChoice { AccessibleName = "Audio track" };
         _audioTrack.ApplyPalette(_colors);
         _audioTrack.SelectedIndexChanged += (_, _) =>
@@ -310,6 +318,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         };
 
         _collectionButton = B("Browse playlist", 152, VesperIcon.Queue);
+        _collectionButton.AccessibleName = "Browse playlist items";
         _collectionButton.Click += async (_, _) => await LoadCollectionAsync();
         _canvas.Controls.Add(_collectionButton);
 
@@ -340,7 +349,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _cancel.DialogResult = DialogResult.Cancel;
         _queue = B("Add to queue", 122, VesperIcon.Queue);
         _download = B("Download", 130, VesperIcon.Download, primary: true);
-        _retry = B("Try again", 122, VesperIcon.Refresh);
+        _retry = B("Check again", 122, VesperIcon.Refresh);
+        _retry.AccessibleName = "Check available media again";
         _queue.Click += async (_, _) => await MakeSelectionsAsync(queueOnly: true);
         _download.Click += async (_, _) => await MakeSelectionsAsync(queueOnly: false);
         _retry.Click += async (_, _) => await DiscoverAsync();
@@ -680,7 +690,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             {
                 string message = result.Error?.UserMessage ?? "No downloadable media was found.";
                 string hint = result.Error?.BrowserMayHelp == true
-                    ? "The browser butterfly may find a stream if it is available in the player."
+                    ? "Open the page in your browser and check the VESPER picker while the media is playing."
                     : "This page may not expose a downloadable or supported stream.";
                 ShowUnavailable(message, hint);
 
@@ -690,7 +700,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         catch (Exception) when (!_lifetime.IsCancellationRequested)
         {
             if (!IsDisposed) ShowUnavailable("This media source could not be inspected.",
-                "Check your connection or try browser-assisted discovery.");
+                "Check your connection, then check again or use the VESPER browser picker.");
         }
         finally { if (!IsDisposed) SetBusy(false); }
     }
@@ -718,7 +728,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _notice.Text = hint;
         if (_item is null && !_hasMetadata)
         {
-            _title.Text = "Playback discovery unavailable";
+            _title.Text = "Could not check this page";
             _source.Text = _url.Host;
         }
         Render(ViewState.Unavailable);
@@ -846,7 +856,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         MediaDownloadChoice? sourceAudio = Prepare(_item, FormatPreferences.AudioOnly).Choice;
         var audioOutputs = new List<(MediaOutputPreference Output, string Label)>();
         if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice is { DisplayContainer: "M4A" })
-            audioOutputs.Add((MediaOutputPreference.M4a, "M4A — plays everywhere"));
+            audioOutputs.Add((MediaOutputPreference.M4a, "M4A (compatible)"));
         audioOutputs.Add((MediaOutputPreference.Original, "Original audio"));
         if (Prepare(_item, FormatPreferences.AudioOnly, output: MediaOutputPreference.Opus).Choice is not null)
             audioOutputs.Add((MediaOutputPreference.Opus, "Opus — copied, no re-encoding"));
@@ -961,7 +971,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             {
                 result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
                 if (result.Choice is null) clipError = result.Error ?? "This time range isn't available for the source.";
-                else clipText = ClipSelection.Summary(start, end, _item.Duration!.Value.TotalSeconds) + ". " + ClipSelection.Notice(mode);
+                else clipText = ClipRangeSummary(start, end, _item.Duration!.Value.TotalSeconds) + ". " + ClipSelection.Notice(mode);
             }
             if (clipError.Length > 0) clipText = clipError;
         }
@@ -1209,6 +1219,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private async Task LoadCollectionAsync()
     {
         if (_item?.Related is not { } hint) return;
+        _collectionButton.Text = "Reading…";
+        _collectionButton.Symbol = VesperIcon.Refresh;
         SetBusy(true, "Reading available playlist entries…");
         try
         {
@@ -1217,8 +1229,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             if (!IsDisposed && result.Collection is { } collection) await DisplayCollectionAsync(collection);
             else if (!IsDisposed)
             {
-                _status.Text = "This collection couldn't be listed.";
-                _notice.Text = result.Error?.UserMessage ?? "Try another supported collection.";
+                _status.Text = "Couldn't list these items.";
+                _notice.Text = result.Error?.UserMessage ?? "Check again or open the original page.";
+                SetCollectionRetryLabel();
             }
         }
         catch (OperationCanceledException) { }
@@ -1226,11 +1239,19 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         {
             if (!IsDisposed)
             {
-                _status.Text = "Playlist discovery failed.";
-                _notice.Text = "The original video remains available; try another source.";
+                _status.Text = "Couldn't read these items.";
+                _notice.Text = "Check your connection, then try listing them again.";
+                SetCollectionRetryLabel();
             }
         }
         finally { if (!IsDisposed) SetBusy(false); }
+    }
+
+    private void SetCollectionRetryLabel()
+    {
+        _collectionButton.Text = "Try again";
+        _collectionButton.Symbol = VesperIcon.Refresh;
+        _collectionButton.AccessibleName = "Try listing these items again";
     }
 
     private Task DisplayCollectionAsync(MediaCollection collection)
@@ -1419,6 +1440,10 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     internal static string ClipBehaviorNotice(MediaOutput output, JobKind kind) =>
         ClipSelection.Notice(ClipSelection.ModeFor(output, kind));
+
+    internal static string ClipRangeSummary(double start, double end, double duration) =>
+        $"{ClipSelection.TimeText(start)} to {ClipSelection.TimeText(end)} selected " +
+        $"({ClipSelection.TimeText(end - start)} of {ClipSelection.TimeText(duration)})";
 
     private static string Limit(string text, int length) => text.Length > length ? text[..(length - 1)] + "…" : text;
 

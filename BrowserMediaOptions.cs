@@ -10,7 +10,7 @@ internal sealed partial class BrowserBridgeHandler
 {
     private sealed record ChoiceRecipe(FormatPreferences Preferences, MediaRepresentation? Exact, MediaOutputPreference Output);
     private sealed record MediaSession(DateTimeOffset Expires, MediaDownloadChoice[] Choices, MediaItem Item, ChoiceRecipe[] Recipes);
-    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container, bool CanClip);
+    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container, bool CanClip, bool ClipUsesWholeFile);
     private readonly Dictionary<Guid, MediaSession> _mediaSessions = [];
     private readonly object _mediaSessionsLock = new();
 
@@ -120,7 +120,9 @@ internal sealed partial class BrowserBridgeHandler
                 jobs.Add(job);
                 recipes.Add(recipe ?? new ChoiceRecipe(FormatPreferences.BestQuality, null, MediaOutputPreference.Original));
             }
-            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer, SupportsSegmentClip(job));
+            var clipMode = ClipSelection.ModeFor(job);
+            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer,
+                clipMode != ClipMode.None, clipMode == ClipMode.FullFile);
         }
         void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
         {
@@ -155,7 +157,7 @@ internal sealed partial class BrowserBridgeHandler
             if (planned is null || output == MediaOutputPreference.M4a && planned.DisplayContainer != "M4A") return;
             if (OptionFor(planned, "Audio only") is { } option) audioOutputs.Add(new { label, choice = option });
         }
-        AudioOutput(MediaOutputPreference.M4a, "M4A — plays everywhere");
+        AudioOutput(MediaOutputPreference.M4a, "M4A (compatible)");
         AudioOutput(MediaOutputPreference.Original, "Original audio");
         AudioOutput(MediaOutputPreference.Opus, "Opus — copied, no re-encoding");
         AudioOutput(MediaOutputPreference.Wav, "WAV — decoded PCM");

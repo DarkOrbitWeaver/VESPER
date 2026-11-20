@@ -82,7 +82,7 @@ public sealed class SettingsAccessibilityTests
             form.StartPosition = FormStartPosition.Manual;
             form.Location = new Point(-form.Width - 80, -form.Height - 80);
             form.Show();
-            form.ClientSize = new Size(700, 560);
+            form.ClientSize = new Size(UiKit.Scale(form, 700), UiKit.Scale(form, 560));
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -105,7 +105,7 @@ public sealed class SettingsAccessibilityTests
             form.StartPosition = FormStartPosition.Manual;
             form.Location = new Point(-form.Width - 80, -form.Height - 80);
             form.Show();
-            form.ClientSize = new Size(700, 560);
+            form.ClientSize = new Size(UiKit.Scale(form, 700), UiKit.Scale(form, 560));
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;

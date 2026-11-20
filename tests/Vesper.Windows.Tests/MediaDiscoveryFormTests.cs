@@ -71,6 +71,31 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Fact]
+    public void ClipSummaryShowsBothSelectedBoundaries()
+    {
+        Assert.Equal("00:00:10 to 00:00:20 selected (00:00:10 of 00:03:00)",
+            MediaDiscoveryForm.ClipRangeSummary(10, 20, 180));
+    }
+
+    [Fact]
+    public void OutputChoicesUseAccurateCompatibleAndOriginalLabels()
+    {
+        OnSta(() =>
+        {
+            using var form = new MediaDiscoveryForm(new VesperPreferences(), new Uri("https://example.test/watch"));
+            const System.Reflection.BindingFlags members =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var video = (VesperChoice)typeof(MediaDiscoveryForm).GetField("_outputChoice", members)!.GetValue(form)!;
+            var audio = (VesperChoice)typeof(MediaDiscoveryForm).GetField("_audioOutputChoice", members)!.GetValue(form)!;
+
+            Assert.Equal("MP4 (compatible)", video.SelectedText);
+            Assert.Contains("Original format", video.AccessibleDescription);
+            Assert.Equal("M4A (compatible)", audio.SelectedText);
+            Assert.Contains("Original audio", audio.AccessibleDescription);
+        });
+    }
+
+    [Fact]
     public void TimeRangeKeepsTheExactEndAndBlocksAnIncompatibleFormat()
     {
         OnSta(() =>

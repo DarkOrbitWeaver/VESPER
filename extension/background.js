@@ -674,6 +674,7 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route].join('|');
+  if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = cachedMediaOptions(lookupKey);
   if (cached) return cached;
   const prefetch = message.prefetch === true;
@@ -1006,8 +1007,10 @@ function contextPageUrl(info, tab) {
 
 function linkedMediaPage(value) {
   const page = VesperPlayerSource.http(value);
-  if (!page || !isYouTubePage(page)) return null;
-  if (VesperPlayerSource.identity(page.href) !== page.href) return page.href;
+  if (!page) return null;
+  const identity = VesperPlayerSource.identity(page.href);
+  if (/^(youtube|instagram|tiktok):/.test(identity)) return page.href;
+  if (!isYouTubePage(page)) return null;
   if (['/playlist', '/watch'].includes(page.pathname)
       && /^[\w-]{2,128}$/.test(page.searchParams.get('list') || '')) return page.href;
   return null;
@@ -1019,7 +1022,7 @@ async function openContextMedia(pageUrl, info, tab) {
       frameId: info.frameId ?? 0 }, { userGesture: true }),
     url: pageUrl, pageTitle: '', candidates: []
   })) : { ok: false, message: 'This page cannot be inspected.' };
-  flash(tab?.id, reply);
+  await flash(tab?.id, reply, info.frameId);
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -1036,6 +1039,19 @@ chrome.runtime.onInstalled.addListener(async () => {
 chrome.runtime.onStartup.addListener(async () => { await updateBadge(); await recoverChromeDownloads(); });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  try { await runContextAction(info, tab); }
+  catch { await flash(tab?.id, { ok: false, message: 'VESPER could not open this item. Try again.' }, info.frameId); }
+});
+
+async function openFramePicker(info, tab, playerUrl) {
+  if (!Number.isSafeInteger(tab?.id)) return false;
+  try {
+    const opened = await chrome.tabs.sendMessage(tab.id, { type: 'vesper-open-picker', playerUrl }, { frameId: info.frameId ?? 0 });
+    return opened?.ok === true;
+  } catch { return false; }
+}
+
+async function runContextAction(info, tab) {
   await recoverChromeCaptures();
   if (info.menuItemId === 'vesper-transfers') {
     await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
@@ -1043,59 +1059,67 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
   if (info.menuItemId === 'vesper-smart') {
     try { await chrome.tabs.sendMessage(tab.id, { type: 'vesper-smart-select' }, { frameId: info.frameId ?? 0 }); }
-    catch { flash(tab?.id, { ok: false }); }
+    catch { await flash(tab?.id, { ok: false, message: 'Smart Select is unavailable on this page.' }, info.frameId); }
     return;
   }
   if (info.menuItemId === 'vesper-page-media') {
-    if (Number.isSafeInteger(tab?.id)) {
-      try {
-        const opened = await chrome.tabs.sendMessage(tab.id, { type: 'vesper-open-picker' }, { frameId: info.frameId ?? 0 });
-        if (opened?.ok) return;
-      } catch { /* Use the native page resolver when this frame has no VESPER player. */ }
-    }
+    if (await openFramePicker(info, tab)) return;
     await openContextMedia(contextPageUrl(info, tab), info, tab);
     return;
   }
   const linkAction = info.menuItemId === 'vesper-link';
+  if (!linkAction && info.menuItemId !== 'vesper-media') return;
   const url = linkAction ? info.linkUrl : info.srcUrl;
   const targetPage = linkedMediaPage(info.linkUrl);
-  if (linkAction && targetPage) {
+  if (targetPage) {
     await openContextMedia(targetPage, info, tab);
     return;
   }
-  if (info.menuItemId === 'vesper-media' && (!url || !/^https?:/i.test(url))) {
-    // The preview URL may vanish. The link Chrome captured still identifies the card.
-    await openContextMedia(targetPage || (url && contextPageUrl(info, tab)), info, tab);
+  if (!linkAction && (!url || url.startsWith('blob:'))) {
+    if (url && await openFramePicker(info, tab, url)) return;
+    await openContextMedia(contextPageUrl(info, tab), info, tab);
     return;
   }
-  if (!url || !/^https?:/i.test(url)) {
-    if (info.menuItemId === 'vesper-media') flash(tab?.id, { ok: false });
-    return;      // blob: and data: URLs cannot be fetched by another program
+  if (!VesperPlayerSource.http(url)) {
+    await flash(tab?.id, { ok: false, message: 'VESPER needs a web address for this item.' }, info.frameId);
+    return;
   }
   const prefs = await settings();
   if (prefs.route === 'chrome') {
     if (info.menuItemId !== 'vesper-link' && VesperPlayerSource.kind(url) !== 'direct') {
-      flash(tab?.id, { ok: false });
+      await flash(tab?.id, { ok: false, message: 'Chrome can only save a direct media file here.' }, info.frameId);
       return;
     }
     try {
       await chrome.downloads.download({ url, saveAs: false, conflictAction: 'uniquify' });
-      flash(tab?.id, { ok: true });
-    } catch { flash(tab?.id, { ok: false }); }
+      await flash(tab?.id, { ok: true }, info.frameId);
+    } catch { await flash(tab?.id, { ok: false, message: 'Chrome could not start the download.' }, info.frameId); }
     return;
   }
   // The frame that holds the link is the real initiator; an embedded frame can be another site than the tab.
   const { items, authorized } = await withSignIn([{ url, referer: info.frameUrl || info.pageUrl || tab?.url, userAgent: navigator.userAgent }],
     { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined });
   const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
-  flash(tab?.id, reply);
-});
+  await flash(tab?.id, reply, info.frameId);
+}
 
-function flash(tabId, reply) {
-  if (tabId === undefined) return;
-  chrome.action.setBadgeBackgroundColor({ tabId, color: reply.ok ? '#3D694B' : '#B25247' });
-  chrome.action.setBadgeText({ tabId, text: reply.ok ? '✓' : '!' });
-  setTimeout(() => chrome.action.setBadgeText({ tabId, text: '' }), 2500);
+const contextFlashes = new Map();
+async function flash(tabId, reply, frameId = 0) {
+  if (!Number.isSafeInteger(tabId)) return;
+  clearTimeout(contextFlashes.get(tabId));
+  await chrome.action.setBadgeBackgroundColor({ tabId, color: reply.ok ? '#3D694B' : '#B25247' }).catch(() => {});
+  await chrome.action.setBadgeText({ tabId, text: reply.ok ? '✓' : '!' }).catch(() => {});
+  if (!reply.ok) {
+    const message = reply.message || 'VESPER could not open this item.';
+    await chrome.action.setTitle?.({ tabId, title: message }).catch(() => {});
+    await chrome.tabs.sendMessage(tabId, { type: 'vesper-context-notice', reply: { code: reply.code, message } }, { frameId })
+      .catch(() => {});
+  } else await chrome.action.setTitle?.({ tabId, title: 'VESPER Download Manager' }).catch(() => {});
+  contextFlashes.set(tabId, setTimeout(() => {
+    contextFlashes.delete(tabId);
+    chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {});
+    chrome.action.setTitle?.({ tabId, title: 'VESPER Download Manager' }).catch(() => {});
+  }, reply.ok ? 2500 : 5000));
 }
 
 // ---------------------------------------------------------------- Chrome downloads

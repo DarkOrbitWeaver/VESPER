@@ -18,6 +18,8 @@ The social picker follow-up rechecks loaded videos on in-page Reels navigation, 
 
 Preview `1.0.2-firstflight.8` at `3da0d28` passed the Windows Release solution and the packaged HTTP interruption and setup transaction checks summarized in the Windows checklist. The packaged engine also passed ten process stops covering HLS, DASH, merge, conversion and Cancel. Next verify setup recovery across an abrupt process stop between registration and journal commit. The registered Chrome picker, the First Flight window on clean install, and power-loss evidence remain open.
 
+The straightforward fixes batch adds butterfly drag and fullscreen idle behavior, explicit right-click failure messages, fresh format retries, persistent trim choices while the picker is open, DPI-aware grid metrics, and a First Flight fallback if the intro art can't load. Its desktop, Setup, and extension suites passed 101, 56, and 154 tests respectively. Distribute First Flight as the standalone `VESPER-Setup.exe`. Use `scripts/Build-Release.ps1 -InstallerOnly` to omit the portable ZIP. Preserve the remaining design and release requirements in the existing trackers.
+
 The tracker verifier is the source for the current item count. At a work checkpoint report the commit and checkout state, evidence, open tracker IDs and gates, blockers, and next concrete action. Use disposable Windows environments, Chrome profiles, accounts, and files. Leave the owner's regular profile, production installation, registration, downloads, and original audit files alone.
 
 ## Product contracts

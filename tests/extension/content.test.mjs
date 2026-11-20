@@ -189,6 +189,53 @@ test('the context-menu picker reports when its frame has no video player', async
   assert.equal(reply.code, 'no-player');
 });
 
+test('dragging stays inside the video and fullscreen wakes again after idle', () => {
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
+  const window = new EventTarget();
+  let now = 10000, idle;
+  const context = vm.createContext({
+    window, document, URL, AbortController, location: { href: 'https://example.test/watch' },
+    Date: class extends Date { static now() { return now; } },
+    innerWidth: 800, innerHeight: 600, getComputedStyle: () => ({ visibility: 'visible' }),
+    HTMLVideoElement: class {}, HTMLIFrameElement: class {},
+    ResizeObserver: class {}, IntersectionObserver: class {},
+    setTimeout: callback => { idle = callback; return 1; }, clearTimeout() {},
+    VesperTheme: { available: () => true, watchPreference: () => () => {} },
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
+  });
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.testPlayer = {
+    startDrag, moveDrag, finishDrag, onPointer, moved: () => suppressDragClick,
+    setup: (player, action, picker, sprite) => {
+      video = player; button = action; panel = picker; companion = sprite;
+      perch = { x: 20, y: 30, faceLeft: false };
+    }
+  };\n})();`);
+  vm.runInContext(content, context);
+
+  const calls = [];
+  const classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
+  const player = { isConnected: true, getBoundingClientRect: () => ({ left: 10, top: 20, right: 490, bottom: 320 }) };
+  const button = { classList, matches: () => false, setPointerCapture() {}, getBoundingClientRect: () => ({ left: 20, top: 30 }) };
+  window.testPlayer.setup(player, button, { classList }, {
+    setPerch: (x, y) => calls.push([x, y]), setVisible: shown => calls.push(shown), pointerMove() {}
+  });
+  const down = { button: 0, isPrimary: true, pointerId: 1, clientX: 25, clientY: 35 };
+  window.testPlayer.startDrag(down);
+  window.testPlayer.moveDrag({ ...down, clientX: 700, clientY: 550 });
+  window.testPlayer.finishDrag(down);
+  assert.deepEqual(calls[0], [446, 276]);
+  assert.equal(window.testPlayer.moved(), true);
+
+  document.fullscreenElement = { contains: () => true };
+  window.testPlayer.onPointer({ target: null, clientX: 200, clientY: 190 });
+  assert.equal(calls.at(-1), true);
+  now += 3000;
+  idle();
+  assert.equal(calls.at(-1), false);
+  window.testPlayer.onPointer({ target: null, clientX: 210, clientY: 190 });
+  assert.equal(calls.at(-1), true);
+});
+
 test('Smart Select associates only one clearly labelled SHA-256 with its sole nearby file link', () => {
   const smartSelect = readFileSync(new URL('../../extension/smart-select.js', import.meta.url), 'utf8')
     .replace(/\}\)\(\);\s*$/, 'globalThis.__publisherChecksum = publisherChecksum;\n})();');

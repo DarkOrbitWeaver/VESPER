@@ -32,6 +32,7 @@ internal sealed class FirstFlightCanvas : Control
     private double _clockOffset;
     private double _lastFrame;
     private bool _holdBeforeReveal;
+    private bool _showWelcomeArt = true;
     private string _holdMessage = "";
 
     internal void SetHoldMessage(string message) => _holdMessage = message;
@@ -66,10 +67,22 @@ internal sealed class FirstFlightCanvas : Control
         Invalidate();
     }
 
-    internal void StartIntro(bool holdForSetup = false)
+    internal bool TryStartIntro(bool holdForSetup = false)
     {
         ClearArt();
-        PreloadIntroArt();
+        _showWelcomeArt = true;
+        try
+        {
+            PreloadIntroArt();
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or ExternalException or OutOfMemoryException)
+        {
+            ClearArt();
+            _showWelcomeArt = false;
+            Invalidate();
+            return false;
+        }
+
         _clockOffset = 0;
         _lastFrame = -1;
         _holdBeforeReveal = holdForSetup;
@@ -79,6 +92,7 @@ internal sealed class FirstFlightCanvas : Control
         _timer.Interval = 16;
         _timer.Start();
         Invalidate();
+        return true;
     }
 
     internal void ReleaseHold()
@@ -152,7 +166,7 @@ internal sealed class FirstFlightCanvas : Control
             graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
             graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
             if (seconds is double time) DrawIntro(graphics, time);
-            else DrawWelcome(graphics);
+            else if (_showWelcomeArt) DrawWelcome(graphics);
         }
         finally { graphics.Restore(saved); }
     }
@@ -218,37 +232,45 @@ internal sealed class FirstFlightCanvas : Control
     {
         if (_art.TryGetValue("emblem", out var cached)) return cached;
         var emblem = new Bitmap(330, 170, PixelFormat.Format32bppPArgb);
-        using var graphics = Graphics.FromImage(emblem);
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        using var disk = new GraphicsPath();
-        disk.AddEllipse(97, 17, 136, 136);
-        using var shade = new PathGradientBrush(disk)
+        try
         {
-            CenterPoint = new PointF(147, 59),
-            CenterColor = Color.FromArgb(55, 75, 53),
-            SurroundColors = [Color.FromArgb(12, 25, 17)]
-        };
-        graphics.FillPath(shade, disk);
+            using var graphics = Graphics.FromImage(emblem);
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            using var disk = new GraphicsPath();
+            disk.AddEllipse(97, 17, 136, 136);
+            using var shade = new PathGradientBrush(disk)
+            {
+                CenterPoint = new PointF(147, 59),
+                CenterColor = Color.FromArgb(55, 75, 53),
+                SurroundColors = [Color.FromArgb(12, 25, 17)]
+            };
+            graphics.FillPath(shade, disk);
 
-        // Derive the whole ring and front rim from one source so the arcs meet without seams.
-        using var originalStream = InstallPayload.Resource("Vesper.Setup.Art.brand.publisher-original.png");
-        using var original = new Bitmap(originalStream);
-        const int sourceX = 254, sourceY = 368;
-        using var orbit = original.Clone(new Rectangle(sourceX, sourceY, 746, 394), PixelFormat.Format32bppArgb);
-        bool dark = _palette.IsDark;
-        Filter(orbit, (x, y, pixels, i) =>
+            // Derive the whole ring and front rim from one source so the arcs meet without seams.
+            using var originalStream = InstallPayload.Resource("Vesper.Setup.Art.brand.publisher-original.png");
+            using var original = new Bitmap(originalStream);
+            const int sourceX = 254, sourceY = 368;
+            using var orbit = original.Clone(new Rectangle(sourceX, sourceY, 746, 394), PixelFormat.Format32bppArgb);
+            bool dark = _palette.IsDark;
+            Filter(orbit, (x, y, pixels, i) =>
+            {
+                int alpha = Math.Clamp((pixels[i] - 8) * 255 / 247, 0, 255);
+                float dx = x + sourceX - 625, dy = y + sourceY - 570;
+                float lit = dark ? 1 : Math.Clamp((177 - MathF.Sqrt(dx * dx + dy * dy)) / 24, 0, 1);
+                pixels[i] = (byte)(35 + 184 * lit);
+                pixels[i + 1] = (byte)(55 + 187 * lit);
+                pixels[i + 2] = (byte)(35 + 217 * lit);
+                pixels[i + 3] = (byte)alpha;
+            });
+            Draw(graphics, orbit, new RectangleF(9, 1, 312, 165));
+            return _art["emblem"] = emblem;
+        }
+        catch
         {
-            int alpha = Math.Clamp((pixels[i] - 8) * 255 / 247, 0, 255);
-            float dx = x + sourceX - 625, dy = y + sourceY - 570;
-            float lit = dark ? 1 : Math.Clamp((177 - MathF.Sqrt(dx * dx + dy * dy)) / 24, 0, 1);
-            pixels[i] = (byte)(35 + 184 * lit);
-            pixels[i + 1] = (byte)(55 + 187 * lit);
-            pixels[i + 2] = (byte)(35 + 217 * lit);
-            pixels[i + 3] = (byte)alpha;
-        });
-        Draw(graphics, orbit, new RectangleF(9, 1, 312, 165));
-        return _art["emblem"] = emblem;
+            emblem.Dispose();
+            throw;
+        }
     }
 
     private static void DrawSwarm(Graphics graphics, double time, Bitmap atlas)

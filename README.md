@@ -27,10 +27,10 @@ Use Windows 11 x64 with the .NET 10 SDK and Node.js for the extension tests.
 
 ```powershell
 .\scripts\Run-Tests.ps1
-.\scripts\Build-Release.ps1 -AllowUnsigned  # isolated development build only
+.\scripts\Build-Release.ps1 -InstallerOnly -AllowUnsigned  # isolated development build only
 ```
 
-The build creates a self-contained setup executable and a portable ZIP. Add `-PortableOnly` to build only the ZIP, or `-SelfContained` to include the .NET runtime in that ZIP. Shipping builds require an Authenticode certificate and verified signatures; `-AllowUnsigned` is for local development only. Packaging does not install or register anything.
+`-InstallerOnly` builds the self-contained First Flight installer at `release/setup-<version>/VESPER-Setup.exe` and writes its SHA-256 checksum beside it. Users can run the EXE directly. For portable builds, use `-PortableOnly`; add `-SelfContained` to include the .NET runtime in that ZIP. Shipping builds require an Authenticode certificate and verified signatures. Use `-AllowUnsigned` for isolated development builds. Packaging leaves Windows and browser registration alone.
 
 ## Limits and verification
 
