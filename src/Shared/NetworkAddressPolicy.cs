@@ -62,5 +62,16 @@ internal static class NetworkAddressPolicy
         return true;
     }
 
+    private static readonly string[] BlockedLocalSuffixes =
+        [".localhost", ".local", ".internal", ".home.arpa", ".lan", ".intranet", ".corp", ".localdomain"];
+
+    public static bool IsBlockedLocalHostName(string host)
+    {
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (string suffix in BlockedLocalSuffixes)
+            if (host.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
     private static bool AllZero(ReadOnlySpan<byte> bytes) => bytes.IndexOfAnyExcept((byte)0) < 0;
 }

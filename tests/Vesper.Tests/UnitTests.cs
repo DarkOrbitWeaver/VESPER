@@ -257,12 +257,16 @@ public class UrlPolicyTests
         UrlPolicy.EnsureAllowed(uri, allowPrivate: true);   // the user's "allow private networks" choice still works
     }
 
-    [Fact]
-    public void Private_targets_are_blocked_unless_allowed()
+    [Theory]
+    [InlineData("http://localhost/x")]
+    [InlineData("http://192.168.1.1/x")]
+    [InlineData("http://printer.local/x")]
+    [InlineData("http://service.home.arpa/x")]
+    public void Private_targets_are_blocked_unless_allowed(string url)
     {
-        Assert.Throws<BlockedAddressException>(() => UrlPolicy.EnsureAllowed(new Uri("http://localhost/x"), false));
-        Assert.Throws<BlockedAddressException>(() => UrlPolicy.EnsureAllowed(new Uri("http://192.168.1.1/x"), false));
-        UrlPolicy.EnsureAllowed(new Uri("http://192.168.1.1/x"), true);
+        var uri = new Uri(url);
+        Assert.Throws<BlockedAddressException>(() => UrlPolicy.EnsureAllowed(uri, allowPrivate: false));
+        UrlPolicy.EnsureAllowed(uri, allowPrivate: true);
     }
 
     [Fact]

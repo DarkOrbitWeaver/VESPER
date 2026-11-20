@@ -9,9 +9,6 @@ public static class UrlValidator
 {
     public const int MaxUrlLength = 4096;
 
-    private static readonly string[] BlockedSuffixes =
-        [".localhost", ".local", ".internal", ".home.arpa", ".lan", ".intranet", ".corp", ".localdomain"];
-
     public static bool TryParse(string? text, out Uri uri, out string? reason)
     {
         uri = null!;
@@ -32,9 +29,11 @@ public static class UrlValidator
         if (options.AllowPrivateNetworks) return true;
 
         string host = uri.Host.Trim('[', ']');
-        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) { reason = "localhost"; return false; }
-        foreach (var s in BlockedSuffixes)
-            if (host.EndsWith(s, StringComparison.OrdinalIgnoreCase)) { reason = "local/internal host name"; return false; }
+        if (Vesper.Shared.NetworkAddressPolicy.IsBlockedLocalHostName(host))
+        {
+            reason = host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ? "localhost" : "local/internal host name";
+            return false;
+        }
         if (!host.Contains('.') && !host.Contains(':')) { reason = "single-label host name"; return false; }
         if (IPAddress.TryParse(host, out var ip) && !IpAddressClassifier.IsPublic(ip)) { reason = "non-public IP address"; return false; }
         return true;
