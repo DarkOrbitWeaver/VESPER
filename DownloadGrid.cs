@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using Vesper.Engine;
@@ -8,8 +7,18 @@ namespace VESPER;
 
 // A virtual list, not a DataGridView. Only visible records are painted.
 // This avoids native cell borders and focus outlines bleeding through the design.
-public sealed class DownloadGrid : ScrollableControl
+public sealed class DownloadGrid : Control
 {
+    private sealed class GridScrollBar : VScrollBar
+    {
+        public GridScrollBar()
+        {
+            SetStyle(ControlStyles.ApplyThemingImplicitly, true);
+            TabStop = false;
+            AccessibleName = "Scroll downloads";
+        }
+    }
+
     private IReadOnlyList<DownloadItem> _items = [];
     private readonly HashSet<Guid> _checked = [];
     private readonly ToolTip _tips = new() { InitialDelay = 750, ReshowDelay = 250 };
@@ -28,6 +37,10 @@ public sealed class DownloadGrid : ScrollableControl
     private (DownloadItem Item, Rectangle Threshold, bool Details)? _filePress;
     private readonly int[] _columnWidths = new int[6];
     private int _contentWidth;
+    private readonly GridScrollBar _scrollBar = new();
+    private int _scrollLimit;
+    private int _wheelRemainder;
+    internal int ScrollOffset => _scrollBar.Value;
 
     public event Action? CheckStateChanged;
     internal event Action<DownloadItem>? DetailsRequested;
@@ -52,7 +65,7 @@ public sealed class DownloadGrid : ScrollableControl
     /// <summary>Repaints rows after an in-place change (progress tick). Only visible rows are drawn.</summary>
     internal void RefreshRows<T>(IReadOnlyList<T> changes, Func<T, Guid> idOf)
     {
-        int first = Math.Clamp(-AutoScrollPosition.Y / Math.Max(1, _rowHeight), 0, _items.Count);
+        int first = Math.Clamp(ScrollOffset / Math.Max(1, _rowHeight), 0, _items.Count);
         int last = Math.Min(_items.Count, first + Math.Max(0, (ClientSize.Height - _headerHeight) / Math.Max(1, _rowHeight) + 2));
         for (int index = first; index < last; index++)
         {
@@ -72,7 +85,13 @@ public sealed class DownloadGrid : ScrollableControl
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
             ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
             ControlStyles.Selectable, true);
-        AutoScroll = true;
+        _scrollBar.Visible = false;
+        _scrollBar.ValueChanged += (_, _) =>
+        {
+            Invalidate(BodyBounds);
+            LoadVisiblePosters();
+        };
+        Controls.Add(_scrollBar);
         TabStop = true;
         BackColor = Color.White;
         AccessibleName = "Downloads";
@@ -80,15 +99,6 @@ public sealed class DownloadGrid : ScrollableControl
         if (LicenseManager.UsageMode == LicenseUsageMode.Designtime)
             _items = DownloadItem.DesignerSamples(); // Visual Studio designer preview only.
         ApplyAppearance(VesperPalette.Light, Density.Compact);
-    }
-
-    protected override CreateParams CreateParams
-    {
-        get
-        {
-            SetStyle(ControlStyles.ApplyThemingImplicitly, true);
-            return base.CreateParams;
-        }
     }
 
     internal IReadOnlyList<DownloadItem> VisibleItems => _items;
@@ -180,10 +190,6 @@ public sealed class DownloadGrid : ScrollableControl
 
     internal void ApplyAppearance(VesperPalette palette, Density density)
     {
-        // WinForms applies the native scrollbar theme when the handle is created.
-        bool darkScrollbarChanged = IsHandleCreated && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000)
-            && (palette.IsDark && !palette.HighContrast) != (_palette.IsDark && !_palette.HighContrast);
-        int scrollOffset = darkScrollbarChanged ? -AutoScrollPosition.Y : 0;
         _palette = palette;
         _density = density;
         BackColor = palette.Surface;
@@ -197,115 +203,50 @@ public sealed class DownloadGrid : ScrollableControl
             _ => 46
         });
         UpdateScrollArea();
-        if (darkScrollbarChanged)
-        {
-            RecreateHandle();
-            AutoScrollPosition = new Point(0, scrollOffset);
-        }
         Invalidate();
         LoadVisiblePosters();
     }
 
     private void UpdateScrollArea()
     {
-        // Width zero prevents the horizontal scrollbar at every density.
-        AutoScrollMinSize = new Size(0, _headerHeight + _items.Count * _rowHeight);
+        int page = Math.Max(1, ClientSize.Height - _headerHeight);
+        int rows = (int)Math.Min(int.MaxValue, (long)_items.Count * _rowHeight);
+        _scrollLimit = Math.Max(0, rows - page);
+        ScrollToOffset(ScrollOffset);
+        _scrollBar.Maximum = Math.Max(0, rows - 1);
+        _scrollBar.LargeChange = page;
+        _scrollBar.SmallChange = Math.Max(1, _rowHeight);
+        _scrollBar.Width = SystemInformation.GetVerticalScrollBarWidthForDpi(DeviceDpi);
+        _scrollBar.SetBounds(ClientSize.Width - _scrollBar.Width, _headerHeight, _scrollBar.Width, page);
+        _scrollBar.Visible = _scrollLimit > 0;
         CalculateColumns();
     }
 
     protected override void OnResize(EventArgs e)
     {
         base.OnResize(e);
-        CalculateColumns();
-        Invalidate();
-        LoadVisiblePosters();
-    }
-
-    protected override void OnLayout(LayoutEventArgs e)
-    {
-        base.OnLayout(e);
-        CalculateColumns();
-    }
-
-    protected override void OnScroll(ScrollEventArgs se)
-    {
-        base.OnScroll(se);
+        if (_scrollBar is null) return;
+        UpdateScrollArea();
         Invalidate();
         LoadVisiblePosters();
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
-        int before = AutoScrollPosition.Y;
         base.OnMouseWheel(e);
-        if (AutoScrollPosition.Y != before) { Invalidate(); LoadVisiblePosters(); }
+        int lines = SystemInformation.MouseWheelScrollLines;
+        if (_scrollLimit == 0 || lines == 0) return;
+        if (e is HandledMouseEventArgs handled) handled.Handled = true;
+        _wheelRemainder += e.Delta;
+        int step = lines < 0 ? _scrollBar.LargeChange : lines * _rowHeight;
+        ScrollToOffset(ScrollOffset - _wheelRemainder / 120 * step);
+        _wheelRemainder %= 120;
     }
 
-    // ScrollableControl scrolls by copying the pixels already on screen (ScrollWindowEx) and only then asks
-    // for a repaint. The copy is visible at once: it moves the fixed header into the body and rows under the
-    // header. The repaint that fixes it is a queued WM_PAINT, which waits behind every posted progress update,
-    // so one stepped wheel notch (a 120 px jump) left a second Name/Activity/Transfer/Size header on screen
-    // until the queue drained. Redraw is switched off while the base class moves the scroll position, so
-    // nothing is copied, and the client area and scrollbar are then painted once, immediately.
-    private const int WM_SETREDRAW = 0x000B, WM_HSCROLL = 0x0114, WM_VSCROLL = 0x0115,
-        WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
-    private const uint RDW_INVALIDATE = 0x0001, RDW_UPDATENOW = 0x0100, RDW_FRAME = 0x0400;
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern bool RedrawWindow(IntPtr handle, IntPtr updateRect, IntPtr updateRegion, uint flags);
-
-    internal static bool IsScrollMessage(int message) =>
-        message is WM_HSCROLL or WM_VSCROLL or WM_MOUSEWHEEL or WM_MOUSEHWHEEL;
-
-    protected override void WndProc(ref Message m)
+    internal void ScrollToOffset(int y)
     {
-        if (!IsScrollMessage(m.Msg) || !IsHandleCreated || !Visible)
-        {
-            base.WndProc(ref m);
-            return;
-        }
-
-        bool quiet = BeginQuietScroll();
-        try
-        {
-            base.WndProc(ref m);
-        }
-        finally
-        {
-            EndQuietScroll(quiet);
-        }
-    }
-
-    private bool BeginQuietScroll()
-    {
-        if (!IsHandleCreated || !Visible) return false;
-        SendMessage(Handle, WM_SETREDRAW, IntPtr.Zero, IntPtr.Zero);
-        return true;
-    }
-
-    private void EndQuietScroll(bool quiet)
-    {
-        if (!quiet || !IsHandleCreated) return;
-        SendMessage(Handle, WM_SETREDRAW, (IntPtr)1, IntPtr.Zero);
-        // RDW_FRAME repaints the scrollbar too: its thumb moved while redraw was off.
-        RedrawWindow(Handle, IntPtr.Zero, IntPtr.Zero, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
-    }
-
-    // Keyboard navigation and "show this row" move the scroll position through the same pixel-copying path.
-    private void ScrollToOffset(int y)
-    {
-        bool quiet = BeginQuietScroll();
-        try
-        {
-            AutoScrollPosition = new Point(0, y);
-        }
-        finally
-        {
-            EndQuietScroll(quiet);
-        }
+        // Change row positions without scrolling the window pixels under the fixed header.
+        _scrollBar.Value = Math.Clamp(y, 0, _scrollLimit);
     }
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -325,7 +266,7 @@ public sealed class DownloadGrid : ScrollableControl
             var token = _posterLifetime.Token;
             while (!token.IsCancellationRequested && _density == Density.Gallery && Visible)
             {
-                int first = Math.Clamp(-AutoScrollPosition.Y / Math.Max(1, _rowHeight), 0, _items.Count);
+                int first = Math.Clamp(ScrollOffset / Math.Max(1, _rowHeight), 0, _items.Count);
                 int last = Math.Min(_items.Count, first + Math.Clamp(ClientSize.Height / Math.Max(1, _rowHeight) + 1, 1, 20));
                 Uri? next = null;
                 string? key = null;
@@ -363,9 +304,7 @@ public sealed class DownloadGrid : ScrollableControl
 
     private void CalculateColumns()
     {
-        // ClientSize already excludes the native scrollbar. Subtracting it again
-        // left a dead strip beside the rightmost action buttons.
-        int width = Math.Max(0, ClientSize.Width);
+        int width = Math.Max(0, ClientSize.Width - (_scrollLimit > 0 ? _scrollBar.Width : 0));
         if (width == 0) return;
         int select = UiKit.Scale(this, 48);
         int actions = UiKit.Scale(this, 44);
@@ -396,7 +335,7 @@ public sealed class DownloadGrid : ScrollableControl
     }
 
     private Rectangle RowRectangle(int row)
-        => new(0, _headerHeight + AutoScrollPosition.Y + row * _rowHeight,
+        => new(0, _headerHeight - ScrollOffset + row * _rowHeight,
             Math.Max(1, _contentWidth), _rowHeight);
 
     private Rectangle BodyBounds => new(0, _headerHeight, _contentWidth, Math.Max(0, ClientSize.Height - _headerHeight));
@@ -411,13 +350,9 @@ public sealed class DownloadGrid : ScrollableControl
     {
         base.OnPaint(e);
         Graphics g = e.Graphics;
-        // Paint in client coordinates even if the scroll offset leaked into the transform.
-        g.ResetTransform();
-        g.ResetClip();
-        g.SetClip(e.ClipRectangle);
         using (var background = new SolidBrush(_palette.Surface))
             g.FillRectangle(background, e.ClipRectangle);
-        int scrolled = -AutoScrollPosition.Y;
+        int scrolled = ScrollOffset;
         var dirtyRows = Rectangle.Intersect(e.ClipRectangle, BodyBounds);
         if (dirtyRows.Height > 0 && _items.Count > 0)
         {
@@ -752,7 +687,7 @@ public sealed class DownloadGrid : ScrollableControl
     {
         if (point.Y < _headerHeight)
             return (-1, point.X >= 0 && point.X < _columnWidths[0] ? 0 : -1);
-        int row = (point.Y - _headerHeight - AutoScrollPosition.Y) / Math.Max(1, _rowHeight);
+        int row = (point.Y - _headerHeight + ScrollOffset) / Math.Max(1, _rowHeight);
         if (row < 0 || row >= _items.Count) return (-1, -1);
         for (int column = 0, x = 0; column < _columnWidths.Length; column++)
         {
@@ -859,11 +794,11 @@ public sealed class DownloadGrid : ScrollableControl
             if (_focusRow != old)
             {
                 int desired = _focusRow * _rowHeight;
-                int scroll = -AutoScrollPosition.Y;
+                int scroll = ScrollOffset;
                 if (desired < scroll) ScrollToOffset(desired);
                 else if (desired + _rowHeight > scroll + ClientSize.Height - _headerHeight)
                     ScrollToOffset(desired + _rowHeight - (ClientSize.Height - _headerHeight));
-                if (scroll == -AutoScrollPosition.Y)
+                if (scroll == ScrollOffset)
                 {
                     Invalidate(RowRectangle(old));
                     Invalidate(RowRectangle(_focusRow));

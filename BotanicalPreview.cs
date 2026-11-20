@@ -128,7 +128,7 @@ internal static class BotanicalPreview
         var paint = new List<double>();
         for (int i = 0; i < 130; i++)
         {
-            grid.AutoScrollPosition = new Point(0, i * 96);
+            grid.ScrollToOffset(i * 96);
             var sw = Stopwatch.StartNew();
             grid.DrawToBitmap(bitmap, grid.ClientRectangle);
             if (i >= 10) paint.Add(sw.Elapsed.TotalMilliseconds);
@@ -136,7 +136,7 @@ internal static class BotanicalPreview
 
         int gridPaints = 0;
         grid.Paint += (_, _) => gridPaints++;
-        grid.AutoScrollPosition = Point.Empty;
+        grid.ScrollToOffset(0);
         Application.DoEvents();
         gridPaints = 0;
 
@@ -145,7 +145,7 @@ internal static class BotanicalPreview
         {
             int beforePaints = gridPaints;
             var sw = Stopwatch.StartNew();
-            grid.AutoScrollPosition = new Point(0, (i + 1) * 96);
+            grid.ScrollToOffset((i + 1) * 96);
             grid.Invalidate();
             grid.Update();
             Application.DoEvents();
@@ -155,7 +155,7 @@ internal static class BotanicalPreview
             if (i >= 10) scroll.Add(sw.Elapsed.TotalMilliseconds);
         }
 
-        grid.AutoScrollPosition = Point.Empty;
+        grid.ScrollToOffset(0);
         Application.DoEvents();
         DownloadItem[] activeItems = grid.VisibleItems.Take(3).ToArray();
         if (activeItems.Length != 3)

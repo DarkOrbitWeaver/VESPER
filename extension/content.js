@@ -16,9 +16,8 @@
   let activePreview = null;
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
-  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
-  let motionMode = 'system', unwatchMotion = null;
-  const still = () => motionMode === 'still' || (motionMode === 'system' && reducedMotion.matches);
+  let motionMode = 'animate', unwatchMotion = null;
+  const still = () => motionMode === 'still';
   const protectedVideos = new WeakSet();
   const playback = new WeakMap();
   const prefetchedPlayers = new WeakMap();
@@ -1072,9 +1071,8 @@
   });
   window.addEventListener('pagehide', e => { if (e.persisted) companion?.setVisible(false); else retire(); }, { signal });
   window.addEventListener('pageshow', selectPlayer, { signal });
-  reducedMotion.addEventListener('change', applyMotion, { signal });
-  unwatchMotion = VesperTheme.watchPreference('motion', 'system', value => {
-    motionMode = ['animate', 'still'].includes(value) ? value : 'system';
+  unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
+    motionMode = value;
     applyMotion();
   });
   document.querySelectorAll('video').forEach(consider);

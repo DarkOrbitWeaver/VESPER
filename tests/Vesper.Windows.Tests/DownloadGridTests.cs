@@ -255,14 +255,12 @@ public sealed class DownloadGridTests
         grid.SetItems(items);
 
         Assert.True(grid.Reveal(items[30].Id));
-        Assert.True(grid.AutoScrollPosition.Y < 0);
+        Assert.True(grid.ScrollOffset > 0);
         Assert.False(grid.Reveal(Guid.NewGuid()));
     }
 
-    // A wheel step must not leave the scrolled copy of the header waiting for a queued repaint:
-    // the grid repaints before the message returns, so no update region is left behind.
     [Fact]
-    public void A_wheel_step_scrolls_and_repaints_before_the_message_returns()
+    public void Wheel_and_scrollbar_move_rows_without_invalidating_the_fixed_header()
     {
         RunOnSta(() =>
         {
@@ -277,25 +275,26 @@ public sealed class DownloadGridTests
             form.Show();
             Application.DoEvents();
 
+            var bar = Assert.Single(grid.Controls.OfType<VScrollBar>());
+            Assert.True(bar.Visible);
+            var invalidated = new List<Rectangle>();
+            grid.Invalidated += (_, e) => invalidated.Add(e.InvalidRect);
             const int WM_MOUSEWHEEL = 0x020A;
             IntPtr oneNotchDown = unchecked((IntPtr)(int)0xFF880000); // wheel delta -120 in the high word
             SendMessage(grid.Handle, WM_MOUSEWHEEL, oneNotchDown, IntPtr.Zero);
-
-            Assert.True(DownloadGrid.IsScrollMessage(WM_MOUSEWHEEL));
-            Assert.True(grid.AutoScrollPosition.Y < 0);
-            Assert.True(IsWindowVisible(grid.Handle));
-            Assert.False(GetUpdateRect(grid.Handle, IntPtr.Zero, false));
+            if (SystemInformation.MouseWheelScrollLines != 0) Assert.True(grid.ScrollOffset > 0);
+            bar.Value = Math.Min(200, bar.Maximum - bar.LargeChange + 1);
+            Assert.Equal(bar.Value, grid.ScrollOffset);
+            Assert.NotEmpty(invalidated);
+            Assert.All(invalidated, dirty => Assert.True(dirty.Top >= bar.Top));
+            grid.SetItems([]);
+            Assert.False(bar.Visible);
+            Assert.Equal(0, grid.ScrollOffset);
         });
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr handle, int message, IntPtr wParam, IntPtr lParam);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    private static extern bool GetUpdateRect(IntPtr handle, IntPtr rect, bool erase);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr handle);
 
     [Fact]
     public void Keyboard_focus_stays_with_the_same_download_when_rows_reorder()

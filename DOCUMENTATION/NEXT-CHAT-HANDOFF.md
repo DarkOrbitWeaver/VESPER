@@ -12,7 +12,7 @@ Work in the primary checkout on `main`. Check local changes, HEAD, and the live 
 
 ## Current work
 
-Review and merge viable frontier patches in coherent batches. Codex owns focused regression checks, integration, the final Release suites, real Windows and Chrome validation, performance measurement, and packaging. Complete the approved implementation and essential release checks first. Preserve the eight First Flight pictures and the fixes already on main for damaged inputs, HLS quality, YouTube retries, desktop trim and scrolling, and popup clutter. The unsigned `1.0.2-firstflight.3` preview is from `61f4f4e`; packaged Windows and Chrome acceptance remain open.
+Review and merge viable frontier patches in coherent batches. Codex owns focused regression checks, integration, the final Release suites, real Windows and Chrome validation, performance measurement, and packaging. Preserve the eight First Flight pictures and the fixes already on main for damaged inputs, HLS quality, YouTube retries, and desktop trim. The settings and scroll milestone simplified the popup, added About, and separated the grid's fixed header from its scrolling rows. The Windows desktop suite and extension suite passed. Confirm the packaged scroll behavior and reproduce the reported TikTok and Instagram picker failures in disposable Chrome with its registered helper. The owner's example TikTok video passed the native URL workflow; that result covers desktop only.
 
 The tracker verifier is the source for the current item count. At a work checkpoint report the commit and checkout state, evidence, open tracker IDs and gates, blockers, and next concrete action. Use disposable Windows environments, Chrome profiles, accounts, and files. Leave the owner's regular profile, production installation, registration, downloads, and original audit files alone.
 
@@ -20,7 +20,7 @@ The tracker verifier is the source for the current item count. At a work checkpo
 
 - Cancel removes only the native job and its owned unfinished files. Pause preserves progress. Failure keeps an actionable entry. Chrome keeps bytes it already owns. Use native readiness and source identity before accepting a fresh handoff.
 - Keep the existing temporary-file layout, recoverable persistence, output validation, per-origin consent, privacy, and no-overwrite publication. Keep C#/.NET 10, native WinForms, Chrome MV3, the custom download engine, and existing botanical/butterfly assets.
-- The extension popup holds essential settings, butterfly preferences, and a small extension version. Action-specific feedback belongs with the action. The in-page picker handles media and the desktop manages downloads.
+- The extension popup holds essential settings, Animate and Off for butterfly motion, and a small extension version. Video sign-in defaults on and uses the current supported video site's HTTPS session after Chrome grants access. File sign-in still requires exact-host approval. Action-specific feedback belongs with the action. The in-page picker handles media and the desktop manages downloads.
 - Apply Humanify. Verify the actual behavior before closing a requirement. Use the exact candidate commit for release claims. The owner performs the final audit before public distribution.
 
 ## Reminder after the complete product ships

@@ -5,19 +5,16 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 
-test('the Butterfly motion picker explains its motion choices', () => {
+test('the butterfly motion picker has Animate and Off', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
   const selectTag = popup.match(/<select id="motion"([^>]*)>([\s\S]*?)<\/select>/);
-  const attributes = selectTag?.[1] || '';
   const select = selectTag?.[2];
   assert.ok(select);
   const options = [...select.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)]
     .map(([, value, label]) => [value, label]);
   assert.deepEqual(options, [
-    ['system', 'Follow system'], ['animate', 'Always animate'], ['still', 'No animation']
+    ['animate', 'Animate'], ['still', 'Off']
   ]);
-  assert.match(attributes, /aria-describedby="motion-hint"/);
-  assert.match(popup, /<small id="motion-hint" class="hint">Follow system respects your reduced-motion setting\.<\/small>/);
 });
 
 test('browser sign-in settings require approval for the current HTTPS host', () => {
@@ -31,6 +28,8 @@ test('opening the popup shows the installed extension version without checking t
   for (const versionName of [undefined, '1.0.2-firstflight.3']) {
     const elements = new Map();
     const messages = [];
+    const preferences = [];
+    const permissionRequests = [];
     const getElementById = id => {
       if (!elements.has(id)) elements.set(id, {});
       return elements.get(id);
@@ -41,21 +40,44 @@ test('opening the popup shows the installed extension version without checking t
         sendMessage: async message => { messages.push(message); return { ok: false }; }
       },
       storage: {
-        sync: { get: async defaults => ({ ...defaults, route: 'chrome', handoff: 'default' }) },
+        sync: {
+          get: async defaults => ({ ...defaults, route: 'chrome', handoff: 'default', motion: 'system' }),
+          set: async value => preferences.push(structuredClone(value))
+        },
         local: { get: async () => ({ vesperSeen: true, prefetchFormats: true }) },
         session: { get: async () => ({}) }
       },
-      permissions: { contains: async () => false, onRemoved: { addListener() {} } },
+      permissions: {
+        contains: async () => permissionRequests.length > 0,
+        request: async value => { permissionRequests.push(structuredClone(value)); return true; },
+        onRemoved: { addListener() {} }
+      },
       tabs: { query: async () => [] }
     };
     vm.runInNewContext(source('popup'), { chrome, document: { getElementById }, VesperTheme: { install() {} } });
     await new Promise(resolve => setImmediate(resolve));
 
     assert.equal(getElementById('version').textContent, `Extension ${versionName || '1.0.2'}`);
-    assert.equal(getElementById('route').value, 'chrome');
+    const browserDownloads = getElementById('browser-downloads');
+    assert.equal(browserDownloads.value, 'chrome');
     assert.equal(getElementById('handoff').value, 'default');
     assert.equal(getElementById('prefetch').checked, true);
+    assert.equal(getElementById('motion').value, 'animate');
+    assert.equal(getElementById('signin').checked, true);
+    const allow = getElementById('signin-permission');
+    assert.equal(allow.hidden, false);
     assert.deepEqual(messages, []);
+    assert.deepEqual(permissionRequests, []);
+    browserDownloads.value = 'manual';
+    await browserDownloads.onchange();
+    browserDownloads.value = 'automatic';
+    await browserDownloads.onchange();
+    await allow.onclick();
+    assert.deepEqual(permissionRequests, [{ permissions: ['cookies'] }]);
+    assert.equal(allow.hidden, true);
+    assert.deepEqual(preferences, [
+      { route: 'auto', intercept: false }, { route: 'auto', intercept: true }, { useSignIn: true }
+    ]);
   }
 });
 
@@ -90,18 +112,13 @@ test('browser playlist browsing only opens the native picker from resolver colle
   assert.match(options, /hasRelatedCollection = HasRelatedCollection\(item\)/);
 });
 
-test('System motion follows the reduced-motion preference and explicit choices override it', () => {
+test('butterfly motion responds to Animate and Off', () => {
   const document = new EventTarget();
   document.querySelectorAll = () => [];
   const window = new EventTarget();
-  const motion = Object.assign(new EventTarget(), { matches: true });
   let updatePreference;
   const context = vm.createContext({
     window, document, AbortController, URL, location: { href: 'https://example.test/watch' },
-    matchMedia: query => {
-      assert.equal(query, '(prefers-reduced-motion: reduce)');
-      return motion;
-    },
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
     VesperTheme: {
@@ -109,7 +126,7 @@ test('System motion follows the reduced-motion preference and explicit choices o
       contextGone: () => false,
       watchPreference(key, fallback, apply) {
         assert.equal(key, 'motion');
-        assert.equal(fallback, 'system');
+        assert.equal(fallback, 'animate');
         updatePreference = apply;
         return () => {};
       }
@@ -127,32 +144,17 @@ test('System motion follows the reduced-motion preference and explicit choices o
     toggleAttribute(name, value) { if (value) attributes.add(name); else attributes.delete(name); }
   }, { setStill: value => stillModes.push(value) });
 
-  assert.equal(window.__testMotion.still(), true);
-  updatePreference('system');
-  assert.equal(window.__testMotion.still(), true);
-  assert.equal(attributes.has('data-vesper-still'), true);
-  assert.equal(stillModes.at(-1), true);
-
-  motion.matches = false;
-  motion.dispatchEvent(new Event('change'));
-  assert.equal(window.__testMotion.still(), false);
-  assert.equal(attributes.has('data-vesper-still'), false);
-  assert.equal(stillModes.at(-1), false);
-
-  motion.matches = true;
-  motion.dispatchEvent(new Event('change'));
-  assert.equal(window.__testMotion.still(), true);
-  updatePreference('animate');
-  assert.equal(window.__testMotion.still(), false);
-  assert.equal(attributes.has('data-vesper-still'), false);
-  motion.matches = false;
-  motion.dispatchEvent(new Event('change'));
   assert.equal(window.__testMotion.still(), false);
 
   updatePreference('still');
   assert.equal(window.__testMotion.still(), true);
   assert.equal(attributes.has('data-vesper-still'), true);
   assert.equal(stillModes.at(-1), true);
+
+  updatePreference('animate');
+  assert.equal(window.__testMotion.still(), false);
+  assert.equal(attributes.has('data-vesper-still'), false);
+  assert.equal(stillModes.at(-1), false);
 });
 
 test('the context-menu picker reports when its frame has no video player', async () => {

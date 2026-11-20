@@ -86,7 +86,7 @@ public sealed class SettingsAccessibilityTests
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser" })
+            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser", "About" })
             {
                 showPage.Invoke(form, [name]);
                 Application.DoEvents();
@@ -109,7 +109,7 @@ public sealed class SettingsAccessibilityTests
             Application.DoEvents();
 
             MethodInfo showPage = typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser" })
+            foreach (string name in new[] { "Downloads", "Transfers", "Network", "Appearance", "Sites", "Browser", "About" })
             {
                 showPage.Invoke(form, [name]);
                 Application.DoEvents();
@@ -158,7 +158,7 @@ public sealed class SettingsAccessibilityTests
             string[] expectedNames =
             [
                 "Simultaneous downloads", "Preset 1 unit", "Preset 2 unit", "Preset 3 unit",
-                "Download connections", "Proxy mode", "When the browser captures a download",
+                "Connections per download", "Proxy mode", "When Chrome sends a file",
                 "Color theme", "Download row height"
             ];
             Assert.Equal(expectedNames.Length, choices.Length);
@@ -179,7 +179,7 @@ public sealed class SettingsAccessibilityTests
     }
 
     [Fact]
-    public void Browser_settings_exposes_diagnostics_export_only_with_a_running_engine()
+    public void About_exposes_diagnostics_export_only_with_a_running_engine()
     {
         OnSta(() =>
         {

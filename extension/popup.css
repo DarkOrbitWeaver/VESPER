@@ -7,6 +7,8 @@ h1 span { margin-left:7px; color:var(--muted); font:12px "Segoe UI",system-ui,sa
 main { padding:8px 15px 14px; }
 .setting { display:flex; gap:12px; justify-content:space-between; align-items:center; padding:7px 0; }
 .setting select { flex:0 0 176px; min-width:0; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font:inherit; }
+#browser-downloads { flex-basis:208px; }
+#signin-permission { margin-bottom:8px; }
 .check { display:flex; gap:8px; align-items:flex-start; padding:7px 0; }
 .check input { flex:none; margin:3px 0 0; accent-color:var(--green); }
 small { display:block; color:var(--muted); font-size:11px; margin-top:2px; }

@@ -14,7 +14,7 @@ const DEFAULTS = {
   handoff: 'download',         // default = VESPER decides, download, queue
   route: 'auto',
   intercept: true,             // enabled by default when the user explicitly installs the extension; can be disabled
-  useSignIn: false             // Sign-in cookies are sent only after the user enables this setting.
+  useSignIn: true              // Chrome must grant cookie access before VESPER can use it.
 };
 
 // ---------------------------------------------------------------- native messaging
@@ -250,7 +250,7 @@ async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = 
 async function withSignIn(items, context = {}) {
   const safe = items.map(stripSecrets);
   const prefs = await settings();
-  if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] })))
+  if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false)))
     return { items: safe, authorized: false };
   const { signInHosts = [] } = await chrome.storage.local.get('signInHosts').catch(() => ({}));
   const approvedHosts = new Set(Array.isArray(signInHosts)
@@ -258,11 +258,16 @@ async function withSignIn(items, context = {}) {
   const enriched = [];
   for (const item of safe) {
     let targetHost;
+    let allowVideoSignIn = false;
     try {
       const target = new URL(item.url);
-      if (target.protocol === 'https:' && !target.username && !target.password) targetHost = target.hostname.toLowerCase();
+      if (target.protocol === 'https:' && !target.username && !target.password) {
+        targetHost = target.hostname.toLowerCase();
+        allowVideoSignIn = context.mediaPicker && context.userGesture && context.frame && supportsMediaPrefetch(target)
+          && target.origin === new URL(item.referer).origin;
+      }
     } catch { /* invalid URLs receive no browser credentials */ }
-    if (!targetHost || !approvedHosts.has(targetHost)) {
+    if (!targetHost || (!allowVideoSignIn && !approvedHosts.has(targetHost))) {
       enriched.push(item);
       continue;
     }
@@ -653,7 +658,7 @@ async function mediaAuthorization(pageUrl, sender, { userGesture = false } = {})
     ...(sender.documentId ? { documentId: sender.documentId } : {})
   } : undefined;
   const enriched = await withSignIn([{ url: pageUrl, referer: sender?.url || pageUrl,
-    userAgent: navigator.userAgent }], { frame, userGesture });
+    userAgent: navigator.userAgent }], { frame, userGesture, mediaPicker: true });
   return enriched.authorized ? { authorized: true, mediaAuth: enriched.items[0] } : {};
 }
 
@@ -672,7 +677,9 @@ async function playerOptions(message, sender) {
   const cached = cachedMediaOptions(lookupKey);
   if (cached) return cached;
   const prefetch = message.prefetch === true;
-  if (mediaLookups.has(lookupKey)) return mediaLookups.get(lookupKey);
+  // A click can use sign-in even while a background lookup is in flight.
+  const pendingKey = prefetch ? lookupKey + '|prefetch' : lookupKey;
+  if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   if (prefetch) {
     const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats');
     if (!prefetchFormats) return { ok: true, data: { prefetchSkipped: true } };
@@ -726,7 +733,7 @@ async function playerOptions(message, sender) {
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
-      const reply = await nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: title,
+      const reply = await nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender, { userGesture: !prefetch }), url: page.href, pageTitle: title,
         candidates: !youTube || candidates.length ? candidates : undefined }), 60000);
       if (reply.ok || !wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
     }
@@ -743,13 +750,13 @@ async function playerOptions(message, sender) {
       label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
       detail: 'Saves with Chrome', container }] } };
   })();
-  mediaLookups.set(lookupKey, task);
+  mediaLookups.set(pendingKey, task);
   try {
     const reply = await task;
     rememberMediaOptions(lookupKey, tab, reply);
     return reply;
   }
-  finally { mediaLookups.delete(lookupKey); }
+  finally { mediaLookups.delete(pendingKey); }
 }
 
 async function selectBrowserFile(message, sender) {
@@ -790,7 +797,7 @@ async function selectMediaSource(message, sender) {
   const { route } = await settings();
   if (route === 'chrome')
     return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
-  return nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender), url: page.href, pageTitle: selection.title,
+  return nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender, { userGesture: true }), url: page.href, pageTitle: selection.title,
     candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }
 

@@ -20,13 +20,18 @@
       </select>
     </label>
     <label class="setting"><span>Butterfly motion</span>
-      <select id="motion" aria-describedby="motion-hint">
-        <option value="system">Follow system</option>
-        <option value="animate">Always animate</option>
-        <option value="still">No animation</option>
+      <select id="motion">
+        <option value="animate">Animate</option>
+        <option value="still">Off</option>
       </select>
     </label>
-    <small id="motion-hint" class="hint">Follow system respects your reduced-motion setting.</small>
+    <label class="setting"><span>Browser downloads</span>
+      <select id="browser-downloads">
+        <option value="automatic">Send to VESPER automatically</option>
+        <option value="manual">Only when I choose VESPER</option>
+        <option value="chrome">Save with Chrome</option>
+      </select>
+    </label>
     <label class="setting"><span>When capturing a file</span>
       <select id="handoff">
         <option value="download">Download now</option>
@@ -34,22 +39,19 @@
         <option value="default">Use desktop setting</option>
       </select>
     </label>
-    <p id="first-run" class="hint" hidden>VESPER takes over safe downloads; Chrome keeps the rest. You can turn capture off below.</p>
-    <label class="check"><input type="checkbox" id="intercept"><span>Capture downloads automatically</span></label>
+    <p id="first-run" class="hint" hidden>Chrome keeps downloads it has already started.</p>
     <details id="site-sign-in">
       <summary>Site sign-in</summary>
-      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my sign-in <small id="signin-access">Chrome permission required.</small></span></label>
-      <label class="check"><input type="checkbox" id="signin-site" disabled><span>Allow on <strong id="signin-host">this site</strong><small id="signin-site-hint"></small></span></label>
+      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my sign-in<small id="signin-access"></small></span></label>
+      <button id="signin-permission" class="vesper-button" type="button" hidden>Allow sign-in in Chrome</button>
+      <details id="file-sign-in" hidden>
+        <summary>File downloads</summary>
+        <label class="check"><input type="checkbox" id="signin-site" disabled><span>Use sign-in on <strong id="signin-host">this site</strong><small id="signin-site-hint"></small></span></label>
+      </details>
     </details>
     <details>
       <summary>More settings</summary>
-      <label class="setting"><span>Download connection</span>
-        <select id="route">
-          <option value="auto">Automatic</option>
-          <option value="chrome">Keep Chrome’s connection</option>
-        </select>
-      </label>
-      <label class="check"><input type="checkbox" id="prefetch"><span>Prepare video formats early</span></label>
+      <label class="check"><input type="checkbox" id="prefetch"><span>Load video choices early</span></label>
     </details>
     <details id="recent" hidden>
       <summary>Recent capture results</summary>
