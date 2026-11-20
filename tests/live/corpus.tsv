@@ -1,4 +1,4 @@
-# platform	scenario	mode	url   (curated public, non-DRC corpus; see MEDIA_ENGINE_COMPATIBILITY.md)
+# platform	scenario	mode	url   (curated public, clear-media corpus; see MEDIA_ENGINE_LIMITATIONS.md)
 youtube	standard video (first upload, 240p)	balanced	https://www.youtube.com/watch?v=jNQXAC9IVRw
 youtube	youtu.be short link	audio	https://youtu.be/jNQXAC9IVRw
 youtube	YouTube Music URL	audio	https://music.youtube.com/watch?v=jNQXAC9IVRw

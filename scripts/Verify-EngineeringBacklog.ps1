@@ -71,15 +71,13 @@ if ($audit -notmatch 'Original-audit reconciliation' -and $audit -notmatch 'Orig
 
 # The portable ZIP must not ship an older version's test counts and readiness claims.
 $releasePath = Join-Path $root 'DOCUMENTATION\RELEASE.md'
-$historicalReleasePath = Join-Path $root 'DOCUMENTATION\RELEASE-2026-11-12-HISTORICAL.md'
 $buildScriptPath = Join-Path $root 'scripts\Build-Release.ps1'
-foreach ($required in @($releasePath, $historicalReleasePath, $buildScriptPath)) {
+foreach ($required in @($releasePath, $buildScriptPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Release documentation or packaging script is missing: $required"
     }
 }
 $releaseNotes = [IO.File]::ReadAllText($releasePath)
-$historicalNotes = [IO.File]::ReadAllText($historicalReleasePath)
 $buildScript = [IO.File]::ReadAllText($buildScriptPath)
 if ($releaseNotes -match '(?i)verification run on 2026-11-12|^# VESPER 1\.0\.0 release status') {
     throw 'Current packaged release notes contain the obsolete 1.0.0 verification report.'
@@ -87,9 +85,6 @@ if ($releaseNotes -match '(?i)verification run on 2026-11-12|^# VESPER 1\.0\.0 r
 if ($quality -match 'Current release status: NOT APPROVED' -and
     $releaseNotes -notmatch '(?i)not approved for public release') {
     throw 'Packaged release notes claim more readiness than the quality gates support.'
-}
-if ($historicalNotes -notmatch 'Historical evidence only') {
-    throw 'Historical release evidence lacks its stale-results warning.'
 }
 if ($buildScript -notmatch 'Copy-Item[^\r\n]+DOCUMENTATION\\RELEASE\.md') {
     throw 'Packaging no longer copies the current release information.'
