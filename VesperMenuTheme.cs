@@ -5,27 +5,26 @@ namespace VESPER;
 // Keep WinForms' menu keyboard and submenu behavior. Paint the same surface at every level.
 internal static class VesperMenuTheme
 {
-    private static readonly object IconLock = new();
-    private static readonly Dictionary<(VesperIcon Symbol, int Color, int Dpi), Image> IconCache = [];
-    private static readonly Queue<(VesperIcon Symbol, int Color, int Dpi)> IconOrder = [];
-    private static readonly Font MenuFont = new("Segoe UI", 9F);
+    // Each UI thread owns its GDI objects.
+    [ThreadStatic] private static Dictionary<(VesperIcon Symbol, int Color, int Dpi), Image>? _iconCache;
+    [ThreadStatic] private static Queue<(VesperIcon Symbol, int Color, int Dpi)>? _iconOrder;
+    [ThreadStatic] private static Font? _menuFont;
 
     public static Image IconImage(VesperIcon symbol, VesperPalette palette, int dpi = 96)
     {
         Color color = VesperDrawing.Ink(symbol, palette);
         var key = (symbol, color.ToArgb(), dpi);
-        lock (IconLock)
-        {
-            if (IconCache.TryGetValue(key, out Image? cached)) return cached;
-            int size = Math.Max(16, (int)Math.Round(20d * dpi / 96));
-            var bitmap = new Bitmap(size, size);
-            using (var graphics = Graphics.FromImage(bitmap))
-                VesperDrawing.Icon(graphics, symbol, new Rectangle(2, 2, size - 4, size - 4), color);
-            // Menu items can still hold an evicted image.
-            if (IconOrder.Count >= 128) IconCache.Remove(IconOrder.Dequeue());
-            IconOrder.Enqueue(key);
-            return IconCache[key] = bitmap;
-        }
+        var cache = _iconCache ??= [];
+        if (cache.TryGetValue(key, out Image? cached)) return cached;
+        int size = Math.Max(16, (int)Math.Round(20d * dpi / 96));
+        var bitmap = new Bitmap(size, size);
+        using (var graphics = Graphics.FromImage(bitmap))
+            VesperDrawing.Icon(graphics, symbol, new Rectangle(2, 2, size - 4, size - 4), color);
+        // Menu items can still hold an evicted image.
+        var order = _iconOrder ??= [];
+        if (order.Count >= 128) cache.Remove(order.Dequeue());
+        order.Enqueue(key);
+        return cache[key] = bitmap;
     }
 
     public static void Apply(ContextMenuStrip menu, VesperPalette palette, bool withIcons = false)
@@ -73,7 +72,7 @@ internal static class VesperMenuTheme
         menu.Renderer = palette.HighContrast ? new ToolStripSystemRenderer() : new VesperMenuRenderer(palette);
         menu.BackColor = palette.Surface;
         menu.ForeColor = palette.Text;
-        menu.Font = MenuFont;
+        menu.Font = _menuFont ??= new Font("Segoe UI", 9F);
         menu.Padding = new Padding(4, 5, 4, 5);
         menu.DropShadowEnabled = true;
         menu.Cursor = Cursors.Default;
