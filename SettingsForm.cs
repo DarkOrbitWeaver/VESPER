@@ -79,7 +79,8 @@ internal sealed class SettingsForm : VesperPopupForm
         (string Title, VesperIcon Icon)[] tabs =
         [
             ("Downloads", VesperIcon.Download), ("Transfers", VesperIcon.Gauge), ("Network", VesperIcon.Provider),
-            ("Appearance", VesperIcon.Leaf), ("Sites", VesperIcon.Provider), ("Browser", VesperIcon.Link)
+            ("Appearance", VesperIcon.Leaf), ("Sites", VesperIcon.Provider), ("Browser", VesperIcon.Link),
+            ("About", VesperIcon.Info)
         ];
         for (int i = 0; i < tabs.Length; i++)
         {
@@ -125,6 +126,7 @@ internal sealed class SettingsForm : VesperPopupForm
         BuildAppearance();
         BuildSiteRules();
         BuildBrowser();
+        BuildAbout();
         ShowPage("Downloads");
         ClientSize = new Size(ClientSize.Width, ClientSize.Height + VesperDialogChrome.HeaderHeight);
         VesperDialogChrome.Attach(this, "VESPER  /  Settings", _colors, VesperIcon.Gear);
@@ -302,33 +304,26 @@ internal sealed class SettingsForm : VesperPopupForm
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
         var clipboard = Check("Offer to download links I copy", 25, 612, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
         var tray = Check("Keep VESPER in the tray when I close the window", 25, 640, _draft.CloseToTray, v => _draft.CloseToTray = v);
-        var collisions = Label("Existing files are never overwritten: a number is added to the new file's name instead.", 8, muted: true);
-        collisions.SetBounds(25, 670, 490, 23);
-        var separator5 = Divider(705);
-        var openFolder = Check("Open the latest download folder when the queue finishes", 25, 718,
+        var separator5 = Divider(679);
+        var openFolder = Check("Open the latest download folder when the queue finishes", 25, 692,
             _draft.OpenFolderWhenQueueFinishes, value => _draft.OpenFolderWhenQueueFinishes = value);
-        var openFolderNote = Label("Uses the folder of the most recently completed file.", 8, muted: true);
-        openFolderNote.SetBounds(45, 746, 470, 22);
-        var sleepQueue = Check("Ask before putting the PC to sleep when the queue finishes", 25, 776,
+        var sleepQueue = Check("Ask before putting the PC to sleep when the queue finishes", 25, 723,
             _draft.SleepWhenQueueFinishes, value => _draft.SleepWhenQueueFinishes = value);
-        var sleepNote = Label("Choose Sleep now within 60 seconds. New downloads or exiting VESPER cancels the prompt.", 8, muted: true);
-        sleepNote.SetBounds(45, 804, 470, 36);
-        var shutdownQueue = Check("Ask before shutting down the PC when the queue finishes", 25, 848,
+        var shutdownQueue = Check("Ask before shutting down the PC when the queue finishes", 25, 754,
             _draft.ShutdownWhenQueueFinishes, value => _draft.ShutdownWhenQueueFinishes = value);
-        var shutdownNote = Label("Choose Shut down now within 60 seconds. New downloads or exiting VESPER cancels the prompt.", 8, muted: true);
-        shutdownNote.SetBounds(45, 876, 470, 36);
+        var powerNote = Label("The prompt closes after 60 seconds or when new downloads start.", 8, muted: true);
+        powerNote.SetBounds(45, 782, 470, 28);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
-            separator4, notify, sound, previewSound, clipboard, tray, collisions, separator5, openFolder,
-            openFolderNote, sleepQueue, sleepNote, shutdownQueue, shutdownNote]);
+            separator4, notify, sound, previewSound, clipboard, tray, separator5, openFolder,
+            sleepQueue, shutdownQueue, powerNote]);
         void Layout()
         {
             int right = page.ClientSize.Width - 25;
             browse.Left = Math.Max(308, right - browse.Width);
             frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
             int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
-            categoryNote.Width = missingNote.Width = collisions.Width = templateNote.Width = templatePreview.Width
-                = openFolderNote.Width = sleepNote.Width = shutdownNote.Width = noteWidth;
+            categoryNote.Width = missingNote.Width = templateNote.Width = templatePreview.Width = powerNote.Width = noteWidth;
             templateFrame.Width = Math.Max(UiKit.Scale(this, 180), right - 50);
         }
         page.Resize += (_, _) => Layout();
@@ -540,8 +535,6 @@ internal sealed class SettingsForm : VesperPopupForm
         var page = Page("Transfers", "How many downloads run at once, and how fast.");
         var concurrencyLabel = Label("Simultaneous downloads", 9, bold: true);
         concurrencyLabel.SetBounds(25, 108, 280, 22);
-        var concurrencyNote = Label("Maximum number of active jobs.", 8, muted: true);
-        concurrencyNote.SetBounds(25, 133, 260, 22);
         int[] counts = [1, 2, 3, 4, 5, 6, 8];
         var concurrency = Choice(["1", "2", "3", "4", "5", "6", "8"],
             Math.Max(0, Array.IndexOf(counts, _draft.ConcurrentTransfers)), 126, "Simultaneous downloads");
@@ -569,7 +562,7 @@ internal sealed class SettingsForm : VesperPopupForm
         };
         _addPreset = Button("Add preset", 112, symbol: VesperIcon.Plus);
         _addPreset.Click += (_, _) => { if (_presets.Count < 8) AddPreset(2048); };
-        page.Controls.AddRange([concurrencyLabel, concurrencyNote, concurrency, separator1,
+        page.Controls.AddRange([concurrencyLabel, concurrency, separator1,
             _globalEnabled, globalNote, _globalFrame, unit, separator2,
             presetHeading, presetDescription, _presetArea, _addPreset]);
         void Layout()
@@ -649,13 +642,13 @@ internal sealed class SettingsForm : VesperPopupForm
     private void BuildNetwork()
     {
         var page = Page("Network", "Connections, schedule and privacy.");
-        var connLabel = Label("Download connections", 9, bold: true);
+        var connLabel = Label("Connections per download", 9, bold: true);
         connLabel.SetBounds(25, 108, 300, 22);
         var connNote = Label("Downloads use parts when supported; four is a good default.", 8, muted: true);
         connNote.SetBounds(25, 133, 360, 20);
         int[] counts = [1, 2, 3, 4, 6, 8];
         var connections = Choice(["1", "2", "3", "4", "6", "8"],
-            Math.Max(0, Array.IndexOf(counts, _draft.MaxConnectionsPerJob)), 126, "Download connections");
+            Math.Max(0, Array.IndexOf(counts, _draft.MaxConnectionsPerJob)), 126, "Connections per download");
         connections.SetBounds(404, 109, 126, 33);
         connections.SelectedIndexChanged += (_, _) => _draft.MaxConnectionsPerJob = int.Parse(connections.SelectedText);
         var separator1 = Divider(169);
@@ -735,49 +728,21 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void BuildBrowser()
     {
-        var page = Page("Browser", "The browser butterfly sends supported downloads to VESPER.");
-        // About: which build is this? Two clicks away, as support asks for it.
-        var about = Label("VESPER " + Vesper.Shared.BuildInfo.Version(typeof(SettingsForm).Assembly)
-            + " · " + (Environment.Is64BitProcess ? "64-bit" : "32-bit") + " · .NET " + Environment.Version.ToString(2), 8.5F, muted: true);
-        about.Name = "aboutBuild";
-        about.AccessibleName = "About VESPER";
-        page.Controls.Add(about);
-        about.SetBounds(25, 704, 505, 30);
-        about.AutoEllipsis = true;
-        page.AutoScrollMinSize = new Size(0, 750);
-        page.Resize += (_, _) => about.Width = Math.Max(120, page.ClientSize.Width - 50);
-        var heading = Label("Browser downloads", 10, bold: true);
-        heading.SetBounds(25, 109, 390, 25);
-        var note = Label("VESPER works without an extension. Install the browser add-on to capture downloads while browsing.", 8.5F, muted: true);
-        note.SetBounds(25, 137, 505, 43);
-        note.AutoEllipsis = false;
-
-        var statusTitle = Label("Desktop helper", 9, bold: true);
-        statusTitle.SetBounds(25, 190, 230, 23);
+        var page = Page("Browser", "Send files and videos from Chrome.");
         var status = Label("", 8.5F, muted: true);
-        status.SetBounds(25, 213, 505, 44);
+        status.SetBounds(25, 192, 505, 34);
         status.AutoEllipsis = false;
-        var sep1 = Divider(265);
-        var handoff = Label("When the butterfly captures a download", 9, bold: true);
-        handoff.SetBounds(25, 283, 320, 22);
+        var handoff = Label("When Chrome sends a file", 9, bold: true);
+        handoff.SetBounds(25, 111, 290, 23);
         var action = Choice(["Ask me", "Download now", "Add to queue"], (int)_draft.BrowserAction, 190,
-            "When the browser captures a download");
-        action.SetBounds(335, 281, 190, 33);
+            "When Chrome sends a file");
+        action.SetBounds(335, 106, 190, 33);
         action.SelectedIndexChanged += (_, _) => _draft.BrowserAction = (BrowserAction)action.SelectedIndex;
-        var handoffNote = Label("Choose what VESPER should do after the browser extension sends a file.", 8.5F, muted: true);
-        handoffNote.SetBounds(25, 320, 505, 26);
-
-        var sep2 = Divider(361);
-        var extensionTitle = Label("Extension setup", 9, bold: true);
-        extensionTitle.SetBounds(25, 377, 290, 22);
-        var extensionNote = Label(NativeHostSetup.ExtensionPresent
-            ? "Development build: load the add-on from the extension folder. A Store extension will require your approval."
-            : "The extension is not bundled here. Browser add-ons require your approval to install and enable.",
-            8.5F, muted: true);
-        extensionNote.SetBounds(25, 402, 505, 42);
-        extensionNote.AutoEllipsis = false;
+        var separator = Divider(155);
+        var extensionTitle = Label("Chrome extension", 9, bold: true);
+        extensionTitle.SetBounds(25, 168, 290, 22);
         var open = Button("Open extension files", 178, symbol: VesperIcon.Folder);
-        open.SetBounds(25, 448, 178, 34);
+        open.SetBounds(25, 236, 178, 34);
         open.Enabled = NativeHostSetup.ExtensionPresent;
         open.Click += (_, _) =>
         {
@@ -787,7 +752,7 @@ internal sealed class SettingsForm : VesperPopupForm
         };
         VesperButton disconnect = null!;
         var repair = Button(NativeHostSetup.IsRegistered ? "Repair helper" : "Connect Chrome", 131, symbol: VesperIcon.Refresh);
-        repair.SetBounds(213, 448, 131, 34);
+        repair.SetBounds(213, 236, 131, 34);
         repair.Enabled = NativeHostSetup.HostPresent;
         repair.Click += (_, _) =>
         {
@@ -799,7 +764,7 @@ internal sealed class SettingsForm : VesperPopupForm
             Refresh();
         };
         disconnect = Button("Disconnect helper", 160, symbol: VesperIcon.Close);
-        disconnect.SetBounds(354, 448, 160, 34);
+        disconnect.SetBounds(354, 236, 160, 34);
         disconnect.Enabled = NativeHostSetup.IsRegistered;
         disconnect.Click += (_, _) =>
         {
@@ -814,15 +779,52 @@ internal sealed class SettingsForm : VesperPopupForm
             bool hostPresent = NativeHostSetup.HostPresent;
             bool registered = NativeHostSetup.IsRegistered;
             status.Text = !hostPresent
-                ? "The browser helper isn't included in this development build. The release installer installs it automatically."
+                ? "This build is missing the Chrome helper."
                 : registered
-                    ? "Desktop helper is registered. Enable the VESPER extension in your browser to start using it."
-                    : "Desktop helper found. The release installer normally registers it automatically.";
+                    ? "Helper registered for this copy of VESPER."
+                    : "Choose Connect Chrome to register the helper.";
             ApplyBrowserHelperState(repair, disconnect, hostPresent, registered);
         }
 
+        var developerTip = Label(NativeHostSetup.ExtensionPresent
+            ? "Load the extension in Chrome from chrome://extensions using Developer mode."
+            : "This build does not include the extension files.", 8, muted: true);
+        developerTip.SetBounds(25, 277, 505, 35);
+        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, repair, disconnect, developerTip]);
+        void Layout()
+        {
+            int right = page.ClientSize.Width - 25;
+            action.Left = Math.Max(315, right - action.Width);
+            handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
+            status.Width = developerTip.Width = Math.Max(UiKit.Scale(this, 180), right - 25);
+        }
+        page.Resize += (_, _) => Layout();
+        Layout();
+        Refresh();
+    }
+
+    private void BuildAbout()
+    {
+        var page = Page("About", "Built by DarkOrbitWeaver.");
+        string version = Vesper.Shared.BuildInfo.Version(typeof(SettingsForm).Assembly);
+        var about = Label("VESPER " + version, 10, bold: true);
+        about.Name = "aboutBuild";
+        about.AccessibleName = "VESPER build version";
+        about.SetBounds(25, 105, 485, 27);
+        var github = Button("VESPER on GitHub", 156, symbol: VesperIcon.Link);
+        github.SetBounds(25, 143, 156, 34);
+        github.Click += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/DarkOrbitWeaver/VESPER")
+                { UseShellExecute = true });
+            }
+            catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+            { VesperMessageBox.Show(this, "Could not open GitHub. " + ex.Message, "About", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        };
         var updates = Button("Check for updates", 182, symbol: VesperIcon.Refresh);
-        updates.SetBounds(25, 539, 182, 34);
+        updates.SetBounds(191, 143, 182, 34);
         updates.Click += async (_, _) =>
         {
             updates.Enabled = false;
@@ -846,35 +848,26 @@ internal sealed class SettingsForm : VesperPopupForm
             }
             finally { if (!IsDisposed) updates.Enabled = true; }
         };
-        var developerTip = Label("For unpacked Chrome builds: chrome://extensions → Developer mode → Load unpacked.", 8, muted: true);
-        developerTip.SetBounds(25, 489, 505, 33);
-
+        var separator = Divider(195);
         var diagnosticsTitle = Label("Diagnostics", 9, bold: true);
-        diagnosticsTitle.SetBounds(25, 584, 300, 22);
+        diagnosticsTitle.SetBounds(25, 208, 300, 22);
         var diagnosticsNote = Label(_engine is null
             ? "Open Settings from the running VESPER window to export diagnostics."
             : "Exports system details and the redacted event log. Event details can include filenames; review before sharing.", 8, muted: true);
-        diagnosticsNote.SetBounds(25, 608, 505, 34);
+        diagnosticsNote.SetBounds(25, 233, 485, 38);
         diagnosticsNote.AutoEllipsis = false;
         var exportDiagnostics = Button("Export diagnostics bundle", 188, symbol: VesperIcon.Folder);
         exportDiagnostics.Name = "exportDiagnostics";
         exportDiagnostics.AccessibleName = "Export diagnostics bundle";
-        exportDiagnostics.SetBounds(25, 650, 188, 34);
+        exportDiagnostics.SetBounds(25, 277, 200, 34);
         exportDiagnostics.Enabled = _engine is not null;
         exportDiagnostics.Click += (_, _) => ExportDiagnostics();
 
-        page.Controls.AddRange([heading, note, statusTitle, status, sep1, handoff, action,
-            handoffNote, sep2, extensionTitle, extensionNote, open, repair, disconnect, updates, developerTip,
-            diagnosticsTitle, diagnosticsNote, exportDiagnostics]);
+        page.Controls.AddRange([about, github, updates, separator, diagnosticsTitle, diagnosticsNote, exportDiagnostics]);
         page.Resize += (_, _) =>
         {
-            int right = page.ClientSize.Width - 25;
-            action.Left = Math.Max(315, right - action.Width);
-            foreach (Label l in new[] { note, status, handoffNote, extensionNote, developerTip, diagnosticsNote })
-                l.Width = Math.Max(UiKit.Scale(this, 180), right - 25);
-            handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
+            about.Width = diagnosticsNote.Width = Math.Max(UiKit.Scale(this, 180), page.ClientSize.Width - 50);
         };
-        Refresh();
     }
 
     internal static void ApplyBrowserHelperState(VesperButton repair, VesperButton disconnect,
@@ -918,8 +911,6 @@ internal sealed class SettingsForm : VesperPopupForm
         var page = Page("Appearance", "Choose how VESPER looks.");
         var theme = Label("Color theme", 9, bold: true);
         theme.SetBounds(25, 107, 240, 23);
-        var themeNote = Label("Match your preferred light or dark palette.", 8, muted: true);
-        themeNote.SetBounds(25, 134, 245, 29);
         var themeChoice = Choice(["System", "Light", "Dark"], (int)_draft.Theme, 184, "Color theme");
         themeChoice.SetBounds(346, 112, 184, 33);
         themeChoice.SelectedIndexChanged += (_, _) => _draft.Theme = (ThemeChoice)themeChoice.SelectedIndex;
@@ -941,7 +932,7 @@ internal sealed class SettingsForm : VesperPopupForm
             value => _draft.Botanical = value);
         var botanicalNote = Label("Illustrated headers, watercolor scenery, and a warm palette.", 8, muted: true);
         botanicalNote.SetBounds(45, 331, 470, 34);
-        page.Controls.AddRange([theme, themeNote, themeChoice, separator1, density, densityNote,
+        page.Controls.AddRange([theme, themeChoice, separator1, density, densityNote,
             densityChoice, separator2, botanical, botanicalNote]);
         void Layout()
         {
@@ -949,7 +940,7 @@ internal sealed class SettingsForm : VesperPopupForm
             themeChoice.Left = Math.Max(300, right - themeChoice.Width);
             densityChoice.Left = Math.Max(UiKit.Scale(this, 282), right - densityChoice.Width);
             int leftWidth = Math.Max(UiKit.Scale(this, 160), densityChoice.Left - 40);
-            themeNote.Width = densityNote.Width = leftWidth;
+            densityNote.Width = leftWidth;
             botanicalNote.Width = Math.Max(UiKit.Scale(this, 225), page.ClientSize.Width - 70);
         }
         page.Resize += (_, _) => Layout();

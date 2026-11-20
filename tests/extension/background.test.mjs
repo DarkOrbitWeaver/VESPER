@@ -1859,7 +1859,7 @@ test('unsafe downloads remain exclusively Chrome-owned and are not exposed for m
   assert.equal(file.paused, false);
 });
 
-test('site cookies are omitted unless sign-in is explicitly enabled', async () => {
+test('file download cookies still require host approval when sign-in is on by default', async () => {
   const app = load({ submit: { ok: true } }, { signInPermission: true });
 
   await app.message({ type: 'submit', pageUrl: 'https://public.example/',
@@ -1994,6 +1994,29 @@ const videoSender = { tab: { id: 17, url: videoPage }, url: videoPage, frameId: 
 const videoOptionsMessage = (pageUrl, extra = {}) => ({
   type: 'media-options', pageUrl, playerPageUrl: pageUrl, playerUrl: '', generation: 1,
   mediaChangedAt: 0, playerPlaying: false, ...extra
+});
+
+test('opening a supported video picker uses sign-in after Chrome approves it', async () => {
+  const pageUrl = 'https://www.tiktok.com/@author/video/1234567';
+  const sender = { ...videoSender, tab: { id: 17, url: pageUrl }, url: pageUrl };
+  const app = load({ 'media-options': mediaOptionsReply }, { signInPermission: true });
+  const result = await app.message(videoOptionsMessage(pageUrl), sender);
+  assert.equal(result.ok, true);
+  assert.deepEqual(app.cookieLookups, [pageUrl]);
+  assert.equal(app.sent[0].mediaAuth.cookie, 'session=test-value');
+  assert.equal(app.sent[0].authorized, true);
+
+  for (const [address, opts, extra] of [
+    [pageUrl, { signInPermission: false }, {}],
+    [pageUrl, { signInPermission: true, prefs: { useSignIn: false } }, {}],
+    [pageUrl, { signInPermission: true, localData: { prefetchFormats: true } }, { prefetch: true }],
+    ['https://example.com/video', { signInPermission: true }, {}]
+  ]) {
+    const blocked = load({ 'media-options': mediaOptionsReply }, opts);
+    await blocked.message(videoOptionsMessage(address, extra), { ...sender, url: address, tab: { id: 17, url: address } });
+    assert.deepEqual(blocked.cookieLookups, []);
+    assert.equal(blocked.sent[0].mediaAuth, undefined);
+  }
 });
 
 test('video format prefetch is off by default and limited to supported pages', async () => {
