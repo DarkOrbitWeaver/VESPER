@@ -100,16 +100,19 @@ public sealed class MediaMergerPayloadValidationTests
         Assert.Equal(PresentationOffset(video, audio), PresentationOffset(outputVideo, outputAudio));
     }
 
-    [Fact]
-    public void Mp4_remux_preserves_a_single_media_edit_with_a_leading_time_and_end_trim()
+    [Theory]
+    [InlineData(1000u, 250L, 1000u, 250L)]
+    [InlineData(48000u, 12001L, 48000u, 12001L)]
+    public void Mp4_remux_preserves_a_single_media_edit_with_a_leading_time_and_end_trim(
+        uint sourceScale, long sourceTicks, uint outputScale, long outputTicks)
     {
         using var originalSource = new MemoryStream(Fixture("video-only.mp4"));
         DemuxedTrack original = Assert.Single(MediaMerger.Demux(originalSource, originalSource.Length, CancellationToken.None));
         long mediaTime = Math.Max(1, original.Timescale / 4);
-        const ulong segmentDuration = 250;
-        original.EditList = [new Mp4EditListEntry(segmentDuration, mediaTime, 1, 0)];
+        ulong segmentDuration = (ulong)outputTicks;
+        original.EditList = [new Mp4EditListEntry((ulong)sourceTicks, mediaTime, 1, 0)];
         original.EditMediaTime = mediaTime;
-        original.EditMovieTimescale = 1000;
+        original.EditMovieTimescale = sourceScale;
 
         using var editedSource = new MemoryStream();
         Mp4Muxer.Write([(original, (Stream)originalSource)], editedSource, CancellationToken.None,
@@ -120,7 +123,7 @@ public sealed class MediaMergerPayloadValidationTests
         Assert.Equal(segmentDuration, sourceEdit.SegmentDuration);
         Assert.Equal(segmentDuration, edited.TrackHeaderDurationMovieTicks);
         Assert.Equal(segmentDuration, edited.MovieHeaderDurationMovieTicks);
-        Assert.Equal(1000u, edited.MovieTimescale);
+        Assert.Equal(outputScale, edited.MovieTimescale);
         AssertEditEndsBeforeMedia(edited, sourceEdit);
 
         var inputs = new[] { (edited, (Stream)editedSource) };
@@ -136,7 +139,7 @@ public sealed class MediaMergerPayloadValidationTests
         Assert.Equal(sourceEdit.MediaRateFraction, outputEdit.MediaRateFraction);
         Assert.Equal(segmentDuration, remuxed.TrackHeaderDurationMovieTicks);
         Assert.Equal(segmentDuration, remuxed.MovieHeaderDurationMovieTicks);
-        Assert.Equal(1000u, remuxed.MovieTimescale);
+        Assert.Equal(outputScale, remuxed.MovieTimescale);
         AssertEditEndsBeforeMedia(remuxed, outputEdit);
     }
 
