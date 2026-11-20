@@ -15,11 +15,11 @@ internal sealed class FirstFlightCanvas : Control
     internal const double BlankStart = 5.03;
     internal const double Duration = 5.25;
     private const double SwarmStart = 1.18;
-    private const double WordmarkStart = 3.55;
+    private const double ForegroundPass = 3.55;
     private const double HoldStart = 4.23;
     private const double FadeStart = 4.75;
     private static readonly double[] Cuts =
-        [0, .12, .26, .43, .57, .70, .88, 1.04, SwarmStart, PublisherStart, WordmarkStart, HoldStart, FadeStart, BlankStart];
+        [0, .12, .26, .43, .57, .70, .88, 1.04, SwarmStart, PublisherStart, ForegroundPass, HoldStart, FadeStart, BlankStart];
     private static readonly string[] Props = ["01_hourglass", "02_key", "03_letter", "04_quill", "05_camera", "06_vinyl", "07_book", "08_moon"];
     private static readonly Flight[] Flights = Enumerable.Range(0, 26).Select(CreateFlight).ToArray();
 
@@ -194,17 +194,18 @@ internal sealed class FirstFlightCanvas : Control
         if (time >= BlankStart) return;
         string theme = _palette.IsDark ? "dark" : "light";
         float fade = 1 - Math.Clamp((float)((time - FadeStart) / (BlankStart - FadeStart)), 0, 1);
-        float reveal = Math.Clamp((float)((time - PublisherStart) / (WordmarkStart - PublisherStart)), 0, 1);
-        Bitmap emblem = Emblem();
-        Draw(graphics, emblem, new RectangleF(235, 109, emblem.Width, emblem.Height), reveal * fade);
-        if (time < WordmarkStart) return;
-
-        Bitmap wordmark = Art("brand.wordmark_" + theme);
-        var wordmarkBounds = new RectangleF(212, 323, 376, 376f * wordmark.Height / wordmark.Width);
-        float opening = Math.Clamp((float)((time - WordmarkStart) / (HoldStart - WordmarkStart)), 0, 1);
-        Draw(graphics, wordmark, wordmarkBounds, fade * Math.Min(1, opening * 2.5f));
+        float opening = Math.Clamp((float)((time - PublisherStart) / (HoldStart - PublisherStart)), 0, 1);
+        float reveal = Math.Clamp((opening - .62f) / .2f, 0, 1);
+        if (reveal > 0)
+        {
+            Bitmap emblem = Emblem();
+            Draw(graphics, emblem, new RectangleF(235, 109, emblem.Width, emblem.Height), reveal * fade);
+            Bitmap wordmark = Art("brand.wordmark_" + theme);
+            float height = 376f * wordmark.Height / wordmark.Width;
+            Draw(graphics, wordmark, new RectangleF(212, 323, 376, height), reveal * fade);
+        }
         if (opening < 1)
-            DrawWordmarkSwarm(graphics, Art("atlas"), wordmarkBounds, opening, time);
+            DrawPublisherFlight(graphics, Art("atlas"), opening, time);
         if (_holdBeforeReveal && _holdMessage.Length > 0 && time >= HoldStart)
         {
             using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
@@ -266,25 +267,34 @@ internal sealed class FirstFlightCanvas : Control
         }
     }
 
-    private static void DrawWordmarkSwarm(Graphics graphics, Bitmap atlas, RectangleF wordmark, float opening, double time)
+    private static void DrawPublisherFlight(Graphics graphics, Bitmap atlas, float opening, double time)
     {
-        const int columns = 10;
-        for (int i = 0; i < columns * 2; i++)
+        const float centerX = 400;
+        const float centerY = 237;
+        int wingBeat = (int)(time * 20);
+        for (int i = 0; i < 14; i++)
         {
             float variation = RandomValue(i * 17 + 4);
-            float delay = variation * .22f;
+            float delay = variation * .14f;
             float flight = Math.Clamp((opening - delay) / (1 - delay), 0, 1);
-            float across = (i % columns + .5f) / columns;
-            float direction = across < .5f ? -1 : 1;
-            float x = wordmark.Left + across * wordmark.Width + (i < columns ? -9 : 9);
-            float y = wordmark.Top + wordmark.Height * (i < columns ? .16f : .82f);
-            x += direction * (LogicalWidth / 2f + 130) * flight * flight;
-            y -= (100 + 155 * variation) * flight;
-            float size = (72 + 23 * variation) * (1 - .28f * flight);
-            float tilt = direction * (.24f + .46f * flight) + .15f * MathF.Sin(7 * flight + i);
-            int frame = 33 + (int)(time * 18 + i * 3) % 10;
-            DrawButterfly(graphics, atlas, new PointF(x, y), size, tilt, frame, direction < 0);
+            // Nearer butterflies appear larger and spread farther from the center.
+            float projection = 1 / (1 - .96f * flight);
+            float angle = i * 2.4f + variation * .35f;
+            float radius = (34 + 56 * variation) * projection;
+            float x = centerX + MathF.Cos(angle) * radius * 1.45f;
+            float y = centerY + MathF.Sin(angle) * radius + 10 * MathF.Sin(7 * flight + i);
+            float size = (25 + 22 * variation) * Math.Min(projection, 7);
+            if (x < -size || x > LogicalWidth + size || y < -size || y > LogicalHeight + size) continue;
+            float tilt = .5f * MathF.Cos(angle) + .17f * MathF.Sin(7 * flight + i);
+            DrawButterfly(graphics, atlas, new PointF(x, y), size, tilt, 33 + (wingBeat + i * 3) % 10, x < centerX);
         }
+
+        // The closest butterfly crosses the viewer's left side as the logo appears behind it.
+        float foreground = opening / .88f;
+        if (foreground >= 1) return;
+        float approach = foreground * foreground;
+        var lead = new PointF(centerX - 720 * approach * foreground, centerY - 68 * foreground);
+        DrawButterfly(graphics, atlas, lead, 56 + 518 * approach, -.17f - .47f * foreground, 33 + wingBeat % 10, true);
     }
 
     private static void DrawButterfly(Graphics graphics, Bitmap atlas, PointF center, float size, float tilt, int frame, bool flip)

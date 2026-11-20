@@ -89,9 +89,9 @@ public sealed class FirstFlightUiTests
             ("logo-flash-first", .05),
             ("logo-flash-last", 1.08),
             ("butterfly-swarm", 2.10),
-            ("publisher-reveal", 3.30),
-            ("wordmark-covered", 3.58),
-            ("wordmark-clearing", 3.86),
+            ("publisher-approach", 3.30),
+            ("publisher-foreground", 3.62),
+            ("publisher-clearing", 3.86),
             ("publisher-wordmark", 4.40),
             ("transition", 4.89),
         })
