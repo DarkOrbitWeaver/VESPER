@@ -107,7 +107,7 @@ internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistratio
     {
         if (!File.Exists(paths.Journal)) return;
         using var appLock = lockApp?.Invoke(ct);
-        ct.ThrowIfCancellationRequested();
+        // Settle the previous transaction under the lock before honoring cancellation of the new one.
         Recover();
     }
 

@@ -785,11 +785,11 @@ internal static class MediaMerger
                 || !Mp4Muxer.EditListsMatch(sourceTrack, outputTrack))
                 throw new MediaContainerException("The MP4 remux changed a track's time base or edit-list timeline.");
 
-            ulong trackDuration = Mp4Muxer.MoviePresentationDuration(sourceTrack);
+            if (outputTrack.MovieTimescale == 0)
+                throw new MediaContainerException("The MP4 remux has no movie timescale.");
+            ulong trackDuration = Mp4Muxer.MoviePresentationDuration(sourceTrack, outputTrack.MovieTimescale);
             expectedMovieDuration = Math.Max(expectedMovieDuration, trackDuration);
-            if (outputTrack.MovieTimescale == 0
-                || (Int128)outputTrack.TrackHeaderDurationMovieTicks * Mp4Muxer.MovieTimescale
-                    != (Int128)trackDuration * outputTrack.MovieTimescale)
+            if (outputTrack.TrackHeaderDurationMovieTicks != trackDuration)
                 throw new MediaContainerException($"The MP4 remux changed the {sourceTrack.Kind.ToString().ToLowerInvariant()} track's presentation duration.");
             if ((outputMovieTimescale is { } savedTimescale && savedTimescale != outputTrack.MovieTimescale)
                 || (outputMovieDuration is { } savedDuration
@@ -822,9 +822,7 @@ internal static class MediaMerger
             }
         }
 
-        if (outputMovieTimescale is not { } movieTimescale || outputMovieDuration is not { } movieDuration
-            || (Int128)movieDuration * Mp4Muxer.MovieTimescale
-                != (Int128)expectedMovieDuration * movieTimescale)
+        if (outputMovieDuration != expectedMovieDuration)
             throw new MediaContainerException("The MP4 remux changed the movie header duration.");
     }
 

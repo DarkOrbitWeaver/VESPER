@@ -89,8 +89,9 @@ internal static class Mp4Muxer
             ValidateEditListForMp4(t);
         }
 
-        ulong movieDuration = inputs.Max(input => MoviePresentationDuration(input.Track));
-        ChapterTrackData chapterTrack = BuildChapterTrack(metadata?.Chapters ?? [], movieDuration);
+        uint movieTimescale = ChooseMovieTimescale(inputs.Select(input => input.Track));
+        ulong movieDuration = inputs.Max(input => MoviePresentationDuration(input.Track, movieTimescale));
+        ChapterTrackData chapterTrack = BuildChapterTrack(metadata?.Chapters ?? [], (ulong)((Int128)movieDuration * MovieTimescale / movieTimescale));
         writtenMetadata = metadata is null ? null : metadata with { Chapters = chapterTrack.Chapters };
 
         var chunks = new List<Chunk>();
@@ -118,11 +119,11 @@ internal static class Mp4Muxer
 
         byte[] ftyp = BuildFtyp(inputs.Select(i => i.Track).ToList());
         int mdatHeader = payload + 8 > uint.MaxValue ? 16 : 8;
-        byte[] moov = BuildMoov(inputs, chunks, 0, false, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
+        byte[] moov = BuildMoov(inputs, chunks, 0, false, mediaPayload, chapterTrack, writtenMetadata, thumbnail, movieTimescale);
         bool co64 = ftyp.Length + moov.Length + mdatHeader + payload > uint.MaxValue;
-        if (co64) moov = BuildMoov(inputs, chunks, 0, true, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
+        if (co64) moov = BuildMoov(inputs, chunks, 0, true, mediaPayload, chapterTrack, writtenMetadata, thumbnail, movieTimescale);
         long baseOffset = ftyp.Length + moov.Length + mdatHeader;
-        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64, mediaPayload, chapterTrack, writtenMetadata, thumbnail);
+        byte[] final = BuildMoov(inputs, chunks, baseOffset, co64, mediaPayload, chapterTrack, writtenMetadata, thumbnail, movieTimescale);
         if (final.Length != moov.Length) throw new InvalidOperationException("MP4 header size changed between passes.");
 
         output.Write(ftyp);
@@ -205,19 +206,43 @@ internal static class Mp4Muxer
         return Math.Max(0, checked(end - Math.Max(0, track.EditMediaTime)));
     }
 
-    internal static ulong MoviePresentationDuration(DemuxedTrack track)
+    internal static ulong MoviePresentationDuration(DemuxedTrack track, uint movieTimescale)
     {
         if (track.EditList is { } edits)
-            return ConvertEditDuration(edits[0].SegmentDuration, track.EditMovieTimescale);
-        return ToMovie(PresentationDuration(track), track.Timescale);
+            return ConvertEditDuration(edits[0].SegmentDuration, track.EditMovieTimescale, movieTimescale);
+        return ConvertEditDuration(ToMovie(PresentationDuration(track), track.Timescale), MovieTimescale, movieTimescale);
     }
 
-    private static ulong ConvertEditDuration(ulong duration, uint sourceMovieTimescale)
+    private static uint ChooseMovieTimescale(IEnumerable<DemuxedTrack> tracks)
+    {
+        // Preserve exact edit durations while keeping the normal millisecond time base when it fits.
+        uint scale = MovieTimescale;
+        foreach (DemuxedTrack track in tracks)
+        {
+            if (track.EditList is not { } edits) continue;
+            uint source = track.EditMovieTimescale;
+            uint denominator = source / Gcd(source, (uint)(edits[0].SegmentDuration % source));
+            ulong next = (ulong)(scale / Gcd(scale, denominator)) * denominator;
+            if (next > uint.MaxValue)
+                throw new MediaContainerException("The MP4 edits need a movie timescale too large for the container.");
+            scale = (uint)next;
+        }
+        return scale;
+    }
+
+    private static uint Gcd(uint left, uint right)
+    {
+        while (right != 0)
+            (left, right) = (right, left % right);
+        return left;
+    }
+
+    private static ulong ConvertEditDuration(ulong duration, uint sourceMovieTimescale, uint movieTimescale)
     {
         if (sourceMovieTimescale == 0)
             throw new MediaContainerException("The MP4 edit list has no movie timescale.");
 
-        Int128 scaledDuration = (Int128)duration * MovieTimescale;
+        Int128 scaledDuration = (Int128)duration * movieTimescale;
         if (scaledDuration % sourceMovieTimescale != 0)
             throw new MediaContainerException("The MP4 edit duration cannot be represented exactly in the output time scale.");
         Int128 outputDuration = scaledDuration / sourceMovieTimescale;
@@ -238,7 +263,8 @@ internal static class Mp4Muxer
         if (edit.SegmentDuration == 0)
             throw new MediaContainerException("MP4 output does not support a zero-length media edit.");
 
-        _ = ConvertEditDuration(edit.SegmentDuration, track.EditMovieTimescale);
+        if (track.EditMovieTimescale == 0)
+            throw new MediaContainerException("The MP4 edit list has no movie timescale.");
     }
 
     internal static bool EditListsMatch(DemuxedTrack expected, DemuxedTrack actual)
@@ -280,7 +306,7 @@ internal static class Mp4Muxer
         var marks = new List<(MediaMergeChapter Chapter, uint Start)>();
         foreach (MediaMergeChapter chapter in chapters)
         {
-            ulong start = ToMovie(chapter.Start.Ticks, TimeSpan.TicksPerSecond);
+            ulong start = ToMovie(chapter.Start.Ticks, TimeSpan.TicksPerSecond, MovieTimescale);
             if (start >= movieDuration || marks.Count > 0 && start <= marks[^1].Start) continue;
             marks.Add((chapter, (uint)start));
         }
@@ -293,12 +319,12 @@ internal static class Mp4Muxer
         {
             (MediaMergeChapter chapter, uint start) = marks[i];
             uint next = i + 1 < marks.Count ? marks[i + 1].Start : (uint)movieDuration;
-            ulong requestedEnd = chapter.End is { } end ? ToMovie(end.Ticks, TimeSpan.TicksPerSecond) : next;
+            ulong requestedEnd = chapter.End is { } end ? ToMovie(end.Ticks, TimeSpan.TicksPerSecond, MovieTimescale) : next;
             uint endTime = (uint)Math.Min(movieDuration, Math.Min(requestedEnd, next));
             if (endTime <= start) continue;
             if (start > cursor) samples.Add(new ChapterSample(TextSample(""), start - cursor));
             samples.Add(new ChapterSample(TextSample(chapter.Title), endTime - start));
-            written.Add(new MediaMergeChapter(chapter.Title, FromMovie(start), FromMovie(endTime)));
+            written.Add(new MediaMergeChapter(chapter.Title, TimeSpan.FromMilliseconds(start), TimeSpan.FromMilliseconds(endTime)));
             cursor = endTime;
         }
         if (written.Count == 0) return new ChapterTrackData([], [], 0);
@@ -315,8 +341,6 @@ internal static class Mp4Muxer
         utf8.CopyTo(data, 2);
         return data;
     }
-
-    private static TimeSpan FromMovie(uint ticks) => TimeSpan.FromTicks((long)ticks * TimeSpan.TicksPerMillisecond);
 
     private static byte[] ChapterSampleEntry()
     {
@@ -426,11 +450,12 @@ internal static class Mp4Muxer
 
     private static ulong ToMovie(long ticks, uint timescale) => ticks <= 0 ? 0 : (ulong)(((Int128)ticks * MovieTimescale + timescale / 2) / timescale);
 
-    private static ulong ToMovie(long ticks, long timescale) => ticks <= 0 ? 0 : (ulong)(((Int128)ticks * MovieTimescale + timescale / 2) / timescale);
+    private static ulong ToMovie(long ticks, long timescale, uint movieTimescale) =>
+        ticks <= 0 ? 0 : (ulong)(((Int128)ticks * movieTimescale + timescale / 2) / timescale);
 
     private static byte[] BuildMoov(IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, List<Chunk> chunks,
         long baseOffset, bool co64, long mediaPayload, ChapterTrackData chapterTrack, MediaMergeMetadata? metadata,
-        MediaThumbnail? thumbnail)
+        MediaThumbnail? thumbnail, uint movieTimescale)
     {
         var w = new BoxWriter();
         int moov = w.Begin("moov");
@@ -439,14 +464,14 @@ internal static class Mp4Muxer
         for (int i = 0; i < inputs.Count; i++)
         {
             var t = inputs[i].Track;
-            presentation[i] = MoviePresentationDuration(t);
+            presentation[i] = MoviePresentationDuration(t, movieTimescale);
             movieDuration = Math.Max(movieDuration, presentation[i]);
         }
 
         bool v1 = movieDuration > uint.MaxValue;
         int mvhd = w.BeginFull("mvhd", (byte)(v1 ? 1 : 0), 0);
-        if (v1) { w.U64(0); w.U64(0); w.U32(MovieTimescale); w.U64(movieDuration); }
-        else { w.U32(0); w.U32(0); w.U32(MovieTimescale); w.U32((uint)movieDuration); }
+        if (v1) { w.U64(0); w.U64(0); w.U32(movieTimescale); w.U64(movieDuration); }
+        else { w.U32(0); w.U32(0); w.U32(movieTimescale); w.U32((uint)movieDuration); }
         w.U32(0x00010000); w.U16(0x0100); w.Zero(10); w.Matrix(); w.Zero(24);
         w.U32((uint)inputs.Count + (chapterTrack.Samples.Count > 0 ? 2u : 1u));
         w.End(mvhd);
@@ -489,7 +514,7 @@ internal static class Mp4Muxer
                 Mp4EditListEntry[] outputEdits = edits.Select(edit => edit with
                 {
                     SegmentDuration = t.EditList is null ? edit.SegmentDuration
-                        : ConvertEditDuration(edit.SegmentDuration, t.EditMovieTimescale)
+                        : ConvertEditDuration(edit.SegmentDuration, t.EditMovieTimescale, movieTimescale)
                 }).ToArray();
                 int edts = w.Begin("edts");
                 bool ev1 = outputEdits.Any(edit => edit.SegmentDuration > uint.MaxValue
@@ -556,14 +581,16 @@ internal static class Mp4Muxer
         long chunkOffset, bool co64)
     {
         int trak = w.Begin("trak");
-        int tkhd = w.BeginFull("tkhd", 0, 0x000002); // Disabled marker track, linked from the primary track.
-        w.U32(0); w.U32(0); w.U32(trackId); w.U32(0); w.U32((uint)duration);
+        bool longDuration = duration > uint.MaxValue;
+        int tkhd = w.BeginFull("tkhd", (byte)(longDuration ? 1 : 0), 0x000002); // Disabled marker track.
+        if (longDuration) { w.U64(0); w.U64(0); w.U32(trackId); w.U32(0); w.U64(duration); }
+        else { w.U32(0); w.U32(0); w.U32(trackId); w.U32(0); w.U32((uint)duration); }
         w.Zero(8); w.U16(0); w.U16(0); w.U16(0); w.U16(0); w.Matrix(); w.U32(0); w.U32(0);
         w.End(tkhd);
 
         int mdia = w.Begin("mdia");
         int mdhd = w.BeginFull("mdhd", 0, 0);
-        w.U32(0); w.U32(0); w.U32(MovieTimescale); w.U32((uint)duration);
+        w.U32(0); w.U32(0); w.U32(MovieTimescale); w.U32((uint)data.Samples.Sum(sample => (long)sample.Duration));
         w.U16(PackLanguage("und")); w.U16(0);
         w.End(mdhd);
         int hdlr = w.BeginFull("hdlr", 0, 0);
