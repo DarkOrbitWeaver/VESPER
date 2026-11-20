@@ -187,45 +187,36 @@ public sealed partial class DownloadEngine
             {
                 MediaTimeRange? range = RequestedWaveRange(job);
                 MediaMergeMetadata? metadata = ConvertedFileMetadata(job);
+                bool rewrite = range is not null || metadata is not null;
                 string waveStage = ConversionTaggedPath(job);
                 using (var decoded = File.OpenRead(stage))
-                using (var wave = CreateOwnedStage(waveStage, FileShare.None, out taggedIdentity))
                 {
                     PathSafety.RequireTemporaryIdentity(decoded.SafeFileHandle, stageIdentity);
                     var info = WaveAudio.Read(decoded);
                     if (info.Channels != audio.Channels || info.SampleRate != audio.SampleRate
                         || Math.Abs(info.Duration - audio.DurationSeconds) > Math.Max(.25, audio.DurationSeconds * .01))
                         throw new MediaContainerException("The decoded WAV differs from the source timeline.");
-                    await WaveAudio.WriteAsync(decoded, wave, range, metadata, ct).ConfigureAwait(false);
-                    wave.Flush(flushToDisk: true);
+                    if (rewrite)
+                    {
+                        using var wave = CreateOwnedStage(waveStage, FileShare.None, out taggedIdentity);
+                        await WaveAudio.WriteAsync(decoded, wave, range, metadata, ct).ConfigureAwait(false);
+                        wave.Flush(flushToDisk: true);
+                    }
                 }
-                try
+                if (rewrite)
                 {
-                    ReplaceFile(job, waveStage, taggedIdentity, stage, stageIdentity, out string movedIdentity);
-                    stageIdentity = movedIdentity;
-                    taggedIdentity = null;
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    if (range is not null || metadata is not null)
+                    try
+                    {
+                        ReplaceFile(job, waveStage, taggedIdentity, stage, stageIdentity, out string movedIdentity);
+                        stageIdentity = movedIdentity;
+                        taggedIdentity = null;
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
                         preserveConversionStagesForAttention = true;
                         throw new LocalStorageException("The requested WAV clip or track details could not be saved safely at "
                             + PathSafety.ForDisplay(stage) + ". No file was published. Move any conflicting temporary stage "
                             + "out of the download folder, then resume.", ex);
-                    }
-
-                    try
-                    {
-                        if (stageIdentity is null) throw new IOException("The earlier WAV stage has no saved identity.");
-                        RequirePathIdentity(stage, stageIdentity);
-                    }
-                    catch (Exception verificationError) when (verificationError is IOException or UnauthorizedAccessException)
-                    {
-                        preserveConversionStagesForAttention = true;
-                        throw new LocalStorageException("The earlier WAV stage at " + PathSafety.ForDisplay(stage)
-                            + " could not be verified after a failed swap. No file was published. Move any conflicting "
-                            + "temporary stage out of the download folder, then resume.", verificationError);
                     }
                 }
             }
