@@ -21,7 +21,7 @@ public sealed class FirstFlightUiTests
     public void StalledPaintsStillAdvanceThroughEveryIntroScene()
     {
         double frame = -1;
-        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.91, 3.73, 4.88, 5.35];
+        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.91, 3.55, 4.23, 4.75];
         foreach (double cut in cuts)
         {
             frame = FirstFlightCanvas.NextFrame(frame, 10);
@@ -90,15 +90,17 @@ public sealed class FirstFlightUiTests
             ("logo-flash-last", 1.08),
             ("butterfly-swarm", 2.10),
             ("publisher-reveal", 3.30),
-            ("publisher-wordmark", 4.25),
-            ("transition", 5.50),
+            ("wordmark-covered", 3.58),
+            ("wordmark-clearing", 3.86),
+            ("publisher-wordmark", 4.40),
+            ("transition", 4.89),
         })
         {
             canvas.Render(graphics, image.Size, time);
             Save(image, $"first-flight-{theme}-{name}");
         }
 
-        canvas.Render(graphics, image.Size, 4.98);
+        canvas.Render(graphics, image.Size, 4.40);
         Color band = image.GetPixel(400, 199);
         Color disk = image.GetPixel(400, 175);
         Assert.True(band.GetBrightness() > disk.GetBrightness() + .3f, $"Rim {band}, disk {disk}");
@@ -192,7 +194,7 @@ public sealed class FirstFlightUiTests
                         introCaptured = true;
                     }
 
-                    if (!publisherCaptured && introClock.Elapsed.TotalSeconds >= 4.98)
+                    if (!publisherCaptured && introClock.Elapsed.TotalSeconds >= 4.40)
                     {
                         Assert.True(canvas.Playing, "The publisher reveal ended before its screenshot was captured.");
                         SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-publisher-reveal.png"));
