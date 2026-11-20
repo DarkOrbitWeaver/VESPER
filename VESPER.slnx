@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="VESPER.csproj" />
   <Folder Name="/src/">
+    <Project Path="src/Vesper.MediaPlanning/Vesper.MediaPlanning.csproj" />
     <Project Path="src/Vesper.Engine/Vesper.Engine.csproj" />
     <Project Path="src/Vesper.MediaResolver/Vesper.MediaResolver.csproj" />
     <Project Path="src/Vesper.NativeHost/Vesper.NativeHost.csproj" />

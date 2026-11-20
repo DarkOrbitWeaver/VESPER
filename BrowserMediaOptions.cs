@@ -58,6 +58,7 @@ internal sealed partial class BrowserBridgeHandler
         if (!Uri.TryCreate(request.Url, UriKind.Absolute, out Uri? page))
             return BridgeResponse.Fail(request.Id, "invalid", "This page address is invalid.");
 
+        using var timing = ProcessingTiming.Measure(Guid.TryParse(request.Id, out var id) ? id : Guid.Empty, ProcessingPhase.Discovery);
         using var discovery = CancellationTokenSource.CreateLinkedTokenSource(ct);
         discovery.CancelAfter(TimeSpan.FromSeconds(42)); // Leave time for the browser helper's cold start.
         using var resolver = new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options));

@@ -224,6 +224,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
     private async Task<RunOutcome> MergeAsync(MediaMergePlan plan, string fingerprint, CancellationToken ct)
     {
+        using var timing = ProcessingTiming.Measure(Job.Id, ProcessingPhase.Merge, Job.TotalBytes ?? 0);
         string mergingPath = MergingPath(Job);
         string? mergingIdentity = null;
         string? tracksIdentity = null;
@@ -332,7 +333,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;
-                    MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
+                    using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Verify, output.Length))
+                        MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
                     output.Position = 0;
                     sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
                     tracksLength = source.Length;

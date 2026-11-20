@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Vesper.Engine/Vesper.Engine.csproj" />
+    <ProjectReference Include="../Vesper.MediaResolver/Vesper.MediaResolver.csproj" />
+    <InternalsVisibleTo Include="VESPER" />
+    <InternalsVisibleTo Include="Vesper.Tests" />
+    <InternalsVisibleTo Include="Vesper.Windows.Tests" />
+    <InternalsVisibleTo Include="Vesper.LiveCheck" />
+    <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />
+  </ItemGroup>
+</Project>

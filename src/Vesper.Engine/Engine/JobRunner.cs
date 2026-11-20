@@ -137,8 +137,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 if (first.Total is long total) { EnsureSpace(file, total); file.EnsureLength(total); }
                 await WaitForBrowserApprovalAsync(ct).ConfigureAwait(false);
 
-                if (first.Ranged) await RunRangedAsync(first, ct).ConfigureAwait(false);
-                else await RunLinearAsync(first, file, ct).ConfigureAwait(false);
+                using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Transfer, first.Total ?? 0))
+                {
+                    if (first.Ranged) await RunRangedAsync(first, ct).ConfigureAwait(false);
+                    else await RunLinearAsync(first, file, ct).ConfigureAwait(false);
+                }
             }
             catch (RangeProblemException problem) when (!_singleConnection)
             {

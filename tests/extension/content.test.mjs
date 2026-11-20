@@ -297,7 +297,7 @@ test('a feed player uses the unique page linked from its card', async () => {
   assert.equal(window.__testPageForPlayer(new FakeElement()), home);
 });
 
-test('a feed preview that starts after the pointer settles uses its linked page', async () => {
+test('a delayed hover preview keeps its linked page after the player is reset', async () => {
   class FakeElement {
     parentElement = null;
     isConnected = true;
@@ -317,6 +317,12 @@ test('a feed preview that starts after the pointer settles uses its linked page'
   const card = new FakeElement();
   const video = new FakeVideo();
   const unrelatedVideo = new FakeVideo();
+  const sent = [];
+  const timers = [];
+  const node = () => ({
+    setAttribute() {}, matches: () => false,
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false }
+  });
   let videos = [];
   let hoverTarget = card;
   card.parentElement = body;
@@ -327,6 +333,7 @@ test('a feed preview that starts after the pointer settles uses its linked page'
   const document = Object.assign(new EventTarget(), {
     body,
     documentElement: {},
+    createElement: node,
     querySelectorAll: () => [],
     elementFromPoint: () => hoverTarget
   });
@@ -337,11 +344,14 @@ test('a feed preview that starts after the pointer settles uses its linked page'
     HTMLMediaElement: FakeVideo, HTMLVideoElement: FakeVideo,
     AbortController, URL, innerWidth: 1280, innerHeight: 720,
     getComputedStyle: () => ({ visibility: 'visible' }),
+    clearTimeout() {},
+    setTimeout: (_handler, delay) => timers.push(delay),
     matchMedia: () => motion,
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
     chrome: {
-      runtime: { id: 'vesper-test', onMessage: { addListener() {} } },
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} },
+        sendMessage: async message => { sent.push(message); return { ok: false, code: 'protected' }; } },
       storage: {
         sync: { get: async defaults => defaults },
         onChanged: { addListener() {}, removeListener() {} }
@@ -352,7 +362,13 @@ test('a feed preview that starts after the pointer settles uses its linked page'
   vm.runInContext(source('player-source'), context);
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
     onPointer, consider, handlePlayerPlaying, setSelectPlayer: fn => { selectPlayer = fn; },
-    activePreview: () => activePreview
+    activePreview: () => activePreview, holdMissingPreview, loadFormats,
+    attachForTest: (player, controls) => {
+      video = player; perch = { x: 10, y: 10 };
+      ({ button, panel, receipt } = controls);
+      companion = { setPickerOpen() {}, setVisible() {} };
+      renderShell = () => {};
+    }
   };\n})();`);
   vm.runInContext(content, context);
   await Promise.resolve();
@@ -370,4 +386,13 @@ test('a feed preview that starts after the pointer settles uses its linked page'
 
   assert.equal(window.__testContent.activePreview()?.player, video);
   assert.equal(window.__testContent.activePreview()?.page, item);
+  window.__testContent.attachForTest(video, { button: node(), panel: node(), receipt: node() });
+  video.readyState = 0;
+  assert.equal(window.__testContent.holdMissingPreview(), true);
+  assert.deepEqual(timers, [900]);
+
+  await window.__testContent.loadFormats();
+  assert.equal(sent[0].pageUrl, item);
+  assert.equal(sent[0].playerUrl, '');
+  assert.equal(sent[0].playerPlaying, false);
 });

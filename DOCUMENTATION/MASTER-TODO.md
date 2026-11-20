@@ -86,7 +86,7 @@
 
 - [ ] **VES-060 — shared network policies.** Remove redundant HTTP handler/proxy/SSRF/redirect logic only when current cross-origin, proxy and download security tests give proof.
 - [ ] **VES-063 — large absolute-layout forms.** Split/measure only problematic surfaces while preserving stable WinForms startup and low working set.
-- [ ] **VES-064 — linked planner source.** Consider moving into a proper referenced library once interface is stable; preserve direct-paste/extension parity.
+- [x] **VES-064 — shared planner project.** The app, LiveCheck, benchmarks, and engine tests compile against the same Vesper.MediaPlanning assembly. Real browser and provider acceptance stays tracked separately.
 - [ ] **VES-066 — unreachable APIs.** Create explicit caller/entrypoint reachability map and regression for engine commands; do not duplicate dead UI.
 - [ ] **VES-067 — string-based errors.** Introduce typed/shared reason catalog with compatibility tests so UI and extension cannot drift.
 - [x] **VES-068 — comments explain why; add debug invariants.** Kept the explanatory-comment standard and added debug-only live-checkpoint extent and publication-length assertions. Runtime guards remain authoritative; see `STATUS.tsv` and the 2026-11-19 implementation record.

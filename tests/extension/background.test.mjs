@@ -2454,6 +2454,20 @@ test('every reason the worker can record has plain wording in the popup', async 
 
 // ---------------------------------------------------------------- right-clicking a player-made video (issue 5)
 
+test('both YouTube Mix card actions open Find media for the clicked item', async () => {
+  const page = 'https://www.youtube.com/watch?v=abcdefghijk&list=RDabcdefghijk';
+  const tab = { id: 9, url: 'https://www.youtube.com/' };
+  const app = load({ 'media-picker': { ok: true } });
+  for (const [menuItemId, srcUrl] of [
+    ['vesper-link', undefined], ['vesper-media', 'blob:https://www.youtube.com/preview'], ['vesper-media', undefined]
+  ]) {
+    await app.onContextClicked({ menuItemId, linkUrl: page, srcUrl, pageUrl: tab.url }, tab);
+    assert.equal(app.sent.at(-1).type, 'media-picker');
+    assert.equal(app.sent.at(-1).url, page);
+  }
+  assert.equal(app.sent.length, 3);
+});
+
 test('right-clicking a blob video opens the media picker for the page instead of failing silently', async () => {
   const app = load({ 'media-picker': { ok: true } });
   const tab = { id: 9, url: 'https://video.example/watch?v=abc' };

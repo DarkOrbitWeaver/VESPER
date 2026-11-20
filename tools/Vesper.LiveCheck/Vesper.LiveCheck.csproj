@@ -15,6 +15,6 @@
     <ProjectReference Include="..\..\src\Vesper.Engine\Vesper.Engine.csproj" />
     <ProjectReference Include="..\..\src\Vesper.MediaResolver\Vesper.MediaResolver.csproj" />
     <!-- The exact selection/plan code the desktop app and browser bridge use. -->
-    <Compile Include="..\..\MediaTransferBridge.cs" Link="MediaTransferBridge.cs" />
+    <ProjectReference Include="../../src/Vesper.MediaPlanning/Vesper.MediaPlanning.csproj" />
   </ItemGroup>
 </Project>

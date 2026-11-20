@@ -985,6 +985,24 @@ function contextPageUrl(info, tab) {
   return /^https?:\/\//i.test(tab?.url || '') ? tab.url : null;
 }
 
+function linkedMediaPage(value) {
+  const page = VesperPlayerSource.http(value);
+  if (!page || !isYouTubePage(page)) return null;
+  if (VesperPlayerSource.identity(page.href) !== page.href) return page.href;
+  if (['/playlist', '/watch'].includes(page.pathname)
+      && /^[\w-]{2,128}$/.test(page.searchParams.get('list') || '')) return page.href;
+  return null;
+}
+
+async function openContextMedia(pageUrl, info, tab) {
+  const reply = pageUrl ? await nativeRequest(envelope('media-picker', {
+    ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || info.pageUrl || tab?.url || pageUrl,
+      frameId: info.frameId ?? 0 }, { userGesture: true }),
+    url: pageUrl, pageTitle: '', candidates: []
+  })) : { ok: false, message: 'This page cannot be inspected.' };
+  flash(tab?.id, reply);
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER…', contexts: ['page', 'link', 'selection'] });
@@ -1016,32 +1034,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         if (opened?.ok) return;
       } catch { /* Use the native page resolver when this frame has no VESPER player. */ }
     }
-    const pageUrl = contextPageUrl(info, tab);
-    if (pageUrl) {
-      const reply = await nativeRequest(envelope('media-picker', {
-        ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }, { userGesture: true }),
-        url: pageUrl, pageTitle: '', candidates: []
-      }));
-      flash(tab?.id, reply);
-    } else {
-      flash(tab?.id, { ok: false, message: 'This page cannot be inspected.' });
-    }
+    await openContextMedia(contextPageUrl(info, tab), info, tab);
     return;
   }
-  const url = info.menuItemId === 'vesper-link' ? info.linkUrl : info.srcUrl;
-  if (info.menuItemId === 'vesper-media' && url && !/^https?:/i.test(url)) {
-    // A blob: or data: source is made by the page itself (an MSE player). VESPER cannot fetch it, but it
-    // can resolve the page's real stream. Open the media picker for this page instead of failing silently.
-    const pageUrl = contextPageUrl(info, tab);
-    if (pageUrl) {
-      const reply = await nativeRequest(envelope('media-picker', {
-        ...await mediaAuthorization(pageUrl, { tab, url: info.frameUrl || pageUrl, frameId: info.frameId ?? 0 }, { userGesture: true }),
-        url: pageUrl, pageTitle: '', candidates: []
-      }));
-      flash(tab?.id, reply.ok ? { ok: true } : reply);
-    } else {
-      flash(tab?.id, { ok: false, message: 'This page cannot be inspected.' });
-    }
+  const linkAction = info.menuItemId === 'vesper-link';
+  const url = linkAction ? info.linkUrl : info.srcUrl;
+  const targetPage = linkedMediaPage(info.linkUrl);
+  if (linkAction && targetPage) {
+    await openContextMedia(targetPage, info, tab);
+    return;
+  }
+  if (info.menuItemId === 'vesper-media' && (!url || !/^https?:/i.test(url))) {
+    // The preview URL may vanish. The link Chrome captured still identifies the card.
+    await openContextMedia(targetPage || (url && contextPageUrl(info, tab)), info, tab);
     return;
   }
   if (!url || !/^https?:/i.test(url)) {

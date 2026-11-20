@@ -59,15 +59,20 @@ public sealed class MediaConversionTests
     }
 
     [Fact]
-    public async Task CompatibleFragmentedAacIsRemuxedToM4aWithoutReencoding()
+    public async Task CompatibleFragmentedAacIsRemuxedToTaggedM4aWithoutReencoding()
     {
         await using var server = new FaultServer();
         byte[] sourceBytes = server.Extra["/audio.mp4"] = Audio();
+        server.Extra["/cover.png"] = TinyPng();
         await server.StartAsync();
         using var harness = new Harness();
-        Guid id = AddAudio(harness, server);
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/audio.mp4"), FileName: "audio.mp4",
+            MediaProvider: "fixture", MediaQuality: "Audio AAC", Output: MediaOutput.M4a,
+            MediaMetadataJson: System.Text.Json.JsonSerializer.Serialize(SongTags),
+            MediaThumbnailUrl: server.Url("/cover.png")));
+        Assert.True(added.Ok, added.Message);
 
-        JobSnapshot done = await harness.WaitForStateAsync(id, JobState.Completed);
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
 
         Assert.Equal("", done.Reason);
         Assert.Equal("audio.m4a", done.FileName);
@@ -94,6 +99,9 @@ public sealed class MediaConversionTests
         Assert.NotEmpty(outputAudio.Samples);
         Assert.InRange(Math.Abs(outputAudio.DurationSeconds - sourceAudio.DurationSeconds), 0, 0.05);
         AssertSameSamples(source, sourceAudio, output, outputAudio);
+        AssertSongTags(Mp4Demuxer.ReadMetadata(output, output.Length));
+        Assert.Equal(Payloads.Sha256(TinyPng()), Mp4Demuxer.ReadThumbnail(output, output.Length)?.Sha256);
+        Assert.Equal(1, server.Hits("/cover.png"));
     }
 
     [Fact]

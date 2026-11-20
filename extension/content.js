@@ -176,7 +176,7 @@
   function selectPlayer() {
     if (!alive()) return;
     if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
-    if (video && !video.isConnected && activePreview?.player === video && holdDisconnectedPreview()) { place(); return; }
+    if (holdMissingPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
     let best = null, bestArea = 0;
     if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))) {
@@ -192,10 +192,8 @@
       if (area > bestArea) { best = el; bestArea = area; }
     }
     if (best) attach(best);
-    else if (video && !video.isConnected) {
-      if (holdDisconnectedPreview()) place();
-      else detach();
-    } else if (video) place();
+    else if (video && !video.isConnected) detach();
+    else if (video) place();
   }
 
   function consider(el) {
@@ -259,7 +257,10 @@
       playback.delete(e.target);
     }
     if (e.target !== video) return;
-    if (type === 'emptied') mediaChangedAt = Date.now();
+    if (type === 'emptied') {
+      mediaChangedAt = Date.now();
+      schedule();
+    }
     if (!panelMedia && receiptTimer) closePanel();
   }, { capture: true, passive: true, signal });
   document.addEventListener('encrypted', (e) => {
@@ -440,6 +441,7 @@
 
   function detach() {
     listening = false;
+    activePreview = null;
     companion?.stopIdle();
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
@@ -454,7 +456,6 @@
     cancelAnimationFrame(frame);
     frame = 0;
     perch = null;
-    activePreview = null;
     companion?.dispose();
     companion = null;
     host?.remove(); host = root = button = panel = receipt = null; video = null;
@@ -462,18 +463,23 @@
 
   function place(continuous = false) {
     if (!alive()) return;
-    if (!video || !video.isConnected) {
-      if (panelMedia && panel?.classList.contains('show')) { button.hidden = true; updateFlyVisibility(); return; }
-      if (holdDisconnectedPreview()) { updateFlyVisibility(); return; }
-      return detach();
-    }
+    if (!video) return detach();
     const fullscreen = document.fullscreenElement;
-    const r = visiblePlayer(video);
-    button.hidden = !r || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
-    if (button.hidden) { perch = null; closePanel(); return; }
-    perch = playerPerch(r, Boolean(fullscreen));
+    const held = holdMissingPreview();
+    if (held) {
+      button.hidden = false;
+    } else if (!video.isConnected) {
+      if (!perch || !panelMedia || !panel?.classList.contains('show')) return detach();
+      button.hidden = true;
+    } else {
+      const rect = visiblePlayer(video);
+      button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
+      if (button.hidden) { perch = null; closePanel(); return; }
+      perch = playerPerch(rect, Boolean(fullscreen));
+      companion.setPerch(perch.x, perch.y, perch.faceLeft, Boolean(fullscreen), { continuous });
+    }
+    if (!perch) return detach();
     const { x, y, faceLeft } = perch;
-    companion.setPerch(x, y, faceLeft, Boolean(fullscreen), { continuous });
     updateFlyVisibility();
     if (panel.classList.contains('show')) {
       const left = faceLeft ? x + FLY_SIZE - panel.offsetWidth : x;
@@ -539,14 +545,14 @@
       if (activatePreview(cardPreview(e.target))) selectPlayer();
     }
     updateFlyVisibility();
-    if (video && !video.isConnected && !panelMedia) holdDisconnectedPreview();
+    holdMissingPreview();
     companion?.pointerMove(e.clientX, e.clientY);
   }
   function clearPointer() {
     pointer = pointerTarget = null;
     companion?.pointerMove(-Infinity, -Infinity);
     updateFlyVisibility();
-    if (video && !video.isConnected && !panelMedia) holdDisconnectedPreview();
+    holdMissingPreview();
   }
 
   function previewLatched() {
@@ -554,8 +560,13 @@
     return !!pointer && !!perch && Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) <= 90;
   }
 
-  function holdDisconnectedPreview() {
-    if (!video || video.isConnected || activePreview?.player !== video || panelMedia) return false;
+  function previewMissing() {
+    return !!video && activePreview?.player === video && (video.readyState < 1 || !visiblePlayer(video));
+  }
+
+  function holdMissingPreview() {
+    if (document.fullscreenElement || !perch || !previewMissing()) return false;
+    if (panelMedia?.player === video) return true;
     if (!previewRemovedAt) previewRemovedAt = Date.now();
     if (!previewExitTimer) {
       const player = video;
@@ -563,10 +574,10 @@
       const delay = Math.min(PREVIEW_EXIT_GRACE, Math.max(0, PREVIEW_MAX_LATCH - elapsed));
       previewExitTimer = setTimeout(() => {
         previewExitTimer = 0;
-        if (video !== player || player.isConnected) { previewRemovedAt = 0; return; }
+        if (video !== player || !previewMissing()) { previewRemovedAt = 0; return; }
         if (panelMedia) return;
         if (previewLatched() && Date.now() - previewRemovedAt < PREVIEW_MAX_LATCH) {
-          holdDisconnectedPreview();
+          holdMissingPreview();
           return;
         }
         activePreview = null;
@@ -601,7 +612,7 @@
     button?.setAttribute('aria-expanded', 'false');
     companion?.setPickerOpen(false, acknowledged);
     updateFlyVisibility();
-    if (video && !video.isConnected) holdDisconnectedPreview();
+    holdMissingPreview();
   }
 
   async function togglePanel() {
@@ -623,7 +634,7 @@
     const targetPage = activePreview?.player === player ? activePreview.page : pageForPlayer(player);
     const identity = VesperPlayerSource.identity(targetPage);
     const binding = playback.get(player) || preview?.binding;
-    const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
+    const current = !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
     const targetKey = activePreview?.player === player ? activePreview.key
       : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), targetKey,
@@ -644,7 +655,7 @@
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
     const result = await send({ type: 'media-options', pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
-      title, playerPlaying: !player.paused && !player.ended, playerPageUrl: targetPage,
+      title, playerPlaying: current && !player.paused && !player.ended, playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;

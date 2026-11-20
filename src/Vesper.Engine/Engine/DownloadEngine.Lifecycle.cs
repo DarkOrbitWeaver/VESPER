@@ -24,7 +24,7 @@ public sealed partial class DownloadEngine
             return RunOutcome.NeedsAttention("incomplete", "Some data is missing even though the transfer ended. Saved data was kept; resume to fetch the rest.");
 
         if (file.Length != total) file.Truncate(total);     // stale tail from an older, longer file never ships
-        file.Flush();
+        using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush, total)) file.Flush();
         if (!HttpFacts.IsHtmlFileName(job.FileName) && LooksLikeHtmlFile(file, total))
             return RunOutcome.NeedsAttention("html", "The server sent a web page instead of the selected file. Saved data was kept; nothing was published.");
         bool hasPreparedConversion = job.PendingConversionBytes is not null
@@ -47,6 +47,7 @@ public sealed partial class DownloadEngine
                 : extension is ".mp4" or ".m4a" or ".m4v" or ".mov" || type.Contains("mp4") ? "mp4" : null;
             if (format is not null)
             {
+                using var probe = ProcessingTiming.Measure(job.Id, ProcessingPhase.Probe, total);
                 try { MediaTrackProbe.RequireAudio(file, format, ct); }
                 catch (MediaContainerException ex)
                 { return RunOutcome.NeedsAttention("media-validation", ex.Message + " Saved data was kept."); }
@@ -56,7 +57,8 @@ public sealed partial class DownloadEngine
         if (job.ExpectedSha256 is { } expected)
         {
             SetPhase(job, JobState.Verifying);
-            string actual = HashFile(file, total, ct);
+            string actual;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, total)) actual = HashFile(file, total, ct);
             if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
             {
                 session.CloseFile();
@@ -116,6 +118,7 @@ public sealed partial class DownloadEngine
         if (!PathSafety.TryResolveFolder(job.DestinationFolder, create: true, out _, out string problem))
             return RunOutcome.NeedsAttention("destination", problem + " The finished file is waiting at " + PathSafety.ForDisplay(job.PartialPath));
 
+        using var timing = ProcessingTiming.Measure(job.Id, ProcessingPhase.Publish, prepared?.Bytes ?? job.TotalBytes ?? 0);
         string source = prepared?.Path ?? job.PartialPath;
         long? expectedLength = prepared?.Bytes ?? job.TotalBytes;
         if (!IsPublicationFile(job, source, expectedLength))

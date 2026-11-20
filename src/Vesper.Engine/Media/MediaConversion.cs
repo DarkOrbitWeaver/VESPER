@@ -54,7 +54,9 @@ public sealed partial class DownloadEngine
                 return (file, notice);
 
             using var source = PartialFile.OpenOwnedRead(job);
-            List<DemuxedTrack> tracks = MediaMerger.Demux(source, source.Length, ct);
+            List<DemuxedTrack> tracks;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Probe, source.Length))
+                tracks = MediaMerger.Demux(source, source.Length, ct);
             DemuxedTrack? audio = tracks.Find(t => t.Kind == TrackKind.Audio);
             DemuxedTrack? video = tracks.Find(t => t.Kind == TrackKind.Video);
             bool wantVideo = job.Output == MediaOutput.Mp4;
@@ -78,8 +80,12 @@ public sealed partial class DownloadEngine
                 var tags = ConvertedFileMetadata(job);
                 var cover = ReadEmbeddedCover(source)
                     ?? await MediaThumbnail.FetchAsync(job.MediaThumbnailUrl, _http, Options.AllowPrivateNetworks, ct).ConfigureAwait(false);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.CopyQueue))
+                    await _remuxSlots.WaitAsync(ct).ConfigureAwait(false);
+                remuxPermit = true;
                 using var opus = CreateOwnedStage(stage, FileShare.None, out stageIdentity);
-                await OpusMuxer.WriteAsync(audio, source, opus, tags, cover, ct).ConfigureAwait(false);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Remux, source.Length))
+                    await OpusMuxer.WriteAsync(audio, source, opus, tags, cover, ct).ConfigureAwait(false);
                 opus.Flush(flushToDisk: true); opus.Position = 0;
                 string hash = Convert.ToHexString(await SHA256.HashDataAsync(opus, ct).ConfigureAwait(false));
                 file = new PreparedMediaFile(opus.Length, hash, stage, Path.ChangeExtension(job.FileName, ".opus"),
@@ -109,12 +115,28 @@ public sealed partial class DownloadEngine
                 && MediaMerger.ChooseContainer(remuxInputs.Select(input => input.Track).ToArray(), remuxContainer) == remuxContainer;
             if (directRemux)
             {
-                await _remuxSlots.WaitAsync(ct).ConfigureAwait(false);
+                MediaMergeMetadata? metadata;
+                MediaThumbnail? cover;
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Tags))
+                {
+                    metadata = ConvertedFileMetadata(job);
+                    cover = ReadEmbeddedCover(source);
+                    if (cover is null && !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl))
+                        cover = await MediaThumbnail.FetchAsync(job.MediaThumbnailUrl, _http, Options.AllowPrivateNetworks, ct).ConfigureAwait(false);
+                }
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.CopyQueue))
+                    await _remuxSlots.WaitAsync(ct).ConfigureAwait(false);
                 remuxPermit = true;
                 using var remuxed = CreateOwnedStage(stage, FileShare.None, out stageIdentity);
-                MediaMerger.Merge(remuxInputs, remuxContainer!, remuxed, ct);
-                MediaMerger.ValidateRemux(remuxed, remuxed.Length, remuxInputs, ct);
-                // The durability flush happens after metadata edits, before hashing and publication staging.
+                MergeResult merged;
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Remux, source.Length))
+                    merged = MediaMerger.Merge(remuxInputs, remuxContainer!, remuxed, ct, metadata, cover);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Verify, remuxed.Length))
+                {
+                    var verified = MediaMerger.ValidateRemux(remuxed, remuxed.Length, remuxInputs, ct, merged.Metadata, merged.ThumbnailSha256);
+                    ValidateConvertedMp4(remuxed, tracks, audio, video, stageIdentity, ct, verified);
+                }
+                if (cover is null && !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl)) notice = "Saved without unavailable source artwork.";
             }
             else
             {
@@ -124,18 +146,23 @@ public sealed partial class DownloadEngine
 
                 string extension = audio.SourceContainer == "webm" ? ".mkv" : ".mp4";
                 double totalSeconds = Math.Max(audio.DurationSeconds, video?.DurationSeconds ?? 0);
+                int lastPercent = -1;
                 Action<double> progress = seconds =>
                 {
                     int percent = totalSeconds > 0 ? (int)Math.Clamp(seconds / totalSeconds * 100, 0, 99) : 0;
+                    if (percent == lastPercent) return;
+                    lastPercent = percent;
                     UpdateJob(job, j => j.Message = $"Converting {percent}% ({FormatClock(seconds)} of {FormatClock(totalSeconds)})");
                 };
                 if (Options.ConvertMedia is null && !OperatingSystem.IsWindows()) return (file, notice);
                 // Native and injected encoders remain serialized (including RemuxWithAac's audio transcode).
                 // Hold this gate only for the actual conversion, not source inspection, metadata, hashing,
                 // or independent direct-remux jobs.
-                await _conversionSlot.WaitAsync(ct).ConfigureAwait(false);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.EncoderQueue))
+                    await _conversionSlot.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {
+                    using var encoding = ProcessingTiming.Measure(job.Id, ProcessingPhase.Encode, source.Length);
                     if (Options.ConvertMedia is { } convert)
                     {
                         convert(job.PartialPath, extension, stage, job.Output, ct);
@@ -213,7 +240,7 @@ public sealed partial class DownloadEngine
                 (notice, stageIdentity) = await EmbedConvertedMp3TagsAsync(job, source, stage,
                     stageIdentity ?? throw new IOException("The converted MP3 has no saved identity."), ct).ConfigureAwait(false);
             }
-            else
+            else if (!directRemux)
             {
                 using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read,
                     1 << 16, FileOptions.SequentialScan))
@@ -222,14 +249,17 @@ public sealed partial class DownloadEngine
                 }
 
                 // The converter only writes audio and video. Title, artist and cover go in now, before the file is hashed.
-                (notice, stageIdentity) = await EmbedConvertedTagsAsync(job, source, stage,
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Tags))
+                    (notice, stageIdentity) = await EmbedConvertedTagsAsync(job, source, stage,
                     stageIdentity ?? throw new IOException("The converted file has no saved identity."), ct).ConfigureAwait(false);
             }
 
             using var output = new FileStream(stage, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
-            output.Flush(flushToDisk: true);
-            string digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) output.Flush(flushToDisk: true);
+            string digest;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, output.Length))
+                digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
             file = new PreparedMediaFile(output.Length, digest, stage,
                 Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), stageIdentity
@@ -371,10 +401,10 @@ public sealed partial class DownloadEngine
     }
 
     private static void ValidateConvertedMp4(FileStream converted, List<DemuxedTrack> tracks, DemuxedTrack audio,
-        DemuxedTrack? video, string? identity, CancellationToken ct)
+        DemuxedTrack? video, string? identity, CancellationToken ct, List<DemuxedTrack>? verified = null)
     {
         PathSafety.RequireTemporaryIdentity(converted.SafeFileHandle, identity);
-        List<DemuxedTrack> actual = Mp4Demuxer.Read(converted, converted.Length, ct);
+        List<DemuxedTrack> actual = verified ?? Mp4Demuxer.Read(converted, converted.Length, ct);
         DemuxedTrack? outAudio = actual.Find(t => t.Kind == TrackKind.Audio);
         DemuxedTrack? outVideo = actual.Find(t => t.Kind == TrackKind.Video);
         if (actual.Count != tracks.Count || outAudio is not { Codec: "aac" } || outAudio.Channels != audio.Channels
