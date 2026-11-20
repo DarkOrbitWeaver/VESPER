@@ -255,7 +255,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _customFormat.SelectedIndexChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
         _canvas.Controls.AddRange([_qualityLabel, _quality, _outputChoice, _audioOutputChoice,
             _audioTrack, _subtitleChoice, _embedSubtitles, _customLabel, _customFormat]);
-        _clipCheck = new CheckBox
+        _clipCheck = new VesperCheckBox(_colors)
         {
             Text = "Time range", AccessibleName = "Download only a time range of the media", AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft, BackColor = _colors.Surface, ForeColor = _colors.Text,
@@ -488,7 +488,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             if (_state == ViewState.Ready) _status.Height = S(181 + _statusExtra) - _status.Top;
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
             shift = _statusExtra;                       // everything below the status text moves down with it
-            int outputWidth = Math.Min(S(132), contentWidth / 2);
+            int outputWidth = Math.Min(S(156), contentWidth / 2);
             int subtitleShift = _embedSubtitles.Visible ? 29 : 0;
             Place(_outputChoice, width - margin - outputWidth, 181, outputWidth, 28);
             Place(_audioOutputChoice, width - margin - outputWidth, 181, outputWidth, 28);
