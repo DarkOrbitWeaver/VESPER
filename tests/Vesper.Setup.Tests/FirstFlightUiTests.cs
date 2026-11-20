@@ -140,7 +140,7 @@ public sealed class FirstFlightUiTests
             Assert.True(canvas.Playing, "A fast successful install cut off the First Flight sequence.");
             Assert.Equal("Open VESPER", Assert.IsType<VesperButton>(window.AcceptButton).Text);
             Assert.Contains(window.Controls.OfType<Label>(), label => label.Text ==
-                "Native host files and browser registration were installed. Setup has not verified that the extension can connect to VESPER.");
+                "Open VESPER to get started. Enable the extension in Chrome to send downloads.");
         }
         else
         {

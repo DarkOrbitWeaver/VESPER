@@ -6,13 +6,15 @@
 
   const lifetime = new AbortController();
   const { signal } = lifetime;
-  const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_RADIUS = 100;
+  const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_IDLE = 2300;
   const PREVIEW_EXIT_GRACE = 900, PREVIEW_MAX_LATCH = 2200;
   let video = null;            // the player the butterfly is attached to
   let host = null, root = null, button = null, panel = null, receipt = null;
   let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
-  let previewRemovedAt = 0, panelMotion = null;
+  let previewRemovedAt = 0, panelMotion = null, fullscreenTimer = 0;
+  let drag = null, movedPerch = null, suppressDragClick = false, pointerMovedAt = 0;
+  let contextNotice = null, contextNoticeTimer = 0;
   let activePreview = null;
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
@@ -42,6 +44,8 @@
     visibility.disconnect();
     observed.clear();
     unwatchMotion?.();
+    clearTimeout(contextNoticeTimer);
+    contextNotice?.remove();
     detach();
     delete window.__vesperContent;
   }
@@ -103,7 +107,8 @@
     const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
     if (right - left < MIN_WIDTH || bottom - top < MIN_HEIGHT) return null;
     const style = getComputedStyle(el);
-    return style.visibility === 'hidden' || style.visibility === 'collapse' ? null : { left, top, right, bottom };
+    return style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0'
+      ? null : { left, top, right, bottom };
   }
 
   function cardContext(node, includePlayer) {
@@ -174,6 +179,7 @@
 
   function selectPlayer() {
     if (!alive()) return;
+    if (drag && visiblePlayer(video)) { place(true); return; }
     if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
     if (holdMissingPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
@@ -282,9 +288,9 @@
   function parseClock(text) {
     const value = String(text || '').trim();
     if (!value) return null;
-    if (/^\d+(\.\d+)?$/.test(value)) return Number(value);
+    if (!/^\d+(?::[0-5]?\d){0,2}(?:\.\d+)?$/.test(value)) return null;
     const parts = value.split(':').map(Number);
-    if (parts.length > 3 || parts.some(part => !Number.isFinite(part) || part < 0)) return null;
+    if (parts.some(part => !Number.isFinite(part))) return null;
     return parts.reduce((total, part) => total * 60 + part, 0);
   }
   function clockText(seconds) {
@@ -312,7 +318,8 @@
         *{box-sizing:border-box;font-family:'Segoe UI',system-ui,sans-serif}
         .fly{position:fixed;left:0;top:0;width:${FLY_SIZE}px;height:${FLY_SIZE}px;border-radius:6px;border:0;background:none;display:flex;
           align-items:center;justify-content:center;cursor:pointer;padding:0;opacity:0;pointer-events:none;
-          transition:opacity .18s ease;touch-action:manipulation}
+          transition:opacity .18s ease;touch-action:none}
+        .fly.dragging{cursor:grabbing}
         .fly[hidden]{display:none}.fly.show,.fly:focus-visible{opacity:1;pointer-events:auto}
         .fly canvas{transition:translate 160ms ease-out}.fly:hover canvas{translate:0 -2px}
         @media (prefers-reduced-motion:reduce){.fly canvas{transition:none}.fly:hover canvas{translate:none}}
@@ -341,10 +348,14 @@
         .output{display:flex;flex-wrap:wrap;min-width:0;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
         .clip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px 0;font-size:12px;color:var(--text)}
         .clip[hidden],.clip .fields[hidden],.hint[hidden]{display:none}
-        .clip .fields{display:flex;align-items:center;gap:6px;margin-left:auto}
+        .clip .fields{display:grid;gap:6px;width:100%}
+        .clip .trim-line{display:grid;grid-template-columns:30px 62px 1fr;gap:8px;align-items:center}
         .clip .fields small{color:var(--muted);font-size:11px}
         .clip input[type=text]{width:62px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px}
+        .clip input[type=range]{min-width:0;width:100%;margin:0;accent-color:var(--green)}
         .clip input[type=checkbox]{accent-color:var(--green);margin:0}
+        .clip>label{display:flex;gap:7px;align-items:center}
+        .clip-error{color:var(--red);font-size:11px}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
         .output[hidden]{display:none}
         .output select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
@@ -383,8 +394,18 @@
     root.append(style, button, panel, receipt);
     button.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (suppressDragClick && e.detail !== 0) {
+        suppressDragClick = false;
+        return;
+      }
       void togglePanel();
     }, { signal });
+    button.draggable = false;
+    button.addEventListener('pointerdown', startDrag, { signal });
+    button.addEventListener('pointermove', moveDrag, { signal });
+    button.addEventListener('pointerup', finishDrag, { signal });
+    button.addEventListener('pointercancel', finishDrag, { signal });
+    button.addEventListener('lostpointercapture', finishDrag, { signal });
     button.addEventListener('focus', updateFlyVisibility, { signal });
     button.addEventListener('blur', updateFlyVisibility, { signal });
     root.addEventListener('keydown', (e) => {
@@ -407,10 +428,17 @@
   document.addEventListener('fullscreenchange', () => {
     if (!alive()) return;
     pointer = null;
+    stopFullscreenIdle();
+    if (document.fullscreenElement) wakeFullscreen();
     if (host) mount();
     selectPlayer();
   }, { passive: true, signal });
-  document.addEventListener('visibilitychange', () => { if (alive()) updateFlyVisibility(); }, { signal });
+  document.addEventListener('visibilitychange', () => {
+    if (!alive()) return;
+    if (document.hidden) stopFullscreenIdle();
+    else if (document.fullscreenElement) wakeFullscreen();
+    updateFlyVisibility();
+  }, { signal });
   document.addEventListener('keydown', e => {
     if (!alive() || !e.altKey || !e.shiftKey || e.key.toLowerCase() !== 'v' || !perch || button?.hidden) return;
     e.preventDefault();
@@ -426,6 +454,7 @@
     }
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
+    if (drag) finishDrag({ pointerId: drag.id });
     closePanel();
     resize.disconnect();
     video = el;
@@ -449,6 +478,8 @@
     listening = false;
     activePreview = null;
     companion?.stopIdle();
+    stopFullscreenIdle();
+    drag = null;
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
     closePanel();
@@ -482,7 +513,7 @@
       button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
       if (button.hidden) { perch = null; closePanel(); return; }
       perch = playerPerch(rect, Boolean(fullscreen));
-      companion.setPerch(perch.x, perch.y, perch.faceLeft, Boolean(fullscreen), { continuous });
+      companion.setPerch(perch.x, perch.y, perch.faceLeft, Boolean(fullscreen), { continuous, immediate: !!drag?.moved });
     }
     if (!perch) return detach();
     const { x, y, faceLeft } = perch;
@@ -501,6 +532,11 @@
   }
 
   function playerPerch(rect, fullscreen) {
+    if (movedPerch) {
+      const x = rect.left + (rect.right - rect.left - FLY_SIZE) * movedPerch.x;
+      const y = rect.top + (rect.bottom - rect.top - FLY_SIZE) * movedPerch.y;
+      return { x, y, faceLeft: movedPerch.x > 0.5 };
+    }
     const preview = activePreview?.player === video && !fullscreen;
     const right = { x: rect.right - FLY_SIZE - 10, faceLeft: true };
     const left = { x: rect.left + 10, faceLeft: false };
@@ -517,19 +553,74 @@
     return { ...corners[0], y: rect.top + 8 };
   }
 
-  function schedule() { if (alive() && !frame) frame = requestAnimationFrame(() => { frame = 0; place(true); }); }
+  function startDrag(e) {
+    if (e.button !== 0 || !e.isPrimary || !perch || !video) return;
+    suppressDragClick = false;
+    const box = button.getBoundingClientRect();
+    drag = { id: e.pointerId, player: video, x: e.clientX, y: e.clientY,
+      grabX: e.clientX - box.left, grabY: e.clientY - box.top, moved: false };
+    button.setPointerCapture(e.pointerId);
+  }
+
+  function moveDrag(e) {
+    if (drag?.id !== e.pointerId || drag.player !== video) return;
+    if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 5) return;
+    const rect = visiblePlayer(video);
+    if (!rect) return;
+    drag.moved = true;
+    button.classList.add('dragging');
+    const fraction = (value, size) => Math.max(0, Math.min(1, value / size));
+    movedPerch = {
+      x: fraction(e.clientX - drag.grabX - rect.left, rect.right - rect.left - FLY_SIZE),
+      y: fraction(e.clientY - drag.grabY - rect.top, rect.bottom - rect.top - FLY_SIZE)
+    };
+    place(true);
+  }
+
+  function finishDrag(e) {
+    if (drag?.id !== e.pointerId) return;
+    suppressDragClick = drag.moved;
+    drag = null;
+    button?.classList.remove('dragging');
+    updateFlyVisibility();
+  }
+
+  function schedule() {
+    if (alive() && !frame) frame = requestAnimationFrame(() => {
+      frame = 0;
+      if (visiblePlayer(video)) place(true);
+      else selectPlayer();
+    });
+  }
+
+  function stopFullscreenIdle() {
+    clearTimeout(fullscreenTimer);
+    fullscreenTimer = 0;
+  }
+
+  function wakeFullscreen() {
+    pointerMovedAt = Date.now();
+    if (fullscreenTimer || document.hidden) return;
+    function idle() {
+      fullscreenTimer = 0;
+      if (!alive() || !document.fullscreenElement || document.hidden) return;
+      const remaining = FULLSCREEN_IDLE - (Date.now() - pointerMovedAt);
+      if (remaining > 0) fullscreenTimer = setTimeout(idle, remaining);
+      else updateFlyVisibility();
+    }
+    fullscreenTimer = setTimeout(idle, FULLSCREEN_IDLE);
+  }
 
   function updateFlyVisibility() {
     if (!button || !companion) return;
     if (!perch || button.hidden) { companion.setVisible(false); return; }
-    const radius = FULLSCREEN_RADIUS + (button.classList.contains('show') ? 14 : 0);
-    const nearby = pointer && Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) <= radius;
-    const show = !document.fullscreenElement || panel.classList.contains('show') || !!receiptTimer || !!nearby || button.matches(':focus-visible');
+    const awake = Date.now() - pointerMovedAt < FULLSCREEN_IDLE;
+    const show = !document.hidden && (!document.fullscreenElement || awake || drag
+      || panel.classList.contains('show') || !!receiptTimer || button.matches(':focus-visible'));
     button.classList.toggle('show', show);
-    companion.setVisible(show && !document.hidden);
+    companion.setVisible(Boolean(show));
   }
 
-  let pointerMovedAt = 0;
   // What the butterfly needs to know before it may stir on its own (vesper-companion.js scheduleIdle).
   const idleContext = {
     paused: () => !video || video.paused || video.ended,
@@ -545,10 +636,17 @@
   function onPointer(e) {
     if (!alive()) return;
     pointerMovedAt = Date.now();
+    if (document.fullscreenElement) wakeFullscreen();
     pointer = { x: e.clientX, y: e.clientY };
+    if (drag) { updateFlyVisibility(); return; }
     if (e.target !== pointerTarget) {
       pointerTarget = e.target;
-      if (activatePreview(cardPreview(e.target))) selectPlayer();
+      const preview = cardPreview(e.target);
+      if (activatePreview(preview)) selectPlayer();
+      else if (!preview && activePreview && !previewMissing() && !previewLatched()) {
+        activePreview = null;
+        selectPlayer();
+      }
     }
     updateFlyVisibility();
     holdMissingPreview();
@@ -588,6 +686,7 @@
         }
         activePreview = null;
         detach();
+        selectPlayer();
       }, delay);
     }
     return true;
@@ -628,7 +727,7 @@
     await loadFormats();
   }
 
-  async function loadFormats() {
+  async function loadFormats(refresh = false) {
     syncPage();
     if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
     dismissReceipt();
@@ -660,7 +759,7 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
-    const result = await send({ type: 'media-options', pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
+    const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
       title, playerPlaying: current && !player.paused && !player.ended, playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
@@ -675,7 +774,8 @@
     }
     if (!result?.ok || (!result.data?.choices?.length && !result.data?.sourceChoices?.length)) {
       const message = errorMessage(result);
-      if (!['protected', 'blocked', 'chrome-format'].includes(result?.code)) appendRetry(message, loadFormats, result?.data?.retryAt);
+      if (!['protected', 'blocked', 'chrome-format'].includes(result?.code))
+        appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
       return renderShell(title, poster, duration, message);
     }
     const formats = result.data;
@@ -735,7 +835,7 @@
           const accepted = (reply.results || []).filter(result => ['queued', 'started', 'already-submitted'].includes(result.status)).length;
           status.textContent = `${accepted} item(s) accepted in VESPER.`;
         } else {
-          status.textContent = errorMessage(reply);
+          status.textContent = errorMessage(reply).textContent;
           status.classList.toggle('bad', reply?.code !== 'cancelled');
         }
       } catch {
@@ -772,7 +872,7 @@
       if (output.hidden) return;
       const kind = audio ? 'audio' : 'video';
       if (mode.dataset.kind !== kind) {
-        const labels = audio ? formats.audioOutputs?.map(entry => entry.label) || ['M4A — plays everywhere', 'Original audio'] : ['Plays everywhere (MP4)', 'Original (best quality)'];
+        const labels = audio ? formats.audioOutputs?.map(entry => entry.label) || ['M4A (compatible)', 'Original audio'] : ['MP4 (compatible)', 'Original format'];
         mode.replaceChildren(...labels.map(name => element('option', '', name)));
         mode.dataset.kind = kind;
       }
@@ -842,33 +942,61 @@
       };
       list.prepend(pinned);
     }
-    // "Download part": only for formats VESPER can cut (segmented HLS/DASH). Start/End as m:ss or seconds.
-    const clip = element('label', 'clip');
+    const clip = element('div', 'clip');
+    const clipToggle = element('label');
     const clipBox = element('input');
     clipBox.type = 'checkbox';
-    const clipFields = element('span', 'fields');
+    const draft = formats.trimDraft ||= { enabled: false, start: '', end: '' };
+    clipBox.checked = draft.enabled;
+    clipToggle.append(clipBox, element('span', '', 'Trim'));
+    const clipFields = element('div', 'fields');
+    const clipError = element('div', 'clip-error');
+    clipError.setAttribute('role', 'status');
+    clipError.hidden = true;
+    const hasDuration = Number.isFinite(seconds) && seconds > 0;
     const startField = element('input'), endField = element('input');
-    for (const [field, name] of [[startField, 'Start'], [endField, 'End']]) {
-      field.type = 'text'; field.placeholder = name === 'Start' ? '0:00' : (seconds ? clockText(seconds) : '1:00');
-      field.setAttribute('aria-label', name); field.size = 7; field.inputMode = 'numeric';
-      clipFields.append(element('small', '', name), field);
+    for (const [field, key, label] of [[startField, 'start', 'Start'], [endField, 'end', 'End']]) {
+      const row = element('div', 'trim-line');
+      field.type = 'text';
+      field.value = draft[key];
+      field.placeholder = key === 'start' ? '0:00' : hasDuration ? clockText(seconds) : '1:00';
+      field.setAttribute('aria-label', label + ' time');
+      row.append(element('small', '', label), field);
+      const slider = hasDuration ? element('input') : null;
+      if (slider) {
+        slider.type = 'range';
+        slider.min = '0';
+        slider.max = String(seconds);
+        slider.step = 'any';
+        slider.value = String(parseClock(field.value) ?? (key === 'start' ? 0 : seconds));
+        slider.setAttribute('aria-label', 'Trim ' + key);
+        slider.oninput = () => {
+          field.value = draft[key] = slider.valueAsNumber.toFixed(2).replace(/\.?0+$/, '');
+          clipError.hidden = true;
+        };
+        row.append(slider);
+      }
+      field.oninput = () => {
+        draft[key] = field.value;
+        const value = parseClock(field.value);
+        if (slider && value !== null) slider.value = String(value);
+        clipError.hidden = true;
+      };
+      clipFields.append(row);
     }
-    clipFields.hidden = true;
-    clipBox.onchange = () => { clipFields.hidden = !clipBox.checked; clipNote.hidden = !clipBox.checked; };
-    clip.append(clipBox, element('span', '', 'Download part'), clipFields);
-    const clipNote = element('small', 'hint', 'May start a few seconds early: it cuts at the nearest segment.');
-    clipNote.hidden = true;
-    function clipRange() {
-      if (!clipBox.checked || clip.hidden) return undefined;
-      const start = parseClock(startField.value) ?? 0;
-      const end = parseClock(endField.value) ?? seconds ?? NaN;
-      return { start, end };
-    }
+    const clipNote = element('small', 'hint');
+    clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); place(true); };
+    clip.append(clipToggle, clipFields, clipError);
+
     function refreshClip() {
       const canClip = !!choice?.canClip;
-      clipNote.textContent = choice?.container === 'WAV' ? 'Exact sample boundaries. The entire source is downloaded and decoded.' : 'May start a few seconds early: it cuts at the nearest segment.';
-      clip.hidden = !canClip;
-      if (!canClip) { clipFields.hidden = true; clipNote.hidden = true; }
+      clip.hidden = !canClip && !draft.enabled;
+      clipFields.hidden = !canClip || !draft.enabled;
+      clipNote.hidden = !draft.enabled;
+      clipError.hidden = true;
+      clipNote.textContent = !canClip ? 'Choose a format that supports trimming, or turn Trim off.'
+        : choice.clipUsesWholeFile ? 'Saves the times you chose. VESPER downloads and decodes the whole file first.'
+        : 'The clip may start earlier or end later than the times you choose.';
     }
     const body = [output, list, clip, clipNote];
     if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {
@@ -927,7 +1055,22 @@
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
       action.onclick = () => {
-        if (action.isConnected) void deliver(title, poster, seconds, formats, choice.index, mode, request, { ...intent, range: clipRange() });
+        if (!action.isConnected) return;
+        let range;
+        if (draft.enabled) {
+          const start = draft.start.trim() ? parseClock(draft.start) : 0;
+          let end = draft.end.trim() ? parseClock(draft.end) : hasDuration ? seconds : null;
+          if (hasDuration && end !== null && end <= seconds + 0.005) end = Math.min(end, seconds);
+          if (!choice.canClip || start === null || end === null || end <= start || hasDuration && end > seconds) {
+            clipError.textContent = choice.canClip ? 'Enter a valid start and end time within the video.'
+              : 'Turn Trim off or choose another format.';
+            clipError.hidden = false;
+            place(true);
+            return;
+          }
+          range = { start, end };
+        }
+        void deliver(title, poster, seconds, formats, choice.index, mode, request, { ...intent, range });
       };
       footer.append(action);
     }
@@ -938,7 +1081,7 @@
   function renderSourceChoices(title, poster, seconds, formats) {
     const list = element('div', 'list');
     list.setAttribute('role', 'group');
-    list.setAttribute('aria-label', 'Choose a stream');
+    list.setAttribute('aria-label', 'Other video sources');
     for (const source of formats.sourceChoices) {
       const option = element('button', 'opt');
       const labels = element('span');
@@ -947,7 +1090,7 @@
       option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds); };
       list.append(option);
     }
-    renderShell(title, poster, seconds, element('div', 'msg', 'Check a source to see its download options.'), list);
+    renderShell(title, poster, seconds, element('div', 'msg', 'Check a video source to see its formats.'), list);
   }
 
   async function inspectSource(token, title, poster, seconds) {
@@ -968,7 +1111,7 @@
     const message = result?.code === 'unavailable'
       ? element('div', 'msg bad', 'This source couldn’t be opened.')
       : errorMessage(result);
-    appendRetry(message, loadFormats, result?.data?.retryAt, 'Back to sources');
+    appendRetry(message, () => loadFormats(true), result?.data?.retryAt, 'Back to sources');
     renderShell(title, poster, seconds, message);
   }
 
@@ -989,8 +1132,9 @@
         status === 'already-submitted' ? 'Already in VESPER' : 'Sent to VESPER', request);
     }
     const error = errorMessage(reply);
-    appendRetry(error, reply?.code === 'expired-selection' ? loadFormats
-      : () => deliver(title, poster, seconds, formats, formatChoice, mode, request));
+    const refresh = ['expired-selection', 'source-expired'].includes(reply?.code);
+    appendRetry(error, refresh ? () => loadFormats(true)
+      : () => deliver(title, poster, seconds, formats, formatChoice, mode, request, intent), reply?.data?.retryAt);
     const hasFocus = panel.contains(root.activeElement);
     renderShell(title, poster, seconds, error);
     if (hasFocus) error.querySelector('button')?.focus({ preventScroll: true });
@@ -1028,24 +1172,45 @@
 
   function errorMessage(reply) {
     const text = {
-      'host-missing': 'The browser helper needs registration. Use Repair helper in VESPER’s Browser settings.',
+      'host-missing': 'Open VESPER Settings, then use Repair helper under Browser.',
       'app-unavailable': 'Could not connect to the desktop helper.',
       'host-error': 'The connection to VESPER failed.',
       duplicate: 'This link is already in VESPER.',
       cancelled: 'Cancelled in VESPER.',
       timeout: 'VESPER didn’t answer in time.',
-      'no-media': 'No downloadable media was found for this page.',
-      unavailable: 'This media is unavailable or has been removed.',
-      'source-expired': 'The media link expired. Reopen the preview to refresh it.',
-      'sign-in': 'This media requires a sign-in to access.',
-      'browser-context': 'The site requires a browser session or verification step.',
+      'no-media': 'VESPER couldn’t find a video to download. Play the video, then try again.',
+      unavailable: 'VESPER couldn’t open this video. Refresh the page and try again.',
+      'source-expired': 'The video link expired. Try again to look for a fresh link.',
+      'expired-selection': 'Those choices expired. Try again to refresh them.',
+      'sign-in': 'Sign in on this site, then try again.',
+      'browser-context': 'Open and play the video in Chrome, then try again.',
       blocked: 'The site blocked the request or restricted its region.',
       network: 'The media link could not be reached. Check your connection and retry.',
-      'resolver-error': 'The media resolver hit a temporary problem. Try again shortly.',
+      'resolver-error': 'VESPER couldn’t load the video choices. Try again in a moment.',
       invalid: reply?.message || 'The current media selection is invalid.',
       unsupported: reply?.message || 'This source can’t be downloaded.'
     }[reply?.code] || reply?.message || 'Something went wrong.';
     return element('div', 'msg bad', text);
+  }
+
+  function showContextNotice(reply) {
+    clearTimeout(contextNoticeTimer);
+    contextNotice?.remove();
+    contextNotice = element('div');
+    contextNotice.style.cssText = 'all:initial;position:fixed;right:18px;top:18px;z-index:2147483647;pointer-events:none';
+    const root = contextNotice.attachShadow({ mode: 'closed' });
+    const style = element('style');
+    style.textContent = VesperTheme.css + `
+      .notice{max-width:min(310px,calc(100vw - 36px));padding:11px 14px;border:1px solid var(--border);
+        border-radius:8px;background:var(--surface);color:var(--text);font:13px/1.4 'Segoe UI',sans-serif}
+    `;
+    const notice = element('div', 'notice', errorMessage(reply).textContent);
+    notice.setAttribute('role', 'status');
+    root.append(style, notice);
+    const fullscreen = document.fullscreenElement;
+    (fullscreen?.tagName === 'DIV' ? fullscreen : document.documentElement).append(contextNotice);
+    contextNotice.dataset.vesperTheme = host?.dataset.vesperTheme || 'system';
+    contextNoticeTimer = setTimeout(() => { contextNotice?.remove(); contextNotice = null; }, 5000);
   }
 
   function applyMotion() {
@@ -1060,9 +1225,16 @@
   }, { capture: true, passive: true, signal });
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender?.id !== chrome.runtime.id) return false;
+    if (message?.type === 'vesper-context-notice' && alive()) {
+      showContextNotice(message.reply);
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === 'vesper-open-picker') {
       syncPage();
-      if ((!video?.isConnected && activePreview?.player !== video) || !panel) {
+      const playerUrl = video && (playerSource(video) || activePreview?.binding?.src);
+      if ((!video?.isConnected && activePreview?.player !== video) || !panel || button?.hidden
+          || message.playerUrl && playerUrl !== message.playerUrl) {
         sendResponse({ ok: false, code: 'no-player' });
         return false;
       }

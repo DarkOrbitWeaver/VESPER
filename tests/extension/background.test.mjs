@@ -1832,6 +1832,9 @@ test('blob and data media context-menu actions show failure feedback', async () 
   await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'blob:https://example.com/media' }, { id: 3 });
   await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'data:video/mp4;base64,AAAA' }, { id: 3 });
   assert.deepEqual(JSON.parse(JSON.stringify(app.badges)), [{ tabId: 3, text: '!' }, { tabId: 3, text: '!' }]);
+  const notices = app.tabMessages.filter(entry => entry.message.type === 'vesper-context-notice');
+  assert.equal(notices.length, 2);
+  assert.ok(notices.every(entry => entry.message.reply.message.length > 0));
 });
 
 test('a rate-limited lookup does not start a new request using Chrome', async () => {
@@ -2068,7 +2071,7 @@ test('video format prefetch is off by default and limited to supported pages', a
   assert.equal(enabled.sent.length, 0);
 });
 
-test('prepared formats are reused by the click and expire quickly', async () => {
+test('prepared formats are reused, refreshed on request and expire quickly', async () => {
   const app = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
   const prefetched = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
   assert.equal(prefetched.ok, true);
@@ -2078,9 +2081,12 @@ test('prepared formats are reused by the click and expire quickly', async () => 
   assert.deepEqual(click.data.choices, mediaOptionsReply.data.choices);
   assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
 
+  await app.message(videoOptionsMessage(videoPage, { refresh: true }), videoSender);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 2);
+
   app.advanceTime(31_000);
   await app.message(videoOptionsMessage(videoPage), videoSender);
-  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 2);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 3);
 });
 
 test('generic player prefetch requires a media URL observed by Chrome', async () => {
@@ -2523,6 +2529,26 @@ test('both YouTube Mix card actions open Find media for the clicked item', async
     assert.equal(app.sent.at(-1).url, page);
   }
   assert.equal(app.sent.length, 3);
+});
+
+test('the clicked TikTok card takes precedence over its temporary preview file', async () => {
+  const page = 'https://www.tiktok.com/@owner/video/12345';
+  const tab = { id: 9, url: 'https://www.tiktok.com/' };
+  const app = load({ 'media-picker': { ok: true } });
+  await app.onContextClicked({ menuItemId: 'vesper-media', linkUrl: page,
+    srcUrl: 'https://cdn.example/preview.mp4', pageUrl: tab.url }, tab);
+  assert.equal(app.sent[0].type, 'media-picker');
+  assert.equal(app.sent[0].url, page);
+});
+
+test('a link without a usable web address explains the failure in the clicked frame', async () => {
+  const app = load();
+  await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'blob:https://example.com/item', frameId: 2 }, { id: 3 });
+  assert.equal(app.sent.length, 0);
+  const notice = app.tabMessages.at(-1);
+  assert.equal(notice.options.frameId, 2);
+  assert.equal(notice.message.type, 'vesper-context-notice');
+  assert.match(notice.message.reply.message, /web address/);
 });
 
 test('right-clicking a blob video opens the media picker for the page instead of failing silently', async () => {

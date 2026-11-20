@@ -58,11 +58,11 @@ globalThis.VesperCompanion = (() => {
 
     // continuous=true means the player moved (scroll, resize): stay attached, do not fly.
     // A discrete change (new player, fullscreen) flies or walks as before.
-    setPerch(x, y, faceLeft, fullscreen, { continuous = false } = {}) {
+    setPerch(x, y, faceLeft, fullscreen, { continuous = false, immediate = false } = {}) {
       const previous = this.perch;
       if (previous?.x === x && previous.y === y && previous.faceLeft === faceLeft && previous.fullscreen === fullscreen) return;
       this.perch = { x, y, faceLeft, fullscreen };
-      if (!previous || !this.visible || !this.ready || this.still) return this.resetPose();
+      if (immediate || !previous || !this.visible || !this.ready || this.still) return this.resetPose();
       if (continuous && !this.flight && !this.walk) {
         this.position(this.x + (x - previous.x), this.y + (y - previous.y));
         return;

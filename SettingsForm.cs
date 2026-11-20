@@ -151,6 +151,8 @@ internal sealed class SettingsForm : VesperPopupForm
         return button;
     }
 
+    private int S(int logicalPixels) => UiKit.Scale(this, logicalPixels);
+
     private VesperChoice Choice(string[] options, int selected, int width, string accessibleName)
     {
         var control = new VesperChoice
@@ -175,8 +177,8 @@ internal sealed class SettingsForm : VesperPopupForm
         page.Controls.AddRange([heading, intro, divider]);
         page.Resize += (_, _) =>
         {
-            intro.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 50);
-            divider.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 50);
+            intro.Width = Math.Max(S(200), page.ClientSize.Width - S(50));
+            divider.Width = Math.Max(S(200), page.ClientSize.Width - S(50));
         };
         _pages.Add(key, page);
         _content.Controls.Add(page);
@@ -319,12 +321,12 @@ internal sealed class SettingsForm : VesperPopupForm
             sleepQueue, shutdownQueue, powerNote]);
         void Layout()
         {
-            int right = page.ClientSize.Width - 25;
-            browse.Left = Math.Max(308, right - browse.Width);
-            frame.Width = Math.Max(UiKit.Scale(this, 180), browse.Left - 34);
-            int noteWidth = Math.Max(UiKit.Scale(this, 210), right - 45);
+            int right = page.ClientSize.Width - S(25);
+            browse.Left = Math.Max(S(308), right - browse.Width);
+            frame.Width = Math.Max(S(180), browse.Left - S(34));
+            int noteWidth = Math.Max(S(210), right - S(45));
             categoryNote.Width = missingNote.Width = templateNote.Width = templatePreview.Width = powerNote.Width = noteWidth;
-            templateFrame.Width = Math.Max(UiKit.Scale(this, 180), right - 50);
+            templateFrame.Width = Math.Max(S(180), right - S(50));
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -517,13 +519,13 @@ internal sealed class SettingsForm : VesperPopupForm
             folderLabel, folderFrame, browse, saveRule, removeRule, note]);
         void Layout()
         {
-            int available = page.ClientSize.Width - 50;
-            int gap = UiKit.Scale(this, 8);
-            _siteRuleList.Width = Math.Max(UiKit.Scale(this, 200), available);
-            hostFrame.Width = Math.Max(UiKit.Scale(this, 200), available);
-            folderFrame.Width = Math.Max(UiKit.Scale(this, 200), available - browse.Width - gap);
+            int available = page.ClientSize.Width - S(50);
+            int gap = S(8);
+            _siteRuleList.Width = Math.Max(S(200), available);
+            hostFrame.Width = Math.Max(S(200), available);
+            folderFrame.Width = Math.Max(S(200), available - browse.Width - gap);
             browse.Left = folderFrame.Right + gap;
-            note.Width = Math.Max(UiKit.Scale(this, 200), available);
+            note.Width = Math.Max(S(200), available);
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -567,17 +569,17 @@ internal sealed class SettingsForm : VesperPopupForm
             presetHeading, presetDescription, _presetArea, _addPreset]);
         void Layout()
         {
-            concurrency.Left = Math.Max(UiKit.Scale(this, 292), page.ClientSize.Width - 25 - concurrency.Width);
-            globalNote.Width = Math.Max(UiKit.Scale(this, 200), page.ClientSize.Width - 70);
-            unit.Width = Math.Max(UiKit.Scale(this, 160), page.ClientSize.Width - 204);
+            concurrency.Left = Math.Max(S(292), page.ClientSize.Width - S(25) - concurrency.Width);
+            globalNote.Width = Math.Max(S(200), page.ClientSize.Width - S(70));
+            unit.Width = Math.Max(S(160), page.ClientSize.Width - S(204));
             bool showLimit = _globalEnabled.Checked;
             _globalFrame.Visible = unit.Visible = showLimit;
-            int offset = showLimit ? 0 : -44;
-            separator2.Top = 291 + offset;
-            presetHeading.Top = 303 + offset;
-            presetDescription.Top = 326 + offset;
-            _presetArea.Top = 354 + offset;
-            _presetArea.Width = Math.Max(315, page.ClientSize.Width - 50);
+            int offset = showLimit ? 0 : -S(44);
+            separator2.Top = S(291) + offset;
+            presetHeading.Top = S(303) + offset;
+            presetDescription.Top = S(326) + offset;
+            _presetArea.Top = S(354) + offset;
+            _presetArea.Width = Math.Max(S(315), page.ClientSize.Width - S(50));
             LayoutPresets();
         }
         _layoutTransfers = Layout;
@@ -625,16 +627,16 @@ internal sealed class SettingsForm : VesperPopupForm
         if (_presetArea is null || _addPreset is null) return;
         for (int i = 0; i < _presets.Count; i++)
         {
-            int y = i * 37;
+            int y = i * S(37);
             var row = _presets[i];
             row.Caption.Text = $"Preset {i + 1}";
-            row.Caption.SetBounds(0, y, 59, 33);
-            row.Frame.SetBounds(66, y, 105, 32);
-            row.Unit.SetBounds(178, y, 83, 32);
-            row.Remove.SetBounds(269, y, 31, 32);
+            row.Caption.SetBounds(0, y, S(59), S(33));
+            row.Frame.SetBounds(S(66), y, S(105), S(32));
+            row.Unit.SetBounds(S(178), y, S(83), S(32));
+            row.Remove.SetBounds(S(269), y, S(31), S(32));
         }
-        _presetArea.Height = _presets.Count * 37;
-        _addPreset.SetBounds(25, _presetArea.Bottom + 5, 112, 32);
+        _presetArea.Height = _presets.Count * S(37);
+        _addPreset.SetBounds(S(25), _presetArea.Bottom + S(5), S(112), S(32));
         _addPreset.Enabled = _presets.Count < 8;
     }
 
@@ -701,16 +703,16 @@ internal sealed class SettingsForm : VesperPopupForm
         page.AutoScrollMinSize = new Size(0, 610);
         void Layout()
         {
-            int right = page.ClientSize.Width - 25;
-            connections.Left = Math.Max(UiKit.Scale(this, 292), right - connections.Width);
-            connNote.Width = Math.Max(UiKit.Scale(this, 200), connections.Left - connNote.Left - 8);
-            proxy.Left = Math.Max(UiKit.Scale(this, 292), right - proxy.Width);
-            proxyNote.Width = Math.Max(UiKit.Scale(this, 200), proxy.Left - proxyNote.Left - 8);
-            _proxyFrame.Width = Math.Max(UiKit.Scale(this, 200), right - 25);
-            scheduleNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
-            scheduleHint.Width = Math.Max(UiKit.Scale(this, 120), right - scheduleHint.Left);
-            privateNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
-            meteredNote.Width = Math.Max(UiKit.Scale(this, 200), right - 45);
+            int right = page.ClientSize.Width - S(25);
+            connections.Left = Math.Max(S(292), right - connections.Width);
+            connNote.Width = Math.Max(S(200), connections.Left - connNote.Left - S(8));
+            proxy.Left = Math.Max(S(292), right - proxy.Width);
+            proxyNote.Width = Math.Max(S(200), proxy.Left - proxyNote.Left - S(8));
+            _proxyFrame.Width = Math.Max(S(200), right - S(25));
+            scheduleNote.Width = Math.Max(S(200), right - S(45));
+            scheduleHint.Width = Math.Max(S(120), right - scheduleHint.Left);
+            privateNote.Width = Math.Max(S(200), right - S(45));
+            meteredNote.Width = Math.Max(S(200), right - S(45));
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -793,10 +795,10 @@ internal sealed class SettingsForm : VesperPopupForm
         page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, repair, disconnect, developerTip]);
         void Layout()
         {
-            int right = page.ClientSize.Width - 25;
-            action.Left = Math.Max(315, right - action.Width);
-            handoff.Width = Math.Max(UiKit.Scale(this, 180), action.Left - 36);
-            status.Width = developerTip.Width = Math.Max(UiKit.Scale(this, 180), right - 25);
+            int right = page.ClientSize.Width - S(25);
+            action.Left = Math.Max(S(315), right - action.Width);
+            handoff.Width = Math.Max(S(180), action.Left - S(36));
+            status.Width = developerTip.Width = Math.Max(S(180), right - S(25));
         }
         page.Resize += (_, _) => Layout();
         Layout();
@@ -866,7 +868,7 @@ internal sealed class SettingsForm : VesperPopupForm
         page.Controls.AddRange([about, github, updates, separator, diagnosticsTitle, diagnosticsNote, exportDiagnostics]);
         page.Resize += (_, _) =>
         {
-            about.Width = diagnosticsNote.Width = Math.Max(UiKit.Scale(this, 180), page.ClientSize.Width - 50);
+            about.Width = diagnosticsNote.Width = Math.Max(S(180), page.ClientSize.Width - S(50));
         };
     }
 
@@ -936,12 +938,12 @@ internal sealed class SettingsForm : VesperPopupForm
             densityChoice, separator2, botanical, botanicalNote]);
         void Layout()
         {
-            int right = page.ClientSize.Width - 25;
-            themeChoice.Left = Math.Max(300, right - themeChoice.Width);
-            densityChoice.Left = Math.Max(UiKit.Scale(this, 282), right - densityChoice.Width);
-            int leftWidth = Math.Max(UiKit.Scale(this, 160), densityChoice.Left - 40);
+            int right = page.ClientSize.Width - S(25);
+            themeChoice.Left = Math.Max(S(300), right - themeChoice.Width);
+            densityChoice.Left = Math.Max(S(282), right - densityChoice.Width);
+            int leftWidth = Math.Max(S(160), densityChoice.Left - S(40));
             densityNote.Width = leftWidth;
-            botanicalNote.Width = Math.Max(UiKit.Scale(this, 225), page.ClientSize.Width - 70);
+            botanicalNote.Width = Math.Max(S(225), page.ClientSize.Width - S(70));
         }
         page.Resize += (_, _) => Layout();
         Layout();

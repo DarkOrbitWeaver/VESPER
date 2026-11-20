@@ -4,7 +4,7 @@
 
 ## Installing and connecting Chrome
 
-First Flight is a per-user Windows installer. It verifies its packaged files, supports repair, and retains downloaded files and app data during ordinary uninstall. Installer rollback, upgrade while running, and clean-machine behavior still require final acceptance testing.
+Run `VESPER-Setup.exe` to install First Flight for your Windows account. The EXE contains the application and its runtime. It verifies its packaged files, supports repair, and retains downloaded files and app data during ordinary uninstall. Installer rollback, upgrade while running, and clean-machine behavior still require final acceptance testing.
 
 The portable ZIP does **not** register the native Chrome messaging helper. A portable installation can run VESPER directly, but Chrome integration is unavailable until the helper is explicitly configured. The extension currently requires a separate manual development installation; a published Chrome Web Store channel and its permissions review are prerequisites for broad distribution.
 

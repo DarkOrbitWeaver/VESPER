@@ -194,17 +194,22 @@ public sealed class DownloadGrid : Control
         _density = density;
         BackColor = palette.Surface;
         if (density != Density.Gallery) ClearPosters();
+        UpdateRowMetrics();
+        UpdateScrollArea();
+        Invalidate();
+        LoadVisiblePosters();
+    }
+
+    private void UpdateRowMetrics()
+    {
         _headerHeight = UiKit.Scale(this, 37);
-        _rowHeight = UiKit.Scale(this, density switch
+        _rowHeight = UiKit.Scale(this, _density switch
         {
             Density.ExtraCompact => 34,
             Density.Comfortable => 58,
             Density.Gallery => 84,
             _ => 46
         });
-        UpdateScrollArea();
-        Invalidate();
-        LoadVisiblePosters();
     }
 
     private void UpdateScrollArea()
@@ -226,6 +231,15 @@ public sealed class DownloadGrid : Control
     {
         base.OnResize(e);
         if (_scrollBar is null) return;
+        UpdateScrollArea();
+        Invalidate();
+        LoadVisiblePosters();
+    }
+
+    protected override void OnDpiChangedAfterParent(EventArgs e)
+    {
+        base.OnDpiChangedAfterParent(e);
+        UpdateRowMetrics();
         UpdateScrollArea();
         Invalidate();
         LoadVisiblePosters();

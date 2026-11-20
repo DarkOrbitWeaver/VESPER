@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS  Builds, tests and packages VESPER for Windows 11 x64.
-.EXAMPLE   .\scripts\Build-Release.ps1 -AllowUnsigned  # isolated development only
+.EXAMPLE   .\scripts\Build-Release.ps1 -InstallerOnly -AllowUnsigned  # isolated development only
 .EXAMPLE   .\scripts\Build-Release.ps1 -PortableOnly -AllowUnsigned
 .NOTES     Output: release\setup-<version>\VESPER-Setup.exe and release\VESPER-<version>.zip.
            Signing requires VESPER_SIGN_CERT_SHA1 (Windows certificate store). Use -AllowUnsigned only for development.
@@ -17,6 +17,7 @@ param(
     [uri]$TimestampServer = 'https://timestamp.digicert.com',
     [switch]$AllowUnsigned,
     [switch]$SelfContained,
+    [switch]$InstallerOnly,
     [switch]$PortableOnly,
     [switch]$AllowDirtyWorkingTreeForDevelopment,
     [ValidatePattern('^10\.0\.[0-9]+$')][string]$RuntimeVersion
@@ -24,6 +25,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+if ($InstallerOnly -and $PortableOnly) { throw 'Choose either the installer or the portable package.' }
 
 function Run($label, [scriptblock]$block) {
     Write-Host "==> $label" -ForegroundColor Green
@@ -142,6 +144,8 @@ if (-not $PortableOnly) {
         Remove-Item -LiteralPath $package
     }
 }
+if ($InstallerOnly) { return }
+
 Copy-Item (Join-Path $root "DOCUMENTATION\RELEASE.md") (Join-Path $out "RELEASE.md")
 
 Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
