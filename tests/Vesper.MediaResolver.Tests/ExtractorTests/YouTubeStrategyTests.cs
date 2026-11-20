@@ -74,6 +74,47 @@ public sealed class YouTubeStrategyTests
     }
 
     [Fact]
+    public async Task TransientProbeFailure_RetriesOnceBeforeDiscardingStrategy()
+    {
+        int probeCount = 0;
+        using var handler = new DelegateHandler(req =>
+        {
+            string url = req.RequestUri!.AbsoluteUri;
+            if (url == Watch) return DelegateHandler.Text(PageHtml);
+            if (url == Api) return DelegateHandler.Text(ApiOk, "application/json");
+            if (url == Media(137))
+            {
+                if (Interlocked.Increment(ref probeCount) == 1)
+                    return DelegateHandler.Text("busy", "text/plain", System.Net.HttpStatusCode.ServiceUnavailable);
+                var resp = new HttpResponseMessage(System.Net.HttpStatusCode.PartialContent);
+                resp.Content = new ByteArrayContent([(byte)'x']);
+                resp.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("video/mp4");
+                resp.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(3_999_999, 3_999_999, 4_000_000);
+                return resp;
+            }
+            return DelegateHandler.Text("", "text/plain", System.Net.HttpStatusCode.NotFound);
+        });
+        using var resolver = new DefaultMediaResolver(handler: handler);
+        var res = await resolver.ResolveAsync(new() { Url = new(Watch) }, CancellationToken.None);
+        Assert.True(res.IsSuccess, res.Error?.Diagnostic);
+        Assert.Equal(2, probeCount);
+    }
+
+    private sealed class DelegateHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            HttpResponseMessage response = respond(request);
+            response.RequestMessage = request;
+            return Task.FromResult(response);
+        }
+
+        public static HttpResponseMessage Text(string body, string mediaType = "text/html",
+            System.Net.HttpStatusCode status = System.Net.HttpStatusCode.OK) =>
+            new(status) { Content = new StringContent(body, System.Text.Encoding.UTF8, mediaType) };
+    }
+
+    [Fact]
     public async Task IgnoredRangeResponse_IsNotAcceptedAsPlayable()
     {
         var h = new FakeHttpHandler().Add(Watch, PageHtml).Add(Api, ApiOk, "application/json")
