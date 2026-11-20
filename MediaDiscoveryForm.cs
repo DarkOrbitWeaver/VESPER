@@ -56,6 +56,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     private readonly Label _clipEndLabel;
     private readonly TextBox _clipStart;
     private readonly TextBox _clipEnd;
+    private readonly VesperRangeBar _clipBar;
+    private readonly Label _clipNote;
+    private bool _clipRowShown;
+    private bool _clipFieldsShown;
+    private bool _syncingClip;
+    private int _clipExtra;
     private readonly CheckedListBox _entries;
     private readonly VesperButton _download;
     private readonly VesperButton _queue;
@@ -243,18 +249,24 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _audioTrack, _subtitleChoice, _embedSubtitles, _customLabel, _customFormat]);
         _clipCheck = new CheckBox
         {
-            Text = "Download part", AccessibleName = "Download only part of the media", AutoSize = false,
+            Text = "Time range", AccessibleName = "Download only a time range of the media", AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft, BackColor = _colors.Surface, ForeColor = _colors.Text,
             Font = new Font("Segoe UI", 9), Visible = false
         };
-        _clipStartLabel = L("Start", 8.5f, muted: true);
-        _clipEndLabel = L("End", 8.5f, muted: true);
+        _clipStartLabel = L("From", 8.5f, muted: true);
+        _clipEndLabel = L("To", 8.5f, muted: true);
         _clipStart = ClipTimeBox("Clip start time");
         _clipEnd = ClipTimeBox("Clip end time");
-        _canvas.Controls.AddRange([_clipCheck, _clipStartLabel, _clipStart, _clipEndLabel, _clipEnd]);
+        _clipBar = new VesperRangeBar { Visible = false };
+        _clipBar.ApplyPalette(_colors);
+        _clipNote = L("", 8.5f, muted: true);
+        _clipNote.TextAlign = ContentAlignment.TopLeft;
+        _clipNote.Visible = false;
+        _canvas.Controls.AddRange([_clipCheck, _clipStartLabel, _clipStart, _clipEndLabel, _clipEnd, _clipBar, _clipNote]);
         _clipCheck.CheckedChanged += (_, _) => { UpdateChoiceSummary(); FitToContent(); };
-        _clipStart.TextChanged += (_, _) => UpdateChoiceSummary();
-        _clipEnd.TextChanged += (_, _) => UpdateChoiceSummary();
+        _clipStart.TextChanged += (_, _) => ClipTextChanged();
+        _clipEnd.TextChanged += (_, _) => ClipTextChanged();
+        _clipBar.RangeChanged += (_, _) => ClipBarChanged();
         _presetOptions = new Panel { BackColor = _colors.Surface, Visible = false, TabIndex = 3 };
         (string Title, VesperIcon Icon)[] presets =
         [
@@ -420,6 +432,18 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         return Math.Max(0, neededLogical - fixedLogicalHeight);
     }
 
+    // The status label ends above the track and output controls.
+    private int StatusBaseHeight => _state == ViewState.Unavailable ? 57 : 28;
+
+    // Height of the time bar and the time-range message below the Time range row, in logical pixels.
+    private int ClipExtraHeight(int contentWidth)
+    {
+        if (_state != ViewState.Ready || !_clipRowShown) return 0;
+        int extra = _clipFieldsShown ? 28 : 0;
+        if (_clipNote.Text.Length > 0) extra += 20 + ExtraLines(_clipNote, contentWidth, 18);
+        return extra;
+    }
+
     private void LayoutBody()
     {
         if (_arranging || _body.ClientSize.Width < S(150)) return;
@@ -429,7 +453,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             int width = _canvas.ClientSize.Width;
             int margin = S(24), contentWidth = Math.Max(1, width - 2 * margin);
             bool hasPlaylist = _state == ViewState.Ready && _item?.Related is not null;
-            _statusExtra = ExtraLines(_status, contentWidth - (hasPlaylist ? S(172) : 0), _state == ViewState.Unavailable ? 57 : 34);
+            _statusExtra = ExtraLines(_status, contentWidth - (hasPlaylist ? S(172) : 0), StatusBaseHeight);
+            _clipExtra = ClipExtraHeight(contentWidth);
             _noticeExtra = ExtraLines(_notice, contentWidth, 40);
             _canvas.Height = S(BodyHeight());
             width = _canvas.ClientSize.Width;
@@ -449,7 +474,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
             bool playlist = _state == ViewState.Ready && _item?.Related is not null;
             int statusWidth = contentWidth - (playlist ? S(172) : 0);
-            Place(_status, margin, 153, statusWidth, (_state == ViewState.Unavailable ? 57 : 34) + _statusExtra);
+            Place(_status, margin, 153, statusWidth, StatusBaseHeight + _statusExtra);
+            if (_state == ViewState.Ready) _status.Height = S(181 + _statusExtra) - _status.Top;
             Place(_collectionButton, width - margin - S(162), 143, S(162), 34);
             shift = _statusExtra;                       // everything below the status text moves down with it
             int outputWidth = Math.Min(S(132), contentWidth / 2);
@@ -490,9 +516,16 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Place(_clipStart, margin + S(174), clipY + 2, S(86), 25);
             Place(_clipEndLabel, margin + S(272), clipY, S(26), 29);
             Place(_clipEnd, margin + S(300), clipY + 2, S(86), 25);
+            int clipNoteY = clipY + 31;
+            if (_clipFieldsShown)
+            {
+                Place(_clipBar, margin, clipNoteY, contentWidth, 26);
+                clipNoteY += 28;
+            }
+            Place(_clipNote, margin, clipNoteY, contentWidth, Math.Max(18, _clipExtra - (_clipFieldsShown ? 28 : 0) - 2));
             int noticeY = _state switch
             {
-                ViewState.Ready => IsExactFormat ? (_clipCheck.Visible ? 495 : 464) : (_clipCheck.Visible ? 440 : 402),
+                ViewState.Ready => (IsExactFormat ? (_clipRowShown ? 495 : 464) : (_clipRowShown ? 440 : 402)) + _clipExtra,
                 ViewState.Collection => 417,
                 ViewState.Unavailable => 213,
                 _ => 191
@@ -541,9 +574,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private int BodyHeight() => _statusExtra + _noticeExtra + _state switch
     {
-        ViewState.Ready => (IsExactFormat ? (_clipCheck.Visible ? 541 : 510)
-            : _clipCheck.Visible ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448)
-            + (_embedSubtitles.Visible ? 29 : 0),
+        ViewState.Ready => (IsExactFormat ? (_clipRowShown ? 541 : 510)
+            : _clipRowShown ? 485 : string.IsNullOrEmpty(_notice.Text) ? 407 : 448)
+            + (_embedSubtitles.Visible ? 29 : 0) + _clipExtra,
         ViewState.Collection => 464,
         ViewState.Unavailable => 260,
         _ => 214
@@ -592,7 +625,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _viewPage.Visible = !list;
         _notice.Visible = state != ViewState.Inspecting;
         UpdateQualityUi();
-        if (!ready) SetClipControlsVisible(false);
+        if (!ready) SetClipControls(show: false, available: false);
         FitToContent();
         if (!ready) SetButtonsEnabled(list && _entries.CheckedIndices.Count > 0);
     }
@@ -666,8 +699,13 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     {
         _item = item;
         _clipCheck.Checked = false;
+        _syncingClip = true;
         _clipStart.Text = "00:00";
-        _clipEnd.Text = item.Duration is { } known ? ClipTimeText(known) : "";
+        _clipEnd.Text = item.Duration is { } known ? ClipSelection.TimeText(known) : "";
+        _syncingClip = false;
+        double length = item.Duration is { TotalSeconds: > 0 and <= ClipSelection.LongestSeconds } whole ? whole.TotalSeconds : 0;
+        _clipBar.SetDuration(length);
+        _clipBar.SetRange(0, length);
         _title.Text = string.IsNullOrWhiteSpace(item.Title) ? "Media source" : item.Title;
         _source.Text = item.Provider + (item.Duration is { } duration ? $"  ·  {duration:hh\\:mm\\:ss}" : "");
         _ = LoadThumbnailAsync(item.Thumbnail);
@@ -897,70 +935,97 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         UpdateChoiceSummary();
     }
 
+    private const string ClipNotPossible =
+        "This format can't be cut to a time range. Turn off Time range to download all of it, or pick another format.";
+
     private void UpdateChoiceSummary()
     {
         if (_state != ViewState.Ready || _item is null || _busy) return;
         FormatPreferences prefs = CurrentPreferences();
         var complete = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs));
-        bool canClip = !_item.IsLive && _item.Duration is { TotalSeconds: > 0 and <= 31_536_000 }
-            && complete.Choice is { } fullChoice && SupportsSegmentClip(fullChoice);
-        SetClipControlsVisible(canClip);
-        if (!canClip && _clipCheck.Checked) _clipCheck.Checked = false;
+        ClipMode mode = complete.Choice is { } fullChoice ? ClipSelection.ModeFor(fullChoice) : ClipMode.None;
+        string? unavailable = ClipSelection.UnavailableReason(_item.IsLive, _item.Duration, mode);
+        bool wantsClip = _clipCheck.Checked;
+        // No format, no time-range row: the format problem is the message that matters.
+        SetClipControls(show: complete.Choice is not null, available: unavailable is null);
 
-        var result = _clipCheck.Checked ? PrepareCurrentChoice() : complete;
-        if (result.Choice is { } choice)
+        // A chosen range is never dropped quietly. If the new format cannot be cut, the buttons stay off
+        // until the user turns Time range off or picks a format that can.
+        var result = complete;
+        string clipError = "";
+        string clipText = unavailable ?? "";
+        if (wantsClip && complete.Choice is not null)
+        {
+            if (unavailable is not null) clipError = ClipNotPossible;
+            else if (TryGetClipRange(out double start, out double end, out clipError))
+            {
+                result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
+                if (result.Choice is null) clipError = result.Error ?? "This time range isn't available for the source.";
+                else clipText = ClipSelection.Summary(start, end, _item.Duration!.Value.TotalSeconds) + ". " + ClipSelection.Notice(mode);
+            }
+            if (clipError.Length > 0) clipText = clipError;
+        }
+        _clipNote.Text = complete.Choice is null ? "" : clipText;
+        _clipNote.ForeColor = clipError.Length > 0 ? _colors.Red : _colors.Muted;
+        _clipNote.Visible = _clipRowShown && _clipNote.Text.Length > 0;
+
+        // The format line is separate from the time-range line above, so neither hides the other.
+        if ((result.Choice ?? complete.Choice) is { } choice)
         {
             _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
                 ? "Audio is unconfirmed and will be checked before publication."
                 : IsExactFormat ? choice.DisplayDetail : "";
-            if (_clipCheck.Checked)
-                _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "")
-                    + ClipBehaviorNotice(choice.Output, choice.Kind);
-            if (choice.SubtitleTracks is { Count: > 0 } subtitles)
+            if (choice.SubtitleTracks is { Count: > 0 })
             {
                 string subtitleNotice = choice.SubtitleNotice ?? "Selected subtitles are saved as separate files.";
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "") + subtitleNotice;
             }
         }
         else
-            _notice.Text = result.Error ?? "This preference isn't available for the source.";
-        _notice.ForeColor = result.Choice is null ? _colors.Red : _colors.Muted;
+            _notice.Text = complete.Error ?? "This preference isn't available for the source.";
+        _notice.ForeColor = complete.Choice is null ? _colors.Red : _colors.Muted;
         _notice.Visible = _notice.Text.Length > 0;
-        SetButtonsEnabled(result.Choice is not null);
+        SetButtonsEnabled(result.Choice is not null && clipError.Length == 0);
+
+        int contentWidth = Math.Max(1, _canvas.ClientSize.Width - 2 * S(24));
+        if (ClipExtraHeight(contentWidth) != _clipExtra) FitToContent();
     }
 
     private (MediaDownloadChoice? Choice, string? Error) PrepareCurrentChoice()
     {
         if (_item is null) return (null, "The selected media is unavailable.");
-        if (!_clipCheck.Checked)
-            return Prepare(_item, CurrentPreferences(), SelectedExactRepresentation(), OutputPreference(CurrentPreferences()));
-        if (!TryGetClipRange(out double start, out double end, out string error)) return (null, error);
         FormatPreferences prefs = CurrentPreferences();
+        var complete = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs));
+        if (!_clipCheck.Checked || complete.Choice is null) return complete;
+        // Checked again at submission, so a hidden or stale range can never turn into a full download.
+        if (ClipSelection.UnavailableReason(_item.IsLive, _item.Duration, ClipSelection.ModeFor(complete.Choice)) is not null)
+            return (null, ClipNotPossible);
+        if (!TryGetClipRange(out double start, out double end, out string error)) return (null, error);
         return Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
     }
 
-    private bool TryGetClipRange(out double start, out double end, out string error)
+    private bool TryGetClipRange(out double start, out double end, out string error) =>
+        ClipSelection.TryGetRange(_clipStart.Text, _clipEnd.Text, _item?.Duration, out start, out end, out error);
+
+    // Typed times move the bar; a dragged handle rewrites the typed times. _syncingClip stops the echo.
+    private void ClipTextChanged()
     {
-        start = end = 0;
-        error = "Enter start and end times as mm:ss or hh:mm:ss.";
-        if (_item?.Duration is not { } duration
-            || !TryParseClipTime(_clipStart.Text, out TimeSpan from)
-            || !TryParseClipTime(_clipEnd.Text, out TimeSpan to)
-            || from < TimeSpan.Zero || to <= from || to > duration || to.TotalSeconds > 31_536_000)
-            return false;
-        start = from.TotalSeconds;
-        end = to.TotalSeconds;
-        error = "";
-        return true;
+        if (_syncingClip) return;
+        if (TryGetClipRange(out double start, out double end, out _)) _clipBar.SetRange(start, end);
+        UpdateChoiceSummary();
     }
 
-    private static bool TryParseClipTime(string text, out TimeSpan value) => TimeSpan.TryParseExact(text.Trim(),
-        ["m\\:ss", "mm\\:ss", "h\\:mm\\:ss", "hh\\:mm\\:ss", "d\\.hh\\:mm\\:ss"],
-        CultureInfo.InvariantCulture, TimeSpanStyles.None, out value);
-
-    private static string ClipTimeText(TimeSpan value) => value.TotalHours >= 24
-        ? $"{(int)value.TotalDays}.{value:hh\\:mm\\:ss}"
-        : $"{(int)value.TotalHours:00}:{value:mm\\:ss}";
+    private void ClipBarChanged()
+    {
+        _syncingClip = true;
+        try
+        {
+            _clipStart.Text = ClipSelection.TimeText(_clipBar.StartSeconds);
+            _clipEnd.Text = ClipSelection.TimeText(_clipBar.EndSeconds);
+        }
+        finally { _syncingClip = false; }
+        UpdateChoiceSummary();
+    }
 
     private TextBox ClipTimeBox(string accessibleName) => new()
     {
@@ -969,12 +1034,18 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         TextAlign = HorizontalAlignment.Center, Visible = false
     };
 
-    private void SetClipControlsVisible(bool visible)
+    // show: the Time range row belongs on screen. available: the chosen format can be cut.
+    // A checked box stays usable when the format cannot be cut, so the user can turn it off.
+    private void SetClipControls(bool show, bool available)
     {
-        _clipCheck.Visible = visible;
-        bool fields = visible && _clipCheck.Checked;
-        _clipStart.Visible = _clipEnd.Visible = _clipStartLabel.Visible = _clipEndLabel.Visible = fields;
-        _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
+        _clipRowShown = show;
+        _clipFieldsShown = show && available && _clipCheck.Checked;
+        _clipCheck.Visible = show;
+        _clipStart.Visible = _clipEnd.Visible = _clipStartLabel.Visible = _clipEndLabel.Visible = _clipFieldsShown;
+        _clipBar.Visible = _clipFieldsShown;
+        if (!show) _clipNote.Visible = false;
+        _clipCheck.Enabled = !_busy && (available || _clipCheck.Checked);
+        _clipStart.Enabled = _clipEnd.Enabled = _clipBar.Enabled = !_busy;
     }
 
     private MediaRepresentation? SelectedExactRepresentation() =>
@@ -1347,9 +1418,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     };
 
     internal static string ClipBehaviorNotice(MediaOutput output, JobKind kind) =>
-        output == MediaOutput.Wav && kind == JobKind.Http
-            ? "WAV keeps the selected sample range, but downloads and decodes the full source."
-            : "May start a few seconds early: it cuts at the nearest segment.";
+        ClipSelection.Notice(ClipSelection.ModeFor(output, kind));
 
     private static string Limit(string text, int length) => text.Length > length ? text[..(length - 1)] + "…" : text;
 
@@ -1372,7 +1441,8 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _subtitleChoice.Enabled = !_busy;
         _subtitleLanguages.Enabled = !_busy;
         _embedSubtitles.Enabled = !_busy;
-        _clipCheck.Enabled = _clipStart.Enabled = _clipEnd.Enabled = !_busy;
+        _clipStart.Enabled = _clipEnd.Enabled = _clipBar.Enabled = !_busy;
+        if (_busy) _clipCheck.Enabled = false;
         _outputChoice.Enabled = !_busy;
         _audioOutputChoice.Enabled = !_busy;
         _presetOptions.Enabled = !_busy;

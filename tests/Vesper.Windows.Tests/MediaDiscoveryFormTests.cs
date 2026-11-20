@@ -62,12 +62,67 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Theory]
-    [InlineData(MediaOutput.Wav, JobKind.Http, "full source")]
-    [InlineData(MediaOutput.Wav, JobKind.Hls, "nearest segment")]
-    [InlineData(MediaOutput.Original, JobKind.Merge, "nearest segment")]
+    [InlineData(MediaOutput.Wav, JobKind.Http, "whole file first")]
+    [InlineData(MediaOutput.Wav, JobKind.Hls, "start a little early or end a little late")]
+    [InlineData(MediaOutput.Original, JobKind.Merge, "start a little early or end a little late")]
     public void ClipNoticeMatchesTheActualRangeBehavior(MediaOutput output, JobKind kind, string expected)
     {
         Assert.Contains(expected, MediaDiscoveryForm.ClipBehaviorNotice(output, kind), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TimeRangeKeepsTheExactEndAndBlocksAnIncompatibleFormat()
+    {
+        OnSta(() =>
+        {
+            MediaRepresentation hls = Representation("sample", "hls", 1080, 30) with
+            {
+                Protocol = StreamProtocol.Hls,
+                Url = new Uri("https://sample.example.test/1080.m3u8")
+            };
+            MediaItem sample = Item("sample", [hls, Representation("sample", "mp4", 480, 30)]) with
+            {
+                Duration = TimeSpan.FromSeconds(92.7)
+            };
+            using var form = new MediaDiscoveryForm(new VesperPreferences(), sample.SourceUrl, sample);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags members =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            T Control<T>(string name) => (T)typeof(MediaDiscoveryForm).GetField(name, members)!.GetValue(form)!;
+            var selectPreset = typeof(MediaDiscoveryForm).GetMethod("SelectPreset", members)!;
+            var output = Control<VesperChoice>("_outputChoice");
+            output.SelectedIndex = 1;
+            selectPreset.Invoke(form, [0]);
+            var clip = Control<CheckBox>("_clipCheck");
+            var download = Control<VesperButton>("_download");
+            var queue = Control<VesperButton>("_queue");
+
+            Assert.True(clip.Enabled);
+            clip.Checked = true;
+            Control<TextBox>("_clipStart").Text = "00:10";
+            Assert.Equal("00:01:32.7", Control<TextBox>("_clipEnd").Text);
+            Assert.Equal(92.7, Control<VesperRangeBar>("_clipBar").EndSeconds, 4);
+            Assert.True(download.Enabled);
+            Assert.True(queue.Enabled);
+
+            var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;
+            var selection = ((MediaDownloadChoice? Choice, string? Error))prepare.Invoke(form, null)!;
+            Assert.Null(selection.Error);
+            Assert.Equal(JobKind.Hls, selection.Choice!.Kind);
+            var range = System.Text.Json.JsonSerializer.Deserialize<MediaTimeRange>(selection.Choice.MediaPlanJson!);
+            Assert.Equal(new MediaTimeRange(10, sample.Duration!.Value.TotalSeconds), range);
+
+            output.SelectedIndex = 0;
+            Assert.True(clip.Checked);
+            Assert.False(download.Enabled);
+            Assert.False(queue.Enabled);
+            clip.Checked = false;
+            Assert.True(download.Enabled);
+        });
     }
 
     [Fact]

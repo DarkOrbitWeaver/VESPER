@@ -333,15 +333,14 @@ internal static class MediaTransferBridge
             return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds,
                 unsupportedSubtitleCount: unsupportedSubtitleCount);
 
-        if (clipStartSeconds is not null)
-            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
-
         if (plan.RequiresExternalHelper || plan.Steps.Count != 1 ||
             (plan.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) != 0)
             return (null, "This format requires audio/video processing that VESPER doesn't support yet.");
         TransferStep step = plan.Steps[0];
         if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash) || !CanCarryContext(step.Context))
             return (null, "This source needs an unsupported transfer method or request context.");
+        if (clipStartSeconds is not null && step.Protocol == StreamProtocol.Http)
+            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
         if (step.Protocol == StreamProtocol.Hls && step.Segments is not null &&
             !step.Url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
             return (null, "This HLS stream needs a segment download path that isn't supported.");
