@@ -17,6 +17,59 @@ public sealed class FirstFlightUiTests
         bool highContrast, bool settingRead, bool animationsEnabled, bool expected) =>
         Assert.Equal(expected, Program.MotionEnabledFor(highContrast, settingRead, animationsEnabled));
 
+    [Fact]
+    public void StalledPaintsStillAdvanceThroughEveryIntroScene()
+    {
+        double frame = -1;
+        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.91, 3.73, 4.88, 5.35];
+        foreach (double cut in cuts)
+        {
+            frame = FirstFlightCanvas.NextFrame(frame, 10);
+            Assert.Equal(cut, frame);
+        }
+        Assert.Equal(10, FirstFlightCanvas.NextFrame(frame, 10));
+    }
+
+    [Fact]
+    public void SlowInstallKeepsTheIntroVisibleUntilSetupCompletes() => OnSta(() =>
+    {
+        var paths = new InstallPaths(Path.GetTempPath(), Path.GetTempPath(), Path.GetTempPath());
+        using var finish = new ManualResetEventSlim();
+        using var window = new SetupWindow(SetupMode.Install, paths, VesperPalette.BotanicalDark, (progress, ct) =>
+        {
+            progress.Report(new("Verifying setup payload", 1, 2));
+            if (!finish.Wait(TimeSpan.FromSeconds(10), ct)) throw new TimeoutException("Setup fixture timed out.");
+        });
+        window.StartPosition = FormStartPosition.Manual;
+        window.Location = new Point(-window.Width - 80, -window.Height - 80);
+        window.Show();
+        Task install = window.RunAttemptAsync(animate: true);
+        FirstFlightCanvas canvas = window.Controls.OfType<FirstFlightCanvas>().Single();
+
+        try
+        {
+            var elapsed = Stopwatch.StartNew();
+            while (elapsed.Elapsed.TotalSeconds < FirstFlightCanvas.Duration + .25)
+            {
+                Application.DoEvents();
+                Thread.Sleep(5);
+            }
+            Assert.True(canvas.Playing);
+            Assert.False(install.IsCompleted);
+        }
+        finally { finish.Set(); }
+
+        var reveal = Stopwatch.StartNew();
+        while (canvas.Playing && reveal.Elapsed < TimeSpan.FromSeconds(3))
+        {
+            Application.DoEvents();
+            Thread.Sleep(5);
+        }
+        Assert.False(canvas.Playing);
+        Assert.True(install.IsCompletedSuccessfully);
+        Assert.Contains(window.Controls.OfType<Label>(), label => label.Visible && label.Text == "Installation complete");
+    }, TimeSpan.FromSeconds(12));
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

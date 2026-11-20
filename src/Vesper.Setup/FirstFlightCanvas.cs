@@ -18,7 +18,8 @@ internal sealed class FirstFlightCanvas : Control
     private const double WordmarkStart = 3.73;
     private const double HoldStart = 4.88;
     private const double FadeStart = 5.35;
-    private static readonly double[] Cuts = [0, .12, .26, .43, .57, .70, .88, 1.04];
+    private static readonly double[] Cuts =
+        [0, .12, .26, .43, .57, .70, .88, 1.04, SwarmStart, PublisherStart, WordmarkStart, HoldStart, FadeStart, BlankStart];
     private static readonly string[] Props = ["01_hourglass", "02_key", "03_letter", "04_quill", "05_camera", "06_vinyl", "07_book", "08_moon"];
     private static readonly Flight[] Flights = Enumerable.Range(0, 26).Select(CreateFlight).ToArray();
 
@@ -28,7 +29,12 @@ internal sealed class FirstFlightCanvas : Control
     private readonly Stopwatch _clock = new();
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 16 };
     private VesperPalette _palette;
-    private int _scene = -1;
+    private double _clockOffset;
+    private double _lastFrame;
+    private bool _holdBeforeReveal;
+    private string _holdMessage = "";
+
+    internal void SetHoldMessage(string message) => _holdMessage = message;
 
     internal event Action? IntroFinished;
     internal bool Playing => _timer.Enabled;
@@ -42,12 +48,14 @@ internal sealed class FirstFlightCanvas : Control
         TabStop = false;
         _timer.Tick += (_, _) =>
         {
-            if (_clock.Elapsed.TotalSeconds >= Duration)
+            if (_lastFrame >= Duration)
             {
                 StopIntro();
                 IntroFinished?.Invoke();
+                return;
             }
-            else Invalidate();
+            _timer.Interval = _holdBeforeReveal && _lastFrame >= FadeStart ? 100 : 16;
+            Invalidate();
         };
     }
 
@@ -58,24 +66,80 @@ internal sealed class FirstFlightCanvas : Control
         Invalidate();
     }
 
-    internal void StartIntro()
+    internal void StartIntro(bool holdForSetup = false)
     {
         ClearArt();
-        _clock.Restart();
+        PreloadIntroArt();
+        _clockOffset = 0;
+        _lastFrame = -1;
+        _holdBeforeReveal = holdForSetup;
+        _holdMessage = "";
+        // Start timing on the first paint.
+        _clock.Reset();
+        _timer.Interval = 16;
         _timer.Start();
+        Invalidate();
+    }
+
+    internal void ReleaseHold()
+    {
+        if (!_holdBeforeReveal) return;
+        IntroTime();
+        _holdBeforeReveal = false;
         Invalidate();
     }
 
     internal void StopIntro()
     {
         if (!Playing) return;
+        _holdBeforeReveal = false;
         _timer.Stop();
         _clock.Stop();
         ClearArt();
         Invalidate();
     }
 
-    protected override void OnPaint(PaintEventArgs e) => Render(e.Graphics, ClientSize, Playing ? _clock.Elapsed.TotalSeconds : null);
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        double? seconds = null;
+        if (Playing)
+        {
+            if (!_clock.IsRunning) _clock.Start();
+            double time = IntroTime();
+            _lastFrame = NextFrame(_lastFrame, time);
+            _clockOffset += time - _lastFrame;
+            seconds = _lastFrame;
+        }
+        Render(e.Graphics, ClientSize, seconds);
+    }
+
+    private double IntroTime()
+    {
+        double time = _clock.Elapsed.TotalSeconds - _clockOffset;
+        if (_holdBeforeReveal && time > FadeStart)
+        {
+            _clockOffset += time - FadeStart;
+            time = FadeStart;
+        }
+        return time;
+    }
+
+    // After a stall, play the next scene that would have been skipped.
+    internal static double NextFrame(double previous, double elapsed)
+    {
+        int next = Array.FindIndex(Cuts, cut => cut > previous);
+        return next >= 0 && next + 1 < Cuts.Length && elapsed >= Cuts[next + 1]
+            ? Cuts[next]
+            : elapsed;
+    }
+
+    private void PreloadIntroArt()
+    {
+        foreach (string prop in Props) Art("objects." + prop);
+        Art("atlas");
+        Emblem();
+        Art("brand.wordmark_" + (_palette.IsDark ? "dark" : "light"));
+    }
 
     internal void Render(Graphics graphics, Size size, double? seconds)
     {
@@ -95,7 +159,6 @@ internal sealed class FirstFlightCanvas : Control
 
     private void DrawWelcome(Graphics graphics)
     {
-        EnterScene(0);
         if (!_palette.HighContrast)
         {
             Center(graphics, Art("botanical.blossom_header"), 660, 45, 315, 140, .78f);
@@ -120,23 +183,15 @@ internal sealed class FirstFlightCanvas : Control
         if (time < SwarmStart)
         {
             int index = Math.Max(0, Array.FindLastIndex(Cuts, cut => cut <= time));
-            EnterScene(index + 1);
             Center(graphics, Art("objects." + Props[index]), 400, 236, 224, 220);
             return;
         }
         if (time < PublisherStart)
         {
-            EnterScene(9);
             DrawSwarm(graphics, time, Art("atlas"));
             return;
         }
-        if (time >= BlankStart)
-        {
-            EnterScene(11);
-            return;
-        }
-
-        EnterScene(10);
+        if (time >= BlankStart) return;
         string theme = _palette.IsDark ? "dark" : "light";
         float fade = 1 - Math.Clamp((float)((time - FadeStart) / (BlankStart - FadeStart)), 0, 1);
         float reveal = Math.Clamp((float)((time - PublisherStart) / (WordmarkStart - PublisherStart)), 0, 1);
@@ -152,6 +207,12 @@ internal sealed class FirstFlightCanvas : Control
         graphics.SetClip(new RectangleF(212, wordmarkY, 376 * fraction, height + 1));
         Draw(graphics, wordmark, new RectangleF(212, wordmarkY, 376, height), fade);
         graphics.Restore(saved);
+        if (_holdBeforeReveal && _holdMessage.Length > 0 && time >= HoldStart)
+        {
+            using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            using var ink = new SolidBrush(_palette.Muted);
+            graphics.DrawString(_holdMessage, _subtitle, ink, new RectangleF(160, 396, 480, 28), format);
+        }
     }
 
     private Bitmap Emblem()
@@ -238,13 +299,6 @@ internal sealed class FirstFlightCanvas : Control
         return (value & 0xffffff) / 16777216f;
     }
 
-    private void EnterScene(int scene)
-    {
-        if (scene == _scene) return;
-        ClearArt();
-        _scene = scene;
-    }
-
     private Bitmap Art(string name, bool feather = false)
     {
         if (_art.TryGetValue(name, out var cached)) return cached;
@@ -307,7 +361,6 @@ internal sealed class FirstFlightCanvas : Control
     {
         foreach (Bitmap image in _art.Values) image.Dispose();
         _art.Clear();
-        _scene = -1;
     }
 
     protected override void Dispose(bool disposing)
