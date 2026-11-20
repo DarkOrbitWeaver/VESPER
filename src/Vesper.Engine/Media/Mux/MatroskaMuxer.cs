@@ -605,16 +605,16 @@ internal static class MediaMerger
         => ValidateCore(output, length, expected, null, ct, expectedMetadata, expectedThumbnailSha256);
 
     /// <summary>Validates each remuxed sample's payload and representable timing.</summary>
-    public static void ValidateRemux(Stream output, long length,
+    public static List<DemuxedTrack> ValidateRemux(Stream output, long length,
         IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, CancellationToken ct,
         MediaMergeMetadata? expectedMetadata = null, string? expectedThumbnailSha256 = null)
     {
         if (inputs.Count == 0) throw new MediaContainerException("A remux needs at least one source track.");
-        ValidateCore(output, length, inputs.Select(input => input.Track).ToArray(), inputs,
+        return ValidateCore(output, length, inputs.Select(input => input.Track).ToArray(), inputs,
             ct, expectedMetadata, expectedThumbnailSha256);
     }
 
-    private static void ValidateCore(Stream output, long length, IReadOnlyList<DemuxedTrack> expected,
+    private static List<DemuxedTrack> ValidateCore(Stream output, long length, IReadOnlyList<DemuxedTrack> expected,
         IReadOnlyList<(DemuxedTrack Track, Stream Source)>? inputs, CancellationToken ct,
         MediaMergeMetadata? expectedMetadata, string? expectedThumbnailSha256)
     {
@@ -656,6 +656,7 @@ internal static class MediaMerger
             if (thumbnail?.Sha256 != expectedThumbnailSha256)
                 throw new MediaContainerException("The merged file did not retain the selected cover image.");
         }
+        return got;
     }
 
     private static void ValidateSamplePayloads(Stream output, IReadOnlyList<DemuxedTrack> actual,
@@ -700,9 +701,21 @@ internal static class MediaMerger
                         || outputSample.Offset < 0 || outputSample.Offset > output.Length - outputSample.Size)
                         throw new MediaContainerException("A sample lies outside its source or merged file.");
 
-                    source.Position = sourceSample.Offset;
-                    output.Position = outputSample.Offset;
+                    // Audio packets are often contiguous in both files. Compare a run at once,
+                    // but still check every packet size and boundary before joining it.
                     int remaining = sourceSample.Size;
+                    while (sampleIndex + 1 < expectedTrack.Samples.Count && remaining < 1024 * 1024)
+                    {
+                        var next = expectedTrack.Samples[sampleIndex + 1];
+                        var nextOutput = actualTrack.Samples[sampleIndex + 1];
+                        if (next.Size <= 0 || next.Size != nextOutput.Size || next.Size > 1024 * 1024 - remaining
+                            || next.Offset != sourceSample.Offset + remaining || nextOutput.Offset != outputSample.Offset + remaining
+                            || next.Offset > source.Length - next.Size || nextOutput.Offset > output.Length - next.Size) break;
+                        remaining += next.Size;
+                        sampleIndex++;
+                    }
+                    if (source.Position != sourceSample.Offset) source.Position = sourceSample.Offset;
+                    if (output.Position != outputSample.Offset) output.Position = outputSample.Offset;
                     while (remaining > 0)
                     {
                         ct.ThrowIfCancellationRequested();

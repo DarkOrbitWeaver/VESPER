@@ -196,7 +196,7 @@ internal sealed class JobSession : IDisposable
             }
 
             _engine.Failpoint("checkpoint.beforeFlush");
-            File!.Flush();                                  // covers every write that completed before the snapshot
+            using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.DiskFlush)) File!.Flush();                                  // covers every write that completed before the snapshot
             _engine.Failpoint("checkpoint.afterFlush");
 
             ExtentSet next = Job.Extents.Clone();

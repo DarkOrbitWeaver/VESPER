@@ -1,3 +1,4 @@
+using StreamContent = Vesper.MediaResolver.Models.StreamContent;
 using Vesper.Engine;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;

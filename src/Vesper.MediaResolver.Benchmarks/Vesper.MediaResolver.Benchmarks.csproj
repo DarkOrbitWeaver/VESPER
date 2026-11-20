@@ -13,6 +13,6 @@
     <None Include="../../tests/Vesper.MediaResolver.Tests/Fixtures/youtube_watch.html" Link="Fixtures/youtube_watch.html" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup Condition="'$(Baseline)' != 'true'">
-    <Compile Include="../../MediaTransferBridge.cs" Link="MediaTransferBridge.cs" />
+    <ProjectReference Include="../Vesper.MediaPlanning/Vesper.MediaPlanning.csproj" />
   </ItemGroup>
 </Project>

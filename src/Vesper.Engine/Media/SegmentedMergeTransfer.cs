@@ -487,6 +487,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     private async Task<RunOutcome> MergeAsync(MediaMergePlan plan, string fingerprint, PreparedTrack[] tracks,
         int[] completed, List<long> partLengths, CancellationToken ct)
     {
+        using var timing = ProcessingTiming.Measure(Job.Id, ProcessingPhase.Merge, Job.TotalBytes ?? 0);
         string mergingPath = MergeTransfer.MergingPath(Job);
         string samplesPath = Job.PartialPath + ".samples";
         if (MergeTransfer.PathExists(mergingPath) || MergeTransfer.PathExists(samplesPath))
@@ -578,7 +579,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;
-                    MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
+                    using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Verify, output.Length))
+                        MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
                     output.Position = 0;
                     sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
                 }
