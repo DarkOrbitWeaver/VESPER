@@ -16,7 +16,10 @@ internal static class WaveAudio
     internal static Info Read(Stream source)
     {
         source.Position = 0;
-        Span<byte> header = stackalloc byte[12]; source.ReadExactly(header);
+        Span<byte> header = stackalloc byte[12];
+        if (source.Length < header.Length)
+            throw new MediaContainerException("The WAV header is truncated.");
+        source.ReadExactly(header);
         bool rf64 = header[..4].SequenceEqual("RF64"u8);
         if ((!rf64 && !header[..4].SequenceEqual("RIFF"u8)) || !header[8..].SequenceEqual("WAVE"u8))
             throw new MediaContainerException("The WAV output has an invalid RIFF length.");
@@ -26,7 +29,10 @@ internal static class WaveAudio
         {
             if (BinaryPrimitives.ReadUInt32LittleEndian(header[4..]) != uint.MaxValue)
                 throw new MediaContainerException("The RF64 output has an invalid size marker.");
-            Span<byte> ds64 = stackalloc byte[36]; source.ReadExactly(ds64);
+            Span<byte> ds64 = stackalloc byte[36];
+            if (source.Length - source.Position < ds64.Length)
+                throw new MediaContainerException("The RF64 size table is truncated.");
+            source.ReadExactly(ds64);
             if (!ds64[..4].SequenceEqual("ds64"u8) || BinaryPrimitives.ReadUInt32LittleEndian(ds64[4..]) != 28
                 || BinaryPrimitives.ReadUInt32LittleEndian(ds64[32..]) != 0)
                 throw new MediaContainerException("The RF64 size table is unsupported or invalid.");
@@ -54,8 +60,11 @@ internal static class WaveAudio
             }
             else if (rf64 && chunkSize == uint.MaxValue)
                 throw new MediaContainerException("An RF64 chunk has no supported size entry.");
-            long end = checked(source.Position + size);
-            if (end > source.Length) throw new MediaContainerException("A WAV chunk is truncated.");
+            long remaining = source.Length - source.Position;
+            long padding = size & 1;
+            if (size > remaining || padding > remaining - size)
+                throw new MediaContainerException("A WAV chunk is truncated.");
+            long end = source.Position + size;
             if (chunk[..4].SequenceEqual("fmt "u8))
             {
                 if (size < 16) throw new MediaContainerException("A WAV format is truncated.");
@@ -75,7 +84,7 @@ internal static class WaveAudio
                 if (dataOffset != 0) throw new MediaContainerException("Multiple WAV data chunks are unsupported.");
                 dataOffset = source.Position; dataBytes = size;
             }
-            source.Position = end + (size & 1);
+            source.Position = end + padding;
         }
         if (rate == 0 || dataOffset == 0 || dataBytes == 0 || dataBytes % align != 0
             || (rf64 && rf64Samples != (ulong)(dataBytes / align)))
