@@ -764,6 +764,22 @@ public class SiteAdapterTests
 
     private const string TikTokUrl = "https://www.tiktok.com/@fixtureuser/video/7234567890123456789";
 
+    [Theory]
+    [InlineData("7234567890123456789", true)]
+    [InlineData("7234567890123456780", false)]
+    public async Task TikTok_EmbedRequiresTheRequestedVideo(string id, bool expectedSuccess)
+    {
+        string url = $"https://www.tiktok.com/embed/v2/{id}";
+        var handler = new FakeHttpHandler().Add(url, Fixture.Load("tiktok_page.html"), "text/html");
+        var result = await Resolve(handler, url);
+
+        Assert.Equal(expectedSuccess, result.IsSuccess);
+        if (expectedSuccess)
+            Assert.Equal(id, result.Item!.MediaId);
+        else
+            Assert.Equal(MediaErrorCode.NoDownloadableMedia, result.Error!.Code);
+    }
+
     [Fact]
     public async Task TikTok_ReturnsQualitiesWithoutLeakingHostOnlyCookiesToCdn()
     {

@@ -60,6 +60,22 @@ public class GenericAdapterTests
         Assert.True(res.Error.IsPermanent);
     }
 
+    [Theory]
+    [InlineData("<video data-src='/asset'></video>")]
+    [InlineData("<video><source data-src='/asset'></video>")]
+    [InlineData("<video data-setup='{&quot;sources&quot;:[{&quot;src&quot;:&quot;/asset&quot;}]}'></video>")]
+    public async Task HtmlPlayerWithDeferredSource_IsVerifiedByProbe(string html)
+    {
+        var handler = new FakeHttpHandler()
+            .Add($"{Page}/watch", html, "text/html")
+            .AddMedia($"{Page}/asset", "video/mp4");
+
+        var result = await Resolve(handler, $"{Page}/watch");
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal($"{Page}/asset", Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+    }
+
     [Fact]
     public async Task ExpiredSignedUrl_IsRefusedWithARetryableExpiredError()
     {

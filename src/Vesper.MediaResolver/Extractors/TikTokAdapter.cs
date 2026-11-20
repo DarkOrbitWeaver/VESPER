@@ -13,7 +13,7 @@ internal sealed class TikTokAdapter : AdapterBase
         "tiktok", "TikTok", Matches, svc => new TikTokAdapter(svc),
         new AdapterCapabilities(
             Domains: ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"],
-            UrlPatterns: ["tiktok.com/@{user}/video/{id}", "vm.tiktok.com/{code}", "vt.tiktok.com/{code}", "tiktok.com/t/{code}"],
+            UrlPatterns: ["tiktok.com/@{user}/video/{id}", "tiktok.com/embed/v2/{id}", "vm.tiktok.com/{code}", "vt.tiktok.com/{code}", "tiktok.com/t/{code}"],
             SingleItem: true, Playlist: false, AudioOnly: false, Subtitles: false,
             Authentication: "Public videos; optional explicitly authorized browser context",
             KnownUnsupported: ["user pages and collections", "photo posts", "private videos", "pages gated by captcha"],
@@ -25,6 +25,7 @@ internal sealed class TikTokAdapter : AdapterBase
         && (u.Host.StartsWith("vm.", StringComparison.OrdinalIgnoreCase)
             || u.Host.StartsWith("vt.", StringComparison.OrdinalIgnoreCase)
             || u.AbsolutePath.StartsWith("/@", StringComparison.Ordinal) && u.AbsolutePath.Contains("/video/", StringComparison.Ordinal)
+            || EmbedVideoId(u) is not null
             || u.AbsolutePath.StartsWith("/t/", StringComparison.Ordinal));
 
     public override bool CanHandle(Uri url) => Matches(url);
@@ -37,7 +38,8 @@ internal sealed class TikTokAdapter : AdapterBase
         JsonElement? item = null;
         try
         {
-            string? videoId = VideoId(page.FinalUrl) ?? VideoId(request.Url);
+            string? embedId = EmbedVideoId(request.Url);
+            string? videoId = embedId ?? VideoId(page.FinalUrl) ?? EmbedVideoId(page.FinalUrl) ?? VideoId(request.Url);
             var found = FindPlayerState(page.Content, videoId);
             state = found.Document;
             item = found.Item;
@@ -52,6 +54,8 @@ internal sealed class TikTokAdapter : AdapterBase
                     ? MediaErrors.BrowserContext("TikTok returned a verification page. Complete verification in your browser; VESPER does not bypass it.")
                     : MediaErrors.SourceChanged($"TikTok player state was not found{(found.Layout is null ? "" : $" in {found.Layout}")}. Refresh the page or update VESPER."));
             var s = item;
+            if (embedId is not null && s.P("id").Str() != embedId)
+                return Fail(MediaErrors.NoMedia("The TikTok player did not identify the requested video.", browserMayHelp: false));
             if (s.P("imagePost") is not null)
                 return Fail(MediaErrors.NoMedia("This TikTok post is a photo slideshow, not a video", browserMayHelp: false));
             var video = s.P("video");
@@ -181,6 +185,15 @@ internal sealed class TikTokAdapter : AdapterBase
         int at = path.IndexOf("/video/", StringComparison.Ordinal);
         if (at < 0) return null;
         string id = path[(at + 7)..].Trim('/');
+        return id.Length is > 0 and <= 32 && id.All(char.IsAsciiDigit) ? id : null;
+    }
+
+    private static string? EmbedVideoId(Uri url)
+    {
+        const string prefix = "/embed/v2/";
+        string path = url.AbsolutePath;
+        if (!path.StartsWith(prefix, StringComparison.Ordinal)) return null;
+        string id = path[prefix.Length..].TrimEnd('/');
         return id.Length is > 0 and <= 32 && id.All(char.IsAsciiDigit) ? id : null;
     }
 
