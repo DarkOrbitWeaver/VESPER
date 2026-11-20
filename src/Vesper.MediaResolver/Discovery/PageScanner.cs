@@ -85,12 +85,25 @@ internal static class PageScanner
                     }
                     case "video":
                     case "audio":
+                    {
                         currentMedia = tag.Name;
-                        AddCandidate(tag.Attr("src"), tag.Name == "audio" ? "audio/*" : tag.Attr("type"), Dim(tag.Attr("width")), Dim(tag.Attr("height")), null);
+                        string? src = tag.Attr("src");
+                        string? mime = tag.Name == "audio" ? "audio/*" : tag.Attr("type");
+                        AddCandidate(src ?? tag.Attr("data-src") ?? tag.Attr("data-video-src")
+                            ?? tag.Attr("data-hls") ?? tag.Attr("data-dash") ?? tag.Attr("data-mp4"),
+                            mime, Dim(tag.Attr("width")), Dim(tag.Attr("height")), null);
+                        if (string.IsNullOrWhiteSpace(src) && tag.Attr("data-setup") is { Length: > 2 and <= 8192 } setup)
+                        {
+                            using var config = JsonExt.TryParse(setup);
+                            if (config is not null)
+                                foreach (var source in config.RootElement.P("sources").Items().Take(6))
+                                    AddCandidate(source.P("src").Str(), source.P("type").Str() ?? mime, null, null, null);
+                        }
                         if (_meta.Thumbnail is null && tag.Attr("poster") is { } poster) _meta.Thumbnail = UrlUtil.Resolve(_base, poster);
                         break;
+                    }
                     case "source" when currentMedia is not null:
-                        AddCandidate(tag.Attr("src"), tag.Attr("type") ?? (currentMedia == "audio" ? "audio/*" : null),
+                        AddCandidate(tag.Attr("src") ?? tag.Attr("data-src"), tag.Attr("type") ?? (currentMedia == "audio" ? "audio/*" : null),
                             Dim(tag.Attr("width")), Dim(tag.Attr("height")), tag.Attr("label") ?? tag.Attr("title"));
                         break;
                     case "track":
