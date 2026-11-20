@@ -120,6 +120,14 @@ public sealed class MediaParserMalformedInputTests
             TextSubtitleParser.Parse(bytes, "srt", "en", "English", 60).Track.Samples.Count > 0),
         ["vtt-subtitle"] = new(2015, () => Encoding.UTF8.GetBytes(Vtt), bytes =>
             TextSubtitleParser.Parse(bytes, "vtt", "en", "English", 60).Track.Samples.Count > 0),
+        ["wav-pcm"] = new(2016, PcmWave, ReadWave),
+        ["wav-rf64"] = new(2017, () =>
+        {
+            using var pcm = new MemoryStream(PcmWave(), writable: false);
+            using var rf64 = new MemoryStream();
+            WaveAudio.WriteAsync(pcm, rf64, null, Tags, CancellationToken.None, forceRf64: true).GetAwaiter().GetResult();
+            return rf64.ToArray();
+        }, ReadWave),
     };
 
     public static TheoryData<string> TargetNames()
@@ -230,6 +238,33 @@ public sealed class MediaParserMalformedInputTests
 
     // The writers only await in-memory streams here, so the task is already complete.
     private static T Finished<T>(Task<T> task) => task.GetAwaiter().GetResult();
+
+    private static byte[] PcmWave()
+    {
+        const int sampleRate = 48000, dataBytes = 960;
+        using var wave = new MemoryStream();
+        using var writer = new BinaryWriter(wave, Encoding.UTF8, leaveOpen: true);
+        writer.Write("RIFF"u8);
+        writer.Write(36u + dataBytes);
+        writer.Write("WAVEfmt "u8);
+        writer.Write(16u);
+        writer.Write((short)1);
+        writer.Write((short)1);
+        writer.Write(sampleRate);
+        writer.Write(sampleRate * 2);
+        writer.Write((short)2);
+        writer.Write((short)16);
+        writer.Write("data"u8);
+        writer.Write(dataBytes);
+        writer.Write(new byte[dataBytes]);
+        return wave.ToArray();
+    }
+
+    private static bool ReadWave(byte[] bytes)
+    {
+        using var source = new MemoryStream(bytes, writable: false);
+        return WaveAudio.Read(source).SampleCount > 0;
+    }
 
     private static byte[] Media(string name) =>
         File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));

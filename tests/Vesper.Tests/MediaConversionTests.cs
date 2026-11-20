@@ -211,6 +211,7 @@ public sealed class MediaConversionTests
         Assert.Equal(sourceAudio.Channels, info.Channels);
         Assert.Equal(sourceAudio.SampleRate, info.SampleRate);
         Assert.InRange(Math.Abs(info.Duration - sourceAudio.DurationSeconds), 0, 0.05);
+        SaveQaOutput(done, "VESPER_MEDIA_QA_CONVERTED_WAV");
     }
 
     [WindowsFact]
@@ -238,6 +239,7 @@ public sealed class MediaConversionTests
         Assert.Equal("MP3 audio", done.MediaQuality);
         using var outputFile = File.OpenRead(done.FinalPath!);
         Assert.True(Mp3MetadataWriter.IsPlayableMpegLayer3(outputFile));
+        SaveQaOutput(done, "VESPER_MEDIA_QA_CONVERTED_MP3");
     }
 
     [Fact]
@@ -616,13 +618,16 @@ public sealed class MediaConversionTests
         Assert.Single(h.Files());                                       // no .convert or .convert-tagged leftovers
         Assert.Equal(1, server.Hits("/m/cover.png"));                    // the cover the merge stored is reused, not fetched twice
 
-        // Lets a developer hand the exact published bytes to ffprobe, mutagen or Windows Media Player.
-        string? qaPath = Environment.GetEnvironmentVariable("VESPER_MEDIA_QA_CONVERTED_M4A");
-        if (!string.IsNullOrWhiteSpace(qaPath))
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(qaPath))!);
-            File.Copy(done.FinalPath!, Path.GetFullPath(qaPath), overwrite: true);
-        }
+        SaveQaOutput(done, "VESPER_MEDIA_QA_CONVERTED_M4A");
+    }
+
+    private static void SaveQaOutput(JobSnapshot done, string variable)
+    {
+        string? qaPath = Environment.GetEnvironmentVariable(variable);
+        if (string.IsNullOrWhiteSpace(qaPath)) return;
+        string fullPath = Path.GetFullPath(qaPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        File.Copy(done.FinalPath!, fullPath, overwrite: true);
     }
 
     [Fact]
