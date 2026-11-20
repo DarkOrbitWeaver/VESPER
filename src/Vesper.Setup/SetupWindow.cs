@@ -93,7 +93,11 @@ internal sealed class SetupWindow : Form
         _cancellation = cancellation;
         _view = View.Working;
         _progress = new(_mode == SetupMode.Uninstall ? "Preparing to remove VESPER…" : "Preparing VESPER…");
-        if (_mode == SetupMode.Install && animate) _canvas.StartIntro();
+        if (_mode == SetupMode.Install && animate)
+        {
+            _canvas.StartIntro(holdForSetup: true);
+            _canvas.SetHoldMessage(_progress.Activity);
+        }
         RefreshControls();
         if (_canvas.Playing) _skip.Focus();
         else _cancel.Focus();
@@ -102,7 +106,8 @@ internal sealed class SetupWindow : Form
         {
             if (_view != View.Working || _cancellation != cancellation || cancellation.IsCancellationRequested) return;
             _progress = update;
-            if (!_canvas.Playing) RefreshControls();
+            if (_canvas.Playing) _canvas.SetHoldMessage(HoldText(update));
+            else RefreshControls();
         });
         try
         {
@@ -120,11 +125,16 @@ internal sealed class SetupWindow : Form
         {
             _cancellation = null;
             if (_view != View.Complete || _mode != SetupMode.Install) _canvas.StopIntro();
+            else _canvas.ReleaseHold();
             RefreshControls();
             if (_view == View.Cancelled && _closeAfterCancel) Close();
             else _action.Focus();
         }
     }
+
+    private static string HoldText(InstallProgress progress) => progress.Total > 0
+        ? $"{progress.Activity}  {(int)Math.Clamp(100d * progress.Verified / progress.Total, 0, 100)}%"
+        : progress.Activity;
 
     private void RefreshControls()
     {
