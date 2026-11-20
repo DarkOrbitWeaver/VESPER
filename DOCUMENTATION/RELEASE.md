@@ -20,8 +20,8 @@ VESPER does not bypass DRM, site challenges, or sign-in restrictions. Some media
 
 ## Verification and remaining release gates
 
-Passing automated tests is not equivalent to a production-ready release. Before public distribution, the **exact candidate build** still needs signed-file and browser-channel verification, fresh Windows/Chrome handoff and cancellation tests, clean install/repair/rollback/uninstall, mixed-DPI visuals and accessibility, media playback/codec checks, and reproducible performance and security evidence.
+Before public distribution, the exact candidate needs signed-file and browser-channel verification, Windows and Chrome handoff and cancellation checks, clean install/repair/rollback/uninstall, mixed-DPI visuals, media playback and codec checks, and reproducible performance and security evidence. The owner has deferred the optional Q5 accessibility gate.
 
 Current engineering decisions, supported-media limits, audit status, and the Q0–Q10 acceptance criteria are maintained in the source repository: `DOCUMENTATION/STATUS.tsv`, `MEDIA_ENGINE_LIMITATIONS.md`, `DOCUMENTATION/AUDIT-RECONCILIATION.md`, and `DOCUMENTATION/QUALITY-RELEASE-GATES.md`.
 
-Historical verification numbers from November 12, 2026 are preserved in `DOCUMENTATION/RELEASE-2026-11-12-HISTORICAL.md`. They describe **that earlier build only**, not the package containing this file.
+Consult the [engineering handoff in the source repository](https://github.com/DarkOrbitWeaver/VESPER/blob/main/DOCUMENTATION/NEXT-CHAT-HANDOFF.md) for current checkpoints and historical evidence.
