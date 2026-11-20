@@ -4,6 +4,8 @@ VesperTheme.install();
 const $ = id => document.getElementById(id);
 
 async function init() {
+  const manifest = chrome.runtime.getManifest();
+  $('version').textContent = `Extension ${manifest.version_name || manifest.version}`;
   const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'system', route: 'auto', handoff: 'download', intercept: true, useSignIn: false });
   $('theme').value = prefs.theme;
   $('motion').value = ['animate', 'still'].includes(prefs.motion) ? prefs.motion : 'system';
@@ -47,7 +49,7 @@ async function init() {
   }
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   const siteHost = httpsHost(activeTab?.url);
-  siteHostLabel.textContent = siteHost || 'this HTTPS site';
+  siteHostLabel.textContent = siteHost || 'this site';
   siteSignIn.disabled = !siteHost;
   if (siteHost) {
     try {
@@ -74,7 +76,7 @@ async function init() {
       if (siteSignIn.checked) hosts.add(siteHost);
       else hosts.delete(siteHost);
       await chrome.storage.local.set({ signInHosts: [...hosts].slice(0, 50) });
-      siteHint.textContent = 'Only this exact host is approved. This also requires the setting above.';
+      siteHint.textContent = '';
     } catch {
       siteSignIn.checked = !siteSignIn.checked;
       siteHint.textContent = 'Couldn’t save this site’s sign-in setting.';
@@ -84,7 +86,7 @@ async function init() {
   };
   function showAccess(allowed) {
     signIn.checked = prefs.useSignIn && allowed;
-    access.textContent = allowed ? 'Only hosts approved below can use cookies.' : 'Chrome permission required.';
+    access.textContent = allowed ? 'Only on sites you approve.' : 'Chrome permission required.';
   }
   chrome.permissions.onRemoved.addListener(removed => {
     if (removed.permissions?.includes('cookies')) showAccess(false);
@@ -106,37 +108,12 @@ async function init() {
   showAccess(await hasAccess());
   signIn.disabled = false;
   await showRecentDownloads(prefs, signIn);
-  void showVersions();
-}
-
-// "Extension 1.0.1 · VESPER 1.0.1 (2620e76)". When the two numbers differ, say which one to update.
-async function showVersions() {
-  const extension = chrome.runtime.getManifest().version;
-  const line = $('versions');
-  line.textContent = `Extension ${extension}`;
-  const reply = await chrome.runtime.sendMessage({ type: 'hello' }).catch(() => null);
-  if (!reply?.ok) { line.textContent += ' · VESPER app not reachable'; return; }
-  const app = reply.data?.build || reply.appVersion || '';
-  line.textContent = `Extension ${extension} · VESPER ${app}`.trim();
-  const appNumber = (reply.appVersion || app).split(' ')[0];
-  if (appNumber && appNumber !== extension) {
-    const older = compareVersions(extension, appNumber) < 0 ? 'extension' : 'VESPER app';
-    line.textContent += ` — update the ${older}`;
-  }
-}
-
-function compareVersions(a, b) {
-  const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] || 0) - (pb[i] || 0);
-    if (d) return d;
-  }
-  return 0;
 }
 
 // One button per reason, and only where the user can actually change the outcome.
 const RECENT_ACTIONS = {
   'sign-in': { label: 'Use my sign-in', run: async (prefs, signIn) => {
+    $('site-sign-in').open = true;
     signIn.checked = true;
     await signIn.onchange();
     return prefs.useSignIn ? 'Sign-in is on. Approve this HTTPS site above, then start again.' : 'Chrome didn’t grant access, so nothing changed.';

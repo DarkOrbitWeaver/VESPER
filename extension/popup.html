@@ -27,30 +27,36 @@
       </select>
     </label>
     <small id="motion-hint" class="hint">Follow system respects your reduced-motion setting.</small>
-    <label class="setting"><span>When Chrome sends a file</span>
+    <label class="setting"><span>When capturing a file</span>
       <select id="handoff">
         <option value="download">Download now</option>
         <option value="queue">Queue</option>
-        <option value="default">Follow VESPER</option>
-      </select>
-    </label>
-    <label class="setting"><span>Download connection</span>
-      <select id="route">
-        <option value="auto">Automatic</option>
-        <option value="chrome">Keep Chrome’s connection</option>
+        <option value="default">Use desktop setting</option>
       </select>
     </label>
     <p id="first-run" class="hint" hidden>VESPER takes over safe downloads; Chrome keeps the rest. You can turn capture off below.</p>
     <label class="check"><input type="checkbox" id="intercept"><span>Capture downloads automatically</span></label>
-    <label class="check"><input type="checkbox" id="prefetch"><span>Prepare video formats in advance<small>Prepares a picker for supported videos. It does not download video data.</small></span></label>
-    <label class="check"><input type="checkbox" id="signin" disabled><span>Use sign-in cookies <small id="signin-access">Chrome permission required.</small></span></label>
-    <label class="check"><input type="checkbox" id="signin-site" disabled><span>Allow sign-in for <strong id="signin-host">this HTTPS site</strong><small id="signin-site-hint">Only this exact host is approved. This also requires the setting above.</small></span></label>
-    <p id="versions" class="hint"></p>
-    <section id="recent" hidden aria-labelledby="recent-title">
-      <h2 id="recent-title">Recent downloads</h2>
+    <details id="site-sign-in">
+      <summary>Site sign-in</summary>
+      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my sign-in <small id="signin-access">Chrome permission required.</small></span></label>
+      <label class="check"><input type="checkbox" id="signin-site" disabled><span>Allow on <strong id="signin-host">this site</strong><small id="signin-site-hint"></small></span></label>
+    </details>
+    <details>
+      <summary>More settings</summary>
+      <label class="setting"><span>Download connection</span>
+        <select id="route">
+          <option value="auto">Automatic</option>
+          <option value="chrome">Keep Chrome’s connection</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="prefetch"><span>Prepare video formats early</span></label>
+    </details>
+    <details id="recent" hidden>
+      <summary>Recent capture results</summary>
       <ul id="decisions"></ul>
       <p id="recent-result" class="result" role="status"></p>
-    </section>
+    </details>
+    <small id="version" class="version"></small>
   </main>
   <script src="theme.js"></script>
   <script src="capture-reasons.js"></script>
