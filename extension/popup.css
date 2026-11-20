@@ -10,6 +10,11 @@ main { padding:8px 15px 14px; }
 .check { display:flex; gap:8px; align-items:flex-start; padding:7px 0; }
 .check input { flex:none; margin:3px 0 0; accent-color:var(--green); }
 small { display:block; color:var(--muted); font-size:11px; margin-top:2px; }
+.check span { min-width:0; overflow-wrap:anywhere; }
+.check small:empty { display:none; }
+details { border-top:1px solid var(--border); }
+summary { padding:8px 0; cursor:pointer; }
+.version { margin-top:8px; text-align:right; }
 .transfers { width:min(620px,100%); margin:auto; }
 h2 { margin:14px 0 6px; font:600 16px Georgia,serif; }
 .hint { color:var(--muted); }

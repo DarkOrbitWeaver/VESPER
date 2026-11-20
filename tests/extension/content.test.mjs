@@ -22,10 +22,41 @@ test('the Butterfly motion picker explains its motion choices', () => {
 
 test('browser sign-in settings require approval for the current HTTPS host', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
-  assert.match(popup, /Use sign-in cookies/);
+  assert.match(popup, /Use my sign-in/);
   assert.match(popup, /id="signin-site" disabled/);
   assert.match(popup, /id="signin-host"/);
-  assert.match(popup, /Only this exact host is approved\. This also requires the setting above\./);
+});
+
+test('opening the popup shows the installed extension version without checking the app', async () => {
+  for (const versionName of [undefined, '1.0.2-firstflight.3']) {
+    const elements = new Map();
+    const messages = [];
+    const getElementById = id => {
+      if (!elements.has(id)) elements.set(id, {});
+      return elements.get(id);
+    };
+    const chrome = {
+      runtime: {
+        getManifest: () => ({ version: '1.0.2', version_name: versionName }),
+        sendMessage: async message => { messages.push(message); return { ok: false }; }
+      },
+      storage: {
+        sync: { get: async defaults => ({ ...defaults, route: 'chrome', handoff: 'default' }) },
+        local: { get: async () => ({ vesperSeen: true, prefetchFormats: true }) },
+        session: { get: async () => ({}) }
+      },
+      permissions: { contains: async () => false, onRemoved: { addListener() {} } },
+      tabs: { query: async () => [] }
+    };
+    vm.runInNewContext(source('popup'), { chrome, document: { getElementById }, VesperTheme: { install() {} } });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(getElementById('version').textContent, `Extension ${versionName || '1.0.2'}`);
+    assert.equal(getElementById('route').value, 'chrome');
+    assert.equal(getElementById('handoff').value, 'default');
+    assert.equal(getElementById('prefetch').checked, true);
+    assert.deepEqual(messages, []);
+  }
 });
 
 test('the media picker wraps long metadata and keeps horizontal overflow inside its bounds', () => {
