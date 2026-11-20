@@ -1459,6 +1459,24 @@ public class HlsTests
         throw new InvalidOperationException("The transport fixture has no H.264 sequence parameter set.");
     }
 
+    [Fact]
+    public async Task BrokenHighestQualityVariantAddressDoesNotSilentlyDownloadALowerQuality()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        server.HlsPlaylists["/hls/broken-best/index.m3u8"] =
+            "#EXTM3U\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\nhttps://[broken/high.m3u8\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360\n/hls/plain/index.m3u8\n";
+        using var h = new Harness();
+        Guid id = AddHls(h, server, "/hls/broken-best/index.m3u8");
+
+        JobSnapshot stopped = await h.WaitAsync(id, s => s.State == JobState.NeedsAttention);
+        Assert.Equal("unsupported", stopped.Reason);
+        Assert.Contains("invalid playlist address", stopped.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Null(stopped.FinalPath);
+    }
+
     private static int PayloadOffset(Span<byte> packet)
     {
         int control = (packet[3] >> 4) & 3;

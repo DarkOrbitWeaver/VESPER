@@ -81,14 +81,16 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 string reasonCode = sessionKeys.Any(HlsParser.IsDrmSessionKey) ? "drm" : "unsupported";
                 return RunOutcome.NeedsAttention(reasonCode, "Master session keys are not supported.");
             }
-            IReadOnlyList<HlsVariant> listed = HlsParser.ParseMaster(text, baseUri);
-            if (listed.Count == 0)
+            IReadOnlyList<(HlsVariant Variant, bool ValidAddress)> listed = HlsParser.ParseMasterEntries(text, baseUri);
+            if (listed.Count == 0 || listed.All(entry => !entry.ValidAddress))
                 return RunOutcome.NeedsAttention("unsupported", "The playlist lists no quality with a usable address.");
-            IReadOnlyList<HlsVariant> usable = [.. listed.Where(v => !v.NeedsSeparateAudio)];
+            var usable = listed.Where(entry => !entry.Variant.NeedsSeparateAudio).ToList();
             if (usable.Count == 0)
                 return RunOutcome.NeedsAttention("separate-audio", "Every quality keeps audio separate; VESPER does not include a verified muxer for this combination.");
-            HlsVariant best = usable.OrderByDescending(v => v.Bandwidth).First();
-            (text, baseUri) = await FetchTextAsync(best.Uri, ct).ConfigureAwait(false);
+            var best = usable.OrderByDescending(entry => entry.Variant.Bandwidth).First();
+            if (!best.ValidAddress)
+                return RunOutcome.NeedsAttention("unsupported", "The selected HLS quality has an invalid playlist address.");
+            (text, baseUri) = await FetchTextAsync(best.Variant.Uri, ct).ConfigureAwait(false);
         }
         playlistUrl = baseUri.AbsoluteUri;
         HlsMedia media = HlsParser.ParseMedia(text, baseUri, allowTimelineChanges: true);

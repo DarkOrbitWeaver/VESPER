@@ -91,7 +91,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         var t = Parse(request.Url);
         if (t is null)
             return Fail(new MediaError(MediaErrorCode.InvalidInput,
-                "This YouTube page type (channel, search or home) is not supported. Paste a video or playlist link.",
+                "Paste a YouTube video or playlist link.",
                 "No video id or list id in URL", false, false, true));
 
         bool wantCollection = request.Options.CollectionIntent == CollectionIntent.CollectionOnly || t.VideoId is null;
@@ -336,16 +336,30 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         var target = reps.Where(r => r.FileSize is > 1_500_000).OrderBy(r => r.FileSize).FirstOrDefault()
                      ?? reps.OrderBy(r => r.FileSize ?? long.MaxValue).First();
         long offset = target.FileSize is long size && size > 1 ? size - 1 : 0;
-        try
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            MediaRangeProbeResult result = await Http.ProbeExactRangeAsync(target.Url, target.Context, offset, ct).ConfigureAwait(false);
-            string detail = $"byte probe {target.Id}@{offset}: {result.Detail}";
-            return result.IsValid ? (true, detail, null) : (false, detail, RangeFailure(result));
+            try
+            {
+                MediaRangeProbeResult result = await Http.ProbeExactRangeAsync(target.Url, target.Context, offset, ct).ConfigureAwait(false);
+                string detail = $"byte probe {target.Id}@{offset}: {result.Detail}";
+                if (result.IsValid) return (true, detail, null);
+                if (attempt == 0 && (result.StatusCode == 408 || result.StatusCode >= 500))
+                {
+                    await Task.Delay(250, ct).ConfigureAwait(false);
+                    continue;
+                }
+                return (false, detail, RangeFailure(result));
+            }
+            catch (MediaResolverException ex) when (attempt == 0 && ex.Error.Code == MediaErrorCode.NetworkFailure)
+            {
+                await Task.Delay(250, ct).ConfigureAwait(false);
+            }
+            catch (MediaResolverException ex)
+            {
+                return (false, $"byte probe {target.Id} failed ({ex.Error.Code})", ex.Error);
+            }
         }
-        catch (MediaResolverException ex)
-        {
-            return (false, $"byte probe {target.Id} failed ({ex.Error.Code})", ex.Error);
-        }
+        return (false, $"byte probe {target.Id} failed", MediaErrors.Network("Byte probe failed after retry"));
     }
 
     private static MediaError RangeFailure(MediaRangeProbeResult result)
@@ -375,7 +389,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         if (s.Drm > 0) return MediaErrors.Drm($"{strategy}: {s.Drm} DRM-protected formats; no clear formats offered");
         if (s.Cipher > 0 || s.Throttled > 0)
             return new MediaError(MediaErrorCode.BrowserContextRequired,
-                "YouTube only offers this video's streams to players that run its JavaScript challenges, which VESPER does not execute. Use the VESPER extension on the open page.",
+                "This video needs browser playback. Open it in Chrome and use the VESPER butterfly.",
                 $"{strategy}: {s.Cipher} formats use signatureCipher, {s.Throttled} carry the n challenge (unsupported player transformation)", false, true, false);
         if (s.ServerAbr)
             return MediaErrors.BrowserContext($"{strategy}: only a server-ABR playback endpoint was supplied (unsupported streaming feature)");
@@ -418,7 +432,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         {
             case "LOGIN_REQUIRED" when r.Contains("bot"):
                 return new MediaError(MediaErrorCode.BrowserContextRequired,
-                    "YouTube is asking this network to sign in to confirm it's not a bot. Use the VESPER extension from a page where you are signed in, or try again later.", diag, false, true, false);
+                    "YouTube asked for a sign-in check. Open the video in Chrome while signed in, or try again later.", diag, false, true, false);
             case "LOGIN_REQUIRED" or "AGE_VERIFICATION_REQUIRED" or "CONTENT_CHECK_REQUIRED":
                 return MediaErrors.LoginRequired(diag);
             case "LIVE_STREAM_OFFLINE":
