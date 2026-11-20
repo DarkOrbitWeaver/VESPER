@@ -299,6 +299,41 @@ test('a feed player uses the unique page linked from its card', async () => {
   assert.equal(window.__testPageForPlayer(new FakeElement()), home);
 });
 
+test('an in-page navigation finds an already loaded reel without waiting for playback', () => {
+  class Video {
+    isConnected = true;
+    src = 'blob:https://www.instagram.com/reel';
+    readyState = 1;
+    paused = true;
+    querySelectorAll() { return []; }
+    getBoundingClientRect() { return { left: 10, top: 15, right: 430, bottom: 680 }; }
+  }
+
+  const window = Object.assign(new EventTarget(), { navigation: new EventTarget() });
+  const location = { href: 'https://www.instagram.com/' };
+  const videos = [];
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => videos });
+  const context = vm.createContext({
+    window, document, location, URL, AbortController, innerWidth: 1200, innerHeight: 800,
+    Element: Video, HTMLMediaElement: Video, HTMLVideoElement: Video,
+    getComputedStyle: () => ({ visibility: 'visible' }),
+    ResizeObserver: class {},
+    IntersectionObserver: class { observe() {} },
+    VesperTheme: { available: () => true, watchPreference: () => () => {} },
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
+  });
+  vm.runInContext(source('player-source'), context);
+  const content = source('content').replace(/\}\)\(\);\s*$/, `attach = el => { window.testPlayer = el; };\n})();`);
+  vm.runInContext(content, context);
+
+  const reel = new Video();
+  videos.push(reel);
+  location.href = 'https://www.instagram.com/reels/';
+  window.navigation.dispatchEvent(new Event('currententrychange'));
+
+  assert.equal(window.testPlayer, reel);
+});
+
 test('a delayed hover preview keeps its linked page after the player is reset', async () => {
   class FakeElement {
     parentElement = null;
@@ -363,7 +398,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   vm.runInContext(source('theme'), context);
   vm.runInContext(source('player-source'), context);
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
-    onPointer, consider, handlePlayerPlaying, setSelectPlayer: fn => { selectPlayer = fn; },
+    onPointer, consider, refreshPlayer, setSelectPlayer: fn => { selectPlayer = fn; },
     activePreview: () => activePreview, holdMissingPreview, loadFormats,
     attachForTest: (player, controls) => {
       video = player; perch = { x: 10, y: 10 };
@@ -382,9 +417,9 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   window.__testContent.consider(video);
   window.__testContent.consider(unrelatedVideo);
   window.__testContent.setSelectPlayer(() => {});
-  window.__testContent.handlePlayerPlaying(unrelatedVideo);
+  window.__testContent.refreshPlayer(unrelatedVideo);
   assert.equal(window.__testContent.activePreview(), null);
-  window.__testContent.handlePlayerPlaying(video);
+  window.__testContent.refreshPlayer(video);
 
   assert.equal(window.__testContent.activePreview()?.player, video);
   assert.equal(window.__testContent.activePreview()?.page, item);

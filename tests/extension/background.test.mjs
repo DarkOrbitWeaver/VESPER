@@ -1423,7 +1423,8 @@ test('a blob player must choose even a single inferred manifest before VESPER re
 });
 
 test('an Instagram blob player can choose a complete browser-observed video response', async () => {
-  const app = load({ 'media-options': { ok: true } });
+  const app = load({ 'media-options': request => request.candidates.length
+    ? { ok: true } : { ok: false, code: 'no-media' } });
   const page = 'https://www.instagram.com/reel/abc123/';
   const sender = { url: page, tab: { id: 19 }, frameId: 0, documentId: 'instagram-player' };
   const changedAt = Date.now();
@@ -1438,12 +1439,39 @@ test('an Instagram blob player can choose a complete browser-observed video resp
   assert.equal(options.ok, true);
   assert.equal(options.data.sourceChoices.length, 1);
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('signature='), false);
-  assert.match(options.data.sourceChoices[0].label, /MP4/);
-  assert.deepEqual(app.sent, []);
+  assert.equal(options.data.sourceChoices[0].label, 'Video source 1');
+  assert.match(options.data.sourceChoices[0].detail, /MP4/);
+  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent[0].candidates.length, 0);
 
+  // Another response for the same URL should not invalidate the menu already on screen.
+  await app.onMedia({ url: mediaUrl, tabId: 19, frameId: 0, documentId: sender.documentId,
+    method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 200,
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
   await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
     pageUrl: page, generation: 4, playerUrl: message.playerUrl }, sender);
-  assert.equal(app.sent[0].candidates[0].url, mediaUrl);
+  assert.equal(app.sent[1].candidates[0].url, mediaUrl);
+});
+
+test('TikTok and reels show resolved formats before offering recently observed streams', async () => {
+  for (const page of ['https://www.tiktok.com/@example/video/1234567', 'https://www.instagram.com/reel/abc123/']) {
+    const reply = { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } };
+    const app = load({ 'media-options': reply });
+    const sender = { url: page, tab: { id: 21 }, frameId: 0, documentId: 'video-document' };
+    const changedAt = Date.now();
+    for (const name of ['preview.mp4', 'other.mp4'])
+      await app.onMedia({ url: `https://cdn.example.com/${name}`, tabId: 21, frameId: 0, documentId: sender.documentId,
+        method: 'GET', statusCode: 200, type: 'media', timeStamp: changedAt,
+        responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+
+    const options = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+      playerUrl: 'blob:player', generation: 4, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+    assert.equal(options.data.choices[0].label, 'Best quality');
+    assert.equal(options.data.sourceChoices, undefined);
+    assert.equal(app.sent.length, 1);
+    assert.equal(app.sent[0].url, page);
+    assert.equal(app.sent[0].candidates.length, 0);
+  }
 });
 
 test('an Instagram carousel with multiple observed videos requires the user to choose one', async () => {
@@ -1526,7 +1554,7 @@ test('a partial video range is not offered as a complete Instagram source', asyn
   assert.equal(result.data?.sourceChoices, undefined);
   assert.equal(app.sent[0].candidates.length, 0);
 
-  const completeApp = load({ 'media-options': { ok: true } });
+  const completeApp = load({ 'media-options': { ok: false, code: 'no-media' } });
   const completeSender = { url: page, tab: { id: 21 }, frameId: 0, documentId: 'instagram-full-range-player' };
   await completeApp.onMedia({ url: 'https://scontent.cdninstagram.com/v/t50.2886-16/video.mp4', tabId: 21,
     frameId: 0, documentId: completeSender.documentId, method: 'GET', statusCode: 206, type: 'xmlhttprequest',
@@ -1609,6 +1637,12 @@ test('an ambiguous blob player shows scoped stream choices before sending a cand
     generation: 3, playerUrl: message.playerUrl }, sender);
   assert.equal(replay.code, 'expired-selection');
   assert.equal(app.sent.length, 1);
+
+  const reopened = await app.message(message, sender);
+  assert.notEqual(reopened.data.sourceChoices[0].token, token);
+  const retried = await app.message({ type: 'media-source-select', sourceChoice: reopened.data.sourceChoices[0].token,
+    pageUrl: page, generation: 3, playerUrl: message.playerUrl }, sender);
+  assert.equal(retried.ok, true);
 });
 
 test('source-choice tokens are not restored after a worker restarts', async () => {
