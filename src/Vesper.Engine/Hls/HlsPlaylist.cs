@@ -67,8 +67,10 @@ public static class HlsParser
                 && !codecs.Contains("vp0", StringComparison.OrdinalIgnoreCase) && !codecs.Contains("av01", StringComparison.OrdinalIgnoreCase);
             // A variant that points at an audio group carries picture only; joining needs a muxer VESPER does not ship.
             bool separateAudio = a.TryGetValue("AUDIO", out var group) && externalAudioGroups.Contains(group) && !audioOnly;
+            // An address that cannot be resolved can never be fetched, so that quality is not offered.
+            if (!Uri.TryCreate(baseUri, uri, out Uri? address)) continue;
             if (variants.Count >= 1000) break;
-            variants.Add(new HlsVariant(new Uri(baseUri, uri).AbsoluteUri, bandwidth, width, height, codecs, separateAudio, audioOnly));
+            variants.Add(new HlsVariant(address.AbsoluteUri, bandwidth, width, height, codecs, separateAudio, audioOnly));
         }
         return variants;
     }

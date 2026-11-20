@@ -2,6 +2,21 @@
 
 **Current continuation index:** [MASTER-TODO.md](MASTER-TODO.md) · [NEXT-CHAT-HANDOFF.md](NEXT-CHAT-HANDOFF.md) · [STATUS.tsv](STATUS.tsv). The original audit history below is not a present-day release certification.
 
+## 2026-11-19 candidate patch: damaged-input sweeps and two parser refusals
+
+This describes candidate patch `VESPER-CANDIDATE-CLAUDE-PARSER-REFUSALS-889c5df`, based on `889c5df741dc090f4563939be1733f56fc50f2af`. It was built and tested in a Linux x64 container with .NET SDK 10.0.404. Nothing here was run on Windows, in Chrome or against a live site.
+
+USER-DEMUX-FUZZ. Seeded sweeps now cover the engine parsers that read bytes VESPER did not write: MPEG-TS demux and validation, fragmented MP4 initialization and fragments, MP4 and WebM audio-only and video-only inputs and tag readers, the FLAC, Vorbis, Opus and MP3 tag writers, and SRT/WebVTT. Text sweeps cover the engine HLS playlist parser and the resolver HLS, DASH, podcast-feed and URL-list parsers. Each target has a fixed seed and 96 cases per mutation; `VESPER_FUZZ_CASES` raises the count for a deeper local run. A failure prints the seed and the exact case.
+
+The sweeps found two defects, both fixed with regressions that fail on `889c5df`:
+
+- `FragmentedMp4.Open` read the one `stsd` entry with `SingleOrDefault()`. The entry count is only a field, so a damaged size could split the payload into two boxes and the call threw InvalidOperationException. A job reading that HLS or DASH initialization segment stopped as `unexpected` with "Sequence contains more than one element". It now refuses with the existing "Exactly one clear sample description is required." It only showed up at 20,000 cases, so two fixed inputs are kept as their own test.
+- `HlsParser.ParseMaster` resolved each quality with `new Uri(baseUri, uri)`, which throws for an address such as `https://[broken/x.m3u8`. The job stopped as `unexpected` with "Invalid URI". The parser now leaves out a quality whose address cannot be resolved. When a master playlist lists nothing usable, the job and `ProbeMediaAsync` report `unsupported` with "The playlist lists no quality with a usable address." instead of the separate-audio message. For a playlist that mixes one bad address with good ones, the parser returns the good ones; that case is tested at the parser, not as a full download.
+
+Results in that container: the sweeps passed at 96 and at 20,000 cases per mutation. The engine suite finished 719 passed, 72 failed, 39 skipped of 830. The untouched base finished 697 passed, 72 failed, 39 skipped of 808 in the same container, and the two failing sets are identical, so the difference is the 22 new tests. The resolver suite passed 369/369 and the extension suite 146/146. `dotnet build VESPER.slnx -c Release -warnaserror -p:EnableWindowsTargeting=true` compiled every project with 0 warnings; the Windows projects were compiled, not run. `scripts/Verify-EngineeringBacklog.ps1` reports 96 unique IDs and 51 unfinished, unchanged. Full logs are the `VESPER-CANDIDATE-CLAUDE-PARSER-REFUSALS-889c5df-LOG-*` files in tempdocs.
+
+Still needed before this counts as verified: the full Release suites on Windows, including the 72 engine tests that cannot pass on Linux, and the Windows UI and Setup suites.
+
 ## 2026-11-19 integrated Release test run
 
 On the `main` working tree based on `9c39cbd0cae05445fdc3b2ce798326ff727b4c7c`, the consolidated Release solution run passed **1274/1274** with no skips: engine 787, media resolver 363, Windows UI 78, and Setup 46. The full log is `release/audit-evidence/full-release-engineering-batch-rerun-20261119.log`. The complete extension suite passed **144/144**, log `release/audit-evidence/extension-release-rerun-20261119.log`. Later changes before this note were documentation and tracker updates only; the packaged release candidate and real Windows/Chrome/installer/media-player/performance gates remain open. Builds still report NU1900 because the NuGet vulnerability service is unreachable; the resolver test packages restored from the local package cache.
