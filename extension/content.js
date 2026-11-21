@@ -6,16 +6,18 @@
 
   const lifetime = new AbortController();
   const { signal } = lifetime;
-  const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_IDLE = 2300;
+  const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_IDLE = 2300, ENDED_PLAYER_TTL = 10 * 60_000;
   const PREVIEW_EXIT_GRACE = 900, PREVIEW_MAX_LATCH = 2200;
   let video = null;            // the player the butterfly is attached to
   let host = null, root = null, button = null, panel = null, receipt = null;
   let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
-  let previewRemovedAt = 0, panelMotion = null, fullscreenTimer = 0;
-  let drag = null, movedPerch = null, suppressDragClick = false, pointerMovedAt = 0;
+  let previewRemovedAt = 0, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
+  let drag = null, movedPerch = null, suppressDragClick = false, suppressDragClickTimer = 0, pointerMovedAt = 0;
+  let lastPointerPosition = null;
   let contextNotice = null, contextNoticeTimer = 0;
   let activePreview = null;
+  let endedPlayer = null;
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
   let motionMode = 'animate', unwatchMotion = null;
@@ -45,6 +47,7 @@
     observed.clear();
     unwatchMotion?.();
     clearTimeout(contextNoticeTimer);
+    clearTimeout(endedPlayerTimer);
     contextNotice?.remove();
     detach();
     delete window.__vesperContent;
@@ -75,6 +78,9 @@
     pageUrl = current;
     if (!changed) return;
     mediaChangedAt = Date.now();
+    endedPlayer = null;
+    clearTimeout(endedPlayerTimer);
+    movedPerch = null;
     activePreview = null;
     pointerTarget = null;
     if (panelMedia || receiptTimer) closePanel();
@@ -108,14 +114,71 @@
   // ------------------------------------------------------------ noticing media
 
   function visiblePlayer(el) {
-    if (!el?.isConnected || intersecting.get(el) === false) return null;
+    const ended = isCurrentEndedPlayer(el);
+    if (!el?.isConnected || intersecting.get(el) === false && !ended) return null;
     const r = el.getBoundingClientRect();
-    const left = Math.max(0, r.left), right = Math.min(innerWidth, r.right);
-    const top = Math.max(0, r.top), bottom = Math.min(innerHeight, r.bottom);
-    if (right - left < MIN_WIDTH || bottom - top < MIN_HEIGHT) return null;
     const style = getComputedStyle(el);
-    return style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0'
-      ? null : { left, top, right, bottom };
+    const hidden = style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0';
+    if (!hidden) {
+      const rect = clippedPlayerRect(r);
+      if (rect) return rect;
+    }
+    if (!ended) return null;
+
+    for (let parent = el.parentElement, depth = 0; parent && parent !== document.body && depth < 5; parent = parent.parentElement, depth++) {
+      const parentStyle = getComputedStyle(parent);
+      if (parentStyle.visibility === 'hidden' || parentStyle.visibility === 'collapse' || parentStyle.opacity === '0') continue;
+      const parentBox = parent.getBoundingClientRect();
+      const original = endedPlayer.frame;
+      const left = parentBox.left + scrollX, top = parentBox.top + scrollY;
+      const right = parentBox.right + scrollX, bottom = parentBox.bottom + scrollY;
+      const overlapsFrame = Math.max(0, Math.min(right, original.right) - Math.max(left, original.left))
+        * Math.max(0, Math.min(bottom, original.bottom) - Math.max(top, original.top));
+      const frameArea = Math.max(1, (original.right - original.left) * (original.bottom - original.top));
+      const closeSize = parentBox.width >= original.width * 0.5 && parentBox.width <= original.width * 2
+        && parentBox.height >= original.height * 0.5 && parentBox.height <= original.height * 2;
+      if (overlapsFrame >= frameArea * 0.5 && closeSize) {
+        const parentRect = clippedPlayerRect(parentBox);
+        if (parentRect) return parentRect;
+      }
+    }
+    return null;
+  }
+
+  function clippedPlayerRect(rect) {
+    if (!rect) return null;
+    const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
+    const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
+    return right - left < MIN_WIDTH || bottom - top < MIN_HEIGHT ? null : { left, top, right, bottom };
+  }
+
+  function isCurrentEndedPlayer(el) {
+    return !!endedPlayer && endedPlayer.player === el && Date.now() < endedPlayer.expires
+      && endedPlayer.pageIdentity === VesperPlayerSource.identity(pageForPlayer(el))
+      && el?.isConnected;
+  }
+
+  function rememberEndedPlayer(el) {
+    if (el !== video || !observed.has(el)) return;
+    const binding = playback.get(el);
+    if (!binding) return;
+    const rect = el.getBoundingClientRect();
+    endedPlayer = {
+      player: el,
+      binding,
+      pageIdentity: VesperPlayerSource.identity(binding.page),
+      frame: { left: rect.left + scrollX, top: rect.top + scrollY,
+        right: rect.right + scrollX, bottom: rect.bottom + scrollY,
+        width: rect.width, height: rect.height },
+      expires: Date.now() + ENDED_PLAYER_TTL
+    };
+    clearTimeout(endedPlayerTimer);
+    endedPlayerTimer = setTimeout(() => {
+      endedPlayerTimer = 0;
+      if (endedPlayer?.player !== el) return;
+      endedPlayer = null;
+      selectPlayer();
+    }, ENDED_PLAYER_TTL);
   }
 
   function cardContext(node, includePlayer) {
@@ -195,6 +258,15 @@
       const rect = visiblePlayer(activePreview.player);
       if (rect) { best = activePreview.player; bestArea = Infinity; }
     }
+    if (bestArea !== Infinity && isCurrentEndedPlayer(endedPlayer?.player)
+        && (!fullscreen || fullscreen.contains(endedPlayer.player))) {
+      const newPlayerPlaying = [...observed].some(el => el !== endedPlayer.player && !el.paused && !el.ended
+        && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el));
+      if (!newPlayerPlaying && visiblePlayer(endedPlayer.player)) {
+        best = endedPlayer.player;
+        bestArea = Infinity;
+      }
+    }
     for (const el of observed) {
       if (bestArea === Infinity) break;
       if (fullscreen && !fullscreen.contains(el)) continue;
@@ -217,11 +289,16 @@
       visibility.observe(el);
     }
     const page = pageForPlayer(el);
-    const previous = playback.get(el);
-    if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)) {
+    const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
+    if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)
+        && !(isCurrentEndedPlayer(el) && !src)) {
       const changedAt = Date.now();
       const binding = { src, page, generation: ++generation, changedAt };
       playback.set(el, binding);
+      if (endedPlayer?.player === el && binding.generation !== endedPlayer.binding.generation) {
+        endedPlayer = null;
+        clearTimeout(endedPlayerTimer);
+      }
       if (activePreview?.player === el) {
         activePreview = { ...activePreview, page, src,
           key: `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}`, binding };
@@ -241,11 +318,12 @@
   function prefetchPlayer(el) {
     if (!alive() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
         || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
-    const src = playerSource(el);
+    const ended = isCurrentEndedPlayer(el);
+    const src = playerSource(el) || (ended ? endedPlayer.binding.src : '');
     const targetPage = pageForPlayer(el);
     const identity = VesperPlayerSource.identity(targetPage);
     if (!identity) return;
-    const binding = playback.get(el);
+    const binding = playback.get(el) || (ended ? endedPlayer.binding : null);
     const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
     const key = `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
     if (prefetchedPlayers.get(el) === key) return;
@@ -253,7 +331,7 @@
     const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
     void send({ type: 'media-options', prefetch: true, pageUrl: targetPage,
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
-      playerPlaying: !el.paused && !el.ended, playerPageUrl: targetPage,
+      playerPlaying: !el.paused && !el.ended, playerHasMedia: current && (el.readyState >= 1 || el.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       mutedLoop: current && isMutedLoop(el, src),
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
@@ -264,17 +342,35 @@
 
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
   for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
+    if (type === 'playing') {
+      endedPlayer = null;
+      clearTimeout(endedPlayerTimer);
+    }
     consider(e.target);
     refreshPlayer(e.target);
     if (e.target === video) prefetchPlayer(e.target);
+  }, { capture: true, passive: true, signal });
+  document.addEventListener('ended', e => {
+    if (!alive()) return;
+    rememberEndedPlayer(e.target);
+    consider(e.target);
+    refreshPlayer(e.target);
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
     if (!alive()) return;
     if (type === 'emptied') {
       protectedVideos.delete(e.target);
-      if (activePreview?.player === e.target && playback.has(e.target))
-        activePreview = { ...activePreview, binding: playback.get(e.target) };
-      playback.delete(e.target);
+      if (isCurrentEndedPlayer(e.target)) {
+        playback.set(e.target, endedPlayer.binding);
+      } else {
+        if (activePreview?.player === e.target && playback.has(e.target))
+          activePreview = { ...activePreview, binding: playback.get(e.target) };
+        playback.delete(e.target);
+      }
+    }
+    if (type === 'loadstart' && endedPlayer?.player === e.target) {
+      endedPlayer = null;
+      clearTimeout(endedPlayerTimer);
     }
     if (e.target !== video) return;
     if (type === 'emptied') {
@@ -404,6 +500,8 @@
       e.stopPropagation();
       if (suppressDragClick && e.detail !== 0) {
         suppressDragClick = false;
+        clearTimeout(suppressDragClickTimer);
+        suppressDragClickTimer = 0;
         return;
       }
       void togglePanel();
@@ -436,6 +534,7 @@
   document.addEventListener('fullscreenchange', () => {
     if (!alive()) return;
     pointer = null;
+    button?.blur();
     stopFullscreenIdle();
     if (document.fullscreenElement) wakeFullscreen();
     if (host) mount();
@@ -479,6 +578,7 @@
       window.addEventListener('scroll', schedule, { passive: true, capture: true, signal });
       window.addEventListener('resize', schedule, { passive: true, signal });
     }
+    if (document.fullscreenElement) wakeFullscreen();
     place();
   }
 
@@ -551,19 +651,30 @@
     const corners = preview ? [left, right] : [right, left];
     const border = Math.abs(video.getBoundingClientRect().top - rect.top) < 2;
     const clear = (x, y) => y >= 4 && ![8, FLY_SIZE / 2, FLY_SIZE - 8].some(offset =>
-      document.elementsFromPoint(x + offset, y + FLY_SIZE / 2)
-        .some(el => el !== host && el.closest('button, a[href], input, [role="button"]')));
+      (document.elementsFromPoint?.(x + offset, y + FLY_SIZE / 2) || [])
+        .some(el => {
+          if (el === host || el === video) return false;
+          const control = el.closest?.('button, a[href], input, [role="button"]');
+          if (!control || control === host || control.contains?.(video)) return false;
+          return true;
+        }));
     const positions = fullscreen || !border ? [rect.top + 8] : [rect.top - VesperCompanion.footY, rect.top + 8];
+    if (rect.bottom - rect.top >= 180) positions.push(rect.top + 56);
     for (const y of positions) {
       const corner = corners.find(({ x }) => clear(x, y));
       if (corner) return { ...corner, y };
     }
+    const middle = rect.top + (rect.bottom - rect.top - FLY_SIZE) / 2;
+    const side = corners.find(({ x }) => clear(x, middle));
+    if (side) return { ...side, y: middle };
     return { ...corners[0], y: rect.top + 8 };
   }
 
   function startDrag(e) {
     if (e.button !== 0 || !e.isPrimary || !perch || !video) return;
     suppressDragClick = false;
+    clearTimeout(suppressDragClickTimer);
+    suppressDragClickTimer = 0;
     const box = button.getBoundingClientRect();
     drag = { id: e.pointerId, player: video, x: e.clientX, y: e.clientY,
       grabX: e.clientX - box.left, grabY: e.clientY - box.top, moved: false };
@@ -588,6 +699,11 @@
   function finishDrag(e) {
     if (drag?.id !== e.pointerId) return;
     suppressDragClick = drag.moved;
+    clearTimeout(suppressDragClickTimer);
+    suppressDragClickTimer = drag.moved ? setTimeout(() => {
+      suppressDragClick = false;
+      suppressDragClickTimer = 0;
+    }, 300) : 0;
     drag = null;
     button?.classList.remove('dragging');
     updateFlyVisibility();
@@ -643,6 +759,9 @@
 
   function onPointer(e) {
     if (!alive()) return;
+    const moved = !lastPointerPosition || lastPointerPosition.x !== e.clientX || lastPointerPosition.y !== e.clientY;
+    if (!moved && !drag) return;
+    lastPointerPosition = { x: e.clientX, y: e.clientY };
     pointerMovedAt = Date.now();
     if (document.fullscreenElement) wakeFullscreen();
     pointer = { x: e.clientX, y: e.clientY };
@@ -662,6 +781,7 @@
   }
   function clearPointer() {
     pointer = pointerTarget = null;
+    lastPointerPosition = null;
     companion?.pointerMove(-Infinity, -Infinity);
     updateFlyVisibility();
     holdMissingPreview();
@@ -743,10 +863,11 @@
     const request = ++panelRequest;
     const player = video;
     const preview = activePreview?.player === player ? activePreview : null;
-    const src = playerSource(player) || preview?.binding?.src || '';
+    const ended = isCurrentEndedPlayer(player);
+    const src = playerSource(player) || preview?.binding?.src || (ended ? endedPlayer.binding.src : '');
     const targetPage = activePreview?.player === player ? activePreview.page : pageForPlayer(player);
     const identity = VesperPlayerSource.identity(targetPage);
-    const binding = playback.get(player) || preview?.binding;
+    const binding = playback.get(player) || preview?.binding || (ended ? endedPlayer.binding : null);
     const current = !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
     const targetKey = activePreview?.player === player ? activePreview.key
       : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
@@ -768,7 +889,8 @@
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
-      title, playerPlaying: current && !player.paused && !player.ended, playerPageUrl: targetPage,
+      title, playerPlaying: current && !player.paused && !player.ended,
+      playerHasMedia: current && (player.readyState >= 1 || player.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       mutedLoop: current && !isPreview && isMutedLoop(player, src),
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
@@ -1005,7 +1127,7 @@
       clipError.hidden = true;
       clipNote.textContent = !canClip ? 'Choose a format that supports trimming, or turn Trim off.'
         : choice.clipUsesWholeFile ? 'Saves the times you chose. VESPER downloads and decodes the whole file first.'
-        : 'The clip may start earlier or end later than the times you choose.';
+        : 'VESPER fetches only the selected-range parts. The clip may start earlier or end later than the times you choose.';
     }
     const body = [output, list, clip, clipNote];
     if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {

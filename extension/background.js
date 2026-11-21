@@ -48,6 +48,7 @@ async function settings() {
 }
 
 const SITE_CAPTURE_RULES_KEY = 'vesperSiteNeverCaptureHosts';
+const SITE_POLICY_TIMEOUT = 15_000;
 let siteNeverCaptureHosts = new Set();
 let siteRulesLoaded = chrome.storage.local.get(SITE_CAPTURE_RULES_KEY).then(async saved => {
   const hosts = normalizeNeverCaptureHosts(saved[SITE_CAPTURE_RULES_KEY]);
@@ -93,7 +94,7 @@ async function refreshNeverCaptureHosts() {
   if (siteRulesRefresh) return siteRulesRefresh;
   siteRulesRefresh = (async () => {
     try {
-      const reply = await nativeRequest(envelope('hello'), 2500);
+      const reply = await nativeRequest(envelope('hello'), SITE_POLICY_TIMEOUT);
       return await cacheNeverCaptureHosts(reply);
     } catch { return false; }
   })().finally(() => { siteRulesRefresh = null; });
@@ -710,9 +711,10 @@ async function playerOptions(message, sender) {
     };
     const matchedManifest = manifest && observed(manifest);
     const possibleSources = [];
-    if (!matchedManifest && source === null && message.playerPlaying === true && Number.isInteger(message.generation) && message.generation > 0
+    const playerActiveOrLoaded = message.playerPlaying === true || message.playerHasMedia === true;
+    if (!matchedManifest && source === null && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
-      const sourceCutoff = Math.max(now - 15_000, changedAt - 15_000);
+      const sourceCutoff = Math.max(now - SOURCE_TTL, changedAt - 15_000);
       const sourceLimit = changedAt + 15_000;
       for (const evidence of state.sources) {
         const recent = evidence.seen >= sourceCutoff && evidence.seen <= sourceLimit;

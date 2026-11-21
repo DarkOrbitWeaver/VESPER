@@ -107,6 +107,25 @@ test('subtitle embedding stays opt-in and travels with the native media selectio
   assert.match(background, /mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles/);
 });
 
+test('ended media stays bound to its player and selected range notice explains what is fetched', () => {
+  const content = source('content');
+  assert.match(content, /document\.addEventListener\('ended'/);
+  assert.match(content, /pageIdentity === VesperPlayerSource\.identity\(pageForPlayer\(el\)\)/);
+  assert.match(content, /playerHasMedia: current &&/);
+  assert.match(content, /newPlayerPlaying/);
+  assert.match(content, /overlapsFrame >= frameArea \* 0\.5/);
+  assert.match(content, /VESPER fetches only the selected-range parts/);
+  assert.match(content, /downloads and decodes the whole file first/);
+});
+
+test('the butterfly clears fullscreen focus and tries safer edge perches first', () => {
+  const content = source('content');
+  assert.match(content, /button\?\.blur\(\)/);
+  assert.match(content, /rect\.top \+ 56/);
+  assert.match(content, /const middle = rect\.top \+ \(rect\.bottom - rect\.top - FLY_SIZE\) \/ 2/);
+  assert.match(content, /control\.contains\?\.\(video\)/);
+});
+
 test('browser playlist browsing only opens the native picker from resolver collection metadata', () => {
   const content = source('content');
   const background = source('background');
@@ -388,6 +407,7 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
     window, document, location, URL, AbortController, innerWidth: 1200, innerHeight: 800,
     Element: Video, HTMLMediaElement: Video, HTMLVideoElement: Video,
     getComputedStyle: () => ({ visibility: 'visible' }),
+    setTimeout: () => 1, clearTimeout() {},
     ResizeObserver: class {},
     IntersectionObserver: class { observe() {} },
     VesperTheme: { available: () => true, watchPreference: () => () => {} },

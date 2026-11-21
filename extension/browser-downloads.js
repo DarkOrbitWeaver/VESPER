@@ -456,6 +456,8 @@ function inBrowserOrder(id, work) {
 
 const transferCommand = (transferId, operation) => nativeRequest(envelope('browser-transfer', { transferId, operation }),
   operation === 'watch' ? 42000 : operation === 'abandon' ? 5000 : 16000);
+const unavailableTransferState = reply => !reply?.ok
+  && ['host-missing', 'timeout', 'app-unavailable', 'host-error', 'error'].includes(reply?.code);
 const chromeKeeps = (message = 'Chrome is continuing this download.') => ({ ok: false, code: 'in-chrome', chromePaused: false, message });
 
 async function armBrowserRecovery() {
@@ -893,7 +895,16 @@ async function reconcileChromeDownload(id, record, knownReply) {
   }
   if (item.state === 'in_progress' && !item.paused) { await restoreChromeDownload(id, record); return; }
   if (record.stage === 'parking') {
-    if (!canMove(item) || !item.paused || !(await transferCommand(record.transferId, 'accept')).ok) {
+    if (!canMove(item) || !item.paused) {
+      await restoreChromeDownload(id, record);
+      return;
+    }
+    const accepted = await transferCommand(record.transferId, 'accept');
+    if (!accepted?.ok) {
+      if (unavailableTransferState(accepted)) {
+        await armBrowserRecovery();
+        return;
+      }
       await restoreChromeDownload(id, record);
       return;
     }
@@ -901,6 +912,10 @@ async function reconcileChromeDownload(id, record, knownReply) {
     await writeBrowserRecord(id, record);
   }
   const reply = knownReply || await transferCommand(record.transferId, 'status');
+  if (unavailableTransferState(reply)) {
+    await armBrowserRecovery();
+    return;
+  }
   if (reply.ok && reply.data?.state === 'active') return;
   if (reply.ok && reply.data?.state === 'complete') { await finishBrowserHandoff(id, record); return; }
   await restoreChromeDownload(id, record);

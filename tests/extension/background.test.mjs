@@ -28,11 +28,13 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const alarms = new Map();
   const ports = [];
   const timers = new Set();
+  const timerDelays = [];
   let finishDownloadCancel;
   let digestCalls = 0;
   let deferredDigestCall = 0;
   let finishDigest;
   const testSetTimeout = (callback, delay, ...args) => {
+    timerDelays.push(delay);
     let timer;
     timer = setTimeout(() => { timers.delete(timer); callback(...args); }, delay);
     timers.add(timer);
@@ -161,7 +163,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
+  return { describe: context.__describe, sent, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
     localData: localSeed,
     install: () => onInstalled(),
     finishDownloadCancel: () => finishDownloadCancel?.(),
@@ -334,6 +336,16 @@ test('automatic capture fails closed when the fresh site policy is unavailable',
       assert.doesNotMatch(JSON.stringify(app.sessionData.vesperCaptureDecisions), /https?:|token=private/);
     }
   }
+});
+
+test('site policy waits long enough for a cold desktop start', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  await waitFor(() => app.policyRequests.length === 1, 'the site policy check did not run');
+
+  assert.ok(app.timerDelays.includes(15_000));
 });
 
 test('automatic capture checks the referrer, original URL and final URL hosts', async () => {
@@ -1189,6 +1201,27 @@ test('an unknown abandon state keeps a Chrome download paused by an automatic ca
   assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'parked');
 });
 
+test('an unavailable status check keeps the paused Chrome item attached to its native transfer', async () => {
+  const file = activeDownload();
+  let bridgeDown = false;
+  const app = load({ 'browser-submit': started, 'browser-transfer': message => {
+    if (bridgeDown && message.operation === 'status')
+      return { ok: false, code: 'app-unavailable', message: 'VESPER is restarting.' };
+    return transfer('active');
+  } }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(file.paused, true);
+
+  bridgeDown = true;
+  await app.recover();
+
+  assert.equal(file.paused, true);
+  assert.equal(app.actions.includes('resume'), false);
+  assert.equal(app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'abandon'), false);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'parked');
+});
+
 test('Chrome resumes when an automatic acceptance reports a failed VESPER transfer', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer('failed') },
@@ -1491,6 +1524,24 @@ test('TikTok and reels show resolved formats before offering recently observed s
     assert.equal(app.sent[0].url, page);
     assert.equal(app.sent[0].candidates.length, 0);
   }
+});
+
+test('a paused or ended blob player can use its recent manifest after a late click', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://video.example/watch/demo';
+  const sender = { url: page, tab: { id: 29 }, frameId: 0, documentId: 'late-click-doc' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://cdn.video.example/live/master.m3u8', tabId: 29,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 200, responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  app.advanceTime(60_000);
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 4, playerPlaying: false, playerHasMedia: true,
+    mediaChangedAt: changedAt }, sender);
+  assert.equal(result.ok, true);
+  assert.equal(result.data?.sourceChoices?.length, 1);
+  assert.equal(result.data.sourceChoices[0].label, 'HLS stream');
 });
 
 test('an Instagram carousel with multiple observed videos requires the user to choose one', async () => {
