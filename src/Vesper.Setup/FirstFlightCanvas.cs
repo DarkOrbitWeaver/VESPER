@@ -11,15 +11,15 @@ internal sealed class FirstFlightCanvas : Control
 {
     internal const int LogicalWidth = 800;
     internal const int LogicalHeight = 484;
-    internal const double PublisherStart = 3.06;
-    internal const double BlankStart = 5.03;
-    internal const double Duration = 5.25;
-    private const double FlightStart = 1.18;
-    private const double ForegroundPass = 2.95;
-    private const double HoldStart = 4.23;
-    private const double FadeStart = 4.75;
+    internal const double FlightStart = 1.53;
+    private const double ForegroundPass = FlightStart + 1.77;
+    internal const double PublisherStart = FlightStart + 1.88;
+    private const double HoldStart = FlightStart + 3.05;
+    private const double FadeStart = FlightStart + 3.57;
+    internal const double BlankStart = FlightStart + 3.85;
+    internal const double Duration = FlightStart + 4.07;
     private static readonly double[] Cuts =
-        [0, .12, .26, .43, .57, .70, .88, 1.04, FlightStart, ForegroundPass, PublisherStart, HoldStart, FadeStart, BlankStart];
+        [0, .16, .34, .56, .74, .91, 1.14, 1.35, FlightStart, ForegroundPass, PublisherStart, HoldStart, FadeStart, BlankStart];
     private static readonly string[] Props = ["01_hourglass", "02_key", "03_letter", "04_quill", "05_camera", "06_vinyl", "07_book", "08_moon"];
 
     // Draw the trailing butterflies first so the closest wings can pass in front of them.

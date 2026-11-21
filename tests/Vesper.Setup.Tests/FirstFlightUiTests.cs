@@ -12,11 +12,11 @@ public sealed class FirstFlightUiTests
     public void StalledPaintsStillAdvanceThroughEveryIntroScene()
     {
         double frame = -1;
-        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.95, FirstFlightCanvas.PublisherStart, 4.23, 4.75];
+        double[] cuts = [0, .16, .34, .56, .74, .91, 1.14, 1.35, 1.53, 3.30, 3.41, 4.58, 5.10];
         foreach (double cut in cuts)
         {
             frame = FirstFlightCanvas.NextFrame(frame, 10);
-            Assert.Equal(cut, frame);
+            Assert.Equal(cut, frame, 3);
         }
         Assert.Equal(10, FirstFlightCanvas.NextFrame(frame, 10));
     }
@@ -76,30 +76,31 @@ public sealed class FirstFlightUiTests
         Save(image, "first-flight-" + theme);
         Save(image, "first-flight-" + theme + "-vesper-welcome");
 
+        const double flightStart = FirstFlightCanvas.FlightStart;
         foreach ((string name, double time) in new (string, double)[]
         {
             ("logo-flash-first", .05),
-            ("logo-flash-last", 1.08),
-            ("butterfly-swarm", 1.20),
-            ("publisher-approach", 2.25),
-            ("publisher-foreground", 3.14),
-            ("publisher-clearing", 3.55),
-            ("publisher-wordmark", 4.40),
-            ("transition", 4.89),
+            ("logo-flash-last", flightStart - .10),
+            ("butterfly-swarm", flightStart + .02),
+            ("publisher-approach", flightStart + 1.07),
+            ("publisher-foreground", flightStart + 1.96),
+            ("publisher-clearing", flightStart + 2.37),
+            ("publisher-wordmark", flightStart + 3.22),
+            ("transition", flightStart + 3.71),
         })
         {
             canvas.Render(graphics, image.Size, time);
             Save(image, $"first-flight-{theme}-{name}");
         }
 
-        canvas.Render(graphics, image.Size, 4.40);
+        canvas.Render(graphics, image.Size, flightStart + 3.22);
         Color band = image.GetPixel(400, 199);
         Color disk = image.GetPixel(400, 175);
         Assert.True(band.GetBrightness() > disk.GetBrightness() + .3f, $"Rim {band}, disk {disk}");
         Save(image, "publisher-" + theme);
         canvas.Render(graphics, image.Size, FirstFlightCanvas.PublisherStart - .01);
         Assert.True(HasArtwork(image, palette.Back), "Butterflies should still be in flight when the publisher reveal begins.");
-        canvas.Render(graphics, image.Size, 5.90);
+        canvas.Render(graphics, image.Size, FirstFlightCanvas.Duration);
         Assert.False(HasArtwork(image, palette.Back), "The last butterflies should clear before setup returns.");
         Save(image, "first-flight-" + theme + "-blank-transition");
     });
@@ -176,7 +177,7 @@ public sealed class FirstFlightUiTests
 
                     if (!installCompleted) return;
                     if (canvas.Playing) AssertIntroControls(window);
-                    if (!introCaptured && introClock.Elapsed.TotalSeconds >= 2.1)
+                    if (!introCaptured && introClock.Elapsed.TotalSeconds >= FirstFlightCanvas.FlightStart + .92)
                     {
                         Assert.True(canvas.Playing, "The completed install did not keep the intro visible.");
                         VesperButton skipButton = Assert.IsType<VesperButton>(window.AcceptButton);
@@ -185,7 +186,7 @@ public sealed class FirstFlightUiTests
                         introCaptured = true;
                     }
 
-                    if (!publisherCaptured && introClock.Elapsed.TotalSeconds >= 4.40)
+                    if (!publisherCaptured && introClock.Elapsed.TotalSeconds >= FirstFlightCanvas.FlightStart + 3.22)
                     {
                         Assert.True(canvas.Playing, "The publisher reveal ended before its screenshot was captured.");
                         SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-publisher-reveal.png"));
