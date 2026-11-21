@@ -177,7 +177,7 @@ internal sealed class DownloadItem
             return quality is not null && System.Text.RegularExpressions.Regex.IsMatch(quality, @"\b\d{3,4}p\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ? "Video" : "Media";
         return extension switch
         {
-            "MP3" or "WAV" or "FLAC" or "M4A" or "OGG" or "AAC" or "WEBA" => "Audio",
+            "MP3" or "WAV" or "FLAC" or "M4A" or "OGG" or "OPUS" or "AAC" or "WEBA" => "Audio",
             "AVI" or "MOV" or "TS" or "M4V" => "Video",
             "ZIP" or "RAR" or "7Z" or "GZ" or "TAR" or "XZ" => "Archive",
             "ISO" or "IMG" => "Disc image",

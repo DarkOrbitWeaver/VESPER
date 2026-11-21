@@ -68,10 +68,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         {
             owner.BeginInvoke(() =>
             {
+                if (ct.IsCancellationRequested) { finished.TrySetCanceled(ct); return; }
                 try
                 {
-                    owner.RequestShow();
+                    owner.ShowFromTray();
                     using var picker = new MediaDiscoveryForm(preferences(), page, hints);
+                    using var registration = ActivateReview(picker, ct);
                     DialogResult outcome = picker.ShowDialog(owner);
                     finished.TrySetResult(outcome == DialogResult.OK
                         ? (picker.Selections, picker.QueueOnly)
@@ -325,12 +327,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 VesperPreferences formPreferences = preferences().Clone();
                 if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
                 using var form = new BatchReviewForm(formPreferences, request.Items);
-                form.Shown += (_, _) => form.Activate();
-                using var registration = ct.Register(() =>
-                {
-                    if (!form.IsDisposed && form.IsHandleCreated)
-                        try { form.BeginInvoke(() => form.Close()); } catch (InvalidOperationException) { }
-                });
+                using var registration = ActivateReview(form, ct);
                 form.ShowDialog(owner);
                 done.TrySetResult((form.Result, form.Destination, form.SelectedIndices, form.TrustedChecksumIndices));
             }
@@ -360,16 +357,37 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             detail = "Sent from your browser";
         }
 
-        var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string)>();
+        var done = new TaskCompletionSource<(QuickDownloadForm.Outcome, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
         owner.BeginInvoke(() =>
         {
-            VesperPreferences formPreferences = preferences().Clone();
-            if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
-            using var form = new QuickDownloadForm(formPreferences, title, detail, size);
-            form.ShowDialog();
-            done.TrySetResult((form.Result, form.Destination));
+            if (ct.IsCancellationRequested) { done.TrySetCanceled(ct); return; }
+            try
+            {
+                owner.ShowFromTray();
+                VesperPreferences formPreferences = preferences().Clone();
+                if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
+                using var form = new QuickDownloadForm(formPreferences, title, detail, size);
+                using var registration = ActivateReview(form, ct);
+                form.ShowDialog(owner);
+                done.TrySetResult((form.Result, form.Destination));
+            }
+            catch (Exception ex) { done.TrySetException(ex); }
         });
-        await using (ct.Register(() => done.TrySetCanceled(ct))) return await done.Task;
+        return await done.Task.WaitAsync(ct);
+    }
+
+    private static CancellationTokenRegistration ActivateReview(Form form, CancellationToken ct)
+    {
+        form.Shown += (_, _) =>
+        {
+            if (ct.IsCancellationRequested) form.BeginInvoke(() => form.Close());
+            else form.Activate();
+        };
+        return ct.Register(() =>
+        {
+            if (!form.IsDisposed && form.IsHandleCreated)
+                try { form.BeginInvoke(() => form.Close()); } catch (InvalidOperationException) { }
+        });
     }
 
     private static string DescribeProbe(MediaProbeResult probe)

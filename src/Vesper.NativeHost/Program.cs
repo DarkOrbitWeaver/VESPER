@@ -53,7 +53,9 @@ internal static class Program
     private static async Task<string> HandleAsync(BridgeRequest request, string rawJson, CancellationToken ct)
     {
         string pipe = BridgePipe.NameForCurrentUser();
-        bool bringReviewForward = request.Type == "batch-review";
+        bool bringReviewForward = request.Type is "batch-review" or "media-picker"
+            || request.Type == "submit" && (request.Mode == "ask" || request.Items.Count > 1
+                || request.Items.Any(item => item.Sha256 is not null));
 
         string? answer = await TryRequestAsync(pipe, rawJson, ct, bringReviewForward);
         if (answer is not null) return answer;

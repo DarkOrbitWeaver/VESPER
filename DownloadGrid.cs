@@ -88,6 +88,7 @@ public sealed class DownloadGrid : Control
         _scrollBar.Visible = false;
         _scrollBar.ValueChanged += (_, _) =>
         {
+            if (IsHandleCreated) UpdateHover(PointToClient(MousePosition));
             Invalidate(BodyBounds);
             LoadVisiblePosters();
         };
@@ -216,8 +217,8 @@ public sealed class DownloadGrid : Control
     {
         int page = Math.Max(1, ClientSize.Height - _headerHeight);
         int rows = (int)Math.Min(int.MaxValue, (long)_items.Count * _rowHeight);
+        int offset = ScrollOffset;
         _scrollLimit = Math.Max(0, rows - page);
-        ScrollToOffset(ScrollOffset);
         _scrollBar.Maximum = Math.Max(0, rows - 1);
         _scrollBar.LargeChange = page;
         _scrollBar.SmallChange = Math.Max(1, _rowHeight);
@@ -225,6 +226,7 @@ public sealed class DownloadGrid : Control
         _scrollBar.SetBounds(ClientSize.Width - _scrollBar.Width, _headerHeight, _scrollBar.Width, page);
         _scrollBar.Visible = _scrollLimit > 0;
         CalculateColumns();
+        ScrollToOffset(offset);
     }
 
     protected override void OnResize(EventArgs e)
@@ -251,6 +253,8 @@ public sealed class DownloadGrid : Control
         int lines = SystemInformation.MouseWheelScrollLines;
         if (_scrollLimit == 0 || lines == 0) return;
         if (e is HandledMouseEventArgs handled) handled.Handled = true;
+        if ((_wheelRemainder > 0 && e.Delta < 0) || (_wheelRemainder < 0 && e.Delta > 0))
+            _wheelRemainder = 0;
         _wheelRemainder += e.Delta;
         int step = lines < 0 ? _scrollBar.LargeChange : lines * _rowHeight;
         ScrollToOffset(ScrollOffset - _wheelRemainder / 120 * step);
@@ -319,9 +323,8 @@ public sealed class DownloadGrid : Control
     private void CalculateColumns()
     {
         int width = Math.Max(0, ClientSize.Width - (_scrollLimit > 0 ? _scrollBar.Width : 0));
-        if (width == 0) return;
-        int select = UiKit.Scale(this, 48);
-        int actions = UiKit.Scale(this, 44);
+        int actions = Math.Min(width, UiKit.Scale(this, 44));
+        int select = Math.Min(width - actions, UiKit.Scale(this, 48));
         int size = UiKit.Scale(this, 89);
         int activity = Math.Clamp((int)(width * .235), UiKit.Scale(this, 158), UiKit.Scale(this, 258));
         int transfer = Math.Clamp((int)(width * .165), UiKit.Scale(this, 122), UiKit.Scale(this, 225));
@@ -329,7 +332,18 @@ public sealed class DownloadGrid : Control
         if (name < UiKit.Scale(this, 190))
         {
             int deficit = UiKit.Scale(this, 190) - name;
-            transfer = Math.Max(UiKit.Scale(this, 80), transfer - deficit);
+            int cut = Math.Min(deficit, transfer - UiKit.Scale(this, 80));
+            transfer -= cut;
+            deficit -= cut;
+            activity = Math.Max(UiKit.Scale(this, 110), activity - deficit);
+            int room = Math.Max(0, width - select - actions - UiKit.Scale(this, 80));
+            int total = size + activity + transfer;
+            if (total > room)
+            {
+                size = size * room / total;
+                activity = activity * room / total;
+                transfer = transfer * room / total;
+            }
             name = width - select - actions - size - activity - transfer;
         }
         _columnWidths[0] = select;
@@ -409,12 +423,13 @@ public sealed class DownloadGrid : Control
     private void PaintHeader(Graphics g)
     {
         using (var fill = new SolidBrush(_palette.Secondary))
-            g.FillRectangle(fill, 0, 0, _contentWidth, _headerHeight);
+            g.FillRectangle(fill, 0, 0, ClientSize.Width, _headerHeight);
         using (var pen = new Pen(_palette.Divider))
-            g.DrawLine(pen, 0, _headerHeight - 1, _contentWidth, _headerHeight - 1);
+            g.DrawLine(pen, 0, _headerHeight - 1, ClientSize.Width, _headerHeight - 1);
         for (int col = 0; col < 6; col++)
         {
             Rectangle rect = Cell(col, 0, _headerHeight);
+            if (rect.Width == 0) continue;
             if (col == 0)
             {
                 PaintCheck(g, Center(rect, UiKit.Scale(this, 16)),
@@ -664,7 +679,12 @@ public sealed class DownloadGrid : Control
                 return;
             }
         }
-        var (row, column) = Hit(e.Location);
+        UpdateHover(e.Location);
+    }
+
+    private void UpdateHover(Point point)
+    {
+        var (row, column) = Hit(point);
         if (row != _hoverRow)
         {
             int old = _hoverRow;
@@ -672,7 +692,7 @@ public sealed class DownloadGrid : Control
             if (old >= 0) Invalidate(RowRectangle(old));
             if (row >= 0) Invalidate(RowRectangle(row));
         }
-        bool link = row >= 0 && (column is 5 or 0 || column == 1 && e.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48));
+        bool link = row >= 0 && (column is 5 or 0 || column == 1 && point.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48));
         Cursor desiredCursor = link ? Cursors.Hand : Cursors.Default;
         if (Cursor != desiredCursor) Cursor = desiredCursor;
         if (row == _hoverRow && column != _hoverColumn && row >= 0)
@@ -702,6 +722,7 @@ public sealed class DownloadGrid : Control
 
     private (int row, int col) Hit(Point point)
     {
+        if (!ClientRectangle.Contains(point) || point.X >= _contentWidth) return (-1, -1);
         if (point.Y < _headerHeight)
             return (-1, point.X >= 0 && point.X < _columnWidths[0] ? 0 : -1);
         int row = (point.Y - _headerHeight + ScrollOffset) / Math.Max(1, _rowHeight);

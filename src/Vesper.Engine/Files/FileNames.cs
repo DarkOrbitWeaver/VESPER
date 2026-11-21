@@ -152,7 +152,7 @@ public static class FileNames
     public static string CategoryFor(string name) => Path.GetExtension(name).ToLowerInvariant() switch
     {
         ".mp4" or ".mkv" or ".webm" or ".avi" or ".mov" or ".ts" or ".m4v" => "Video",
-        ".mp3" or ".flac" or ".wav" or ".m4a" or ".ogg" or ".aac" or ".weba" => "Audio",
+        ".mp3" or ".flac" or ".wav" or ".m4a" or ".ogg" or ".opus" or ".aac" or ".weba" => "Audio",
         ".zip" or ".rar" or ".7z" or ".gz" or ".tar" or ".xz" or ".bz2" => "Archives",
         ".iso" or ".img" => "Disc images",
         ".exe" or ".msi" or ".msix" or ".appx" => "Programs",

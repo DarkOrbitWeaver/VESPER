@@ -162,25 +162,8 @@ public sealed partial class DownloadEngine
             if (!PathSafety.PathStillNamesFile(source, file, digest))
                 return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
 
-            // Zone.Identifier is path-based. Reopen and pin the identity after writing it,
-            // before the handle-bound rename below.
-            file.Dispose();
+            // Hold the verified stream without write sharing through publication.
             WriteMarkOfTheWeb(job, source, expectedSourceIdentity);
-            file = prepared is null
-                ? PartialFile.OpenOwnedRead(job, share, options)
-                : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
-            if (file.Length != expectedLength
-                || OperatingSystem.IsWindows() && !string.Equals(sourceIdentity,
-                    TryGetPublishedFileIdentity(file.SafeFileHandle), StringComparison.Ordinal))
-                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
-            if (prepared is not null)
-            {
-                try { PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, prepared.Identity); }
-                catch (IOException)
-                { return RunOutcome.NeedsAttention("publication-file", "The prepared file changed before it could be published."); }
-            }
-            if (!Convert.ToHexString(SHA256.HashData(file)).Equals(digest, StringComparison.OrdinalIgnoreCase))
-                return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
 
             for (int attempt = 0; attempt < 50; attempt++)
             {
@@ -229,7 +212,6 @@ public sealed partial class DownloadEngine
                 if (!PathSafety.PathStillNamesFile(target, file, digest))
                     return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
                 long publishedLength = file.Length;
-                file.Dispose();
                 try
                 {
                     // The transfer handle allows rename/delete. Reopen the final path with sharing
@@ -288,8 +270,9 @@ public sealed partial class DownloadEngine
             string directoryPath = Path.GetDirectoryName(Path.GetFullPath(path))
                 ?? throw new IOException("The download folder is unavailable.");
             using SafeFileHandle directory = PathSafety.OpenTemporaryDirectoryHandle(directoryPath);
+            // Pin the name while writing the alternate stream.
             using SafeFileHandle file = PathSafety.OpenTemporaryHandle(path, FileMode.Open,
-                FileAccess.Read, FileShare.Read | FileShare.Write);
+                FileAccess.Read, FileShare.Read);
             PathSafety.RequireTemporaryIdentity(file, expectedIdentity);
             string host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? source) ? source.GetLeftPart(UriPartial.Path) : "";
             string referrer = Uri.TryCreate(job.Referer, UriKind.Absolute, out Uri? r) ? r.GetLeftPart(UriPartial.Path) : "";
