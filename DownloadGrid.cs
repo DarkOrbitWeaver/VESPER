@@ -257,8 +257,10 @@ public sealed class DownloadGrid : Control
             _wheelRemainder = 0;
         _wheelRemainder += e.Delta;
         int step = lines < 0 ? _scrollBar.LargeChange : lines * _rowHeight;
-        ScrollToOffset(ScrollOffset - _wheelRemainder / 120 * step);
+        int before = ScrollOffset;
+        ScrollToOffset(before - _wheelRemainder / 120 * step);
         _wheelRemainder %= 120;
+        if (ScrollOffset != before) UpdateHover(e.Location);
     }
 
     internal void ScrollToOffset(int y)
@@ -689,8 +691,8 @@ public sealed class DownloadGrid : Control
         {
             int old = _hoverRow;
             _hoverRow = row;
-            if (old >= 0) Invalidate(RowRectangle(old));
-            if (row >= 0) Invalidate(RowRectangle(row));
+            if (old >= 0) InvalidateBodyRow(old);
+            if (row >= 0) InvalidateBodyRow(row);
         }
         bool link = row >= 0 && (column is 5 or 0 || column == 1 && point.X < Cell(1, 0, 0).Left + UiKit.Scale(this, 48));
         Cursor desiredCursor = link ? Cursors.Hand : Cursors.Default;
@@ -707,6 +709,12 @@ public sealed class DownloadGrid : Control
             _ => ""
         } : "";
         if (tip != _tipText) { _tipText = tip; _tips.SetToolTip(this, tip); }
+    }
+
+    private void InvalidateBodyRow(int row)
+    {
+        Rectangle dirty = Rectangle.Intersect(RowRectangle(row), BodyBounds);
+        if (!dirty.IsEmpty) Invalidate(dirty);
     }
 
     protected override void OnMouseLeave(EventArgs e)

@@ -279,10 +279,25 @@ public sealed class DownloadGridTests
             Assert.True(bar.Visible);
             var invalidated = new List<Rectangle>();
             grid.Invalidated += (_, e) => invalidated.Add(e.InvalidRect);
+            int mouseX = 24, mouseY = bar.Top + 10;
+            typeof(DownloadGrid).GetMethod("OnMouseMove", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(grid, [new MouseEventArgs(MouseButtons.None, 0, mouseX, mouseY, 0)]);
+            var hoverRow = typeof(DownloadGrid).GetField("_hoverRow", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            int previousHover = (int)hoverRow.GetValue(grid)!;
+            Assert.Equal(0, previousHover);
             const int WM_MOUSEWHEEL = 0x020A;
             IntPtr oneNotchDown = unchecked((IntPtr)(int)0xFF880000); // wheel delta -120 in the high word
-            SendMessage(grid.Handle, WM_MOUSEWHEEL, oneNotchDown, IntPtr.Zero);
-            if (SystemInformation.MouseWheelScrollLines != 0) Assert.True(grid.ScrollOffset > 0);
+            Point screenPointer = grid.PointToScreen(new Point(mouseX, mouseY));
+            IntPtr wheelLocation = unchecked((IntPtr)((ushort)screenPointer.X | (uint)(ushort)screenPointer.Y << 16));
+            SendMessage(grid.Handle, WM_MOUSEWHEEL, oneNotchDown, wheelLocation);
+            if (SystemInformation.MouseWheelScrollLines != 0)
+            {
+                Assert.True(grid.ScrollOffset > 0);
+                var hit = typeof(DownloadGrid).GetMethod("Hit", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                int expectedHover = ((ValueTuple<int, int>)hit.Invoke(grid, [new Point(mouseX, mouseY)])!).Item1;
+                Assert.Equal(expectedHover, hoverRow.GetValue(grid));
+                Assert.NotEqual(previousHover, expectedHover);
+            }
             bar.Value = Math.Min(200, bar.Maximum - bar.LargeChange + 1);
             Assert.Equal(bar.Value, grid.ScrollOffset);
             Assert.NotEmpty(invalidated);
