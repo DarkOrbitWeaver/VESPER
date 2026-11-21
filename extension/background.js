@@ -47,6 +47,11 @@ async function settings() {
   return prefs;
 }
 
+async function extensionPaused() {
+  const { vesperPaused = false } = await chrome.storage.local.get('vesperPaused').catch(() => ({}));
+  return vesperPaused === true;
+}
+
 const SITE_CAPTURE_RULES_KEY = 'vesperSiteNeverCaptureHosts';
 const SITE_POLICY_TIMEOUT = 15_000;
 let siteNeverCaptureHosts = new Set();
@@ -903,6 +908,8 @@ async function describe(url, durationSeconds) {
 // They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
 const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker']);
+const PAUSE_BLOCKED_COMMANDS = new Set(['smart-submit', 'media-options', 'media-select', 'media-source-select',
+  'browser-media-select', 'native-picker', 'retry', 'submit']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit']);
 
@@ -920,6 +927,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   (async () => {
+    if (await extensionPaused() && PAUSE_BLOCKED_COMMANDS.has(message.type))
+      return { ok: false, code: 'paused', message: 'VESPER is paused in Chrome.' };
     await recoverChromeCaptures();
     switch (message.type) {
       case 'smart-submit': {
@@ -1048,10 +1057,22 @@ async function openContextMedia(pageUrl, info, tab) {
   await flash(tab?.id, reply, info.frameId);
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
-  await chrome.contextMenus.removeAll();
+async function updateVesperContextMenus(paused) {
+  for (const id of ['vesper-smart', 'vesper-download'])
+    await chrome.contextMenus.remove(id).catch(() => {});
+  if (paused) return;
   chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER', contexts: ['page'] });
   chrome.contextMenus.create({ id: 'vesper-download', title: 'Download with VESPER', contexts: ['link', 'video', 'audio'] });
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || !changes.vesperPaused) return;
+  return updateVesperContextMenus(changes.vesperPaused.newValue === true);
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.contextMenus.removeAll();
+  await updateVesperContextMenus(await extensionPaused());
   chrome.contextMenus.create({ id: 'vesper-transfers', title: 'Unconfirmed VESPER requests…', contexts: ['action'] });
   await updateBadge();
   await recoverChromeDownloads();
@@ -1078,6 +1099,7 @@ async function runContextAction(info, tab) {
     await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
     return;
   }
+  if (await extensionPaused()) return;
   if (info.menuItemId === 'vesper-smart') {
     try { await chrome.tabs.sendMessage(tab.id, { type: 'vesper-smart-select' }, { frameId: info.frameId ?? 0 }); }
     catch { await flash(tab?.id, { ok: false, message: 'Smart Select is unavailable on this page.' }, info.frameId); }

@@ -45,6 +45,14 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   // Sign-in fixtures model a user who also approved the test site's exact host.
   const localSeed = { ...(prefs.useSignIn ? { signInHosts: ['example.com'] } : {}), ...localData };
   const local = storage(localSeed);
+  const saveLocal = local.set;
+  local.set = async values => {
+    const changes = {};
+    for (const [key, value] of Object.entries(values))
+      changes[key] = { oldValue: (await local.get(key))[key], newValue: structuredClone(value) };
+    await saveLocal(values);
+    await onStorageChanged?.(changes, 'local');
+  };
   if (download && !downloadHistory.some(item => item.id === download.id)) downloadHistory.push(download);
   const chrome = {
     runtime: {
@@ -77,7 +85,11 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
         throw new Error('No receiver');
       }
     },
-    contextMenus: { create: item => contextMenuItems.push(item), removeAll: async () => { contextMenuItems.length = 0; }, onClicked: { addListener: fn => { onContextClicked = fn; } } },
+    contextMenus: {
+      create: item => contextMenuItems.push(item),
+      remove: async id => { const index = contextMenuItems.findIndex(item => item.id === id); if (index >= 0) contextMenuItems.splice(index, 1); },
+      removeAll: async () => { contextMenuItems.length = 0; }, onClicked: { addListener: fn => { onContextClicked = fn; } }
+    },
     alarms: {
       get: async name => alarms.get(name),
       create: async (name, details) => alarms.set(name, details),
@@ -833,6 +845,29 @@ test('automatic API interception off leaves Chrome as the only download owner', 
   assert.equal(file.paused, false);
   assert.equal(app.actions.includes('cancel'), false);
   assert.equal(app.ports.length, 0);
+});
+
+test('pausing VESPER in Chrome hides new actions and leaves accepted transfers alone', async () => {
+  const file = { ...activeDownload(), paused: true };
+  const existing = { startTime: file.startTime, transferId: 'active-vesper-transfer',
+    sourceHash: 'd'.repeat(64), stage: 'parked', resumeChrome: true, at: Date.now() };
+  const app = load({ 'browser-submit': { ok: true, results: [{ transferReady: true }] } }, {
+    download: file, prefs: { useSignIn: false }, localData: { browserDownloads: { [file.id]: existing } }
+  });
+  await app.local.set({ vesperPaused: true });
+
+  const blocked = await app.message({ type: 'media-options' }, { tab: { id: 2 }, url: 'https://example.com/watch' });
+  assert.equal(blocked.code, 'paused');
+  await app.onCreated({ ...file, paused: false });
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+  assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].transferId, existing.transferId);
+  assert.equal(app.actions.includes('resume'), false);
+  assert.equal(app.actions.includes('cancel'), false);
+
+  await app.local.set({ vesperPaused: false });
+  await app.onChanged({ id: file.id, totalBytes: { current: 0 } });
+  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false,
+    'a file first seen during pause must stay with Chrome after unpausing');
 });
 
 test('a pending Chrome capture survives a service worker restart', async () => {

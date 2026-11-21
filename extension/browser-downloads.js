@@ -68,12 +68,20 @@ const captureStateReady = chrome.storage.session.get(CAPTURE_STATE_KEY).then(({ 
 
 let captureSettings = { intercept: true, route: 'auto' };
 let captureEnabled = false;
+let capturePaused = false;
+let captureAdmissionGeneration = 0;
 let captureGeneration = 0;
 let captureSettingsRevision = 0;
+let capturePauseRevision = 0;
 let captureSettingsReady;
 
 function captureIsEnabled(generation = captureGeneration) {
   return captureSettingsReady.then(() => captureEnabled && generation === captureGeneration);
+}
+
+async function captureCanBegin(generation, admissionGeneration) {
+  return await captureIsEnabled(generation) && !capturePaused
+    && admissionGeneration === captureAdmissionGeneration;
 }
 
 function clearCaptureMemory() {
@@ -95,6 +103,24 @@ function clearCaptureState() {
   return write;
 }
 
+function clearPausedCaptureEvidence() {
+  const write = captureWrites.catch(() => {}).then(async () => {
+    await captureStateReady;
+    clearCaptureMemory();
+    await chrome.storage.session.set({ [CAPTURE_STATE_KEY]: { responses: [], awaiting: [], created: [], chains: [], blocked: [] } });
+  });
+  captureWrites = write.catch(() => {});
+  return write;
+}
+
+function setCapturePaused(paused) {
+  if (capturePaused === paused) return Promise.resolve();
+  capturePaused = paused;
+  captureAdmissionGeneration++;
+  if (paused) return clearPausedCaptureEvidence();
+  return Promise.resolve();
+}
+
 function setCapturePreferences(next) {
   const wasEnabled = captureEnabled;
   captureSettings = next;
@@ -113,6 +139,10 @@ function setCapturePreferences(next) {
 }
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === 'local' && changes.vesperPaused) {
+    capturePauseRevision++;
+    return setCapturePaused(changes.vesperPaused.newValue === true);
+  }
   if (areaName !== 'sync' || (!changes.intercept && !changes.route)) return;
   captureSettingsRevision++;
   const next = { ...captureSettings };
@@ -121,11 +151,16 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   return setCapturePreferences(next);
 });
 
-captureSettingsReady = settings().then(prefs => {
+captureSettingsReady = Promise.all([settings(), chrome.storage.local.get('vesperPaused')]).then(([prefs, localPrefs]) => {
   if (captureSettingsRevision === 0) {
     captureSettings = { intercept: prefs.intercept !== false, route: prefs.route || 'auto' };
     captureEnabled = captureSettings.intercept && captureSettings.route !== 'chrome';
   }
+  if (capturePauseRevision === 0 && localPrefs.vesperPaused === true) {
+    capturePaused = true;
+    captureAdmissionGeneration++;
+  }
+  if (capturePaused) return clearPausedCaptureEvidence();
   if (!captureEnabled) return clearCaptureState();
 }).catch(() => {
   captureEnabled = false;
@@ -163,7 +198,8 @@ function saveCaptureState(generation = captureGeneration) {
 function recentlyCreated(item) {
   const created = createdDownloads.get(item?.id);
   return !!created && created.startTime === item.startTime && Date.now() >= created.seen
-    && Date.now() - created.seen <= NEW_DOWNLOAD_WINDOW;
+    && Date.now() - created.seen <= NEW_DOWNLOAD_WINDOW
+    && (created.admissionGeneration === undefined || created.admissionGeneration === captureAdmissionGeneration);
 }
 
 function rememberWaitingResponse(item, url, generation) {
@@ -201,7 +237,7 @@ function requestChainIsRelevant(chain) {
 }
 
 async function persistRequestChainsForDownload(item, generation) {
-  if (!(await captureIsEnabled(generation))) return;
+  if (!(await captureCanBegin(generation, captureAdmissionGeneration))) return;
   let changed = false;
   for (const chain of requestChains.values()) {
     if (chain.replayable && chain.originalUrl === startUrl(item) && !chain.persisted) {
@@ -212,21 +248,20 @@ async function persistRequestChainsForDownload(item, generation) {
   if (changed) await saveCaptureState(generation);
 }
 
-function rememberRequestRedirect(details, generation) {
-  if (!captureEnabled || generation !== captureGeneration) return Promise.resolve();
+async function rememberRequestRedirect(details, generation, admissionGeneration = captureAdmissionGeneration) {
+  if (!(await captureCanBegin(generation, admissionGeneration))) return;
   const chain = updateRequestChain(details.requestId, withoutFragment(details.url), details.method);
   if (chain && typeof details.redirectUrl === 'string') {
     chain.currentUrl = withoutFragment(details.redirectUrl);
     chain.seen = Date.now();
     if (chain.replayable && requestChainIsRelevant(chain)) chain.persisted = true;
-    if (chain.persisted || !chain.replayable) return saveCaptureState(generation);
+    if (chain.persisted || !chain.replayable) await saveCaptureState(generation);
   }
-  return Promise.resolve();
 }
 
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
-async function observeDownloadResponse(details, generation) {
-  if (!captureEnabled || generation !== captureGeneration) return;
+async function observeDownloadResponse(details, generation, admissionGeneration = captureAdmissionGeneration) {
+  if (!(await captureCanBegin(generation, admissionGeneration))) return;
   const url = withoutFragment(details.url);
   const chain = updateRequestChain(details.requestId, url, details.method, details.statusCode);
   if (details.statusCode !== 200 && details.statusCode !== 206) {
@@ -279,15 +314,25 @@ async function observeDownloadResponse(details, generation) {
 const DOWNLOAD_TYPES = ['main_frame', 'sub_frame', 'other'];
 chrome.webRequest.onHeadersReceived.addListener(details => {
   const generation = captureGeneration;
+  const admissionGeneration = captureAdmissionGeneration;
   void captureSettingsReady.then(async () => {
-    if (await captureIsEnabled(generation)) await captureStateReady.then(() => observeDownloadResponse(details, generation));
+    if (await captureCanBegin(generation, admissionGeneration)) {
+      await captureStateReady;
+      if (await captureCanBegin(generation, admissionGeneration))
+        await observeDownloadResponse(details, generation, admissionGeneration);
+    }
   }).catch(() => {});
 },
   { urls: ['http://*/*', 'https://*/*'], types: DOWNLOAD_TYPES }, ['responseHeaders']);
 chrome.webRequest.onBeforeRedirect.addListener(details => {
   const generation = captureGeneration;
+  const admissionGeneration = captureAdmissionGeneration;
   void captureSettingsReady.then(async () => {
-    if (await captureIsEnabled(generation)) await captureStateReady.then(() => rememberRequestRedirect(details, generation));
+    if (await captureCanBegin(generation, admissionGeneration)) {
+      await captureStateReady;
+      if (await captureCanBegin(generation, admissionGeneration))
+        await rememberRequestRedirect(details, generation, admissionGeneration);
+    }
   }).catch(() => {});
 },
   { urls: ['http://*/*', 'https://*/*'], types: DOWNLOAD_TYPES });
@@ -386,10 +431,11 @@ async function recoverUncapturedChromeDownloads() {
   // Only an onCreated event (also kept briefly across worker restarts) authorizes automatic capture.
   // Do not scan Chrome's existing downloads and adopt work it has already been doing.
   const items = await Promise.all([...createdDownloads.keys()].map(id => getChromeDownload(id).catch(() => null)));
-  const recoverable = items.filter(item => recentlyCreated(item) && canMove(item) && !item.paused
+  const recoverable = items.filter(item => !capturePaused && recentlyCreated(item) && canMove(item) && !item.paused
     && !startedByVesper(item) && !browserOperations.has(item.id)
     && (!sameDownload(item, records[item.id] || {}) || records[item.id]?.stage === 'attempted'));
-  await Promise.allSettled(recoverable.map(item => captureChromeDownloadSafely(item)));
+  await Promise.allSettled(recoverable.map(item => captureChromeDownloadSafely(item, captureGeneration,
+    createdDownloads.get(item.id)?.admissionGeneration ?? captureAdmissionGeneration)));
 }
 
 async function stopExhaustedCaptureAttempts() {
@@ -465,11 +511,11 @@ async function armBrowserRecovery() {
     await chrome.alarms.create(RECOVERY_ALARM, { delayInMinutes: 1 });
 }
 
-function moveChromeDownload(id, mode, automatic = false) {
+function moveChromeDownload(id, mode, automatic = false, admissionGeneration = captureAdmissionGeneration) {
   if (!Number.isSafeInteger(id) || id < 0) return Promise.resolve(chromeKeeps('Choose a Chrome download.'));
   return inBrowserOrder(id, async () => {
     const generation = captureGeneration;
-    if (automatic && !(await captureIsEnabled(generation))) return chromeKeeps();
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) return chromeKeeps();
     const item = await getChromeDownload(id);
     if (!automatic || !recentlyCreated(item))
       return chromeKeeps('Chrome owns this download. Start it with VESPER to download using VESPER.');
@@ -520,6 +566,7 @@ function moveChromeDownload(id, mode, automatic = false) {
         await note(candidate.state === 'complete' ? 'chrome-finished' : candidate.bytesReceived > 0 ? 'chrome-started' : 'not-ready');
       return chromeKeeps();
     }
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) return chromeKeeps();
     const record = previous?.stage === 'attempted'
       ? { ...previous }
       : { startTime: item.startTime, transferId: crypto.randomUUID(), stage: 'attempted', attempts: 0 };
@@ -527,16 +574,16 @@ function moveChromeDownload(id, mode, automatic = false) {
     delete record.retryAt;
     record.attempts = captureAttemptCount(record) + 1;
     if (!(await writeBrowserRecord(id, record))) return chromeKeeps();
-    if (automatic && !(await captureIsEnabled(generation))) {
-      await writeBrowserRecord(id, null);
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
+      if (!previous) await writeBrowserRecord(id, null);
       return chromeKeeps();
     }
     const { items, authorized } = await withSignIn([{
       url: browserUrl(item), originalUrl: startUrl(item), fileName: chromeFileName(candidate),
       referer: item.referrer || undefined, userAgent: navigator.userAgent
     }]);
-    if (automatic && !(await captureIsEnabled(generation))) {
-      await writeBrowserRecord(id, null);
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
+      if (!previous) await writeBrowserRecord(id, null);
       return chromeKeeps();
     }
     const reply = await nativeRequest(envelope('browser-submit', { id: record.transferId, mode, items, authorized, browserProof: proof }), 24000);
@@ -931,7 +978,7 @@ async function recoverChromeDownloads() {
 }
 
 
-async function captureChromeDownload(item, generation = captureGeneration) {
+async function captureChromeDownload(item, generation = captureGeneration, admissionGeneration = captureAdmissionGeneration) {
   await captureStateReady;
   if (item?.state === 'complete') {
     // Too late to take over, and Chrome's file is not VESPER's to list. Just stand down if we had started one.
@@ -945,17 +992,17 @@ async function captureChromeDownload(item, generation = captureGeneration) {
     });
     return;
   }
-  if (!(await captureIsEnabled(generation))) return;
+  if (!(await captureCanBegin(generation, admissionGeneration))) return;
   await persistRequestChainsForDownload(item, generation);
-  if (!(await captureIsEnabled(generation))) return;
+  if (!(await captureCanBegin(generation, admissionGeneration))) return;
   if (startedByVesper(item) || !recentlyCreated(item)) return;
   const wanted = captureEnabled;
   if (!canMove(item) || item.paused) {
     // A file the page built itself (blob: or data:) has no address VESPER could fetch.
     const pageMade = isSafe(item) && item.state === 'in_progress' && /^(blob|data):/i.test(item.finalUrl || item.url || '');
-    if (wanted && pageMade && await captureIsEnabled(generation)) await noteDecision(item, 'page-made');
+    if (wanted && pageMade && await captureCanBegin(generation, admissionGeneration)) await noteDecision(item, 'page-made');
     else if (wanted && isSafe(item) && item.state === 'in_progress' && item.bytesReceived > 0
-        && await captureIsEnabled(generation))
+        && await captureCanBegin(generation, admissionGeneration))
       await noteDecision(item, 'chrome-started');
     return;
   }
@@ -964,21 +1011,21 @@ async function captureChromeDownload(item, generation = captureGeneration) {
   if (!proof) {
     if (!recentResponse(url)) await rememberWaitingResponse(item, url, generation);
     else if (awaitingResponses.delete(item.id)) await saveCaptureState(generation);
-    if (wanted && await captureIsEnabled(generation)) await noteDecision(item, reason);
+    if (wanted && await captureCanBegin(generation, admissionGeneration)) await noteDecision(item, reason);
     return;
   }
   if (awaitingResponses.delete(item.id)) await saveCaptureState(generation);
-  if (wanted && await captureIsEnabled(generation)) {
+  if (wanted && await captureCanBegin(generation, admissionGeneration)) {
     const prefs = await settings();
-    if (await captureIsEnabled(generation))
-      await moveChromeDownload(item.id, prefs.handoff, true);
+    if (await captureCanBegin(generation, admissionGeneration))
+      await moveChromeDownload(item.id, prefs.handoff, true, admissionGeneration);
   }
 }
 
-async function captureChromeDownloadSafely(item, generation = captureGeneration) {
-  try { await captureChromeDownload(item, generation); }
+async function captureChromeDownloadSafely(item, generation = captureGeneration, admissionGeneration = captureAdmissionGeneration) {
+  try { await captureChromeDownload(item, generation, admissionGeneration); }
   catch {
-    if (!(await captureIsEnabled(generation)) || !canMove(item) || item.incognito || item.paused) return;
+    if (!(await captureCanBegin(generation, admissionGeneration)) || !canMove(item) || item.incognito || item.paused) return;
     try {
       const prefs = await settings();
       if (prefs.intercept && prefs.route !== 'chrome') await noteDecision(item, 'capture-error');
@@ -993,15 +1040,16 @@ chrome.alarms.onAlarm.addListener(alarm => {
 chrome.downloads.onCreated.addListener(item => {
   const seen = Date.now();
   const generation = captureGeneration;
+  const admissionGeneration = captureAdmissionGeneration;
   return captureSettingsReady.then(async () => {
-    if (!(await captureIsEnabled(generation))) return;
+    if (!(await captureCanBegin(generation, admissionGeneration))) return;
     await captureStateReady;
-    if (!(await captureIsEnabled(generation))) return;
+    if (!(await captureCanBegin(generation, admissionGeneration))) return;
     if (Number.isSafeInteger(item?.id) && item.state === 'in_progress' && !item.incognito && !startedByVesper(item)) {
-      createdDownloads.set(item.id, { startTime: item.startTime, seen });
+      createdDownloads.set(item.id, { startTime: item.startTime, seen, admissionGeneration });
       await saveCaptureState(generation);
     }
-    await captureChromeDownloadSafely(item, generation);
+    await captureChromeDownloadSafely(item, generation, admissionGeneration);
   }).catch(() => {});
 });
 chrome.downloads.onChanged.addListener(async change => {

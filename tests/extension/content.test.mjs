@@ -215,7 +215,7 @@ test('the context-menu picker reports when its frame has no video player', async
   assert.equal(reply.code, 'no-player');
 });
 
-test('dragging stays inside the video and fullscreen wakes again after idle', () => {
+test('dragging can perch outside the player and fullscreen wakes again after idle', () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();
   let now = 10000, idle;
@@ -240,16 +240,16 @@ test('dragging stays inside the video and fullscreen wakes again after idle', ()
 
   const calls = [];
   const classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
-  const player = { isConnected: true, getBoundingClientRect: () => ({ left: 10, top: 20, right: 490, bottom: 320 }) };
-  const button = { classList, matches: () => false, setPointerCapture() {}, getBoundingClientRect: () => ({ left: 20, top: 30 }) };
+  const player = { isConnected: true, getBoundingClientRect: () => ({ left: 160, top: 120, right: 640, bottom: 420 }) };
+  const button = { classList, matches: () => false, setPointerCapture() {}, getBoundingClientRect: () => ({ left: 170, top: 130 }) };
   window.testPlayer.setup(player, button, { classList }, {
     setPerch: (x, y) => calls.push([x, y]), setVisible: shown => calls.push(shown), pointerMove() {}
   });
-  const down = { button: 0, isPrimary: true, pointerId: 1, clientX: 25, clientY: 35 };
+  const down = { button: 0, isPrimary: true, pointerId: 1, clientX: 175, clientY: 135 };
   window.testPlayer.startDrag(down);
-  window.testPlayer.moveDrag({ ...down, clientX: 700, clientY: 550 });
+  window.testPlayer.moveDrag({ ...down, clientX: 110, clientY: 70 });
   window.testPlayer.finishDrag(down);
-  assert.deepEqual(calls[0], [446, 276]);
+  assert.deepEqual(calls[0], [116, 76]);
   assert.equal(window.testPlayer.moved(), true);
 
   document.fullscreenElement = { contains: () => true };
@@ -340,9 +340,9 @@ test('an orphaned content script disconnects observers and storage listeners on 
   document.dispatchEvent(new Event('fullscreenchange'));
   assert.equal(window.__vesperContent, undefined);
   assert.equal(disconnected, 2);
-  assert.equal(unsubscribed, 1);
+  assert.equal(unsubscribed, 2);
   document.dispatchEvent(new Event('fullscreenchange'));
-  assert.equal(unsubscribed, 1);
+  assert.equal(unsubscribed, 2);
 });
 
 test('a feed player uses the unique page linked from its card', async () => {
@@ -375,6 +375,7 @@ test('a feed player uses the unique page linked from its card', async () => {
     chrome: {
       runtime: { id: 'vesper-test', onMessage: { addListener() {} } },
       storage: {
+        local: { get: async () => ({ vesperPaused: false, vesperHiddenButterflyHosts: [] }) },
         sync: { get: async defaults => defaults },
         onChanged: { addListener() {}, removeListener() {} }
       }
@@ -491,6 +492,8 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
     onPointer, consider, refreshPlayer, setSelectPlayer: fn => { selectPlayer = fn; },
     activePreview: () => activePreview, holdMissingPreview, loadFormats,
+    choiceKey: pickerOptionKey, restorePickerDraft,
+    setRetainedPickerDraft: draft => { retainedPickerDraft = draft; },
     attachForTest: (player, controls) => {
       video = player; perch = { x: 10, y: 10 };
       ({ button, panel, receipt } = controls);
@@ -499,7 +502,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
     }
   };\n})();`);
   vm.runInContext(content, context);
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
 
   window.__testContent.onPointer({ target: card, clientX: 220, clientY: 100 });
   assert.equal(window.__testContent.activePreview(), null);
@@ -523,4 +526,30 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   assert.equal(sent[0].pageUrl, item);
   assert.equal(sent[0].playerUrl, '');
   assert.equal(sent[0].playerPlaying, false);
+
+  const best = { index: 0, label: 'Best quality', detail: '1080p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };
+  const balanced = { index: 1, label: 'Balanced', detail: '720p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };
+  window.__testContent.setRetainedPickerDraft({
+    targetKey: 'same-video', choiceKey: window.__testContent.choiceKey(balanced), useOriginal: false, useM4a: true,
+    intent: { audioTrack: 'es', subtitles: ['en', 'es'], includeAutoSubtitles: false, embedSubtitles: true },
+    trimDraft: { enabled: true, start: '00:12', end: '00:20' }
+  });
+  const refreshed = {
+    choices: [best, { ...balanced, index: 7 }],
+    audioTracks: [{ id: 'en' }, { id: 'es' }],
+    subtitleOptions: [{ language: 'en', embedSupported: true }, { language: 'es', embedSupported: true }]
+  };
+  const restored = window.__testContent.restorePickerDraft(refreshed, 'same-video');
+  assert.equal(restored.choice.index, 7, 'a fresh format index may differ while the same choice remains available');
+  assert.deepEqual(refreshed.intent.subtitles, ['en', 'es']);
+  assert.equal(refreshed.intent.audioTrack, 'es');
+  assert.equal(refreshed.intent.embedSubtitles, true);
+  assert.equal(JSON.stringify(refreshed.trimDraft), JSON.stringify({ enabled: true, start: '00:12', end: '00:20' }));
+
+  const changed = { choices: [best], audioTracks: [{ id: 'en' }], subtitleOptions: [{ language: 'en' }] };
+  const changedRestore = window.__testContent.restorePickerDraft(changed, 'same-video');
+  assert.equal(changed.selectionNeedsChoice, true);
+  assert.match(changed.selectionNotice, /no longer available/);
+  assert.match(changed.trackNotice, /selected tracks/);
+  assert.equal(changedRestore.choice.index, 0);
 });

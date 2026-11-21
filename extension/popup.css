@@ -14,6 +14,10 @@ main { padding:8px 15px 14px; }
 small { display:block; color:var(--muted); font-size:11px; margin-top:2px; }
 .check span { min-width:0; overflow-wrap:anywhere; }
 .check small:empty { display:none; }
+.text-action { display:block; margin:8px 0 0; padding:0; border:0; background:none; color:var(--blue); font:inherit; text-align:left; text-decoration:underline; cursor:pointer; }
+.text-action:disabled { color:var(--muted); cursor:default; text-decoration:none; }
+.site-host { margin-top:2px; }
+.pause { border-top:1px solid var(--border); margin-top:8px; }
 details { border-top:1px solid var(--border); }
 summary { padding:8px 0; cursor:pointer; }
 .version { margin-top:8px; text-align:right; }

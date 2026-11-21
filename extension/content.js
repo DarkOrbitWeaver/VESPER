@@ -21,7 +21,24 @@
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
   let motionMode = 'animate', unwatchMotion = null;
+  let extensionPaused = false, extensionPreferencesReady = false;
+  let hiddenButterflyHosts = new Set();
+  let retainedPickerDraft = null;
   const still = () => motionMode === 'still';
+  const butterflyHidden = () => extensionPaused || hiddenButterflyHosts.has((location.hostname || '').toLowerCase());
+  function onExtensionPreferencesChanged(changes, areaName) {
+    if (areaName !== 'local') return;
+    if (changes.vesperPaused) extensionPaused = changes.vesperPaused.newValue === true;
+    if (changes.vesperHiddenButterflyHosts) {
+      const hosts = changes.vesperHiddenButterflyHosts.newValue;
+      hiddenButterflyHosts = new Set(Array.isArray(hosts)
+        ? hosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()) : []);
+    }
+    if (!extensionPreferencesReady || !('vesperPaused' in changes || 'vesperHiddenButterflyHosts' in changes)) return;
+    if (butterflyHidden()) detach(true);
+    else refreshPlayers();
+  }
+  chrome.storage?.onChanged?.addListener?.(onExtensionPreferencesChanged);
   const protectedVideos = new WeakSet();
   const playback = new WeakMap();
   const prefetchedPlayers = new WeakMap();
@@ -46,6 +63,9 @@
     visibility.disconnect();
     observed.clear();
     unwatchMotion?.();
+    retainedPickerDraft = null;
+    try { chrome.storage?.onChanged?.removeListener?.(onExtensionPreferencesChanged); }
+    catch { /* An extension reload can invalidate its storage events before the page listener is removed. */ }
     clearTimeout(contextNoticeTimer);
     clearTimeout(endedPlayerTimer);
     contextNotice?.remove();
@@ -77,6 +97,7 @@
     const changed = VesperPlayerSource.identity(current) !== VesperPlayerSource.identity(pageUrl);
     pageUrl = current;
     if (!changed) return;
+    retainedPickerDraft = null;
     mediaChangedAt = Date.now();
     endedPlayer = null;
     clearTimeout(endedPlayerTimer);
@@ -107,6 +128,7 @@
     const binding = panelMedia.player && playback.get(panelMedia.player);
     const sourceMatches = !panelMedia.generation || !binding || binding.generation === panelMedia.generation;
     if (pageMatches && previewMatches && sourceMatches) return true;
+    retainedPickerDraft = null;
     closePanel();
     return false;
   }
@@ -224,6 +246,8 @@
 
   function activatePreview(preview) {
     if (!preview || (preview.player === activePreview?.player && preview.key === activePreview?.key)) return false;
+    if (activePreview && activePreview.key !== preview.key || panelMedia && panelMedia.targetKey !== preview.key)
+      retainedPickerDraft = null;
     activePreview = preview;
     consider(preview.player);
     if (panelMedia && panelMedia.targetKey !== preview.key) closePanel();
@@ -249,6 +273,8 @@
 
   function selectPlayer() {
     if (!alive()) return;
+    if (!extensionPreferencesReady) return;
+    if (butterflyHidden()) { detach(true); return; }
     if (drag && visiblePlayer(video)) { place(true); return; }
     if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
     if (holdMissingPreview()) { place(); return; }
@@ -305,18 +331,25 @@
         if (panelMedia && panelMedia.targetKey !== activePreview.key) closePanel();
       }
       if (el === video) mediaChangedAt = changedAt;
+      if (el === video && panelMedia?.player === el) {
+        retainedPickerDraft = null;
+        closePanel();
+      }
+      if (el === video && retainedPickerDraft) retainedPickerDraft = null;
     }
   }
 
   function refreshPlayers() {
     if (!alive()) return;
     syncPage();
+    if (!extensionPreferencesReady) return;
+    if (butterflyHidden()) { detach(true); return; }
     document.querySelectorAll('video').forEach(consider);
     selectPlayer();
   }
 
   function prefetchPlayer(el) {
-    if (!alive() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
+    if (!alive() || butterflyHidden() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
         || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
     const ended = isCurrentEndedPlayer(el);
     const src = playerSource(el) || (ended ? endedPlayer.binding.src : '');
@@ -358,7 +391,16 @@
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
     if (!alive()) return;
-    if (type === 'emptied') {
+    if (type === 'loadstart') {
+      protectedVideos.delete(e.target);
+      playback.delete(e.target);
+      if (activePreview?.player === e.target) activePreview = null;
+      if (e.target === video) {
+        mediaChangedAt = Date.now();
+        retainedPickerDraft = null;
+        if (panelMedia?.player === e.target) closePanel();
+      }
+    } else {
       protectedVideos.delete(e.target);
       if (isCurrentEndedPlayer(e.target)) {
         playback.set(e.target, endedPlayer.binding);
@@ -568,6 +610,7 @@
       place();
       return;
     }
+    if (video && video !== el) retainedPickerDraft = null;
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
     if (drag) finishDrag({ pointerId: drag.id });
@@ -591,7 +634,8 @@
     place();
   }
 
-  function detach() {
+  function detach(preservePickerDraft = false) {
+    if (!preservePickerDraft) retainedPickerDraft = null;
     listening = false;
     activePreview = null;
     companion?.stopIdle();
@@ -650,8 +694,10 @@
 
   function playerPerch(rect, fullscreen) {
     if (movedPerch) {
-      const x = rect.left + (rect.right - rect.left - FLY_SIZE) * movedPerch.x;
-      const y = rect.top + (rect.bottom - rect.top - FLY_SIZE) * movedPerch.y;
+      const width = rect.right - rect.left - FLY_SIZE;
+      const height = rect.bottom - rect.top - FLY_SIZE;
+      const x = Math.max(8, Math.min(rect.left + width * movedPerch.x, innerWidth - FLY_SIZE - 8));
+      const y = Math.max(8, Math.min(rect.top + height * movedPerch.y, innerHeight - FLY_SIZE - 8));
       return { x, y, faceLeft: movedPerch.x > 0.5 };
     }
     const preview = activePreview?.player === video && !fullscreen;
@@ -697,10 +743,18 @@
     if (!rect) return;
     drag.moved = true;
     button.classList.add('dragging');
-    const fraction = (value, size) => Math.max(0, Math.min(1, value / size));
+    const fraction = (value, size, low, high) => Math.max(low, Math.min(high, value / Math.max(1, size)));
+    const width = rect.right - rect.left - FLY_SIZE;
+    const height = rect.bottom - rect.top - FLY_SIZE;
+    const leftRoom = Math.min(FLY_SIZE, Math.max(0, rect.left - 8));
+    const rightRoom = Math.min(FLY_SIZE, Math.max(0, innerWidth - 8 - rect.right));
+    const topRoom = Math.min(FLY_SIZE, Math.max(0, rect.top - 8));
+    const bottomRoom = Math.min(FLY_SIZE, Math.max(0, innerHeight - 8 - rect.bottom));
     movedPerch = {
-      x: fraction(e.clientX - drag.grabX - rect.left, rect.right - rect.left - FLY_SIZE),
-      y: fraction(e.clientY - drag.grabY - rect.top, rect.bottom - rect.top - FLY_SIZE)
+      x: fraction(e.clientX - drag.grabX - rect.left, width, -leftRoom / Math.max(1, width),
+        (width + rightRoom) / Math.max(1, width)),
+      y: fraction(e.clientY - drag.grabY - rect.top, height, -topRoom / Math.max(1, height),
+        (height + bottomRoom) / Math.max(1, height))
     };
     place(true);
   }
@@ -832,6 +886,61 @@
   // ------------------------------------------------------------ the quality picker
 
   let choice = null;
+  function pickerOptionKey(option) {
+    return JSON.stringify([option?.label || '', option?.detail || '', option?.container || '',
+      option?.canClip === true, option?.clipUsesWholeFile === true]);
+  }
+
+  function restorePickerDraft(formats, targetKey, player) {
+    const saved = retainedPickerDraft?.targetKey === targetKey
+      && (!player || retainedPickerDraft.player === player) ? retainedPickerDraft : null;
+    if (!saved) {
+      if (retainedPickerDraft) retainedPickerDraft = null;
+      return { choice: formats.choices[0], useOriginal: false, useM4a: true };
+    }
+
+    const availableTracks = formats.audioTracks || [];
+    const availableSubtitles = formats.subtitleOptions || [];
+    const audioTrack = availableTracks.some(track => track.id === saved.intent.audioTrack) ? saved.intent.audioTrack : null;
+    const subtitles = saved.intent.subtitles.filter(language => availableSubtitles.some(track => track.language === language));
+    const embedSubtitles = saved.intent.embedSubtitles && availableSubtitles.some(track =>
+      track.embedSupported && subtitles.includes(track.language));
+    const tracksMissing = !!saved.intent.audioTrack && !audioTrack
+      || subtitles.length !== saved.intent.subtitles.length
+      || saved.intent.embedSubtitles && !embedSubtitles;
+    formats.intent = {
+      audioTrack,
+      subtitles,
+      includeAutoSubtitles: saved.intent.includeAutoSubtitles && subtitles.some(language =>
+        availableSubtitles.some(track => track.language === language && track.auto)),
+      embedSubtitles
+    };
+    formats.trimDraft = { ...saved.trimDraft };
+    if (tracksMissing) formats.trackNotice = 'Some selected tracks are no longer available. Check the audio and subtitle choices.';
+
+    const choices = [
+      ...(saved.useOriginal ? formats.originalChoices || [] : formats.choices || []),
+      ...formats.more || [],
+      ...(formats.audioOutputs || []).map(entry => entry.choice),
+      formats.audioM4a,
+      ...formats.choices || [],
+      ...formats.originalChoices || []
+    ].filter(Boolean);
+    const selected = choices.find(option => pickerOptionKey(option) === saved.choiceKey);
+    if (!selected) {
+      formats.selectionNeedsChoice = true;
+      formats.selectionNotice = 'Your previous format is no longer available. Choose another before downloading.';
+    }
+    const selectedOriginal = selected && (formats.originalChoices || []).some(option => pickerOptionKey(option) === saved.choiceKey);
+    const selectedAudio = selected && (formats.audioOutputs || []).find(entry => pickerOptionKey(entry.choice) === saved.choiceKey);
+    if (selectedAudio) formats.selectedAudio = selectedAudio.choice.index;
+    return {
+      choice: selected || formats.choices[0],
+      useOriginal: selectedOriginal || false,
+      useM4a: saved.useM4a
+    };
+  }
+
   function dismissReceipt() {
     clearTimeout(receiptTimer);
     receiptTimer = 0;
@@ -858,7 +967,7 @@
   }
 
   async function togglePanel() {
-    if (!alive()) return;
+    if (!alive() || butterflyHidden()) return;
     syncPage();
     if (panel.classList.contains('show')) return closePanel();
     await loadFormats();
@@ -880,6 +989,9 @@
     const current = !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
     const targetKey = activePreview?.player === player ? activePreview.key
       : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
+    const savedDraft = retainedPickerDraft?.targetKey === targetKey && retainedPickerDraft.player === player;
+    if (retainedPickerDraft && !savedDraft) retainedPickerDraft = null;
+    refresh = refresh || savedDraft;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), targetKey,
       player, pageUrl: targetPage, src, generation: current ? binding.generation : 0 };
     panel.classList.add('show');
@@ -920,8 +1032,10 @@
     }
     const formats = result.data;
     if (formats.sourceChoices?.length) return renderSourceChoices(title, poster, duration, formats);
-    choice = formats.choices[0];
-    renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? duration, formats);
+    const restored = restorePickerDraft(formats, targetKey, player);
+    choice = restored.choice;
+    renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? duration,
+      formats, false, restored.useOriginal, restored.useM4a);
   }
 
   function declaredManifest(identity) {
@@ -996,6 +1110,7 @@
     const audioChoice = selectedAudio || (useM4a ? formats.audioM4a : null);
     const presets = audioChoice ? originalPresets.map(c => c.label === 'Audio only' ? audioChoice : c) : originalPresets;
     const intent = formats.intent ||= { audioTrack: null, subtitles: [], includeAutoSubtitles: false, embedSubtitles: false };
+    const draft = formats.trimDraft ||= { enabled: false, start: '', end: '' };
     const moreFormats = formats.more || [];
     const all = expanded ? [...presets, ...moreFormats] : presets;
     const output = element('label', 'output', 'Output');
@@ -1005,6 +1120,21 @@
     list.setAttribute('role', 'radiogroup');
     list.setAttribute('aria-label', 'Download format');
     const rows = [];
+    const downloadButtons = [];
+    let selectionNotice = null;
+    const noticeText = () => [formats.selectionNotice, formats.trackNotice].filter(Boolean).join(' ');
+    function saveDraft() {
+      if (!panelMedia?.targetKey || formats.selectionNeedsChoice) return;
+      retainedPickerDraft = {
+        targetKey: panelMedia.targetKey,
+        player: panelMedia.player,
+        choiceKey: pickerOptionKey(choice),
+        useOriginal,
+        useM4a,
+        intent: { ...intent, subtitles: [...intent.subtitles] },
+        trimDraft: { ...draft }
+      };
+    }
     function updateOutput(index) {
       const isPreset = index < presets.length;
       const audio = isPreset && choice.label === 'Audio only';
@@ -1018,8 +1148,18 @@
       }
       mode.selectedIndex = audio && formats.audioOutputs ? Math.max(0, formats.audioOutputs.findIndex(entry => entry.choice.index === choice.index)) : (audio ? !useM4a : useOriginal) ? 1 : 0;
     }
-    function select(index, focus) {
+    function select(index, focus, userSelected = false) {
       choice = all[index];
+      if (userSelected) {
+        formats.selectionNeedsChoice = false;
+        formats.selectionNotice = '';
+        const text = noticeText();
+        if (selectionNotice) {
+          selectionNotice.textContent = text;
+          selectionNotice.hidden = !text;
+        }
+      }
+      for (const action of downloadButtons) action.disabled = !!formats.selectionNeedsChoice;
       if (pinned && presets.includes(choice)) { pinned.remove(); pinned = null; }
       for (const [i, option] of rows.entries()) {
         option.setAttribute('aria-checked', String(i === index));
@@ -1028,6 +1168,7 @@
       }
       updateOutput(index);
       refreshClip();
+      if (userSelected || !formats.selectionNeedsChoice) saveDraft();
       if (focus) rows[index].focus();
     }
     for (const c of all) {
@@ -1044,14 +1185,14 @@
       option.append(element('span', 'tick'));
       const index = rows.length;
       option.onclick = () => {
-        if (option.isConnected && isCurrentRequest(request)) select(index, false);
+        if (option.isConnected && isCurrentRequest(request)) select(index, false, true);
       };
       option.onkeydown = e => {
         const offset = { ArrowUp: -1, ArrowLeft: -1, ArrowDown: 1, ArrowRight: 1 }[e.key];
         if (!offset || !option.isConnected || !isCurrentRequest(request)) return;
         e.preventDefault();
         e.stopPropagation();
-        select((index + offset + all.length) % all.length, true);
+        select((index + offset + all.length) % all.length, true, true);
       };
       rows.push(option);
       list.append(option);
@@ -1069,6 +1210,7 @@
         choice = next.find(c => c.label === choice.label) || next[0];
       }
       renderChoices(title, poster, seconds, formats, expanded, original, m4a);
+      saveDraft();
       panel.querySelector('.output select')?.focus({ preventScroll: true });
     };
     // A choice picked from the expanded list stays visible when the list collapses.
@@ -1086,7 +1228,6 @@
     const clipToggle = element('label');
     const clipBox = element('input');
     clipBox.type = 'checkbox';
-    const draft = formats.trimDraft ||= { enabled: false, start: '', end: '' };
     clipBox.checked = draft.enabled;
     clipToggle.append(clipBox, element('span', '', 'Trim'));
     const clipFields = element('div', 'fields');
@@ -1113,6 +1254,7 @@
         slider.oninput = () => {
           field.value = draft[key] = slider.valueAsNumber.toFixed(2).replace(/\.?0+$/, '');
           clipError.hidden = true;
+          saveDraft();
         };
         row.append(slider);
       }
@@ -1121,11 +1263,12 @@
         const value = parseClock(field.value);
         if (slider && value !== null) slider.value = String(value);
         clipError.hidden = true;
+        saveDraft();
       };
       clipFields.append(row);
     }
     const clipNote = element('small', 'hint');
-    clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); place(true); };
+    clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); saveDraft(); place(true); };
     clip.append(clipToggle, clipFields, clipError);
 
     function refreshClip() {
@@ -1139,6 +1282,10 @@
         : 'VESPER fetches only the selected-range parts. The clip may start earlier or end later than the times you choose.';
     }
     const body = [output, list, clip, clipNote];
+    if (noticeText()) {
+      selectionNotice = element('div', 'msg', noticeText());
+      body.unshift(selectionNotice);
+    }
     if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {
       const advanced = element('details', 'languages');
       const fields = element('div', 'language-fields');
@@ -1148,7 +1295,7 @@
         const label = element('label', 'audio-track', 'Audio track'), tracks = element('select');
         const automatic = element('option', '', 'Original / automatic'); automatic.value = ''; tracks.append(automatic);
         for (const track of formats.audioTracks) { const option = element('option', '', track.label); option.value = track.id; tracks.append(option); }
-        tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; };
+        tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; saveDraft(); };
         label.append(tracks); fields.append(label);
       }
       let embedSubtitleControl = null;
@@ -1164,6 +1311,7 @@
             intent.embedSubtitles = false;
             if (embedSubtitleControl) embedSubtitleControl.checked = false;
           }
+          saveDraft();
         };
         check.dataset.auto = String(subtitle.auto);
         label.append(check, element('span', '', subtitle.label + (subtitle.auto ? ' (automatic)' : '')));
@@ -1175,7 +1323,7 @@
         embedSubtitleControl.type = 'checkbox';
         embedSubtitleControl.checked = !!intent.embedSubtitles;
         embedSubtitleControl.disabled = !(formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
-        embedSubtitleControl.onchange = () => { intent.embedSubtitles = embedSubtitleControl.checked; };
+        embedSubtitleControl.onchange = () => { intent.embedSubtitles = embedSubtitleControl.checked; saveDraft(); };
         embedLabel.append(embedSubtitleControl, element('span', '', 'Embed selected subtitles'));
         const embedHint = element('small', 'hint', 'Separate subtitle files are still queued. Live, segmented, styled, or unsupported tracks stay separate.');
         fields.append(embedLabel, embedHint);
@@ -1198,6 +1346,8 @@
     for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
+      action.disabled = !!formats.selectionNeedsChoice;
+      downloadButtons.push(action);
       action.onclick = () => {
         if (!action.isConnected) return;
         let range;
@@ -1377,7 +1527,7 @@
     if (message?.type === 'vesper-open-picker') {
       syncPage();
       const playerUrl = video && (playerSource(video) || activePreview?.binding?.src);
-      if ((!video?.isConnected && activePreview?.player !== video) || !panel || button?.hidden
+      if (butterflyHidden() || (!video?.isConnected && activePreview?.player !== video) || !panel || button?.hidden
           || message.playerUrl && playerUrl !== message.playerUrl) {
         sendResponse({ ok: false, code: 'no-player' });
         return false;
@@ -1387,6 +1537,7 @@
       return false;
     }
     if (message?.type !== 'vesper-prefetch') return false;
+    if (butterflyHidden()) return false;
     syncPage();
     if (video) {
       prefetchedPlayers.delete(video);
@@ -1400,5 +1551,17 @@
     motionMode = value;
     applyMotion();
   });
-  refreshPlayers();
+  if (chrome.storage?.local?.get) {
+    void chrome.storage.local.get(['vesperPaused', 'vesperHiddenButterflyHosts']).then(prefs => {
+      extensionPaused = prefs.vesperPaused === true;
+      hiddenButterflyHosts = new Set(Array.isArray(prefs.vesperHiddenButterflyHosts)
+        ? prefs.vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()) : []);
+    }).catch(() => {}).finally(() => {
+      extensionPreferencesReady = true;
+      refreshPlayers();
+    });
+  } else {
+    extensionPreferencesReady = true;
+    refreshPlayers();
+  }
 })();

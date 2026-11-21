@@ -17,8 +17,25 @@ async function init() {
     $('handoff-setting').hidden = browserDownloads.value === 'chrome';
   }
   showDownloadMode();
-  const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats').catch(() => ({}));
+  const { prefetchFormats = false, vesperPaused = false, vesperHiddenButterflyHosts = [] } =
+    await chrome.storage.local.get(['prefetchFormats', 'vesperPaused', 'vesperHiddenButterflyHosts']).catch(() => ({}));
   $('prefetch').checked = prefetchFormats;
+  $('pause-vesper').checked = vesperPaused;
+  const [siteTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  let butterflyHost = '';
+  try {
+    const site = new URL(siteTab?.url || '');
+    if (site.protocol === 'http:' || site.protocol === 'https:') butterflyHost = site.hostname.toLowerCase();
+  } catch { /* Browser pages have no site butterfly. */ }
+  const siteButterfly = $('site-butterfly');
+  const hiddenHosts = new Set(Array.isArray(vesperHiddenButterflyHosts)
+    ? vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()) : []);
+  function showSiteButterfly() {
+    siteButterfly.disabled = !butterflyHost;
+    siteButterfly.textContent = hiddenHosts.has(butterflyHost) ? 'Show butterfly on this site' : 'Hide butterfly on this site';
+    $('site-butterfly-host').textContent = butterflyHost;
+  }
+  showSiteButterfly();
   // Say what capture does the first time, in plain words.
   const { vesperSeen } = await chrome.storage.local.get('vesperSeen').catch(() => ({}));
   $('first-run').hidden = !!vesperSeen;
@@ -42,6 +59,26 @@ async function init() {
       if (tab?.id !== undefined)
         await chrome.tabs.sendMessage(tab.id, { type: 'vesper-prefetch' }).catch(() => {});
     }
+  };
+  siteButterfly.onclick = async () => {
+    if (!butterflyHost) return;
+    siteButterfly.disabled = true;
+    if (hiddenHosts.has(butterflyHost)) hiddenHosts.delete(butterflyHost);
+    else hiddenHosts.add(butterflyHost);
+    try {
+      await chrome.storage.local.set({ vesperHiddenButterflyHosts: [...hiddenHosts].slice(0, 100) });
+    } catch {
+      if (hiddenHosts.has(butterflyHost)) hiddenHosts.delete(butterflyHost);
+      else hiddenHosts.add(butterflyHost);
+    }
+    showSiteButterfly();
+  };
+  $('pause-vesper').onchange = async () => {
+    const checkbox = $('pause-vesper');
+    checkbox.disabled = true;
+    try { await chrome.storage.local.set({ vesperPaused: checkbox.checked }); }
+    catch { checkbox.checked = !checkbox.checked; }
+    checkbox.disabled = false;
   };
 
   const signIn = $('signin');
