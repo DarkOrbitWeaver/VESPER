@@ -529,6 +529,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                         demuxed = DemuxFragmented(source, trackOffset, sizes, kind, prepared.Track.Codec, ct);
                         sampleSource = source;
                     }
+                    else if (kind == TrackKind.Audio && prepared.Track.Source?.Protocol == "hls"
+                        && sizes.Length > 0 && sizes[0] >= 3
+                        && ReadAt(source, trackOffset, 3).AsSpan().SequenceEqual("ID3"u8))
+                    {
+                        using var region = new RegionStream(source, trackOffset, trackLength);
+                        demuxed = PackedAudioDemuxer.Read(region, sizes, samples, ct);
+                        sampleSource = samples;
+                    }
                     else
                     {
                         using var region = new RegionStream(source, trackOffset, trackLength);

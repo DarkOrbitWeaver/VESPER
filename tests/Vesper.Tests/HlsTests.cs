@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text.Json;
 using System.Text;
 using Microsoft.AspNetCore.Builder;
@@ -15,6 +16,44 @@ public class HlsTests
 {
     private static Guid AddHls(Harness h, FaultServer s, string path) =>
         h.Engine.Add(new AddRequest(s.Url(path), FileName: "video", Kind: JobKind.Hls)).JobId;
+
+    private static byte[] Id3TimestampTag(ulong timestamp)
+    {
+        byte[] owner = "com.apple.streaming.transportStreamTimestamp"u8.ToArray();
+        int bodyLength = owner.Length + 1 + 8;
+        byte[] tag = new byte[10 + 10 + bodyLength];
+        "ID3"u8.CopyTo(tag);
+        tag[3] = 3;
+        int tagBodyLength = tag.Length - 10;
+        tag[6] = (byte)((tagBodyLength >> 21) & 0x7f);
+        tag[7] = (byte)((tagBodyLength >> 14) & 0x7f);
+        tag[8] = (byte)((tagBodyLength >> 7) & 0x7f);
+        tag[9] = (byte)(tagBodyLength & 0x7f);
+        "PRIV"u8.CopyTo(tag.AsSpan(10));
+        BinaryPrimitives.WriteUInt32BigEndian(tag.AsSpan(14), (uint)bodyLength);
+        owner.CopyTo(tag.AsSpan(20));
+        BinaryPrimitives.WriteUInt64BigEndian(tag.AsSpan(21 + owner.Length), timestamp);
+        return tag;
+    }
+
+    private static byte[] AdtsFrame(ReadOnlySpan<byte> sample, DemuxedTrack track)
+    {
+        byte[] config = track.CodecPrivate!;
+        int objectType = config[0] >> 3;
+        int frequencyIndex = ((config[0] & 7) << 1) | (config[1] >> 7);
+        int channels = (config[1] >> 3) & 15;
+        int frameLength = sample.Length + 7;
+        var frame = new byte[frameLength];
+        frame[0] = 0xff;
+        frame[1] = 0xf1;
+        frame[2] = (byte)(((objectType - 1) << 6) | (frequencyIndex << 2) | (channels >> 2));
+        frame[3] = (byte)(((channels & 3) << 6) | ((frameLength >> 11) & 3));
+        frame[4] = (byte)(frameLength >> 3);
+        frame[5] = (byte)(((frameLength & 7) << 5) | 0x1f);
+        frame[6] = 0xfc;
+        sample.CopyTo(frame.AsSpan(7));
+        return frame;
+    }
 
     [Fact]
     public async Task A_plain_VOD_playlist_becomes_one_transport_stream_file()
@@ -1071,6 +1110,97 @@ public class HlsTests
         using var output = File.OpenRead(done.FinalPath!);
         Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
+    }
+
+    [Fact]
+    public async Task SegmentedMergeJob_MergesId3TimestampedPackedAacHlsAudio()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        string[] fragmentNames = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
+        byte[] initialization = DashTransferTests.Fixture("av-init.mp4");
+        byte[][] fragments = fragmentNames.Select(DashTransferTests.Fixture).ToArray();
+        byte[] sourceBytes = [.. initialization, .. fragments.SelectMany(fragment => fragment)];
+        var sourceMp4 = FragmentedMp4.Open(initialization, captureSamples: true);
+        long sourceOffset = initialization.Length;
+        long[] fragmentStarts = new long[fragments.Length];
+        for (int i = 0; i < fragments.Length; i++)
+        {
+            fragmentStarts[i] = sourceOffset;
+            sourceMp4.ValidateFragment(fragments[i], sourceOffset);
+            sourceOffset += fragments[i].Length;
+        }
+        sourceMp4.Finish(requireAudio: true, requireVideo: true);
+        DemuxedTrack sourceAudio = sourceMp4.GetTracks().Single(track => track.Kind == TrackKind.Audio);
+
+        byte[][] packedSegments = new byte[fragments.Length][];
+        for (int i = 0; i < fragments.Length; i++)
+        {
+            long fragmentEnd = fragmentStarts[i] + fragments[i].Length;
+            TrackSample[] samples = [.. sourceAudio.Samples.Where(sample => sample.Offset >= fragmentStarts[i]
+                && sample.Offset < fragmentEnd)];
+            Assert.NotEmpty(samples);
+            ulong timestamp = checked((ulong)((Int128)samples[0].Dts * 90_000 / sourceAudio.Timescale));
+            using var segment = new MemoryStream();
+            segment.Write(Id3TimestampTag(timestamp));
+            foreach (TrackSample sample in samples)
+                segment.Write(AdtsFrame(sourceBytes.AsSpan(checked((int)sample.Offset), sample.Size), sourceAudio));
+            packedSegments[i] = segment.ToArray();
+        }
+
+        const string videoRoot = "/hls/packed-audio/video";
+        const string audioRoot = "/hls/packed-audio/audio";
+        server.HlsPlaylists[videoRoot + "/index.m3u8"] = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            + string.Concat(fragmentNames.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+        server.HlsFiles[videoRoot + "/init.mp4"] = initialization;
+        for (int i = 0; i < fragments.Length; i++)
+            server.HlsFiles[videoRoot + "/" + fragmentNames[i]] = fragments[i];
+        server.HlsPlaylists[audioRoot + "/index.m3u8"] = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n"
+            + string.Concat(packedSegments.Select((_, i) => $"#EXTINF:1,\naudio-{i + 1}.aac\n")) + "#EXT-X-ENDLIST\n";
+        for (int i = 0; i < packedSegments.Length; i++)
+            server.HlsFiles[audioRoot + $"/audio-{i + 1}.aac"] = packedSegments[i];
+
+        string videoUrl = server.Url(videoRoot + "/index.m3u8");
+        string audioUrl = server.Url(audioRoot + "/index.m3u8");
+        var plan = new MediaMergePlan
+        {
+            Version = 2,
+            OutputContainer = "mkv",
+            RequireAudio = true,
+            RequireVideo = true,
+            Tracks =
+            [
+                new MergeTrack("video", "hls-video", videoUrl, 0, "mp4", "h264", Source: new MergeMediaSource("hls", videoUrl)),
+                new MergeTrack("audio", "hls-audio", audioUrl, 0, "ts", "aac", Source: new MergeMediaSource("hls", audioUrl))
+            ]
+        };
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(videoUrl, FileName: "packed-audio.mkv", Kind: JobKind.Merge,
+            MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> outputTracks = MediaMerger.Demux(output, output.Length, default);
+        DemuxedTrack outputAudio = Assert.Single(outputTracks, track => track.Kind == TrackKind.Audio);
+        Assert.Equal(sourceAudio.Samples.Count, outputAudio.Samples.Count);
+        Assert.Equal(sourceAudio.SampleRate, outputAudio.SampleRate);
+        Assert.Equal(sourceAudio.Channels, outputAudio.Channels);
+        // ADTS carries the AAC-LC profile, sample rate and channels.
+        Assert.Equal(sourceAudio.CodecPrivate![..2], outputAudio.CodecPrivate);
+        for (int i = 0; i < sourceAudio.Samples.Count; i++)
+        {
+            TrackSample expected = sourceAudio.Samples[i];
+            TrackSample actual = outputAudio.Samples[i];
+            Assert.Equal(expected.Size, actual.Size);
+            var expectedBytes = sourceBytes.AsSpan(checked((int)expected.Offset), expected.Size).ToArray();
+            var actualBytes = new byte[actual.Size];
+            output.Position = actual.Offset;
+            output.ReadExactly(actualBytes);
+            Assert.Equal(expectedBytes, actualBytes);
+        }
     }
 
     [Fact]

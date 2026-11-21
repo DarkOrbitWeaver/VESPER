@@ -400,45 +400,27 @@ internal static class MpegTsDemuxer
         int sampleRate = 0;
         while (position < payload.Length)
         {
-            if (payload.Length - position < 7 || payload[position] != 0xff || (payload[position + 1] & 0xf6) != 0xf0)
-                throw Bad("An AAC PES packet contains a truncated or invalid ADTS frame.");
-            int profile = ((payload[position + 2] >> 6) & 3) + 1;
-            int frequency = (payload[position + 2] >> 2) & 15;
-            int channels = ((payload[position + 2] & 1) << 2) | (payload[position + 3] >> 6);
-            int header = (payload[position + 1] & 1) == 0 ? 9 : 7;
-            int frameLength = ((payload[position + 3] & 3) << 11) | (payload[position + 4] << 3) | (payload[position + 5] >> 5);
-            int rawBlocks = payload[position + 6] & 3;
-            if (profile != 2 || frequency >= 13 || channels is < 1 or > 7 || rawBlocks != 0
-                || frameLength < header || frameLength > payload.Length - position)
-                throw Bad("Only complete AAC-LC ADTS frames with one raw block are supported.");
-            int rate = SampleRates[frequency];
-            byte[] config = AudioConfig(profile, frequency, channels);
-            if (state.AudioConfig is not null && !state.AudioConfig.AsSpan().SequenceEqual(config))
+            AacAdtsFrame frame = AacAdtsParser.ReadFrame(payload, position, "An AAC PES packet");
+            int rate = frame.SampleRate;
+            if (state.AudioConfig is not null
+                && (state.Track.SampleRate != rate || state.Track.Channels != frame.Channels))
                 throw Bad("The AAC sample rate or channel layout changed inside one transport program.");
-            state.AudioConfig ??= config;
-            state.Track.CodecPrivate = config;
+            state.AudioConfig ??= AacAdtsParser.AudioSpecificConfig(frame);
+            state.Track.CodecPrivate = state.AudioConfig;
             state.Track.SampleRate = rate;
-            state.Track.Channels = channels;
+            state.Track.Channels = frame.Channels;
             state.Track.Timescale = (uint)rate;
             sampleRate = rate;
 
             long firstFrameTime = checked((long)((Int128)timing.Pts * rate / 90_000));
             long dts = checked(firstFrameTime + (long)frameIndex * 1024);
             long offset = output.Position;
-            output.Write(payload.Slice(position + header, frameLength - header));
-            AddSample(state, offset, frameLength - header, dts, 0, 1024, key: true);
-            position += frameLength;
+            output.Write(payload.Slice(position + frame.HeaderLength, frame.PayloadLength));
+            AddSample(state, offset, frame.PayloadLength, dts, 0, 1024, key: true);
+            position += frame.FrameLength;
             frameIndex++;
         }
         if (sampleRate == 0) throw Bad("An AAC PES packet contains no audio frames.");
-    }
-
-    private static readonly int[] SampleRates = [96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000, 7_350];
-
-    private static byte[] AudioConfig(int objectType, int frequencyIndex, int channelConfig)
-    {
-        int value = (objectType << 11) | (frequencyIndex << 7) | (channelConfig << 3);
-        return [(byte)(value >> 8), (byte)value];
     }
 
     private static void AddSample(TrackState state, long offset, int size, long dts, int cts, int duration, bool key)
