@@ -1,11 +1,11 @@
 # Media support
 
-This page describes the current VESPER implementation. Site results and available Windows codecs vary by environment. See the [status register](DOCUMENTATION/STATUS.tsv) for exact results and open checks, and the [Windows checklist](DOCUMENTATION/MANUAL_WINDOWS_TEST_CHECKLIST.md) for candidate verification.
+Site compatibility and available Windows codecs vary by device and source.
 
 - VESPER saves direct HTTP/HTTPS files, completed HLS, and supported clear DASH plans. It can merge compatible tracks into MP4, M4A, WebM, or Matroska without re-encoding them. Live HLS recording requires one usable rendition with audio included. HLS changes in codec or program layout can be refused to protect output integrity.
 - Compatible MP4 and M4A can re-encode eligible sources using Windows Media Foundation. M4A prefers copying compatible AAC. MP3 conversion requires a confirmed Windows encoder and a supported source track. WAV uses a supported decoder and can write RF64. Opus copies supported existing Opus packets. FLAC files can be saved in their source format. FLAC encoding remains open. Some sites offer only a combined video-and-audio stream, for which the picker can decline audio extraction.
 - Completed HLS/DASH trim cuts at segment boundaries. Direct WAV trim is sample-accurate and fetches and decodes the full source. Indexed single-file MP4/WebM clipping is open.
 - Tags, cover art, and chapters depend on the selected output and source metadata. Supported SRT/WebVTT tracks can be embedded in eligible MP4/Matroska outputs. Other supported captions are saved separately. Segmented and live captions have additional limits.
-- A usable source must be discovered before the engine can download or convert it. VESPER has no DRM or access-check bypass. A public TikTok sample passed native transfer and independent decoding. Instagram fixture coverage exists and actual Reel/feed acceptance remains open. Current provider-specific evidence lives in the status register.
+- Media discovery needs an accessible file or supported stream. VESPER respects DRM and site access controls.
 - Chrome owns transfers whose bytes it already received. Fresh handoffs require verified identity and readiness. Page-created, POST, blob, or single-use transfers stay with Chrome when they cannot be safely replayed. Host-approved sign-in scopes credentials to the permitted origin.
-- Conversion speed depends on the work involved. Native remux skips the encoder. Decoder/encoder availability, real playback, and the reported slow post-download case still need target Windows evidence. See [media performance and design](DOCUMENTATION/OWNER-DESIGN-REQUIRED.md#media-processing-performance-and-architecture).
+- Native remux copies existing audio and video. Changing codecs requires decoding and encoding, which can take longer.

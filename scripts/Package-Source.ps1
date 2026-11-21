@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS Creates a source-only ZIP without overwriting an existing artifact.
-.NOTES No .NET runtime, FFmpeg, browser runtime, user data, Git database or build output is bundled.
+.NOTES Packages tracked source files from the working tree. Requires Git.
 #>
 param([string]$Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release\VESPER-media-engine-source.zip'))
 $ErrorActionPreference = 'Stop'
@@ -13,12 +13,16 @@ $temp = Join-Path $parent ('.vesper-source-' + [guid]::NewGuid().ToString('N') +
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = $null
 try {
+    $tracked = @(git -C $root -c core.quotepath=false ls-files --cached --full-name)
+    if ($LASTEXITCODE -ne 0 -or $tracked.Count -eq 0) { throw 'Could not list tracked source files.' }
     $archive = [IO.Compression.ZipFile]::Open($temp, [IO.Compression.ZipArchiveMode]::Create)
-    foreach ($file in Get-ChildItem -LiteralPath $root -File -Recurse -Force) {
+    foreach ($relative in $tracked) {
+        if ($relative -match '(^|/)(\.git|\.vs|\.vesper-dev|\.scratchpad|bin|obj|node_modules|release|TestResults)(/|$)') { continue }
+        if ($relative -match '(^|/)\.env($|\.)|\.(user|suo|db|sqlite|vpart|vmeta|zip|patch|diff)$') { continue }
+        $path = Join-Path $root $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $file = Get-Item -LiteralPath $path -Force
         if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
-        if ($relative -match '(^|/)(\.git|\.vs|bin|obj|node_modules|release|TestResults)(/|$)') { continue }
-        if ($relative -match '(^|/)\.env($|\.)|\.(user|suo|db|sqlite|vpart|vmeta|zip)$') { continue }
         if ($file.FullName -eq $target -or $file.FullName -eq $temp) { continue }
         [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, ('VESPER/' + $relative), [IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }

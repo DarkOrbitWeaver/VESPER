@@ -823,7 +823,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void BuildAbout()
     {
-        var page = Page("About", "Built by DarkOrbitWeaver.");
+        var page = Page("About", "DarkOrbitWeaver · ko-fi.com/darkorbitweaver");
         string version = Vesper.Shared.BuildInfo.Version(typeof(SettingsForm).Assembly);
         var about = Label("VESPER " + version, 10, bold: true);
         about.Name = "aboutBuild";

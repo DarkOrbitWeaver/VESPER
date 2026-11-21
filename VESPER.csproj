@@ -29,6 +29,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Update="LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="Assets\VESPER-Illustrated.ico;Assets\Botanical\butterfly.png;Assets\Botanical\empty-hero.png;Assets\Botanical\header.png;Assets\Botanical\sprig.png;Assets\Botanical\hills-left.png;Assets\Botanical\hills.png" CopyToOutputDirectory="PreserveNewest" />
     <ProjectReference Include="src\Vesper.MediaPlanning\Vesper.MediaPlanning.csproj" />
     <ProjectReference Include="src\Vesper.Engine\Vesper.Engine.csproj" />
