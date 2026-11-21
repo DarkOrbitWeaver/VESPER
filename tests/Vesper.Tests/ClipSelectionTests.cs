@@ -56,8 +56,11 @@ public sealed class ClipSelectionTests
         var wavMerge = new MediaDownloadChoice("https://example.test/audio", "audio.wav", JobKind.Merge,
             null, null, Output: MediaOutput.Wav);
         Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(wavMerge));
+        var mp4Source = new MediaDownloadChoice("https://example.test/video.mp4", "video.mp4", JobKind.Http,
+            null, null, CanUseFullFileClip: true);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(mp4Source));
         Assert.Contains("only the segments", ClipSelection.Notice(ClipMode.Segments), StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("whole file first", ClipSelection.Notice(ClipMode.FullFile));
+        Assert.Contains("full media first", ClipSelection.Notice(ClipMode.FullFile));
     }
 
     [Theory]

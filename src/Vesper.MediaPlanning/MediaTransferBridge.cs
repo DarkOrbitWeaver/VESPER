@@ -20,7 +20,8 @@ internal sealed record MediaDownloadChoice(
     string? ConvertedVideoQuality = null, string? ConvertedAudioCodec = null,
     IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null,
     int EmbeddedSubtitleCount = 0, string? SubtitleNotice = null,
-    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null)
+    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null,
+    [property: System.Text.Json.Serialization.JsonIgnore] bool CanUseFullFileClip = false)
 {
     public string DisplayContainer => Output switch
     {
@@ -50,6 +51,8 @@ internal sealed record MediaDownloadChoice(
 internal static class MediaTransferBridge
 {
     private const int MaxEmbeddedSubtitleTracks = 25;
+    private const string LocalMp4ClipSourceError = "This source doesn't provide enough information for VESPER to trim the MP4.";
+    private const string LocalMp4ClipSubtitleError = "Time range can't keep selected subtitles at full length. Turn subtitles off or choose a segmented format.";
     private static readonly ResolverOptions SubtitleUrlOptions = new();
 
     internal static string DisplayQuality(string quality) => quality
@@ -129,10 +132,12 @@ internal static class MediaTransferBridge
                     : r.VideoCodec == "h264" && (!r.HasAudio || r.AudioCodec == "aac"))).ToArray()
         };
         FormatPreferences nativePrefs = prefs with { Container = "mp4", ContainerStrict = true };
-        if (PrepareSource(native, nativePrefs, exact: null, out FormatSelection? nativeSelection,
-                clipStartSeconds, clipEndSeconds).Choice is { } compatible
-            && nativeSelection is { HasVideo: true })
+        var nativeResult = PrepareSource(native, nativePrefs, exact: null, out FormatSelection? nativeSelection,
+            clipStartSeconds, clipEndSeconds);
+        if (nativeResult.Choice is { } compatible && nativeSelection is { HasVideo: true })
             return (compatible, null);
+        if (clipStartSeconds is not null && nativeSelection is { HasVideo: true })
+            return (null, nativeResult.Error ?? "The selected MP4-compatible format can't use this time range.");
 
         var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
             clipStartSeconds, clipEndSeconds);
@@ -146,7 +151,8 @@ internal static class MediaTransferBridge
             string? videoQuality = video.Height is int height
                 ? video.FrameRate is > 30.5 ? $"{height}p {Math.Round(video.FrameRate.Value)} fps · " : $"{height}p · "
                 : null;
-            return (choice with { Output = MediaOutput.Mp4, ConvertedVideoQuality = videoQuality }, null);
+            return (choice with { Output = MediaOutput.Mp4, ConvertedVideoQuality = videoQuality,
+                CanUseFullFileClip = false }, null);
         }
         return original;
     }
@@ -260,6 +266,48 @@ internal static class MediaTransferBridge
         && choice.Kind is JobKind.Http or JobKind.Merge
         && Path.GetExtension(choice.FileName).ToLowerInvariant() is ".webm" or ".mkv" or ".mp4" or ".m4a";
 
+    private static bool CanClipLocalMp4Tracks(IReadOnlyList<MediaRepresentation> tracks, string? outputContainer)
+    {
+        if (outputContainer != "mp4" || tracks.Count is < 1 or > 2
+            || tracks.Any(track => track.Protocol != StreamProtocol.Http || track.IsLive
+                || track.FileSize is not > 0 || track.FileSizeIsEstimate
+                || string.IsNullOrWhiteSpace(track.ContentIdentity) || HasIncompatibleAacProfile(track)))
+            return false;
+
+        if (tracks.Count == 1)
+        {
+            return tracks[0] is
+            {
+                Content: StreamContent.VideoAndAudio, Container: "mp4", VideoCodec: "h264", AudioCodec: "aac",
+                AudioUnverified: false
+            };
+        }
+
+        if (tracks.Count(track => track.Content == StreamContent.VideoOnly) != 1
+            || tracks.Count(track => track.Content == StreamContent.AudioOnly) != 1)
+            return false;
+
+        MediaRepresentation video = tracks.Single(track => track.Content == StreamContent.VideoOnly);
+        MediaRepresentation audio = tracks.Single(track => track.Content == StreamContent.AudioOnly);
+        return video.Container == "mp4" && video.VideoCodec == "h264"
+            && (audio.Container is "mp4" or "m4a") && audio.AudioCodec == "aac";
+    }
+
+    private static bool HasIncompatibleAacProfile(MediaRepresentation track)
+    {
+        if (track.AudioCodec != "aac" || string.IsNullOrWhiteSpace(track.RawCodecs)) return false;
+        foreach (string rawCodec in track.RawCodecs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            string[] parts = rawCodec.Split('.');
+            if (parts.Length < 2 || !parts[0].Equals("mp4a", StringComparison.OrdinalIgnoreCase)) continue;
+            if (parts.Length < 3) continue;
+            if (!parts[1].Equals("40", StringComparison.OrdinalIgnoreCase)
+                || !int.TryParse(parts[2], out int audioObjectType) || audioObjectType != 2)
+                return true;
+        }
+        return false;
+    }
+
     private static (MediaDownloadChoice? Choice, string? Error) PrepareSource(MediaItem item, FormatPreferences prefs,
         MediaRepresentation? exact, out FormatSelection? selection, double? clipStartSeconds = null, double? clipEndSeconds = null)
     {
@@ -343,7 +391,14 @@ internal static class MediaTransferBridge
         if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash) || !CanCarryContext(step.Context))
             return (null, "This source needs an unsupported transfer method or request context.");
         if (clipStartSeconds is not null && step.Protocol == StreamProtocol.Http)
-            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
+        {
+            if (selection.Video is not { } localMuxedVideo || selection.Audio is not null
+                || !CanClipLocalMp4Tracks([localMuxedVideo], step.Container ?? selection.OutputContainer)
+                || MergeCapability.MuxedContainer(localMuxedVideo, "mp4") is not { } localMuxedContainer)
+                return (null, LocalMp4ClipSourceError);
+            return BuildMerge(item, selection, plan, [localMuxedVideo], localMuxedContainer,
+                clipStartSeconds, clipEndSeconds, prefs.EmbedSubtitles, unsupportedSubtitleCount);
+        }
         if (step.Protocol == StreamProtocol.Hls && step.Segments is not null &&
             !step.Url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
             return (null, "This HLS stream needs a segment download path that isn't supported.");
@@ -389,7 +444,10 @@ internal static class MediaTransferBridge
                 unsupportedSubtitleCount: unsupportedSubtitleCount),
             MediaMetadataJson: step.Protocol == StreamProtocol.Http && item.Kind == MediaKind.Audio
                 && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
-                    ? SerializeAudioMetadata(item) : null), null);
+                    ? SerializeAudioMetadata(item) : null,
+            CanUseFullFileClip: clipStartSeconds is null && step.Protocol == StreamProtocol.Http
+                && selection.Video is { } localClipVideo && selection.Audio is null
+                && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer)), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
@@ -402,9 +460,13 @@ internal static class MediaTransferBridge
         unsupportedSubtitleCount += selection.Subtitles.Count - validatedSubtitles.Count;
         SubtitleTrack[] subtitles = validatedSubtitles.Where(IsSupportedSubtitle).ToArray();
         unsupportedSubtitleCount += validatedSubtitles.Count - subtitles.Length;
-        if (clipStartSeconds is not null && (tracks.Count != 2
-            || tracks.Any(track => track.Protocol is not (StreamProtocol.Hls or StreamProtocol.Dash))))
-            return (null, "Time ranges are supported for clear segmented HLS or DASH audio/video renditions.");
+        bool segmentedClip = tracks.Count == 2
+            && tracks.All(track => track.Protocol is StreamProtocol.Hls or StreamProtocol.Dash);
+        bool localMp4Clip = CanClipLocalMp4Tracks(tracks, container);
+        if (clipStartSeconds is not null && !segmentedClip && !localMp4Clip)
+            return (null, "This format can't use a time range. Choose a compatible MP4 or segmented HLS/DASH format.");
+        if (clipStartSeconds is not null && localMp4Clip && selection.Subtitles.Count > 0)
+            return (null, LocalMp4ClipSubtitleError);
         MediaRequestContext ctx = tracks[0].Context;
         if (tracks.Any(t => !CanCarryContext(t.Context)
             || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer
@@ -486,6 +548,8 @@ internal static class MediaTransferBridge
                 subtitle.Format.ToLowerInvariant(), TextUtil.NormalizeLang(subtitle.Language),
                 SubtitleName(subtitle.Name, subtitle.Language))).ToArray()
         };
+        if (clipStartSeconds is not null && localMp4Clip && !merge.CanClipLocalMp4)
+            return (null, LocalMp4ClipSourceError);
         string name = Path.ChangeExtension(plan.SuggestedFileName, container);
         string summary = DisplayQuality(selection.Summary);
         return (new MediaDownloadChoice(tracks[0].Url.AbsoluteUri, name, JobKind.Merge, ctx.Referer, ctx.UserAgent,
@@ -494,7 +558,8 @@ internal static class MediaTransferBridge
             EmbeddedSubtitleCount: embeddedSubtitles.Length,
             SubtitleNotice: SubtitleNotice(embedSubtitles, subtitles.Length, embeddedSubtitles.Length,
                 subtitleLimitReached, unsupportedSubtitleCount),
-            Secrets: secrets), null);
+            Secrets: secrets,
+            CanUseFullFileClip: clipStartSeconds is null && CanClipLocalMp4Tracks(tracks, container)), null);
     }
 
     private static MediaMergeMetadata? MergeMetadata(MediaItem item, bool includeChapters)
@@ -695,6 +760,7 @@ internal static class MediaTransferBridge
     {
         if (choice.Output == MediaOutput.Wav) return choice.Kind is JobKind.Http or JobKind.Merge;
         if (choice.Kind == JobKind.Hls) return true;
+        if (choice.Kind == JobKind.Http) return choice.Output == MediaOutput.Original && choice.CanUseFullFileClip;
         if (choice.MediaPlanJson is null) return false;
         try
         {
@@ -706,8 +772,13 @@ internal static class MediaTransferBridge
             }
             if (choice.Kind != JobKind.Merge) return false;
             MediaMergePlan? plan = JsonSerializer.Deserialize<MediaMergePlan>(choice.MediaPlanJson);
-            return plan is { Version: 2, Tracks.Count: 2 }
-                && plan.Tracks.All(track => track.Source?.Protocol is "hls" or "dash");
+            if (plan is { Version: 2, Tracks.Count: 2 }
+                && plan.Tracks.All(track => track.Source?.Protocol is "hls" or "dash"))
+                return true;
+            if (choice.Output != MediaOutput.Original || plan is null
+                || !choice.CanUseFullFileClip || plan.ClipRange is not null) return false;
+            return plan.CanClipLocalMp4 || plan.Subtitles.Count > 0
+                && (plan with { Subtitles = [] }).CanClipLocalMp4;
         }
         catch (JsonException) { return false; }
     }

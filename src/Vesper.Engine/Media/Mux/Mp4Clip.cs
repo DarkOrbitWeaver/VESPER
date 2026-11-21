@@ -29,6 +29,8 @@ internal static class Mp4Clip
         const uint movieScale = (uint)TimeSpan.TicksPerSecond;
         if (track.SourceContainer != "mp4" || track.Timescale == 0 || track.Samples.Count == 0)
             throw new MediaContainerException("The selected MP4 track has no usable timeline.");
+        if (track.Kind == TrackKind.Audio && (track.CodecPrivate is not { Length: >= 2 } config || config[0] >> 3 != 2))
+            throw new MediaContainerException("The selected MP4 audio isn't AAC-LC and can't be trimmed by copying its packets.");
 
         long origin = track.EditMediaTime;
         if (track.EditList is { } edits)

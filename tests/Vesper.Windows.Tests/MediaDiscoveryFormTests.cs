@@ -62,7 +62,7 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Theory]
-    [InlineData(MediaOutput.Wav, JobKind.Http, "whole file first")]
+    [InlineData(MediaOutput.Wav, JobKind.Http, "full media first")]
     [InlineData(MediaOutput.Wav, JobKind.Hls, "start a little early or end a little late")]
     [InlineData(MediaOutput.Original, JobKind.Merge, "start a little early or end a little late")]
     public void ClipNoticeMatchesTheActualRangeBehavior(MediaOutput output, JobKind kind, string expected)
@@ -201,6 +201,54 @@ public sealed class MediaDiscoveryFormTests
             Assert.Equal(JobKind.Hls, selection.Choice.Kind);
             Assert.Equal(new MediaTimeRange(10, 20),
                 System.Text.Json.JsonSerializer.Deserialize<MediaTimeRange>(selection.Choice.MediaPlanJson!));
+        });
+    }
+
+    [Fact]
+    public void Default_compatible_mp4_clip_discloses_full_source_before_submit()
+    {
+        OnSta(() =>
+        {
+            MediaRepresentation direct = Representation("sample", "137", 1080, 30) with
+            {
+                RawCodecs = "avc1.640028, mp4a.40.2",
+                FileSize = 2_097_152,
+                ContentIdentity = "youtube:sample:137:modified:2097152"
+            };
+            MediaItem sample = Item("sample", [direct]) with { Duration = TimeSpan.FromSeconds(120) };
+            using var form = new MediaDiscoveryForm(new VesperPreferences(), sample.SourceUrl, sample);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags members =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            T Control<T>(string name) => (T)typeof(MediaDiscoveryForm).GetField(name, members)!.GetValue(form)!;
+            var output = Control<VesperChoice>("_outputChoice");
+            var clip = Control<CheckBox>("_clipCheck");
+            var download = Control<VesperButton>("_download");
+            var note = Control<Label>("_clipNote");
+
+            Assert.Equal("MP4 (compatible)", output.SelectedText);
+            Assert.True(clip.Enabled);
+            clip.Checked = true;
+            Control<TextBox>("_clipStart").Text = "00:10";
+            Control<TextBox>("_clipEnd").Text = "00:25";
+            Application.DoEvents();
+
+            Assert.Contains("downloads the full media first", note.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("decodes", note.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.True(download.Enabled);
+            var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;
+            var result = ((MediaDownloadChoice? Choice, string? Error))prepare.Invoke(form, null)!;
+            Assert.Null(result.Error);
+            Assert.Equal(JobKind.Merge, result.Choice!.Kind);
+            Assert.Equal(MediaOutput.Original, result.Choice.Output);
+            var plan = Assert.IsType<MediaMergePlan>(
+                System.Text.Json.JsonSerializer.Deserialize<MediaMergePlan>(result.Choice.MediaPlanJson!));
+            Assert.Equal(new MediaTimeRange(10, 25), plan.ClipRange);
+            Assert.True(plan.CanClipLocalMp4);
         });
     }
 

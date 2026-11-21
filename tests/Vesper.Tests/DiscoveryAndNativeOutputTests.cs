@@ -135,6 +135,112 @@ public sealed class DiscoveryAndNativeOutputTests
         Assert.Equal(ClipMode.Segments, ClipSelection.ModeFor(clipChoice));
     }
 
+    [Fact]
+    public void Compatible_muxed_mp4_clip_keeps_quality_format_and_refresh_identity()
+    {
+        MediaRepresentation stream = MuxedMp4("137", "youtube:video:137:modified:2097152");
+        MediaItem item = VideoItem(stream);
+        MediaDownloadChoice fullChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.BestQuality, output: MediaOutputPreference.CompatibleVideo).Choice);
+
+        Assert.Equal(JobKind.Http, fullChoice.Kind);
+        Assert.Equal(MediaOutput.Original, fullChoice.Output);
+        Assert.True(fullChoice.CanUseFullFileClip);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(fullChoice));
+
+        MediaDownloadChoice clipChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.BestQuality, output: MediaOutputPreference.CompatibleVideo,
+            clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+        Assert.Equal(JobKind.Merge, clipChoice.Kind);
+        Assert.Equal(MediaOutput.Original, clipChoice.Output);
+        Assert.Equal(fullChoice.FormatId, clipChoice.FormatId);
+        Assert.Equal(fullChoice.DisplayDetail, clipChoice.DisplayDetail);
+        Assert.Equal(item.Provider, clipChoice.Provider);
+        Assert.Equal(item.MediaId, clipChoice.MediaId);
+        Assert.True(MediaMergePlan.TryParse(clipChoice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.True(plan.CanClipLocalMp4);
+        Assert.Equal(new MediaTimeRange(10, 25), plan.ClipRange);
+        Assert.Equal("muxed", Assert.Single(plan.Tracks).Role);
+        Assert.Equal(stream.ContentIdentity, plan.Tracks[0].Identity);
+        Assert.Equal(stream.FileSize, plan.Tracks[0].Size);
+    }
+
+    [Fact]
+    public void Compatible_split_mp4_clip_keeps_both_source_identities()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "137", Url = new Uri("https://cdn.example.test/video.mp4"), Content = StreamContent.VideoOnly,
+            Container = "mp4", VideoCodec = "h264", RawCodecs = "avc1.640028", Height = 1080,
+            FileSize = 2_097_152, ContentIdentity = "youtube:video:137:modified:2097152"
+        };
+        var audio = new MediaRepresentation
+        {
+            Id = "140", Url = new Uri("https://cdn.example.test/audio.m4a"), Content = StreamContent.AudioOnly,
+            Container = "m4a", AudioCodec = "aac", RawCodecs = "mp4a.40.2", AudioTrackId = "english",
+            FileSize = 524_288, ContentIdentity = "youtube:video:140:modified:524288"
+        };
+        MediaItem item = VideoItem(video, audio);
+        MediaDownloadChoice fullChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.BestQuality, output: MediaOutputPreference.CompatibleVideo).Choice);
+        Assert.Equal(JobKind.Merge, fullChoice.Kind);
+        Assert.True(fullChoice.CanUseFullFileClip);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(fullChoice));
+
+        MediaDownloadChoice clipChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.BestQuality, output: MediaOutputPreference.CompatibleVideo,
+            clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+        Assert.True(MediaMergePlan.TryParse(clipChoice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.True(plan.CanClipLocalMp4);
+        Assert.Equal(new[] { video.ContentIdentity, audio.ContentIdentity }, plan.Tracks.Select(track => track.Identity));
+        Assert.Equal(new[] { video.FileSize!.Value, audio.FileSize!.Value }, plan.Tracks.Select(track => track.Size));
+    }
+
+    [Fact]
+    public void Local_mp4_range_refuses_selected_subtitles_and_unsafe_sources()
+    {
+        MediaRepresentation stream = MuxedMp4("137", "youtube:video:137:modified:2097152");
+        MediaItem item = VideoItem(stream) with
+        {
+            Subtitles = [new SubtitleTrack(new Uri("https://cdn.example.test/en.vtt"), "en", "English", "vtt")]
+        };
+        FormatPreferences preferences = FormatPreferences.BestQuality with { SubtitleLanguages = ["en"] };
+        MediaDownloadChoice fullChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            preferences, output: MediaOutputPreference.CompatibleVideo).Choice);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(fullChoice));
+        var captionClip = MediaTransferBridge.Prepare(item, preferences,
+            output: MediaOutputPreference.CompatibleVideo, clipStartSeconds: 10, clipEndSeconds: 25);
+        Assert.Null(captionClip.Choice);
+        Assert.Contains("selected subtitles", captionClip.Error, StringComparison.OrdinalIgnoreCase);
+
+        MediaRepresentation[] unsafeSources =
+        [
+            MuxedMp4("no-identity", null),
+            MuxedMp4("estimated", "youtube:estimated") with { FileSizeIsEstimate = true },
+            MuxedMp4("he-aac", "youtube:he-aac") with { RawCodecs = "avc1.640028, mp4a.40.5" }
+        ];
+        foreach (MediaRepresentation source in unsafeSources)
+        {
+            MediaDownloadChoice choice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(
+                VideoItem(source), FormatPreferences.BestQuality, output: MediaOutputPreference.CompatibleVideo).Choice);
+            Assert.False(choice.CanUseFullFileClip);
+            Assert.Equal(ClipMode.None, ClipSelection.ModeFor(choice));
+        }
+    }
+
+    private static MediaRepresentation MuxedMp4(string id, string? identity) => new()
+    {
+        Id = id, Url = new Uri("https://cdn.example.test/video.mp4"), Content = StreamContent.VideoAndAudio,
+        Container = "mp4", VideoCodec = "h264", AudioCodec = "aac", RawCodecs = "avc1.640028, mp4a.40.2",
+        Height = 1080, FileSize = 2_097_152, ContentIdentity = identity
+    };
+
+    private static MediaItem VideoItem(params MediaRepresentation[] representations) => new()
+    {
+        SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "youtube", MediaId = "video",
+        Title = "Video", Duration = TimeSpan.FromSeconds(60), Representations = representations
+    };
+
     [Theory]
     [InlineData("CONIN$.txt")]
     [InlineData("CONOUT$")]

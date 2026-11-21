@@ -115,7 +115,7 @@ test('ended media stays bound to its player and selected range notice explains w
   assert.match(content, /newPlayerPlaying/);
   assert.match(content, /overlapsFrame >= frameArea \* 0\.5/);
   assert.match(content, /VESPER fetches only the selected-range parts/);
-  assert.match(content, /downloads and decodes the whole file first/);
+  assert.match(content, /downloads the full media first, then keeps your range/);
 });
 
 test('the butterfly clears fullscreen focus and tries safer edge perches first', () => {

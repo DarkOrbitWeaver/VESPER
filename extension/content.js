@@ -1126,7 +1126,7 @@
       clipNote.hidden = !draft.enabled;
       clipError.hidden = true;
       clipNote.textContent = !canClip ? 'Choose a format that supports trimming, or turn Trim off.'
-        : choice.clipUsesWholeFile ? 'Saves the times you chose. VESPER downloads and decodes the whole file first.'
+        : choice.clipUsesWholeFile ? 'Saves the times you chose. VESPER downloads the full media first, then keeps your range.'
         : 'VESPER fetches only the selected-range parts. The clip may start earlier or end later than the times you choose.';
     }
     const body = [output, list, clip, clipNote];

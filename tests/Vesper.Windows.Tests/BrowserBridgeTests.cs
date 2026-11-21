@@ -84,6 +84,35 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public void Butterfly_default_compatible_mp4_preset_discloses_full_source_trim()
+    {
+        var direct = new MediaRepresentation
+        {
+            Id = "137", Url = new Uri("https://cdn.example.test/video.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            RawCodecs = "avc1.640028, mp4a.40.2", Height = 1080, FileSize = 2_097_152,
+            ContentIdentity = "youtube:video:137:modified:2097152"
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "youtube", MediaId = "video",
+            Title = "Video", Duration = TimeSpan.FromSeconds(60), Representations = [direct]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => new VesperPreferences());
+        var createOptions = typeof(BrowserBridgeHandler).GetMethod("CreateBrowserOptions",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        var response = (BridgeResponse)createOptions.Invoke(bridge,
+            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None])!;
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(response.Data, BridgeProtocol.Json));
+        JsonElement best = json.RootElement.GetProperty("choices")[0];
+
+        Assert.True(response.Ok, response.Message);
+        Assert.True(best.GetProperty("canClip").GetBoolean());
+        Assert.True(best.GetProperty("clipUsesWholeFile").GetBoolean());
+    }
+
+    [Fact]
     public void Browser_collection_shortcut_requires_a_resolver_supplied_http_collection()
     {
         var item = new MediaItem

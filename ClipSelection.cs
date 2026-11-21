@@ -8,18 +8,19 @@ internal enum ClipMode
 {
     None,       // this format cannot be cut
     Segments,   // HLS/DASH: only the needed segments are downloaded, so the cut lands on segment edges
-    FullFile    // the whole file is downloaded and decoded, then the range is kept
+    FullFile    // the full source is downloaded, then trimmed locally
 }
 
 internal static class ClipSelection
 {
     internal const double LongestSeconds = 31_536_000;
     internal const string SegmentNotice = "VESPER downloads only the segments in your range; the clip may start a little early or end a little late.";
-    internal const string FullFileNotice = "VESPER downloads the whole file first, then keeps your time range.";
+    internal const string FullFileNotice = "VESPER downloads the full media first, then keeps your time range.";
 
     internal static ClipMode ModeFor(MediaDownloadChoice choice)
     {
         if (!MediaTransferBridge.SupportsTimeRange(choice)) return ClipMode.None;
+        if (choice.Output == MediaOutput.Wav || choice.CanUseFullFileClip) return ClipMode.FullFile;
         return ModeFor(choice.Output, choice.Kind);
     }
 
