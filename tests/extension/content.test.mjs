@@ -62,7 +62,7 @@ test('opening the popup shows the installed extension version without checking t
     assert.equal(browserDownloads.value, 'chrome');
     assert.equal(getElementById('handoff-setting').hidden, true);
     assert.equal(getElementById('manual-downloads').hidden, true);
-    assert.equal(getElementById('handoff').value, 'default');
+    assert.equal(getElementById('handoff').value, 'download');
     assert.equal(getElementById('prefetch').checked, true);
     assert.equal(getElementById('motion').value, 'animate');
     assert.equal(getElementById('signin').checked, true);

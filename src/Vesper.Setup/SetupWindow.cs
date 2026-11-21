@@ -83,10 +83,10 @@ internal sealed class SetupWindow : Form
             return;
         }
         if (_view == View.Working) return;
-        await RunAttemptAsync(Program.MotionEnabled);
+        await RunAttemptAsync();
     }
 
-    internal async Task RunAttemptAsync(bool animate)
+    internal async Task RunAttemptAsync()
     {
         if (_view == View.Working) return;
         using var cancellation = new CancellationTokenSource();
@@ -107,7 +107,7 @@ internal sealed class SetupWindow : Form
         {
             bool deleteUserData = _mode == SetupMode.Uninstall && _deleteUserData.Checked;
             setup = Task.Run(() => _work(progress, cancellation.Token, deleteUserData));
-            if (_mode == SetupMode.Install && animate && _canvas.TryStartIntro(holdForSetup: true))
+            if (_mode == SetupMode.Install && _canvas.TryStartIntro(holdForSetup: true))
                 _canvas.SetHoldMessage(HoldText(_progress));
 
             RefreshControls();
@@ -262,8 +262,7 @@ internal sealed class SetupWindow : Form
         if (_canvas is null) return;
         _palette = UiKit.Palette(UiKit.IsSystemDark(), botanical: true);
         ApplyPalette();
-        if (_canvas.Playing && !Program.MotionEnabled) SkipIntro();
-        else RefreshControls();
+        RefreshControls();
     }
 
     protected override void OnLoad(EventArgs e)

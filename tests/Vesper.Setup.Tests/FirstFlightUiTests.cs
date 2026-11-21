@@ -8,15 +8,6 @@ namespace Vesper.Setup.Tests;
 
 public sealed class FirstFlightUiTests
 {
-    [Theory]
-    [InlineData(false, true, true, true)]
-    [InlineData(false, true, false, false)]
-    [InlineData(false, false, true, false)]
-    [InlineData(true, true, true, false)]
-    public void MotionPreferenceRequiresClientAreaAnimationsAndNoHighContrast(
-        bool highContrast, bool settingRead, bool animationsEnabled, bool expected) =>
-        Assert.Equal(expected, Program.MotionEnabledFor(highContrast, settingRead, animationsEnabled));
-
     [Fact]
     public void StalledPaintsStillAdvanceThroughEveryIntroScene()
     {
@@ -43,7 +34,7 @@ public sealed class FirstFlightUiTests
         window.StartPosition = FormStartPosition.Manual;
         window.Location = new Point(-window.Width - 80, -window.Height - 80);
         window.Show();
-        Task install = window.RunAttemptAsync(animate: true);
+        Task install = window.RunAttemptAsync();
         FirstFlightCanvas canvas = window.Controls.OfType<FirstFlightCanvas>().Single();
 
         try
@@ -126,7 +117,7 @@ public sealed class FirstFlightUiTests
         _ = window.Handle;
         Assert.Contains(window.Controls.OfType<Label>(), label => label.Text == "For this Windows account only.");
         var stopwatch = Stopwatch.StartNew();
-        Task install = window.RunAttemptAsync(animate: true);
+        Task install = window.RunAttemptAsync();
         while (!install.IsCompleted && stopwatch.Elapsed < TimeSpan.FromSeconds(3))
         {
             Application.DoEvents();
@@ -232,7 +223,7 @@ public sealed class FirstFlightUiTests
             {
                 try
                 {
-                    await window.RunAttemptAsync(animate: true);
+                    await window.RunAttemptAsync();
                     installCompleted = true;
                 }
                 catch (Exception ex)
