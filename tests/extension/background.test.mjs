@@ -348,6 +348,28 @@ test('site policy waits long enough for a cold desktop start', async () => {
   assert.ok(app.timerDelays.includes(15_000));
 });
 
+test('Chrome taking bytes during the site check avoids a second download request', async () => {
+  const file = activeDownload();
+  let allowSite;
+  const policy = new Promise(resolve => { allowSite = resolve; });
+  const app = load({ hello: policy, 'browser-submit': started }, {
+    download: file,
+    signInPermission: true,
+    prefs: { useSignIn: true }
+  });
+  await observe(app, file);
+  const capture = app.onCreated(file);
+  await waitFor(() => app.policyRequests.length === 1, 'the site policy check did not run');
+  file.bytesReceived = 4096;
+  allowSite({ ok: true, data: { siteRules: { neverCaptureHosts: [] } } });
+  await capture;
+
+  assert.deepEqual(app.sent, []);
+  assert.deepEqual(app.cookieLookups, []);
+  assert.equal(file.paused, false);
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'chrome-started');
+});
+
 test('automatic capture checks the referrer, original URL and final URL hosts', async () => {
   const cases = [
     { host: 'blocked-origin.example', url: 'https://blocked-origin.example/start?token=private', finalUrl: 'https://cdn.example/file.zip?token=private' },
@@ -541,8 +563,8 @@ test('automatic queued results without transfer readiness leave Chrome running',
 
 test('a temporary native error leaves Chrome downloading and never retries late', async () => {
   const file = activeDownload();
-  const app = load({ 'browser-submit': { ok: false, code: 'host-error', message: 'Temporary disconnect.' } },
-    { download: file });
+  const app = load({ 'browser-submit': { ok: false, code: 'host-error', message: 'Temporary disconnect.' },
+    'browser-transfer': transfer('failed') }, { download: file });
   await observe(app, file);
   await app.onCreated(file);
   assert.equal(file.paused, false);
@@ -554,6 +576,32 @@ test('a temporary native error leaves Chrome downloading and never retries late'
   assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
   assert.equal(file.state, 'in_progress');
   assert.equal(app.actions.includes('cancel'), false);
+});
+
+test('a lost native reply leaves durable cleanup and never takes the Chrome file', async () => {
+  const file = activeDownload();
+  const timeout = { ok: false, code: 'timeout' };
+  const app = load({ 'browser-submit': timeout, 'browser-transfer': timeout }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  const [submission, cleanup] = app.sent;
+  assert.equal(submission.type, 'browser-submit');
+  assert.equal(cleanup.operation, 'abandon');
+  assert.equal(cleanup.transferId, submission.id);
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'releasing');
+  assert.deepEqual(app.actions, ['native', 'native']);
+  assert.equal(file.paused, false);
+
+  const restarted = load({ 'browser-transfer': transfer('failed') }, {
+    download: file, localData: structuredClone(app.localData)
+  });
+  await restarted.recover();
+  assert.ok(restarted.sent.length > 0);
+  assert.ok(restarted.sent.every(message => message.operation === 'abandon' && message.transferId === submission.id));
+  assert.equal(restarted.localData.browserDownloads[file.id].stage, 'stand-down');
+  assert.equal(file.state, 'in_progress');
+  assert.equal(file.paused, false);
 });
 
 test('same-size responses without a strong ETag stay in Chrome', async () => {
@@ -580,13 +628,13 @@ test('same-size responses without a strong ETag stay in Chrome', async () => {
 
 test('automatic handoff includes extensionless files and starts them by default', async () => {
   const file = { ...activeDownload(), url: 'https://example.com/export?receipt=42', filename: '' };
-  const app = load({}, { download: file });
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file });
   await observe(app, file);
   await app.onCreated(file);
   assert.equal(app.sent[0].items[0].url, file.url);
   assert.equal(app.sent[0].mode, 'download');
-  assert.equal(file.paused, false);
-  assert.deepEqual(app.actions, ['native']);
+  assert.equal(file.paused, true);
+  assert.deepEqual(app.actions, ['native', 'pause', 'native', 'native']);
 });
 
 test('automatic handoff waits for Chrome to clear a download', async () => {
@@ -808,7 +856,7 @@ test('an attempted native handoff resumes after worker restart with the same tra
   let finishFirst, finishSecond;
   const firstReply = new Promise(resolve => { finishFirst = resolve; });
   const secondReply = new Promise(resolve => { finishSecond = resolve; });
-  const firstWorker = load({ 'browser-submit': () => firstReply }, { download: file });
+  const firstWorker = load({ 'browser-submit': () => firstReply, 'browser-transfer': transfer('failed') }, { download: file });
   await observe(firstWorker, file);
 
   const firstCapture = firstWorker.onCreated(file);
@@ -818,7 +866,7 @@ test('an attempted native handoff resumes after worker restart with the same tra
   assert.equal(attempted.stage, 'attempted');
   assert.equal(file.paused, false, 'Chrome keeps running while native readiness is unknown');
 
-  const restarted = load({ 'browser-submit': () => secondReply }, {
+  const restarted = load({ 'browser-submit': () => secondReply, 'browser-transfer': transfer('failed') }, {
     download: file, localData: firstWorker.localData, sessionData: firstWorker.sessionData
   });
   await waitFor(() => restarted.sent.some(message => message.type === 'browser-submit'));

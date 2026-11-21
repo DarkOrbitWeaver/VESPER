@@ -476,15 +476,6 @@ function moveChromeDownload(id, mode, automatic = false) {
     if (!canMove(item) || item.paused || !Number.isFinite(Date.parse(item.startTime)))
       return chromeKeeps('This Chrome download is unavailable to move.');
     const note = outcome => automatic ? noteDecision(item, outcome, generation) : Promise.resolve();
-    const siteDecision = automatic ? await shouldKeepChromeForSite(item) : 'allowed';
-    if (automatic && siteDecision === 'policy-unavailable') {
-      await note('policy-unavailable');
-      return chromeKeeps('VESPER could not confirm the site rules. Chrome is continuing this download.');
-    }
-    if (automatic && siteDecision === 'site-rule') {
-      await note('site-rule');
-      return chromeKeeps('This site is set to keep automatic downloads in Chrome.');
-    }
     const { proof, reason } = downloadProof(item, !automatic);
     if (!proof) {
       await note(reason);
@@ -505,8 +496,30 @@ function moveChromeDownload(id, mode, automatic = false) {
       return chromeKeeps();
     }
 
-    const sourceHash = await sourceIdentity(browserUrl(item));
+    const [siteDecision, sourceHash] = await Promise.all([
+      shouldKeepChromeForSite(item), sourceIdentity(browserUrl(item))
+    ]);
+    if (siteDecision === 'policy-unavailable') {
+      await note('policy-unavailable');
+      return chromeKeeps('VESPER could not confirm the site rules. Chrome is continuing this download.');
+    }
+    if (siteDecision === 'site-rule') {
+      await note('site-rule');
+      return chromeKeeps('This site is set to keep automatic downloads in Chrome.');
+    }
     if (!sourceHash) return chromeKeeps('The download source cannot be verified.');
+
+    // The helper may have taken time to start. Check Chrome before starting a second request.
+    const candidate = await getChromeDownload(id);
+    if (!sameDownload(candidate, item) || !canMove(candidate) || candidate.paused
+        || browserUrl(candidate) !== browserUrl(item) || startUrl(candidate) !== startUrl(item)
+        || candidate.referrer !== item.referrer) {
+      if (previous?.stage === 'attempted')
+        await releaseChromeDownload(candidate, { ...previous, id, standDownAfterRelease: true });
+      if (sameDownload(candidate, item))
+        await note(candidate.state === 'complete' ? 'chrome-finished' : candidate.bytesReceived > 0 ? 'chrome-started' : 'not-ready');
+      return chromeKeeps();
+    }
     const record = previous?.stage === 'attempted'
       ? { ...previous }
       : { startTime: item.startTime, transferId: crypto.randomUUID(), stage: 'attempted', attempts: 0 };
@@ -519,7 +532,7 @@ function moveChromeDownload(id, mode, automatic = false) {
       return chromeKeeps();
     }
     const { items, authorized } = await withSignIn([{
-      url: browserUrl(item), originalUrl: startUrl(item), fileName: chromeFileName(item),
+      url: browserUrl(item), originalUrl: startUrl(item), fileName: chromeFileName(candidate),
       referer: item.referrer || undefined, userAgent: navigator.userAgent
     }]);
     if (automatic && !(await captureIsEnabled(generation))) {
@@ -540,29 +553,16 @@ function moveChromeDownload(id, mode, automatic = false) {
       return chromeKeeps();
     }
     if (!reply.ok || result?.transferReady !== true) {
-      // A delayed reply cannot publish a tentative download. Release the job if the helper answered.
-      if (reply.ok) {
-        const stopped = await transferCommand(record.transferId, 'abandon').catch(() => null);
-        if (stopped?.ok && stopped.data?.state === 'complete') {
-          // A staged transfer must not publish before acceptance. Never label this Chrome-owned file moved.
-          if (captureEnabled && generation === captureGeneration)
-            await writeBrowserRecord(id, { startTime: record.startTime, stage: 'stand-down' });
-          else
-            await writeBrowserRecord(id, null);
-          await note('capture-error');
-          return chromeKeeps();
-        }
+      let stopped;
+      if (reply.ok || unavailableTransferState(reply) && reply.code !== 'host-missing'
+          || record.attempts >= MAX_CAPTURE_ATTEMPTS) {
+        // The helper may have started a candidate even if its reply was lost. Keep the cleanup record until it answers.
+        stopped = await releaseChromeDownload(latest, { ...record, id, standDownAfterRelease: true });
+      } else {
+        await writeBrowserRecord(id, { startTime: record.startTime, stage: 'stand-down' });
       }
-      if (record.attempts >= MAX_CAPTURE_ATTEMPTS) {
-        await releaseChromeDownload(latest, { ...record, id, standDownAfterRelease: true });
-        await note(handoffOutcome(reply, result, authorized));
-        return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
-      }
-      // No delayed retry: if Chrome keeps downloading after a failed attempt, ownership stays with Chrome.
-      record.stage = 'stand-down';
-      delete record.retryAt;
-      await writeBrowserRecord(id, record);
-      await note(handoffOutcome(reply, result, authorized));
+      // Chrome never paused for this candidate. Recovery only cleans up the VESPER half.
+      await note(stopped?.ok && stopped.data?.state === 'complete' ? 'capture-error' : handoffOutcome(reply, result, authorized));
       return chromeKeeps(reply.ok ? undefined : reply.message || undefined);
     }
 
@@ -664,6 +664,7 @@ async function releaseChromeDownload(item, record) {
   } else {
     await armBrowserRecovery();
   }
+  return stopped;
 }
 
 async function releaseChromeAfterOptOut(id, record) {
