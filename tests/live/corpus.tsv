@@ -19,7 +19,6 @@ internet-archive	public film	smallest	https://archive.org/details/BigBuckBunny_1
 vimeo	public video	smallest	https://vimeo.com/76979871
 peertube	public video (framatube)	smallest	https://framatube.org/videos/watch/9c9de5e8-0a1e-484a-b099-e80766180a6d
 bandcamp	public test track	audio	https://youtube-dl.bandcamp.com/track/youtube-dl-test-song
-podcast	RSS feed	collection	https://feeds.npr.org/510289/podcast.xml
 soundcloud	public track (no adapter)	audio	https://soundcloud.com/forss/flickermood
 twitch	public clip/VOD (no adapter)	discover	https://www.twitch.tv/videos/2000000000
 x	public post video (no adapter)	discover	https://x.com/NASA/status/1800000000000000000

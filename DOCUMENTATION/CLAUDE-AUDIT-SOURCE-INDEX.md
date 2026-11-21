@@ -97,7 +97,7 @@ Original opportunity rows are explicitly **not** automatic release blockers. The
 | N-16 | 1732 | **Per-site rules** (always audio, always a given folder, never capture) | Partial; focused tests passed; real Chrome acceptance open |
 | N-17 | 1733 | **Diagnostics bundle** (redacted log, versions, settings; local zip the user can share) | Implemented; solution tests |
 | N-18 | 1734 | **Low-disk forecast** ("Queue needs 14 GB; 9 GB free") | Implemented; solution tests |
-| N-19 | 1735 | **Podcast feed follow** (new episodes queued on demand, no background polling unless opted in) | Partial; focused Windows tests passed; live feed acceptance open |
+| N-19 | 1735 | **Podcast feed follow** (new episodes queued on demand, no background polling unless opted in) | Removed at the owner's request on 2026-11-21 |
 | N-20 | 1736 | **Windows Share target / "Open with VESPER" for .m3u8/.mpd files** | OWNER DESIGN REQUIRED; see `DOCUMENTATION/OWNER-DESIGN-REQUIRED.md` |
 
 The original **ranks 1–7** are covered by existing VES/USER work rather than duplicate `N-01`–`N-07` identifiers. Their original claims still need individual dispositions:

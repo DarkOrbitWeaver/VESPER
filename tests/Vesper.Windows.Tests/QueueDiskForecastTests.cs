@@ -49,10 +49,12 @@ public sealed class QueueDiskForecastTests
 
         Assert.True(Assert.Single(shortByOne).IsShort);
         Assert.False(Assert.Single(enough).IsShort);
+        Assert.Equal("Low disk space on C:", QueueDiskForecast.Summary(shortByOne));
+        Assert.Contains("free for this queue", QueueDiskForecast.Details(shortByOne));
     }
 
     [Fact]
-    public void Unknown_sizes_are_called_out_in_the_summary_and_details()
+    public void Unknown_sizes_and_unavailable_free_space_do_not_signal_a_shortage()
     {
         JobSnapshot[] jobs =
         [
@@ -62,16 +64,13 @@ public sealed class QueueDiskForecastTests
         IReadOnlyList<DiskForecastVolume> forecast = QueueDiskForecast.Calculate(jobs,
             new Dictionary<string, long?> { ["C:\\"] = null }, 64 * 1024 * 1024);
 
-        string summary = QueueDiskForecast.Summary(forecast);
-        string details = QueueDiskForecast.Details(forecast);
-        Assert.Contains("at least", summary);
-        Assert.Contains("1 unknown", summary);
-        Assert.Contains("free space unavailable", details);
-        Assert.Contains("final size cannot be estimated", details);
+        DiskForecastVolume volume = Assert.Single(forecast);
+        Assert.Equal(1, volume.UnknownJobs);
+        Assert.False(volume.IsShort);
     }
 
     [Fact]
-    public void Main_window_footer_surfaces_the_estimate_and_accessible_details()
+    public void Main_window_footer_keeps_unknown_sizes_out_of_the_way()
     {
         OnSta(() =>
         {
@@ -79,9 +78,8 @@ public sealed class QueueDiskForecastTests
             form.LoadPreviewRows([DownloadItem.From(Job("C:\\downloads", 20_000, output: MediaOutput.Wav))]);
             Label footer = Assert.IsAssignableFrom<Label>(Assert.Single(form.Controls.Find("statusText", searchAllChildren: true)));
 
-            Assert.Contains("Disk:", footer.Text);
-            Assert.Contains("1 size unknown", footer.Text);
-            Assert.Contains("final size cannot be estimated", footer.AccessibleDescription);
+            Assert.DoesNotContain("Disk", footer.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal("", footer.AccessibleDescription);
             Assert.True(footer.AutoEllipsis);
         });
     }

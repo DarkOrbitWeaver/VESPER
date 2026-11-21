@@ -29,7 +29,7 @@ foreach ($match in $matches) {
 
 $openCount = 0
 foreach ($row in $rows) {
-    $closed = $row.Status -match '^(Implemented|Preserved)'
+    $closed = $row.Status -match '^(Implemented|Preserved|Removed by owner)'
     if ($closed) {
         if ($checks.ContainsKey($row.ID) -and $checks[$row.ID] -eq ' ') {
             throw "Marked closed in TSV but unchecked in TODO: $($row.ID)"

@@ -39,8 +39,6 @@ public sealed class ManifestMalformedInputTests
             text => HlsParser.Parse(text, Source) is not null),
         ["dash-manifest"] = new(3004, () => Fixture.Load("reddit_dash.mpd"),
             text => DashParser.Parse(text, Source).Representations.Count > 0),
-        ["podcast-feed"] = new(3005, () => Fixture.Load("podcast.xml"),
-            text => PodcastFeedParser.Parse(text, Source, 100) is not null),
         ["url-list"] = new(3006, () => UrlList,
             text => UrlListParser.Parse(text) is not null),
     };

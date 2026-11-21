@@ -44,6 +44,23 @@ public sealed class MediaTrackProbeTests
         Assert.True(stopped.CommittedBytes > 0); Assert.True(File.Exists(stopped.PartialPath));
     }
     [Fact]
+    public async Task HttpMediaHandoff_KeepsFragmentedMp4SegmentWithoutPublishingIt()
+    {
+        byte[] fragment = DashTransferTests.Fixture("av-1.m4s");
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        server.Extra["/media/instagram.mp4"] = fragment;
+        var added = h.Engine.Add(new AddRequest(server.Url("/media/instagram.mp4"), FileName: "instagram.mp4", MediaProvider: "generic"));
+
+        var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+
+        Assert.Equal("media-validation", stopped.Reason);
+        Assert.Null(stopped.FinalPath);
+        Assert.Contains("The site sent only part of the video.", stopped.Message);
+        Assert.Contains("choose another format", stopped.Message);
+        Assert.Contains("Saved data was kept.", stopped.Message);
+        Assert.Equal(fragment, await File.ReadAllBytesAsync(stopped.PartialPath));
+    }
+    [Fact]
     public async Task OrdinaryHttpDownload_CanStillSaveAnIntentionallyVideoOnlyFile()
     {
         await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();

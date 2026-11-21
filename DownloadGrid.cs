@@ -555,6 +555,7 @@ public sealed class DownloadGrid : Control
 
     private void PaintActivity(Graphics g, DownloadItem item, Rectangle rect, int pad)
     {
+        bool mediaCheckFailed = item.Status == JobStatus.NeedsAttention && item.Snapshot?.Reason == "media-validation";
         var (label, icon, color) = item.Status switch
         {
             JobStatus.Downloading when item.Snapshot?.IsLiveRecording == true => ("Recording", VesperIcon.Download, _palette.MutedGreen),
@@ -569,6 +570,7 @@ public sealed class DownloadGrid : Control
             JobStatus.Verifying => ("Checking", VesperIcon.Shield, _palette.MutedGreen),
             JobStatus.Resolving => ("Resolving", VesperIcon.Info, _palette.Muted),
             JobStatus.WaitingRetry => ("Waiting to retry", VesperIcon.Clock, _palette.ProgressAmber),
+            JobStatus.NeedsAttention when mediaCheckFailed => ("File check failed", VesperIcon.Warning, _palette.ProgressAmber),
             JobStatus.NeedsAttention => ("Needs attention", VesperIcon.Warning, _palette.ProgressAmber),
             JobStatus.Processing => ("Preparing file", VesperIcon.Info, _palette.MutedGreen),
             JobStatus.Converting => ("Converting", VesperIcon.Refresh, _palette.MutedGreen),
@@ -577,7 +579,7 @@ public sealed class DownloadGrid : Control
             _ => ("Suspect integrity", VesperIcon.Warning, _palette.ProgressRed)
         };
         if (_palette.HighContrast) color = _palette.Text;
-        bool progress = item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink
+        bool progress = !mediaCheckFailed && item.Percent.HasValue && item.Status is JobStatus.Downloading or JobStatus.Paused or JobStatus.NeedsLink
             or JobStatus.NeedsAttention or JobStatus.WaitingRetry or JobStatus.Waiting or JobStatus.Failed;
         int iconSize = UiKit.Scale(this, 14);
         int statusHeight = UiKit.Scale(this, _density == Density.ExtraCompact ? 18 : 21);
