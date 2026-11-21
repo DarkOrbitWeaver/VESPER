@@ -1829,8 +1829,8 @@ test('a choice restarts Chrome when the worker died before the download began', 
 
 test('blob and data media context-menu actions show failure feedback', async () => {
   const app = load();
-  await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'blob:https://example.com/media' }, { id: 3 });
-  await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'data:video/mp4;base64,AAAA' }, { id: 3 });
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', srcUrl: 'blob:https://example.com/media' }, { id: 3 });
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', srcUrl: 'data:video/mp4;base64,AAAA' }, { id: 3 });
   assert.deepEqual(JSON.parse(JSON.stringify(app.badges)), [{ tabId: 3, text: '!' }, { tabId: 3, text: '!' }]);
   const notices = app.tabMessages.filter(entry => entry.message.type === 'vesper-context-notice');
   assert.equal(notices.length, 2);
@@ -2151,7 +2151,7 @@ test('a link on another site never carries SameSite=Strict cookies to VESPER', a
   for (const [where, expected] of cases) {
     const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
       localData: { signInHosts: ['bank.example'] }, cookies: cookieJar });
-    await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://bank.example/export.csv', ...where }, undefined);
+    await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: 'https://bank.example/export.csv', ...where }, undefined);
     assert.equal(app.sent[0].items[0].cookie, expected, JSON.stringify(where));
     assert.equal(app.sent[0].authorized, true);
   }
@@ -2160,14 +2160,14 @@ test('a link on another site never carries SameSite=Strict cookies to VESPER', a
 test('sibling subdomains are treated as different sites, which can only withhold a cookie', async () => {
   const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
     localData: { signInHosts: ['alice.pages.example'] }, cookies: cookieJar });
-  await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://alice.pages.example/file.zip', pageUrl: 'https://mallory.pages.example/' }, undefined);
+  await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: 'https://alice.pages.example/file.zip', pageUrl: 'https://mallory.pages.example/' }, undefined);
   assert.equal(app.sent[0].items[0].cookie, withoutStrict);
 });
 
 test('public-suffix tenant hosts do not receive each other’s Strict cookies', async () => {
   const app = load({ submit: { ok: true } }, { signInPermission: true, prefs: { useSignIn: true },
     localData: { signInHosts: ['user.github.io'] }, cookies: cookieJar });
-  await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'https://user.github.io/export.zip', pageUrl: 'https://github.io/' }, undefined);
+  await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: 'https://user.github.io/export.zip', pageUrl: 'https://github.io/' }, undefined);
   assert.equal(app.sent[0].items[0].cookie, withoutStrict);
 });
 
@@ -2517,14 +2517,14 @@ test('every reason the worker can record has plain wording in the popup', async 
 
 // ---------------------------------------------------------------- right-clicking a player-made video (issue 5)
 
-test('both YouTube Mix card actions open Find media for the clicked item', async () => {
+test('the download action opens Find media for the clicked YouTube Mix card', async () => {
   const page = 'https://www.youtube.com/watch?v=abcdefghijk&list=RDabcdefghijk';
   const tab = { id: 9, url: 'https://www.youtube.com/' };
   const app = load({ 'media-picker': { ok: true } });
-  for (const [menuItemId, srcUrl] of [
-    ['vesper-link', undefined], ['vesper-media', 'blob:https://www.youtube.com/preview'], ['vesper-media', undefined]
+  for (const media of [
+    {}, { mediaType: 'video', srcUrl: 'blob:https://www.youtube.com/preview' }, { mediaType: 'video' }
   ]) {
-    await app.onContextClicked({ menuItemId, linkUrl: page, srcUrl, pageUrl: tab.url }, tab);
+    await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: page, pageUrl: tab.url, ...media }, tab);
     assert.equal(app.sent.at(-1).type, 'media-picker');
     assert.equal(app.sent.at(-1).url, page);
   }
@@ -2535,7 +2535,7 @@ test('the clicked TikTok card takes precedence over its temporary preview file',
   const page = 'https://www.tiktok.com/@owner/video/12345';
   const tab = { id: 9, url: 'https://www.tiktok.com/' };
   const app = load({ 'media-picker': { ok: true } });
-  await app.onContextClicked({ menuItemId: 'vesper-media', linkUrl: page,
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', linkUrl: page,
     srcUrl: 'https://cdn.example/preview.mp4', pageUrl: tab.url }, tab);
   assert.equal(app.sent[0].type, 'media-picker');
   assert.equal(app.sent[0].url, page);
@@ -2543,7 +2543,7 @@ test('the clicked TikTok card takes precedence over its temporary preview file',
 
 test('a link without a usable web address explains the failure in the clicked frame', async () => {
   const app = load();
-  await app.onContextClicked({ menuItemId: 'vesper-link', linkUrl: 'blob:https://example.com/item', frameId: 2 }, { id: 3 });
+  await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: 'blob:https://example.com/item', frameId: 2 }, { id: 3 });
   assert.equal(app.sent.length, 0);
   const notice = app.tabMessages.at(-1);
   assert.equal(notice.options.frameId, 2);
@@ -2554,7 +2554,7 @@ test('a link without a usable web address explains the failure in the clicked fr
 test('right-clicking a blob video opens the media picker for the page instead of failing silently', async () => {
   const app = load({ 'media-picker': { ok: true } });
   const tab = { id: 9, url: 'https://video.example/watch?v=abc' };
-  await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'blob:https://video.example/6f1c-uuid', pageUrl: tab.url }, tab);
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', srcUrl: 'blob:https://video.example/6f1c-uuid', pageUrl: tab.url }, tab);
   assert.equal(app.sent.length, 1);
   assert.equal(app.sent[0].type, 'media-picker');
   assert.equal(app.sent[0].url, tab.url);
@@ -2564,12 +2564,12 @@ test('right-clicking a blob video opens the media picker for the page instead of
 test('right-clicking an ordinary video still downloads it directly', async () => {
   const app = load({ submit: { ok: true } });
   const tab = { id: 9, url: 'https://cdn.example/page' };
-  await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'https://cdn.example/clip.mp4', pageUrl: tab.url }, tab);
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', srcUrl: 'https://cdn.example/clip.mp4', pageUrl: tab.url }, tab);
   assert.equal(app.sent[0].type, 'submit');
   assert.equal(app.sent[0].items[0].url, 'https://cdn.example/clip.mp4');
 });
 
-test('right-clicking an ordinary page control opens discovery without replaying the control', async () => {
+test('right-clicking a blob video in a frame uses that frame for discovery and sign-in', async () => {
   const frameUrl = 'https://player.example/embed';
   const app = load({ 'media-picker': { ok: true } }, {
     prefs: { useSignIn: true }, signInPermission: true,
@@ -2577,7 +2577,8 @@ test('right-clicking an ordinary page control opens discovery without replaying 
     cookies: [{ name: 'session', value: 'authorized', sameSite: 'lax' }]
   });
   const tab = { id: 9, url: 'https://video.example/watch' };
-  await app.onContextClicked({ menuItemId: 'vesper-page-media', pageUrl: tab.url, frameUrl, frameId: 2 }, tab);
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video',
+    srcUrl: 'blob:https://player.example/video', pageUrl: tab.url, frameUrl, frameId: 2 }, tab);
 
   assert.equal(app.sent.length, 1);
   assert.equal(app.sent[0].type, 'media-picker');
@@ -2588,29 +2589,30 @@ test('right-clicking an ordinary page control opens discovery without replaying 
   assert.equal(app.tabMessages[0].message.type, 'vesper-open-picker');
 });
 
-test('a page context action opens the existing player picker when the clicked frame has a player', async () => {
+test('the download action opens the existing picker for a blob-backed player', async () => {
   const app = load({}, { playerPicker: true });
   const tab = { id: 11, url: 'https://video.example/watch' };
 
-  await app.onContextClicked({ menuItemId: 'vesper-page-media', pageUrl: tab.url, frameUrl: tab.url, frameId: 0 }, tab);
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video',
+    srcUrl: 'blob:https://video.example/watch', pageUrl: tab.url, frameUrl: tab.url, frameId: 0 }, tab);
 
   assert.equal(app.tabMessages[0].message.type, 'vesper-open-picker');
   assert.equal(app.tabMessages[0].options.frameId, 0);
   assert.equal(app.sent.length, 0);
 });
 
-test('the page-media action is registered for ordinary page and frame contexts', async () => {
+test('Smart Select and Download use separate Chrome right-click contexts', async () => {
   const app = load();
   await app.install();
-  const item = app.contextMenuItems.find(menu => menu.id === 'vesper-page-media');
-
-  assert.equal(item.title, 'Find video on this page with VESPER');
-  assert.equal(Array.from(item.contexts).join(','), 'page,frame');
+  const registered = app.contextMenuItems.map(menu => [menu.id, Array.from(menu.contexts).join(',')]);
+  assert.deepEqual(registered, [
+    ['vesper-smart', 'page'], ['vesper-download', 'link,video,audio'], ['vesper-transfers', 'action']
+  ]);
 });
 
 test('right-clicking a blob video on a page that cannot be inspected says so', async () => {
   const app = load({ 'media-picker': { ok: true } });
-  await app.onContextClicked({ menuItemId: 'vesper-media', srcUrl: 'blob:file:///tmp/x', pageUrl: 'file:///tmp/page.html' },
+  await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video', srcUrl: 'blob:file:///tmp/x', pageUrl: 'file:///tmp/page.html' },
     { id: 9, url: 'file:///tmp/page.html' });
   assert.equal(app.sent.length, 0);
   assert.equal([...app.badges].at(-1).text, '!');

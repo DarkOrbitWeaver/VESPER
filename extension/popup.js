@@ -9,7 +9,7 @@ async function init() {
   const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'animate', route: 'auto', handoff: 'download', intercept: true, useSignIn: true });
   $('theme').value = prefs.theme;
   $('motion').value = prefs.motion === 'still' ? 'still' : 'animate';
-  $('handoff').value = prefs.handoff;
+  $('handoff').value = prefs.handoff === 'queue' ? 'queue' : 'download';
   const browserDownloads = $('browser-downloads');
   browserDownloads.value = prefs.route === 'chrome' ? 'chrome' : prefs.intercept ? 'automatic' : 'manual';
   function showDownloadMode() {

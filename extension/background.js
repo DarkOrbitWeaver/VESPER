@@ -11,7 +11,7 @@ const MAX_TOTAL_SOURCES = 200;
 const SOURCE_TTL = 10 * 60_000;
 const SOURCE_EXPIRY_ALARM = 'vesper-media-sources';
 const DEFAULTS = {
-  handoff: 'download',         // default = VESPER decides, download, queue
+  handoff: 'download',
   route: 'auto',
   intercept: true,             // enabled by default when the user explicitly installs the extension; can be disabled
   useSignIn: true              // Chrome must grant cookie access before VESPER can use it.
@@ -42,7 +42,9 @@ function nativeRequest(message, timeoutMs = 330000) {
 const envelope = (type, extra = {}) => ({ v: PROTOCOL, id: crypto.randomUUID(), type, ...extra });
 
 async function settings() {
-  return { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
+  const prefs = { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
+  prefs.handoff = prefs.handoff === 'queue' ? 'queue' : 'download';
+  return prefs;
 }
 
 const SITE_CAPTURE_RULES_KEY = 'vesperSiteNeverCaptureHosts';
@@ -988,7 +990,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'submit': {
         const { items, authorized } = await withSignIn(message.items.map((i) => ({ referer: message.pageUrl, userAgent: navigator.userAgent, ...i })));
         const prefs = await settings();
-        const mode = message.mode || (prefs.handoff === 'default' ? 'ask' : prefs.handoff);
+        const mode = message.mode || prefs.handoff;
         return submit(items, mode, { authorized });
       }
       default: return { ok: false, code: 'unknown', message: 'Unknown message.' };
@@ -1027,10 +1029,8 @@ async function openContextMedia(pageUrl, info, tab) {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
-  chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER…', contexts: ['page', 'link', 'selection'] });
-  chrome.contextMenus.create({ id: 'vesper-page-media', title: 'Find video on this page with VESPER', contexts: ['page', 'frame'] });
-  chrome.contextMenus.create({ id: 'vesper-link', title: 'Download link with VESPER', contexts: ['link'] });
-  chrome.contextMenus.create({ id: 'vesper-media', title: 'Download media with VESPER', contexts: ['video', 'audio'] });
+  chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER', contexts: ['page'] });
+  chrome.contextMenus.create({ id: 'vesper-download', title: 'Download with VESPER', contexts: ['link', 'video', 'audio'] });
   chrome.contextMenus.create({ id: 'vesper-transfers', title: 'Unconfirmed VESPER requests…', contexts: ['action'] });
   await updateBadge();
   await recoverChromeDownloads();
@@ -1062,20 +1062,15 @@ async function runContextAction(info, tab) {
     catch { await flash(tab?.id, { ok: false, message: 'Smart Select is unavailable on this page.' }, info.frameId); }
     return;
   }
-  if (info.menuItemId === 'vesper-page-media') {
-    if (await openFramePicker(info, tab)) return;
-    await openContextMedia(contextPageUrl(info, tab), info, tab);
-    return;
-  }
-  const linkAction = info.menuItemId === 'vesper-link';
-  if (!linkAction && info.menuItemId !== 'vesper-media') return;
-  const url = linkAction ? info.linkUrl : info.srcUrl;
+  if (info.menuItemId !== 'vesper-download') return;
+  const mediaAction = info.mediaType === 'video' || info.mediaType === 'audio';
+  const url = mediaAction ? info.srcUrl : info.linkUrl;
   const targetPage = linkedMediaPage(info.linkUrl);
   if (targetPage) {
     await openContextMedia(targetPage, info, tab);
     return;
   }
-  if (!linkAction && (!url || url.startsWith('blob:'))) {
+  if (mediaAction && (!url || url.startsWith('blob:'))) {
     if (url && await openFramePicker(info, tab, url)) return;
     await openContextMedia(contextPageUrl(info, tab), info, tab);
     return;
@@ -1086,7 +1081,7 @@ async function runContextAction(info, tab) {
   }
   const prefs = await settings();
   if (prefs.route === 'chrome') {
-    if (info.menuItemId !== 'vesper-link' && VesperPlayerSource.kind(url) !== 'direct') {
+    if (mediaAction && VesperPlayerSource.kind(url) !== 'direct') {
       await flash(tab?.id, { ok: false, message: 'Chrome can only save a direct media file here.' }, info.frameId);
       return;
     }
@@ -1099,7 +1094,7 @@ async function runContextAction(info, tab) {
   // The frame that holds the link is the real initiator; an embedded frame can be another site than the tab.
   const { items, authorized } = await withSignIn([{ url, referer: info.frameUrl || info.pageUrl || tab?.url, userAgent: navigator.userAgent }],
     { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined });
-  const reply = await submit(items, prefs.handoff === 'default' ? 'ask' : prefs.handoff, { authorized });
+  const reply = await submit(items, prefs.handoff, { authorized });
   await flash(tab?.id, reply, info.frameId);
 }
 

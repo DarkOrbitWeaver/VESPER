@@ -955,7 +955,7 @@ async function captureChromeDownload(item, generation = captureGeneration) {
   if (wanted && await captureIsEnabled(generation)) {
     const prefs = await settings();
     if (await captureIsEnabled(generation))
-      await moveChromeDownload(item.id, prefs.handoff === 'default' ? 'ask' : prefs.handoff, true);
+      await moveChromeDownload(item.id, prefs.handoff, true);
   }
 }
 

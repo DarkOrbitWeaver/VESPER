@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using VESPER;
 using Vesper.Shared;
@@ -8,7 +7,6 @@ namespace Vesper.Setup;
 
 internal static class Program
 {
-    private const uint SpiGetClientAreaAnimation = 0x1042;
     private static readonly TimeSpan ExitRequestConnectTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan ExitRequestReplyTimeout = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan InstanceReleaseTimeout = TimeSpan.FromSeconds(60);
@@ -118,22 +116,6 @@ internal static class Program
             mutex.Dispose();
         }
     }
-
-    internal static bool MotionEnabled
-    {
-        get
-        {
-            bool readAnimationSetting = SystemParametersInfo(SpiGetClientAreaAnimation, 0, out bool animationsEnabled, 0);
-            return MotionEnabledFor(SystemInformation.HighContrast, readAnimationSetting, animationsEnabled);
-        }
-    }
-
-    internal static bool MotionEnabledFor(bool highContrast, bool animationSettingRead, bool animationsEnabled) =>
-        !highContrast && animationSettingRead && animationsEnabled;
-
-    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SystemParametersInfo(uint action, uint parameter, [MarshalAs(UnmanagedType.Bool)] out bool value, uint flags);
 
     // Running outside the install directory lets Windows rename it during repair or uninstall.
     private static void StartMaintenanceWorker(string executable, SetupMode mode)
