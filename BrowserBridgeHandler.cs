@@ -321,10 +321,11 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             if (ct.IsCancellationRequested) { done.TrySetCanceled(ct); return; }
             try
             {
-                owner.RequestShow();
+                owner.ShowFromTray();
                 VesperPreferences formPreferences = preferences().Clone();
                 if (siteFolder is not null) formPreferences.DefaultFolder = siteFolder;
                 using var form = new BatchReviewForm(formPreferences, request.Items);
+                form.Shown += (_, _) => form.Activate();
                 using var registration = ct.Register(() =>
                 {
                     if (!form.IsDisposed && form.IsHandleCreated)

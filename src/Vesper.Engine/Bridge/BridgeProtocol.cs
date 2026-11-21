@@ -5,7 +5,8 @@ using Vesper.Shared;
 namespace Vesper.Engine;
 
 public sealed record BridgeItem(string Url, string? FileName, string Kind, string? Referer, string? UserAgent, string? Sha256,
-    string? Cookie, string? Authorization, string? OriginalUrl = null);
+    string? Cookie, string? Authorization, string? OriginalUrl = null,
+    string? ReviewLabel = null, string? ReviewType = null, double? ReviewDurationSeconds = null);
 
 public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false);
 
@@ -178,6 +179,14 @@ public static class BridgeProtocol
                 foreach (JsonElement element in array.EnumerateArray())
                 {
                     if (!TryItem(element, authorized, type == "browser-submit", out BridgeItem? item, out error)) return false;
+                    if (type == "batch-review")
+                    {
+                        double? duration = element.TryGetProperty("reviewDurationSeconds", out var seconds)
+                            && seconds.ValueKind == JsonValueKind.Number && seconds.TryGetDouble(out double value)
+                            && value is > 0 and <= 31_536_000 ? value : null;
+                        item = item! with { ReviewLabel = Header(element, "reviewLabel", 200),
+                            ReviewType = Header(element, "reviewType", 32), ReviewDurationSeconds = duration };
+                    }
                     items.Add(item!);
                 }
                 if (type == "browser-submit")

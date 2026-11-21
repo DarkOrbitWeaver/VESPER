@@ -1,5 +1,7 @@
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 using Vesper.Shared;
 
 namespace Vesper.Engine;
@@ -14,7 +16,8 @@ public static class BridgePipe
     internal static string NameForIdentity(string purpose, string identity) => WindowsObjectNames.NameForIdentity(purpose, identity);
 
     /// <summary>One request, one response, then close. Used by the native-messaging host.</summary>
-    public static async Task<string> RequestAsync(string pipeName, string json, TimeSpan connectTimeout, TimeSpan replyTimeout, CancellationToken ct)
+    public static async Task<string> RequestAsync(string pipeName, string json, TimeSpan connectTimeout, TimeSpan replyTimeout,
+        CancellationToken ct, bool bringReviewForward = false)
     {
         await using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
         using (var connect = CancellationTokenSource.CreateLinkedTokenSource(ct))
@@ -26,12 +29,20 @@ public static class BridgePipe
                 throw new TimeoutException("VESPER is not accepting connections.");   // lets callers tell "not running" from "no answer"
             }
         }
+        if (bringReviewForward && OperatingSystem.IsWindows() && GetNamedPipeServerProcessId(client.SafePipeHandle, out uint processId))
+            _ = AllowSetForegroundWindow(processId);
         using var reply = CancellationTokenSource.CreateLinkedTokenSource(ct);
         reply.CancelAfter(replyTimeout);
         await BridgeProtocol.WriteFrameAsync(client, json, reply.Token).ConfigureAwait(false);
         return await BridgeProtocol.ReadFrameAsync(client, reply.Token).ConfigureAwait(false)
             ?? throw new InvalidDataException("VESPER closed the connection without answering.");
     }
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(uint processId);
 }
 
 /// <summary>

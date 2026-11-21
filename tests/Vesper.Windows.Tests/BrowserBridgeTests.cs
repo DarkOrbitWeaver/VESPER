@@ -273,6 +273,29 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public void BatchReviewShowsThePageTitleTypeAndDurationWithoutExposingTheSignedUrl()
+    {
+        const string json = """
+            {"v":1,"id":"smart-review-1","type":"batch-review","mode":"ask","items":[
+              {"url":"https://media.example/clip.mp4?signature=private-value",
+               "reviewLabel":"Launch demo","reviewType":"MP4 video","reviewDurationSeconds":95.5},
+              {"url":"https://media.example/another.mp4","reviewType":"MP4 video","reviewDurationSeconds":1e100}
+            ]}
+            """;
+        Assert.True(BridgeProtocol.TryParse(json, out var request, out var error), error);
+        Assert.Null(request.Items[0].FileName);
+        Assert.Null(request.Items[1].ReviewDurationSeconds);
+        OnSta(() =>
+        {
+            using var form = new BatchReviewForm(new VesperPreferences(), request.Items);
+            var files = Assert.IsType<VesperCheckedList>(Assert.Single(form.Controls.Find("filesToReview", true)));
+            Assert.Contains("MP4 video · 1:35  |  Launch demo  |  media.example", files.Items[0].ToString());
+            Assert.DoesNotContain("private-value", files.Items[0].ToString());
+            Assert.Contains("Duration unknown", files.Items[1].ToString());
+        });
+    }
+
+    [Fact]
     public void BatchReviewShowsTheFullPageHashAndRequiresAnExplicitTrustChoice()
     {
         OnSta(() =>

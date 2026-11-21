@@ -53,8 +53,9 @@ internal static class Program
     private static async Task<string> HandleAsync(BridgeRequest request, string rawJson, CancellationToken ct)
     {
         string pipe = BridgePipe.NameForCurrentUser();
+        bool bringReviewForward = request.Type == "batch-review";
 
-        string? answer = await TryRequestAsync(pipe, rawJson, ct);
+        string? answer = await TryRequestAsync(pipe, rawJson, ct, bringReviewForward);
         if (answer is not null) return answer;
 
         // A browser download or format request can wake the desktop.
@@ -65,15 +66,15 @@ internal static class Program
         while (DateTime.UtcNow < deadline)
         {
             await Task.Delay(300, ct);
-            answer = await TryRequestAsync(pipe, rawJson, ct);
+            answer = await TryRequestAsync(pipe, rawJson, ct, bringReviewForward);
             if (answer is not null) return answer;
         }
         return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "VESPER started but did not answer in time. Try again in a moment."));
     }
 
-    private static async Task<string?> TryRequestAsync(string pipe, string json, CancellationToken ct)
+    private static async Task<string?> TryRequestAsync(string pipe, string json, CancellationToken ct, bool bringReviewForward)
     {
-        try { return await BridgePipe.RequestAsync(pipe, json, TimeSpan.FromMilliseconds(500), TimeSpan.FromMinutes(5), ct); }
+        try { return await BridgePipe.RequestAsync(pipe, json, TimeSpan.FromMilliseconds(500), TimeSpan.FromMinutes(5), ct, bringReviewForward); }
         catch (TimeoutException) { return null; }
         catch (IOException) { return null; }
     }

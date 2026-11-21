@@ -82,8 +82,15 @@ internal sealed class BatchReviewForm : VesperPopupForm
         foreach (var item in items)
         {
             var uri = new Uri(item.Url);
+            string title = item.ReviewLabel ?? item.FileName ?? FileNames.FromUrl(uri);
+            string type = item.ReviewType ?? "File";
+            string duration = "";
+            if (item.ReviewDurationSeconds is double seconds)
+                duration = " · " + TimeSpan.FromSeconds(seconds).ToString(seconds >= 3600 ? @"h\:mm\:ss" : @"m\:ss");
+            else if (type.EndsWith("video", StringComparison.OrdinalIgnoreCase) || type.EndsWith("audio", StringComparison.OrdinalIgnoreCase))
+                duration = " · Duration unknown";
             string checksum = item.Sha256 is null ? "" : "  |  page SHA-256 available";
-            _files.Items.Add($"{item.FileName ?? FileNames.FromUrl(uri)}  |  {uri.Host}{checksum}", true);
+            _files.Items.Add($"{type}{duration}  |  {title}  |  {uri.Host}{checksum}", true);
         }
 
         _trustPageChecksums = new VesperCheckBox(colors)

@@ -243,6 +243,23 @@ test('dragging stays inside the video and fullscreen wakes again after idle', ()
   assert.equal(calls.at(-1), true);
 });
 
+test('Smart Select filters navigation links and reports direct file details', () => {
+  const smartSelect = readFileSync(new URL('../../extension/smart-select.js', import.meta.url), 'utf8')
+    .replace(/\}\)\(\);\s*$/, 'globalThis.__details = fileDetails;\n})();');
+  const context = vm.createContext({ URL, chrome: { runtime: { onMessage: { addListener() {} } } } });
+  vm.runInContext(smartSelect, context);
+  const link = { dataset: {}, getAttribute: () => null, hasAttribute: () => false };
+  for (const path of ['/channel/abc', '/watch?v=123', '/playlist?list=123', '/about/']) {
+    assert.equal(context.__details(link, `https://youtube.com${path}`), null);
+  }
+  assert.equal(context.__details(link, 'https://example.test/setup.zip?signature=hidden').type, 'ZIP archive');
+  assert.equal(context.__details({ ...link, hasAttribute: key => key === 'download' }, 'https://example.test/export').type, 'File');
+  const movie = context.__details(link, 'https://example.test/movie.mp4', { tagName: 'VIDEO', duration: 95 });
+  assert.equal(movie.type, 'MP4 video');
+  assert.equal(movie.duration, 95);
+  assert.equal(context.__details(link, 'https://example.test/movie.mp4').duration, undefined);
+});
+
 test('Smart Select associates only one clearly labelled SHA-256 with its sole nearby file link', () => {
   const smartSelect = readFileSync(new URL('../../extension/smart-select.js', import.meta.url), 'utf8')
     .replace(/\}\)\(\);\s*$/, 'globalThis.__publisherChecksum = publisherChecksum;\n})();');

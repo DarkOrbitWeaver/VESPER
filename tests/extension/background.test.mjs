@@ -2676,13 +2676,17 @@ test('a media selection carries its time range to VESPER and refuses an impossib
 test('Smart Select from a content script cannot bypass native review or choose a destination', async () => {
   const app = load({ 'batch-review': { ok: true, results: [] } });
   const reply = await app.message({ type: 'smart-submit', mode: 'download', destination: 'C:\\Windows',
-    items: [{ url: 'https://files.example/a.zip', sha256: 'ab'.repeat(32) }, { url: 'https://files.example/a.zip' }] },
+    items: [{ url: 'https://files.example/a.zip', sha256: 'ab'.repeat(32), reviewLabel: 'Archive', reviewType: 'ZIP archive' },
+      { url: 'https://files.example/a.zip' }] },
     { tab: { id: 7, url: 'https://page.example/list' }, frameId: 0, documentId: 'doc' });
   assert.equal(reply.ok, true);
   const request = app.sent.find(value => value.type === 'batch-review');
   assert.equal(request.mode, 'ask');
   assert.equal(request.items.length, 1);
   assert.equal(request.items[0].sha256, 'AB'.repeat(32));
+  assert.equal(request.items[0].reviewLabel, 'Archive');
+  assert.equal(request.items[0].reviewType, 'ZIP archive');
+  assert.equal(request.items[0].fileName, undefined);
   assert.equal(request.destination, undefined);
 });
 

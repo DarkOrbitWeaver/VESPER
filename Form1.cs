@@ -776,7 +776,7 @@ public partial class Form1 : Form
 
     internal void RequestShow() => PostToUi(ShowFromTray);
 
-    private void ShowFromTray()
+    internal void ShowFromTray()
     {
         _allowVisible = true;
         Show();

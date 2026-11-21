@@ -922,7 +922,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!url || unique.has(url.href)) continue;
           unique.add(url.href);
           const sha256 = typeof item?.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(item.sha256) ? item.sha256.toUpperCase() : undefined;
-          safe.push({ url: url.href, referer: page.href, userAgent: navigator.userAgent, ...(sha256 ? { sha256 } : {}) });
+          const reviewLabel = typeof item.reviewLabel === 'string' && item.reviewLabel.length <= 200 ? item.reviewLabel : undefined;
+          const reviewType = typeof item.reviewType === 'string' && /^[a-z0-9 ]{1,32}$/i.test(item.reviewType) ? item.reviewType : undefined;
+          const seconds = item.reviewDurationSeconds;
+          const reviewDurationSeconds = Number.isFinite(seconds) && seconds > 0 && seconds <= 31_536_000 ? seconds : undefined;
+          safe.push({ url: url.href, referer: page.href, userAgent: navigator.userAgent, ...(sha256 ? { sha256 } : {}),
+            reviewLabel, reviewType, reviewDurationSeconds });
         }
         if (!safe.length) return { ok: false, code: 'invalid', message: 'No reusable file addresses were selected.' };
         // Untrusted content can propose links, never skip the native confirmation or choose a disk path.
