@@ -2646,28 +2646,6 @@ test('the decision list survives a worker restart, holds 20 entries and keeps on
   assert.equal(new Set(list.map(entry => entry.id)).size, 20);
 });
 
-test('every reason the worker can record has plain wording in the popup', async () => {
-  const context = vm.createContext({});
-  vm.runInContext(readFileSync(new URL('../../extension/capture-reasons.js', import.meta.url), 'utf8') + '\n;globalThis.reasons = VesperCaptureReasons;', context);
-  const reasons = context.reasons;
-  const source = readFileSync(new URL('../../extension/browser-downloads.js', import.meta.url), 'utf8');
-  const recorded = new Set();
-  for (const pattern of [/reason: '([a-z-]+)'/g, /\bnote\('([a-z-]+)'/g, /noteDecision\(item, '([a-z-]+)'/g, /why = '([a-z-]+)'/g, /\bnote\([^\n]*\? '([a-z-]+)' : '([a-z-]+)'\)/g])
-    for (const match of source.matchAll(pattern)) for (const code of match.slice(1)) recorded.add(code);
-  const app = load();
-  for (const reply of [{ ok: false, code: 'host-missing' }, { ok: false, code: 'timeout' }, { ok: false, code: 'duplicate' }, { ok: false, code: 'x' }])
-    recorded.add(app.evaluate(`handoffOutcome(${JSON.stringify(reply)}, undefined, false)`));
-  for (const transferReason of ['auth', 'forbidden', 'browser-fallback', 'queued', 'busy', 'slow', 'other'])
-    for (const signedIn of [true, false])
-      recorded.add(app.evaluate(`handoffOutcome({ ok: true }, ${JSON.stringify({ transferReason })}, ${signedIn})`));
-  assert.ok(recorded.size >= 18, [...recorded].join(', '));
-  for (const code of recorded) {
-    assert.ok(reasons[code], `no wording for "${code}"`);
-    assert.doesNotMatch(reasons[code].text, /etag|content-|http|cookie|proof|replay|header|redirect|native|bytes/i, code);
-    assert.ok([undefined, 'sign-in', 'download-now', 'check-app', 'move'].includes(reasons[code].action), code);
-  }
-});
-
 // ---------------------------------------------------------------- right-clicking a player-made video (issue 5)
 
 test('the download action opens Find media for the clicked YouTube Mix card', async () => {

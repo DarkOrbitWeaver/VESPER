@@ -93,7 +93,7 @@ test('the media picker wraps long metadata and keeps horizontal overflow inside 
   assert.match(content, /\.panel\{[^}]*overflow-x:hidden;overflow-y:auto/);
   assert.match(content, /\.head>div:nth-child\(2\)\{flex:1 1 auto;min-width:0/);
   assert.match(content, /\.t\{display:-webkit-box;[^}]*-webkit-line-clamp:2;[^}]*overflow-wrap:anywhere/);
-  assert.match(content, /\.output select\{max-width:100%;min-width:0/);
+  assert.match(content, /:is\(\.output,\.audio-track\) select\{max-width:100%;min-width:0/);
   assert.match(content, /\.opt>span:nth-child\(2\)\{flex:1 1 auto;min-width:0;overflow-wrap:anywhere/);
 });
 

@@ -146,57 +146,5 @@ async function init() {
   };
   showAccess(await hasAccess());
   signIn.disabled = false;
-  await showRecentDownloads(allowSignIn);
-}
-
-// One button per reason, and only where the user can actually change the outcome.
-const RECENT_ACTIONS = {
-  'sign-in': { label: 'Set up sign-in', run: async allowSignIn => {
-    $('site-sign-in').open = true;
-    if (!await allowSignIn()) return 'Chrome sign-in access was not enabled.';
-    $('file-sign-in').open = true;
-    return 'Allow file sign-in on the download’s site, then try the download again.';
-  } },
-  'download-now': { label: 'Download now instead', run: async () => {
-    await chrome.storage.sync.set({ handoff: 'download' });
-    $('handoff').value = 'download';
-    return 'New downloads will start in VESPER right away.';
-  } },
-  'check-app': { label: 'Check VESPER', run: async () => {
-    const reply = await chrome.runtime.sendMessage({ type: 'hello' });
-    return reply?.ok ? 'VESPER is running. Start the download again.'
-      : 'VESPER didn’t answer. Open the VESPER app once, then try again.';
-  } }
-};
-
-async function showRecentDownloads(allowSignIn) {
-  const { vesperCaptureDecisions: saved } = await chrome.storage.session.get('vesperCaptureDecisions').catch(() => ({}));
-  const recent = (Array.isArray(saved) ? saved : []).filter(entry => VesperCaptureReasons[entry?.outcome]).slice(0, 5);
-  $('recent').hidden = recent.length === 0;
-  for (const entry of recent) {
-    const reason = VesperCaptureReasons[entry.outcome];
-    const item = document.createElement('li');
-    item.className = 'decision';
-    const name = document.createElement('b');
-    name.textContent = name.title = String(entry.name || 'Download');
-    const text = document.createElement('small');
-    const site = entry.site ? `${entry.site} · ` : '';
-    text.textContent = site + (entry.outcome === 'moved' ? reason.text : `Stayed in Chrome. ${reason.text}`);
-    item.append(name, text);
-    const action = RECENT_ACTIONS[reason.action];
-    if (action) {
-      const button = document.createElement('button');
-      button.className = 'vesper-button';
-      button.textContent = action.label;
-      button.onclick = async () => {
-        button.disabled = true;
-        try { $('recent-result').textContent = await action.run(allowSignIn); }
-        catch { $('recent-result').textContent = 'That didn’t work. Try again in a moment.'; }
-        button.disabled = false;
-      };
-      item.append(button);
-    }
-    $('decisions').append(item);
-  }
 }
 void init();

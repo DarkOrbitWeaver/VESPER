@@ -462,9 +462,8 @@
         .clip-error{color:var(--red);font-size:11px}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
         .output[hidden]{display:none}
-        .output select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
+        :is(.output,.audio-track) select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
           color-scheme:inherit;padding:4px 6px;font:inherit;cursor:pointer}
-        .output select:focus-visible{outline:2px solid var(--sage);outline-offset:2px}
         .list{min-width:0;padding:7px 8px}.opt{display:flex;gap:8px;align-items:center;width:100%;min-width:0;min-height:43px;border:1px solid transparent;
           background:none;text-align:left;padding:7px 8px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--text)}
         .opt:hover,.opt[aria-checked=true]{background:var(--wash)}
@@ -476,6 +475,16 @@
         .kind{flex:none;max-width:35%;overflow:hidden;text-overflow:ellipsis;font-size:10px;color:var(--sage);padding:2px 4px;border-radius:4px;background:var(--wash);margin-left:auto}
         .tick{width:13px;flex:none;color:var(--sage)}
         .more{display:block;width:calc(100% - 16px);margin:0 8px 8px;font-size:12px}
+        .languages summary{box-sizing:border-box;list-style:none;text-align:center}
+        .languages summary::-webkit-details-marker{display:none}
+        .languages summary::after{content:' ▾'}
+        .languages[open] summary::after{content:' ▴'}
+        .language-fields{display:grid;gap:8px;padding:3px 12px 12px;font-size:12px}
+        .audio-track{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px}
+        .subtitle-choice{display:flex;align-items:flex-start;gap:8px;overflow-wrap:anywhere}
+        .subtitle-choice input{flex:none;margin:2px 0 0;accent-color:var(--green)}
+        .subtitle-choice:has(input:disabled){color:var(--muted)}
+        .language-fields small.hint{padding:0 0 0 21px}
         .foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 12px;border-top:1px solid var(--border);
           position:sticky;bottom:0;background:var(--surface)}
         .msg{padding:14px;font-size:12.5px;line-height:1.45}.msg.bad{color:var(--red)}
@@ -1131,18 +1140,20 @@
     }
     const body = [output, list, clip, clipNote];
     if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {
-      const advanced = element('details');
-      advanced.append(element('summary', '', 'Language and subtitles'));
+      const advanced = element('details', 'languages');
+      const fields = element('div', 'language-fields');
+      advanced.append(element('summary', 'vesper-button more', 'Language and subtitles'), fields);
+      advanced.ontoggle = () => { if (advanced.isConnected) place(true); };
       if (formats.audioTracks?.length > 1) {
-        const label = element('label', 'output', 'Audio track'), tracks = element('select');
+        const label = element('label', 'audio-track', 'Audio track'), tracks = element('select');
         const automatic = element('option', '', 'Original / automatic'); automatic.value = ''; tracks.append(automatic);
         for (const track of formats.audioTracks) { const option = element('option', '', track.label); option.value = track.id; tracks.append(option); }
         tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; };
-        label.append(tracks); advanced.append(label);
+        label.append(tracks); fields.append(label);
       }
       let embedSubtitleControl = null;
       for (const subtitle of formats.subtitleOptions || []) {
-        const label = element('label', 'output'), check = element('input'); check.type = 'checkbox';
+        const label = element('label', 'subtitle-choice'), check = element('input'); check.type = 'checkbox';
         check.checked = intent.subtitles.includes(subtitle.language);
         check.onchange = () => {
           intent.subtitles = check.checked ? [...new Set([...intent.subtitles, subtitle.language])] : intent.subtitles.filter(language => language !== subtitle.language);
@@ -1154,18 +1165,20 @@
             if (embedSubtitleControl) embedSubtitleControl.checked = false;
           }
         };
-        check.dataset.auto = String(subtitle.auto); label.append(check, document.createTextNode(subtitle.label + (subtitle.auto ? ' (automatic)' : ''))); advanced.append(label);
+        check.dataset.auto = String(subtitle.auto);
+        label.append(check, element('span', '', subtitle.label + (subtitle.auto ? ' (automatic)' : '')));
+        fields.append(label);
       }
       if ((formats.subtitleOptions || []).some(subtitle => subtitle.embedSupported)) {
-        const embedLabel = element('label', 'output');
+        const embedLabel = element('label', 'subtitle-choice');
         embedSubtitleControl = element('input');
         embedSubtitleControl.type = 'checkbox';
         embedSubtitleControl.checked = !!intent.embedSubtitles;
         embedSubtitleControl.disabled = !(formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
         embedSubtitleControl.onchange = () => { intent.embedSubtitles = embedSubtitleControl.checked; };
-        embedLabel.append(embedSubtitleControl, document.createTextNode('Embed selected subtitles'));
+        embedLabel.append(embedSubtitleControl, element('span', '', 'Embed selected subtitles'));
         const embedHint = element('small', 'hint', 'Separate subtitle files are still queued. Live, segmented, styled, or unsupported tracks stay separate.');
-        advanced.append(embedLabel, embedHint);
+        fields.append(embedLabel, embedHint);
       }
       body.push(advanced);
     }
@@ -1175,7 +1188,7 @@
       more.onclick = () => {
         if (!isCurrentRequest(request)) return;
         renderChoices(title, poster, seconds, formats, !expanded, useOriginal, useM4a);
-        panel.querySelector('.more')?.focus({ preventScroll: true });
+        panel.querySelector('button.more')?.focus({ preventScroll: true });
       };
       body.push(more);
     }
