@@ -254,6 +254,7 @@ public sealed class BrowserBridgeTests
             var item = new BridgeItem("https://cdn.example.test/archive.zip", "archive.zip", "http",
                 "https://publisher.example/downloads", null, hash, null, null);
             using var form = new BatchReviewForm(new VesperPreferences(), [item]);
+            form.Size = form.MinimumSize;
             form.StartPosition = FormStartPosition.Manual;
             form.Location = new Point(-form.Width - 80, -form.Height - 80);
             form.Show();
@@ -261,15 +262,27 @@ public sealed class BrowserBridgeTests
             _ = form.Handle;
             Application.DoEvents();
 
-            var files = Assert.IsType<CheckedListBox>(Assert.Single(form.Controls.Find("filesToReview", true)));
-            var trust = Assert.IsType<CheckBox>(Assert.Single(form.Controls.Find("trustPageChecksums", true)));
+            var files = Assert.IsType<VesperCheckedList>(Assert.Single(form.Controls.Find("filesToReview", true)));
+            var trust = Assert.IsType<VesperCheckBox>(Assert.Single(form.Controls.Find("trustPageChecksums", true)));
             var details = Assert.IsType<TextBox>(Assert.Single(form.Controls.Find("pageChecksumDetails", true)));
+            var footer = Assert.IsType<VesperPanel>(Assert.Single(form.Controls.Find("reviewFooter", true)));
+            var download = Assert.IsType<VesperButton>(Assert.Single(form.Controls.Find("downloadReviewedFiles", true)));
             Assert.Empty(form.TrustedChecksumIndices);
+            Assert.Equal(BorderStyle.None, files.BorderStyle);
+            Assert.Equal(ContentAlignment.MiddleCenter, download.TextAlign);
+            Assert.True(footer.ClientRectangle.Contains(download.Bounds), "The Download button is clipped by the footer.");
             Assert.Contains("page SHA-256 available", files.Items[0]!.ToString() ?? "");
+
+            string chosenFolder = Path.Combine(Path.GetTempPath(), "vesper-review-chosen-folder");
+            TextBox folder = Assert.IsType<TextBox>(Assert.Single(form.Controls.Find("destinationFolder", true)));
+            Assert.IsType<VesperInputFrame>(folder.Parent);
+            folder.Text = chosenFolder;
+            Assert.Equal(Path.GetFullPath(chosenFolder), form.Destination);
 
             files.SetItemChecked(0, true);
             files.SelectedIndex = 0;
             Application.DoEvents();
+            Assert.Equal(0, Assert.Single(form.SelectedIndices));
             Assert.True(trust.Enabled);
             Assert.Contains(hash, details.Text);
             Assert.Contains("https://publisher.example", details.Text);
@@ -281,6 +294,11 @@ public sealed class BrowserBridgeTests
             Assert.Equal(0, Assert.Single(form.TrustedChecksumIndices));
             trust.Checked = false;
             Assert.Empty(form.TrustedChecksumIndices);
+
+            files.SetItemChecked(0, false);
+            Application.DoEvents();
+            Assert.Empty(form.SelectedIndices);
+            Assert.False(download.Enabled);
         });
     }
 
