@@ -11,17 +11,36 @@ internal sealed class FirstFlightCanvas : Control
 {
     internal const int LogicalWidth = 800;
     internal const int LogicalHeight = 484;
-    internal const double PublisherStart = 2.91;
+    internal const double PublisherStart = 3.06;
     internal const double BlankStart = 5.03;
     internal const double Duration = 5.25;
-    private const double SwarmStart = 1.18;
-    private const double ForegroundPass = 3.55;
+    private const double FlightStart = 1.18;
+    private const double ForegroundPass = 2.95;
     private const double HoldStart = 4.23;
     private const double FadeStart = 4.75;
     private static readonly double[] Cuts =
-        [0, .12, .26, .43, .57, .70, .88, 1.04, SwarmStart, PublisherStart, ForegroundPass, HoldStart, FadeStart, BlankStart];
+        [0, .12, .26, .43, .57, .70, .88, 1.04, FlightStart, ForegroundPass, PublisherStart, HoldStart, FadeStart, BlankStart];
     private static readonly string[] Props = ["01_hourglass", "02_key", "03_letter", "04_quill", "05_camera", "06_vinyl", "07_book", "08_moon"];
-    private static readonly Flight[] Flights = Enumerable.Range(0, 26).Select(CreateFlight).ToArray();
+
+    // Draw the trailing butterflies first so the closest wings can pass in front of them.
+    private static readonly Flight[] Flights =
+    [
+        new(-44, 86, 17, 3.04f, -.18f),
+        new(53, -83, 20, 2.99f, .20f),
+        new(129, 69, 25, 2.93f, .14f),
+        new(-113, -74, 27, 2.88f, -.24f),
+        new(160, -24, 19, 2.83f, .24f),
+        new(-155, 46, 23, 2.78f, -.15f),
+        new(25, 120, 29, 2.73f, .12f),
+        new(-8, -113, 26, 2.68f, -.10f),
+        new(-127, -10, 31, 2.63f, -.32f),
+        new(93, -66, 34, 2.59f, .22f),
+        new(-76, 55, 37, 2.55f, -.12f),
+        new(85, 69, 48, 2.50f, .29f),
+        new(90, 16, 40, 2.40f, .17f),
+        new(55, -40, 58, 2.29f, .16f),
+        new(-16, 8, 88, 2.19f, -.30f)
+    ];
 
     private readonly Font _heading = new("Georgia", 56, FontStyle.Regular, GraphicsUnit.Pixel);
     private readonly Font _subtitle = new("Georgia", 11, FontStyle.Regular, GraphicsUnit.Pixel);
@@ -194,32 +213,27 @@ internal sealed class FirstFlightCanvas : Control
 
     private void DrawIntro(Graphics graphics, double time)
     {
-        if (time < SwarmStart)
+        if (time < FlightStart)
         {
             int index = Math.Max(0, Array.FindLastIndex(Cuts, cut => cut <= time));
             Center(graphics, Art("objects." + Props[index]), 400, 236, 224, 220);
             return;
         }
-        if (time < PublisherStart)
-        {
-            DrawSwarm(graphics, time, Art("atlas"));
-            return;
-        }
         if (time >= BlankStart) return;
-        string theme = _palette.IsDark ? "dark" : "light";
-        float fade = 1 - Math.Clamp((float)((time - FadeStart) / (BlankStart - FadeStart)), 0, 1);
-        float opening = Math.Clamp((float)((time - PublisherStart) / (HoldStart - PublisherStart)), 0, 1);
-        float reveal = Math.Clamp((opening - .62f) / .2f, 0, 1);
-        if (reveal > 0)
+        if (time > PublisherStart)
         {
+            float fade = 1 - Math.Clamp((float)((time - FadeStart) / (BlankStart - FadeStart)), 0, 1);
+            float reveal = Math.Min((float)((time - PublisherStart) / .42), 1);
+            float opacity = reveal * reveal * (3 - 2 * reveal) * fade;
             Bitmap emblem = Emblem();
-            Draw(graphics, emblem, new RectangleF(235, 109, emblem.Width, emblem.Height), reveal * fade);
+            Draw(graphics, emblem, new RectangleF(235, 109, emblem.Width, emblem.Height), opacity);
+            string theme = _palette.IsDark ? "dark" : "light";
             Bitmap wordmark = Art("brand.wordmark_" + theme);
             float height = 376f * wordmark.Height / wordmark.Width;
-            Draw(graphics, wordmark, new RectangleF(212, 323, 376, height), reveal * fade);
+            Draw(graphics, wordmark, new RectangleF(212, 323, 376, height), opacity);
         }
-        if (opening < 1)
-            DrawPublisherFlight(graphics, Art("atlas"), opening, time);
+        if (time < HoldStart)
+            DrawFlight(graphics, Art("atlas"), (float)(time - FlightStart));
         if (_holdBeforeReveal && _holdMessage.Length > 0 && time >= HoldStart)
         {
             using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
@@ -273,88 +287,42 @@ internal sealed class FirstFlightCanvas : Control
         }
     }
 
-    private static void DrawSwarm(Graphics graphics, double time, Bitmap atlas)
+    private static void DrawFlight(Graphics graphics, Bitmap atlas, float elapsed)
     {
         for (int i = 0; i < Flights.Length; i++)
         {
             Flight flight = Flights[i];
-            float t = (float)((time - flight.Start) / flight.Duration);
-            if (t is < 0 or > 1) continue;
-            float x = flight.From.X + (flight.To.X - flight.From.X) * t;
-            float y = flight.From.Y + (flight.To.Y - flight.From.Y) * t + MathF.Sin((t * 4 + flight.Phase) * MathF.PI) * flight.Wiggle;
-            float size = 91 * flight.Scale * (.58f + .55f * t);
-            int frame = 33 + ((int)((time - flight.Start) * 11 + i * 3) % 10);
-            float tilt = flight.Tilt + MathF.Sin(t * 6 + flight.Phase) * .14f;
-            DrawButterfly(graphics, atlas, new PointF(x, y), size, tilt, frame, i % 6 == 0);
+            float t = elapsed / flight.Duration;
+            if (t >= 1) continue;
+
+            // Shrinking depth enlarges the wings and carries them past the same viewpoint.
+            float depth = 1 - .96f * t * (.72f + .28f * t);
+            float scale = 1 / depth;
+            float pass = Math.Max(0, (t - .79f) / .21f);
+            float bank = flight.Bank * pass * pass;
+            float sway = MathF.Sin(elapsed * 4 + i * 1.7f);
+            float x = 400 + (flight.X + 330 * bank + 5 * sway) * scale;
+            float y = 237 + (flight.Y + 6 * MathF.Cos(elapsed * 3.5f + i)) * scale;
+            float size = flight.Size * scale;
+            float margin = .65f * size;
+            if (x < -margin || x > LogicalWidth + margin || y < -margin || y > LogicalHeight + margin) continue;
+
+            int frame = 33 + ((int)(elapsed * (16 + i % 4) + i * 3) % 10);
+            DrawButterfly(graphics, atlas, x, y, size, flight.Bank + bank * .5f + .10f * sway, frame);
         }
     }
 
-    private static void DrawPublisherFlight(Graphics graphics, Bitmap atlas, float opening, double time)
-    {
-        const float centerX = 400;
-        const float centerY = 237;
-        int wingBeat = (int)(time * 20);
-        for (int i = 0; i < 14; i++)
-        {
-            float variation = RandomValue(i * 17 + 4);
-            float delay = variation * .14f;
-            float flight = Math.Clamp((opening - delay) / (1 - delay), 0, 1);
-            // Nearer butterflies appear larger and spread farther from the center.
-            float projection = 1 / (1 - .96f * flight);
-            float angle = i * 2.4f + variation * .35f;
-            float radius = (34 + 56 * variation) * projection;
-            float x = centerX + MathF.Cos(angle) * radius * 1.45f;
-            float y = centerY + MathF.Sin(angle) * radius + 10 * MathF.Sin(7 * flight + i);
-            float size = (25 + 22 * variation) * Math.Min(projection, 7);
-            if (x < -size || x > LogicalWidth + size || y < -size || y > LogicalHeight + size) continue;
-            float tilt = .5f * MathF.Cos(angle) + .17f * MathF.Sin(7 * flight + i);
-            DrawButterfly(graphics, atlas, new PointF(x, y), size, tilt, 33 + (wingBeat + i * 3) % 10, x < centerX);
-        }
-
-        // The closest butterfly crosses the viewer's left side as the logo appears behind it.
-        float foreground = opening / .88f;
-        if (foreground >= 1) return;
-        float approach = foreground * foreground;
-        var lead = new PointF(centerX - 720 * approach * foreground, centerY - 68 * foreground);
-        DrawButterfly(graphics, atlas, lead, 56 + 518 * approach, -.17f - .47f * foreground, 33 + wingBeat % 10, true);
-    }
-
-    private static void DrawButterfly(Graphics graphics, Bitmap atlas, PointF center, float size, float tilt, int frame, bool flip)
+    private static void DrawButterfly(Graphics graphics, Bitmap atlas, float x, float y, float size, float tilt, int frame)
     {
         var saved = graphics.Save();
-        graphics.TranslateTransform(center.X, center.Y);
+        graphics.TranslateTransform(x, y);
         graphics.RotateTransform(tilt * 180 / MathF.PI);
-        if (flip) graphics.ScaleTransform(-1, 1);
         graphics.DrawImage(atlas, new RectangleF(-size / 2, -size / 2, size, size),
             new RectangleF(frame % 10 * 80, frame / 10 * 80, 80, 80), GraphicsUnit.Pixel);
         graphics.Restore(saved);
     }
 
-    private readonly record struct Flight(PointF From, PointF To, double Start, double Duration, float Scale, float Wiggle, float Phase, float Tilt);
-
-    private static Flight CreateFlight(int i)
-    {
-        float u = RandomValue(i * 13 + 8), v = RandomValue(i * 19 + 21), w = RandomValue(i * 23 + 3);
-        (PointF from, PointF to) = (i % 4) switch
-        {
-            0 => (new PointF(-115, u * 550), new PointF(935, v * 460)),
-            1 => (new PointF(920, u * 480), new PointF(-130, v * 480)),
-            2 => (new PointF(u * 800, -120), new PointF(v * 800, 600)),
-            _ => (new PointF(u * 800, 575), new PointF(v * 800, -135))
-        };
-        double start = SwarmStart + i * .046;
-        return new(from, to, start, Math.Min(.48 + w * .48, PublisherStart - start - .02),
-            .62f + w * .92f, 8 + w * 17, w * 5, i % 2 == 0 ? .16f : -.16f);
-    }
-
-    private static float RandomValue(int input)
-    {
-        uint value = unchecked((uint)input * 1664525u + 1013904223u);
-        value ^= value << 13;
-        value ^= value >> 17;
-        value ^= value << 5;
-        return (value & 0xffffff) / 16777216f;
-    }
+    private readonly record struct Flight(float X, float Y, float Size, float Duration, float Bank);
 
     private Bitmap Art(string name, bool feather = false)
     {

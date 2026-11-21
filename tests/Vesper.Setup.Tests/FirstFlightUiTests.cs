@@ -12,7 +12,7 @@ public sealed class FirstFlightUiTests
     public void StalledPaintsStillAdvanceThroughEveryIntroScene()
     {
         double frame = -1;
-        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.91, 3.55, 4.23, 4.75];
+        double[] cuts = [0, .12, .26, .43, .57, .70, .88, 1.04, 1.18, 2.95, FirstFlightCanvas.PublisherStart, 4.23, 4.75];
         foreach (double cut in cuts)
         {
             frame = FirstFlightCanvas.NextFrame(frame, 10);
@@ -47,6 +47,7 @@ public sealed class FirstFlightUiTests
             }
             Assert.True(canvas.Playing);
             Assert.False(install.IsCompleted);
+            AssertIntroControls(window);
         }
         finally { finish.Set(); }
 
@@ -79,10 +80,10 @@ public sealed class FirstFlightUiTests
         {
             ("logo-flash-first", .05),
             ("logo-flash-last", 1.08),
-            ("butterfly-swarm", 2.10),
-            ("publisher-approach", 3.30),
-            ("publisher-foreground", 3.62),
-            ("publisher-clearing", 3.86),
+            ("butterfly-swarm", 1.20),
+            ("publisher-approach", 2.25),
+            ("publisher-foreground", 3.14),
+            ("publisher-clearing", 3.55),
             ("publisher-wordmark", 4.40),
             ("transition", 4.89),
         })
@@ -96,10 +97,10 @@ public sealed class FirstFlightUiTests
         Color disk = image.GetPixel(400, 175);
         Assert.True(band.GetBrightness() > disk.GetBrightness() + .3f, $"Rim {band}, disk {disk}");
         Save(image, "publisher-" + theme);
-        canvas.Render(graphics, image.Size, 2.90);
-        AssertBlank(image, palette.Back);
+        canvas.Render(graphics, image.Size, FirstFlightCanvas.PublisherStart - .01);
+        Assert.True(HasArtwork(image, palette.Back), "Butterflies should still be in flight when the publisher reveal begins.");
         canvas.Render(graphics, image.Size, 5.90);
-        AssertBlank(image, palette.Back);
+        Assert.False(HasArtwork(image, palette.Back), "The last butterflies should clear before setup returns.");
         Save(image, "first-flight-" + theme + "-blank-transition");
     });
 
@@ -114,7 +115,7 @@ public sealed class FirstFlightUiTests
             progress.Report(new("Verifying…", 1, 2));
             if (!success) throw new IOException("The test package is damaged.");
         });
-        _ = window.Handle;
+        window.Show();
         Assert.Contains(window.Controls.OfType<Label>(), label => label.Text == "For this Windows account only.");
         var stopwatch = Stopwatch.StartNew();
         Task install = window.RunAttemptAsync();
@@ -129,14 +130,17 @@ public sealed class FirstFlightUiTests
         if (success)
         {
             Assert.True(canvas.Playing, "A fast successful install cut off the First Flight sequence.");
+            VesperButton skip = AssertIntroControls(window);
+            skip.PerformClick();
+            Assert.False(canvas.Playing);
             Assert.Equal("Open VESPER", Assert.IsType<VesperButton>(window.AcceptButton).Text);
-            Assert.Contains(window.Controls.OfType<Label>(), label => label.Text ==
-                "Open VESPER to get started. Enable the extension in Chrome to send downloads.");
+            Assert.Contains(window.Controls.OfType<VesperButton>(), button => button.Visible && button.Text == "Extension files");
+            Assert.Contains(window.Controls.OfType<Label>(), label => label.Visible && label.Text == "Installation complete");
         }
         else
         {
             Assert.False(canvas.Playing, "A failed install should reveal its error immediately.");
-            Assert.Contains(window.Controls.OfType<Label>(), label => label.Text == "The test package is damaged.");
+            Assert.Contains(window.Controls.OfType<Label>(), label => label.Visible && label.Text == "The test package is damaged.");
         }
     });
 
@@ -171,15 +175,11 @@ public sealed class FirstFlightUiTests
                         throw new TimeoutException("The setup intro did not finish within nine seconds.");
 
                     if (!installCompleted) return;
+                    if (canvas.Playing) AssertIntroControls(window);
                     if (!introCaptured && introClock.Elapsed.TotalSeconds >= 2.1)
                     {
                         Assert.True(canvas.Playing, "The completed install did not keep the intro visible.");
-                        VesperButton openButton = Assert.IsType<VesperButton>(window.AcceptButton);
-                        VesperButton skipButton = window.Controls.OfType<VesperButton>().Single(button => button.Text == "Skip intro");
-                        Assert.Equal("Open VESPER", openButton.Text);
-                        Assert.True(openButton.Visible, "Open VESPER should be available while the intro continues.");
-                        Assert.True(skipButton.Visible, "Skip intro should remain available while the intro continues.");
-                        Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(openButton));
+                        VesperButton skipButton = Assert.IsType<VesperButton>(window.AcceptButton);
                         Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(skipButton));
                         SaveVisibleWindow(window, Path.Combine(folder, $"setup-window-{theme}-fast-complete-intro.png"));
                         introCaptured = true;
@@ -196,6 +196,8 @@ public sealed class FirstFlightUiTests
                     Label completeLabel = window.Controls.OfType<Label>().Single(label => label.Text == "Installation complete");
                     VesperButton completedAction = Assert.IsType<VesperButton>(window.AcceptButton);
                     Assert.Equal("Open VESPER", completedAction.Text);
+                    Assert.True(completedAction.Visible);
+                    Assert.Contains(window.Controls.OfType<VesperButton>(), button => button.Visible && button.Text == "Extension files");
                     Assert.True(completeLabel.Visible, "The completion status should be visible after the intro.");
                     Assert.True(window.Controls.GetChildIndex(canvas) > window.Controls.GetChildIndex(completeLabel));
                     window.Refresh();
@@ -239,11 +241,21 @@ public sealed class FirstFlightUiTests
         }, TimeSpan.FromSeconds(15));
     }
 
-    private static void AssertBlank(Bitmap image, Color color)
+    private static VesperButton AssertIntroControls(SetupWindow window)
+    {
+        VesperButton visible = Assert.Single(window.Controls.OfType<VesperButton>(), button => button.Visible);
+        Assert.Equal("Skip intro", visible.Text);
+        Assert.Same(visible, window.AcceptButton);
+        Assert.DoesNotContain(window.Controls.OfType<Label>(), label => label.Visible);
+        return visible;
+    }
+
+    private static bool HasArtwork(Bitmap image, Color background)
     {
         for (int y = 0; y < image.Height; y += 7)
             for (int x = 0; x < image.Width; x += 7)
-                Assert.Equal(color.ToArgb(), image.GetPixel(x, y).ToArgb());
+                if (image.GetPixel(x, y).ToArgb() != background.ToArgb()) return true;
+        return false;
     }
 
     private static void Save(Bitmap image, string name)

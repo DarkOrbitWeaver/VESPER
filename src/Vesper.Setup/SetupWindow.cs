@@ -77,12 +77,12 @@ internal sealed class SetupWindow : Form
 
     private async void StartOrOpen()
     {
+        if (_canvas.Playing || _view == View.Working) return;
         if (_view == View.Complete)
         {
             if (_mode == SetupMode.Uninstall || OpenPath(_paths.Executable, shell: false)) Close();
             return;
         }
-        if (_view == View.Working) return;
         await RunAttemptAsync();
     }
 
@@ -137,7 +137,7 @@ internal sealed class SetupWindow : Form
             else _canvas.ReleaseHold();
             RefreshControls();
             if (_view == View.Cancelled && _closeAfterCancel) Close();
-            else _action.Focus();
+            else if (!_canvas.Playing) _action.Focus();
         }
     }
 
@@ -149,14 +149,14 @@ internal sealed class SetupWindow : Form
     {
         bool working = _view == View.Working;
         bool intro = _canvas.Playing;
-        _action.Visible = !working;
+        _action.Visible = !working && !intro;
         _cancel.Visible = working && !intro;
         _cancel.Enabled = _cancellation?.IsCancellationRequested == false;
         _skip.Visible = intro;
         _deleteUserData.Visible = _mode == SetupMode.Uninstall
             && (_view is View.Ready or View.Failed or View.Cancelled);
         _deleteUserData.Enabled = !working;
-        _extension.Visible = _view == View.Complete && _mode != SetupMode.Uninstall;
+        _extension.Visible = !intro && _view == View.Complete && _mode != SetupMode.Uninstall;
         _meter.Visible = working && !intro && _progress.Total > 0;
         if (_meter.Visible) _meter.Value = (int)Math.Clamp(100d * _progress.Verified / _progress.Total, 0, 100);
         _status.Visible = !intro;
@@ -195,7 +195,7 @@ internal sealed class SetupWindow : Form
             View.Complete => "Your downloads, settings, download history, and other saved data were kept.",
             _ => ""
         };
-        AcceptButton = intro && working ? _skip : working ? null : _action;
+        AcceptButton = intro ? _skip : working ? null : _action;
     }
 
     private void IntroFinished()
