@@ -6,14 +6,14 @@ namespace Vesper.MediaResolver.Discovery;
 
 /// <summary>
 /// Fallback for everything without a dedicated adapter, and the engine behind browser-assisted discovery:
-/// direct files, HLS/DASH URLs, HTML5 media, page metadata, JSON-LD, supported embeds and podcast feeds.
+/// direct files, HLS/DASH URLs, HTML5 media, page metadata, JSON-LD and supported embeds.
 /// Nothing is reported as downloadable unless a probe or a manifest parse verified it.
 /// </summary>
 internal sealed class GenericAdapter : IMediaSourceAdapter
 {
     public static readonly AdapterDescriptor Descriptor = new(
         "generic",
-        "Generic media (direct files, HTML5, HLS, DASH, feeds)",
+        "Generic media (direct files, HTML5, HLS and DASH)",
         _ => true,
         svc => new GenericAdapter(svc),
         new AdapterCapabilities(
@@ -24,7 +24,6 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
                 "HLS (.m3u8) and DASH (.mpd) manifest URLs",
                 "HTML pages: video/audio/source/track, og:video, twitter:player:stream, JSON-LD VideoObject, inline manifest URLs",
                 "Embedded players that a dedicated adapter supports (one level deep)",
-                "RSS/Atom podcast feeds with enclosures (collection)",
                 "Browser-supplied candidates (mode B)"
             ],
             SingleItem: true, Playlist: true, AudioOnly: true, Subtitles: true,
@@ -32,7 +31,7 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
             KnownUnsupported: ["DRM streams", "live streams", "media created by running page scripts", "multi-period DASH"],
             Notes: "Success requires a verified, actionable representation."));
 
-    private const string PageAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml;q=0.9,*/*;q=0.5";
+    private const string PageAccept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5";
 
     private readonly ResolverServices _svc;
 
@@ -74,11 +73,6 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
                 else if (SniffManifest(resp.Content) is { } mk)
                 {
                     candidates.Add(new MediaCandidate(resp.FinalUrl, mk));
-                }
-                else if (PodcastFeedParser.LooksLikeFeed(resp.ContentType, resp.Content))
-                {
-                    var feed = PodcastFeedParser.Parse(resp.Content, resp.FinalUrl, request.Options.MaxCollectionItems);
-                    if (feed is not null) return MediaDiscoveryResult.FromCollection(feed with { SourceUrl = request.Url });
                 }
                 else
                 {
@@ -161,7 +155,7 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
         if (specific is not null) return specific;
 
         string diag = candidateCount == 0
-            ? "No media tags, metadata, manifest URLs or feed enclosures were found in the page"
+            ? "No media tags, metadata or manifest URLs were found in the page"
             : $"{candidateCount} candidate(s) found but none verified as media" + (outcome.Problems.Count > 0 ? $": {outcome.Problems[0].Diagnostic}" : "");
         return MediaErrors.NoMedia(diag, browserMayHelp: !browserMode);
     }

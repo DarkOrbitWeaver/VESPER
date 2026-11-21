@@ -22,6 +22,7 @@ internal static class MediaTrackProbe
         long offset = 0;
         byte[]? moov = null;
         bool media = false;
+        bool fragment = false;
         for (int count = 0; offset < file.Length; count++)
         {
             ct.ThrowIfCancellationRequested();
@@ -42,9 +43,12 @@ internal static class MediaTrackProbe
                 moov = Read(file, offset + prefix, (int)size - prefix);
             }
             if (type == "mdat" && size > (ulong)prefix) media = true;
+            if (type == "moof") fragment = true;
             if (type == "pssh") throw Bad("Protected MP4 initialization is unsupported.");
             offset += (long)size;
         }
+        if (moov is null && media && fragment)
+            throw Bad("The site sent only part of the video. Open the original page and choose another format.");
         if (moov is null || !media) throw Bad("The MP4 file has no movie metadata or media payload.");
         var movie = IsoBoxes(moov, 0, moov.Length);
         if (movie.Any(b => b.Type == "pssh")) throw Bad("Protected MP4 movie metadata is unsupported.");

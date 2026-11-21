@@ -83,59 +83,23 @@ internal static class QueueDiskForecast
 
     public static string Summary(IReadOnlyList<DiskForecastVolume> volumes)
     {
-        if (volumes.Count == 0) return "";
-        if (volumes.Count == 1)
+        return volumes.Count switch
         {
-            DiskForecastVolume volume = volumes[0];
-            string prefix = volume.IsShort ? "Low disk" : "Disk";
-            string needed = volume.UnknownJobs == 0
-                ? Formatting.Bytes(volume.RequiredBytes) + " needed"
-                : volume.KnownRemainingBytes == 0
-                    ? $"{volume.UnknownJobs} size{(volume.UnknownJobs == 1 ? "" : "s")} unknown"
-                    : $"at least {Formatting.Bytes(volume.RequiredBytes)} known + {volume.UnknownJobs} unknown";
-            string free = volume.AvailableBytes is long bytes ? $" · {Formatting.Bytes(bytes)} free" : " · free space unavailable";
-            return $"{prefix}: {needed} on {volume.Root}{free}";
-        }
-
-        long knownNeeded = 0;
-        int unknown = 0;
-        int shortVolumes = 0;
-        int uncheckedVolumes = 0;
-        foreach (DiskForecastVolume volume in volumes)
-        {
-            knownNeeded = AddSaturated(knownNeeded, volume.RequiredBytes);
-            unknown += volume.UnknownJobs;
-            if (volume.IsShort) shortVolumes++;
-            if (volume.AvailableBytes is null) uncheckedVolumes++;
-        }
-        string prefixMany = shortVolumes > 0 ? "Low disk" : "Disk";
-        return $"{prefixMany}: {Formatting.Bytes(knownNeeded)} baseline across {volumes.Count} locations"
-            + (unknown > 0 ? $" · {unknown} size{(unknown == 1 ? "" : "s")} unknown" : "")
-            + (shortVolumes > 0 ? $" · {shortVolumes} below estimate" : "")
-            + (uncheckedVolumes > 0 ? $" · free space unknown on {uncheckedVolumes}" : "");
+            0 => "",
+            1 => $"Low disk space on {volumes[0].Root.TrimEnd(Path.DirectorySeparatorChar)}",
+            _ => $"Low disk space on {volumes.Count} drives"
+        };
     }
 
     public static string Details(IReadOnlyList<DiskForecastVolume> volumes)
     {
-        if (volumes.Count == 0) return "";
-        var lines = new List<string>
-        {
-            "Estimated remaining storage by destination volume:"
-        };
+        var lines = new List<string>();
         foreach (DiskForecastVolume volume in volumes.Take(MaxVolumeChecks))
         {
-            string reserve = volume.SafetyReserveBytes > 0 ? $"{Formatting.Bytes(volume.SafetyReserveBytes)} reserve" : "no reserve";
-            string known = volume.KnownRemainingBytes > 0
-                ? $"at least {Formatting.Bytes(volume.KnownRemainingBytes)} known" : "no known sizes";
-            string needed = volume.UnknownJobs == 0
-                ? $"{Formatting.Bytes(volume.KnownRemainingBytes)} remaining + {reserve}"
-                : $"{known} + {reserve}; {volume.UnknownJobs} size{(volume.UnknownJobs == 1 ? "" : "s")} unknown";
-            string free = volume.AvailableBytes is long bytes ? $"{Formatting.Bytes(bytes)} available" : "free space unavailable";
-            lines.Add($"{volume.Root}: {needed}; {free}.");
+            if (volume.AvailableBytes is not long free) continue;
+            string drive = volume.Root.TrimEnd(Path.DirectorySeparatorChar);
+            lines.Add($"{drive} has {Formatting.Bytes(free)} free. Keep at least {Formatting.Bytes(volume.RequiredBytes)} free for this queue.");
         }
-        if (volumes.Count > MaxVolumeChecks)
-            lines.Add($"Free space was not checked for {volumes.Count - MaxVolumeChecks} additional locations.");
-        lines.Add("Converted and segmented media sizes are counted as unknown when their final size cannot be estimated. Other applications can also use disk space.");
         return string.Join(Environment.NewLine, lines);
     }
 

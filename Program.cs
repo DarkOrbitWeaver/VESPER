@@ -37,7 +37,7 @@ namespace VESPER
 
             if (NativeHostSetup.HostPresent && (NativeHostSetup.IsInstalledApp || NativeHostSetup.HasDevelopmentRegistration)
                 && !NativeHostSetup.IsRegistered)
-                _ = NativeHostSetup.Register(); // Troubleshooting > Repair helper is available if registration fails.
+                _ = NativeHostSetup.Register(); // Browser settings can retry if registration fails.
 
             DownloadEngine engine;
             try

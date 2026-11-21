@@ -50,7 +50,8 @@ internal sealed class SettingsForm : VesperPopupForm
     public VesperPreferences Result => _draft.Clone();
     public SettingsForm() : this(new VesperPreferences()) { }
 
-    public SettingsForm(VesperPreferences preferences, DownloadEngine? engine = null)
+    public SettingsForm(VesperPreferences preferences, DownloadEngine? engine = null,
+        Action<IWin32Window>? importDownloadList = null, Action<IWin32Window>? exportDownloadList = null)
     {
         _draft = preferences.Clone();
         _engine = engine;
@@ -120,7 +121,7 @@ internal sealed class SettingsForm : VesperPopupForm
         AcceptButton = save;
         CancelButton = cancel;
 
-        BuildDownloads();
+        BuildDownloads(importDownloadList, exportDownloadList);
         BuildTransfers();
         BuildNetwork();
         BuildAppearance();
@@ -236,7 +237,7 @@ internal sealed class SettingsForm : VesperPopupForm
         return (frame, input);
     }
 
-    private void BuildDownloads()
+    private void BuildDownloads(Action<IWin32Window>? importDownloadList, Action<IWin32Window>? exportDownloadList)
     {
         var page = Page("Downloads", "Where new files will be saved.");
         var folderLabel = Label("Default download folder", 9, bold: true);
@@ -319,6 +320,18 @@ internal sealed class SettingsForm : VesperPopupForm
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
             separator4, notify, sound, previewSound, clipboard, tray, separator5, openFolder,
             sleepQueue, shutdownQueue, powerNote]);
+        if (importDownloadList is not null && exportDownloadList is not null)
+        {
+            var lists = Label("Download lists", 9, bold: true);
+            lists.SetBounds(25, 833, 250, 22);
+            var import = Button("Import list…", 134, symbol: VesperIcon.Folder);
+            import.SetBounds(25, 863, 134, 34);
+            import.Click += (_, _) => importDownloadList(this);
+            var export = Button("Export list…", 134, symbol: VesperIcon.Clipboard);
+            export.SetBounds(169, 863, 134, 34);
+            export.Click += (_, _) => exportDownloadList(this);
+            page.Controls.AddRange([Divider(820), lists, import, export]);
+        }
         void Layout()
         {
             int right = page.ClientSize.Width - S(25);
@@ -752,47 +765,39 @@ internal sealed class SettingsForm : VesperPopupForm
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
             { VesperMessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         };
-        VesperButton disconnect = null!;
-        var repair = Button(NativeHostSetup.IsRegistered ? "Repair helper" : "Connect Chrome", 131, symbol: VesperIcon.Refresh);
-        repair.SetBounds(213, 236, 131, 34);
-        repair.Enabled = NativeHostSetup.HostPresent;
-        repair.Click += (_, _) =>
-        {
-            if (!NativeHostSetup.IsRegistered && VesperMessageBox.Show(this,
-                "Register this copy of VESPER as the browser helper for your Windows account? This changes only your per-user browser connection.",
-                "Connect Chrome", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            string? error = NativeHostSetup.Register();
-            if (error is not null) VesperMessageBox.Show(this, error, "Repair browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            Refresh();
-        };
-        disconnect = Button("Disconnect helper", 160, symbol: VesperIcon.Close);
-        disconnect.SetBounds(354, 236, 160, 34);
-        disconnect.Enabled = NativeHostSetup.IsRegistered;
-        disconnect.Click += (_, _) =>
-        {
-            if (VesperMessageBox.Show(this, "Disconnect this VESPER copy from your browser? Downloads and history will be kept.",
-                "Disconnect helper", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            string? problem = NativeHostSetup.Unregister();
-            if (problem is not null) VesperMessageBox.Show(this, problem, "Browser helper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            Refresh();
-        };
-        void Refresh()
-        {
-            bool hostPresent = NativeHostSetup.HostPresent;
-            bool registered = NativeHostSetup.IsRegistered;
-            status.Text = !hostPresent
-                ? "This build is missing the Chrome helper."
-                : registered
-                    ? "Helper registered for this copy of VESPER."
-                    : "Choose Connect Chrome to register the helper.";
-            ApplyBrowserHelperState(repair, disconnect, hostPresent, registered);
-        }
-
+        bool installed = NativeHostSetup.IsInstalledApp;
+        var helperAction = Button("Connect Chrome", 164, symbol: VesperIcon.Link);
+        helperAction.SetBounds(213, 236, 164, 34);
         var developerTip = Label(NativeHostSetup.ExtensionPresent
             ? "Load the extension in Chrome from chrome://extensions using Developer mode."
             : "This build does not include the extension files.", 8, muted: true);
         developerTip.SetBounds(25, 277, 505, 35);
-        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, repair, disconnect, developerTip]);
+        helperAction.Click += (_, _) =>
+        {
+            bool disconnect = NativeHostSetup.IsRegistered;
+            if (disconnect && installed) { RefreshHelper(); return; }
+            string title = disconnect ? "Disconnect Chrome" : "Connect Chrome";
+            string prompt = disconnect ? "Disconnect this portable copy from Chrome?"
+                : "Connect this copy of VESPER to Chrome for your Windows account?";
+            if (VesperMessageBox.Show(this, prompt, title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            string? error = disconnect ? NativeHostSetup.Unregister() : NativeHostSetup.Register();
+            if (error is not null) VesperMessageBox.Show(this, error, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            RefreshHelper();
+        };
+
+        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, helperAction, developerTip]);
+        void RefreshHelper()
+        {
+            bool hostPresent = NativeHostSetup.HostPresent;
+            bool registered = NativeHostSetup.IsRegistered;
+            status.Text = hostPresent ? "Connect this copy of VESPER to Chrome." : "This build is missing the Chrome helper.";
+            status.Visible = !registered;
+            helperAction.Visible = ShouldShowBrowserHelperAction(hostPresent, registered, installed);
+            helperAction.Text = registered ? "Disconnect Chrome" : "Connect Chrome";
+            helperAction.Top = S(registered ? 204 : 236);
+            open.Top = S(registered ? 204 : 236);
+            developerTip.Top = open.Bottom + S(7);
+        }
         void Layout()
         {
             int right = page.ClientSize.Width - S(25);
@@ -802,7 +807,7 @@ internal sealed class SettingsForm : VesperPopupForm
         }
         page.Resize += (_, _) => Layout();
         Layout();
-        Refresh();
+        RefreshHelper();
     }
 
     private void BuildAbout()
@@ -872,13 +877,8 @@ internal sealed class SettingsForm : VesperPopupForm
         };
     }
 
-    internal static void ApplyBrowserHelperState(VesperButton repair, VesperButton disconnect,
-        bool hostPresent, bool registered)
-    {
-        repair.Text = registered ? "Repair helper" : "Connect Chrome";
-        repair.Enabled = hostPresent;
-        disconnect.Enabled = registered;
-    }
+    internal static bool ShouldShowBrowserHelperAction(bool hostPresent, bool registered, bool installed) =>
+        hostPresent && (!registered || !installed);
 
     private void ExportDiagnostics()
     {

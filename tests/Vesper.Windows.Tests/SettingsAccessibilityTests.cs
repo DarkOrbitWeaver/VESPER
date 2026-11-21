@@ -78,7 +78,7 @@ public sealed class SettingsAccessibilityTests
     {
         OnSta(() =>
         {
-            using var form = new SettingsForm();
+            using var form = new SettingsForm(new VesperPreferences(), importDownloadList: _ => { }, exportDownloadList: _ => { });
             form.StartPosition = FormStartPosition.Manual;
             form.Location = new Point(-form.Width - 80, -form.Height - 80);
             form.Show();
@@ -93,6 +93,29 @@ public sealed class SettingsAccessibilityTests
                 VesperScrollPanel page = Descendants(form).OfType<VesperScrollPanel>().Single(panel => panel.Visible);
                 Assert.False(page.HorizontalScroll.Visible, $"{name} extends beyond the minimum-width viewport.");
             }
+        });
+    }
+
+    [Fact]
+    public void DownloadListButtonsUseSettingsAsTheirDialogOwner()
+    {
+        OnSta(() =>
+        {
+            IWin32Window? importOwner = null;
+            IWin32Window? exportOwner = null;
+            using var form = new SettingsForm(new VesperPreferences(),
+                importDownloadList: owner => importOwner = owner,
+                exportDownloadList: owner => exportOwner = owner);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+
+            var buttons = Descendants(form).OfType<VesperButton>().Where(button => button.Visible).ToArray();
+            Assert.Single(buttons, button => button.Text == "Import list…").PerformClick();
+            Assert.Single(buttons, button => button.Text == "Export list…").PerformClick();
+
+            Assert.Same(form, importOwner);
+            Assert.Same(form, exportOwner);
         });
     }
 

@@ -178,21 +178,4 @@ public class GenericAdapterTests
         Assert.Equal("vimeo", res.Item!.Provider);
         Assert.DoesNotContain(h.Requests, r => r.Url.Host == "ads.generic-fixture.example");
     }
-
-    [Fact]
-    public async Task PodcastFeed_BecomesADeduplicatedCollection_WithoutProbingEveryEpisode()
-    {
-        var h = new FakeHttpHandler().AddFile("https://pod.generic-fixture.example/feed.xml", "podcast.xml", "application/rss+xml");
-        var res = await Resolve(h, "https://pod.generic-fixture.example/feed.xml");
-
-        Assert.True(res.IsSuccess, res.Error?.Diagnostic);
-        var c = res.Collection!;
-        Assert.Equal(CollectionKind.Feed, c.Kind);
-        Assert.Equal("Fixture Podcast", c.Title);
-        Assert.Equal(2, c.Entries.Count);                                      // duplicate guid and the enclosure-less item are gone
-        Assert.Equal(TimeSpan.FromSeconds(754), c.Entries[0].Duration);
-        Assert.Equal(TimeSpan.FromSeconds(3600), c.Entries[1].Duration);
-        Assert.Equal("https://pod.generic-fixture.example/cover.jpg", c.Entries[0].Thumbnail!.AbsoluteUri);
-        Assert.Single(h.Requests);                                             // only the feed itself was fetched
-    }
 }

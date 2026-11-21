@@ -16,7 +16,7 @@ public sealed record CollectionEntry
     public MediaError? Error { get; init; }
 }
 
-/// <summary>A playlist, album, feed or dynamic mix. Listing never implies permission to download everything.</summary>
+/// <summary>A playlist, album or dynamic mix. Listing never implies permission to download everything.</summary>
 public sealed record MediaCollection
 {
     public required Uri SourceUrl { get; init; }

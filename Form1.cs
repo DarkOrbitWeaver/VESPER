@@ -175,16 +175,6 @@ public partial class Form1 : Form
     private readonly Func<bool> _hasActiveDownloads;
     private readonly Func<DialogResult> _confirmExitWithDownloads;
     private readonly ContextMenuStrip _rowMenu = new() { ShowImageMargin = true };
-    private readonly ContextMenuStrip _listMenu = new() { ShowImageMargin = true };
-    private readonly VesperButton _listButton = new()
-    {
-        Name = "downloadListActionsButton",
-        Text = "List",
-        Symbol = VesperIcon.Queue,
-        TrailingChevron = true,
-        Anchor = AnchorStyles.Top | AnchorStyles.Right,
-        Size = new Size(86, 34)
-    };
     private readonly Dictionary<string, ToolStripMenuItem> _menuCommands = [];
     private readonly Dictionary<ToolStripMenuItem, VesperIcon> _menuSymbols = [];
     private readonly List<ToolStripMenuItem> _rateOptions = [];
@@ -239,7 +229,6 @@ public partial class Form1 : Form
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             _botanicalArt?.Dispose();
             _rowMenu.Dispose();
-            _listMenu.Dispose();
             _tooltips.Dispose();
             _diskForecastTimer.Dispose();
             _announcementTimer.Dispose();
@@ -248,14 +237,9 @@ public partial class Form1 : Form
         _startHidden = startHidden;
         _allowVisible = !startHidden;
         InitializeComponent();
-        _listButton.AccessibleName = "Download lists and podcast feeds";
-        _listButton.TabIndex = 1;
-        _settings.TabIndex = 2;
-        _listButton.Visible = engine is not null;
-        _mast.Controls.Add(_listButton);
-        _listButton.BringToFront();
+        _settings.TabIndex = 1;
         _footerLabel.AutoEllipsis = true;
-        _footerLabel.AccessibleName = "Download and storage status";
+        _footerLabel.AccessibleName = "Download status";
         _diskForecastTimer.Tick += (_, _) => _ = RefreshDiskSpaceAsync();
         _announcementTimer.Tick += (_, _) => FlushScreenReaderAnnouncement();
         Move += (_, _) => RememberNoticeMonitor();
@@ -790,37 +774,6 @@ public partial class Form1 : Form
         VesperMenuTheme.FormatItems(menu.Items, _colors, itemWidth: 180, dpi: DeviceDpi);
     }
 
-    private void BuildListMenu()
-    {
-        _listMenu.Items.Add(new ToolStripMenuItem("Import download list…", null, (_, _) => ImportDownloadList())
-        {
-            Tag = VesperIcon.Folder
-        });
-        _listMenu.Items.Add(new ToolStripMenuItem("Export list as JSON…", null, (_, _) => ExportDownloadList(".json"))
-        {
-            Tag = VesperIcon.Clipboard
-        });
-        _listMenu.Items.Add(new ToolStripMenuItem("Export list as CSV…", null, (_, _) => ExportDownloadList(".csv"))
-        {
-            Tag = VesperIcon.Clipboard
-        });
-        _listMenu.Items.Add(new ToolStripSeparator());
-        _listMenu.Items.Add(new ToolStripMenuItem("Podcast feeds…", null, (_, _) => OpenPodcastFeeds())
-        {
-            Tag = VesperIcon.Audio
-        });
-        ApplyListMenuAppearance();
-    }
-
-    private void ApplyListMenuAppearance()
-    {
-        foreach (ToolStripMenuItem item in _listMenu.Items.OfType<ToolStripMenuItem>())
-            if (item.Tag is VesperIcon icon)
-                item.Image = VesperMenuTheme.IconImage(icon, _colors, DeviceDpi);
-        VesperMenuTheme.Apply(_listMenu, _colors, withIcons: true);
-        VesperMenuTheme.FormatItems(_listMenu.Items, _colors, itemWidth: 220, dpi: DeviceDpi);
-    }
-
     internal void RequestShow() => PostToUi(ShowFromTray);
 
     private void ShowFromTray()
@@ -1082,13 +1035,7 @@ public partial class Form1 : Form
 #endif
         };
         BuildMenuOnce();
-        BuildListMenu();
         _rowMenu.Opening += ConfigureRowMenu;
-        _listButton.Click += (_, _) =>
-        {
-            ApplyListMenuAppearance();
-            _listMenu.Show(_listButton, new Point(0, _listButton.Height));
-        };
         // Create the native menu handles right after the window exists, without a timer, so the first right-click is instant.
         HandleCreated += (_, _) => BeginInvoke((Action)(() =>
         {
@@ -1096,7 +1043,6 @@ public partial class Form1 : Form
         }));
         _tooltips.SetToolTip(_settings, "Settings");
         _tooltips.SetToolTip(_add, "Add download (Ctrl+N)");
-        _tooltips.SetToolTip(_listButton, "Import or export download lists and manage podcast feeds");
         _tooltips.SetToolTip(_searchFrame, "Search downloads");
         _add.Click += (_, _) => AddDownload();
         _settings.Click += (_, _) => OpenSettings();
@@ -1181,15 +1127,7 @@ public partial class Form1 : Form
         int y = Math.Max(0, (_mast.Height - _add.Height) / 2);
         _settings.SetBounds(_mast.ClientSize.Width - edge - _settings.Width, y, _settings.Width, _settings.Height);
         int gap = UiKit.Scale(this, 12);
-        if (_listButton.Visible)
-        {
-            _listButton.SetBounds(_settings.Left - gap - _listButton.Width, y, _listButton.Width, _add.Height);
-            _add.Location = new Point(_listButton.Left - gap - _add.Width, y);
-        }
-        else
-        {
-            _add.Location = new Point(_settings.Left - gap - _add.Width, y);
-        }
+        _add.Location = new Point(_settings.Left - gap - _add.Width, y);
         _brandIcon.SetBounds(edge, UiKit.Scale(this, 10), UiKit.Scale(this, 62), UiKit.Scale(this, 55));
         int brandX = _botanicalArt is null ? edge : _brandIcon.Right + UiKit.Scale(this, 9);
         _brandText.Location = new Point(brandX, UiKit.Scale(this, 12));
@@ -1282,7 +1220,7 @@ public partial class Form1 : Form
         _brandCaption.ForeColor = _colors.Muted;
         _selectedLabel.ForeColor = _colors.Text;
 
-        foreach (var button in new[] { _add, _settings, _listButton, _pause, _resume, _remove, _clear })
+        foreach (var button in new[] { _add, _settings, _pause, _resume, _remove, _clear })
             button.ApplyPalette(_colors);
         _searchFrame.FillColor = _colors.Surface;
         _searchFrame.OutlineColor = _colors.Border;
@@ -1295,7 +1233,6 @@ public partial class Form1 : Form
         _grid.ApplyAppearance(_colors, _prefs.Density);
         VesperMenuTheme.Apply(_rowMenu, _colors, withIcons: true);
         RefreshMenuStyle();
-        ApplyListMenuAppearance();
         ApplyTrayAppearance();
         LayoutMast();
         _searchFrame.Invalidate();
@@ -1395,14 +1332,13 @@ public partial class Form1 : Form
             _lastDiskProbeUtc = DateTime.MinValue;
         }
 
-        IReadOnlyList<DiskForecastVolume> forecast = QueueDiskForecast.Calculate(pending, _availableDiskSpace,
-            _engine?.Options.FreeSpaceReserve ?? 0);
-        if (forecast.Count > 0) parts.Add(QueueDiskForecast.Summary(forecast));
-        string details = QueueDiskForecast.Details(forecast);
+        DiskForecastVolume[] lowSpace = QueueDiskForecast.Calculate(pending, _availableDiskSpace,
+            _engine?.Options.FreeSpaceReserve ?? 0).Where(volume => volume.IsShort).ToArray();
+        if (lowSpace.Length > 0) parts.Add(QueueDiskForecast.Summary(lowSpace));
+        string details = QueueDiskForecast.Details(lowSpace);
         _footerLabel.AccessibleDescription = details;
         _tooltips.SetToolTip(_footerLabel, details);
-        _footerLabel.ForeColor = forecast.Any(volume => volume.IsShort) ? _colors.ProgressRed
-            : forecast.Any(volume => volume.UnknownJobs > 0 || volume.AvailableBytes is null) ? _colors.ProgressAmber : _colors.Muted;
+        _footerLabel.ForeColor = lowSpace.Length > 0 ? _colors.ProgressRed : _colors.Muted;
 
         string text = string.Join("    |    ", parts);
         if (_footerLabel.Text != text) _footerLabel.Text = text;
@@ -1527,7 +1463,7 @@ public partial class Form1 : Form
             VesperMessageBox.Show(this, "Some links were not added:\n\n" + string.Join("\n\n", problems), "Add download", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private void ImportDownloadList()
+    private void ImportDownloadList(IWin32Window owner)
     {
         if (_engine is null) return;
         using var picker = new OpenFileDialog
@@ -1537,23 +1473,23 @@ public partial class Form1 : Form
             CheckFileExists = true,
             Multiselect = false
         };
-        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        if (picker.ShowDialog(owner) != DialogResult.OK) return;
         if (!TryReadDownloadListFile(picker.FileName, out string contents, out string readError))
         {
-            VesperMessageBox.Show(this, readError, "Import download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(owner, readError, "Import download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         DownloadListReadResult parsed = DownloadListTransfer.Read(contents, Path.GetExtension(picker.FileName));
         if (!parsed.Success)
         {
-            VesperMessageBox.Show(this, parsed.Error ?? "The list could not be imported.", "Import download list",
+            VesperMessageBox.Show(owner, parsed.Error ?? "The list could not be imported.", "Import download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         if (parsed.Entries.Count == 0)
         {
-            VesperMessageBox.Show(this, "The list contains no downloads.", "Import download list",
+            VesperMessageBox.Show(owner, "The list contains no downloads.", "Import download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1561,7 +1497,7 @@ public partial class Form1 : Form
         int queued = parsed.Entries.Count(entry => entry.State == DownloadListState.Queued);
         int paused = parsed.Entries.Count - queued;
         string prompt = $"Import {parsed.Entries.Count} downloads? Queued items may start after import. {paused} paused item{(paused == 1 ? " stays" : "s stay")} paused.";
-        if (VesperMessageBox.Show(this, prompt, "Import download list", MessageBoxButtons.YesNo,
+        if (VesperMessageBox.Show(owner, prompt, "Import download list", MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question) != DialogResult.Yes)
             return;
 
@@ -1620,28 +1556,20 @@ public partial class Form1 : Form
                 + string.Join("\n", problems);
             if (errorCount > problems.Count) summary += $"\nAnd {errorCount - problems.Count} more.";
         }
-        VesperMessageBox.Show(this, summary, "Import download list", MessageBoxButtons.OK,
+        VesperMessageBox.Show(owner, summary, "Import download list", MessageBoxButtons.OK,
             errorCount > 0 ? MessageBoxIcon.Information : MessageBoxIcon.None);
-    }
-
-    private void OpenPodcastFeeds()
-    {
-        if (_engine is null) return;
-        using var dialog = new PodcastFollowForm(_engine, _prefs);
-        dialog.ShowDialog(this);
     }
 
     internal static string? ImportSiteFolder(VesperPreferences preferences, DownloadListEntry entry) =>
         SiteRule.ForPage(preferences.SiteRules, entry.Url)?.Folder;
 
-    private void ExportDownloadList(string extension)
+    private void ExportDownloadList(IWin32Window owner)
     {
         if (_engine is null) return;
-        if (extension is not (".json" or ".csv")) return;
         DownloadListExportResult export = DownloadListTransfer.CreateExport(_engine.Snapshots());
         if (export.Entries.Count == 0)
         {
-            VesperMessageBox.Show(this, "There are no transferable downloads in the list.", "Export download list",
+            VesperMessageBox.Show(owner, "There are no transferable downloads in the list.", "Export download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1649,17 +1577,17 @@ public partial class Form1 : Form
         using var picker = new SaveFileDialog
         {
             Title = "Export download list",
-            Filter = extension == ".csv" ? "CSV list (*.csv)|*.csv" : "JSON list (*.json)|*.json",
-            DefaultExt = extension[1..],
+            Filter = "JSON list (*.json)|*.json|CSV list (*.csv)|*.csv",
             AddExtension = true,
             OverwritePrompt = true,
-            FileName = "vesper-download-list" + extension
+            FileName = "vesper-download-list"
         };
-        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        if (picker.ShowDialog(owner) != DialogResult.OK) return;
 
-        if (!Path.GetExtension(picker.FileName).Equals(extension, StringComparison.OrdinalIgnoreCase))
+        string extension = Path.GetExtension(picker.FileName).ToLowerInvariant();
+        if (extension is not (".json" or ".csv"))
         {
-            VesperMessageBox.Show(this, $"Choose a {extension} filename.", "Export download list",
+            VesperMessageBox.Show(owner, "Choose a .json or .csv filename.", "Export download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1682,12 +1610,12 @@ public partial class Form1 : Form
                 if (export.LimitSkipped > 0) reasons.Add($"{export.LimitSkipped} over the export limit");
                 summary += $" {export.Skipped} items were omitted: {string.Join(", ", reasons)}.";
             }
-            VesperMessageBox.Show(this, summary, "Export download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(owner, summary, "Export download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
             or System.Security.SecurityException or NotSupportedException)
         {
-            VesperMessageBox.Show(this, "The list could not be written: " + ex.Message, "Export download list",
+            VesperMessageBox.Show(owner, "The list could not be written: " + ex.Message, "Export download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
@@ -1767,7 +1695,7 @@ public partial class Form1 : Form
     private void OpenSettings()
     {
         if (_engine is null) { PreviewSettingsRequested?.Invoke(); return; }
-        using var dialog = new SettingsForm(_prefs, _engine);
+        using var dialog = new SettingsForm(_prefs, _engine, ImportDownloadList, ExportDownloadList);
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
 
         VesperPreferences updated = dialog.Result;

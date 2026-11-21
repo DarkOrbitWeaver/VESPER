@@ -121,14 +121,19 @@ internal static class NativeHostSetup
         }
     }
 
-    /// <summary>Remove only browser registration; never touch downloads, settings or history.</summary>
+    /// <summary>Disconnects a portable copy before it is moved or removed.</summary>
     public static string? Unregister()
     {
-        if (!IsRegistered) return "The current browser helper belongs to a different VESPER copy; nothing was changed.";
+        if (!IsRegistered) return "The current browser helper belongs to a different VESPER copy.";
         try
         {
-            foreach (string subKey in BrowserKeys) Registry.CurrentUser.DeleteSubKeyTree(subKey, throwOnMissingSubKey: false);
-            if (File.Exists(ManifestPath)) File.Delete(ManifestPath);
+            foreach (string subKey in BrowserKeys)
+            {
+                using RegistryKey? key = Registry.CurrentUser.OpenSubKey(subKey, writable: true);
+                if (key is not null && string.Equals(key.GetValue(null) as string, ManifestPath, StringComparison.OrdinalIgnoreCase))
+                    key.DeleteValue("", throwOnMissingValue: false);
+            }
+            File.Delete(ManifestPath);
             return null;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)

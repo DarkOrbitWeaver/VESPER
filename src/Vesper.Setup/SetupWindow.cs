@@ -18,7 +18,7 @@ internal sealed class SetupWindow : Form
     private readonly VesperButton _extension = new() { Text = "Extension files", Symbol = VesperIcon.Folder, TabIndex = 1 };
     private readonly CheckBox _deleteUserData = new()
     {
-        Text = "Delete VESPER settings, download history, and podcast subscriptions",
+        Text = "Delete VESPER settings, download history, and other saved data",
         Checked = false,
         TabIndex = 1,
         UseVisualStyleBackColor = false
@@ -69,7 +69,7 @@ internal sealed class SetupWindow : Form
         _extension.Click += (_, _) => OpenPath(Path.Combine(_paths.App, "extension"), shell: true);
         _deleteUserData.CheckedChanged += (_, _) => RefreshControls();
         _tips.SetToolTip(_extension, "Opens the bundled extension files. Setup does not enable the browser extension or verify its connection to VESPER.");
-        _tips.SetToolTip(_deleteUserData, "This removes VESPER settings, download history, and podcast subscriptions. Downloaded files are never deleted.");
+        _tips.SetToolTip(_deleteUserData, "This removes VESPER settings, download history, and other saved data. Downloaded files are never deleted.");
         AcceptButton = _action;
         ApplyPalette();
         RefreshControls();
@@ -185,14 +185,14 @@ internal sealed class SetupWindow : Form
         _note.Text = _view switch
         {
             View.Ready when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
-                "Settings, download history, and podcast subscriptions will be deleted. Downloaded files are never deleted.",
-            View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and podcast subscriptions will be kept.",
+                "Settings, download history, and other saved data will be deleted. Downloaded files are never deleted.",
+            View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and other saved data will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
             View.Complete when _mode != SetupMode.Uninstall =>
                 "Open VESPER to get started. Enable the extension in Chrome to send downloads.",
             View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
-                "Settings, download history, and podcast subscriptions were deleted. Downloaded files were kept.",
-            View.Complete => "Your downloads, settings, download history, and podcast subscriptions were kept.",
+                "Settings, download history, and other saved data were deleted. Downloaded files were kept.",
+            View.Complete => "Your downloads, settings, download history, and other saved data were kept.",
             _ => ""
         };
         AcceptButton = intro && working ? _skip : working ? null : _action;
