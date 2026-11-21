@@ -56,6 +56,8 @@ public sealed class JobSnapshot
     public bool Sha256Verified { get; init; }
 
     public double? Fraction => TotalBytes is > 0 ? Math.Clamp((double)ProgressBytes / TotalBytes.Value, 0, 1) : null;
+    public bool FinishingTransfer => State == JobState.Downloading && !IsLiveRecording && TotalBytes is > 0 && ProgressBytes >= TotalBytes;
+    public bool ShowTransferProgress => !FinishingTransfer && State is not (JobState.Verifying or JobState.Finalizing or JobState.Converting or JobState.Completed);
     public bool IsActive => JobStates.IsActive(State);
     public bool IsCleanupPending => DownloadEngine.IsCleanupPending(State, Reason);
     public bool HasRetainedData => CommittedBytes > 0 && State != JobState.Completed;

@@ -63,7 +63,8 @@ public static class HttpFacts
         if (header is null) return null;
         TimeSpan? delay = header.Delta ?? (header.Date - now);
         if (delay is null) return null;
-        return TimeSpan.FromSeconds(Math.Clamp(delay.Value.TotalSeconds, 0, 3600));
+        // A server cooldown is a minimum, not a hint to retry after at most one hour.
+        return TimeSpan.FromTicks(Math.Clamp(delay.Value.Ticks, 0, DateTimeOffset.MaxValue.UtcTicks - now.UtcTicks));
     }
 
     /// <summary>
@@ -113,7 +114,7 @@ public sealed class OriginCooldown
         {
             string origin = url.GetLeftPart(UriPartial.Authority);
             if (_until.TryGetValue(origin, out var existing) && existing >= until) return;
-            if (_until.Count >= 256) _until.Remove(_until.MinBy(entry => entry.Value).Key);
+            if (_until.Count >= 256 && !_until.ContainsKey(origin)) _until.Remove(_until.MinBy(entry => entry.Value).Key);
             _until[origin] = until;
             if (until.UtcTicks > _latestUtcTicks) Volatile.Write(ref _latestUtcTicks, until.UtcTicks);
         }

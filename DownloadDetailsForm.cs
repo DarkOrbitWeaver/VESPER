@@ -104,7 +104,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
 
     private void Apply(JobSnapshot s)
     {
-        bool structural = s.State != _job.State || s.Message != _job.Message || s.FileMissing != _job.FileMissing
+        bool structural = s.State != _job.State || s.ShowTransferProgress != _job.ShowTransferProgress || s.Message != _job.Message || s.FileMissing != _job.FileMissing
             || s.FileName != _job.FileName || s.Reason != _job.Reason || s.SourceUrl != _job.SourceUrl;
         _job = s;
         if (structural) Build(); else UpdateLive();
@@ -198,7 +198,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
 
             int y = 108;
             _progressFill = null;
-            if (_job.Fraction is double fraction && _job.ProgressBytes > 0 && _job.State != JobState.Completed)
+            if (_job.ShowTransferProgress && _job.Fraction is double fraction && _job.ProgressBytes > 0)
             {
                 _progressWidth = contentWidth;
                 var track = new Panel { Location = new Point(margin, y), Size = new Size(contentWidth, 4), BackColor = _colors.ProgressTrack };
@@ -308,6 +308,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
             JobState.Completed => ("Completed", VesperIcon.Check, _colors.MutedGreen),
             JobState.Downloading when _job.IsLiveRecording =>
                 (_job.Message.StartsWith("Recording live", StringComparison.Ordinal) ? _job.Message : "Recording live", VesperIcon.Download, _colors.MutedGreen),
+            JobState.Downloading when _job.FinishingTransfer => ("Finishing transfer", VesperIcon.Info, _colors.MutedGreen),
             JobState.Downloading => (_job.Fraction is null ? "Downloading" : $"Downloading ({percent}%)", VesperIcon.Download, _colors.MutedGreen),
             JobState.Resolving => ("Contacting server", VesperIcon.Info, _colors.Muted),
             JobState.Paused => ("Paused", VesperIcon.Pause, _colors.Amber),

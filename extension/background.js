@@ -497,11 +497,15 @@ function supportsMediaPrefetch(page) {
     .some(domain => host === domain || host.endsWith('.' + domain));
 }
 
+function isPartialMediaUrl(url) {
+  return SEGMENT.test(url.pathname) || [...url.searchParams.keys()]
+    .some(key => /^(?:range|sq|segment|bytestart|byteend)$/i.test(key));
+}
+
 function isWholeDirectSource(source) {
   if (!source.wholeRepresentation || source.kind !== 'direct') return false;
   const url = VesperPlayerSource.http(source.url);
-  if (!url || SEGMENT.test(url.href)
-      || ['range', 'sq', 'segment'].some(key => url.searchParams.has(key))) return false;
+  if (!url || isPartialMediaUrl(url)) return false;
   return /^(?:audio|video)\//i.test(source.mime || '') || DIRECT.test(url.href);
 }
 
@@ -574,28 +578,29 @@ async function addSource(tabId, source) {
   await enforceSourceBudget();
 }
 
-function sourceLabel(source, index) {
+function sourceLabel(source) {
   const media = source.kind === 'direct' && source.mime.startsWith('audio/') ? 'Audio' : 'Video';
   const format = source.kind === 'direct' ? typeName(source.mime) : source.kind.toUpperCase();
   const size = Number.isSafeInteger(source.bytes) && source.bytes >= 524288 ? mb(source.bytes) : '';
   return {
     token: source.token,
-    label: `${media} source ${index + 1}`,
+    label: source.kind === 'direct' ? `${format} ${media.toLowerCase()}` : `${format} stream`,
     detail: size ? `${format} · ${size}` : format
   };
 }
 
 function rememberSourceSelections(sources, context) {
+  sources = sources.slice(0, 32);
   const now = Date.now();
   for (const [token, selection] of sourceSelections)
     if (selection.expires <= now) sourceSelections.delete(token);
   while (sourceSelections.size + sources.length > 32)
     sourceSelections.delete(sourceSelections.keys().next().value);
-  return sources.map((source, index) => {
+  return sources.map(source => {
     const token = crypto.randomUUID();
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
       seen: source.seen, expires: now + 60_000 });
-    return sourceLabel({ ...source, token }, index);
+    return sourceLabel({ ...source, token });
   });
 }
 
@@ -622,7 +627,8 @@ const observeMediaResponse = (details) => {
     url: details.url,
     kind: VesperPlayerSource.kind(details.url, type), mime: type.split(';')[0].trim().toLowerCase(), bytes,
     // This means headers describe the whole representation; VESPER still fetches and validates the URL itself.
-    wholeRepresentation: !isPlaylist && (details.statusCode === 200 || fullRange),
+    wholeRepresentation: !isPlaylist && (details.statusCode === 200 && !range || fullRange),
+    unexpectedRange: details.statusCode === 200 && !!range,
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
   }).catch(() => {});
  };
@@ -724,14 +730,15 @@ async function playerOptions(message, sender) {
         return { ok: true, data: { prefetchSkipped: true } };
       mediaPrefetchAt.set(tab, now);
     }
-    const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
+    const usableSource = source && !isPartialMediaUrl(source) && !matching?.unexpectedRange ? source : null;
+    const candidates = [usableSource, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
       .filter(Boolean).map(url => {
         const hint = candidate(url);
         if (mutedLoop && url === source && hint.kind === 'direct') hint.mutedLoop = true;
         return hint;
       });
-    const wholeRepresentation = source && matching?.kind === 'direct' && matching.wholeRepresentation && /^(?:audio|video)\//.test(matching.mime)
-      && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
+    const wholeRepresentation = usableSource && matching && isWholeDirectSource(matching)
+      && /^(?:audio|video)\//.test(matching.mime);
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
@@ -763,7 +770,8 @@ async function playerOptions(message, sender) {
     for (const [key, choice] of browserChoices)
       if (choice.expires <= Date.now()) browserChoices.delete(key);
     while (browserChoices.size >= 32) browserChoices.delete(browserChoices.keys().next().value);
-    browserChoices.set(token, { url: source.href, identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
+    browserChoices.set(token, { url: source.href, generation: message.generation ?? 0,
+      identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
     await saveBrowserChoices();
     return { ok: true, data: { browserChoice: token, title, choices: [{ index: 0,
       label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
@@ -783,6 +791,7 @@ async function selectBrowserFile(message, sender) {
   const choice = browserChoices.get(message.browserChoice);
   if (!choice || choice.expires <= Date.now() || choice.tab !== sender.tab?.id || choice.frame !== (sender.frameId ?? 0)
     || !sender.documentId || choice.documentId !== sender.documentId
+    || choice.generation !== (message.generation ?? 0) || choice.url !== VesperPlayerSource.http(message.playerUrl)?.href
     || choice.identity !== VesperPlayerSource.identity(mediaPage(message, sender)?.href))
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   const inFlight = browserChoiceStarts.get(message.browserChoice);

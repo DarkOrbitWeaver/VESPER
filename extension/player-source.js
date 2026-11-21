@@ -21,10 +21,14 @@ globalThis.VesperPlayerSource = (() => {
         : ['shorts', 'embed', 'live'].includes(parts[0]) ? parts[1] : null;
       if (/^[\w-]{11}$/.test(id || '')) return `youtube:${id}`;
     } else if (/(?:^|\.)instagram\.com$/.test(host)) {
-      if (['p', 'reel', 'reels', 'tv'].includes(parts[0]) && /^[\w-]+$/.test(parts[1] || '')) return `instagram:${parts[1]}`;
+      if (['p', 'reel', 'reels', 'tv'].includes(parts[0]) && /^[\w-]+$/.test(parts[1] || '')) {
+        const index = url.searchParams.get('img_index');
+        if (index !== null && !/^[1-9]\d{0,3}$/.test(index)) return url.href;
+        return `instagram:${parts[1]}${index && index !== '1' ? ':' + index : ''}`;
+      }
     } else if (/(?:^|\.)tiktok\.com$/.test(host)) {
       const id = parts[0]?.startsWith('@') && parts[1] === 'video' ? parts[2]
-        : parts[0] === 'embed' && parts[1] === 'v2' ? parts[2] : null;
+        : (parts[0] === 'embed' && parts[1] === 'v2' || parts[0] === 'player' && parts[1] === 'v1') ? parts[2] : null;
       if (/^\d+$/.test(id || '')) return `tiktok:${id}`;
     } else if (/(?:^|\.)facebook\.com$/.test(host)) {
       const index = parts.findIndex(part => part === 'reel' || part === 'videos');

@@ -57,7 +57,7 @@ internal sealed class HttpTransport : IDisposable
             ConnectTimeout = options.ConnectTimeout,
             PooledConnectionLifetime = TimeSpan.FromMinutes(5),
             PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
-            MaxConnectionsPerServer = Math.Max(options.MaxConnectionsPerHost, 4)
+            MaxConnectionsPerServer = Math.Max(options.MaxConnectionsPerHost, 1)
         };
 
         IWebProxy? proxy = null;

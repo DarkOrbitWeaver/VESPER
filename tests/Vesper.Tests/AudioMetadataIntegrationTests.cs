@@ -6,6 +6,21 @@ namespace Vesper.Tests;
 
 public sealed class AudioMetadataIntegrationTests
 {
+    [Theory]
+    [InlineData("recording.FLAC", "audio/flac", "FLAC")]
+    [InlineData("recording.opus", "audio/ogg", "Opus")]
+    [InlineData("recording.ogg", "audio/ogg", "Ogg audio")]
+    public void Tagged_audio_keeps_its_native_container(string name, string mime, string quality)
+    {
+        var job = new DownloadJob { FileName = name, Output = MediaOutput.Original };
+        DownloadEngine.SetTaggedAudioFormat(job);
+        Assert.Equal(mime, job.ContentType);
+        Assert.Equal(quality, job.MediaQuality);
+        job.MediaQuality = "Source quality";
+        DownloadEngine.SetTaggedAudioFormat(job);
+        Assert.Equal("Source quality", job.MediaQuality);
+    }
+
     private static string Fixture(string extension) =>
         Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", "quiet-track." + extension);
 

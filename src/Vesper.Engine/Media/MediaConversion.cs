@@ -84,10 +84,10 @@ public sealed partial class DownloadEngine
                     await _remuxSlots.WaitAsync(ct).ConfigureAwait(false);
                 remuxPermit = true;
                 using var opus = CreateOwnedStage(stage, FileShare.None, out stageIdentity);
+                string hash;
                 using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Remux, source.Length))
-                    await OpusMuxer.WriteAsync(audio, source, opus, tags, cover, ct).ConfigureAwait(false);
-                opus.Flush(flushToDisk: true); opus.Position = 0;
-                string hash = Convert.ToHexString(await SHA256.HashDataAsync(opus, ct).ConfigureAwait(false));
+                    hash = await OpusMuxer.WriteAsync(audio, source, opus, tags, cover, ct).ConfigureAwait(false);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) opus.Flush(flushToDisk: true);
                 file = new PreparedMediaFile(opus.Length, hash, stage, Path.ChangeExtension(job.FileName, ".opus"),
                     stageIdentity ?? throw new IOException("The Opus stage has no saved identity."));
                 PersistPreparedMedia(job, file);

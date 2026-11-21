@@ -1132,7 +1132,7 @@
     const close = renderShell(title, poster, seconds, sending);
     if (hadFocus) close.focus({ preventScroll: true });
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
-      pageUrl: panelMedia.pageUrl }
+      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src }
       : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent });
     if (!isCurrentRequest(request)) return;
     if (reply?.ok) {

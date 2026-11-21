@@ -157,6 +157,7 @@ internal sealed class SetupWindow : Form
             && (_view is View.Ready or View.Failed or View.Cancelled);
         _deleteUserData.Enabled = !working;
         _extension.Visible = !intro && _view == View.Complete && _mode != SetupMode.Uninstall;
+        _extension.Enabled = _extension.Visible && File.Exists(Path.Combine(_paths.App, "extension", "manifest.json"));
         _meter.Visible = working && !intro && _progress.Total > 0;
         if (_meter.Visible) _meter.Value = (int)Math.Clamp(100d * _progress.Verified / _progress.Total, 0, 100);
         _status.Visible = !intro;
@@ -188,8 +189,9 @@ internal sealed class SetupWindow : Form
                 "Settings, download history, and other saved data will be deleted. Downloaded files are never deleted.",
             View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and other saved data will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
-            View.Complete when _mode != SetupMode.Uninstall =>
-                "Open VESPER to get started. Enable the extension in Chrome to send downloads.",
+            View.Complete when _mode != SetupMode.Uninstall => _extension.Enabled
+                ? "Extension files are ready. Enable the extension in Chrome to check its connection."
+                : "The bundled extension manifest is missing. Run Repair to restore the extension files.",
             View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
                 "Settings, download history, and other saved data were deleted. Downloaded files were kept.",
             View.Complete => "Your downloads, settings, download history, and other saved data were kept.",

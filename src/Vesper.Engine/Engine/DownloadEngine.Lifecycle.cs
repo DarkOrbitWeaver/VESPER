@@ -556,10 +556,9 @@ public sealed partial class DownloadEngine
             var extents = new ExtentSet();
             extents.Add(new ByteRange(0, bytes));
             job.Extents = extents;
-            if (job.Output == MediaOutput.Original && string.Equals(Path.GetExtension(target), ".mp3", StringComparison.OrdinalIgnoreCase))
+            if (job.Output == MediaOutput.Original)
             {
-                job.ContentType = "audio/mpeg";
-                job.MediaQuality ??= "MP3";
+                SetTaggedAudioFormat(job);
             }
             else
             {
@@ -593,6 +592,20 @@ public sealed partial class DownloadEngine
             job.Message = $"Saved as {Path.GetExtension(job.FileName).TrimStart('.').ToUpperInvariant()}: this PC can't convert this audio or video. "
                 + "Installing Microsoft's free Web Media Extensions from the Store usually adds the missing decoder.";
         }
+    }
+
+    internal static void SetTaggedAudioFormat(DownloadJob job)
+    {
+        (string? mime, string? format) = Path.GetExtension(job.FileName).ToLowerInvariant() switch
+        {
+            ".mp3" => ("audio/mpeg", "MP3"),
+            ".flac" => ("audio/flac", "FLAC"),
+            ".opus" => ("audio/ogg", "Opus"),
+            ".ogg" => ("audio/ogg", "Ogg audio"),
+            _ => (job.ContentType, job.MediaQuality)
+        };
+        job.ContentType = mime;
+        job.MediaQuality ??= format;
     }
 
     private void FinishPublication(DownloadJob job, bool recovering = false)

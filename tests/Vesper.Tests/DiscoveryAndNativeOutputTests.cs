@@ -38,7 +38,8 @@ public sealed class DiscoveryAndNativeOutputTests
         using var source = File.OpenRead(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", "quiet-track.webm"));
         var audio = Assert.Single(WebmDemuxer.Read(source, source.Length, CancellationToken.None));
         using var output = new MemoryStream();
-        await OpusMuxer.WriteAsync(audio, source, output, new MediaMergeMetadata { Title = "Native song", Artist = "Fixture" }, null, CancellationToken.None);
+        string digest = await OpusMuxer.WriteAsync(audio, source, output, new MediaMergeMetadata { Title = "Native song", Artist = "Fixture" }, null, CancellationToken.None);
+        Assert.Equal(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(output.ToArray())), digest);
         var bytes = output.ToArray();
         Assert.True(bytes.AsSpan(0, 4).SequenceEqual("OggS"u8));
         Assert.Contains("TITLE=Native song", Encoding.UTF8.GetString(bytes));

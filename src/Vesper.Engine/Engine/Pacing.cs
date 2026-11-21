@@ -50,8 +50,8 @@ public sealed class RetryPolicy(RetryOptions options, Random? random = null)
         double ceiling = Math.Min(options.MaxDelay.TotalSeconds, options.BaseDelay.TotalSeconds * Math.Pow(2, exponent));
         // "Equal jitter": half fixed, half random. Avoids both thundering herds and near-zero delays.
         double seconds = ceiling / 2 + _random.NextDouble() * ceiling / 2;
-        if (retryAfter is { } floor) seconds = Math.Max(seconds, floor.TotalSeconds);
-        return TimeSpan.FromSeconds(seconds);
+        TimeSpan backoff = TimeSpan.FromSeconds(seconds);
+        return retryAfter is { } floor && floor > backoff ? floor : backoff;
     }
 }
 

@@ -1,11 +1,12 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 
 namespace Vesper.Engine;
 
 /// <summary>Copies unlaced Opus packets into Ogg, preserving OpusHead pre-skip and channel mapping.</summary>
 internal static class OpusMuxer
 {
-    internal static async Task WriteAsync(DemuxedTrack track, Stream source, Stream output,
+    internal static async Task<string> WriteAsync(DemuxedTrack track, Stream source, Stream output,
         MediaMergeMetadata? metadata, MediaThumbnail? cover, CancellationToken ct)
     {
         if (track.Kind != TrackKind.Audio || track.Codec != "opus" || track.HasLacing || track.Samples.Count == 0
@@ -13,8 +14,10 @@ internal static class OpusMuxer
             || head[8] != 1 || head[9] == 0)
             throw new MediaContainerException("This source does not expose complete, unlaced Opus packets.");
         uint serial = 0x56535052;
-        uint sequence = await OggAudioMetadataWriter.WriteHeaderPacketAsync(output, head, serial, 0, true, ct).ConfigureAwait(false);
-        sequence = await OggAudioMetadataWriter.WriteHeaderPacketAsync(output,
+        using var digest = SHA256.Create();
+        using var hashed = new CryptoStream(output, digest, CryptoStreamMode.Write, leaveOpen: true);
+        uint sequence = await OggAudioMetadataWriter.WriteHeaderPacketAsync(hashed, head, serial, 0, true, ct).ConfigureAwait(false);
+        sequence = await OggAudioMetadataWriter.WriteHeaderPacketAsync(hashed,
             OggAudioMetadataWriter.OpusComments(metadata, cover), serial, sequence, false, ct).ConfigureAwait(false);
         long granule = 0;
         int packetCount = 0;
@@ -38,7 +41,7 @@ internal static class OpusMuxer
                 packet.CopyTo(page, payload); payload += packet.Length;
             }
             OggAudioMetadataWriter.WriteChecksum(page);
-            output.Write(page);
+            hashed.Write(page);
             packets.Clear(); laces = bytes = samplesOnPage = 0;
         }
         for (int i = 0; i < track.Samples.Count; i++)
@@ -57,8 +60,10 @@ internal static class OpusMuxer
         }
         if (granule <= BinaryPrimitives.ReadUInt16LittleEndian(head.AsSpan(10)))
             throw new MediaContainerException("Opus pre-skip consumes the entire output.");
-        output.Flush(); output.Position = 0;
+        await hashed.FlushFinalBlockAsync(ct).ConfigureAwait(false);
+        output.Position = 0;
         OggAudioMetadataWriter.ValidateOpus(output, packetCount, granule);
+        return Convert.ToHexString(digest.Hash!);
     }
 
     internal static int PacketSamples(ReadOnlySpan<byte> packet)

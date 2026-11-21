@@ -559,6 +559,7 @@ public sealed class DownloadGrid : Control
         var (label, icon, color) = item.Status switch
         {
             JobStatus.Downloading when item.Snapshot?.IsLiveRecording == true => ("Recording", VesperIcon.Download, _palette.MutedGreen),
+            JobStatus.Downloading when item.Snapshot?.FinishingTransfer == true => ("Finishing transfer", VesperIcon.Info, _palette.MutedGreen),
             JobStatus.Completed when item.Snapshot?.Reason == "live-gaps" => ("Completed with gaps", VesperIcon.Warning, _palette.ProgressAmber),
             JobStatus.Downloading => (item.BrowserFile is null ? "Downloading" : "In Chrome", VesperIcon.Download, _palette.MutedGreen),
             JobStatus.Paused => ("Paused", VesperIcon.Pause, _palette.ProgressAmber),

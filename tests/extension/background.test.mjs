@@ -1458,7 +1458,7 @@ test('an Instagram blob player can choose a complete browser-observed video resp
   assert.equal(options.ok, true);
   assert.equal(options.data.sourceChoices.length, 1);
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('signature='), false);
-  assert.equal(options.data.sourceChoices[0].label, 'Video source 1');
+  assert.equal(options.data.sourceChoices[0].label, 'MP4 video');
   assert.match(options.data.sourceChoices[0].detail, /MP4/);
   assert.equal(app.sent.length, 1);
   assert.equal(app.sent[0].candidates.length, 0);
@@ -1755,7 +1755,9 @@ test('a Chrome route uses one observed complete file and rejects stale or foreig
   const options = await app.message({ type: 'media-options', pageUrl: current, playerPageUrl: current, playerUrl }, sender);
   assert.equal(options.ok, true);
   assert.equal(options.data.choices[0].container, 'MP4');
-  const select = { type: 'browser-media-select', pageUrl: current, browserChoice: options.data.browserChoice };
+  const select = { type: 'browser-media-select', pageUrl: current, playerUrl, browserChoice: options.data.browserChoice };
+  assert.equal((await app.message({ ...select, generation: 4 }, sender)).code, 'expired-selection');
+  assert.equal((await app.message({ ...select, playerUrl: 'https://video.example/next.mp4' }, sender)).code, 'expired-selection');
   assert.equal((await app.message(select, { ...sender, documentId: 'foreign' })).ok, false);
   assert.equal((await app.message({ ...select, pageUrl: 'https://www.youtube.com/shorts/ccccccccccc' }, sender)).ok, false);
   assert.equal((await app.message(select, sender)).ok, true);
@@ -1776,7 +1778,7 @@ test('a browser format choice survives a service worker restart without starting
   const formats = await firstWorker.message({ type: 'media-options', pageUrl: current, playerPageUrl: current, playerUrl }, sender);
 
   const workerAfterRestart = load({}, options);
-  const select = { type: 'browser-media-select', pageUrl: current, browserChoice: formats.data.browserChoice };
+  const select = { type: 'browser-media-select', pageUrl: current, playerUrl, browserChoice: formats.data.browserChoice };
   assert.equal((await workerAfterRestart.message(select, sender)).ok, true);
   assert.equal((await workerAfterRestart.message(select, sender)).ok, true);
   assert.deepEqual(workerAfterRestart.actions, ['chrome-start']);
@@ -1792,7 +1794,7 @@ test('concurrent browser format selections start Chrome once', async () => {
   await app.onMedia({ url: playerUrl, documentId: 'current', frameId: 0, tabId: 9, method: 'GET', statusCode: 200,
     type: 'media', timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
   const formats = await app.message({ type: 'media-options', pageUrl: current, playerPageUrl: current, playerUrl }, sender);
-  const select = { type: 'browser-media-select', pageUrl: current, browserChoice: formats.data.browserChoice };
+  const select = { type: 'browser-media-select', pageUrl: current, playerUrl, browserChoice: formats.data.browserChoice };
 
   const results = await Promise.all([app.message(select, sender), app.message(select, sender)]);
 
@@ -1818,7 +1820,7 @@ test('a choice reconciles a Chrome start whose reply was lost during worker rest
     state: 'in_progress', byExtensionId: 'vesper-test' });
 
   const workerAfterRestart = load({}, options);
-  const select = { type: 'browser-media-select', pageUrl: current, browserChoice: formats.data.browserChoice };
+  const select = { type: 'browser-media-select', pageUrl: current, playerUrl, browserChoice: formats.data.browserChoice };
   assert.equal((await workerAfterRestart.message(select, sender)).ok, true);
   assert.deepEqual(workerAfterRestart.actions, []);
   assert.equal(sessionData.vesperBrowserChoices.find(([token]) => token === formats.data.browserChoice)[1].downloadId, 40);
@@ -1840,10 +1842,43 @@ test('a choice restarts Chrome when the worker died before the download began', 
   saved.startedAt = Date.now();
 
   const workerAfterRestart = load({}, options);
-  const select = { type: 'browser-media-select', pageUrl: current, browserChoice: formats.data.browserChoice };
+  const select = { type: 'browser-media-select', pageUrl: current, playerUrl, browserChoice: formats.data.browserChoice };
   assert.equal((await workerAfterRestart.message(select, sender)).ok, true);
   assert.deepEqual(workerAfterRestart.actions, ['chrome-start']);
   assert.equal(workerAfterRestart.downloadHistory.length, 1);
+});
+
+test('carousel slides and TikTok embed players keep the exact item identity', () => {
+  const app = load();
+  const identity = url => app.evaluate(`VesperPlayerSource.identity(${JSON.stringify(url)})`);
+  assert.notEqual(identity('https://www.instagram.com/p/clip/?img_index=2'), identity('https://www.instagram.com/p/clip/'));
+  assert.equal(identity('https://www.instagram.com/p/clip/?img_index=1'), identity('https://www.instagram.com/p/clip/'));
+  for (const id of ['7704503448573578527', '7688010685061664021'])
+    assert.equal(identity(`https://www.tiktok.com/player/v1/${id}`), identity(`https://www.tiktok.com/@fixture/video/${id}`));
+  app.stopWorker();
+});
+
+test('known fragments never reach the native picker as complete direct files', async () => {
+  const page = 'https://example.com/player';
+  const sender = { url: page, tab: { id: 5 }, frameId: 0, documentId: 'fragment-fixture' };
+  for (const [url, range] of [['https://cdn.example/asset.mp4?ByteStart=50', null],
+    ['https://cdn.example/asset.mp4', 'bytes 50-99/120']]) {
+    const app = load({ 'media-options': { ok: false, code: 'no-media' } });
+    await app.onMedia({ url, documentId: sender.documentId, frameId: 0, tabId: 5, method: 'GET', statusCode: 200,
+      type: 'media', timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' },
+        ...(range ? [{ name: 'Content-Range', value: range }] : [])] });
+    await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: url }, sender);
+    assert.equal(app.sent.find(r => r.type === 'media-options').candidates.length, 0);
+    app.stopWorker();
+  }
+  const app = load({ 'media-options': { ok: false, code: 'no-media' } });
+  const url = 'https://cdn.example/seekable.mp4';
+  await app.onMedia({ url, documentId: sender.documentId, frameId: 0, tabId: 5, method: 'GET', statusCode: 206,
+    type: 'media', timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' },
+      { name: 'Content-Range', value: 'bytes 50-99/120' }] });
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: url }, sender);
+  assert.equal(app.sent.find(r => r.type === 'media-options').candidates[0].url, url);
+  app.stopWorker();
 });
 
 test('blob and data media context-menu actions show failure feedback', async () => {

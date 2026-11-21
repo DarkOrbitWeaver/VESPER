@@ -60,8 +60,8 @@ internal sealed class DownloadItem
                 : s.State == JobState.Completed ? Formatting.Bytes(s.CommittedBytes) : "Unknown",
             SizeBytes = s.TotalBytes ?? s.CommittedBytes,
             SourceUrl = s.SourceUrl, Destination = s.Destination, Status = Map(s), CreatedUtc = s.CreatedUtc,
-            Percent = s.State == JobState.Completed || s.ProgressBytes == 0 ? null : s.Fraction is double f ? (int)Math.Floor(f * 100) : null,
-            Transfer = TransferText(s), Eta = s.Eta is { } eta ? Formatting.Eta(eta)
+            Percent = !s.ShowTransferProgress || s.ProgressBytes == 0 ? null : s.Fraction is double f ? (int)Math.Floor(f * 100) : null,
+            Transfer = TransferText(s), Eta = s.FinishingTransfer ? "" : s.Eta is { } eta ? Formatting.Eta(eta)
                 : s.EstimatingEta && !s.WaitingForData ? "Estimating…" : "",
             Detail = s.Message, RateCap = Formatting.RateLimit(s.SpeedLimitBytes), _searchAddress = searchAddress
         };
@@ -156,6 +156,7 @@ internal sealed class DownloadItem
     private static string TransferText(JobSnapshot s) => s.State switch
     {
         JobState.Downloading when s.IsLiveRecording => s.Message,
+        JobState.Downloading when s.FinishingTransfer => "",
         JobState.Downloading when s.WaitingForData => "Waiting for data…",
         JobState.Downloading when s.SpeedBytesPerSecond > 0 => Formatting.Rate(s.SpeedBytesPerSecond),
         JobState.Downloading => s.Message,

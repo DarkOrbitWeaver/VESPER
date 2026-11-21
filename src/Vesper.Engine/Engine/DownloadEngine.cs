@@ -492,7 +492,8 @@ public sealed partial class DownloadEngine : IDisposable
                 {
                     TimeSpan delay = _retry.Delay(job.RetryCount - 1, outcome.RetryAfter);
                     job.State = JobState.WaitingForRetry;
-                    job.NextRetryUtc = DateTime.UtcNow + delay;
+                    DateTime now = DateTime.UtcNow;
+                    job.NextRetryUtc = now.AddTicks(Math.Min(delay.Ticks, DateTime.MaxValue.Ticks - now.Ticks));
                     job.Message = $"{outcome.Message} Retrying in {Math.Ceiling(delay.TotalSeconds)} s.";
                 }
                 break;
@@ -526,7 +527,9 @@ public sealed partial class DownloadEngine : IDisposable
         }
 
         _wakeTimer ??= new Timer(_ => OnWake(), null, Timeout.Infinite, Timeout.Infinite);
-        _wakeTimer.Change(next is null ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(Math.Max(50, (next.Value - DateTime.UtcNow).TotalMilliseconds)),
+        // A far-off retry is revisited later within the range supported by Timer.Change.
+        _wakeTimer.Change(next is null ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(
+            Math.Clamp((next.Value - DateTime.UtcNow).TotalMilliseconds, 50, TimeSpan.FromDays(1).TotalMilliseconds)),
             Timeout.InfiniteTimeSpan);
     }
 
