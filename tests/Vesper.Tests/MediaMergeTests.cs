@@ -873,7 +873,7 @@ public sealed class MediaMergeTests
         Assert.True(MediaMergePlan.TryParse(clipped.Choice?.MediaPlanJson, false, out MediaMergePlan clippedPlan, out error), error);
         Assert.Equal(new MediaTimeRange(1.1, 2.2), clippedPlan.ClipRange);
         Assert.Empty(clippedPlan.Metadata!.Chapters);
-        Assert.True(MediaTransferBridge.SupportsSegmentClip(clipped.Choice!));
+        Assert.True(MediaTransferBridge.SupportsTimeRange(clipped.Choice!));
     }
 
     [Fact]
@@ -1099,7 +1099,7 @@ public sealed class MediaMergeTests
         Assert.All(clippedPlan.Tracks, track => Assert.All(track.Source!.Dash!.Fragments,
             fragment => Assert.Equal(1d, fragment.DurationSeconds!.Value)));
         Assert.Equal(new double?[] { 0, 1, 2 }, clippedPlan.Tracks[0].Source!.Dash!.Fragments.Select(fragment => fragment.StartSeconds));
-        Assert.True(MediaTransferBridge.SupportsSegmentClip(clipped.Choice!));
+        Assert.True(MediaTransferBridge.SupportsTimeRange(clipped.Choice!));
     }
 
     [Fact]

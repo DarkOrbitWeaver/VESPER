@@ -82,6 +82,59 @@ public sealed class DiscoveryAndNativeOutputTests
         using var source = new MemoryStream("RIFF\0\0\0\0WAVE"u8.ToArray());
         Assert.Throws<MediaContainerException>(() => WaveAudio.Read(source));
     }
+
+    [Fact]
+    public void Compatible_video_preset_keeps_fragmented_mp4_hls_quality_audio_and_subtitle_choices()
+    {
+        var hls = new MediaRepresentation
+        {
+            Id = "hls-1080", Url = new Uri("https://cdn.example.test/1080.m3u8"),
+            Protocol = StreamProtocol.Hls, Content = StreamContent.VideoAndAudio,
+            Container = "mp4", VideoCodec = "h264", AudioCodec = "aac", Height = 1080,
+            AudioTrackId = "english", AudioLanguage = "en", IsDefaultAudio = true,
+            Segments = new SegmentPlan
+            {
+                InitializationUrl = new Uri("https://cdn.example.test/init.mp4"),
+                Segments = [new MediaSegment(new Uri("https://cdn.example.test/part.m4s"), 60, StartSeconds: 0)],
+                TotalDurationSeconds = 60,
+                IsFragmentedMp4 = true
+            }
+        };
+        var http = new MediaRepresentation
+        {
+            Id = "http-720", Url = new Uri("https://cdn.example.test/720.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            Height = 720
+        };
+        var subtitle = new SubtitleTrack(new Uri("https://cdn.example.test/en.vtt"), "en", "English", "vtt");
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "test", Title = "Video",
+            Duration = TimeSpan.FromSeconds(60), Representations = [http, hls], Subtitles = [subtitle]
+        };
+        FormatPreferences preferences = FormatPreferences.BestQuality with
+        {
+            AudioTrackId = "english", SubtitleLanguages = ["en"], EmbedSubtitles = true
+        };
+
+        var full = MediaTransferBridge.Prepare(item, preferences, output: MediaOutputPreference.CompatibleVideo);
+        MediaDownloadChoice fullChoice = Assert.IsType<MediaDownloadChoice>(full.Choice);
+        Assert.Equal(hls.Id, fullChoice.FormatId);
+        Assert.Contains("1080p", fullChoice.DisplayDetail, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(JobKind.Hls, fullChoice.Kind);
+        Assert.Equal(MediaOutput.Original, fullChoice.Output);
+        Assert.Equal(subtitle.Url, Assert.Single(fullChoice.SubtitleTracks!).Url);
+        Assert.Contains("remain separate", fullChoice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+
+        var clipped = MediaTransferBridge.Prepare(item, preferences, output: MediaOutputPreference.CompatibleVideo,
+            clipStartSeconds: 10, clipEndSeconds: 20);
+        MediaDownloadChoice clipChoice = Assert.IsType<MediaDownloadChoice>(clipped.Choice);
+        Assert.Equal(hls.Id, clipChoice.FormatId);
+        Assert.Equal(JobKind.Hls, clipChoice.Kind);
+        Assert.Equal(new MediaTimeRange(10, 20), JsonSerializer.Deserialize<MediaTimeRange>(clipChoice.MediaPlanJson!));
+        Assert.Equal(ClipMode.Segments, ClipSelection.ModeFor(clipChoice));
+    }
+
     [Theory]
     [InlineData("CONIN$.txt")]
     [InlineData("CONOUT$")]

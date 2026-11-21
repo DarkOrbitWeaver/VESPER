@@ -14,17 +14,17 @@ internal enum ClipMode
 internal static class ClipSelection
 {
     internal const double LongestSeconds = 31_536_000;
-    internal const string SegmentNotice = "Your clip may start a little early or end a little late.";
+    internal const string SegmentNotice = "VESPER downloads only the segments in your range; the clip may start a little early or end a little late.";
     internal const string FullFileNotice = "VESPER downloads the whole file first, then keeps your time range.";
 
     internal static ClipMode ModeFor(MediaDownloadChoice choice)
     {
-        if (!MediaTransferBridge.SupportsSegmentClip(choice)) return ClipMode.None;
+        if (!MediaTransferBridge.SupportsTimeRange(choice)) return ClipMode.None;
         return ModeFor(choice.Output, choice.Kind);
     }
 
     internal static ClipMode ModeFor(MediaOutput output, JobKind kind) =>
-        output == MediaOutput.Wav && kind == JobKind.Http ? ClipMode.FullFile : ClipMode.Segments;
+        output == MediaOutput.Wav && (kind is JobKind.Http or JobKind.Merge) ? ClipMode.FullFile : ClipMode.Segments;
 
     internal static string Notice(ClipMode mode) => mode == ClipMode.FullFile ? FullFileNotice : SegmentNotice;
 

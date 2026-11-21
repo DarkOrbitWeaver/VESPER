@@ -259,7 +259,7 @@ internal sealed partial class BrowserBridgeHandler
         if (request.Clip is not null || request.AudioTrackId is not null || request.SubtitleLanguages is not null
             || request.EmbedSubtitles)
         {
-            if (item is null || how is null || request.Clip is not null && !SupportsSegmentClip(job))
+            if (item is null || how is null || request.Clip is not null && !SupportsTimeRange(job))
                 return BridgeResponse.Fail(request.Id, "invalid", "This format can't use the requested selection.");
             if (request.EmbedSubtitles && request.SubtitleLanguages is not { Count: > 0 })
                 return BridgeResponse.Fail(request.Id, "invalid", "Choose at least one subtitle language before embedding.");

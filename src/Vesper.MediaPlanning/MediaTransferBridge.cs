@@ -123,7 +123,8 @@ internal static class MediaTransferBridge
         MediaItem native = item with
         {
             Representations = item.Representations.Where(r =>
-                r.Protocol != StreamProtocol.Hls && r.Container is "mp4" or "m4a" && !r.AudioUnverified
+                (r.Protocol != StreamProtocol.Hls || r.Segments?.IsFragmentedMp4 == true)
+                && r.Container is "mp4" or "m4a" && !r.AudioUnverified
                 && (r.Content == StreamContent.AudioOnly ? r.AudioCodec == "aac"
                     : r.VideoCodec == "h264" && (!r.HasAudio || r.AudioCodec == "aac"))).ToArray()
         };
@@ -690,9 +691,9 @@ internal static class MediaTransferBridge
         return expanded;
     }
 
-    internal static bool SupportsSegmentClip(MediaDownloadChoice choice)
+    internal static bool SupportsTimeRange(MediaDownloadChoice choice)
     {
-        if (choice.Output == MediaOutput.Wav) return true;
+        if (choice.Output == MediaOutput.Wav) return choice.Kind is JobKind.Http or JobKind.Merge;
         if (choice.Kind == JobKind.Hls) return true;
         if (choice.MediaPlanJson is null) return false;
         try

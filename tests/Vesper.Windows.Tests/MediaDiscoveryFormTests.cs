@@ -151,6 +151,60 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Fact]
+    public void Default_compatible_preset_uses_high_quality_fragmented_mp4_hls_and_shows_segment_notice()
+    {
+        OnSta(() =>
+        {
+            MediaRepresentation hls = Representation("sample", "hls-1080", 1080, 30) with
+            {
+                Protocol = StreamProtocol.Hls,
+                Container = "mp4",
+                Url = new Uri("https://sample.example.test/1080.m3u8"),
+                Segments = new SegmentPlan
+                {
+                    InitializationUrl = new Uri("https://sample.example.test/init.mp4"),
+                    Segments = [new MediaSegment(new Uri("https://sample.example.test/part.m4s"), 120, StartSeconds: 0)],
+                    TotalDurationSeconds = 120,
+                    IsFragmentedMp4 = true
+                }
+            };
+            MediaRepresentation http = Representation("sample", "http-720", 720, 30);
+            MediaItem sample = Item("sample", [http, hls]) with { Duration = TimeSpan.FromSeconds(120) };
+            using var form = new MediaDiscoveryForm(new VesperPreferences(), sample.SourceUrl, sample);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags members =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            T Control<T>(string name) => (T)typeof(MediaDiscoveryForm).GetField(name, members)!.GetValue(form)!;
+            var output = Control<VesperChoice>("_outputChoice");
+            var clip = Control<CheckBox>("_clipCheck");
+            var download = Control<VesperButton>("_download");
+            var note = Control<Label>("_clipNote");
+
+            Assert.Equal("MP4 (compatible)", output.SelectedText);
+            Assert.True(clip.Enabled);
+            clip.Checked = true;
+            Control<TextBox>("_clipStart").Text = "00:10";
+            Control<TextBox>("_clipEnd").Text = "00:20";
+            Application.DoEvents();
+
+            Assert.True(download.Enabled);
+            Assert.Contains("only the segments", note.Text, StringComparison.OrdinalIgnoreCase);
+            var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;
+            var selection = ((MediaDownloadChoice? Choice, string? Error))prepare.Invoke(form, null)!;
+            Assert.Null(selection.Error);
+            Assert.Equal(hls.Id, selection.Choice!.FormatId);
+            Assert.Contains("1080p", selection.Choice.DisplayDetail, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(JobKind.Hls, selection.Choice.Kind);
+            Assert.Equal(new MediaTimeRange(10, 20),
+                System.Text.Json.JsonSerializer.Deserialize<MediaTimeRange>(selection.Choice.MediaPlanJson!));
+        });
+    }
+
+    [Fact]
     public void CollectionOutputChangeInvalidatesOldAvailability()
     {
         OnSta(() =>

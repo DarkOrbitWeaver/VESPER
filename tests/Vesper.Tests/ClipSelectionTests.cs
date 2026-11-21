@@ -50,9 +50,13 @@ public sealed class ClipSelectionTests
     public void The_notice_matches_how_the_range_is_actually_cut()
     {
         Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(MediaOutput.Wav, JobKind.Http));
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(MediaOutput.Wav, JobKind.Merge));
         Assert.Equal(ClipMode.Segments, ClipSelection.ModeFor(MediaOutput.Wav, JobKind.Hls));
         Assert.Equal(ClipMode.Segments, ClipSelection.ModeFor(MediaOutput.Original, JobKind.Merge));
-        Assert.Equal("Your clip may start a little early or end a little late.", ClipSelection.Notice(ClipMode.Segments));
+        var wavMerge = new MediaDownloadChoice("https://example.test/audio", "audio.wav", JobKind.Merge,
+            null, null, Output: MediaOutput.Wav);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(wavMerge));
+        Assert.Contains("only the segments", ClipSelection.Notice(ClipMode.Segments), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("whole file first", ClipSelection.Notice(ClipMode.FullFile));
     }
 

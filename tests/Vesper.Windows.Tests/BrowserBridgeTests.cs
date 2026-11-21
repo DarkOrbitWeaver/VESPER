@@ -41,6 +41,49 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public void Butterfly_default_compatible_preset_exposes_time_range_for_fragmented_mp4_hls()
+    {
+        var hls = new MediaRepresentation
+        {
+            Id = "hls-1080", Url = new Uri("https://cdn.example.test/1080.m3u8"),
+            Protocol = StreamProtocol.Hls, Content = StreamContent.VideoAndAudio,
+            Container = "mp4", VideoCodec = "h264", AudioCodec = "aac", Height = 1080,
+            Segments = new SegmentPlan
+            {
+                InitializationUrl = new Uri("https://cdn.example.test/init.mp4"),
+                Segments = [new MediaSegment(new Uri("https://cdn.example.test/part.m4s"), 60, StartSeconds: 0)],
+                TotalDurationSeconds = 60,
+                IsFragmentedMp4 = true
+            }
+        };
+        var http = new MediaRepresentation
+        {
+            Id = "http-720", Url = new Uri("https://cdn.example.test/720.mp4"),
+            Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac",
+            Height = 720
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "test", Title = "Video",
+            Duration = TimeSpan.FromSeconds(60), Representations = [http, hls]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => new VesperPreferences());
+        var createOptions = typeof(BrowserBridgeHandler).GetMethod("CreateBrowserOptions",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        var response = (BridgeResponse)createOptions.Invoke(bridge,
+            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None])!;
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(response.Data, BridgeProtocol.Json));
+        JsonElement best = json.RootElement.GetProperty("choices")[0];
+
+        Assert.True(response.Ok, response.Message);
+        Assert.Equal("Best quality", best.GetProperty("label").GetString());
+        Assert.Contains("1080p", best.GetProperty("detail").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.True(best.GetProperty("canClip").GetBoolean());
+        Assert.False(best.GetProperty("clipUsesWholeFile").GetBoolean());
+    }
+
+    [Fact]
     public void Browser_collection_shortcut_requires_a_resolver_supplied_http_collection()
     {
         var item = new MediaItem
