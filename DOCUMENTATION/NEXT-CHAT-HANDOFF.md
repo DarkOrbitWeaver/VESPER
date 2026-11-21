@@ -26,7 +26,7 @@ The tracker verifier is the source for the current item count. At a work checkpo
 
 - Cancel removes only the native job and its owned unfinished files. Pause preserves progress. Failure keeps an actionable entry. Chrome keeps bytes it already owns. Use native readiness and source identity before accepting a fresh handoff.
 - Keep the existing temporary-file layout, recoverable persistence, output validation, per-origin consent, privacy, and no-overwrite publication. Keep C#/.NET 10, native WinForms, Chrome MV3, the custom download engine, and existing botanical/butterfly assets.
-- The extension popup holds essential settings, Animate and Off for butterfly motion, and a small extension version. Video sign-in defaults on and uses the current supported video site's HTTPS session after Chrome grants access. File sign-in still requires exact-host approval. Action-specific feedback belongs with the action. The in-page picker handles media and the desktop manages downloads.
+- The extension popup holds essential settings, Animate and Off for butterfly motion, and a small extension version. Manual capture uses Chrome's right-click menu. Video sign-in defaults on and uses the current supported video site's HTTPS session after Chrome grants access. File sign-in still requires exact-host approval. Action-specific feedback belongs with the action. The in-page picker handles media and the desktop manages downloads. Site rules are under Settings → Browser.
 - Apply Humanify. Verify the actual behavior before closing a requirement. Use the exact candidate commit for release claims. The owner performs the final audit before public distribution.
 
 ## Reminder after the complete product ships
