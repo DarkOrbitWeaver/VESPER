@@ -63,6 +63,15 @@ public sealed record MediaMergePlan
     public long TotalBytes => Tracks.Where(t => t.Source is null).Sum(t => t.Size);
 
     internal bool IsSegmented => Tracks.Any(track => track.Source is not null);
+    [JsonIgnore]
+    public bool CanClipLocalMp4 => OutputContainer == "mp4" && RequireVideo && RequireAudio
+        && OutputRange is null && Subtitles is { Count: 0 }
+        && (Tracks is [var single] && IsClipVideo(single, "muxed")
+            || Tracks is { Count: 2 } && Tracks.Any(track => IsClipVideo(track, "video"))
+            && Tracks.Any(track => track is { Role: "audio", Source: null, Container: "mp4" or "m4a", Codec: "aac", Size: > 0 and <= MaxTrackBytes }));
+
+    private static bool IsClipVideo(MergeTrack? track, string role) => track is
+        { Source: null, Container: "mp4", Codec: "h264", Size: > 0 and <= MaxTrackBytes } && track.Role == role;
 
     internal long OffsetOf(int index)
     {
@@ -141,8 +150,7 @@ public sealed record MediaMergePlan
             int expectedVersion = segmented ? 2 : value.Subtitles.Count > 0 || muxed ? 3 : 1;
             if (value.Version != expectedVersion) return false;
             if (value.OutputRange is { IsValid: false }) return false;
-            if (value.ClipRange is { IsValid: false } || value.ClipRange is not null && !segmented) return false;
-            if (value.ClipRange is not null && value.Tracks.Any(track => track.Source?.Dash?.Fragments.Any(fragment => fragment.DurationSeconds is null) == true)) return false;
+            if (value.ClipRange is { IsValid: false }) return false;
             if (segmented && value.Tracks.Any(track => track?.Source is null)) return false;
             int videos = 0, audios = 0, muxedTracks = 0;
             foreach (var t in value.Tracks)
@@ -163,6 +171,12 @@ public sealed record MediaMergePlan
             if (segmented && (videos != 1 || audios != 1 || !value.RequireVideo || !value.RequireAudio
                 || value.Tracks.Select(t => t.Source!.Protocol).Distinct(StringComparer.Ordinal).Count() != 1)) return false;
             if (value.OutputContainer == "m4a" && videos > 0) return false;
+            if (value.ClipRange is not null)
+            {
+                if (!segmented && !value.CanClipLocalMp4) return false;
+                if (value.Tracks.Any(track => track.Source?.Dash?.Fragments.Any(fragment => fragment.DurationSeconds is null) == true))
+                    return false;
+            }
             if (value.Subtitles.Count > 0)
             {
                 if (value.OutputContainer is not ("mkv" or "mp4") || segmented || value.ClipRange is not null

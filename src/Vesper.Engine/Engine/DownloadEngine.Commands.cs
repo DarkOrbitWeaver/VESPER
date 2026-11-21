@@ -115,6 +115,8 @@ public sealed partial class DownloadEngine
         {
             if (!MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan plan, out string mergeError))
                 return new AddResult(AddStatus.Invalid, Guid.Empty, mergeError);
+            if (!plan.IsSegmented && plan.ClipRange is not null && request.Output != MediaOutput.Original)
+                return new AddResult(AddStatus.Invalid, Guid.Empty, "Local MP4 trimming keeps the selected MP4 tracks as they are.");
             if (request.Output == MediaOutput.Mp3 && plan.OutputRange is not null)
                 return new AddResult(AddStatus.Invalid, Guid.Empty, "MP3 output does not support audio clips.");
             if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null)

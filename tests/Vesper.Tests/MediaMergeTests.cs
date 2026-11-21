@@ -38,6 +38,69 @@ public sealed class MediaMergeTests
         Assert.Equal(2, actualEnd);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task LocalMp4Clip_PreservesSelectedTracksAndRefusesOutOfRange(bool muxed, bool outside)
+    {
+        await using var server = new FaultServer();
+        byte[] video = Fixture("video-only.mp4");
+        byte[] audio = AacFmp4();
+        using var videoSource = new MemoryStream(video);
+        using var audioSource = new MemoryStream(audio);
+        DemuxedTrack sourceVideo = Track(videoSource, TrackKind.Video);
+        DemuxedTrack sourceAudio = Track(audioSource, TrackKind.Audio);
+        server.Extra["/clip/video.mp4"] = video;
+        server.Extra["/clip/audio.m4a"] = audio;
+        using var combined = new MemoryStream();
+        MediaMerger.Merge([(sourceVideo, videoSource), (sourceAudio, audioSource)], "mp4", combined, default);
+        server.Extra["/clip/muxed.mp4"] = combined.ToArray();
+        await server.StartAsync();
+        using var h = new Harness();
+
+        var plan = new MediaMergePlan
+        {
+            Version = muxed ? 3 : 1,
+            OutputContainer = "mp4",
+            RequireAudio = true,
+            RequireVideo = true,
+            ClipRange = new MediaTimeRange(0.25, outside ? 2 : 0.7),
+            Tracks = muxed
+                ? [new MergeTrack("muxed", "combined", server.Url("/clip/muxed.mp4"), combined.Length, "mp4", "h264", "complete")]
+                :
+                [
+                    new MergeTrack("video", "video", server.Url("/clip/video.mp4"), video.Length, "mp4", "h264", "video"),
+                    new MergeTrack("audio", "audio", server.Url("/clip/audio.m4a"), audio.Length, "m4a", "aac", "audio")
+                ]
+        };
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "clip.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        if (outside)
+        {
+            Assert.Equal(JobState.NeedsAttention, done.State);
+            Assert.Null(done.FinalPath);
+            Assert.Equal(plan.TotalBytes, done.CommittedBytes);
+            Assert.Equal(server.Extra["/clip/muxed.mp4"], await File.ReadAllBytesAsync(done.PartialPath));
+            return;
+        }
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        List<DemuxedTrack> tracks = MediaMerger.Demux(output, output.Length, default);
+        Assert.Equal(new[] { "h264", "aac" }, tracks.Select(track => track.Codec));
+        Assert.True(tracks[0].Samples[0].Key);
+        Assert.True(tracks[1].Samples.Count < sourceAudio.Samples.Count);
+        Assert.All(tracks, track =>
+        {
+            Mp4EditListEntry edit = Assert.Single(track.EditList!);
+            Assert.Equal(0.45, edit.SegmentDuration / (double)track.EditMovieTimescale, 7);
+            Assert.True(edit.MediaTime > 0);
+        });
+    }
+
     private static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
     private static byte[] AacFmp4() => [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
     private static byte[] TinyPng() => Convert.FromBase64String(

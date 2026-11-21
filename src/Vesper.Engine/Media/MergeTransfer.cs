@@ -95,7 +95,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         }
         if (work.Count > 0)
         {
-            EnsureSpace(work.Sum(w => w.End - w.Start) + total);
+            EnsureSpace(work.Sum(w => w.End - w.Start) + (plan.ClipRange is null ? total : 0));
             await RunWorkersAsync(plan, work, state, ct).ConfigureAwait(false);
             await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
         }
@@ -279,7 +279,9 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     if (container is null)
                         return RunOutcome.NeedsAttention("unsupported-container",
                             $"The downloaded codecs ({string.Join(", ", inputs.Select(input => input.Track.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Nothing was published; saved data was kept.");
-                    EnsureSpace(plan.TotalBytes + (1 << 20));
+                    if (plan.ClipRange is { } clip)
+                        Mp4Clip.Apply(inputs.Select(input => input.Track).ToArray(), clip, ct);
+                    EnsureSpace((plan.ClipRange is null ? plan.TotalBytes : inputs.Sum(input => input.Track.PayloadBytes)) + (1 << 20));
                     MediaThumbnail? thumbnail = container is "mp4" or "m4a" or "webm" or "mkv"
                         ? await MediaThumbnail.FetchAsync(Job.MediaThumbnailUrl, http, engine.Options.AllowPrivateNetworks, ct).ConfigureAwait(false)
                         : null;
