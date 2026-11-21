@@ -32,6 +32,7 @@ public sealed class BrowserMediaCandidate
     public long? Bitrate { get; init; }
     public double? DurationSeconds { get; init; }
     public string? Label { get; init; }
+    public bool MutedLoop { get; init; }
     /// <summary>"video-element", "network", "metadata" - informational only.</summary>
     public string? Source { get; init; }
 }

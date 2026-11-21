@@ -11,13 +11,27 @@ namespace Vesper.Engine;
 internal static class MediaTrackProbe
 {
     private readonly record struct IsoBox(string Type, int Payload, int End);
-    internal static void RequireAudio(PartialFile file, string format, CancellationToken ct)
+    private readonly record struct Mp4ProbeResult(bool HasAudio, bool HasVideo, bool HasFragments, bool HasMovieExtends);
+
+    internal static void RequireAudio(PartialFile file, string format, CancellationToken ct,
+        bool allowSilentProgressiveMp4 = false, string? expectedIdentity = null)
     {
-        bool audio = format == "webm" ? WebmHasAudio(file, ct) : Mp4HasAudio(file, ct);
-        if (!audio) throw new MediaContainerException("The downloaded representation is video-only or has no supported audio track. No silent output was published; choose another format.");
+        if (format == "webm")
+        {
+            if (!WebmHasAudio(file, ct)) throw MissingAudio();
+            return;
+        }
+
+        Mp4ProbeResult result = ProbeMp4(file, ct);
+        if (result.HasAudio) return;
+        if (!allowSilentProgressiveMp4) throw MissingAudio();
+        if (!result.HasVideo || result.HasFragments || result.HasMovieExtends)
+            throw Bad("Only a complete progressive MP4 video can be saved without audio.");
+
+        RequireVideoSamples(file, expectedIdentity, ct);
     }
 
-    private static bool Mp4HasAudio(PartialFile file, CancellationToken ct)
+    private static Mp4ProbeResult ProbeMp4(PartialFile file, CancellationToken ct)
     {
         long offset = 0;
         byte[]? moov = null;
@@ -53,6 +67,7 @@ internal static class MediaTrackProbe
         var movie = IsoBoxes(moov, 0, moov.Length);
         if (movie.Any(b => b.Type == "pssh")) throw Bad("Protected MP4 movie metadata is unsupported.");
         bool audio = false;
+        bool video = false;
         foreach (var trak in movie.Where(b => b.Type == "trak"))
         {
             var mdia = One(IsoBoxes(moov, trak.Payload, trak.End), "mdia");
@@ -70,8 +85,26 @@ internal static class MediaTrackProbe
                 throw Bad("Invalid MP4 sample-description count.");
             if (entries.Any(b => b.Type is "enca" or "encv")) throw Bad("Encrypted MP4 samples are unsupported.");
             if (kind == "soun") audio = true;
+            if (kind == "vide") video = true;
         }
-        return audio;
+        return new Mp4ProbeResult(audio, video, fragment, movie.Any(b => b.Type == "mvex"));
+    }
+
+    private static void RequireVideoSamples(PartialFile file, string? expectedIdentity, CancellationToken ct)
+    {
+        PathSafety.RequireTemporaryIdentity(file.Handle, expectedIdentity);
+        long expectedLength = file.Length;
+        using var source = PathSafety.OpenTemporaryStream(file.Path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite, 1 << 16, FileOptions.RandomAccess);
+        PathSafety.RequireTemporaryIdentity(source.SafeFileHandle, expectedIdentity);
+        if (source.Length != expectedLength) throw Bad("The MP4 changed during media validation.");
+
+        List<DemuxedTrack> tracks = Mp4Demuxer.Read(source, source.Length, ct);
+        PathSafety.RequireTemporaryIdentity(file.Handle, expectedIdentity);
+        PathSafety.RequireTemporaryIdentity(source.SafeFileHandle, expectedIdentity);
+        if (!tracks.Any(track => track.Kind == TrackKind.Video && track.Samples.Count > 0)
+            || tracks.Any(track => track.Kind == TrackKind.Audio && track.Samples.Count > 0))
+            throw Bad("The MP4 does not contain complete video-only samples.");
     }
 
     private static bool WebmHasAudio(PartialFile file, CancellationToken ct)
@@ -176,4 +209,7 @@ internal static class MediaTrackProbe
         return bytes;
     }
     private static MediaContainerException Bad(string text) => new(text);
+
+    private static MediaContainerException MissingAudio() =>
+        Bad("The downloaded representation is video-only or has no supported audio track. No silent output was published; choose another format.");
 }

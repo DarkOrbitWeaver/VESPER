@@ -1,4 +1,5 @@
 using Vesper.MediaResolver.Core;
+using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Tests.TestSupport;
 using Xunit;
@@ -32,6 +33,8 @@ public class GenericAdapterTests
         Assert.True(rep.AudioUnverified);
         Assert.Equal(4321, rep.FileSize);
         Assert.Equal("mp4", rep.Container);
+        var selection = FormatSelector.Select(res.Item, FormatPreferences.BestQuality).Selection!;
+        Assert.Contains("audio not confirmed", selection.Summary);
     }
 
     [Fact]
@@ -41,6 +44,26 @@ public class GenericAdapterTests
         var res = await Resolve(h, $"{Media}/song.mp3");
         Assert.Equal(MediaKind.Audio, res.Item!.Kind);
         Assert.Equal(StreamContent.AudioOnly, res.Item.Representations[0].Content);
+    }
+
+    [Fact]
+    public async Task MutedAutoplayLoopIsRecordedOnlyForItsOwnVideoSource()
+    {
+        var h = new FakeHttpHandler()
+            .Add($"{Page}/demo", """
+                <video muted autoplay loop><source src="/demo.mp4" type="video/mp4"></video>
+                <video muted autoplay loop controls src="/with-controls.mp4"></video>
+                <video controls src="/movie.mp4"></video>
+                """, "text/html")
+            .AddMedia($"{Page}/demo.mp4", "video/mp4", 1000)
+            .AddMedia($"{Page}/with-controls.mp4", "video/mp4", 2000)
+            .AddMedia($"{Page}/movie.mp4", "video/mp4", 3000);
+
+        var result = await Resolve(h, $"{Page}/demo");
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        var loop = Assert.Single(result.Item!.Representations, rep => rep.MutedLoop);
+        Assert.Equal("/demo.mp4", loop.Url.AbsolutePath);
     }
 
     [Fact]

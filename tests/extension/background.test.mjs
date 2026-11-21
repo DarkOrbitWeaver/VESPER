@@ -1422,6 +1422,25 @@ test('a blob player must choose even a single inferred manifest before VESPER re
     ['https://cdn.example.com/video/playlist.m3u8']);
 });
 
+test('the muted-loop hint only travels with the selected direct video', async () => {
+  const app = load({ 'media-options': { ok: true } });
+  const page = 'https://example.com/demo';
+  const sender = { url: page, tab: { id: 18 }, frameId: 0, documentId: 'demo-player' };
+  const url = 'https://cdn.example.com/demo.mp4';
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: url, mutedLoop: true }, sender);
+  assert.equal(app.sent[0].candidates[0].url, url);
+  assert.equal(app.sent[0].candidates[0].mutedLoop, true);
+
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'https://cdn.example.com/master.m3u8', mutedLoop: true }, sender);
+  assert.equal(app.sent[1].candidates[0].mutedLoop, undefined);
+
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: url, mutedLoop: true }, { ...sender, frameId: 1 });
+  assert.equal(app.sent[2].candidates[0].mutedLoop, undefined);
+});
+
 test('an Instagram blob player can choose a complete browser-observed video response', async () => {
   const app = load({ 'media-options': request => request.candidates.length
     ? { ok: true } : { ok: false, code: 'no-media' } });

@@ -231,8 +231,9 @@ public static class FormatSelector
 
         string res = c.V.Height is { } h ? $"{h}p" : "unknown resolution";
         string fps = c.Fps is > 30.5 ? $"{Math.Round(c.Fps.Value)}fps " : "";
-        string audioNote = c.HasAudio ? (c.A is not null ? "+ separate audio (merge required)" : "with audio")
-                                      : "VIDEO ONLY (no audio stream available)";
+        string audioNote = c.A is not null ? "+ separate audio (merge required)"
+            : c.V.AudioUnverified ? "· audio not confirmed"
+            : c.HasAudio ? "with audio" : "VIDEO ONLY (no audio stream available)";
         return new FormatSelection
         {
             Video = c.V,

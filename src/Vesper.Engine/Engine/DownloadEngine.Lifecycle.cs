@@ -48,7 +48,10 @@ public sealed partial class DownloadEngine
             if (format is not null)
             {
                 using var probe = ProcessingTiming.Measure(job.Id, ProcessingPhase.Probe, total);
-                try { MediaTrackProbe.RequireAudio(file, format, ct); }
+                bool allowSilentProgressiveMp4 = format == "mp4" && job.Output == MediaOutput.Original
+                    && string.Equals(job.MediaProvider, "generic", StringComparison.Ordinal)
+                    && string.Equals(job.MediaPlanJson, DirectMediaPlan.AudioIfPresent, StringComparison.Ordinal);
+                try { MediaTrackProbe.RequireAudio(file, format, ct, allowSilentProgressiveMp4, job.PartialIdentity); }
                 catch (MediaContainerException ex)
                 { return RunOutcome.NeedsAttention("media-validation", ex.Message + " Saved data was kept."); }
             }

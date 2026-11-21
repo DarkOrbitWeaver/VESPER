@@ -61,6 +61,39 @@ public sealed class MediaTrackProbeTests
         Assert.Equal(fragment, await File.ReadAllBytesAsync(stopped.PartialPath));
     }
     [Fact]
+    public async Task HttpMediaHandoff_AllowsOptedInProgressiveVideoOnlyMp4()
+    {
+        byte[] video = DashTransferTests.Fixture("video-only.mp4");
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        server.Extra["/media/video-only.mp4"] = video;
+
+        var added = h.Engine.Add(new AddRequest(server.Url("/media/video-only.mp4"), FileName: "video.mp4",
+            MediaProvider: "generic", MediaPlanJson: DirectMediaPlan.AudioIfPresent, InitiallyPaused: true));
+        Assert.Equal(AddStatus.Added, added.Status);
+        h.Restart();
+        h.Engine.Resume(added.JobId);
+        var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+
+        Assert.Equal(video, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+    [Fact]
+    public async Task HttpMediaHandoff_RejectsFragmentedMp4WithOptionalAudioPlan()
+    {
+        byte[] fragment = DashTransferTests.Fixture("av-1.m4s");
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        server.Extra["/media/instagram.mp4"] = fragment;
+
+        var added = h.Engine.Add(new AddRequest(server.Url("/media/instagram.mp4"), FileName: "instagram.mp4",
+            MediaProvider: "generic", MediaPlanJson: DirectMediaPlan.AudioIfPresent));
+        Assert.Equal(AddStatus.Added, added.Status);
+        var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+
+        Assert.Equal("media-validation", stopped.Reason);
+        Assert.Null(stopped.FinalPath);
+        Assert.Contains("The site sent only part of the video.", stopped.Message);
+        Assert.Equal(fragment, await File.ReadAllBytesAsync(stopped.PartialPath));
+    }
+    [Fact]
     public async Task OrdinaryHttpDownload_CanStillSaveAnIntentionallyVideoOnlyFile()
     {
         await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();

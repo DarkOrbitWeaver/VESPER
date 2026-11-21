@@ -124,6 +124,13 @@ public sealed partial class DownloadEngine
                 return new AddResult(AddStatus.Invalid, Guid.Empty, credentialError);
         }
 
+        bool requestedAudioIfPresentPlan = string.Equals(request.MediaPlanJson,
+            DirectMediaPlan.AudioIfPresent, StringComparison.Ordinal);
+        bool audioIfPresentPlan = requestedAudioIfPresentPlan && request.Kind == JobKind.Http
+            && request.Output == MediaOutput.Original
+            && string.Equals(request.MediaProvider, "generic", StringComparison.Ordinal);
+        if (requestedAudioIfPresentPlan && !audioIfPresentPlan)
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "The audio-optional plan requires an original generic media download.");
         if (request.Kind == JobKind.Http && request.Output == MediaOutput.Wav && request.MediaPlanJson is not null
             && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "The requested WAV range is invalid.");
@@ -229,7 +236,8 @@ public sealed partial class DownloadEngine
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
-                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output == MediaOutput.Wav ? request.MediaPlanJson : null,
+                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output == MediaOutput.Wav || audioIfPresentPlan
+                    ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
             SaveLocked(job, request.RequestId); // Durably commit before exposing the job in memory.

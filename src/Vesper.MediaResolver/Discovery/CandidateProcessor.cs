@@ -132,6 +132,7 @@ internal sealed class CandidateProcessor
             Content = audio ? StreamContent.AudioOnly : StreamContent.VideoAndAudio,
             // A bare video file carries no codec metadata here, so audio presence is honestly marked unverified.
             AudioUnverified = !audio,
+            MutedLoop = !audio && c.MutedLoop,
             Container = container,
             Width = c.Width,
             Height = c.Height,

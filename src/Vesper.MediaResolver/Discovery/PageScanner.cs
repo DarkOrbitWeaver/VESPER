@@ -55,6 +55,7 @@ internal static class PageScanner
             var ogVideos = new List<string>();
             var ogAudios = new List<string>();
             string? currentMedia = null;
+            bool mutedLoop = false;
 
             foreach (var tag in HtmlScanner.Scan(html))
             {
@@ -87,11 +88,13 @@ internal static class PageScanner
                     case "audio":
                     {
                         currentMedia = tag.Name;
+                        mutedLoop = tag.Name == "video" && tag.Attr("muted") is not null && tag.Attr("autoplay") is not null
+                            && tag.Attr("loop") is not null && tag.Attr("controls") is null;
                         string? src = tag.Attr("src");
                         string? mime = tag.Name == "audio" ? "audio/*" : tag.Attr("type");
                         AddCandidate(src ?? tag.Attr("data-src") ?? tag.Attr("data-video-src")
                             ?? tag.Attr("data-hls") ?? tag.Attr("data-dash") ?? tag.Attr("data-mp4"),
-                            mime, Dim(tag.Attr("width")), Dim(tag.Attr("height")), null);
+                            mime, Dim(tag.Attr("width")), Dim(tag.Attr("height")), null, mutedLoop && src is not null);
                         if (string.IsNullOrWhiteSpace(src) && tag.Attr("data-setup") is { Length: > 2 and <= 8192 } setup)
                         {
                             using var config = JsonExt.TryParse(setup);
@@ -104,7 +107,8 @@ internal static class PageScanner
                     }
                     case "source" when currentMedia is not null:
                         AddCandidate(tag.Attr("src") ?? tag.Attr("data-src"), tag.Attr("type") ?? (currentMedia == "audio" ? "audio/*" : null),
-                            Dim(tag.Attr("width")), Dim(tag.Attr("height")), tag.Attr("label") ?? tag.Attr("title"));
+                            Dim(tag.Attr("width")), Dim(tag.Attr("height")), tag.Attr("label") ?? tag.Attr("title"),
+                            mutedLoop && tag.Attr("src") is not null);
                         break;
                     case "track":
                     {
@@ -196,7 +200,7 @@ internal static class PageScanner
             if (_meta.Duration is null && e.P("duration").Str() is { } iso) _meta.Duration = DashParser.ParseIsoDuration(iso);
         }
 
-        private void AddCandidate(string? src, string? mime, int? w, int? h, string? label)
+        private void AddCandidate(string? src, string? mime, int? w, int? h, string? label, bool mutedLoop = false)
         {
             if (_meta.Candidates.Count >= _max || string.IsNullOrWhiteSpace(src)) return;
             var u = UrlUtil.Resolve(_base, WebUtility.HtmlDecode(src));
@@ -204,7 +208,7 @@ internal static class PageScanner
             u = UrlUtil.WithoutFragment(u);
             if (!_seen.Add(u.AbsoluteUri)) return;
             string? cleanMime = string.IsNullOrWhiteSpace(mime) ? null : mime.Trim();
-            _meta.Candidates.Add(new MediaCandidate(u, MediaCandidate.Classify(u, cleanMime), cleanMime, w, h, null, null, label));
+            _meta.Candidates.Add(new MediaCandidate(u, MediaCandidate.Classify(u, cleanMime), cleanMime, w, h, null, null, label, mutedLoop));
         }
 
         private void AddEmbed(string? src)

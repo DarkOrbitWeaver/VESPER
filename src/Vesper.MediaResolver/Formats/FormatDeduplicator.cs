@@ -28,6 +28,7 @@ public static class FormatDeduplicator
         bool IsDrc,
         string? AudioGroupId,
         bool AudioUnverified,
+        bool MutedLoop,
         string? ContentIdentity,
         ProcessingRequirement Requirements,
         MediaRequestContext Context,
@@ -60,7 +61,7 @@ public static class FormatDeduplicator
         var requirements = r.Requirements & ~(ProcessingRequirement.HlsSegmentAssembly | ProcessingRequirement.DashSegmentAssembly);
         return new(r.Content, r.DeliveryId, r.Width, r.Height, r.FrameRate, r.Hdr, r.VideoCodec, r.AudioCodec, r.Container,
             r.AudioLanguage, r.AudioChannels, r.AudioSampleRate, r.AudioTrackId, r.IsDefaultAudio,
-            r.IsAudioDescription, r.IsDrc, r.AudioGroupId, r.AudioUnverified, r.ContentIdentity,
+            r.IsAudioDescription, r.IsDrc, r.AudioGroupId, r.AudioUnverified, r.MutedLoop, r.ContentIdentity,
             requirements, r.Context, audioBitrate);
     }
 

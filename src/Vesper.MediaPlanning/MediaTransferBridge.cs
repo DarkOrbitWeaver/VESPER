@@ -136,6 +136,7 @@ internal static class MediaTransferBridge
         var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
             clipStartSeconds, clipEndSeconds);
         if (original.Choice is { } choice && CanConvert(choice)
+            && choice.MediaPlanJson != DirectMediaPlan.AudioIfPresent
             && !prefs.EmbedSubtitles
             && source is { HasAudio: true, Video: { VideoCodec: not null, Hdr: HdrKind.Sdr, Height: null or <= 2304, Width: null or <= 4096 } video }
             && (source.Audio ?? video).AudioCodec is not null
@@ -367,12 +368,20 @@ internal static class MediaTransferBridge
         if (item.Kind == MediaKind.Audio && step.Protocol == StreamProtocol.Http && step.Container == "vorbis")
             name = Path.ChangeExtension(name, ".ogg");
         string? mediaPlan = dashPlan;
+        string summary = selection.Summary;
         if (step.Protocol == StreamProtocol.Hls && clipStartSeconds is double clipStart)
             mediaPlan = JsonSerializer.Serialize(new MediaTimeRange(clipStart, clipEndSeconds!.Value));
+        if (item.Provider == "generic" && step.Protocol == StreamProtocol.Http && step.Container == "mp4"
+            && selection.Video is { AudioUnverified: true, MutedLoop: true } directVideo
+            && !UrlUtil.HostIs(item.SourceUrl, "instagram.com", "tiktok.com", "youtube.com", "youtube-nocookie.com", "youtu.be", "facebook.com", "fb.watch"))
+        {
+            mediaPlan = DirectMediaPlan.AudioIfPresent;
+            summary = directVideo.Height is int height ? $"{height}p · may be silent" : "Video · may be silent";
+        }
         return (new MediaDownloadChoice(step.Url.AbsoluteUri, name,
             step.Protocol == StreamProtocol.Hls ? JobKind.Hls : step.Protocol == StreamProtocol.Dash ? JobKind.Dash : JobKind.Http,
             step.Context.Referer, step.Context.UserAgent,
-            item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, selection.Summary,
+            item.SourceUrl.AbsoluteUri, item.Provider, item.MediaId, summary,
             item.Thumbnail?.AbsoluteUri, plan.ExpiresAt, mediaPlan, selection.Streams.Single().Id,
             SubtitleTracks: subtitles, Secrets: TransferSecrets(step.Context, step.Url),
             SubtitleNotice: SubtitleNotice(prefs.EmbedSubtitles, subtitles.Count, 0,

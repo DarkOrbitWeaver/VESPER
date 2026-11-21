@@ -63,6 +63,7 @@ public sealed record MediaRepresentation
 
     /// <summary>True when the audio presence could not be verified (e.g. direct file with no codec metadata).</summary>
     public bool AudioUnverified { get; init; }
+    public bool MutedLoop { get; init; }
 
     /// <summary>Distinct delivery endpoint to retain as an alternative even at identical quality.</summary>
     public string? DeliveryId { get; init; }

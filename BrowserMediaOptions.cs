@@ -42,7 +42,7 @@ internal sealed partial class BrowserBridgeHandler
         Title = request.PageTitle, UserAgent = request.MediaAuth?.UserAgent,
         Authorization = MediaAuthorization(request, page),
         Candidates = (request.Candidates ?? []).Select(h => new BrowserMediaCandidate
-        { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network" }).ToList()
+        { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network", MutedLoop = h.MutedLoop }).ToList()
     };
 
     private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page) =>
