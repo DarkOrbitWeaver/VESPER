@@ -61,7 +61,7 @@ internal static class BrowserMessageValidator
                 UrlUtil.WithoutFragment(u), kind, Short(c.MimeType, 80), Dim(c.Width), Dim(c.Height),
                 c.Bitrate is > 0 and < 10_000_000_000 ? c.Bitrate : null,
                 c.DurationSeconds is > 0 and < 8_640_000 ? c.DurationSeconds : null,
-                Short(c.Label, 80)));
+                Short(c.Label, 80), c.MutedLoop));
         }
         if (m.Candidates.Count > MaxCandidates) v.Warnings.Add($"Only the first {MaxCandidates} candidates were considered");
 

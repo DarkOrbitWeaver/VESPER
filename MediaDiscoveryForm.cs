@@ -982,9 +982,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         // The format line is separate from the time-range line above, so neither hides the other.
         if ((result.Choice ?? complete.Choice) is { } choice)
         {
-            _notice.Text = _playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified)
-                ? "Audio is unconfirmed and will be checked before publication."
-                : IsExactFormat ? choice.DisplayDetail : "";
+            _notice.Text = IsExactFormat ? choice.DisplayDetail : "";
+            if (choice.MediaPlanJson == DirectMediaPlan.AudioIfPresent)
+                _notice.Text = "This video will be saved with audio if the source includes it.";
+            else if (_playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified))
+                _notice.Text = "Audio is unconfirmed and will be checked before publication.";
             if (choice.SubtitleTracks is { Count: > 0 })
             {
                 string subtitleNotice = choice.SubtitleNotice ?? "Selected subtitles are saved as separate files.";

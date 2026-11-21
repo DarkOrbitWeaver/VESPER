@@ -7,12 +7,39 @@ using System.Text;
 using System.Text.Json;
 using VESPER;
 using Vesper.Engine;
+using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
+using StreamContent = Vesper.MediaResolver.Models.StreamContent;
 
 namespace Vesper.Windows.Tests;
 
 public sealed class BrowserBridgeTests
 {
+    [Theory]
+    [InlineData("https://example.com/demos", true, true)]
+    [InlineData("https://example.com/demos", false, false)]
+    [InlineData("https://www.instagram.com/reel/123/", true, false)]
+    [InlineData("https://www.tiktok.com/@test/video/123", true, false)]
+    public void VideoWithoutAudioIsAllowedOnlyForADeclaredStandaloneMutedLoop(string page, bool mutedLoop, bool allowSilent)
+    {
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri(page), Provider = "generic", Title = "Video",
+            Representations = [new MediaRepresentation
+            {
+                Id = "direct-0", Url = new Uri("https://cdn.example.com/demo.mp4"), Protocol = StreamProtocol.Http,
+                Content = StreamContent.VideoAndAudio, AudioUnverified = true, Container = "mp4", MutedLoop = mutedLoop
+            }]
+        };
+
+        var (choice, error) = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
+
+        Assert.Null(error);
+        Assert.NotNull(choice);
+        Assert.Equal(allowSilent ? DirectMediaPlan.AudioIfPresent : null, choice.MediaPlanJson);
+        Assert.Contains(allowSilent ? "may be silent" : "audio not confirmed", choice.DisplayDetail);
+    }
+
     [Fact]
     public void Browser_collection_shortcut_requires_a_resolver_supplied_http_collection()
     {

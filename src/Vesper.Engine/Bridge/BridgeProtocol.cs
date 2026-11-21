@@ -7,7 +7,7 @@ namespace Vesper.Engine;
 public sealed record BridgeItem(string Url, string? FileName, string Kind, string? Referer, string? UserAgent, string? Sha256,
     string? Cookie, string? Authorization, string? OriginalUrl = null);
 
-public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType);
+public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false);
 
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
     IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
@@ -119,7 +119,8 @@ public static class BridgeProtocol
                         string? mime = Str(hint, "mimeType");
                         if (mime is { Length: > 100 } || mime is not null && mime.Any(char.IsControl))
                         { error = "Invalid media-hint MIME type."; return false; }
-                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime));
+                        bool mutedLoop = hint.TryGetProperty("mutedLoop", out var muted) && muted.ValueKind == JsonValueKind.True;
+                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop));
                     }
                 }
             }

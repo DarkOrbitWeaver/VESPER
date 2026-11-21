@@ -672,10 +672,11 @@ async function playerOptions(message, sender) {
   const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
   const source = binding && VesperPlayerSource.http(message.playerUrl);
   const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
+  const mutedLoop = message.mutedLoop === true && !!source && (sender.frameId ?? 0) === 0;
   const { route } = await settings();
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
-  const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route].join('|');
+  const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route, mutedLoop].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = cachedMediaOptions(lookupKey);
   if (cached) return cached;
@@ -724,7 +725,11 @@ async function playerOptions(message, sender) {
       mediaPrefetchAt.set(tab, now);
     }
     const candidates = [source, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
-      .filter(Boolean).map(candidate);
+      .filter(Boolean).map(url => {
+        const hint = candidate(url);
+        if (mutedLoop && url === source && hint.kind === 'direct') hint.mutedLoop = true;
+        return hint;
+      });
     const wholeRepresentation = source && matching?.kind === 'direct' && matching.wholeRepresentation && /^(?:audio|video)\//.test(matching.mime)
       && !SEGMENT.test(source.href) && !['range', 'sq', 'segment'].some(key => source.searchParams.has(key));
     const title = binding || !youTube ? message.title : undefined;

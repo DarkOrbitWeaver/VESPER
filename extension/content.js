@@ -87,6 +87,13 @@
     return player.currentSrc || player.src || '';
   }
 
+  function isMutedLoop(player, source) {
+    if (!player.defaultMuted || !player.autoplay || !player.loop || player.controls) return false;
+    const selected = VesperPlayerSource.http(source)?.href;
+    return !!selected && (VesperPlayerSource.http(player.src)?.href === selected
+      || [...player.querySelectorAll(':scope > source[src]')].some(child => VesperPlayerSource.http(child.src)?.href === selected));
+  }
+
   function isCurrentRequest(request) {
     if (!alive() || request !== panelRequest || !panelMedia) return false;
     const pageMatches = panelMedia.documentIdentity === VesperPlayerSource.identity(pageAddress());
@@ -248,6 +255,7 @@
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
       playerPlaying: !el.paused && !el.ended, playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      mutedLoop: current && isMutedLoop(el, src),
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
     }).then(reply => {
       if (reply?.data?.prefetchSkipped && prefetchedPlayers.get(el) === key) prefetchedPlayers.delete(el);
@@ -762,6 +770,7 @@
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
       title, playerPlaying: current && !player.paused && !player.ended, playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      mutedLoop: current && !isPreview && isMutedLoop(player, src),
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
