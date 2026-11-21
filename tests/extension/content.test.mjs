@@ -19,7 +19,7 @@ test('the butterfly motion picker has Animate and Off', () => {
 
 test('browser sign-in settings require approval for the current HTTPS host', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
-  assert.match(popup, /Use my sign-in/);
+  assert.match(popup, /Use my Chrome sign-in/);
   assert.match(popup, /id="signin-site" disabled/);
   assert.match(popup, /id="signin-host"/);
 });
@@ -52,14 +52,16 @@ test('opening the popup shows the installed extension version without checking t
         request: async value => { permissionRequests.push(structuredClone(value)); return true; },
         onRemoved: { addListener() {} }
       },
-      tabs: { query: async () => [] }
+      tabs: { query: async () => [{ id: 3, url: 'https://example.com/download' }] }
     };
-    vm.runInNewContext(source('popup'), { chrome, document: { getElementById }, VesperTheme: { install() {} } });
+    vm.runInNewContext(source('popup'), { chrome, URL, document: { getElementById }, VesperTheme: { install() {} } });
     await new Promise(resolve => setImmediate(resolve));
 
     assert.equal(getElementById('version').textContent, `Extension ${versionName || '1.0.2'}`);
     const browserDownloads = getElementById('browser-downloads');
     assert.equal(browserDownloads.value, 'chrome');
+    assert.equal(getElementById('handoff-setting').hidden, true);
+    assert.equal(getElementById('manual-downloads').hidden, true);
     assert.equal(getElementById('handoff').value, 'default');
     assert.equal(getElementById('prefetch').checked, true);
     assert.equal(getElementById('motion').value, 'animate');
@@ -70,11 +72,16 @@ test('opening the popup shows the installed extension version without checking t
     assert.deepEqual(permissionRequests, []);
     browserDownloads.value = 'manual';
     await browserDownloads.onchange();
+    assert.equal(getElementById('handoff-setting').hidden, false);
+    assert.equal(getElementById('manual-downloads').hidden, false);
     browserDownloads.value = 'automatic';
     await browserDownloads.onchange();
+    assert.equal(getElementById('manual-downloads').hidden, true);
     await allow.onclick();
     assert.deepEqual(permissionRequests, [{ permissions: ['cookies'] }]);
     assert.equal(allow.hidden, true);
+    assert.equal(getElementById('signin-site').checked, false);
+    assert.equal(getElementById('signin-host').textContent, 'example.com');
     assert.deepEqual(preferences, [
       { route: 'auto', intercept: false }, { route: 'auto', intercept: true }, { useSignIn: true }
     ]);

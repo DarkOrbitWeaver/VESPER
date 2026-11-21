@@ -80,7 +80,7 @@ internal sealed class SettingsForm : VesperPopupForm
         (string Title, VesperIcon Icon)[] tabs =
         [
             ("Downloads", VesperIcon.Download), ("Transfers", VesperIcon.Gauge), ("Network", VesperIcon.Provider),
-            ("Appearance", VesperIcon.Leaf), ("Sites", VesperIcon.Provider), ("Browser", VesperIcon.Link),
+            ("Appearance", VesperIcon.Leaf), ("Browser", VesperIcon.Link),
             ("About", VesperIcon.Info)
         ];
         for (int i = 0; i < tabs.Length; i++)
@@ -197,10 +197,11 @@ internal sealed class SettingsForm : VesperPopupForm
         foreach (var (name, page) in _pages)
             page.Visible = name == tab;
         if (_pages.TryGetValue(tab, out var active)) active.BringToFront();
+        string section = tab == "Sites" ? "Browser" : tab;
         foreach (var (name, nav) in _navigation)
         {
-            nav.NavigationActive = name == tab;
-            nav.Font = name == tab ? _navActiveFont : _navFont;
+            nav.NavigationActive = name == section;
+            nav.Font = name == section ? _navActiveFont : _navFont;
             nav.Invalidate();
         }
     }
@@ -261,13 +262,14 @@ internal sealed class SettingsForm : VesperPopupForm
         var categoryNote = Label("Organize future files into Music, Video, Archives and other folders.", 8, muted: true);
         categoryNote.SetBounds(45, 265, 470, 23);
         var separator2 = Divider(305);
-        var templateHeading = Label("Optional filename template", 9, bold: true);
+        var templateHeading = Label("Name new files", 9, bold: true);
         templateHeading.SetBounds(25, 317, 400, 22);
-        var templateNote = Label("Use {name} for the title and {host} for the source site. The extension stays at the end.", 8, muted: true);
-        templateNote.SetBounds(25, 342, 500, 20);
+        var templateNote = Label("{name} adds the title. {host} adds the site. Leave blank to keep the original name.", 8, muted: true);
+        templateNote.SetBounds(25, 342, 500, 27);
         var (templateFrame, templateInput) = Input(_draft.FileNameTemplate, 500);
         templateFrame.SetBounds(25, 371, 500, 34);
         templateInput.AccessibleName = "Filename template";
+        templateInput.PlaceholderText = "{name} - {host}";
         _fileNameTemplate = templateInput;
         var templatePreview = Label("", 8, muted: true);
         templatePreview.SetBounds(25, 408, 500, 22);
@@ -276,7 +278,7 @@ internal sealed class SettingsForm : VesperPopupForm
             _draft.FileNameTemplate = templateInput.Text;
             if (string.IsNullOrWhiteSpace(templateInput.Text))
             {
-                templatePreview.Text = "Preview: Coastal walk.mp4 (template off)";
+                templatePreview.Text = "Example: {name} - {host} → Coastal walk - media.example.mp4";
             }
             else if (!FileNames.TryValidateTemplate(templateInput.Text, out string problem))
             {
@@ -347,21 +349,25 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void BuildSiteRules()
     {
-        var page = Page("Sites", "Choose a default behavior for an exact website host.");
-        var listLabel = Label("Site rules", 9, bold: true);
-        listLabel.SetBounds(25, 108, 400, 22);
+        var page = Page("Sites", "Save downloads from a site to a folder, prefer audio, or leave them in Chrome.");
+        var back = Button("Back to Browser", 145);
+        back.SetBounds(380, 98, 145, 32);
+        back.Click += (_, _) => ShowPage("Browser");
+        var listLabel = Label("Saved rules", 9, bold: true);
+        listLabel.SetBounds(25, 104, 210, 22);
         _siteRuleList = new ListBox
         {
             Name = "siteRuleList", AccessibleName = "Site rules", IntegralHeight = false,
             Location = new Point(25, 134), Size = new Size(505, 142),
             BackColor = _colors.Surface, ForeColor = _colors.Text, Font = new Font("Segoe UI", 9)
         };
-        var hostLabel = Label("Website host", 9, bold: true);
+        var hostLabel = Label("Website name", 9, bold: true);
         hostLabel.SetBounds(25, 287, 250, 22);
         var (hostFrame, host) = Input("", 350);
         hostFrame.SetBounds(25, 313, 350, 34);
         host.Name = "siteHostInput";
         host.AccessibleName = "Website host";
+        host.PlaceholderText = "www.example.com";
         _siteHost = host;
         var audio = Check("Prefer audio-only media", 25, 354, false, _ => { });
         audio.Name = "siteAlwaysAudio";
@@ -372,7 +378,7 @@ internal sealed class SettingsForm : VesperPopupForm
         capture.AccessibleName = "Keep automatic browser downloads in Chrome for this site";
         _siteNeverCapture = capture;
 
-        var folderLabel = Label("Always use this download folder", 9, bold: true);
+        var folderLabel = Label("Default folder for this site", 9, bold: true);
         folderLabel.SetBounds(25, 418, 310, 22);
         var (folderFrame, folder) = Input("", 385);
         folderFrame.SetBounds(25, 445, 385, 34);
@@ -396,7 +402,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var removeRule = Button("Remove rule", 130, symbol: VesperIcon.Trash);
         removeRule.Name = "removeSiteRule";
         removeRule.SetBounds(163, 492, 130, 34);
-        var note = Label("Hosts match exactly; add a separate rule for a subdomain. Audio-only is the starting choice. A folder chosen in a review dialog overrides the saved site folder for that download. VESPER stores the host, not the page address or query string.",
+        var note = Label("Use the site name from Chrome’s address bar. www.example.com and example.com need separate rules.",
             8, muted: true);
         note.SetBounds(25, 538, 505, 42);
         note.AutoEllipsis = false;
@@ -528,13 +534,14 @@ internal sealed class SettingsForm : VesperPopupForm
             _draft.SiteRules.RemoveAt(index);
             RefreshRules(Math.Min(index, _draft.SiteRules.Count - 1));
         };
-        page.Controls.AddRange([listLabel, _siteRuleList, hostLabel, hostFrame, audio, capture,
+        page.Controls.AddRange([back, listLabel, _siteRuleList, hostLabel, hostFrame, audio, capture,
             folderLabel, folderFrame, browse, saveRule, removeRule, note]);
         void Layout()
         {
             int available = page.ClientSize.Width - S(50);
             int gap = S(8);
             _siteRuleList.Width = Math.Max(S(200), available);
+            back.Left = _siteRuleList.Right - back.Width;
             hostFrame.Width = Math.Max(S(200), available);
             folderFrame.Width = Math.Max(S(200), available - browse.Width - gap);
             browse.Left = folderFrame.Right + gap;
@@ -772,6 +779,9 @@ internal sealed class SettingsForm : VesperPopupForm
             ? "Load the extension in Chrome from chrome://extensions using Developer mode."
             : "This build does not include the extension files.", 8, muted: true);
         developerTip.SetBounds(25, 277, 505, 35);
+        var siteRules = Button("Site rules…", 142, symbol: VesperIcon.Provider);
+        siteRules.SetBounds(25, 320, 142, 34);
+        siteRules.Click += (_, _) => ShowPage("Sites");
         helperAction.Click += (_, _) =>
         {
             bool disconnect = NativeHostSetup.IsRegistered;
@@ -785,7 +795,7 @@ internal sealed class SettingsForm : VesperPopupForm
             RefreshHelper();
         };
 
-        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, helperAction, developerTip]);
+        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, helperAction, developerTip, siteRules]);
         void RefreshHelper()
         {
             bool hostPresent = NativeHostSetup.HostPresent;
@@ -797,6 +807,7 @@ internal sealed class SettingsForm : VesperPopupForm
             helperAction.Top = S(registered ? 204 : 236);
             open.Top = S(registered ? 204 : 236);
             developerTip.Top = open.Bottom + S(7);
+            siteRules.Top = developerTip.Bottom + S(6);
         }
         void Layout()
         {

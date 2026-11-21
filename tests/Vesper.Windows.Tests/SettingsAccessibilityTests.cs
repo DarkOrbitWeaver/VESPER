@@ -246,9 +246,10 @@ public sealed class SettingsAccessibilityTests
             form.StartPosition = FormStartPosition.Manual;
             form.Location = new Point(-form.Width - 80, -form.Height - 80);
             form.Show();
-            _ = form.Handle;
-            typeof(SettingsForm).GetMethod("ShowPage", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(form, ["Sites"]);
+            var buttons = Descendants(form).OfType<VesperButton>().ToArray();
+            Assert.DoesNotContain(buttons, button => button.Name == "navigationSites");
+            Assert.Single(buttons, button => button.Name == "navigationBrowser").PerformClick();
+            Assert.Single(buttons, button => button.Text == "Site rules…").PerformClick();
             Application.DoEvents();
             TextBox host = Descendants(form).OfType<TextBox>().Single(control => control.Name == "siteHostInput");
             CheckBox audio = Descendants(form).OfType<CheckBox>().Single(control => control.Name == "siteAlwaysAudio");
@@ -266,6 +267,8 @@ public sealed class SettingsAccessibilityTests
 
             remove.PerformClick();
             Assert.Empty(form.Result.SiteRules);
+            Assert.Single(buttons, button => button.Text == "Back to Browser").PerformClick();
+            Assert.False(host.Visible);
         });
     }
 

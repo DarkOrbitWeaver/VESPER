@@ -28,11 +28,12 @@
     <label class="setting"><span>Browser downloads</span>
       <select id="browser-downloads">
         <option value="automatic">Send to VESPER automatically</option>
-        <option value="manual">Only when I choose VESPER</option>
+        <option value="manual">Send from right-click menu</option>
         <option value="chrome">Save with Chrome</option>
       </select>
     </label>
-    <label class="setting"><span>When capturing a file</span>
+    <small id="manual-downloads" hidden>Right-click a link and choose <strong>Download link with VESPER</strong>.</small>
+    <label class="setting" id="handoff-setting"><span>After sending a file</span>
       <select id="handoff">
         <option value="download">Download now</option>
         <option value="queue">Queue</option>
@@ -42,16 +43,16 @@
     <p id="first-run" class="hint" hidden>Chrome keeps downloads it has already started.</p>
     <details id="site-sign-in">
       <summary>Site sign-in</summary>
-      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my sign-in<small id="signin-access"></small></span></label>
-      <button id="signin-permission" class="vesper-button" type="button" hidden>Allow sign-in in Chrome</button>
+      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my Chrome sign-in<small id="signin-access"></small></span></label>
+      <button id="signin-permission" class="vesper-button" type="button" hidden>Allow Chrome sign-in access</button>
       <details id="file-sign-in" hidden>
-        <summary>File downloads</summary>
-        <label class="check"><input type="checkbox" id="signin-site" disabled><span>Use sign-in on <strong id="signin-host">this site</strong><small id="signin-site-hint"></small></span></label>
+        <summary>Files that require sign-in</summary>
+        <label class="check"><input type="checkbox" id="signin-site" disabled><span>Allow file sign-in on <strong id="signin-host">this site</strong><small id="signin-site-hint">Turn this on if the file requires your account.</small></span></label>
       </details>
     </details>
     <details>
-      <summary>More settings</summary>
-      <label class="check"><input type="checkbox" id="prefetch"><span>Load video choices early</span></label>
+      <summary>Video picker</summary>
+      <label class="check"><input type="checkbox" id="prefetch"><span>Find video formats early<small>Start checking formats before you open the butterfly.</small></span></label>
     </details>
     <details id="recent" hidden>
       <summary>Recent capture results</summary>

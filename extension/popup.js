@@ -12,6 +12,11 @@ async function init() {
   $('handoff').value = prefs.handoff;
   const browserDownloads = $('browser-downloads');
   browserDownloads.value = prefs.route === 'chrome' ? 'chrome' : prefs.intercept ? 'automatic' : 'manual';
+  function showDownloadMode() {
+    $('manual-downloads').hidden = browserDownloads.value !== 'manual';
+    $('handoff-setting').hidden = browserDownloads.value === 'chrome';
+  }
+  showDownloadMode();
   const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats').catch(() => ({}));
   $('prefetch').checked = prefetchFormats;
   // Say what capture does the first time, in plain words.
@@ -22,10 +27,13 @@ async function init() {
   $('theme').onchange = () => chrome.storage.sync.set({ theme: $('theme').value });
   $('motion').onchange = () => chrome.storage.sync.set({ motion: $('motion').value });
   $('handoff').onchange = () => chrome.storage.sync.set({ handoff: $('handoff').value });
-  browserDownloads.onchange = () => chrome.storage.sync.set({
-    route: browserDownloads.value === 'chrome' ? 'chrome' : 'auto',
-    intercept: browserDownloads.value === 'automatic'
-  });
+  browserDownloads.onchange = () => {
+    showDownloadMode();
+    return chrome.storage.sync.set({
+      route: browserDownloads.value === 'chrome' ? 'chrome' : 'auto',
+      intercept: browserDownloads.value === 'automatic'
+    });
+  };
   $('prefetch').onchange = async () => {
     const enabled = $('prefetch').checked;
     await chrome.storage.local.set({ prefetchFormats: enabled });
@@ -80,7 +88,8 @@ async function init() {
       if (siteSignIn.checked) hosts.add(siteHost);
       else hosts.delete(siteHost);
       await chrome.storage.local.set({ signInHosts: [...hosts].slice(0, 50) });
-      siteHint.textContent = '';
+      siteHint.textContent = siteSignIn.checked ? 'VESPER can use your sign-in for files from this site.'
+        : 'Turn this on if the file requires your account.';
     } catch {
       siteSignIn.checked = !siteSignIn.checked;
       siteHint.textContent = 'Couldn’t save this site’s sign-in setting.';
@@ -92,7 +101,9 @@ async function init() {
     cookiePermission = allowed;
     signIn.checked = prefs.useSignIn;
     permit.hidden = allowed || !signIn.checked;
-    access.textContent = signIn.checked && allowed ? 'Available on supported video sites.' : '';
+    access.textContent = !signIn.checked ? '' : allowed
+      ? 'Used automatically when you choose a video on a supported site.'
+      : 'Chrome needs your permission to use your sign-in.';
     fileSignIn.hidden = !allowed || !signIn.checked || !siteHost;
     siteSignIn.disabled = fileSignIn.hidden;
   }
