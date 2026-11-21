@@ -9,3 +9,7 @@ release/
 node_modules/
 TestResults/
 *.trx
+.vesper-dev/
+.scratchpad/
+*.patch
+*.diff

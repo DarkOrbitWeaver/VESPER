@@ -100,6 +100,7 @@ Sign-ReleaseFile (Join-Path $out 'vesper-host.exe')
 
 Write-Host "==> Extension" -ForegroundColor Green
 Copy-Item (Join-Path $root "extension") (Join-Path $out "extension") -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $out 'extension/LICENSE')
 $manifestFile = Join-Path $out 'extension/manifest.json'
 $extensionManifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
 $extensionManifest.version = ($Version -split '-')[0]
