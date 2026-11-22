@@ -62,9 +62,9 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Theory]
-    [InlineData(MediaOutput.Wav, JobKind.Http, "full media first")]
-    [InlineData(MediaOutput.Wav, JobKind.Hls, "start a little early or end a little late")]
-    [InlineData(MediaOutput.Original, JobKind.Merge, "start a little early or end a little late")]
+    [InlineData(MediaOutput.Wav, JobKind.Http, "full file, then trims")]
+    [InlineData(MediaOutput.Wav, JobKind.Hls, "cut may shift slightly")]
+    [InlineData(MediaOutput.Original, JobKind.Merge, "cut may shift slightly")]
     public void ClipNoticeMatchesTheActualRangeBehavior(MediaOutput output, JobKind kind, string expected)
     {
         Assert.Contains(expected, MediaDiscoveryForm.ClipBehaviorNotice(output, kind), StringComparison.OrdinalIgnoreCase);
@@ -237,7 +237,7 @@ public sealed class MediaDiscoveryFormTests
             Control<TextBox>("_clipEnd").Text = "00:25";
             Application.DoEvents();
 
-            Assert.Contains("downloads the full media first", note.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("downloads the full file, then trims", note.Text, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("decodes", note.Text, StringComparison.OrdinalIgnoreCase);
             Assert.True(download.Enabled);
             var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;

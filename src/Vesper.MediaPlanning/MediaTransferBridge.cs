@@ -52,7 +52,7 @@ internal static class MediaTransferBridge
 {
     private const int MaxEmbeddedSubtitleTracks = 25;
     private const string LocalMp4ClipSourceError = "This source doesn't provide enough information for VESPER to trim the MP4.";
-    private const string LocalMp4ClipSubtitleError = "Time range can't keep selected subtitles at full length. Turn subtitles off or choose a segmented format.";
+    private const string LocalMp4ClipSubtitleError = "Trim can't include embedded subtitles. Turn subtitle embedding off or choose a segmented format.";
     private static readonly ResolverOptions SubtitleUrlOptions = new();
 
     internal static string DisplayQuality(string quality) => quality
@@ -137,7 +137,7 @@ internal static class MediaTransferBridge
         if (nativeResult.Choice is { } compatible && nativeSelection is { HasVideo: true })
             return (compatible, null);
         if (clipStartSeconds is not null && nativeSelection is { HasVideo: true })
-            return (null, nativeResult.Error ?? "The selected MP4-compatible format can't use this time range.");
+            return (null, nativeResult.Error ?? "The selected MP4-compatible format can't be trimmed.");
 
         var original = PrepareSource(item, prefs, exact: null, out FormatSelection? source,
             clipStartSeconds, clipEndSeconds);
@@ -464,7 +464,7 @@ internal static class MediaTransferBridge
             && tracks.All(track => track.Protocol is StreamProtocol.Hls or StreamProtocol.Dash);
         bool localMp4Clip = CanClipLocalMp4Tracks(tracks, container);
         if (clipStartSeconds is not null && !segmentedClip && !localMp4Clip)
-            return (null, "This format can't use a time range. Choose a compatible MP4 or segmented HLS/DASH format.");
+            return (null, "This format can't be trimmed. Choose a compatible MP4 or segmented HLS/DASH format.");
         if (clipStartSeconds is not null && localMp4Clip && selection.Subtitles.Count > 0)
             return (null, LocalMp4ClipSubtitleError);
         MediaRequestContext ctx = tracks[0].Context;
@@ -661,17 +661,17 @@ internal static class MediaTransferBridge
         bool subtitleLimitReached = false, int unsupportedSubtitleCount = 0)
     {
         string? message = selectedCount == 0 ? null : !requested
-            ? "Selected subtitles are also saved as separate files."
+            ? "Selected subtitles will be saved as separate files."
             : subtitleLimitReached
-                ? $"At most {MaxEmbeddedSubtitleTracks} supported subtitles can be embedded per job. Separate files for every selected subtitle are still queued."
+                ? "Too many subtitles to add inside the video. Separate subtitle files are saved instead."
                 : embeddedCount == selectedCount
-                    ? "VESPER will embed supported SRT/WebVTT subtitles when their content validates. Separate subtitle files are also queued."
+                    ? "Subtitles will appear as a track in the video. Separate files stay available too."
                     : embeddedCount > 0
-                        ? "VESPER will try to embed supported SRT/WebVTT subtitles. Other selected subtitles remain separate files."
-                        : "Selected subtitles remain separate files for this source, format, or transport.";
+                        ? "Supported subtitles will appear in the video; separate files stay available too."
+                        : "These subtitles are saved separately for this format.";
         if (unsupportedSubtitleCount > 0)
         {
-            const string unavailable = "Some selected captions were unsupported or failed source validation; media and supported sidecars remain queued.";
+            const string unavailable = "Some selected captions weren't available; the rest can still be saved.";
             message = message is null ? unavailable : message + " " + unavailable;
         }
         return message;

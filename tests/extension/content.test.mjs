@@ -101,7 +101,7 @@ test('subtitle embedding stays opt-in and travels with the native media selectio
   const content = source('content');
   const background = source('background');
   assert.match(content, /embedSubtitles: false/);
-  assert.match(content, /Embed selected subtitles/);
+  assert.match(content, /Add subtitles to video/);
   assert.match(content, /formats\.browserChoice \? \{ type: 'browser-media-select'[\s\S]*: \{ type: 'media-select',[\s\S]*\.\.\.intent/);
   assert.match(background, /const embedSubtitles = message\.embedSubtitles === true/);
   assert.match(background, /mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles/);
@@ -114,8 +114,8 @@ test('ended media stays bound to its player and selected range notice explains w
   assert.match(content, /playerHasMedia: current &&/);
   assert.match(content, /newPlayerPlaying/);
   assert.match(content, /overlapsFrame >= frameArea \* 0\.5/);
-  assert.match(content, /VESPER fetches only the selected-range parts/);
-  assert.match(content, /downloads the full media first, then keeps your range/);
+  assert.match(content, /Downloads only the segments in this range; the cut may shift slightly/);
+  assert.match(content, /Downloads the full file, then trims to this range/);
 });
 
 test('the butterfly clears fullscreen focus and tries safer edge perches first', () => {

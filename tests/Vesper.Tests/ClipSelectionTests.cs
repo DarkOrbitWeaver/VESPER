@@ -19,9 +19,9 @@ public sealed class ClipSelectionTests
     [Theory]
     [InlineData("abc", "02:00", "mm:ss")]
     [InlineData("", "02:00", "mm:ss")]
-    [InlineData("02:00", "02:00", "later than the From time")]
-    [InlineData("03:00", "02:00", "later than the From time")]
-    [InlineData("00:00", "10:01", "past the end")]
+    [InlineData("02:00", "02:00", "later than Start")]
+    [InlineData("03:00", "02:00", "later than Start")]
+    [InlineData("00:00", "10:01", "past the media length")]
     public void An_invalid_range_says_what_to_change(string from, string to, string expected)
     {
         Assert.False(ClipSelection.TryGetRange(from, to, TenMinutes, out _, out _, out string error));
@@ -32,7 +32,7 @@ public sealed class ClipSelectionTests
     public void An_unknown_length_never_yields_a_range()
     {
         Assert.False(ClipSelection.TryGetRange("00:00", "01:00", null, out _, out _, out string error));
-        Assert.Contains("known length", error);
+        Assert.Contains("known media length", error);
     }
 
     [Fact]
@@ -41,9 +41,9 @@ public sealed class ClipSelectionTests
         Assert.Null(ClipSelection.UnavailableReason(false, TenMinutes, ClipMode.Segments));
         Assert.Null(ClipSelection.UnavailableReason(false, TenMinutes, ClipMode.FullFile));
         Assert.Contains("live", ClipSelection.UnavailableReason(true, TenMinutes, ClipMode.Segments));
-        Assert.Contains("known length", ClipSelection.UnavailableReason(false, null, ClipMode.Segments));
-        Assert.Contains("known length", ClipSelection.UnavailableReason(false, TimeSpan.Zero, ClipMode.Segments));
-        Assert.Contains("can't be cut", ClipSelection.UnavailableReason(false, TenMinutes, ClipMode.None));
+        Assert.Contains("known media length", ClipSelection.UnavailableReason(false, null, ClipMode.Segments));
+        Assert.Contains("known media length", ClipSelection.UnavailableReason(false, TimeSpan.Zero, ClipMode.Segments));
+        Assert.Contains("can't be trimmed", ClipSelection.UnavailableReason(false, TenMinutes, ClipMode.None));
     }
 
     [Fact]
@@ -60,7 +60,7 @@ public sealed class ClipSelectionTests
             null, null, CanUseFullFileClip: true);
         Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(mp4Source));
         Assert.Contains("only the segments", ClipSelection.Notice(ClipMode.Segments), StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("full media first", ClipSelection.Notice(ClipMode.FullFile));
+        Assert.Contains("full file, then trims", ClipSelection.Notice(ClipMode.FullFile));
     }
 
     [Theory]

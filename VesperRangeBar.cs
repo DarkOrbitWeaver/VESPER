@@ -3,7 +3,7 @@ using System.Drawing.Drawing2D;
 
 namespace VESPER;
 
-// A compact time bar with two handles. The From and To text fields stay the precise way to enter a time;
+// A compact time bar with two handles. The Start and End text fields stay the precise way to enter a time;
 // this is the quick way. The owner form keeps both in step through SetRange and RangeChanged.
 public sealed class VesperRangeBar : Control
 {
@@ -29,8 +29,8 @@ public sealed class VesperRangeBar : Control
             ControlStyles.OptimizedDoubleBuffer | ControlStyles.Selectable |
             ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         AccessibleRole = AccessibleRole.Slider;
-        AccessibleName = "Time range";
-        AccessibleDescription = "Left and Right move a handle by one second. Up and Down switch between the From and To handles.";
+        AccessibleName = "Trim range";
+        AccessibleDescription = "Left and Right move a handle by one second. Up and Down switch between the Start and End handles.";
         TabStop = true;
         Height = 26;
     }

@@ -3,7 +3,7 @@ using Vesper.Engine;
 
 namespace VESPER;
 
-// How a chosen format can be cut to a time range.
+// How a chosen format can be trimmed to a time range.
 internal enum ClipMode
 {
     None,       // this format cannot be cut
@@ -14,8 +14,8 @@ internal enum ClipMode
 internal static class ClipSelection
 {
     internal const double LongestSeconds = 31_536_000;
-    internal const string SegmentNotice = "VESPER downloads only the segments in your range; the clip may start a little early or end a little late.";
-    internal const string FullFileNotice = "VESPER downloads the full media first, then keeps your time range.";
+    internal const string SegmentNotice = "Downloads only the segments in this range; the cut may shift slightly.";
+    internal const string FullFileNotice = "Downloads the full file, then trims to this range.";
 
     internal static ClipMode ModeFor(MediaDownloadChoice choice)
     {
@@ -29,14 +29,14 @@ internal static class ClipSelection
 
     internal static string Notice(ClipMode mode) => mode == ClipMode.FullFile ? FullFileNotice : SegmentNotice;
 
-    // Why the time range cannot be used, or null when it can.
+    // Why trimming is unavailable, or null when it can be used.
     internal static string? UnavailableReason(bool isLive, TimeSpan? duration, ClipMode mode)
     {
-        if (isLive) return "Time range isn't available for live streams.";
+        if (isLive) return "Trim isn't available for live streams.";
         if (duration is not { TotalSeconds: > 0 and <= LongestSeconds })
-            return "Time range needs a known length, and this source doesn't report one.";
+            return "Trim needs a known media length, and this source doesn't report one.";
         if (mode == ClipMode.None)
-            return "This format can't be cut to a time range. Pick another format to use Time range.";
+            return "This format can't be trimmed. Choose another format or turn Trim off.";
         return null;
     }
 
@@ -58,22 +58,22 @@ internal static class ClipSelection
         start = end = 0;
         if (duration is not { } length)
         {
-            error = "Time range needs a known length, and this source doesn't report one.";
+            error = "Trim needs a known media length, and this source doesn't report one.";
             return false;
         }
         if (!TryParseTime(fromText, out TimeSpan from) || !TryParseTime(toText, out TimeSpan to))
         {
-            error = "Enter the From and To times as mm:ss or hh:mm:ss.";
+            error = "Enter Start and End as mm:ss or hh:mm:ss.";
             return false;
         }
         if (to <= from)
         {
-            error = "The To time must be later than the From time.";
+            error = "End must be later than Start.";
             return false;
         }
         if (to > length || to.TotalSeconds > LongestSeconds)
         {
-            error = $"The To time is past the end of the media ({TimeText(length)}).";
+            error = $"End is past the media length ({TimeText(length)}).";
             return false;
         }
 

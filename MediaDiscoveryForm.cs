@@ -211,9 +211,9 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _subtitleMenu.Items.Add(_subtitleHost);
         _embedSubtitles = new CheckBox
         {
-            Text = "Embed selected subtitles",
-            AccessibleName = "Embed selected subtitles",
-            AccessibleDescription = "Tries to embed supported SRT or WebVTT subtitles in MP4 or Matroska. Separate subtitle files are still queued; live, segmented, styled, or unsupported subtitles remain separate.",
+            Text = "Add subtitles to video",
+            AccessibleName = "Add subtitles to video",
+            AccessibleDescription = "Adds compatible subtitles inside the video file. Separate subtitle files are saved too.",
             AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft,
             BackColor = _colors.Surface,
@@ -257,12 +257,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             _audioTrack, _subtitleChoice, _embedSubtitles, _customLabel, _customFormat]);
         _clipCheck = new VesperCheckBox(_colors)
         {
-            Text = "Time range", AccessibleName = "Download only a time range of the media", AutoSize = false,
+            Text = "Trim", AccessibleName = "Trim the media", AccessibleDescription = "Choose the part of the media to download.", AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft, BackColor = _colors.Surface, ForeColor = _colors.Text,
             Font = new Font("Segoe UI", 9), Visible = false
         };
-        _clipStartLabel = L("From", 8.5f, muted: true);
-        _clipEndLabel = L("To", 8.5f, muted: true);
+        _clipStartLabel = L("Start", 8.5f, muted: true);
+        _clipEndLabel = L("End", 8.5f, muted: true);
         _clipStart = ClipTimeBox("Clip start time");
         _clipEnd = ClipTimeBox("Clip end time");
         _clipBar = new VesperRangeBar { Visible = false };
@@ -445,11 +445,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     // The status label ends above the track and output controls.
     private int StatusBaseHeight => _state == ViewState.Unavailable ? 57 : 28;
 
-    // Height of the time bar and the time-range message below the Time range row, in logical pixels.
+    // Height for the note below the trim row, in logical pixels.
     private int ClipExtraHeight(int contentWidth)
     {
         if (_state != ViewState.Ready || !_clipRowShown) return 0;
-        int extra = _clipFieldsShown ? 28 : 0;
+        int extra = 0;
         if (_clipNote.Text.Length > 0) extra += 20 + ExtraLines(_clipNote, contentWidth, 18);
         return extra;
     }
@@ -521,18 +521,22 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             Place(_customLabel, margin, 398 + subtitleShift, contentWidth, 18);
             Place(_customFormat, margin, 419 + subtitleShift, contentWidth, 34);
             int clipY = (IsExactFormat ? 457 : 402) + subtitleShift;
-            Place(_clipCheck, margin, clipY, S(126), 29);
-            Place(_clipStartLabel, margin + S(134), clipY, S(40), 29);
-            Place(_clipStart, margin + S(174), clipY + 2, S(86), 25);
-            Place(_clipEndLabel, margin + S(272), clipY, S(26), 29);
-            Place(_clipEnd, margin + S(300), clipY + 2, S(86), 25);
+            int gap = S(7), checkWidth = S(82), startLabelWidth = S(34), startWidth = S(72);
+            int endLabelWidth = S(28), endWidth = S(74);
+            int startLabelX = margin + checkWidth + gap;
+            int startX = startLabelX + startLabelWidth + S(3);
+            int endX = width - margin - endWidth;
+            int endLabelX = endX - S(3) - endLabelWidth;
+            int barX = startX + startWidth + gap;
+            int barWidth = Math.Max(1, endLabelX - gap - barX);
+            Place(_clipCheck, margin, clipY, checkWidth, 29);
+            Place(_clipStartLabel, startLabelX, clipY, startLabelWidth, 29);
+            Place(_clipStart, startX, clipY + 2, startWidth, 25);
+            Place(_clipBar, barX, clipY + 1, barWidth, 26);
+            Place(_clipEndLabel, endLabelX, clipY, endLabelWidth, 29);
+            Place(_clipEnd, endX, clipY + 2, endWidth, 25);
             int clipNoteY = clipY + 31;
-            if (_clipFieldsShown)
-            {
-                Place(_clipBar, margin, clipNoteY, contentWidth, 26);
-                clipNoteY += 28;
-            }
-            Place(_clipNote, margin, clipNoteY, contentWidth, Math.Max(18, _clipExtra - (_clipFieldsShown ? 28 : 0) - 2));
+            Place(_clipNote, margin, clipNoteY, contentWidth, Math.Max(18, _clipExtra - 2));
             int noticeY = _state switch
             {
                 ViewState.Ready => (IsExactFormat ? (_clipRowShown ? 495 : 464) : (_clipRowShown ? 440 : 402)) + _clipExtra,
@@ -946,7 +950,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
     }
 
     private const string ClipNotPossible =
-        "This format can't be cut to a time range. Turn off Time range to download all of it, or pick another format.";
+        "This format can't be trimmed. Turn off Trim to download the full file, or choose another format.";
 
     private void UpdateChoiceSummary()
     {
@@ -956,11 +960,11 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         ClipMode mode = complete.Choice is { } fullChoice ? ClipSelection.ModeFor(fullChoice) : ClipMode.None;
         string? unavailable = ClipSelection.UnavailableReason(_item.IsLive, _item.Duration, mode);
         bool wantsClip = _clipCheck.Checked;
-        // No format, no time-range row: the format problem is the message that matters.
+        // No format, no trim row: the format problem is the message that matters.
         SetClipControls(show: complete.Choice is not null, available: unavailable is null);
 
-        // A chosen range is never dropped quietly. If the new format cannot be cut, the buttons stay off
-        // until the user turns Time range off or picks a format that can.
+        // A chosen range is never dropped quietly. If the new format cannot be trimmed, the buttons stay off
+        // until the user turns Trim off or picks a format that can.
         var result = complete;
         string clipError = "";
         string clipText = unavailable ?? "";
@@ -970,7 +974,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             else if (TryGetClipRange(out double start, out double end, out clipError))
             {
                 result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
-                if (result.Choice is null) clipError = result.Error ?? "This time range isn't available for the source.";
+                if (result.Choice is null) clipError = result.Error ?? "This trim isn't available for the source.";
                 else clipText = ClipRangeSummary(start, end, _item.Duration!.Value.TotalSeconds) + ". " + ClipSelection.Notice(mode);
             }
             if (clipError.Length > 0) clipText = clipError;
@@ -1046,7 +1050,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         TextAlign = HorizontalAlignment.Center, Visible = false
     };
 
-    // show: the Time range row belongs on screen. available: the chosen format can be cut.
+    // show: the trim row belongs on screen. available: the chosen format can be trimmed.
     // A checked box stays usable when the format cannot be cut, so the user can turn it off.
     private void SetClipControls(bool show, bool available)
     {

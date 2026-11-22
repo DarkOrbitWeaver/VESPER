@@ -447,9 +447,12 @@
     return parts.reduce((total, part) => total * 60 + part, 0);
   }
   function clockText(seconds) {
-    const total = Math.max(0, Math.round(seconds));
+    const tenths = Math.max(0, Math.round(seconds * 10));
+    const total = Math.floor(tenths / 10);
+    const fraction = tenths % 10;
     const h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60;
-    return (h ? `${h}:${String(m).padStart(2, '0')}` : String(m)) + ':' + String(s).padStart(2, '0');
+    const secondsText = String(s).padStart(2, '0') + (fraction ? `.${fraction}` : '');
+    return (h ? `${h}:${String(m).padStart(2, '0')}` : String(m)) + ':' + secondsText;
   }
 
   function element(tag, className, text = '') {
@@ -501,11 +504,16 @@
         .output{display:flex;flex-wrap:wrap;min-width:0;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
         .clip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px 0;font-size:12px;color:var(--text)}
         .clip[hidden],.clip .fields[hidden],.hint[hidden]{display:none}
-        .clip .fields{display:grid;gap:6px;width:100%}
-        .clip .trim-line{display:grid;grid-template-columns:30px 62px 1fr;gap:8px;align-items:center}
-        .clip .fields small{color:var(--muted);font-size:11px}
-        .clip input[type=text]{width:62px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px}
-        .clip input[type=range]{min-width:0;width:100%;margin:0;accent-color:var(--green)}
+        .clip .fields{display:grid;gap:5px;width:100%}
+        .clip .trim-values{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%}
+        .clip .trim-value{display:grid;grid-template-columns:auto minmax(64px,82px);gap:6px;align-items:center;color:var(--muted);font-size:11px}
+        .clip .trim-value input{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px;text-align:center}
+        .clip .trim-range{--range-start:0%;--range-end:100%;position:relative;width:100%;height:22px;touch-action:none;
+          background:linear-gradient(to right,var(--border) 0,var(--border) var(--range-start),var(--green) var(--range-start),var(--green) var(--range-end),var(--border) var(--range-end),var(--border) 100%) center/100% 4px no-repeat}
+        .clip .trim-range input[type=range]{position:absolute;inset:0;width:100%;height:100%;margin:0;appearance:none;background:transparent;pointer-events:none;accent-color:var(--green)}
+        .clip .trim-range input[type=range]::-webkit-slider-runnable-track{height:4px;background:transparent}
+        .clip .trim-range input[type=range]::-webkit-slider-thumb{appearance:none;width:14px;height:14px;margin-top:-5px;border:2px solid var(--green);border-radius:50%;background:var(--surface);pointer-events:auto;cursor:ew-resize}
+        .clip .trim-range input[type=range]:focus-visible::-webkit-slider-thumb{outline:2px solid var(--text);outline-offset:2px}
         .clip input[type=checkbox]{accent-color:var(--green);margin:0}
         .clip>label{display:flex;gap:7px;align-items:center}
         .clip-error{color:var(--red);font-size:11px}
@@ -531,6 +539,7 @@
         .language-fields{display:grid;gap:8px;padding:3px 12px 12px;font-size:12px}
         .audio-track{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px}
         .subtitle-choice{display:flex;align-items:flex-start;gap:8px;overflow-wrap:anywhere}
+        .subtitle-choice[hidden],.language-fields .hint[hidden]{display:none}
         .subtitle-choice input{flex:none;margin:2px 0 0;accent-color:var(--green)}
         .subtitle-choice:has(input:disabled){color:var(--muted)}
         .language-fields small.hint{padding:0 0 0 21px}
@@ -1241,39 +1250,87 @@
     const clipError = element('div', 'clip-error');
     clipError.setAttribute('role', 'status');
     clipError.hidden = true;
-    const hasDuration = Number.isFinite(seconds) && seconds > 0;
+    const hasDuration = Number.isFinite(seconds) && seconds >= 0.1;
     const startField = element('input'), endField = element('input');
+    const timeFields = element('div', 'trim-values');
     for (const [field, key, label] of [[startField, 'start', 'Start'], [endField, 'end', 'End']]) {
-      const row = element('div', 'trim-line');
+      const row = element('label', 'trim-value');
+      row.append(element('small', '', label));
       field.type = 'text';
-      field.value = draft[key];
+      field.inputMode = 'numeric';
+      field.value = clockText(parseClock(draft[key]) ?? (key === 'start' ? 0 : hasDuration ? seconds : 60));
+      draft[key] = field.value;
       field.placeholder = key === 'start' ? '0:00' : hasDuration ? clockText(seconds) : '1:00';
       field.setAttribute('aria-label', label + ' time');
-      row.append(element('small', '', label), field);
-      const slider = hasDuration ? element('input') : null;
-      if (slider) {
+      field.oninput = () => { draft[key] = field.value; clipError.hidden = true; saveDraft(); };
+      row.append(field);
+      timeFields.append(row);
+    }
+    let rangeTrack = null, startSlider = null, endSlider = null;
+    let selectedStart = parseClock(startField.value) ?? 0;
+    let selectedEnd = parseClock(endField.value) ?? (hasDuration ? seconds : 60);
+    const sliderMax = hasDuration ? Math.floor(seconds * 10) / 10 : 0;
+    const timeStep = 0.1;
+    const clampTime = value => Math.max(0, Math.min(sliderMax, Math.round(value * 10) / 10));
+
+    if (hasDuration && sliderMax >= timeStep) {
+      rangeTrack = element('div', 'trim-range');
+      startSlider = element('input');
+      endSlider = element('input');
+      for (const [slider, label] of [[startSlider, 'Start'], [endSlider, 'End']]) {
         slider.type = 'range';
         slider.min = '0';
-        slider.max = String(seconds);
-        slider.step = 'any';
-        slider.value = String(parseClock(field.value) ?? (key === 'start' ? 0 : seconds));
-        slider.setAttribute('aria-label', 'Trim ' + key);
-        slider.oninput = () => {
-          field.value = draft[key] = slider.valueAsNumber.toFixed(2).replace(/\.?0+$/, '');
+        slider.max = String(sliderMax);
+        slider.step = String(timeStep);
+        slider.setAttribute('aria-label', 'Trim ' + label.toLowerCase());
+        rangeTrack.append(slider);
+      }
+      selectedStart = clampTime(selectedStart);
+      selectedEnd = clampTime(selectedEnd);
+      if (selectedEnd - selectedStart < timeStep) {
+        selectedStart = 0;
+        selectedEnd = sliderMax;
+      }
+
+      function syncRange(active, updateText) {
+        const gap = Math.min(timeStep, sliderMax);
+        if (active === 'start') selectedStart = clampTime(startSlider.valueAsNumber);
+        if (active === 'end') selectedEnd = clampTime(endSlider.valueAsNumber);
+        selectedStart = Math.min(selectedStart, Math.max(0, selectedEnd - gap));
+        selectedEnd = Math.max(selectedEnd, Math.min(sliderMax, selectedStart + gap));
+        startSlider.max = String(Math.max(0, selectedEnd - gap));
+        endSlider.min = String(Math.min(sliderMax, selectedStart + gap));
+        startSlider.value = String(selectedStart);
+        endSlider.value = String(selectedEnd);
+        rangeTrack.style.setProperty('--range-start', `${selectedStart / sliderMax * 100}%`);
+        rangeTrack.style.setProperty('--range-end', `${selectedEnd / sliderMax * 100}%`);
+        if (updateText) {
+          startField.value = draft.start = clockText(selectedStart);
+          endField.value = draft.end = clockText(selectedEnd);
+        }
+      }
+
+      startSlider.oninput = () => { syncRange('start', true); clipError.hidden = true; saveDraft(); };
+      endSlider.oninput = () => { syncRange('end', true); clipError.hidden = true; saveDraft(); };
+      for (const [field, key] of [[startField, 'start'], [endField, 'end']]) {
+        field.onchange = () => {
+          const value = parseClock(field.value);
+          if (value === null || value < 0 || value > seconds) return;
+          const nextStart = key === 'start' ? value : parseClock(startField.value);
+          const nextEnd = key === 'end' ? value : parseClock(endField.value);
+          if (nextStart === null || nextEnd === null || nextEnd <= nextStart) return;
+          selectedStart = clampTime(nextStart);
+          selectedEnd = clampTime(nextEnd);
+          if (selectedEnd <= selectedStart) return;
+          syncRange('', true);
           clipError.hidden = true;
           saveDraft();
         };
-        row.append(slider);
       }
-      field.oninput = () => {
-        draft[key] = field.value;
-        const value = parseClock(field.value);
-        if (slider && value !== null) slider.value = String(value);
-        clipError.hidden = true;
-        saveDraft();
-      };
-      clipFields.append(row);
+      syncRange('', true);
     }
+    clipFields.append(timeFields);
+    if (rangeTrack) clipFields.append(rangeTrack);
     const clipNote = element('small', 'hint');
     clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); saveDraft(); place(true); };
     clip.append(clipToggle, clipFields, clipError);
@@ -1285,8 +1342,8 @@
       clipNote.hidden = !draft.enabled;
       clipError.hidden = true;
       clipNote.textContent = !canClip ? 'Choose a format that supports trimming, or turn Trim off.'
-        : choice.clipUsesWholeFile ? 'Saves the times you chose. VESPER downloads the full media first, then keeps your range.'
-        : 'VESPER fetches only the selected-range parts. The clip may start earlier or end later than the times you choose.';
+        : choice.clipUsesWholeFile ? 'Downloads the full file, then trims to this range.'
+        : 'Downloads only the segments in this range; the cut may shift slightly.';
     }
     const body = [output, list, clip, clipNote];
     if (noticeText()) {
@@ -1305,19 +1362,27 @@
         tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; saveDraft(); };
         label.append(tracks); fields.append(label);
       }
-      let embedSubtitleControl = null;
+      let embedSubtitleControl = null, embedLabel = null, embedHint = null;
+      function updateEmbedAvailability() {
+        const canEmbed = (formats.subtitleOptions || []).some(option =>
+          option.embedSupported && intent.subtitles.includes(option.language));
+        if (embedLabel) embedLabel.hidden = !canEmbed;
+        if (embedHint) embedHint.hidden = !canEmbed;
+        if (embedSubtitleControl) {
+          embedSubtitleControl.disabled = !canEmbed;
+          if (!canEmbed) {
+            intent.embedSubtitles = false;
+            embedSubtitleControl.checked = false;
+          }
+        }
+      }
       for (const subtitle of formats.subtitleOptions || []) {
         const label = element('label', 'subtitle-choice'), check = element('input'); check.type = 'checkbox';
         check.checked = intent.subtitles.includes(subtitle.language);
         check.onchange = () => {
           intent.subtitles = check.checked ? [...new Set([...intent.subtitles, subtitle.language])] : intent.subtitles.filter(language => language !== subtitle.language);
           intent.includeAutoSubtitles = !!advanced.querySelector('input[data-auto=true]:checked');
-          const canEmbed = (formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
-          if (embedSubtitleControl) embedSubtitleControl.disabled = !canEmbed;
-          if (!canEmbed) {
-            intent.embedSubtitles = false;
-            if (embedSubtitleControl) embedSubtitleControl.checked = false;
-          }
+          updateEmbedAvailability();
           saveDraft();
         };
         check.dataset.auto = String(subtitle.auto);
@@ -1325,15 +1390,15 @@
         fields.append(label);
       }
       if ((formats.subtitleOptions || []).some(subtitle => subtitle.embedSupported)) {
-        const embedLabel = element('label', 'subtitle-choice');
+        embedLabel = element('label', 'subtitle-choice');
         embedSubtitleControl = element('input');
         embedSubtitleControl.type = 'checkbox';
         embedSubtitleControl.checked = !!intent.embedSubtitles;
-        embedSubtitleControl.disabled = !(formats.subtitleOptions || []).some(option => option.embedSupported && intent.subtitles.includes(option.language));
         embedSubtitleControl.onchange = () => { intent.embedSubtitles = embedSubtitleControl.checked; saveDraft(); };
-        embedLabel.append(embedSubtitleControl, element('span', '', 'Embed selected subtitles'));
-        const embedHint = element('small', 'hint', 'Separate subtitle files are still queued. Live, segmented, styled, or unsupported tracks stay separate.');
+        embedLabel.append(embedSubtitleControl, element('span', '', 'Add subtitles to video'));
+        embedHint = element('small', 'hint', 'Adds a subtitle track inside the video. Separate subtitle files remain available.');
         fields.append(embedLabel, embedHint);
+        updateEmbedAvailability();
       }
       body.push(advanced);
     }
