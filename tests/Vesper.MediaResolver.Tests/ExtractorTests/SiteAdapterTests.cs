@@ -216,7 +216,9 @@ public class SiteAdapterTests
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal("clip-one", result.Item!.MediaId);
         Assert.Equal(CollectionKind.Album, result.Item.Related!.Kind);
-        Assert.Single(h.Requests, request => request.Url.Host == "scontent.cdninstagram.com");
+        // Only the requested clip is touched: one probe and one bounded read of its start.
+        Assert.Single(h.Requests.Where(request => request.Url.Host == "scontent.cdninstagram.com")
+            .Select(request => request.Url.AbsoluteUri).Distinct());
     }
 
     // ---------------------------------------------------------------------------------------------- Vimeo

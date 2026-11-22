@@ -96,7 +96,9 @@ public sealed class DiscoveryReliabilityTests
         }, CancellationToken.None);
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal("Observed playback", result.Item!.Title);
-        Assert.Equal("cdn.example.com", Assert.Single(handler.Requests).Url.Host);
+        // One probe and one bounded read of the file's start. The watch page is never requested.
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.All(handler.Requests, request => Assert.Equal("cdn.example.com", request.Url.Host));
     }
 
     [Fact]

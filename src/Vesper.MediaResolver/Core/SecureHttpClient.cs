@@ -238,6 +238,47 @@ public sealed class SecureHttpClient : IDisposable
         return await ProbeGetAsync(url, ctx, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Reads at most <paramref name="maxBytes"/> from the start of a file with one ranged GET.
+    /// Null when the server does not honour the range or encodes the body, so nothing larger is ever pulled.
+    /// </summary>
+    internal async Task<byte[]?> ReadStartAsync(Uri url, MediaRequestContext? ctx, ProbeResult probe, int maxBytes,
+        CancellationToken ct)
+    {
+        using var get = await SendAsync(HttpMethod.Get, url, ctx, ct,
+            req => req.Headers.Range = new RangeHeaderValue(0, maxBytes - 1)).ConfigureAwait(false);
+        var headers = get.Content.Headers;
+        if (get.StatusCode != HttpStatusCode.PartialContent
+            || headers.ContentRange is not { From: 0, To: long last, Length: long total } range
+            || !range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
+            || last != Math.Min(maxBytes, total) - 1 || last < 0
+            || headers.ContentLength is long declared && declared != last + 1
+            || (get.RequestMessage?.RequestUri ?? url) != probe.FinalUrl
+            || probe.ContentLength is long expected && expected != total
+            || headers.ContentEncoding.Any(value => !value.Equals("identity", StringComparison.OrdinalIgnoreCase)))
+            return null;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(_o.RequestTimeout);
+        try
+        {
+            await using Stream body = await get.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+            byte[] buffer = new byte[(int)(last + 1)];
+            int read = 0;
+            while (read < buffer.Length)
+            {
+                int count = await body.ReadAsync(buffer.AsMemory(read), timeout.Token).ConfigureAwait(false);
+                if (count == 0) return null;
+                read += count;
+            }
+            return buffer;
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException
+            || ex is OperationCanceledException && !ct.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
     internal async Task<ProbeResult> ProbeGetAsync(Uri url, MediaRequestContext? ctx, CancellationToken ct)
     {
         using var get = await SendAsync(HttpMethod.Get, url, ctx, ct,

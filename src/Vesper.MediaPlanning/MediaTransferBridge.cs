@@ -60,7 +60,8 @@ internal static class MediaTransferBridge
         .Replace(" (merged by VESPER)", "", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsDirect(MediaRepresentation r) => !r.IsLive
-        && (r.Content is StreamContent.VideoAndAudio or StreamContent.AudioOnly)
+        && (r.Content is StreamContent.VideoAndAudio or StreamContent.AudioOnly
+            || r.StandaloneVideo && r.Protocol == StreamProtocol.Http)
         && (r.Protocol == StreamProtocol.Http || r.Protocol == StreamProtocol.Hls && r.Segments?.HasDiscontinuities != true
             || r.Protocol == StreamProtocol.Dash && r.Segments is { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
                && r.Container is "mp4" or "m4a")
@@ -314,7 +315,7 @@ internal static class MediaTransferBridge
         int unsupportedSubtitleCount = UnsupportedSelectedSubtitleCount(item, prefs);
         item = item with { Subtitles = SelectableSubtitleTracks(item.Subtitles) };
         prefs = prefs with { NativeMergeOnly = true };
-        if (exact is not null && exact.Content == StreamContent.VideoOnly)
+        if (exact is { Content: StreamContent.VideoOnly, StandaloneVideo: false })
         {
             // An exact video-only choice is paired with the preferred audio the native remuxer can merge with it.
             var pool = item with { Representations = item.Representations.Where(r => ReferenceEquals(r, exact) || r == exact || r.Content == StreamContent.AudioOnly).ToArray() };
@@ -346,7 +347,8 @@ internal static class MediaTransferBridge
                 EstimatedSize = exact.FileSize,
                 Summary = exact.Content == StreamContent.AudioOnly
                     ? $"audio {exact.AudioCodec ?? exact.Container ?? ""} {(exact.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
-                    : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}",
+                    : $"{(exact.Height is { } height ? height + "p" : "Source")} · {exact.Container ?? "stream"}"
+                        + (exact.StandaloneVideo ? " · no audio" : ""),
                 Subtitles = subtitleSelection?.Subtitles ?? []
             };
         }

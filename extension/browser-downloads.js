@@ -393,7 +393,8 @@ function handoffOutcome(reply, result, signedIn) {
     return reply.code === 'duplicate' ? 'duplicate' : 'refused';
   }
   switch (result?.transferReason) {
-    case 'auth': case 'forbidden': return signedIn ? 'site-refused' : 'sign-in';
+    case 'auth': return signedIn ? 'site-refused' : 'sign-in';
+    case 'forbidden': return 'site-refused';
     case 'browser-fallback': return signedIn ? 'different' : 'different-signed-out';
     case 'queued': case 'busy': case 'slow': return result.transferReason;
     default: return result?.status === 'queued' ? 'queued' : 'not-ready';

@@ -27,6 +27,9 @@ internal sealed class CandidateProcessor
     private readonly ManifestResolver _manifests;
     private readonly ResolverOptions _o;
 
+    // Enough for a web-optimised MP4's track table. At most this many files are opened per page.
+    private const int HeaderBytes = 256 * 1024, MaxHeaderReads = 3;
+
     public CandidateProcessor(SecureHttpClient http, ManifestResolver manifests, ResolverOptions options)
     {
         _http = http;
@@ -38,7 +41,8 @@ internal sealed class CandidateProcessor
     {
         var outcome = new CandidateOutcome();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        int manifestCount = 0, directIndex = 0;
+        using var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        int manifestCount = 0, directIndex = 0, headerReads = 0;
 
         foreach (var c in candidates)
         {
@@ -75,7 +79,20 @@ internal sealed class CandidateProcessor
                     outcome.Problems.Add(MediaErrors.NoMedia($"{UrlRedactor.Redact(c.Url)} is not media (content-type '{ctype}')", false));
                     continue;
                 }
-                outcome.Representations.Add(BuildDirect(c, probe, ctx, directIndex++));
+                Mp4HeaderFacts? facts = null;
+                if (headerReads < MaxHeaderReads && !headerDeadline.IsCancellationRequested && IsMp4(probe, c))
+                {
+                    if (headerReads == 0) headerDeadline.CancelAfter(TimeSpan.FromSeconds(4));
+                    headerReads++;
+                    facts = await ReadHeaderAsync(c.Url, ctx, probe, headerDeadline.Token, ct).ConfigureAwait(false);
+                }
+                if (facts is { Encrypted: true })
+                {
+                    outcome.Problems.Add(MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
+                    continue;
+                }
+                outcome.Representations.Add(BuildDirect(c, probe, ctx, directIndex++, facts));
+                if (facts?.DurationSeconds is { } seconds) outcome.Duration ??= TimeSpan.FromSeconds(seconds);
             }
             catch (MediaResolverException ex)
             {
@@ -93,6 +110,22 @@ internal sealed class CandidateProcessor
         outcome.AudioTracks.AddRange(m.AudioTracks);
         outcome.Subtitles.AddRange(m.Subtitles);
         outcome.Duration ??= m.Duration;
+    }
+
+    private static bool IsMp4(ProbeResult p, MediaCandidate c) =>
+        (CodecInfo.ContainerFromMime(p.ContentType?.ToLowerInvariant()) ?? ExtensionOf(p, c)) is "mp4" or "m4v" or "m4a" or "mov";
+
+    // The header is extra detail. A server that will not serve it leaves the file's details unknown, nothing more.
+    private async Task<Mp4HeaderFacts?> ReadHeaderAsync(Uri url, MediaRequestContext ctx, ProbeResult probe,
+        CancellationToken headerToken, CancellationToken ct)
+    {
+        try
+        {
+            byte[]? start = await _http.ReadStartAsync(url, ctx, probe, HeaderBytes, headerToken).ConfigureAwait(false);
+            return start is null ? null : Mp4HeaderFacts.Read(start);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return null; }
+        catch (MediaResolverException) { return null; }
     }
 
     private static bool IsMedia(ProbeResult p, MediaCandidate c)
@@ -114,13 +147,15 @@ internal sealed class CandidateProcessor
         return UrlUtil.Extension(p.FinalUrl) ?? UrlUtil.Extension(c.Url) ?? (string.IsNullOrEmpty(fromName) ? null : fromName);
     }
 
-    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index)
+    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index, Mp4HeaderFacts? facts = null)
     {
         string ctype = p.ContentType?.ToLowerInvariant() ?? "";
         string? ext = ExtensionOf(p, c);
         string? container = CodecInfo.ContainerFromMime(ctype) ?? ext;
 
-        bool audio = ctype.StartsWith("audio/")
+        // The file's own track table outranks what its address or content type suggest.
+        bool audio = facts is not null ? !facts.HasVideo
+            : ctype.StartsWith("audio/")
             || (!ctype.StartsWith("video/") && ext is not null && MediaCandidate.AudioExtensions.Contains(ext))
             || (!ctype.StartsWith("video/") && c.MimeType?.StartsWith("audio/") == true);
 
@@ -129,13 +164,17 @@ internal sealed class CandidateProcessor
             Id = $"direct-{index}",
             Url = c.Url,
             Protocol = StreamProtocol.Http,
-            Content = audio ? StreamContent.AudioOnly : StreamContent.VideoAndAudio,
-            // A bare video file carries no codec metadata here, so audio presence is honestly marked unverified.
-            AudioUnverified = !audio,
+            Content = audio ? StreamContent.AudioOnly
+                : facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
+            // Without a readable track table, whether a video file has sound stays honestly unverified.
+            AudioUnverified = !audio && facts is null,
+            StandaloneVideo = facts is { HasVideo: true, HasAudio: false },
             MutedLoop = !audio && c.MutedLoop,
             Container = container,
-            Width = c.Width,
-            Height = c.Height,
+            Width = facts?.Width ?? c.Width,
+            Height = facts?.Height ?? c.Height,
+            VideoCodec = audio ? null : facts?.VideoCodec,
+            AudioCodec = facts is { HasAudio: true } ? facts.AudioCodec : null,
             BitrateKbps = c.Bitrate is { } b ? (int)Math.Min(int.MaxValue, b / 1000) : null,
             FileSize = p.ContentLength,
             ExpiresAt = ExpiryParser.FromUrl(c.Url),

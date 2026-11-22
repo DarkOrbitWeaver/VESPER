@@ -442,6 +442,7 @@ public sealed class BrowserBridgeTests
     [InlineData(MediaErrorCode.VideoUnavailable, "unavailable")]
     [InlineData(MediaErrorCode.SourceExpired, "source-expired")]
     [InlineData(MediaErrorCode.LoginRequired, "sign-in")]
+    [InlineData(MediaErrorCode.AuthorizationRequired, "site-refused")]
     [InlineData(MediaErrorCode.DrmProtected, "protected")]
     [InlineData(MediaErrorCode.UnsupportedManifest, "unsupported")]
     [InlineData(MediaErrorCode.LiveStreamNotSupported, "unsupported")]

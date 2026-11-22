@@ -765,7 +765,7 @@ async function playerOptions(message, sender) {
         }), 60000);
         if (possibleSources.length === 0) {
           if (reply.ok || !wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
-        } else if (reply.ok || !['browser-context', 'sign-in', 'no-media', 'unavailable', 'source-expired'].includes(reply.code)) {
+        } else if (reply.ok || !['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-expired'].includes(reply.code)) {
           return reply;
         }
       }

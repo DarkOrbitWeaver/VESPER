@@ -2530,7 +2530,7 @@ test('each way a handoff can fail is recorded with its own reason and leaves Chr
   const signedIn = { signInPermission: true, prefs: { useSignIn: true } };
   const cases = [
     ['sign-in', notReady('auth'), {}],
-    ['sign-in', notReady('forbidden'), {}],
+    ['site-refused', notReady('forbidden'), {}],
     ['site-refused', notReady('forbidden'), signedIn],
     ['different-signed-out', notReady('browser-fallback'), {}],
     ['different', notReady('browser-fallback'), signedIn],

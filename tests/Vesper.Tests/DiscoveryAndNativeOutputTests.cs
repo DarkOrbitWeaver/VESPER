@@ -11,6 +11,35 @@ namespace Vesper.Tests;
 
 public sealed class DiscoveryAndNativeOutputTests
 {
+    [Fact]
+    public void A_standalone_video_has_a_labelled_direct_choice_even_with_unrelated_audio()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "direct-video", Url = new("https://video.example/clip.mp4"), Container = "mp4",
+            Content = StreamContent.VideoOnly, StandaloneVideo = true, VideoCodec = "h264", Height = 720, FileSize = 1200
+        };
+        var audio = new MediaRepresentation
+        {
+            Id = "direct-audio", Url = new("https://video.example/other.m4a"), Container = "m4a",
+            Content = StreamContent.AudioOnly, AudioCodec = "aac", FileSize = 300
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new("https://video.example/watch"), Provider = "generic", Title = "Clip",
+            Representations = [video, audio]
+        };
+
+        foreach (MediaRepresentation? exact in new MediaRepresentation?[] { null, video })
+        {
+            var plan = MediaTransferBridge.Prepare(MediaTransferBridge.PlayableOnly(item), FormatPreferences.BestQuality, exact);
+            Assert.NotNull(plan.Choice);
+            Assert.Equal(JobKind.Http, plan.Choice.Kind);
+            Assert.Equal(video.Url.AbsoluteUri, plan.Choice.Url);
+            Assert.Contains("no audio", plan.Choice.DisplayDetail);
+        }
+    }
+
     private sealed class PlaybackProbe : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

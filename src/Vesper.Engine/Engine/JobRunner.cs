@@ -777,8 +777,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         RunOutcome outcome = code switch
         {
             401 or 407 => RunOutcome.NeedsAttention("auth", $"The server asks for a sign-in (HTTP {code}). Send this download again from your signed-in browser."),
-            403 when linkWorkedBefore => RunOutcome.NeedsLink("expired", "The server refused the link (HTTP 403). It has probably expired."),
-            403 => RunOutcome.NeedsAttention("forbidden", "The server refused access (HTTP 403). The link may need a signed-in browser session."),
+            403 when linkWorkedBefore => RunOutcome.NeedsLink("forbidden", "The server refused the link (HTTP 403). Get a fresh link from the browser. Your download data was kept."),
+            403 => RunOutcome.NeedsAttention("forbidden", "The server refused the request (HTTP 403). Try again from the browser where the link works."),
             404 or 410 when linkWorkedBefore => RunOutcome.NeedsLink("expired", $"The link no longer works (HTTP {code}). Saved data was kept."),
             404 or 410 => RunOutcome.Failed("not-found", $"The file was not found (HTTP {code})."),
             408 or 429 or 503 => RunOutcome.Retry("throttled", $"The server asked VESPER to wait (HTTP {code}).", HttpFacts.RetryAfter(r, DateTimeOffset.UtcNow)),

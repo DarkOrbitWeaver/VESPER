@@ -64,7 +64,11 @@ public static class FormatSelector
 
         foreach (var v in reps.Where(x => x.Content == StreamContent.VideoOnly))
         {
-            if (audios.Count == 0) combos.Add(new Combo(v, null, p.Container));          // source genuinely has no audio stream
+            if (v.StandaloneVideo)
+            {
+                if (string.IsNullOrWhiteSpace(p.AudioTrackId)) combos.Add(new Combo(v, null, p.Container));
+            }
+            else if (audios.Count == 0) combos.Add(new Combo(v, null, p.Container));
             else if (p.AllowMuxing)
             {
                 var pool = p.NativeMergeOnly ? audios.Where(x => MergeCapability.MergeContainer(v, x) is not null).ToList() : audios;
@@ -233,7 +237,7 @@ public static class FormatSelector
         string fps = c.Fps is > 30.5 ? $"{Math.Round(c.Fps.Value)}fps " : "";
         string audioNote = c.A is not null ? "+ separate audio (merge required)"
             : c.V.AudioUnverified ? "· audio not confirmed"
-            : c.HasAudio ? "with audio" : "VIDEO ONLY (no audio stream available)";
+            : c.HasAudio ? "with audio" : c.V.StandaloneVideo ? "· no audio" : "VIDEO ONLY (no audio stream available)";
         return new FormatSelection
         {
             Video = c.V,
