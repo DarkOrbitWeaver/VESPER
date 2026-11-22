@@ -64,8 +64,10 @@ public class SecureHttpTests
         Assert.True(h.Requests.Count <= 7);
     }
 
-    [Fact]
-    public async Task Cookie_IsNotForwardedToAnotherHostAfterRedirect_ButIsToSubdomains()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CookieFollowsOnlyExplicitlyAllowedRedirectHosts(bool allowSubdomain)
     {
         var h = new FakeHttpHandler()
             .AddRedirect("https://example.com/start", "https://cdn.other-site.net/file")
@@ -75,7 +77,8 @@ public class SecureHttpTests
         var ctx = new MediaRequestContext
         {
             Referer = "https://example.com/watch?id=secret", CookieHeader = "sid=1",
-            CredentialOrigin = new Uri("https://example.com/"), CredentialHosts = ["example.com"]
+            CredentialOrigin = new Uri("https://example.com/"),
+            CredentialHosts = allowSubdomain ? ["example.com", "media.example.com"] : ["example.com"]
         };
         var c = Client(h);
 
@@ -86,7 +89,7 @@ public class SecureHttpTests
         Assert.DoesNotContain("secret", h.Requests[1].Headers["Referer"]);
 
         await c.GetStringAsync(new Uri("https://example.com/start2"), ctx, default);
-        Assert.True(h.Requests[3].Headers.ContainsKey("Cookie"));        // subdomain of the credential host
+        Assert.Equal(allowSubdomain, h.Requests[3].Headers.ContainsKey("Cookie"));
         Assert.Equal("https://example.com/", h.Requests[3].Headers["Referer"]);
     }
 

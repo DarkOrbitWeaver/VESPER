@@ -111,7 +111,7 @@ public class UrlSecurityTests
     }
 
     [Fact]
-    public void CredentialScoping_ExactAndSubdomainOnly()
+    public void CredentialScoping_RequiresAnExplicitHost()
     {
         var ctx = new MediaRequestContext
         {
@@ -119,10 +119,12 @@ public class UrlSecurityTests
             CredentialHosts = ["example.com"]
         };
         Assert.True(ctx.MayForwardCredentialsTo(new Uri("https://example.com/")));
-        Assert.True(ctx.MayForwardCredentialsTo(new Uri("https://media.example.com/")));
+        Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://media.example.com/")));
         Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://notexample.com/")));
         Assert.False(ctx.MayForwardCredentialsTo(new Uri("https://example.com.evil.net/")));
         Assert.DoesNotContain(ctx.HeadersFor(new Uri("https://evil.net/x")), h => h.Key == "Cookie");
+        Assert.DoesNotContain(ctx.HeadersFor(new Uri("https://media.example.com/x")), h => h.Key == "Cookie");
+        ctx = ctx with { CredentialHosts = ["example.com", "media.example.com"] };
         Assert.Contains(ctx.HeadersFor(new Uri("https://media.example.com/x")), h => h.Key == "Cookie");
     }
 

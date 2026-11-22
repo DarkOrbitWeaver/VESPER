@@ -28,7 +28,8 @@ public sealed record HttpTextResponse(
 
 public sealed record ProbeResult(Uri FinalUrl, int StatusCode, string? ContentType, long? ContentLength, bool AcceptsRanges, string? FileName)
 {
-    public bool IsSuccess => StatusCode is 200 or 206;
+    public bool IsSuccess => !InvalidExtent && StatusCode is 200 or 206;
+    internal bool InvalidExtent { get; init; }
 }
 
 public sealed record MediaRangeProbeResult(int StatusCode, bool IsValid, string Detail);
@@ -234,9 +235,24 @@ public sealed class SecureHttpClient : IDisposable
         }
         catch (MediaResolverException ex) when (ex.Error.Code == MediaErrorCode.NetworkFailure) { /* fall back to ranged GET */ }
 
+        return await ProbeGetAsync(url, ctx, ct).ConfigureAwait(false);
+    }
+
+    internal async Task<ProbeResult> ProbeGetAsync(Uri url, MediaRequestContext? ctx, CancellationToken ct)
+    {
         using var get = await SendAsync(HttpMethod.Get, url, ctx, ct,
             req => req.Headers.Range = new RangeHeaderValue(0, 0)).ConfigureAwait(false);
-        return ToProbe(get, url);
+        var headers = get.Content.Headers;
+        var probe = ToProbe(get, url);
+        if (get.StatusCode == HttpStatusCode.PartialContent &&
+            (headers.ContentRange is not { From: 0, To: 0, Length: > 0 } range
+                || !range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
+                || headers.ContentLength is not (null or 1)
+                || headers.ContentEncoding.Any(value => !value.Equals("identity", StringComparison.OrdinalIgnoreCase))))
+            return probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false };
+        if (get.StatusCode == HttpStatusCode.OK && headers.Contains("Content-Range"))
+            return probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false };
+        return probe;
     }
 
     private static ProbeResult ToProbe(HttpResponseMessage resp, Uri fallbackUrl)

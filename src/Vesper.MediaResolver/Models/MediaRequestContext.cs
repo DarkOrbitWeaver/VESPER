@@ -27,7 +27,7 @@ public sealed record MediaRequestContext
     /// <summary>The origin that issued the credentials. Credentials never cross its scheme or port.</summary>
     public Uri? CredentialOrigin { get; init; }
 
-    /// <summary>Hosts (and their subdomains) allowed to receive credentials from <see cref="CredentialOrigin"/>.</summary>
+    /// <summary>Exact hosts allowed to receive credentials from <see cref="CredentialOrigin"/>.</summary>
     public IReadOnlyList<string> CredentialHosts { get; init; } = [];
 
     public bool HasCredentials => CookieHeader is not null || SensitiveHeaders.Count > 0;
@@ -41,8 +41,7 @@ public sealed record MediaRequestContext
             return false;
 
         foreach (var h in CredentialHosts)
-            if (target.Host.Equals(h, StringComparison.OrdinalIgnoreCase)
-                || target.Host.EndsWith("." + h, StringComparison.OrdinalIgnoreCase))
+            if (target.Host.Equals(h, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
     }

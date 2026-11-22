@@ -30,6 +30,11 @@ globalThis.VesperPlayerSource = (() => {
       const id = parts[0]?.startsWith('@') && parts[1] === 'video' ? parts[2]
         : (parts[0] === 'embed' && parts[1] === 'v2' || parts[0] === 'player' && parts[1] === 'v1') ? parts[2] : null;
       if (/^\d+$/.test(id || '')) return `tiktok:${id}`;
+    } else if (host === 'dai.ly' || /(?:^|\.)dailymotion\.com$/.test(host)) {
+      const video = parts.indexOf('video');
+      const id = host === 'dai.ly' ? parts[0] : url.searchParams.get('video')
+        || (video >= 0 ? parts[video + 1]?.split('_')[0] : null);
+      if (/^[a-z0-9]{5,12}$/i.test(id || '')) return `dailymotion:${id}`;
     } else if (/(?:^|\.)facebook\.com$/.test(host)) {
       const index = parts.findIndex(part => part === 'reel' || part === 'videos');
       const id = url.searchParams.get('v') || (index >= 0 ? parts[index + 1] : null);

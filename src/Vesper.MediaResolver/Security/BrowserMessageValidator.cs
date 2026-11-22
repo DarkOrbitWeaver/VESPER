@@ -130,7 +130,6 @@ internal static class BrowserMessageValidator
 
         return baseCtx with
         {
-            Origin = UrlUtil.Origin(page),
             AcceptLanguage = acceptLanguage,
             CookieHeader = cookie,
             SensitiveHeaders = sensitive,

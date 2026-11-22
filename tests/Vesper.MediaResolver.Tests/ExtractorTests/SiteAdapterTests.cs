@@ -786,6 +786,12 @@ public class SiteAdapterTests
     // ---------------------------------------------------------------------------------------------- TikTok
 
     private const string TikTokUrl = "https://www.tiktok.com/@fixtureuser/video/7234567890123456789";
+    private const string TikTokCdn = "https://v16.tiktokcdn-fixture.example/";
+
+    private static FakeHttpHandler AddTikTokMedia(FakeHttpHandler handler) => handler
+        .AddMedia(TikTokCdn + "h264_540.mp4?expire=4000000000", length: 1700)
+        .AddMedia(TikTokCdn + "h265_720.mp4?expire=4000000000", length: 2800)
+        .AddMedia(TikTokCdn + "play.mp4");
 
     [Theory]
     [InlineData("7234567890123456789", true)]
@@ -793,7 +799,7 @@ public class SiteAdapterTests
     public async Task TikTok_EmbedRequiresTheRequestedVideo(string id, bool expectedSuccess)
     {
         string url = $"https://www.tiktok.com/embed/v2/{id}";
-        var handler = new FakeHttpHandler().Add(url, Fixture.Load("tiktok_page.html"), "text/html");
+        var handler = AddTikTokMedia(new FakeHttpHandler().Add(url, Fixture.Load("tiktok_page.html"), "text/html"));
         var result = await Resolve(handler, url);
 
         Assert.Equal(expectedSuccess, result.IsSuccess);
@@ -806,8 +812,8 @@ public class SiteAdapterTests
     [Fact]
     public async Task TikTok_ReturnsQualitiesWithoutLeakingHostOnlyCookiesToCdn()
     {
-        var h = new FakeHttpHandler().Add(TikTokUrl, Fixture.Load("tiktok_page.html"), "text/html",
-            headers: new() { ["Set-Cookie"] = "tt_chain_token=abc; Path=/; HttpOnly" });
+        var h = AddTikTokMedia(new FakeHttpHandler().Add(TikTokUrl, Fixture.Load("tiktok_page.html"), "text/html",
+            headers: new() { ["Set-Cookie"] = "tt_chain_token=abc; Path=/; HttpOnly" }));
         var res = await Resolve(h, TikTokUrl);
 
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
@@ -816,7 +822,7 @@ public class SiteAdapterTests
         Assert.Equal("fixtureuser", item.Uploader);
         Assert.Equal(TimeSpan.FromSeconds(15), item.Duration);
         Assert.Equal(3, item.Representations.Count);
-        Assert.Contains(item.Representations, r => r.VideoCodec == "h265" && r.Height == 1280 && r.FileSize == 2800000);
+        Assert.Contains(item.Representations, r => r.VideoCodec == "h265" && r.Height == 1280 && r.FileSize == 2800 && !r.FileSizeIsEstimate);
         var ctx = item.Representations[0].Context;
         Assert.Null(ctx.CookieHeader);
         Assert.Equal(item.Representations[0].Url.Host, Assert.Single(ctx.CredentialHosts));
@@ -843,17 +849,23 @@ public class SiteAdapterTests
         Assert.Equal(MediaErrorCode.LoginRequired, (await Resolve(priv, TikTokUrl)).Error!.Code);
     }
     [Fact]
-    public async Task TikTok_ObjectAddressesPreserveSignedMirrorsAndByteVc1Codec()
+    public async Task TikTok_OneVerifiedMirrorPerQualityPreservesSignatureAndCodec()
     {
         const string body = """
         <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">{"__DEFAULT_SCOPE__":{"webapp.video-detail":{"statusCode":0,"itemInfo":{"itemStruct":{"id":"7234567890123456789","desc":"Fixture","video":{"duration":22,"width":576,"height":1024,"bitrateInfo":[{"GearName":"hd","CodecType":"h265_hvc1","PlayAddr":{"DataSize":"400577","Width":1080,"Height":1920,"UrlList":["https://v16.tiktokcdn.com/a?signature=a%2Bb&expire=4102444800","https://v19.tiktokcdn.com/a?signature=c%2Fd&expire=4102444800"]}}],"playAddr":{"UrlList":["https://www.tiktok.com/aweme/v1/play/?video_id=123"]}}}}}}}</script>
         """;
-        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body), TikTokUrl);
+        const string denied = "https://v16.tiktokcdn.com/a?signature=a%2Bb&expire=4102444800";
+        const string playable = "https://v19.tiktokcdn.com/a?signature=c%2Fd&expire=4102444800";
+        var handler = new FakeHttpHandler().Add(TikTokUrl, body).Add(denied, "request refused from native route", status: 403)
+            .AddMedia(playable, length: 4096).Add("https://www.tiktok.com/aweme/v1/play/?video_id=123", "<html>Challenge</html>");
+        var result = await Resolve(handler, TikTokUrl);
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
-        Assert.Equal(3, result.Item!.Representations.Count);
-        Assert.Equal("h265", result.Item.Representations[0].VideoCodec);
-        Assert.Equal(400577, result.Item.Representations[0].FileSize);
-        Assert.Contains("signature=a%2Bb", result.Item.Representations[0].Url.AbsoluteUri);
+        var format = Assert.Single(result.Item!.Representations);
+        Assert.Equal("h265", format.VideoCodec);
+        Assert.Equal(1920, format.Height);
+        Assert.Equal(4096, format.FileSize);
+        Assert.Equal(playable, format.Url.AbsoluteUri);
+        Assert.Equal(4, handler.Requests.Count);
     }
 
     [Theory]
@@ -863,8 +875,8 @@ public class SiteAdapterTests
     public async Task TikTok_AnonymousSessionHonorsCookieDomainAndPath(string setCookie, string? expected)
     {
         const string media = "https://v16-webapp-prime.us.tiktok.com/video/tos/fixture/?signature=fixture";
-        string body = "<script id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\">{\"__DEFAULT_SCOPE__\":{\"webapp.video-detail\":{\"statusCode\":0,\"itemInfo\":{\"itemStruct\":{\"id\":\"1\",\"video\":{\"playAddr\":\"" + media + "\"}}}}}}</script>";
-        var h = new FakeHttpHandler().Add(TikTokUrl, body, headers: new() { ["Set-Cookie"] = setCookie });
+        string body = "<script id=\"__UNIVERSAL_DATA_FOR_REHYDRATION__\">{\"__DEFAULT_SCOPE__\":{\"webapp.video-detail\":{\"statusCode\":0,\"itemInfo\":{\"itemStruct\":{\"id\":\"7234567890123456789\",\"video\":{\"playAddr\":\"" + media + "\"}}}}}}</script>";
+        var h = new FakeHttpHandler().Add(TikTokUrl, body, headers: new() { ["Set-Cookie"] = setCookie }).AddMedia(media);
         var result = await Resolve(h, TikTokUrl);
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal(expected, Assert.Single(result.Item!.Representations).Context.CookieHeader);
@@ -876,7 +888,8 @@ public class SiteAdapterTests
         const string body = """
         <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"statusCode":0,"itemInfo":{"itemStruct":{"id":"7234567890123456789","desc":"Next layout","video":{"duration":9,"playAddr":"https://v16.tiktokcdn.com/video.mp4?signature=abc"}}}}}}</script>
         """;
-        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body), TikTokUrl);
+        var result = await Resolve(new FakeHttpHandler().Add(TikTokUrl, body)
+            .AddMedia("https://v16.tiktokcdn.com/video.mp4?signature=abc"), TikTokUrl);
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal("Next layout", result.Item!.Title);
         Assert.Equal(TimeSpan.FromSeconds(9), result.Item.Duration);

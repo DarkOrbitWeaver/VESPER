@@ -282,7 +282,9 @@ async function withSignIn(items, context = {}) {
     let cookie;
     try {
       const matches = await signInCookies(item.url, item.referer, context);
-      const header = matches.map(c => `${c.name}=${c.value}`).join('; ');
+      // A flat Cookie header cannot carry the original path restriction to a media URL.
+      const usable = context.mediaPicker ? matches.filter(c => c.path === '/') : matches;
+      const header = usable.map(c => `${c.name}=${c.value}`).join('; ');
       if (header && header.length <= 8192 && !/[\r\n\0]/.test(header)) cookie = header;
     } catch { /* access can be revoked while the download is being sent */ }
     enriched.push(cookie ? { ...item, cookie } : item);
@@ -667,6 +669,7 @@ chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
 }).catch(() => {}));
 
 async function mediaAuthorization(pageUrl, sender, { userGesture = false } = {}) {
+  if (!userGesture) return {};
   const frame = Number.isInteger(sender?.tab?.id) ? {
     tabId: sender.tab.id, frameId: sender.frameId ?? 0,
     ...(sender.documentId ? { documentId: sender.documentId } : {})
@@ -688,13 +691,15 @@ async function playerOptions(message, sender) {
   const { route } = await settings();
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
+  const prefetch = message.prefetch === true;
+  const auth = route !== 'chrome' && !prefetch
+    ? await mediaAuthorization(page.href, sender, { userGesture: true }) : {};
   const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route, mutedLoop].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
-  const cached = cachedMediaOptions(lookupKey);
+  const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
-  const prefetch = message.prefetch === true;
   // A click can use sign-in even while a background lookup is in flight.
-  const pendingKey = prefetch ? lookupKey + '|prefetch' : lookupKey;
+  const pendingKey = prefetch ? lookupKey + '|prefetch' : auth.authorized ? lookupKey + '|signed' : lookupKey;
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   if (prefetch) {
     const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats');
@@ -751,10 +756,11 @@ async function playerOptions(message, sender) {
     if (route !== 'chrome') {
       // A single-video page can give the resolver a better identity than nearby network traffic.
       const singleVideo = binding && identity && (identity.startsWith('tiktok:')
+        || identity.startsWith('dailymotion:')
         || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
       if (possibleSources.length === 0 || singleVideo) {
         const reply = await nativeRequest(envelope('media-options', {
-          ...await mediaAuthorization(page.href, sender, { userGesture: !prefetch }),
+          ...auth,
           url: page.href, pageTitle: title, candidates: !youTube || candidates.length ? candidates : undefined
         }), 60000);
         if (possibleSources.length === 0) {
@@ -787,7 +793,7 @@ async function playerOptions(message, sender) {
   mediaLookups.set(pendingKey, task);
   try {
     const reply = await task;
-    rememberMediaOptions(lookupKey, tab, reply);
+    if (!auth.authorized) rememberMediaOptions(lookupKey, tab, reply);
     return reply;
   }
   finally { mediaLookups.delete(pendingKey); }

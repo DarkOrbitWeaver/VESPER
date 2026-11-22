@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using VESPER;
 using Vesper.Engine;
+using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 
@@ -10,6 +11,44 @@ namespace Vesper.Tests;
 
 public sealed class DiscoveryAndNativeOutputTests
 {
+    private sealed class PlaybackProbe : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var content = new ByteArrayContent([]);
+            content.Headers.ContentType = new("video/mp4");
+            content.Headers.ContentLength = 4500;
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { RequestMessage = request, Content = content });
+        }
+    }
+
+    [Theory]
+    [InlineData("https://video.example/file.mp4", true)]
+    [InlineData("https://cdn.example/file.mp4", false)]
+    public async Task SignedBrowserEvidenceSurvivesTheResolverAndNativePlanningBoundary(string target, bool sameOrigin)
+    {
+        const string page = "https://video.example/authorized";
+        using var resolver = new DefaultMediaResolver(handler: new PlaybackProbe());
+        var resolved = await resolver.ResolveAsync(new()
+        {
+            Url = new(page), Browser = new BrowserDiscoveryMessage
+            {
+                Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
+                Candidates = [new BrowserMediaCandidate { Url = target, Width = 1280, Height = 720, DurationSeconds = 12 }],
+                Authorization = new BrowserAuthorization { Origin = "https://video.example", ConsentGranted = true, CookieHeader = "session=fixture" }
+            }
+        }, CancellationToken.None);
+
+        Assert.True(resolved.IsSuccess, resolved.Error?.Diagnostic);
+        var item = MediaTransferBridge.PlayableOnly(resolved.Item!);
+        Assert.Equal(720, Assert.Single(item.Representations).Height);
+        Assert.Equal(TimeSpan.FromSeconds(12), item.Duration);
+        var plan = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
+        Assert.NotNull(plan.Choice);
+        Assert.Equal(sameOrigin, plan.Choice.Secrets?.ContainsKey("Cookie") == true);
+        Assert.DoesNotContain("session=fixture", JsonSerializer.Serialize(plan.Choice));
+    }
+
     [Theory]
     [InlineData("https://v16.tiktokcdn.com/file.mp4", false)]
     [InlineData("https://www.tiktok.com/media/file.mp4", true)]
@@ -124,7 +163,7 @@ public sealed class DiscoveryAndNativeOutputTests
         Assert.Equal(JobKind.Hls, fullChoice.Kind);
         Assert.Equal(MediaOutput.Original, fullChoice.Output);
         Assert.Equal(subtitle.Url, Assert.Single(fullChoice.SubtitleTracks!).Url);
-        Assert.Contains("remain separate", fullChoice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("saved separately", fullChoice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
 
         var clipped = MediaTransferBridge.Prepare(item, preferences, output: MediaOutputPreference.CompatibleVideo,
             clipStartSeconds: 10, clipEndSeconds: 20);
@@ -211,7 +250,7 @@ public sealed class DiscoveryAndNativeOutputTests
         var captionClip = MediaTransferBridge.Prepare(item, preferences,
             output: MediaOutputPreference.CompatibleVideo, clipStartSeconds: 10, clipEndSeconds: 25);
         Assert.Null(captionClip.Choice);
-        Assert.Contains("selected subtitles", captionClip.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("embedded subtitles", captionClip.Error, StringComparison.OrdinalIgnoreCase);
 
         MediaRepresentation[] unsafeSources =
         [

@@ -18,6 +18,12 @@ public static class ExpiryParser
                 return DateTimeOffset.FromUnixTimeSeconds(secs);
         }
 
+        // Meta CDN URLs use a hex deadline; do not interpret the same parameter on other sites.
+        if (UrlUtil.HostIs(url, "cdninstagram.com", "fbcdn.net") && UrlUtil.QueryValue(url, "oe") is { Length: 8 } hex
+            && long.TryParse(hex, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out var edge)
+            && edge is > 1_000_000_000 and < 4_100_000_000)
+            return DateTimeOffset.FromUnixTimeSeconds(edge);
+
         // AWS-style presigned URLs: X-Amz-Date + X-Amz-Expires (seconds).
         string? amzDate = UrlUtil.QueryValue(url, "X-Amz-Date");
         if (amzDate is not null
@@ -28,5 +34,12 @@ public static class ExpiryParser
             return start.AddSeconds(ttl);
 
         return null;
+    }
+
+    internal static DateTimeOffset? Earliest(Uri source, Uri final)
+    {
+        var first = FromUrl(source);
+        var last = source == final ? null : FromUrl(final);
+        return first is not null && (last is null || first < last) ? first : last;
     }
 }

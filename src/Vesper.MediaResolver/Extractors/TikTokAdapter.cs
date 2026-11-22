@@ -39,7 +39,7 @@ internal sealed class TikTokAdapter : AdapterBase
         try
         {
             string? embedId = EmbedVideoId(request.Url);
-            string? videoId = embedId ?? VideoId(page.FinalUrl) ?? EmbedVideoId(page.FinalUrl) ?? VideoId(request.Url);
+            string? videoId = embedId ?? VideoId(request.Url) ?? VideoId(page.FinalUrl) ?? EmbedVideoId(page.FinalUrl);
             var found = FindPlayerState(page.Content, videoId);
             state = found.Document;
             item = found.Item;
@@ -54,10 +54,10 @@ internal sealed class TikTokAdapter : AdapterBase
                     ? MediaErrors.BrowserContext("TikTok returned a verification page. Complete verification in your browser; VESPER does not bypass it.")
                     : MediaErrors.SourceChanged($"TikTok player state was not found{(found.Layout is null ? "" : $" in {found.Layout}")}. Refresh the page or update VESPER."));
             var s = item;
-            if (embedId is not null && s.P("id").Str() != embedId)
-                return Fail(MediaErrors.NoMedia("The TikTok player did not identify the requested video.", browserMayHelp: false));
             if (s.P("imagePost") is not null)
                 return Fail(MediaErrors.NoMedia("This TikTok post is a photo slideshow, not a video", browserMayHelp: false));
+            if (videoId is not null && s.P("id").Str() != videoId)
+                return Fail(MediaErrors.NoMedia("The TikTok player did not identify the requested video.", browserMayHelp: false));
             var video = s.P("video");
             request.Publish(new DiscoveryProgress(s.P("desc").Str(), Address(video.P("cover"))));
 
@@ -79,41 +79,90 @@ internal sealed class TikTokAdapter : AdapterBase
                 };
             }
             var reps = new List<MediaRepresentation>();
+            var problems = new List<MediaError>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            void AddAddresses(JsonElement? address, string id, JsonElement? bitrate = null)
+            using var probeDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeDeadline.CancelAfter(TimeSpan.FromSeconds(12));
+            int budget = Math.Min(8, Options.MaxCandidatesPerPage);
+            async Task AddAddressesAsync(JsonElement? address, string id, JsonElement? bitrate = null)
             {
-                int mirror = 0;
-                foreach (Uri url in Addresses(address))
+                foreach (Uri url in Addresses(address).Take(4))
                 {
                     if (!seen.Add(url.AbsoluteUri)) continue;
+                    if (budget <= 0) return;
+                    budget--;
+                    var ctx = ContextFor(url);
+                    ProbeResult probe;
+                    try
+                    {
+                        if (ExpiryParser.FromUrl(url) is { } expires && expires <= Svc.Now)
+                        {
+                            problems.Add(MediaErrors.Expired("TikTok supplied an already expired media URL"));
+                            continue;
+                        }
+                        probe = await Http.ProbeGetAsync(url, ctx, probeDeadline.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested && probeDeadline.IsCancellationRequested)
+                    {
+                        budget = 0;
+                        problems.Add(MediaErrors.Network("Timed out checking TikTok's media sources"));
+                        return;
+                    }
+                    catch (MediaResolverException ex)
+                    {
+                        if (ex.Error.Code == MediaErrorCode.RateLimited) throw;
+                        problems.Add(ex.Error);
+                        continue;
+                    }
+                    if (!probe.IsSuccess)
+                    {
+                        problems.Add(probe.InvalidExtent
+                            ? MediaErrors.NoMedia("TikTok returned an invalid byte range.", browserMayHelp: true)
+                            : MediaErrors.FromHttpStatus(probe.StatusCode, url));
+                        continue;
+                    }
+                    // HEAD metadata and a status alone cannot distinguish a video from a challenge page.
+                    if (probe.ContentLength is 0 || probe.ContentType is not ("video/mp4" or "application/mp4" or "application/octet-stream")
+                        || probe.ContentType == "application/octet-stream" && UrlUtil.Extension(probe.FinalUrl) != "mp4") continue;
+                    var expiry = ExpiryParser.Earliest(url, probe.FinalUrl);
+                    if (expiry is { } end && end <= Svc.Now)
+                    {
+                        problems.Add(MediaErrors.Expired("TikTok redirected to an expired media URL"));
+                        continue;
+                    }
                     string? codec = bitrate.P("CodecType").Str() ?? video.P("codecType").Str();
                     string? normalized = codec?.StartsWith("h265", StringComparison.OrdinalIgnoreCase) == true
                         || codec?.StartsWith("bytevc1", StringComparison.OrdinalIgnoreCase) == true ? "h265"
                         : CodecInfo.NormalizeVideo(codec);
                     reps.Add(new MediaRepresentation
                     {
-                        Id = mirror == 0 ? id : $"{id}-mirror-{mirror}", Url = url,
+                        Id = id, Url = url,
                         Protocol = StreamProtocol.Http, Content = StreamContent.VideoAndAudio,
+                        AudioUnverified = true,
                         Container = "mp4", VideoCodec = normalized, DeliveryId = url.GetLeftPart(UriPartial.Authority),
-                        Width = address.P("Width").Int() ?? video.P("width").Int(),
-                        Height = address.P("Height").Int() ?? video.P("height").Int(),
+                        Width = (address.P("Width") ?? address.P("width")).Int() ?? (bitrate is null ? video.P("width").Int() : null),
+                        Height = (address.P("Height") ?? address.P("height")).Int() ?? (bitrate is null ? video.P("height").Int() : null),
                         FrameRate = bitrate.P("BitrateFPS").Int(),
                         BitrateKbps = (bitrate.P("Bitrate").Int() ?? video.P("bitrate").Int()) is { } bps ? bps / 1000 : null,
-                        FileSize = address.P("DataSize").Long(), ExpiresAt = ExpiryParser.FromUrl(url), Context = ContextFor(url)
+                        FileSize = probe.ContentLength ?? address.P("DataSize").Long(), FileSizeIsEstimate = probe.ContentLength is null,
+                        ExpiresAt = expiry, Context = ctx
                     });
-                    mirror++;
+                    break; // These addresses are mirrors of the same advertised representation, not qualities.
                 }
             }
             int index = 0;
-            foreach (var b in video.P("bitrateInfo").Items())
+            foreach (var b in video.P("bitrateInfo").Items().Take(6))
             {
-                AddAddresses(b.P("PlayAddr") ?? b.P("playAddr"), $"tiktok-{b.P("GearName").Str() ?? "quality"}-{index}", b);
+                await AddAddressesAsync(b.P("PlayAddr") ?? b.P("playAddr"), $"tiktok-{b.P("GearName").Str() ?? "quality"}-{index}", b).ConfigureAwait(false);
                 index++;
             }
-            AddAddresses(video.P("playAddr"), "tiktok-play");
-            AddAddresses(video.P("downloadAddr"), "tiktok-download");
+            await AddAddressesAsync(video.P("playAddr"), "tiktok-play").ConfigureAwait(false);
+            await AddAddressesAsync(video.P("downloadAddr"), "tiktok-download").ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
             if (reps.Count == 0)
-                return Fail(MediaErrors.NoMedia("TikTok supplied title and artwork but no clear media URL. The video may require sign-in, region access, or a refreshed player session.", browserMayHelp: true));
+                return Fail(problems.FirstOrDefault(problem => problem.Code is not (MediaErrorCode.VideoUnavailable or MediaErrorCode.NoDownloadableMedia))
+                    ?? problems.FirstOrDefault()
+                    ?? MediaErrors.NoMedia("TikTok supplied title and artwork but no verified media URL.", browserMayHelp: true));
             string? author = s.P("author").P("uniqueId").Str() ?? s.P("author").Str();
             string desc = s.P("desc").Str() ?? "";
             return MediaDiscoveryResult.FromItem(new MediaItem
@@ -190,9 +239,9 @@ internal sealed class TikTokAdapter : AdapterBase
 
     private static string? EmbedVideoId(Uri url)
     {
-        const string prefix = "/embed/v2/";
         string path = url.AbsolutePath;
-        if (!path.StartsWith(prefix, StringComparison.Ordinal)) return null;
+        string? prefix = new[] { "/embed/v2/", "/player/v1/" }.FirstOrDefault(p => path.StartsWith(p, StringComparison.Ordinal));
+        if (prefix is null) return null;
         string id = path[prefix.Length..].TrimEnd('/');
         return id.Length is > 0 and <= 32 && id.All(char.IsAsciiDigit) ? id : null;
     }

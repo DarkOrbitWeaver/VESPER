@@ -44,7 +44,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
     private static readonly MediaRequestContext ConsentContext = new()
     {
         UserAgent = DesktopUserAgent, CookieHeader = "SOCS=CAI",
-        CredentialOrigin = new Uri("https://www.youtube.com/"), CredentialHosts = ["youtube.com"]
+        CredentialOrigin = new Uri("https://www.youtube.com/"), CredentialHosts = ["www.youtube.com", "youtube.com"]
     };
 
     [GeneratedRegex("^[A-Za-z0-9_-]{11}$")]

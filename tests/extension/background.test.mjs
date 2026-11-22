@@ -7,7 +7,7 @@ import { webcrypto } from 'node:crypto';
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
-  localData = {}, cookies = [{ name: 'session', value: 'test-value' }], playerPicker = false } = {}) {
+  localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }], playerPicker = false } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -2309,6 +2309,36 @@ test('video format prefetch is off by default and limited to supported pages', a
   assert.equal(enabled.sent.length, 0);
 });
 
+test('a signed-in picker click gets fresh formats after anonymous prefetch', async () => {
+  const app = load({ 'media-options': mediaOptionsReply }, {
+    signInPermission: true, localData: { prefetchFormats: true },
+    cookies: [{ name: 'session', value: 'test-value', path: '/' }, { name: 'watch-only', value: 'restricted', path: '/watch' }]
+  });
+  await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  await app.message(videoOptionsMessage(videoPage), videoSender);
+  const requests = app.sent.filter(request => request.type === 'media-options');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].mediaAuth, undefined);
+  assert.equal(requests[1].mediaAuth.cookie, 'session=test-value');
+});
+
+test('an identified Dailymotion embed loads formats before listing observed streams', async () => {
+  const app = load({ 'media-options': mediaOptionsReply });
+  const page = 'https://geo.dailymotion.com/player.html?video=x7abc1';
+  const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
+  const now = Date.now();
+  for (const name of ['master', 'alternate']) {
+    await app.onMedia({ url: `https://cdn.example/${name}.m3u8`, tabId: 7, frameId: 2,
+      documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: now });
+  }
+  const result = await app.message(videoOptionsMessage(page, {
+    playerUrl: 'blob:https://geo.dailymotion.com/player', playerPlaying: true, mediaChangedAt: now
+  }), sender);
+  assert.equal(app.sent[0].url, page);
+  assert.deepEqual(result.data.choices, mediaOptionsReply.data.choices);
+  assert.equal(result.data.sourceChoices, undefined);
+});
+
 test('prepared formats are reused, refreshed on request and expire quickly', async () => {
   const app = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
   const prefetched = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
@@ -2790,7 +2820,7 @@ test('right-clicking a blob video in a frame uses that frame for discovery and s
   const app = load({ 'media-picker': { ok: true } }, {
     prefs: { useSignIn: true }, signInPermission: true,
     localData: { signInHosts: ['player.example'] },
-    cookies: [{ name: 'session', value: 'authorized', sameSite: 'lax' }]
+    cookies: [{ name: 'session', value: 'authorized', sameSite: 'lax', path: '/' }]
   });
   const tab = { id: 9, url: 'https://video.example/watch' };
   await app.onContextClicked({ menuItemId: 'vesper-download', mediaType: 'video',

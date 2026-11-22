@@ -117,12 +117,15 @@ public sealed class DiscoveryReliabilityTests
     {
         const string url = "https://www.tiktok.com/@fixtureuser/video/7234567890123456789";
         string page = Fixture.Load("tiktok_page.html").Replace("v16.tiktokcdn-fixture.example", "v16-webapp-prime.us.tiktok.com", StringComparison.Ordinal);
-        var handler = new FakeHttpHandler().Add(url, page, headers: new() { ["Set-Cookie"] = "tt_chain_token=secret; Domain=.tiktok.com; Path=/; Secure; HttpOnly" });
+        const string cdn = "https://v16-webapp-prime.us.tiktok.com/";
+        var handler = new FakeHttpHandler().Add(url, page, headers: new() { ["Set-Cookie"] = "tt_chain_token=secret; Domain=.tiktok.com; Path=/; Secure; HttpOnly" })
+            .AddMedia(cdn + "h264_540.mp4?expire=4000000000");
         using var resolver = new DefaultMediaResolver(handler: handler);
         var first = await resolver.ResolveAsync(new() { Url = new(url) }, CancellationToken.None);
         await resolver.ResolveAsync(new() { Url = new(url) }, CancellationToken.None);
         Assert.Equal("tt_chain_token=secret", first.Item!.Representations[0].Context.CookieHeader);
-        Assert.Equal(2, handler.Requests.Count);
+        Assert.Equal(2, handler.Count(url));
+        Assert.Equal(2, handler.Count(cdn + "h264_540.mp4"));
     }
 
     [Fact]
