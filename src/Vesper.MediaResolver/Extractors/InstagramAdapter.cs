@@ -58,7 +58,7 @@ internal sealed class InstagramAdapter : AdapterBase
             return Fail(MediaErrors.NoMedia("Instagram returned a non-text page without a verified media URL. Open the post in Chrome and use the VESPER picker.", true));
 
         request.PageResponse = page;
-        EmbeddedPageMedia? embedded = ExtractEmbeddedMedia(page.Content, target.MediaId, Options.MaxCandidatesPerPage);
+        EmbeddedPageMedia? embedded = ExtractEmbeddedMedia(page.Content, target, Options.MaxCandidatesPerPage);
         if (embedded is { IsCarousel: true })
             return await ResolveCarouselAsync(request, target, page, embedded, ct).ConfigureAwait(false);
 
@@ -156,10 +156,11 @@ internal sealed class InstagramAdapter : AdapterBase
         return MediaDiscoveryResult.FromItem(first, warnings);
     }
 
-    private static EmbeddedPageMedia? ExtractEmbeddedMedia(string html, string fallbackId, int maxCandidates)
+    private static EmbeddedPageMedia? ExtractEmbeddedMedia(string html, InstagramTarget target, int maxCandidates)
     {
         maxCandidates = Math.Max(1, maxCandidates);
         int scripts = 0;
+        EmbeddedPageMedia? unlabelled = null;
         foreach (HtmlTag tag in HtmlScanner.Scan(html))
         {
             if (tag.Name != "script" || tag.Attr("data-sjs") is null) continue;
@@ -170,6 +171,11 @@ internal sealed class InstagramAdapter : AdapterBase
 
             foreach (JsonElement media in document.RootElement.FindAll("if_not_gated_logged_out", maxResults: 32))
             {
+                string? code = target.Shortcode is null ? null : media.P("code").Str() ?? media.P("shortcode").Str();
+                bool hasShortcode = !string.IsNullOrWhiteSpace(code);
+                if (hasShortcode && !string.Equals(code, target.Shortcode, StringComparison.Ordinal))
+                    continue;
+                bool useImmediately = hasShortcode || target.Shortcode is null;
                 string? caption = media.P("caption").P("text").Str();
                 string? uploader = media.P("owner").P("username").Str() ?? media.P("user").P("username").Str();
                 if (media.P("carousel_media") is { ValueKind: JsonValueKind.Array } slides)
@@ -188,7 +194,7 @@ internal sealed class InstagramAdapter : AdapterBase
                         }
                         int index = slideIndex++;
                         int choices = Math.Min(4, maxCandidates - candidateCount);
-                        EmbeddedVideo? video = ReadVideo(slide, $"{fallbackId}-{index + 1}", index, caption, uploader, choices);
+                        EmbeddedVideo? video = ReadVideo(slide, $"{target.MediaId}-{index + 1}", index, caption, uploader, choices);
                         if (video is not null)
                         {
                             videos.Add(video);
@@ -196,14 +202,24 @@ internal sealed class InstagramAdapter : AdapterBase
                         }
                     }
                     if (videos.Count > 0)
-                        return new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader);
+                    {
+                        var candidate = new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader);
+                        if (useImmediately) return candidate;
+                        unlabelled ??= candidate;
+                        continue;
+                    }
                 }
 
-                EmbeddedVideo? single = ReadVideo(media, fallbackId, 0, caption, uploader, Math.Min(MaxVideoChoices, maxCandidates));
-                if (single is not null) return new EmbeddedPageMedia([single], false, 1, false, caption, uploader);
+                EmbeddedVideo? single = ReadVideo(media, target.MediaId, 0, caption, uploader, Math.Min(MaxVideoChoices, maxCandidates));
+                if (single is not null)
+                {
+                    var candidate = new EmbeddedPageMedia([single], false, 1, false, caption, uploader);
+                    if (useImmediately) return candidate;
+                    unlabelled ??= candidate;
+                }
             }
         }
-        return null;
+        return unlabelled;
     }
 
     private static bool HasVideoSource(JsonElement media) =>
@@ -270,7 +286,7 @@ internal sealed class InstagramAdapter : AdapterBase
 
     private static bool Matches(Uri url) => InstagramTarget.TryParse(url, out _);
 
-    private readonly record struct InstagramTarget(string MediaId)
+    private readonly record struct InstagramTarget(string MediaId, string? Shortcode = null)
     {
         public static bool TryParse(Uri url, out InstagramTarget target)
         {
@@ -283,7 +299,7 @@ internal sealed class InstagramAdapter : AdapterBase
             if (parts.Length >= 2 && parts[0] is "p" or "reel" or "reels" or "tv"
                 && parts[1] is not "audio")
             {
-                target = new InstagramTarget(parts[1]);
+                target = new InstagramTarget(parts[1], parts[1]);
                 return parts[1].Length is > 0 and <= 128;
             }
 

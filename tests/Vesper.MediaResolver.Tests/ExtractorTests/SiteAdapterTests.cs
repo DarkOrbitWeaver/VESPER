@@ -119,6 +119,29 @@ public class SiteAdapterTests
     }
 
     [Fact]
+    public async Task Instagram_PrefersTheRequestedReelOverOtherEmbeddedVideos()
+    {
+        const string unrelated = "https://scontent.cdninstagram.com/other-reel.mp4";
+        const string unlabelled = "https://scontent.cdninstagram.com/unlabelled.mp4";
+        const string requested = "https://scontent.cdninstagram.com/requested-reel.mp4";
+        string page = $$$"""
+            <script data-sjs>{"if_not_gated_logged_out":{"code":"OtherReel","video_url":"{{{unrelated}}}"}}</script>
+            <script data-sjs>{"if_not_gated_logged_out":{"video_url":"{{{unlabelled}}}"}}</script>
+            <script data-sjs>{"if_not_gated_logged_out":{"shortcode":"FixtureCode","video_url":"{{{requested}}}"}}</script>
+            """;
+        var h = new FakeHttpHandler().Add(InstagramPage, page)
+            .AddMedia(unrelated, "video/mp4", 1000)
+            .AddMedia(unlabelled, "video/mp4", 1000)
+            .AddMedia(requested, "video/mp4", 1000);
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(requested, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsoluteUri == unrelated || request.Url.AbsoluteUri == unlabelled);
+    }
+
+    [Fact]
     public async Task Instagram_LoginRedirectIsExplainedWithoutTryingPrivateEndpoints()
     {
         const string login = "https://www.instagram.com/accounts/login/?next=%2Freel%2FFixtureCode%2F";
