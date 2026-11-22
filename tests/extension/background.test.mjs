@@ -292,6 +292,56 @@ test('automatic handoff verifies the response before pausing Chrome and accepts 
   assert.equal(file.paused, true);
 });
 
+test('pausing during native verification leaves the new download with Chrome', async () => {
+  const file = activeDownload();
+  let finishSubmit;
+  const submit = new Promise(resolve => { finishSubmit = resolve; });
+  const app = load({ 'browser-submit': () => submit, 'browser-transfer': transfer('failed') }, { download: file });
+  await observe(app, file);
+
+  const capture = app.onCreated(file);
+  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'));
+  await app.local.set({ vesperPaused: true });
+  finishSubmit(started);
+  await capture;
+
+  assert.deepEqual(app.sent.filter(message => message.type === 'browser-transfer').map(message => message.operation), ['abandon']);
+  assert.equal(file.paused, false);
+  assert.equal(file.state, 'in_progress');
+  assert.equal(app.actions.includes('pause'), false);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  assert.equal(app.localData.browserDownloads[file.id]?.stage, 'stand-down');
+
+  await app.local.set({ vesperPaused: false });
+  await app.onChanged({ id: file.id, totalBytes: { current: 1 } });
+  assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
+});
+
+test('pausing during native acceptance abandons the tentative handoff and resumes Chrome', async () => {
+  const file = activeDownload();
+  let finishAccept;
+  const accept = new Promise(resolve => { finishAccept = resolve; });
+  const app = load({ 'browser-submit': started, 'browser-transfer': message =>
+    message.operation === 'accept' ? accept : transfer('failed') }, { download: file });
+  await observe(app, file);
+
+  const capture = app.onCreated(file);
+  await waitFor(() => app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'accept'));
+  assert.equal(file.paused, true);
+  await app.local.set({ vesperPaused: true });
+  finishAccept(transfer('active'));
+  await capture;
+
+  assert.deepEqual(app.sent.filter(message => message.type === 'browser-transfer').map(message => message.operation), ['accept', 'abandon']);
+  assert.equal(file.paused, false);
+  assert.equal(file.state, 'in_progress');
+  assert.equal(app.actions.includes('resume'), true);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.actions.includes('erase'), false);
+  assert.equal(app.localData.browserDownloads[file.id]?.stage, 'stand-down');
+});
+
 test('an exact never-capture rule leaves a new Chrome download alone before sending its address to VESPER', async () => {
   const file = activeDownload();
   file.referrer = 'https://video.example/watch?token=private';

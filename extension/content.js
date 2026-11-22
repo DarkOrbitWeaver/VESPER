@@ -126,7 +126,7 @@
     const pageMatches = panelMedia.documentIdentity === VesperPlayerSource.identity(pageAddress());
     const previewMatches = !activePreview || activePreview.key === panelMedia.targetKey;
     const binding = panelMedia.player && playback.get(panelMedia.player);
-    const sourceMatches = !panelMedia.generation || !binding || binding.generation === panelMedia.generation;
+    const sourceMatches = !panelMedia.generation || binding?.generation === panelMedia.generation;
     if (pageMatches && previewMatches && sourceMatches) return true;
     retainedPickerDraft = null;
     closePanel();
@@ -398,7 +398,10 @@
       if (e.target === video) {
         mediaChangedAt = Date.now();
         retainedPickerDraft = null;
-        if (panelMedia?.player === e.target) closePanel();
+      }
+      if (panelMedia?.player === e.target) {
+        retainedPickerDraft = null;
+        closePanel();
       }
     } else {
       protectedVideos.delete(e.target);
@@ -408,6 +411,10 @@
         if (activePreview?.player === e.target && playback.has(e.target))
           activePreview = { ...activePreview, binding: playback.get(e.target) };
         playback.delete(e.target);
+        if (panelMedia?.player === e.target) {
+          retainedPickerDraft = null;
+          closePanel();
+        }
       }
     }
     if (type === 'loadstart' && endedPlayer?.player === e.target) {

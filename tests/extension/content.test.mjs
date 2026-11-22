@@ -466,6 +466,12 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
     querySelectorAll: () => [],
     elementFromPoint: () => hoverTarget
   });
+  let emptiedHandler;
+  const addDocumentListener = document.addEventListener.bind(document);
+  document.addEventListener = (type, handler, options) => {
+    if (type === 'emptied') emptiedHandler = handler;
+    return addDocumentListener(type, handler, options);
+  };
   const window = new EventTarget();
   const motion = Object.assign(new EventTarget(), { matches: false });
   const context = vm.createContext({
@@ -494,6 +500,17 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
     activePreview: () => activePreview, holdMissingPreview, loadFormats,
     choiceKey: pickerOptionKey, restorePickerDraft,
     setRetainedPickerDraft: draft => { retainedPickerDraft = draft; },
+    setPanelForTest: player => {
+      const binding = playback.get(player);
+      panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), targetKey: 'test',
+        player, pageUrl: pageAddress(), src: playerSource(player), generation: binding?.generation || 0 };
+      panelRequest++;
+      panel.classList.add('show');
+      return panelRequest;
+    },
+    isCurrentRequest, panelOpenForTest: () => !!panelMedia,
+    clearPlaybackForTest: player => playback.delete(player),
+    retainedDraftForTest: () => retainedPickerDraft,
     attachForTest: (player, controls) => {
       video = player; perch = { x: 10, y: 10 };
       ({ button, panel, receipt } = controls);
@@ -552,4 +569,19 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   assert.match(changed.selectionNotice, /no longer available/);
   assert.match(changed.trackNotice, /selected tracks/);
   assert.equal(changedRestore.choice.index, 0);
+
+  window.__testContent.attachForTest(video, { button: node(), panel: node(), receipt: node() });
+  const request = window.__testContent.setPanelForTest(unrelatedVideo);
+  window.__testContent.clearPlaybackForTest(unrelatedVideo);
+  assert.equal(window.__testContent.isCurrentRequest(request), false,
+    'a response for a player without its original source binding is stale');
+  assert.equal(window.__testContent.panelOpenForTest(), false);
+
+  window.__testContent.refreshPlayer(unrelatedVideo);
+  window.__testContent.setPanelForTest(unrelatedVideo);
+  window.__testContent.setRetainedPickerDraft({ targetKey: 'test' });
+  emptiedHandler({ target: unrelatedVideo });
+  assert.equal(window.__testContent.panelOpenForTest(), false,
+    'emptying the active player closes its pending picker request');
+  assert.equal(window.__testContent.retainedDraftForTest(), null);
 });

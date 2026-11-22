@@ -595,8 +595,8 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       return chromeKeeps();
     }
     const result = reply.results?.[0];
-    if (automatic && !(await captureIsEnabled(generation))) {
-      await releaseChromeDownload(latest, { ...record, id });
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
+      await releaseChromeDownload(latest, { ...record, id, standDownAfterRelease: true });
       return chromeKeeps();
     }
     if (!reply.ok || result?.transferReady !== true) {
@@ -620,28 +620,37 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       await note(sameDownload(current, record) && current.state === 'complete' ? 'chrome-finished' : 'not-ready');
       return chromeKeeps();
     }
+    if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
+      await releaseChromeDownload(current, { ...record, id, standDownAfterRelease: true });
+      return chromeKeeps();
+    }
     record.stage = 'parking';
     record.resumeChrome = !current.paused;
     try {
       await writeBrowserRecord(id, record);
       await armBrowserRecovery();
-      if (automatic && !(await captureIsEnabled(generation))) {
+      if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
       }
       if (record.resumeChrome) await chrome.downloads.pause(id);
       const paused = await getChromeDownload(id);
-      if (automatic && !(await captureIsEnabled(generation))) {
+      if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
       }
       const canAccept = sameDownload(paused, record) && canMove(paused) && paused.paused
         && await sameSource(paused, record);
-      if (automatic && !(await captureIsEnabled(generation))) {
+      if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
       }
       const accepted = canAccept ? await transferCommand(record.transferId, 'accept') : null;
+      // Pause only blocks a handoff until the helper accepts it. Parked VESPER jobs keep running.
+      if (automatic && (capturePaused || admissionGeneration !== captureAdmissionGeneration)) {
+        await releaseChromeAfterOptOut(id, record);
+        return chromeKeeps();
+      }
       if (automatic && !(await captureIsEnabled(generation))) {
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
