@@ -31,6 +31,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 return await NativeMediaPickerAsync(request, ct);
 
             case "media-options":
+            case "media-source-options":
                 return await MediaOptionsAsync(request, ct);
 
             case "media-select":

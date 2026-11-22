@@ -66,7 +66,11 @@ internal sealed partial class BrowserBridgeHandler
         MediaDiscoveryResult resolved = await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
             Url = page, Browser = MediaHints(request, page),
-            Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly }
+            Options = new DiscoveryOptions
+            {
+                CollectionIntent = CollectionIntent.ItemOnly,
+                ExactBrowserSource = request.Type == "media-source-options"
+            }
         }, discovery.Token);
         if (resolved.Collection is { } collection)
             return BridgeResponse.Success(request.Id, data: new
@@ -80,6 +84,8 @@ internal sealed partial class BrowserBridgeHandler
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
+            if (request.Type == "media-source-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
+                return BridgeResponse.Fail(request.Id, "source-unavailable", "VESPER couldn't verify this source. Go back to try another source.");
             string code = MapResolverError(error?.Code);
             var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
             return error?.RetryAt is { } retryAt ? failure with { Data = new { retryAt } } : failure;

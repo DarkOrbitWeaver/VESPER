@@ -73,7 +73,7 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-select"
+            if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
                 or "browser-submit" or "browser-transfer" or "browser-activity"))
             { error = "Unknown request type."; return false; }
 
@@ -94,18 +94,19 @@ public static class BridgeProtocol
             BrowserTransferProof? browserProof = null;
             BrowserActivity? activity = null;
             string? transferId = null, operation = null;
-            if (type is "probe" or "media-picker" or "media-options")
+            bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options";
+            if (type == "probe" || mediaLookup)
             {
                 probeUrl = Str(root, "url");
                 if (!UrlPolicy.TryParse(probeUrl, out _, out error)) return false;
-                if (type is ("media-picker" or "media-options") && root.TryGetProperty("mediaAuth", out var auth))
+                if (mediaLookup && root.TryGetProperty("mediaAuth", out var auth))
                 {
                     bool authorized = root.TryGetProperty("authorized", out var consent) && consent.ValueKind == JsonValueKind.True;
                     if (!authorized || !TryItem(auth, authorized, false, out mediaAuth, out error)
                         || mediaAuth is null || mediaAuth.Url != probeUrl || mediaAuth.Kind != "http")
                     { error = "Invalid media authorization context."; return false; }
                 }
-                if (type is ("media-picker" or "media-options") && root.TryGetProperty("candidates", out JsonElement candidates))
+                if (mediaLookup && root.TryGetProperty("candidates", out JsonElement candidates))
                 {
                     if (candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 25)
                     { error = "At most 25 media hints are accepted."; return false; }
@@ -124,6 +125,8 @@ public static class BridgeProtocol
                         hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop));
                     }
                 }
+                if (type == "media-source-options" && hints.Count != 1)
+                { error = "Checking a media source requires exactly one hint."; return false; }
             }
             else if (type == "media-select")
             {
@@ -215,7 +218,7 @@ public static class BridgeProtocol
             }
             bool confirmTransfer = type == "browser-submit" || type == "submit" && items.Count == 1
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
-            string? pageTitle = type is ("media-picker" or "media-options") && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
+            string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
                 confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
                 audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles);

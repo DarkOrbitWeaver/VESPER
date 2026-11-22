@@ -1809,7 +1809,7 @@ test('observed media sources stay under a global session-storage budget', async 
 });
 
 test('an ambiguous blob player shows scoped stream choices before sending a candidate to VESPER', async () => {
-  const app = load({ 'media-options': { ok: true } });
+  const app = load({ 'media-source-options': { ok: true } });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();
@@ -1833,6 +1833,7 @@ test('an ambiguous blob player shows scoped stream choices before sending a cand
   const selected = await app.message({ type: 'media-source-select', sourceChoice: token, pageUrl: page,
     generation: 3, playerUrl: message.playerUrl }, sender);
   assert.equal(selected.ok, true);
+  assert.equal(app.sent[0].type, 'media-source-options');
   assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
     ['https://cdn.example.com/video.m3u8?sig=private']);
 
@@ -1850,7 +1851,7 @@ test('an ambiguous blob player shows scoped stream choices before sending a cand
 
 test('source-choice tokens are not restored after a worker restarts', async () => {
   const sessionData = {};
-  const app = load({ 'media-options': { ok: true } }, { sessionData });
+  const app = load({ 'media-source-options': { ok: true } }, { sessionData });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();

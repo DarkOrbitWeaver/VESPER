@@ -130,6 +130,15 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         if (request.Browser is { } message)
             request.ValidatedBrowser = BrowserMessageValidator.Validate(message, svc.Now, _options);
 
+        if (request.Options.ExactBrowserSource)
+        {
+            if (request.Browser is not { Candidates.Count: 1 } || request.ValidatedBrowser is not { Candidates.Count: 1 })
+                return MediaDiscoveryResult.Failure(MediaErrors.Invalid("Checking a media source requires exactly one valid candidate."));
+            // A failed check must never offer a different video from the page or its adapter.
+            var checkedSource = await GetAdapter(GenericAdapter.Descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
+            return ResultFinalizer.Finalize(checkedSource, _options, svc.Now);
+        }
+
         string cacheKey = $"{request.Url.AbsoluteUri}|{request.Options.CollectionIntent}|{request.Options.PageToken}|{request.Options.IncludeSubtitles}|{request.Options.MaxCollectionItems}|{request.Options.ResolveEmbeds}|{request.Options.EmbedDepth}";
         bool cacheable = _cache is not null && request.Browser is null;
         if (cacheable && _cache!.TryGet(cacheKey, svc.Now, out var hit))

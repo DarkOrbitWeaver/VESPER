@@ -6,6 +6,7 @@
 // Add VESPER_NATIVE_HOST_TEST=1 only when the current account is disposable and the test host is registered there.
 // Chrome always gets a fresh isolated profile. The default covers Chrome-owned and page-made files;
 // native mode also needs an isolated registration in the current disposable account.
+// VESPER_CAPTURE_RACE_TEST=1 compares response timing with real Chrome and a simulated helper.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -18,6 +19,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const extension = join(root, 'extension');
 const chromeExe = process.env.CHROME_PATH;
 const nativeHostTest = process.env.VESPER_NATIVE_HOST_TEST === '1';
+const captureRaceTest = process.env.VESPER_CAPTURE_RACE_TEST === '1';
 const nativeDownloadFolder = process.env.VESPER_TEST_DOWNLOAD_FOLDER
   ? resolve(process.env.VESPER_TEST_DOWNLOAD_FOLDER) : null;
 const nativeDataDirectory = process.env.VESPER_TEST_DATA_DIRECTORY
@@ -32,6 +34,23 @@ const nativeFileName = 'vesper-native-capture-fixture.bin';
 const refusalFileName = 'vesper-native-refusal-fixture.bin';
 const signInFileName = 'vesper-native-signin-fixture.bin';
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function installRaceBridge() {
+  const smoke = globalThis.__ownershipSmoke;
+  smoke.raceCalls = [];
+  const simulate = (_host, message, callback) => {
+    smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
+    const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
+    if (message.type === 'hello') return reply({ data: { siteRules: { neverCaptureHosts: [] } } });
+    if (message.type === 'browser-submit')
+      return setTimeout(() => reply({ results: [{ status: 'started', transferReady: true }] }), 400);
+    if (message.type === 'browser-transfer')
+      return reply({ data: { state: 'failed' } });
+    throw new Error('Unexpected native request in capture race test: ' + message.type);
+  };
+  chrome.runtime.sendNativeMessage = simulate;
+  if (chrome.runtime.sendNativeMessage !== simulate) throw new Error('Could not install the simulated native helper.');
+}
 
 class Connection {
   constructor(socket) {
@@ -96,6 +115,7 @@ async function waitFor(fn, timeoutMs, reason) {
 }
 
 async function main() {
+  assert.ok(!(nativeHostTest && captureRaceTest), 'Run the simulated race and registered helper separately.');
   if (nativeHostTest) {
     assert.equal(process.platform, 'win32', 'Native host acceptance requires Windows.');
     assert.ok(nativeDownloadFolder, 'VESPER_TEST_DOWNLOAD_FOLDER must point to the disposable output folder.');
@@ -126,6 +146,20 @@ async function main() {
     if (request.url === '/page') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end('<!doctype html><title>VESPER smoke fixture</title><body></body>');
+      return;
+    }
+    if (captureRaceTest && ['/race-fast', '/race-during-check', '/race-delayed'].includes(request.url)) {
+      response.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="vesper${request.url.replace('/', '-')}.bin"`,
+        'Content-Length': bytes.length,
+        'ETag': '"vesper-capture-race-v1"',
+        'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'no-store'
+      });
+      response.flushHeaders();
+      if (request.url === '/race-fast') response.end(bytes);
+      else setTimeout(() => response.end(bytes), request.url === '/race-during-check' ? 200 : 1600);
       return;
     }
     if (nativeHostTest && request.url === '/native-redirect') {
@@ -290,7 +324,7 @@ async function main() {
     }
 
 
-    const messagingHook = nativeHostTest
+    const messagingHook = captureRaceTest ? '(' + installRaceBridge.toString() + ')();' : nativeHostTest
       ? "const sendNative = chrome.runtime.sendNativeMessage.bind(chrome.runtime);"
         + "const wrapped = (host, message, callback) => { __ownershipSmoke.nativeCalls++;"
         + "const entry = { host, type: message?.type, operation: message?.operation, id: message?.id,"
@@ -364,6 +398,32 @@ async function main() {
       const capture = await evaluate('Read final capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
       return capture.vesperCaptureDecisions?.some(entry => entry.outcome === 'page-made');
     }, 5000, 'The extension did not record that Chrome owns the page-generated download.');
+    let captureRace = null;
+    if (captureRaceTest) {
+      captureRace = [];
+      for (const fixture of ['fast', 'during-check', 'delayed']) {
+        const name = `vesper-race-${fixture}.bin`;
+        const before = await evaluate('Read race call count', '__ownershipSmoke.raceCalls.length');
+        await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/race-' + fixture }, tab);
+        const file = await waitFor(async () => {
+          const matches = await evaluate('Read fixture download', 'chrome.downloads.search({})');
+          return matches.find(candidate => candidate.filename?.endsWith(name) && candidate.state === 'complete');
+        }, 15000, 'Chrome did not save the ' + fixture + ' race fixture.');
+        assert.ok(file.filename.startsWith(downloadFolder), 'The race fixture escaped the isolated test folder.');
+        assert.equal((await readFile(file.filename)).compare(bytes), 0);
+        const readCalls = () => evaluate('Read race calls', `__ownershipSmoke.raceCalls.slice(${before})`);
+        const calls = fixture === 'fast' ? await readCalls() : await waitFor(async () => {
+          const calls = await readCalls();
+          return calls.some(call => call.operation === 'abandon') ? calls : null;
+        }, 5000, 'The extension did not release the simulated transfer for the ' + fixture + ' fixture.');
+        const attempted = calls.some(call => call.type === 'browser-submit');
+        const reachedAccept = calls.some(call => call.operation === 'accept');
+        captureRace.push({ fixture, attempted, reachedAccept, bytes: file.fileSize });
+        if (fixture === 'during-check') assert.ok(attempted, 'No native check was in flight when Chrome started.');
+        assert.equal(reachedAccept, fixture === 'delayed',
+          'Unexpected capture path: ' + JSON.stringify({ captureRace, calls }));
+      }
+    }
     let nativeCapture = null;
     if (nativeHostTest) {
       assert.equal(await evaluate('Check no native calls before the valid file', '__ownershipSmoke.nativeCalls'), 0,
@@ -488,7 +548,7 @@ async function main() {
       keptInChrome: true,
       pageMadeKeptInChrome: true,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
-      nativeCapture
+      nativeCapture, captureRace
     }) + '\n');
   }
   finally {

@@ -13,6 +13,34 @@ public sealed class DirectFileFactsTests
     private const string VideoUrl = "https://cdn.unseen-site.example/m/7/video";
     private const string AudioUrl = "https://cdn.unseen-site.example/m/7/audio";
 
+    [Theory]
+    [InlineData(200, true)]
+    [InlineData(404, false)]
+    public async Task Exact_lookup_never_reads_the_page_or_calls_its_site_adapter(int status, bool success)
+    {
+        const string page = "https://www.dailymotion.com/video/x12345";
+        var handler = new FakeHttpHandler()
+            .Add(page, $"<video src=\"{AudioUrl}\"></video>")
+            .AddMedia(AudioUrl, "audio/mp4")
+            .Add(VideoUrl, "fixture", "video/mp4", status: status);
+        using var resolver = T.Resolver(handler);
+        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        {
+            Url = new(page),
+            Options = new DiscoveryOptions { ExactBrowserSource = true },
+            Browser = new BrowserDiscoveryMessage
+            {
+                Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page, Candidates = [new() { Url = VideoUrl }]
+            }
+        }, CancellationToken.None);
+
+        Assert.Equal(success, result.IsSuccess);
+        Assert.NotEmpty(handler.Requests);
+        Assert.All(handler.Requests, request => Assert.Equal(VideoUrl, request.Url.AbsoluteUri));
+        if (success) Assert.Equal(VideoUrl, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        else Assert.Equal(MediaErrorCode.VideoUnavailable, result.Error!.Code);
+    }
+
     [Fact]
     public async Task A_silent_video_file_and_its_audio_file_are_reported_as_what_they_are()
     {

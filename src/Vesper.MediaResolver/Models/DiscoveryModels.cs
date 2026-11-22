@@ -10,6 +10,7 @@ public sealed class DiscoveryOptions
     public int MaxCollectionItems { get; init; } = 200;
     public bool ResolveEmbeds { get; init; } = true;
     public bool IncludeSubtitles { get; init; } = true;
+    public bool ExactBrowserSource { get; init; }
 
     /// <summary>Internal recursion guard for embedded players.</summary>
     public int EmbedDepth { get; init; }

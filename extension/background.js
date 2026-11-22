@@ -839,7 +839,7 @@ async function selectMediaSource(message, sender) {
   const { route } = await settings();
   if (route === 'chrome')
     return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
-  return nativeRequest(envelope('media-options', { ...await mediaAuthorization(page.href, sender, { userGesture: true }), url: page.href, pageTitle: selection.title,
+  return nativeRequest(envelope('media-source-options', { ...await mediaAuthorization(page.href, sender, { userGesture: true }), url: page.href, pageTitle: selection.title,
     candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }
 

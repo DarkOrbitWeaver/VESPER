@@ -527,6 +527,18 @@ public class BridgeProtocolTests
     }
 
     [Theory]
+    [InlineData("", false)]
+    [InlineData(",\"candidates\":[]", false)]
+    [InlineData(",\"candidates\":[{\"url\":\"https://cdn.example.com/a.m3u8\"}]", true)]
+    [InlineData(",\"candidates\":[{\"url\":\"https://cdn.example.com/a.m3u8\"},{\"url\":\"https://cdn.example.com/b.m3u8\"}]", false)]
+    public void Exact_media_lookup_requires_one_source(string hints, bool valid)
+    {
+        string request = Msg("\"type\":\"media-source-options\",\"url\":\"https://example.com/watch\"" + hints);
+        Assert.Equal(valid, BridgeProtocol.TryParse(request, out BridgeRequest parsed, out _));
+        if (valid) Assert.Single(parsed.Candidates!);
+    }
+
+    [Theory]
     [InlineData("queue", 2, true)]
     [InlineData("download", 63, true)]
     [InlineData("ask", 2, false)]
