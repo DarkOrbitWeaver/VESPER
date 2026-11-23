@@ -257,6 +257,25 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public async Task ManagedChromeConnectStillHonorsNeverCaptureRules()
+    {
+        var preferences = new VesperPreferences
+        {
+            SiteRules = [new SiteRule { Host = "blocked.example", NeverCapture = true }]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => preferences);
+        var file = new BrowserActiveFile("c-demo-profile-7-abc", "leaf.zip", 0, 256,
+            DateTimeOffset.FromUnixTimeMilliseconds(1760000000000).UtcDateTime, false, false, ["blocked.example"], true);
+        var request = new BridgeRequest("managed-blocked-1", "browser-managed", "ask", null, [],
+            Operation: "connect", Activity: new BrowserActivity("demo-profile", [file]));
+
+        BridgeResponse reply = await bridge.HandleAsync(request, CancellationToken.None);
+
+        Assert.False(reply.Ok);
+        Assert.Equal("site-capture-disabled", reply.Code);
+    }
+
+    [Fact]
     public async Task Browser_auto_capture_refuses_every_known_host_before_engine_submission()
     {
         var preferences = new VesperPreferences
