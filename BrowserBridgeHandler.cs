@@ -40,6 +40,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "batch-review":
             case "submit":
             case "browser-submit":
+            case "browser-capture":
                 return await SubmitAsync(request, ct);
 
             case "browser-transfer":
@@ -108,7 +109,8 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
     private async Task<BridgeResponse> SubmitAsync(BridgeRequest request, CancellationToken ct)
     {
-        if (request.Type == "browser-submit")
+        bool browserCapture = request.Type is "browser-submit" or "browser-capture";
+        if (browserCapture)
         {
             IReadOnlyList<SiteRule> siteRules = SiteRule.Normalize(preferences().SiteRules);
             if (request.Items.Any(item => IsNeverCaptureRule(item, siteRules)))
@@ -117,7 +119,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
         // "ask" from the browser means "apply VESPER's own handoff setting"; download/queue are explicit overrides.
         string mode = request.Mode == "ask" ? preferences().BrowserAction.ToString().ToLowerInvariant() : request.Mode;
-        if (request.Type == "browser-submit" && mode == "ask") mode = "download";
+        if (browserCapture && mode == "ask") mode = "download";
 
         IReadOnlySet<int>? selected = null;
         IReadOnlySet<int> trustedChecksums = new HashSet<int>();

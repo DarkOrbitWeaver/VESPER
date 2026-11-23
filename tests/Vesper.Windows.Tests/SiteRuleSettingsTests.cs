@@ -82,8 +82,10 @@ public sealed class SiteRuleSettingsTests : IDisposable
         Assert.DoesNotContain(_root, data.RootElement.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public async Task Browser_auto_capture_is_refused_before_the_engine_sees_a_never_capture_site()
+    [Theory]
+    [InlineData("browser-submit")]
+    [InlineData("browser-capture")]
+    public async Task Browser_auto_capture_is_refused_before_the_engine_sees_a_never_capture_site(string type)
     {
         var preferences = new VesperPreferences
         {
@@ -92,7 +94,7 @@ public sealed class SiteRuleSettingsTests : IDisposable
         var bridge = new BrowserBridgeHandler(null!, null!, () => preferences);
         var item = new BridgeItem("https://cdn.example/video.mp4?token=private", "video.mp4", "http",
             "https://video.example/watch?token=private", null, null, null, null);
-        var request = new BridgeRequest("browser-capture-site-rule", "browser-submit", "download", null, [item]);
+        var request = new BridgeRequest("browser-capture-site-rule", type, "download", null, [item]);
 
         BridgeResponse response = await bridge.HandleAsync(request, CancellationToken.None);
 

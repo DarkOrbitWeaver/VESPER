@@ -477,16 +477,33 @@ public class BridgeProtocolTests
         Assert.False(BridgeProtocol.TryParse(Msg("\"type\":\"batch-review\",\"items\":[{\"url\":\"https://example.com/file.zip\",\"sha256\":\"abc\"}]"), out _, out _));
     }
 
-    [Fact]
-    public void Browser_handoff_parses_the_response_proof_and_always_waits_for_confirmation()
+    [Theory]
+    [InlineData("browser-submit")]
+    [InlineData("browser-capture")]
+    public void Browser_handoff_parses_the_response_proof_and_always_waits_for_confirmation(string type)
     {
-        string request = Msg("""
-            "type":"browser-submit","mode":"download","items":[{"url":"https://example.com/archive"}],
+        string request = Msg($$"""
+            "type":"{{type}}","mode":"download","items":[{"url":"https://example.com/archive"}],
             "browserProof":{"length":200,"etag":"\"p1\"","contentType":"application/zip","awaitingConfirmation":false}
             """);
         Assert.True(BridgeProtocol.TryParse(request, out BridgeRequest parsed, out string error), error);
         Assert.True(parsed.ConfirmTransfer);
         Assert.Equal(new BrowserTransferProof(200, "\"p1\"", "application/zip"), parsed.BrowserProof);
+    }
+
+    [Theory]
+    [InlineData("\"authorized\":true,", "")]
+    [InlineData("", ",\"cookie\":\"session=sample\"")]
+    [InlineData("", ",\"authorization\":\"Bearer sample\"")]
+    public void Unsigned_browser_capture_rejects_credentials(string flag, string credential)
+    {
+        string request = Msg($$"""
+            "type":"browser-capture",{{flag}}
+            "items":[{"url":"https://example.com/archive"{{credential}} }],
+            "browserProof":{"length":200,"etag":"\"p1\"","contentType":"application/zip"}
+            """);
+
+        Assert.False(BridgeProtocol.TryParse(request, out _, out _));
     }
 
     [Theory]

@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
+const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].includes(message.type);
+
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }], playerPicker = false } = {}) {
@@ -66,6 +68,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
           sent.push(message);
         }
         const reply = Object.hasOwn(nativeReplies, message.type) ? nativeReplies[message.type]
+          : message.type === 'browser-capture' ? nativeReplies['browser-submit']
           : message.type === 'hello' ? { ok: true, data: { siteRules: { neverCaptureHosts: [] } } } : undefined;
         const response = typeof reply === 'function' ? reply(message) : reply;
         const fallback = { ok: false, code: 'host-error', message: 'no reply' };
@@ -292,7 +295,8 @@ test('automatic handoff verifies the response before pausing Chrome and accepts 
   await observe(app, file);
   await app.onCreated(file);
   assert.deepEqual(app.actions, ['native', 'pause', 'native', 'native']);
-  assert.equal(app.sent[0].type, 'browser-submit');
+  assert.equal(app.sent[0].type, 'browser-capture');
+  assert.deepEqual(app.policyRequests, []);
   assert.deepEqual(structuredClone(app.sent[0].browserProof), { length: 1000, etag: '"version-1"', contentType: 'application/zip' });
   assert.equal(app.sent[0].items[0].fileName, 'archive.zip');
   assert.equal(app.sent[0].items[0].originalUrl, file.url);
@@ -309,7 +313,7 @@ test('pausing during native verification leaves the new download with Chrome', a
   await observe(app, file);
 
   const capture = app.onCreated(file);
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'));
+  await waitFor(() => app.sent.some(isBrowserSubmission));
   await app.local.set({ vesperPaused: true });
   finishSubmit(started);
   await capture;
@@ -324,7 +328,7 @@ test('pausing during native verification leaves the new download with Chrome', a
 
   await app.local.set({ vesperPaused: false });
   await app.onChanged({ id: file.id, totalBytes: { current: 1 } });
-  assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 1);
 });
 
 test('pausing during native acceptance abandons the tentative handoff and resumes Chrome', async () => {
@@ -355,7 +359,7 @@ test('an exact never-capture rule leaves a new Chrome download alone before send
   const file = activeDownload();
   file.referrer = 'https://video.example/watch?token=private';
   const app = load({ hello: { ok: true, data: { siteRules: { neverCaptureHosts: ['video.example'] } } },
-    'browser-submit': started }, { download: file });
+    'browser-submit': started }, { download: file, localData: { vesperSiteNeverCaptureHosts: ['video.example'] } });
 
   await observe(app, file);
   await app.onCreated(file);
@@ -409,14 +413,37 @@ test('automatic capture fails closed when the fresh site policy is unavailable',
   }
 });
 
-test('site policy waits long enough for a cold desktop start', async () => {
+test('signed capture site policy waits long enough for a cold desktop start', async () => {
   const file = activeDownload();
-  const app = load({ 'browser-submit': started }, { download: file });
+  const app = load({ 'browser-submit': started }, { download: file, signInPermission: true, prefs: { useSignIn: true } });
   await observe(app, file);
   await app.onCreated(file);
   await waitFor(() => app.policyRequests.length === 1, 'the site policy check did not run');
 
   assert.ok(app.timerDelays.includes(15_000));
+});
+
+test('unsigned capture honors a site rule the desktop added after the worker started', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-capture': { ok: false, code: 'site-capture-disabled' } }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.deepEqual(app.policyRequests, []);
+  assert.deepEqual(app.cookieLookups, []);
+  assert.deepEqual(app.sent.map(message => message.type), ['browser-capture']);
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'site-rule');
+});
+
+test('an older helper does not fall back to a command that might ignore site rules', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-capture': { ok: false, code: 'invalid', message: 'Unknown request type.' } }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.deepEqual(app.sent.map(message => message.type), ['browser-capture']);
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
 });
 
 test('Chrome taking bytes during the site check avoids a second download request', async () => {
@@ -475,7 +502,7 @@ test('IPv6 never-capture hosts match the browser’s bracketed URL form', async 
   const file = activeDownload();
   file.referrer = 'https://[2001:db8::1]/watch';
   const app = load({ hello: { ok: true, data: { siteRules: { neverCaptureHosts: ['2001:db8::1'] } } } },
-    { download: file });
+    { download: file, localData: { vesperSiteNeverCaptureHosts: ['2001:db8::1'] } });
 
   await observe(app, file);
   await app.onCreated(file);
@@ -639,12 +666,12 @@ test('a temporary native error leaves Chrome downloading and never retries late'
   await observe(app, file);
   await app.onCreated(file);
   assert.equal(file.paused, false);
-  assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 1);
   assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].stage, 'stand-down');
 
   app.advanceTime(61_000);
   await app.recover();
-  assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 1);
   assert.equal(file.state, 'in_progress');
   assert.equal(app.actions.includes('cancel'), false);
 });
@@ -657,7 +684,7 @@ test('a lost native reply leaves durable cleanup and never takes the Chrome file
   await app.onCreated(file);
 
   const [submission, cleanup] = app.sent;
-  assert.equal(submission.type, 'browser-submit');
+  assert.equal(submission.type, 'browser-capture');
   assert.equal(cleanup.operation, 'abandon');
   assert.equal(cleanup.transferId, submission.id);
   assert.equal(app.localData.browserDownloads[file.id].stage, 'releasing');
@@ -691,7 +718,7 @@ test('same-size responses without a strong ETag stay in Chrome', async () => {
 
     await waitFor(() => app.sessionData.vesperCaptureDecisions?.some(entry => entry.outcome === 'no-validator'),
       'the missing strong validator should be explained');
-    assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+    assert.equal(app.sent.some(isBrowserSubmission), false);
     assert.equal(file.paused, false);
     assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'no-validator');
   }
@@ -734,7 +761,7 @@ test('a download is picked up when Chrome reports its response after the downloa
   await app.onCreated(file);
   assert.equal(app.sent.length, 0);
   await observe(app, file, { contentType: null, attachment: false });
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'), 'Late response capture was not submitted.');
+  await waitFor(() => app.sent.some(isBrowserSubmission), 'Late response capture was not submitted.');
   assert.equal(app.sent[0].browserProof.length, file.fileSize);
   assert.equal(app.sent[0].browserProof.contentType, undefined);
   await waitFor(() => file.paused, 'Chrome was not paused after the late response was accepted.');
@@ -767,15 +794,15 @@ test('a redirected API attachment matches when Chrome creates the item with fina
 
   await waitFor(() => app.sessionData.vesperDownloadCapture.awaiting.length === 0,
     'the final response should match the pending original URL');
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'),
+  await waitFor(() => app.sent.some(isBrowserSubmission),
     'the strong ETag should identify the response even before Chrome reports a size');
-  const request = app.sent.find(message => message.type === 'browser-submit');
+  const request = app.sent.find(isBrowserSubmission);
   assert.equal(request.browserProof.etag, '"api-v1"');
   assert.equal(file.paused, false);
 
   file.totalBytes = 1000;
   const changed = app.onChanged({ id: file.id, totalBytes: { current: 1000 } });
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'),
+  await waitFor(() => app.sent.some(isBrowserSubmission),
     'the strong-ETag response should start native verification');
   assert.equal(request.items[0].cookie, 'session=test-value');
   assert.equal(request.authorized, true);
@@ -804,7 +831,7 @@ test('a redirected response waits for Chrome finalUrl before retrying the native
 
   file.finalUrl = finalUrl;
   await app.onChanged({ id: file.id, finalUrl: { current: finalUrl } });
-  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false,
+  assert.equal(app.sent.some(isBrowserSubmission), false,
     'the final URL alone is not proof of the source representation');
   assert.equal(file.paused, false);
 
@@ -816,8 +843,8 @@ test('a redirected response waits for Chrome finalUrl before retrying the native
       { name: 'ETag', value: '"api-v4"' },
       { name: 'Content-Length', value: '1000' }
     ] });
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'));
-  const request = app.sent.find(message => message.type === 'browser-submit');
+  await waitFor(() => app.sent.some(isBrowserSubmission));
+  const request = app.sent.find(isBrowserSubmission);
   assert.equal(request.items[0].cookie, 'session=test-value');
   assert.equal(request.authorized, true);
   assert.equal(file.paused, false, 'Chrome must continue while VESPER checks readiness');
@@ -840,12 +867,12 @@ test('an authenticated API capture does not mirror Chrome activity while native 
   await observe(app, file, { requestId: 'arena-direct' });
 
   const created = app.onCreated(file);
-  await waitFor(() => app.sent.some(message => message.type === 'browser-submit'),
+  await waitFor(() => app.sent.some(isBrowserSubmission),
     'VESPER may verify the request without listing Chrome downloads');
   assert.equal(app.ports.length, 0);
   assert.equal(file.paused, false);
   assert.equal(app.actions.includes('cancel'), false);
-  const request = app.sent.find(message => message.type === 'browser-submit');
+  const request = app.sent.find(isBrowserSubmission);
   assert.equal(request.authorized, true);
   assert.equal(request.items[0].cookie, 'session=test-value');
   assert.deepEqual(app.cookieLookups, [url]);
@@ -887,7 +914,7 @@ test('a POST redirect hop or 401/407 challenge prevents replaying an API attachm
       'the response should settle the matching pending Chrome download');
     await app.onChanged({ id: file.id, totalBytes: { current: 1000 } });
 
-    assert.equal(app.sent.some(message => message.type === 'browser-submit'), false, scenario.name);
+    assert.equal(app.sent.some(isBrowserSubmission), false, scenario.name);
     assert.equal(app.cookieLookups.length, 0, scenario.name);
     assert.equal(file.paused, false, scenario.name);
   }
@@ -899,7 +926,7 @@ test('automatic API interception off leaves Chrome as the only download owner', 
   await observe(app, file, { requestId: 'arena-disabled' });
   await app.onCreated(file);
 
-  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+  assert.equal(app.sent.some(isBrowserSubmission), false);
   assert.equal(app.cookieLookups.length, 0);
   assert.equal(file.paused, false);
   assert.equal(app.actions.includes('cancel'), false);
@@ -918,14 +945,14 @@ test('pausing VESPER in Chrome hides new actions and leaves accepted transfers a
   const blocked = await app.message({ type: 'media-options' }, { tab: { id: 2 }, url: 'https://example.com/watch' });
   assert.equal(blocked.code, 'paused');
   await app.onCreated({ ...file, paused: false });
-  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false);
+  assert.equal(app.sent.some(isBrowserSubmission), false);
   assert.equal((await app.local.get('browserDownloads')).browserDownloads[file.id].transferId, existing.transferId);
   assert.equal(app.actions.includes('resume'), false);
   assert.equal(app.actions.includes('cancel'), false);
 
   await app.local.set({ vesperPaused: false });
   await app.onChanged({ id: file.id, totalBytes: { current: 0 } });
-  assert.equal(app.sent.some(message => message.type === 'browser-submit'), false,
+  assert.equal(app.sent.some(isBrowserSubmission), false,
     'a file first seen during pause must stay with Chrome after unpausing');
 });
 
@@ -941,7 +968,7 @@ test('a pending Chrome capture survives a service worker restart', async () => {
   await observe(workerAfterRestart, file);
   await new Promise(resolve => setTimeout(resolve, 20));
 
-  assert.equal(workerAfterRestart.sent[0].type, 'browser-submit');
+  assert.equal(workerAfterRestart.sent[0].type, 'browser-capture');
   assert.equal(file.paused, true);
 });
 
@@ -954,8 +981,8 @@ test('an attempted native handoff resumes after worker restart with the same tra
   await observe(firstWorker, file);
 
   const firstCapture = firstWorker.onCreated(file);
-  await waitFor(() => firstWorker.sent.some(message => message.type === 'browser-submit'));
-  const firstRequest = firstWorker.sent.find(message => message.type === 'browser-submit');
+  await waitFor(() => firstWorker.sent.some(isBrowserSubmission));
+  const firstRequest = firstWorker.sent.find(isBrowserSubmission);
   const attempted = (await firstWorker.local.get('browserDownloads')).browserDownloads[file.id];
   assert.equal(attempted.stage, 'attempted');
   assert.equal(file.paused, false, 'Chrome keeps running while native readiness is unknown');
@@ -963,8 +990,8 @@ test('an attempted native handoff resumes after worker restart with the same tra
   const restarted = load({ 'browser-submit': () => secondReply, 'browser-transfer': transfer('failed') }, {
     download: file, localData: firstWorker.localData, sessionData: firstWorker.sessionData
   });
-  await waitFor(() => restarted.sent.some(message => message.type === 'browser-submit'));
-  const retriedRequest = restarted.sent.find(message => message.type === 'browser-submit');
+  await waitFor(() => restarted.sent.some(isBrowserSubmission));
+  const retriedRequest = restarted.sent.find(isBrowserSubmission);
 
   assert.equal(retriedRequest.id, firstRequest.id,
     'a lost worker reply must retry the idempotent native operation, not create a second transfer');
@@ -991,16 +1018,16 @@ test('three interrupted browser submissions reuse one ID then abandon and stand 
   await observe(worker, file);
 
   const firstCapture = worker.onCreated(file);
-  await waitFor(() => worker.sent.some(message => message.type === 'browser-submit'));
-  const firstRequest = worker.sent.find(message => message.type === 'browser-submit');
+  await waitFor(() => worker.sent.some(isBrowserSubmission));
+  const firstRequest = worker.sent.find(isBrowserSubmission);
   let localData = worker.localData;
   assert.equal(localData.browserDownloads[file.id].attempts, 1);
   worker.stopWorker();
 
   for (const attempt of [2, 3]) {
     worker = load({ 'browser-submit': unresolved }, { download: file, sessionData, downloadHistory, localData });
-    await waitFor(() => worker.sent.some(message => message.type === 'browser-submit'));
-    const request = worker.sent.find(message => message.type === 'browser-submit');
+    await waitFor(() => worker.sent.some(isBrowserSubmission));
+    const request = worker.sent.find(isBrowserSubmission);
     assert.equal(request.id, firstRequest.id);
     localData = worker.localData;
     assert.equal(localData.browserDownloads[file.id].attempts, attempt);
@@ -1014,7 +1041,7 @@ test('three interrupted browser submissions reuse one ID then abandon and stand 
   const abandon = worker.sent.find(message => message.type === 'browser-transfer' && message.operation === 'abandon');
   const standDown = worker.localData.browserDownloads[file.id];
   assert.equal(abandon.transferId, firstRequest.id);
-  assert.equal(worker.sent.some(message => message.type === 'browser-submit'), false);
+  assert.equal(worker.sent.some(isBrowserSubmission), false);
   assert.equal(standDown.stage, 'stand-down');
   assert.equal(standDown.transferId, undefined);
   assert.equal(standDown.sourceHash, undefined);
@@ -1050,9 +1077,9 @@ test('a redirect chain survives service worker restart until the final attachmen
       { name: 'Content-Disposition', value: 'attachment; filename="export.zip"' },
       { name: 'ETag', value: '"api-v5"' }
     ] });
-  await waitFor(() => nextWorker.sent.some(message => message.type === 'browser-submit'));
+  await waitFor(() => nextWorker.sent.some(isBrowserSubmission));
 
-  const request = nextWorker.sent.find(message => message.type === 'browser-submit');
+  const request = nextWorker.sent.find(isBrowserSubmission);
   assert.equal(request.items[0].cookie, 'session=test-value');
   assert.equal(request.authorized, true);
   await waitFor(() => file.paused, 'Chrome was not paused after native acceptance.');
@@ -1110,7 +1137,7 @@ test('POST, 401, and 407 replay markers survive restart without persisting their
     await waitFor(() => nextWorker.sessionData.vesperDownloadCapture.responses?.length === 1);
     await nextWorker.onChanged({ id: file.id, totalBytes: { current: 1000 } });
 
-    assert.equal(nextWorker.sent.some(message => message.type === 'browser-submit'), false, scenario.kind);
+    assert.equal(nextWorker.sent.some(isBrowserSubmission), false, scenario.kind);
     assert.equal(file.paused, false, scenario.kind);
   }
 });
@@ -1126,7 +1153,7 @@ test('recent response evidence survives a service worker restart before download
   const workerAfterRestart = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file, sessionData });
   await workerAfterRestart.onCreated(file);
 
-  assert.equal(workerAfterRestart.sent[0].type, 'browser-submit');
+  assert.equal(workerAfterRestart.sent[0].type, 'browser-capture');
   assert.equal(file.paused, true);
 });
 
@@ -2291,7 +2318,7 @@ test('sign-in context is used only during a fresh capture and a failed attempt d
   app.advanceTime(61_000);
   await app.recover();
   assert.deepEqual(app.cookieLookups, [file.url]);
-  assert.equal(app.sent.filter(message => message.type === 'browser-submit').length, 1);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 1);
 
   const fresh = { ...activeDownload(), id: 15 };
   const next = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
@@ -2583,7 +2610,7 @@ test('a link with a #fragment matches the response Chrome reported without it', 
   await app.onHeaders({ url: 'https://example.com/files/archive.zip', requestId: 'r1', method: 'GET', type: 'main_frame',
     statusCode: 200, responseHeaders: responseHeaders(zipHeaders) });
   await app.onCreated(file);
-  assert.equal(app.sent[0].type, 'browser-submit');
+  assert.equal(app.sent[0].type, 'browser-capture');
   assert.equal(app.sent[0].items[0].url, 'https://example.com/files/archive.zip');   // a fragment is never sent to a server
   assert.equal(file.paused, true);
   assert.equal(outcomeOf(app), 'moved');

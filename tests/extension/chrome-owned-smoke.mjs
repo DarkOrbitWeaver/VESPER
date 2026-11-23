@@ -41,8 +41,9 @@ function installRaceBridge() {
   const simulate = (_host, message, callback) => {
     smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
     const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
-    if (message.type === 'hello') return reply({ data: { siteRules: { neverCaptureHosts: [] } } });
-    if (message.type === 'browser-submit')
+    if (message.type === 'hello')
+      return setTimeout(() => reply({ data: { siteRules: { neverCaptureHosts: [] } } }), 650);
+    if (message.type === 'browser-capture' || message.type === 'browser-submit')
       return setTimeout(() => reply({ results: [{ status: 'started', transferReady: true }] }), 400);
     if (message.type === 'browser-transfer')
       return reply({ data: { state: 'failed' } });
@@ -148,7 +149,8 @@ async function main() {
       response.end('<!doctype html><title>VESPER smoke fixture</title><body></body>');
       return;
     }
-    if (captureRaceTest && ['/race-fast', '/race-during-check', '/race-delayed'].includes(request.url)) {
+    const raceBodyDelay = { '/race-fast': 0, '/race-during-check': 200, '/race-policy-window': 800, '/race-delayed': 1600 }[request.url];
+    if (captureRaceTest && Number.isInteger(raceBodyDelay)) {
       response.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Content-Disposition': `attachment; filename="vesper${request.url.replace('/', '-')}.bin"`,
@@ -158,8 +160,8 @@ async function main() {
         'Cache-Control': 'no-store'
       });
       response.flushHeaders();
-      if (request.url === '/race-fast') response.end(bytes);
-      else setTimeout(() => response.end(bytes), request.url === '/race-during-check' ? 200 : 1600);
+      if (raceBodyDelay === 0) response.end(bytes);
+      else setTimeout(() => response.end(bytes), raceBodyDelay);
       return;
     }
     if (nativeHostTest && request.url === '/native-redirect') {
@@ -401,7 +403,7 @@ async function main() {
     let captureRace = null;
     if (captureRaceTest) {
       captureRace = [];
-      for (const fixture of ['fast', 'during-check', 'delayed']) {
+      for (const fixture of ['fast', 'during-check', 'policy-window', 'delayed']) {
         const name = `vesper-race-${fixture}.bin`;
         const before = await evaluate('Read race call count', '__ownershipSmoke.raceCalls.length');
         await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/race-' + fixture }, tab);
@@ -416,11 +418,12 @@ async function main() {
           const calls = await readCalls();
           return calls.some(call => call.operation === 'abandon') ? calls : null;
         }, 5000, 'The extension did not release the simulated transfer for the ' + fixture + ' fixture.');
-        const attempted = calls.some(call => call.type === 'browser-submit');
+        const attempted = calls.some(call => call.type === 'browser-capture');
         const reachedAccept = calls.some(call => call.operation === 'accept');
         captureRace.push({ fixture, attempted, reachedAccept, bytes: file.fileSize });
         if (fixture === 'during-check') assert.ok(attempted, 'No native check was in flight when Chrome started.');
-        assert.equal(reachedAccept, fixture === 'delayed',
+        assert.equal(calls.some(call => call.type === 'hello'), false, 'Unsigned capture sent a separate policy request.');
+        assert.equal(reachedAccept, fixture === 'policy-window' || fixture === 'delayed',
           'Unexpected capture path: ' + JSON.stringify({ captureRace, calls }));
       }
     }
@@ -458,13 +461,13 @@ async function main() {
       assert.equal(chromeFiles.some(name => name.startsWith(nativeFileName)), false,
         'The accepted file must not remain in Chrome’s download folder.');
       const finalState = await evaluate('Read native handoff observations', 'globalThis.__ownershipSmoke');
-      assert.ok(finalState.nativeMessages.some(message => message.type === 'browser-submit'));
+      assert.ok(finalState.nativeMessages.some(message => message.type === 'browser-capture'));
       assert.ok(finalState.nativeMessages.some(message => message.type === 'browser-transfer' && message.operation === 'accept'));
 
-      const originalSubmission = finalState.nativeMessages.find(message => message.type === 'browser-submit');
+      const originalSubmission = finalState.nativeMessages.find(message => message.type === 'browser-capture');
       assert.ok(originalSubmission?.response?.ok, 'The captured download did not receive a native response.');
       const duplicate = await evaluate('Repeat the same native submission',
-        "(async () => { const original = __ownershipSmoke.nativeMessages.find(message => message.type === 'browser-submit');"
+        "(async () => { const original = __ownershipSmoke.nativeMessages.find(message => message.type === 'browser-capture');"
         + "if (!original) throw new Error('The original submission was not observed');"
         + "return await new Promise((resolve, reject) => chrome.runtime.sendNativeMessage('com.vesper.downloader',"
         + "structuredClone(original.message), response => { const error = chrome.runtime.lastError;"
@@ -506,7 +509,7 @@ async function main() {
       }, 8000, 'The extension did not explain why the signed-in download stayed in Chrome.');
       assert.equal(signInDecision.outcome, 'sign-in', 'The sign-in refusal should be explained without transferring ownership.');
       const postScenarioState = await evaluate('Read sign-in native request', 'globalThis.__ownershipSmoke');
-      const signInRequest = postScenarioState.nativeMessages.find(message => message.type === 'browser-submit'
+      const signInRequest = postScenarioState.nativeMessages.find(message => message.type === 'browser-capture'
         && message.message.items?.some(item => item.url.endsWith('/native-signin-protected')));
       assert.ok(signInRequest, 'The redirected sign-in URL was not independently verified by the native host.');
       assert.equal(signInRequest.hasCredentials, false, 'The extension sent an unapproved sign-in credential.');

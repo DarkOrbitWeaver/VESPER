@@ -389,6 +389,7 @@ function noteDecision(item, outcome, generation = captureGeneration) {
 function handoffOutcome(reply, result, signedIn) {
   if (!reply.ok) {
     if (reply.code === 'host-missing') return 'app-missing';
+    if (reply.code === 'site-capture-disabled') return 'site-rule';
     if (['app-unavailable', 'timeout', 'host-error', 'error'].includes(reply.code)) return 'app-unavailable';
     return reply.code === 'duplicate' ? 'duplicate' : 'refused';
   }
@@ -543,9 +544,12 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       return chromeKeeps();
     }
 
-    const [siteDecision, sourceHash] = await Promise.all([
-      shouldKeepChromeForSite(item), sourceIdentity(browserUrl(item))
+    const source = VesperPlayerSource.http(browserUrl(item));
+    const [approvedHosts, sourceHash] = await Promise.all([
+      source?.protocol === 'https:' ? signInApproval() : null, sourceIdentity(browserUrl(item))
     ]);
+    const signedIn = approvedHosts?.has(source?.hostname) === true;
+    const siteDecision = await captureSiteDecision(item, signedIn);
     if (siteDecision === 'policy-unavailable') {
       await note('policy-unavailable');
       return chromeKeeps('VESPER could not confirm the site rules. Chrome is continuing this download.');
@@ -579,15 +583,19 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       if (!previous) await writeBrowserRecord(id, null);
       return chromeKeeps();
     }
-    const { items, authorized } = await withSignIn([{
+    const itemsToSend = [{
       url: browserUrl(item), originalUrl: startUrl(item), fileName: chromeFileName(candidate),
       referer: item.referrer || undefined, userAgent: navigator.userAgent
-    }]);
+    }];
+    const { items, authorized } = signedIn ? await withSignIn(itemsToSend)
+      : { items: itemsToSend, authorized: false };
     if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
       if (!previous) await writeBrowserRecord(id, null);
       return chromeKeeps();
     }
-    const reply = await nativeRequest(envelope('browser-submit', { id: record.transferId, mode, items, authorized, browserProof: proof }), 24000);
+    // The separate command keeps older helpers from accepting capture without checking current site rules.
+    const command = signedIn ? 'browser-submit' : 'browser-capture';
+    const reply = await nativeRequest(envelope(command, { id: record.transferId, mode, items, authorized, browserProof: proof }), 24000);
     // Chrome may finish while native verification is in flight. Its completed file is never ours.
     const latest = await getChromeDownload(id);
     if (!sameDownload(latest, record) || latest.state === 'complete' || !(await sameSource(latest, record))) {

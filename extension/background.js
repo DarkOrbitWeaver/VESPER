@@ -115,18 +115,26 @@ async function refreshNeverCaptureHosts() {
   return siteRulesRefresh;
 }
 
-async function shouldKeepChromeForSite(item) {
-  if (!(await refreshNeverCaptureHosts())) return 'policy-unavailable';
+function matchesNeverCaptureHost(item) {
   for (const address of [item?.referrer, item?.url, item?.finalUrl]) {
     try {
       const candidate = new URL(address);
       if (candidate.protocol === 'http:' || candidate.protocol === 'https:') {
         const host = normalizeRuleHost(candidate.hostname);
-        if (host && siteNeverCaptureHosts.has(host)) return 'site-rule';
+        if (host && siteNeverCaptureHosts.has(host)) return true;
       }
     } catch { /* Invalid sources have no site host to compare. */ }
   }
-  return 'allowed';
+  return false;
+}
+
+async function captureSiteDecision(item, signedIn) {
+  await siteRulesLoaded;
+  // Unsigned capture checks live rules in the same native call that stages the transfer.
+  // Refresh a cached block so removing a site rule takes effect without an extension restart.
+  if (!signedIn && !matchesNeverCaptureHost(item)) return 'allowed';
+  if (!(await refreshNeverCaptureHosts())) return 'policy-unavailable';
+  return matchesNeverCaptureHost(item) ? 'site-rule' : 'allowed';
 }
 
 // ---------------------------------------------------------------- submission (durable and idempotent)
@@ -264,14 +272,19 @@ async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = 
   });
 }
 
-async function withSignIn(items, context = {}) {
-  const safe = items.map(stripSecrets);
+async function signInApproval() {
   const prefs = await settings();
   if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false)))
-    return { items: safe, authorized: false };
+    return null;
   const { signInHosts = [] } = await chrome.storage.local.get('signInHosts').catch(() => ({}));
-  const approvedHosts = new Set(Array.isArray(signInHosts)
+  return new Set(Array.isArray(signInHosts)
     ? signInHosts.filter(host => typeof host === 'string' && host.length <= 253).slice(0, 50).map(host => host.toLowerCase()) : []);
+}
+
+async function withSignIn(items, context = {}) {
+  const safe = items.map(stripSecrets);
+  const approvedHosts = await signInApproval();
+  if (!approvedHosts) return { items: safe, authorized: false };
   const enriched = [];
   for (const item of safe) {
     let targetHost;

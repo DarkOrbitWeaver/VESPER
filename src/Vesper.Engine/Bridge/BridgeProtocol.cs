@@ -74,7 +74,7 @@ public static class BridgeProtocol
 
             string type = Str(root, "type") ?? "";
             if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
-                or "browser-submit" or "browser-transfer" or "browser-activity"))
+                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity"))
             { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
@@ -95,6 +95,7 @@ public static class BridgeProtocol
             BrowserActivity? activity = null;
             string? transferId = null, operation = null;
             bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options";
+            bool browserSubmit = type is "browser-submit" or "browser-capture";
             if (type == "probe" || mediaLookup)
             {
                 probeUrl = Str(root, "url");
@@ -173,15 +174,19 @@ public static class BridgeProtocol
                     clip = new MediaTimeRange(start, end);
                 }
             }
-            else if (type is "submit" or "batch-review" or "browser-submit")
+            else if (type is "submit" or "batch-review" || browserSubmit)
             {
                 if (!root.TryGetProperty("items", out JsonElement array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() is 0 or > MaxItems)
                 { error = $"Provide between 1 and {MaxItems} items."; return false; }
                 bool authorized = root.TryGetProperty("authorized", out JsonElement a) && a.ValueKind == JsonValueKind.True;
+                if (type == "browser-capture" && authorized)
+                { error = "Unsigned capture cannot send credentials."; return false; }
 
                 foreach (JsonElement element in array.EnumerateArray())
                 {
-                    if (!TryItem(element, authorized, type == "browser-submit", out BridgeItem? item, out error)) return false;
+                    if (!TryItem(element, authorized, browserSubmit, out BridgeItem? item, out error)) return false;
+                    if (type == "browser-capture" && (element.TryGetProperty("cookie", out _) || element.TryGetProperty("authorization", out _)))
+                    { error = "Unsigned capture cannot send credentials."; return false; }
                     if (type == "batch-review")
                     {
                         double? duration = element.TryGetProperty("reviewDurationSeconds", out var seconds)
@@ -192,7 +197,7 @@ public static class BridgeProtocol
                     }
                     items.Add(item!);
                 }
-                if (type == "browser-submit")
+                if (browserSubmit)
                 {
                     if (items is not [{ Kind: "http" }] || !root.TryGetProperty("browserProof", out JsonElement proof)
                         || proof.ValueKind != JsonValueKind.Object
@@ -216,7 +221,7 @@ public static class BridgeProtocol
                 if (operation is not ("connect" or "watch") || !TryBrowserActivity(root, out activity))
                 { error = "Invalid Chrome download activity."; return false; }
             }
-            bool confirmTransfer = type == "browser-submit" || type == "submit" && items.Count == 1
+            bool confirmTransfer = browserSubmit || type == "submit" && items.Count == 1
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
             string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
