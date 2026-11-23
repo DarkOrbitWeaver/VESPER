@@ -401,9 +401,6 @@ internal static class MediaTransferBridge
             return BuildMerge(item, selection, plan, [localMuxedVideo], localMuxedContainer,
                 clipStartSeconds, clipEndSeconds, prefs.EmbedSubtitles, unsupportedSubtitleCount);
         }
-        if (step.Protocol == StreamProtocol.Hls && step.Segments is not null &&
-            !step.Url.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
-            return (null, "This HLS stream needs a segment download path that isn't supported.");
         string? dashPlan = null;
         if (step.Protocol == StreamProtocol.Dash)
         {

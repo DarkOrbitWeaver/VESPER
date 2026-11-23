@@ -540,9 +540,10 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   assert.deepEqual(timers, [900]);
 
   await window.__testContent.loadFormats();
-  assert.equal(sent[0].pageUrl, item);
-  assert.equal(sent[0].playerUrl, '');
-  assert.equal(sent[0].playerPlaying, false);
+  const formatRequest = sent.find(message => message.type === 'media-options');
+  assert.equal(formatRequest.pageUrl, item);
+  assert.equal(formatRequest.playerUrl, '');
+  assert.equal(formatRequest.playerPlaying, false);
 
   const best = { index: 0, label: 'Best quality', detail: '1080p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };
   const balanced = { index: 1, label: 'Balanced', detail: '720p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };
@@ -584,4 +585,102 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   assert.equal(window.__testContent.panelOpenForTest(), false,
     'emptying the active player closes its pending picker request');
   assert.equal(window.__testContent.retainedDraftForTest(), null);
+});
+
+test('a butterfly left behind by an ended hover preview never leaves from under the pointer', async () => {
+  class FakeElement {
+    parentElement = null;
+    isConnected = true;
+    querySelectorAll() { return []; }
+    getBoundingClientRect() { return { left: 0, top: 0, right: 480, bottom: 270, width: 480, height: 270 }; }
+  }
+  class FakeVideo extends FakeElement {
+    currentSrc = 'https://www.youtube.com/videoplayback?id=preview';
+    src = this.currentSrc;
+    readyState = 1;
+    paused = false;
+  }
+  const item = 'https://www.youtube.com/watch?v=abcdefghijk';
+  const body = {};
+  const card = new FakeElement();
+  const video = new FakeVideo();
+  const elsewhere = new FakeElement();
+  let hovering = false;
+  let now = 1_000_000;
+  const scheduled = [];
+  const node = () => ({
+    setAttribute() {}, matches: selector => hovering && selector.includes(':hover'),
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false }
+  });
+  card.parentElement = body;
+  elsewhere.parentElement = body;
+  card.querySelectorAll = selector => selector === 'a[href]' ? [{ href: item }] : selector === 'video' ? [video] : [];
+  video.parentElement = card;
+  let hoverTarget = card;
+  const document = Object.assign(new EventTarget(), {
+    body, documentElement: {}, createElement: node, querySelectorAll: () => [], elementFromPoint: () => hoverTarget
+  });
+  const window = new EventTarget();
+  const context = vm.createContext({
+    window, document, location: { href: 'https://www.youtube.com/' }, Element: FakeElement,
+    HTMLMediaElement: FakeVideo, HTMLVideoElement: FakeVideo,
+    AbortController, URL, innerWidth: 1280, innerHeight: 720,
+    Date: class extends Date { static now() { return now; } },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+    clearTimeout() {},
+    setTimeout: (handler, delay) => scheduled.push({ handler, delay }),
+    matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
+    ResizeObserver: class { observe() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
+    chrome: {
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} }, sendMessage: async () => ({ ok: false, code: 'protected' }) },
+      storage: { sync: { get: async defaults => defaults }, onChanged: { addListener() {}, removeListener() {} } }
+    }
+  });
+  vm.runInContext(source('theme'), context);
+  vm.runInContext(source('player-source'), context);
+  let detached = 0;
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
+    onPointer, consider, refreshPlayer, holdMissingPreview, activePreview: () => activePreview,
+    stubMovement: onDetach => { selectPlayer = () => {}; detach = onDetach; },
+    attachForTest: (player, controls) => {
+      video = player; perch = { x: 10, y: 10 };
+      ({ button, panel, receipt } = controls);
+      companion = { setPickerOpen() {}, setVisible() {}, pointerMove() {} };
+    }
+  };\n})();`);
+  vm.runInContext(content, context);
+  await new Promise(resolve => setImmediate(resolve));
+  const page = window.__testContent;
+  const runLatestTimer = afterMs => { now += afterMs; scheduled.at(-1).handler(); };
+
+  page.onPointer({ target: card, clientX: 220, clientY: 100 });
+  page.consider(video);
+  page.stubMovement(() => { detached++; });
+  page.refreshPlayer(video);
+  assert.equal(page.activePreview()?.player, video);
+  page.attachForTest(video, { button: node(), panel: node(), receipt: node() });
+
+  // The site ends the preview as the pointer reaches the butterfly.
+  hoverTarget = elsewhere;
+  page.onPointer({ target: elsewhere, clientX: 30, clientY: 30 });
+  video.readyState = 0;
+  hovering = true;
+  assert.equal(page.holdMissingPreview(), true);
+  for (let check = 0; check < 6; check++) runLatestTimer(900);
+  assert.equal(detached, 0, 'still there after 5.4 seconds of resting on it');
+  assert.equal(page.activePreview()?.player, video);
+  assert.ok(scheduled.every(timer => timer.delay === 900), 'the wait never turns into a zero-delay loop');
+
+  // The pointer moves well away. The butterfly leaves at the next check.
+  hovering = false;
+  page.onPointer({ target: elsewhere, clientX: 900, clientY: 600 });
+  runLatestTimer(900);
+  assert.equal(detached, 1);
+  assert.equal(page.activePreview(), null);
+});
+
+test('a pointer still heading for the butterfly gets extra time, with a limit', async () => {
+  assert.match(source('content'), /const approaching = distance < previewPointerDistance - 6;/);
+  assert.match(source('content'), /\(previewLatched\(\) \|\| approaching\) && Date\.now\(\) - previewRemovedAt < PREVIEW_MAX_LATCH/);
 });

@@ -29,6 +29,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const ports = [];
   const timers = new Set();
   const timerDelays = [];
+  const manifestWatchers = new Map();
   let finishDownloadCancel;
   let digestCalls = 0;
   let deferredDigestCall = 0;
@@ -73,7 +74,15 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       }
     },
     webRequest: {
-      onResponseStarted: { addListener: fn => { onMedia = fn; } },
+      onResponseStarted: {
+        addListener: (fn, filter) => {
+          if (filter?.tabId !== undefined) manifestWatchers.set(filter.tabId, fn);
+          else onMedia = fn;
+        },
+        removeListener: fn => {
+          for (const [tab, listener] of manifestWatchers) if (fn === listener) manifestWatchers.delete(tab);
+        }
+      },
       onHeadersReceived: { addListener: fn => { onHeaders = fn; } },
       onBeforeRedirect: { addListener: fn => { onRedirect = fn; } }
     },
@@ -176,7 +185,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
-    localData: localSeed,
+    localData: localSeed, manifestWatchers,
     install: () => onInstalled(),
     finishDownloadCancel: () => finishDownloadCancel?.(),
     deferDigestAt: callsAhead => { deferredDigestCall = digestCalls + callsAhead; },
@@ -1567,8 +1576,13 @@ test('a blob player only receives its declared manifest from its current frame a
   assert.equal(app.sent[1].candidates.length, 0);
 });
 
-test('a blob player must choose even a single inferred manifest before VESPER receives it', async () => {
-  const app = load({ 'media-options': { ok: true } });
+// A verified exact-source reply from VESPER: a five-minute media session with real choices.
+const checkedSource = (seconds = 61, detail = '720p MP4') => ({ ok: true, data: { mediaSession: 'a'.repeat(32),
+  duration: seconds, choices: [{ index: 0, label: 'Best quality', detail }] } });
+const onlyExactChecks = app => app.sent.every(message => message.type === 'media-source-options' && message.candidates.length === 1);
+
+test('a blob player confirms even a single inferred manifest; VESPER checks only that exact source', async () => {
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': checkedSource() });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();
@@ -1581,11 +1595,15 @@ test('a blob player must choose even a single inferred manifest before VESPER re
   const options = await app.message(message, sender);
 
   assert.equal(options.data.sourceChoices.length, 1);
-  assert.deepEqual(app.sent, []);
-  await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
-    pageUrl: page, generation: 3, playerUrl: message.playerUrl }, sender);
+  assert.match(options.data.sourceChoices[0].label, /^1:01 · HLS · 1 format$/);
+  assert.equal(app.sent.length, 1);
+  assert.ok(onlyExactChecks(app), 'only the one-source check may receive an inferred candidate');
   assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
     ['https://cdn.example.com/video/playlist.m3u8']);
+  const selected = await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
+    pageUrl: page, generation: 3, playerUrl: message.playerUrl }, sender);
+  assert.equal(selected.data.choices[0].label, 'Best quality');
+  assert.equal(app.sent.length, 1, 'the verified reply is reused when the user confirms');
 });
 
 test('the muted-loop hint only travels with the selected direct video', async () => {
@@ -1609,7 +1627,7 @@ test('the muted-loop hint only travels with the selected direct video', async ()
 
 test('an Instagram blob player can choose a complete browser-observed video response', async () => {
   const app = load({ 'media-options': request => request.candidates.length
-    ? { ok: true } : { ok: false, code: 'no-media' } });
+    ? { ok: true } : { ok: false, code: 'no-media' }, 'media-source-options': checkedSource(15) });
   const page = 'https://www.instagram.com/reel/abc123/';
   const sender = { url: page, tab: { id: 19 }, frameId: 0, documentId: 'instagram-player' };
   const changedAt = Date.now();
@@ -1624,18 +1642,21 @@ test('an Instagram blob player can choose a complete browser-observed video resp
   assert.equal(options.ok, true);
   assert.equal(options.data.sourceChoices.length, 1);
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('signature='), false);
-  assert.equal(options.data.sourceChoices[0].label, 'MP4 video');
+  assert.equal(options.data.sourceChoices[0].label, '0:15 · MP4 · 1 format');
   assert.match(options.data.sourceChoices[0].detail, /MP4/);
-  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent.length, 2);
   assert.equal(app.sent[0].candidates.length, 0);
+  assert.equal(app.sent[1].type, 'media-source-options');
 
   // Another response for the same URL should not invalidate the menu already on screen.
   await app.onMedia({ url: mediaUrl, tabId: 19, frameId: 0, documentId: sender.documentId,
     method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 200,
     responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
-  await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
+  const selected = await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
     pageUrl: page, generation: 4, playerUrl: message.playerUrl }, sender);
   assert.equal(app.sent[1].candidates[0].url, mediaUrl);
+  assert.equal(selected.ok, true);
+  assert.equal(app.sent.length, 2);
 });
 
 test('TikTok and reels show resolved formats before offering recently observed streams', async () => {
@@ -1660,7 +1681,7 @@ test('TikTok and reels show resolved formats before offering recently observed s
 });
 
 test('a paused or ended blob player can use its recent manifest after a late click', async () => {
-  const app = load({ 'media-options': { ok: true } });
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': checkedSource() });
   const page = 'https://video.example/watch/demo';
   const sender = { url: page, tab: { id: 29 }, frameId: 0, documentId: 'late-click-doc' };
   const changedAt = Date.now();
@@ -1674,11 +1695,96 @@ test('a paused or ended blob player can use its recent manifest after a late cli
     mediaChangedAt: changedAt }, sender);
   assert.equal(result.ok, true);
   assert.equal(result.data?.sourceChoices?.length, 1);
-  assert.equal(result.data.sourceChoices[0].label, 'HLS stream');
+  assert.equal(result.data.sourceChoices[0].label, '1:01 · HLS · 1 format');
+});
+
+test('a manifest observed long ago still serves a late click while the page is open', async () => {
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': checkedSource(2400) });
+  const page = 'https://video.example/watch/long';
+  const sender = { url: page, tab: { id: 31 }, frameId: 0, documentId: 'long-doc' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://cdn.video.example/vod/master.m3u8', tabId: 31,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 200, responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  app.advanceTime(25 * 60_000);
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 2, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.data?.sourceChoices?.length, 1);
+  assert.match(result.data.sourceChoices[0].label, /^40:00 · HLS/);
+});
+
+test('an extensionless manifest is observed only for the watched tab and gets an exact check', async () => {
+  const app = load({ 'media-source-options': checkedSource() });
+  const page = 'https://video.example/watch/demo';
+  const sender = { url: page, tab: { id: 33 }, frameId: 0, documentId: 'content-type-doc' };
+  const changedAt = Date.now();
+  const url = 'https://cdn.video.example/play?id=42';
+  try {
+    await app.message({ type: 'media-element', watching: true }, sender);
+    assert.deepEqual([...app.manifestWatchers.keys()], [33]);
+    await app.manifestWatchers.get(33)({ url, tabId: 33, frameId: 0, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+    const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+      playerUrl: 'blob:https://video.example/player', generation: 1, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+    assert.equal(result.data?.sourceChoices?.length, 1);
+    assert.ok(onlyExactChecks(app));
+    assert.equal(app.sent[0].candidates[0].url, url);
+  } finally {
+    app.stopWorker();
+  }
+});
+
+test('revoking sign-in before confirming an inferred source sends a fresh unsigned check', async () => {
+  const app = load({ 'media-options': { ok: false, code: 'no-media' }, 'media-source-options': checkedSource() },
+    { signInPermission: true });
+  const page = 'https://www.instagram.com/reel/example/';
+  const sender = { url: page, tab: { id: 34, url: page }, frameId: 0, documentId: 'signed-source-doc' };
+  const changedAt = Date.now();
+  const playerUrl = 'blob:https://www.instagram.com/player';
+  await app.onMedia({ url: 'https://cdn.example/stream.m3u8', tabId: 34, frameId: 0, documentId: sender.documentId,
+    method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt });
+  const options = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl, generation: 1, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(app.sent.at(-1).authorized, true);
+  await app.setPrefs({ useSignIn: false });
+  const selected = await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
+    pageUrl: page, playerUrl, generation: 1 }, sender);
+  assert.equal(selected.ok, true);
+  assert.equal(app.sent.filter(request => request.type === 'media-source-options').length, 2);
+  assert.equal(app.sent.at(-1).mediaAuth, undefined);
+});
+
+test('when no candidate verifies, the picker reports the specific refusal instead of asking to play', async () => {
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': { ok: false, code: 'sign-in', message: 'Sign in.' } });
+  const page = 'https://video.example/watch/private';
+  const sender = { url: page, tab: { id: 32 }, frameId: 0, documentId: 'private-doc' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: 'https://cdn.video.example/private/master.m3u8', tabId: 32,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 100, responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 2, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'sign-in');
+});
+
+test('evidence strength orders verification: an element-requested, typed manifest near the change goes first', async () => {
+  const app = load({});
+  const rank = app.evaluate('rankObservedSources');
+  const changedAt = 1_000_000;
+  const ranked = rank([
+    { url: 'https://a.example/late.mp4', kind: 'direct', mime: 'video/mp4', wholeRepresentation: true, seen: changedAt + 14_000 },
+    { url: 'https://a.example/x', kind: 'hls', typedManifest: true, requestType: 'xmlhttprequest', seen: changedAt + 400 },
+    { url: 'https://a.example/clip.mp4', kind: 'direct', mime: 'video/mp4', wholeRepresentation: true, requestType: 'media', seen: changedAt + 100 }
+  ], changedAt);
+  assert.deepEqual([...ranked.map(source => source.url)],
+    ['https://a.example/x', 'https://a.example/clip.mp4', 'https://a.example/late.mp4']);
 });
 
 test('an Instagram carousel with multiple observed videos requires the user to choose one', async () => {
-  const app = load({ 'media-options': { ok: true } });
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': request =>
+    checkedSource(10, request.candidates[0].url.includes('first') ? '2.9 MB MP4' : '1.0 MB MP4') });
   const page = 'https://www.instagram.com/p/abc123/';
   const sender = { url: page, tab: { id: 22 }, frameId: 0, documentId: 'instagram-carousel' };
   const changedAt = Date.now();
@@ -1696,13 +1802,15 @@ test('an Instagram carousel with multiple observed videos requires the user to c
     playerUrl: 'blob:https://www.instagram.com/player', generation: 7, playerPlaying: true, mediaChangedAt: changedAt };
   const options = await app.message(message, sender);
   assert.equal(options.data.sourceChoices.length, 2);
-  assert.match(options.data.sourceChoices[0].detail, /1\.0 MB/);
-  assert.match(options.data.sourceChoices[1].detail, /2\.9 MB/);
-  assert.deepEqual(app.sent, []);
+  assert.match(options.data.sourceChoices[0].detail, /2\.9 MB/);
+  assert.match(options.data.sourceChoices[1].detail, /1\.0 MB/);
+  assert.equal(app.sent.length, 2);
+  assert.ok(onlyExactChecks(app));
 
-  await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[1].token,
+  const selected = await app.message({ type: 'media-source-select', sourceChoice: options.data.sourceChoices[0].token,
     pageUrl: page, generation: 7, playerUrl: message.playerUrl }, sender);
-  assert.equal(app.sent[0].candidates[0].url, first);
+  assert.match(selected.data.choices[0].detail, /2\.9 MB/);
+  assert.equal(app.sent.length, 2, 'no second request for an already verified source');
 });
 
 test('a late same-frame ad response is not correlated to the active Instagram player', async () => {
@@ -1757,7 +1865,7 @@ test('a partial video range is not offered as a complete Instagram source', asyn
   assert.equal(result.data?.sourceChoices, undefined);
   assert.equal(app.sent[0].candidates.length, 0);
 
-  const completeApp = load({ 'media-options': { ok: false, code: 'no-media' } });
+  const completeApp = load({ 'media-options': { ok: false, code: 'no-media' }, 'media-source-options': checkedSource(5) });
   const completeSender = { url: page, tab: { id: 21 }, frameId: 0, documentId: 'instagram-full-range-player' };
   await completeApp.onMedia({ url: 'https://scontent.cdninstagram.com/v/t50.2886-16/video.mp4', tabId: 21,
     frameId: 0, documentId: completeSender.documentId, method: 'GET', statusCode: 206, type: 'xmlhttprequest',
@@ -1808,8 +1916,8 @@ test('observed media sources stay under a global session-storage budget', async 
   assert.ok(stored.every(([, state]) => state.sources.length <= 25));
 });
 
-test('an ambiguous blob player shows scoped stream choices before sending a candidate to VESPER', async () => {
-  const app = load({ 'media-source-options': { ok: true } });
+test('an ambiguous blob player shows verified, separate stream choices and never a broad lookup', async () => {
+  const app = load({ 'media-source-options': request => checkedSource(request.candidates[0].url.includes('video') ? 61 : 15) });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();
@@ -1825,22 +1933,22 @@ test('an ambiguous blob player shows scoped stream choices before sending a cand
 
   assert.equal(options.ok, true);
   assert.equal(options.data.sourceChoices.length, 2);
-  assert.equal(app.sent.length, 0);
+  assert.equal(app.sent.length, 2);
+  assert.ok(onlyExactChecks(app));
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('sig='), false);
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('.m3u8'), false);
 
-  const token = options.data.sourceChoices[0].token;
+  const token = options.data.sourceChoices.find(choice => choice.label.startsWith('1:01')).token;
   const selected = await app.message({ type: 'media-source-select', sourceChoice: token, pageUrl: page,
     generation: 3, playerUrl: message.playerUrl }, sender);
   assert.equal(selected.ok, true);
-  assert.equal(app.sent[0].type, 'media-source-options');
-  assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
-    ['https://cdn.example.com/video.m3u8?sig=private']);
+  assert.equal(selected.data.duration, 61);
+  assert.equal(app.sent.length, 2);
 
   const replay = await app.message({ type: 'media-source-select', sourceChoice: token, pageUrl: page,
     generation: 3, playerUrl: message.playerUrl }, sender);
   assert.equal(replay.code, 'expired-selection');
-  assert.equal(app.sent.length, 1);
+  assert.equal(app.sent.length, 2);
 
   const reopened = await app.message(message, sender);
   assert.notEqual(reopened.data.sourceChoices[0].token, token);
@@ -1851,7 +1959,7 @@ test('an ambiguous blob player shows scoped stream choices before sending a cand
 
 test('source-choice tokens are not restored after a worker restarts', async () => {
   const sessionData = {};
-  const app = load({ 'media-source-options': { ok: true } }, { sessionData });
+  const app = load({ 'media-source-options': checkedSource() }, { sessionData });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();
@@ -1872,7 +1980,7 @@ test('source-choice tokens are not restored after a worker restarts', async () =
 });
 
 test('source-choice tokens reject mismatched frame, document, page, generation, and player source', async () => {
-  const app = load({ 'media-options': { ok: true } });
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': checkedSource() });
   const page = 'https://example.com/watch/42';
   const sender = { url: page, tab: { id: 7 }, frameId: 2, documentId: 'active-player' };
   const changedAt = Date.now();
@@ -1894,7 +2002,7 @@ test('source-choice tokens reject mismatched frame, document, page, generation, 
       pageUrl: page, generation: original.generation, playerUrl: original.playerUrl, ...changes }, badSender);
     assert.equal(reply.code, 'expired-selection');
   }
-  assert.deepEqual(app.sent, []);
+  assert.ok(onlyExactChecks(app), 'mismatched selections never reach VESPER beyond the exact-source checks');
 });
 
 test('direct player evidence observed just before playback metadata is still current', async () => {

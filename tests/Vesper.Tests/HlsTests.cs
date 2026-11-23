@@ -55,12 +55,17 @@ public class HlsTests
         return frame;
     }
 
-    [Fact]
-    public async Task A_plain_VOD_playlist_becomes_one_transport_stream_file()
+    [Theory]
+    [InlineData("/hls/plain/index.m3u8")]
+    [InlineData("/hls/plain/playlist")]
+    public async Task A_plain_VOD_playlist_becomes_one_transport_stream_file(string path)
     {
         await using var server = new FaultServer(); await server.StartAsync();
         using var h = new Harness();
-        JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, "/hls/plain/index.m3u8"), JobState.Completed);
+        if (path.EndsWith("/playlist", StringComparison.Ordinal))
+            server.HlsPlaylists[path] = "#EXTM3U\n" + string.Concat(Enumerable.Range(0, FaultServer.SegmentCount)
+                .Select(index => $"#EXTINF:4,\ns{index}.ts\n")) + "#EXT-X-ENDLIST\n";
+        JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, path), JobState.Completed);
         Assert.Equal(FaultServer.HlsExpected(), await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.EndsWith(".ts", done.FinalPath);               // honest container: concatenated TS is a valid .ts, not a pretend .mp4
     }

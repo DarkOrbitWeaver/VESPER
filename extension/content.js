@@ -12,7 +12,7 @@
   let host = null, root = null, button = null, panel = null, receipt = null;
   let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
-  let previewRemovedAt = 0, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
+  let previewRemovedAt = 0, previewPointerDistance = Infinity, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
   let drag = null, movedPerch = null, suppressDragClick = false, suppressDragClickTimer = 0, pointerMovedAt = 0;
   let lastPointerPosition = null;
   let contextNotice = null, contextNoticeTimer = 0;
@@ -306,6 +306,15 @@
     else if (video) place();
   }
 
+  // Lets the background briefly watch this tab for manifests named only by Content-Type.
+  let announcedVideoAt = 0;
+  function announceVideoElement() {
+    const now = Date.now();
+    if (now - announcedVideoAt < 60_000) return;
+    announcedVideoAt = now;
+    send({ type: 'media-element', watching: true }).catch(() => {});   // a hint only; never surfaces errors
+  }
+
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
@@ -313,6 +322,7 @@
         (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]'))) {
       observed.add(el);
       visibility.observe(el);
+      announceVideoElement();
     }
     const page = pageForPlayer(el);
     const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
@@ -871,6 +881,14 @@
     return !!pointer && !!perch && Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) <= 90;
   }
 
+  function pointerOnButterfly() {
+    return !!button?.matches(':hover,:focus-visible');
+  }
+
+  function butterflyDistance() {
+    return pointer && perch ? Math.hypot(pointer.x - perch.x - FLY_SIZE / 2, pointer.y - perch.y - FLY_SIZE / 2) : Infinity;
+  }
+
   function previewMissing() {
     return !!video && activePreview?.player === video && (video.readyState < 1 || !visiblePlayer(video));
   }
@@ -878,16 +896,30 @@
   function holdMissingPreview() {
     if (document.fullscreenElement || !perch || !previewMissing()) return false;
     if (panelMedia?.player === video) return true;
-    if (!previewRemovedAt) previewRemovedAt = Date.now();
+    if (!previewRemovedAt) {
+      previewRemovedAt = Date.now();
+      previewPointerDistance = butterflyDistance();
+    }
     if (!previewExitTimer) {
       const player = video;
       const elapsed = Date.now() - previewRemovedAt;
-      const delay = Math.min(PREVIEW_EXIT_GRACE, Math.max(0, PREVIEW_MAX_LATCH - elapsed));
+      // A site ends its hover preview the moment the pointer leaves the thumbnail for the butterfly.
+      // While the pointer rests on the butterfly it stays, however long the user takes to click.
+      const delay = pointerOnButterfly() ? PREVIEW_EXIT_GRACE
+        : Math.min(PREVIEW_EXIT_GRACE, Math.max(0, PREVIEW_MAX_LATCH - elapsed));
       previewExitTimer = setTimeout(() => {
         previewExitTimer = 0;
         if (video !== player || !previewMissing()) { previewRemovedAt = 0; return; }
         if (panelMedia) return;
-        if (previewLatched() && Date.now() - previewRemovedAt < PREVIEW_MAX_LATCH) {
+        const distance = butterflyDistance();
+        const approaching = distance < previewPointerDistance - 6;
+        previewPointerDistance = distance;
+        if (pointerOnButterfly()) {
+          holdMissingPreview();
+          return;
+        }
+        // Near the butterfly, or still heading for it: wait, but not forever.
+        if ((previewLatched() || approaching) && Date.now() - previewRemovedAt < PREVIEW_MAX_LATCH) {
           holdMissingPreview();
           return;
         }
@@ -1456,7 +1488,8 @@
       option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds); };
       list.append(option);
     }
-    renderShell(title, poster, seconds, element('div', 'msg', 'Check a video source to see its formats.'), list);
+    const prompt = formats.verifiedSources ? 'Choose the source that matches your video.' : 'Check a video source to see its formats.';
+    renderShell(title, poster, seconds, element('div', 'msg', prompt), list);
   }
 
   async function inspectSource(token, title, poster, seconds) {
@@ -1545,6 +1578,8 @@
       cancelled: 'Cancelled in VESPER.',
       timeout: 'VESPER didn’t answer in time.',
       'no-media': 'VESPER couldn’t find a video to download. Play the video, then try again.',
+      'no-reusable-source': 'This player’s video isn’t available as a file or stream VESPER can reuse.',
+      'site-refused': 'The site refused the request. Try again from the video page.',
       unavailable: 'VESPER couldn’t open this video. Refresh the page and try again.',
       'source-expired': 'The video link expired. Try again to look for a fresh link.',
       'expired-selection': 'Those choices expired. Try again to refresh them.',

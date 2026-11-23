@@ -7,10 +7,15 @@ namespace Vesper.Engine;
 /// Bounded, seek-based track-presence guard for plain HTTP media handoffs. Prevents an observed adaptive video URL
 /// being published as an audio/video download just because its MIME type is video/mp4 or video/webm.
 /// This checks container layout/track declarations, not full codec decodability. No media payload is buffered.
+/// The MP4 check reads box headers straight from the file and skips the sample tables, so a long video with
+/// many megabytes of movie metadata costs the same few small reads as a short one.
 /// </summary>
 internal static class MediaTrackProbe
 {
     private readonly record struct IsoBox(string Type, int Payload, int End);
+    private readonly record struct FileBox(string Type, long Payload, long End);
+    private const int MaxSampleDescriptionBytes = 1024 * 1024;
+    private const int MaxBoxesPerLevel = 10_000;
     private readonly record struct Mp4ProbeResult(bool HasAudio, bool HasVideo, bool HasFragments, bool HasMovieExtends);
 
     internal static void RequireAudio(PartialFile file, string format, CancellationToken ct,
@@ -34,7 +39,7 @@ internal static class MediaTrackProbe
     private static Mp4ProbeResult ProbeMp4(PartialFile file, CancellationToken ct)
     {
         long offset = 0;
-        byte[]? moov = null;
+        FileBox? moov = null;
         bool media = false;
         bool fragment = false;
         for (int count = 0; offset < file.Length; count++)
@@ -53,8 +58,8 @@ internal static class MediaTrackProbe
             string type = Encoding.ASCII.GetString(header, 4, 4);
             if (type == "moov")
             {
-                if (moov is not null || size > 8 * 1024 * 1024) throw Bad("Duplicate or oversized MP4 metadata requires another processing path.");
-                moov = Read(file, offset + prefix, (int)size - prefix);
+                if (moov is not null) throw Bad("The MP4 has more than one set of movie metadata.");
+                moov = new FileBox(type, offset + prefix, offset + (long)size);
             }
             if (type == "mdat" && size > (ulong)prefix) media = true;
             if (type == "moof") fragment = true;
@@ -64,24 +69,28 @@ internal static class MediaTrackProbe
         if (moov is null && media && fragment)
             throw Bad("The site sent only part of the video. Open the original page and choose another format.");
         if (moov is null || !media) throw Bad("The MP4 file has no movie metadata or media payload.");
-        var movie = IsoBoxes(moov, 0, moov.Length);
+        var movie = FileBoxes(file, moov.Value.Payload, moov.Value.End, ct);
         if (movie.Any(b => b.Type == "pssh")) throw Bad("Protected MP4 movie metadata is unsupported.");
         bool audio = false;
         bool video = false;
         foreach (var trak in movie.Where(b => b.Type == "trak"))
         {
-            var mdia = One(IsoBoxes(moov, trak.Payload, trak.End), "mdia");
-            var md = IsoBoxes(moov, mdia.Payload, mdia.End);
+            var mdia = One(FileBoxes(file, trak.Payload, trak.End, ct), "mdia");
+            var md = FileBoxes(file, mdia.Payload, mdia.End, ct);
             var handler = One(md, "hdlr");
             if (handler.End - handler.Payload < 12) throw Bad("Truncated MP4 track handler.");
-            string kind = Encoding.ASCII.GetString(moov, handler.Payload + 8, 4);
+            string kind = Encoding.ASCII.GetString(Read(file, handler.Payload + 8, 4));
             if (kind is not ("soun" or "vide")) continue;
             var minf = One(md, "minf");
-            var stbl = One(IsoBoxes(moov, minf.Payload, minf.End), "stbl");
-            var stsd = One(IsoBoxes(moov, stbl.Payload, stbl.End), "stsd");
-            if (stsd.End - stsd.Payload < 8) throw Bad("Truncated MP4 sample descriptions.");
-            var entries = IsoBoxes(moov, stsd.Payload + 8, stsd.End);
-            if (entries.Count == 0 || entries.Count > 16 || BinaryPrimitives.ReadUInt32BigEndian(moov.AsSpan(stsd.Payload + 4)) != entries.Count)
+            var stbl = One(FileBoxes(file, minf.Payload, minf.End, ct), "stbl");
+            // Only the sample descriptions are read. The tables beside them grow with the video's length.
+            var stsd = One(FileBoxes(file, stbl.Payload, stbl.End, ct), "stsd");
+            long descriptionBytes = stsd.End - stsd.Payload;
+            if (descriptionBytes < 8) throw Bad("Truncated MP4 sample descriptions.");
+            if (descriptionBytes > MaxSampleDescriptionBytes) throw Bad("Oversized MP4 sample descriptions.");
+            byte[] descriptions = Read(file, stsd.Payload, (int)descriptionBytes);
+            var entries = IsoBoxes(descriptions, 8, descriptions.Length);
+            if (entries.Count == 0 || entries.Count > 16 || BinaryPrimitives.ReadUInt32BigEndian(descriptions.AsSpan(4)) != entries.Count)
                 throw Bad("Invalid MP4 sample-description count.");
             if (entries.Any(b => b.Type is "enca" or "encv")) throw Bad("Encrypted MP4 samples are unsupported.");
             if (kind == "soun") audio = true;
@@ -192,7 +201,31 @@ internal static class MediaTrackProbe
         }
         return boxes;
     }
-    private static IsoBox One(List<IsoBox> boxes, string type)
+    /// <summary>Lists the boxes between two file offsets. Reads each box's header and nothing else.</summary>
+    private static List<FileBox> FileBoxes(PartialFile file, long start, long end, CancellationToken ct)
+    {
+        var boxes = new List<FileBox>();
+        while (start < end)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (end - start < 8 || boxes.Count >= MaxBoxesPerLevel) throw Bad("Truncated MP4 metadata.");
+            byte[] header = Read(file, start, (int)Math.Min(16, end - start));
+            ulong size = BinaryPrimitives.ReadUInt32BigEndian(header);
+            int prefix = 8;
+            if (size == 1)
+            {
+                if (header.Length < 16) throw Bad("Truncated MP4 metadata.");
+                size = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8));
+                prefix = 16;
+            }
+            else if (size == 0) size = (ulong)(end - start);
+            if (size < (ulong)prefix || size > (ulong)(end - start)) throw Bad("Invalid MP4 metadata box size.");
+            boxes.Add(new(Encoding.ASCII.GetString(header, 4, 4), start + prefix, start + (long)size));
+            start += (long)size;
+        }
+        return boxes;
+    }
+    private static FileBox One(List<FileBox> boxes, string type)
     {
         var matches = boxes.Where(b => b.Type == type).ToArray();
         return matches.Length == 1 ? matches[0] : throw Bad($"Missing or duplicate MP4 {type} box.");

@@ -9,6 +9,15 @@ const PROTOCOL = 1;
 const MAX_SOURCES = 25;
 const MAX_TOTAL_SOURCES = 200;
 const SOURCE_TTL = 10 * 60_000;
+// Manifests describe the player's media for as long as the page lives, so a late
+// click after long playback can still use them. Navigation clears them; signed links are revalidated.
+const PLAYER_SOURCE_TTL = 60 * 60_000;
+// Picker verification: a few strong candidates checked in parallel, each through the one-source command.
+const VERIFY_LIMIT = 3;
+const VERIFY_DEADLINE_MS = 20_000;
+// Tabs with a video element get a short-lived listener for manifests identified only by Content-Type.
+const MANIFEST_WATCH_MS = 3 * 60_000;
+const MAX_WATCHED_TABS = 6;
 const SOURCE_EXPIRY_ALARM = 'vesper-media-sources';
 const DEFAULTS = {
   handoff: 'download',
@@ -402,10 +411,95 @@ function cachedMediaOptions(key) {
   return mediaPrefetchCache.get(key)?.reply;
 }
 
+function sourceLifetime(source) {
+  return ['hls', 'dash'].includes(source?.kind) ? PLAYER_SOURCE_TTL : SOURCE_TTL;
+}
+
 function pruneSourceList(sources, now = Date.now()) {
   return (Array.isArray(sources) ? sources : [])
-    .filter(source => Number.isFinite(source.seen) && source.seen >= now - SOURCE_TTL && source.seen <= now + 1000)
+    .filter(source => Number.isFinite(source.seen) && source.seen >= now - sourceLifetime(source) && source.seen <= now + 1000)
     .slice(-MAX_SOURCES);
+}
+
+// How strongly one observed request suggests it carries the selected player's media. Strength only
+// orders verification; identity still comes from the exact-source check of that one URL.
+function evidenceStrength(source, changedAt) {
+  let score = ['hls', 'dash'].includes(source.kind) ? 3 : isWholeDirectSource(source) ? 2 : 0;
+  if (source.requestType === 'media') score += 1;          // requested by a media element itself
+  if (source.typedManifest) score += 1;                     // identified by its Content-Type, not its name
+  const distance = Math.abs(source.seen - changedAt);
+  if (distance <= 3000) score += 2;
+  else if (distance <= 15_000) score += 1;
+  return score;
+}
+
+function rankObservedSources(sources, changedAt) {
+  return sources.map(source => ({ source, score: evidenceStrength(source, changedAt),
+    distance: Math.abs(source.seen - changedAt) }))
+    .sort((a, b) => b.score - a.score || a.distance - b.distance)
+    .map(entry => entry.source);
+}
+
+// Checks each candidate separately with the exact-source command, in parallel, under one deadline.
+// A candidate that fails is never replaced with another source.
+async function verifyObservedSources(sources, { auth, pageUrl, title }) {
+  const deadline = Date.now() + VERIFY_DEADLINE_MS;
+  return Promise.all(sources.map(async source => {
+    const reply = await nativeRequest(envelope('media-source-options', { ...auth, url: pageUrl, pageTitle: title,
+      candidates: [{ url: source.url, kind: source.kind, mimeType: source.mime || undefined }] }),
+    Math.max(1000, deadline - Date.now()));
+    return { source, reply };
+  }));
+}
+
+const clockText = seconds => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const total = Math.round(seconds), h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), sec = total % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+};
+
+// The most specific reason none of the candidates could be used, so the picker can say what to do.
+function bestRefusal(results) {
+  const order = ['protected', 'blocked', 'sign-in', 'site-refused', 'source-expired', 'rate-limited',
+    'browser-context', 'unsupported', 'network', 'host-missing', 'app-unavailable', 'host-error', 'timeout'];
+  const failures = results.map(result => result.reply).filter(reply => reply && !reply.ok && reply.code);
+  for (const code of order) {
+    const reply = failures.find(item => item.code === code);
+    if (reply) return reply;
+  }
+  return null;
+}
+
+const watchedTabs = new Map();
+
+// Some players fetch manifests by script from addresses without .m3u8 or .mpd. Only tabs that have a
+// video element are watched, briefly, and only manifest Content-Types are kept.
+function watchTabForManifests(tabId) {
+  if (!Number.isSafeInteger(tabId) || tabId < 0) return;
+  const now = Date.now();
+  for (const [id, watch] of watchedTabs) if (watch.expires <= now) unwatchTab(id);
+  if (watchedTabs.has(tabId)) return;
+  while (watchedTabs.size >= MAX_WATCHED_TABS) unwatchTab(watchedTabs.keys().next().value);
+  const listener = details => {
+    const type = details.responseHeaders?.find(h => h.name.toLowerCase() === 'content-type')?.value || '';
+    if (!/mpegurl|dash\+xml/i.test(type) || /\.(m3u8|mpd)(\?|$)/i.test(details.url)) return;
+    return observeMediaResponse({ ...details, typedManifest: true });
+  };
+  try {
+    chrome.webRequest.onResponseStarted.addListener(listener,
+      { urls: ['http://*/*', 'https://*/*'], types: ['xmlhttprequest', 'other'], tabId }, ['responseHeaders']);
+  } catch { return; }
+  const watch = { listener, expires: now + MANIFEST_WATCH_MS };
+  watch.timer = setTimeout(() => { if (watchedTabs.get(tabId) === watch) unwatchTab(tabId); }, MANIFEST_WATCH_MS);
+  watchedTabs.set(tabId, watch);
+}
+
+function unwatchTab(tabId) {
+  const watch = watchedTabs.get(tabId);
+  if (!watch) return;
+  watchedTabs.delete(tabId);
+  clearTimeout(watch.timer);
+  try { chrome.webRequest.onResponseStarted.removeListener(watch.listener); } catch { /* already gone */ }
 }
 
 async function loadObservedSources() {
@@ -483,7 +577,7 @@ async function pruneObservedSources() {
   await enforceSourceBudget();
   let nextExpiry = Infinity;
   for (const state of tabStates.values())
-    for (const source of state.sources || []) nextExpiry = Math.min(nextExpiry, source.seen + SOURCE_TTL);
+    for (const source of state.sources || []) nextExpiry = Math.min(nextExpiry, source.seen + sourceLifetime(source));
   if (Number.isFinite(nextExpiry)) {
     await chrome.alarms.create(SOURCE_EXPIRY_ALARM, { when: Math.max(Date.now() + 30_000, nextExpiry) });
     sourceExpiryScheduled = true;
@@ -597,6 +691,19 @@ function sourceLabel(source) {
   };
 }
 
+function verifiedSourceLabel(source, reply) {
+  const data = reply.data;
+  const format = source.kind === 'direct' ? typeName(source.mime) : source.kind.toUpperCase();
+  const count = new Set([...data.choices, ...(data.more || [])].map(choice => choice.index)).size;
+  const duration = clockText(data.duration);
+  const best = data.choices[0];
+  return {
+    token: source.token,
+    label: [duration, format, count > 1 ? `${count} formats` : '1 format'].filter(Boolean).join(' · '),
+    detail: best?.detail || best?.label || ''
+  };
+}
+
 function rememberSourceSelections(sources, context) {
   sources = sources.slice(0, 32);
   const now = Date.now();
@@ -607,8 +714,10 @@ function rememberSourceSelections(sources, context) {
   return sources.map(source => {
     const token = crypto.randomUUID();
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
-      seen: source.seen, expires: now + 60_000 });
-    return sourceLabel({ ...source, token });
+      seen: source.seen, expires: now + 60_000, verified: context.signed ? undefined : source.verified });
+    return source.verified
+      ? verifiedSourceLabel({ ...source, token }, source.verified)
+      : sourceLabel({ ...source, token });
   });
 }
 
@@ -637,6 +746,7 @@ const observeMediaResponse = (details) => {
     // This means headers describe the whole representation; VESPER still fetches and validates the URL itself.
     wholeRepresentation: !isPlaylist && (details.statusCode === 200 && !range || fullRange),
     unexpectedRange: details.statusCode === 200 && !!range,
+    requestType: details.type, ...(details.typedManifest ? { typedManifest: true } : {}),
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
   }).catch(() => {});
  };
@@ -654,6 +764,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === 'loading' && change.url) {
     void inTabOrder(tabId, async () => {
       forgetTab(tabId);                        // the page is gone; its sources go with it
+      unwatchTab(tabId);
       clearMediaPrefetch(tabId);
       await chrome.storage.session.remove(`tab:${tabId}`);
       await clearBrowserChoicesForTab(tabId);
@@ -663,6 +774,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 });
 chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
   forgetTab(tabId);
+  unwatchTab(tabId);
   clearMediaPrefetch(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
   await clearBrowserChoicesForTab(tabId);
@@ -709,10 +821,10 @@ async function playerOptions(message, sender) {
     const state = await tabState(tab);
     const now = Date.now();
     const changedAt = Number.isFinite(message.mediaChangedAt) ? message.mediaChangedAt : 0;
-    const cutoff = Math.max(now - 10 * 60_000, changedAt > 0 ? changedAt - 2000 : 0);
+    const changeCutoff = changedAt > 0 ? changedAt - 2000 : 0;
     const currentEvidence = source => sender.documentId && source.documentId === sender.documentId
       && (source.frameId ?? 0) === frame && Number.isFinite(source.seen)
-      && source.seen >= cutoff && source.seen <= now + 1000;
+      && source.seen >= Math.max(now - sourceLifetime(source), changeCutoff) && source.seen <= now + 1000;
     const observed = url => state.sources.find(s => currentEvidence(s) && s.url === url.href);
     const matching = source ? observed(source) : null;
     const candidate = url => {
@@ -724,9 +836,9 @@ async function playerOptions(message, sender) {
     const playerActiveOrLoaded = message.playerPlaying === true || message.playerHasMedia === true;
     if (!matchedManifest && source === null && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
-      const sourceCutoff = Math.max(now - SOURCE_TTL, changedAt - 15_000);
       const sourceLimit = changedAt + 15_000;
       for (const evidence of state.sources) {
+        const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
         const recent = evidence.seen >= sourceCutoff && evidence.seen <= sourceLimit;
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
         if (currentEvidence(evidence) && recent && (isManifest || isWholeDirectSource(evidence))
@@ -734,6 +846,8 @@ async function playerOptions(message, sender) {
           possibleSources.push(evidence);
       }
     }
+    if (prefetch && possibleSources.length > 0 && !matching && !matchedManifest)
+      return { ok: true, data: { prefetchSkipped: true } };   // opening the picker verifies; idle pages stay cheap
     if (prefetch) {
       if (!supportsMediaPrefetch(page) && !matching && !matchedManifest && possibleSources.length === 0)
         return { ok: true, data: { prefetchSkipped: true } };
@@ -770,10 +884,27 @@ async function playerOptions(message, sender) {
         }
       }
       if (possibleSources.length > 0) {
-        const sources = possibleSources.sort((a, b) => b.seen - a.seen);
-        const sourceChoices = rememberSourceSelections(sources, { identity, tab, frame, documentId: sender.documentId,
-          generation: message.generation, playerUrl: message.playerUrl, title: binding ? message.title : undefined });
-        return { ok: true, data: { title: binding ? message.title : undefined, sourceChoices } };
+        const pickerTitle = binding ? message.title : undefined;
+        const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
+          generation: message.generation, playerUrl: message.playerUrl, title: pickerTitle };
+        const ranked = rankObservedSources(possibleSources, changedAt);
+        const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), { auth, pageUrl: page.href, title: pickerTitle });
+        const usable = checked.filter(result => result.reply?.ok && result.reply.data?.choices?.length);
+        // Timing found these, so the user confirms which one is this player, even when only one
+        // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
+        // Verified sources stay separate unless the site proves they are one video.
+        if (usable.length > 0) {
+          const sourceChoices = rememberSourceSelections(usable.map(result =>
+            ({ ...result.source, verified: result.reply })), context);
+          return { ok: true, data: { title: pickerTitle, sourceChoices, verifiedSources: true } };
+        }
+        const unchecked = ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4);
+        if (unchecked.length > 0)
+          return { ok: true, data: { title: pickerTitle, sourceChoices: rememberSourceSelections(unchecked, context) } };
+        const refusal = bestRefusal(checked);
+        if (refusal) return refusal;
+        return { ok: false, code: 'no-reusable-source',
+          message: 'This player’s video isn’t available as a file or stream VESPER can reuse.' };
       }
     }
     if (!wholeRepresentation) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
@@ -834,12 +965,17 @@ async function selectMediaSource(message, sender) {
   const evidence = state.sources.find(source => source.url === selection.url && source.documentId === selection.documentId
     && (source.frameId ?? 0) === selection.frame && source.seen >= selection.seen && source.kind === selection.kind
     && (source.kind !== 'direct' || isWholeDirectSource(source)));
-  if (!evidence || evidence.seen < Date.now() - 120_000 || evidence.seen > Date.now() + 1000)
+  const now = Date.now();
+  const maxAge = selection.kind === 'direct' ? 120_000 : sourceLifetime(selection);
+  if (!evidence || evidence.seen < now - maxAge || evidence.seen > now + 1000)
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   const { route } = await settings();
   if (route === 'chrome')
     return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
-  return nativeRequest(envelope('media-source-options', { ...await mediaAuthorization(page.href, sender, { userGesture: true }), url: page.href, pageTitle: selection.title,
+  const auth = await mediaAuthorization(page.href, sender, { userGesture: true });
+  // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
+  if (!auth.authorized && selection.verified?.ok) return selection.verified;
+  return nativeRequest(envelope('media-source-options', { ...auth, url: page.href, pageTitle: selection.title,
     candidates: [{ url: selection.url, kind: selection.kind, mimeType: selection.mime || undefined }] }), 60000);
 }
 
@@ -961,7 +1097,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return submit(signed.items, 'ask', { authorized: signed.authorized, review: true });
       }
       case 'media-element': {
-        // Older open tabs may still send these. Only observed responses belong in the network cache.
+        // A frame found a video element. Watch this tab briefly for script-fetched manifests.
+        if (message.watching === true && !(await extensionPaused())) watchTabForManifests(sender.tab?.id);
         return { ok: true };
       }
       case 'tab-state': {

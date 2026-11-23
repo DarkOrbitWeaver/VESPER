@@ -151,12 +151,14 @@ public sealed class DiscoveryAndNativeOutputTests
         Assert.Throws<MediaContainerException>(() => WaveAudio.Read(source));
     }
 
-    [Fact]
-    public void Compatible_video_preset_keeps_fragmented_mp4_hls_quality_audio_and_subtitle_choices()
+    [Theory]
+    [InlineData("1080.m3u8")]
+    [InlineData("playlist?id=1080")]
+    public void Compatible_video_preset_keeps_fragmented_mp4_hls_quality_audio_and_subtitle_choices(string source)
     {
         var hls = new MediaRepresentation
         {
-            Id = "hls-1080", Url = new Uri("https://cdn.example.test/1080.m3u8"),
+            Id = "hls-1080", Url = new Uri("https://cdn.example.test/" + source),
             Protocol = StreamProtocol.Hls, Content = StreamContent.VideoAndAudio,
             Container = "mp4", VideoCodec = "h264", AudioCodec = "aac", Height = 1080,
             AudioTrackId = "english", AudioLanguage = "en", IsDefaultAudio = true,
