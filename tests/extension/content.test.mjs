@@ -215,22 +215,27 @@ test('the context-menu picker reports when its frame has no video player', async
   assert.equal(reply.code, 'no-player');
 });
 
-test('dragging can perch outside the player and fullscreen wakes again after idle', () => {
+test('dragging can perch outside the player and fullscreen modes wake again after idle', () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();
-  let now = 10000, idle;
+  let now = 10000, nextTimer = 0;
+  const timers = new Map();
   const context = vm.createContext({
     window, document, URL, AbortController, location: { href: 'https://example.test/watch' },
     Date: class extends Date { static now() { return now; } },
-    innerWidth: 800, innerHeight: 600, getComputedStyle: () => ({ visibility: 'visible' }),
+    innerWidth: 800, innerHeight: 600, getComputedStyle: element => ({ visibility: 'visible', position: element.position }),
     HTMLVideoElement: class {}, HTMLIFrameElement: class {},
     ResizeObserver: class {}, IntersectionObserver: class {},
-    setTimeout: callback => { idle = callback; return 1; }, clearTimeout() {},
+    setTimeout: (callback, delay) => {
+      timers.set(++nextTimer, { callback, due: now + delay });
+      return nextTimer;
+    },
+    clearTimeout: id => timers.delete(id),
     VesperTheme: { available: () => true, watchPreference: () => () => {} },
     chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
   });
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.testPlayer = {
-    startDrag, moveDrag, finishDrag, onPointer, moved: () => suppressDragClick,
+    startDrag, moveDrag, finishDrag, onPointer, place, moved: () => suppressDragClick,
     setup: (player, action, picker, sprite) => {
       video = player; button = action; panel = picker; companion = sprite;
       perch = { x: 20, y: 30, faceLeft: false };
@@ -241,7 +246,12 @@ test('dragging can perch outside the player and fullscreen wakes again after idl
   const calls = [];
   const classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
   const player = { isConnected: true, getBoundingClientRect: () => ({ left: 160, top: 120, right: 640, bottom: 420 }) };
-  const button = { classList, matches: () => false, setPointerCapture() {}, getBoundingClientRect: () => ({ left: 170, top: 130 }) };
+  let focused = false;
+  const button = {
+    classList, matches: selector => focused && selector === ':focus-visible',
+    blur: () => { focused = false; }, setPointerCapture() {},
+    getBoundingClientRect: () => ({ left: 170, top: 130 })
+  };
   window.testPlayer.setup(player, button, { classList }, {
     setPerch: (x, y) => calls.push([x, y]), setVisible: shown => calls.push(shown), pointerMove() {}
   });
@@ -252,14 +262,33 @@ test('dragging can perch outside the player and fullscreen wakes again after idl
   assert.deepEqual(calls[0], [116, 76]);
   assert.equal(window.testPlayer.moved(), true);
 
-  document.fullscreenElement = { contains: () => true };
-  window.testPlayer.onPointer({ target: null, clientX: 200, clientY: 190 });
-  assert.equal(calls.at(-1), true);
-  now += 3000;
-  idle();
-  assert.equal(calls.at(-1), false);
-  window.testPlayer.onPointer({ target: null, clientX: 210, clientY: 190 });
-  assert.equal(calls.at(-1), true);
+  function advance() {
+    now += 3000;
+    for (const [id, { callback, due }] of [...timers]) {
+      if (due <= now && timers.delete(id)) callback();
+    }
+  }
+  const fullBox = () => ({ left: 0, top: 0, right: 800, bottom: 600 });
+  for (const mode of ['native', 'fullscreen frame', 'expanded player']) {
+    document.fullscreenElement = mode === 'native' ? { contains: () => true } : null;
+    window.screen = mode === 'fullscreen frame' ? { width: 800, height: 600 } : { width: 1200, height: 900 };
+    player.position = mode === 'expanded player' ? 'fixed' : 'static';
+    player.getBoundingClientRect = fullBox;
+    window.testPlayer.place();
+    assert.equal(calls.at(-1), true, mode);
+    advance();
+    assert.equal(calls.at(-1), false, mode);
+    focused = true;
+    window.testPlayer.onPointer({ target: null, clientX: 210 + now, clientY: 190 });
+    assert.equal(calls.at(-1), true, mode);
+    assert.equal(focused, false, mode);
+    advance();
+    document.fullscreenElement = null;
+    window.screen = { width: 1200, height: 900 };
+    player.position = 'static';
+    window.testPlayer.place();
+    assert.equal(calls.at(-1), true, 'a normal embedded player stays visible');
+  }
 });
 
 test('Smart Select filters navigation links and reports direct file details', () => {

@@ -129,6 +129,7 @@ async function main() {
     await access(nativeDownloadFolder);
   }
   await access(chromeExe);
+  const playerClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/muxed.webm'));
   const profile = await mkdtemp(join(profileRoot, '.chrome-ownership-smoke-'));
   const downloadFolder = join(profile, 'downloads');
   await mkdir(downloadFolder);
@@ -147,6 +148,19 @@ async function main() {
     if (request.url === '/page') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end('<!doctype html><title>VESPER smoke fixture</title><body></body>');
+      return;
+    }
+    if (request.url === '/player') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>VESPER player fixture</title><div id="player">'
+        + '<video width="640" height="360" src="/player.webm" autoplay muted loop controls></video>'
+        + '</div><style>#player:fullscreen video, #player.expanded video{width:100%;height:100%}'
+        + '#player.expanded{position:fixed;inset:0}</style>');
+      return;
+    }
+    if (request.url === '/player.webm') {
+      response.writeHead(200, { 'Content-Type': 'video/webm', 'Content-Length': playerClip.length });
+      response.end(playerClip);
       return;
     }
     const raceBodyDelay = { '/race-fast': 0, '/race-during-check': 200, '/race-policy-window': 800, '/race-delayed': 1600 }[request.url];
@@ -541,6 +555,32 @@ async function main() {
     } else {
       assert.equal(await evaluate('Check native isolation', '__ownershipSmoke.nativeCalls'), 0);
     }
+
+    await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/player' }, tab);
+    async function flyShown() {
+      const { root: dom } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+      const nodes = [dom];
+      for (const node of nodes) {
+        nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+        if (node.nodeName !== 'BUTTON') continue;
+        const index = node.attributes?.indexOf('class') ?? -1;
+        const classes = index < 0 ? [] : node.attributes[index + 1].split(' ');
+        if (classes.includes('fly')) return classes.includes('show');
+      }
+      return null;
+    }
+    await waitFor(() => flyShown(), 5000, 'The butterfly did not appear on the regular player.');
+    for (const [mode, enter, leave, pointerX] of [
+      ['native fullscreen', "player.requestFullscreen()", 'document.exitFullscreen()', 400],
+      ['expanded player', "player.classList.add('expanded')", "player.classList.remove('expanded')", 440]
+    ]) {
+      const result = await browser.send('Runtime.evaluate', { expression: enter, awaitPromise: true, userGesture: true }, tab);
+      assert.ok(!result.exceptionDetails, 'Could not enter ' + mode);
+      await waitFor(async () => (await flyShown()) === false, 5000, 'The butterfly stayed visible in ' + mode);
+      await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pointerX, y: 220 }, tab);
+      await waitFor(() => flyShown(), 2500, 'The butterfly did not wake in ' + mode);
+      await browser.send('Runtime.evaluate', { expression: leave, awaitPromise: true }, tab);
+    }
     const finalObservations = await evaluate('Read final Chrome events', 'globalThis.__ownershipSmoke');
     process.stdout.write(JSON.stringify({
       ok: true,
@@ -550,6 +590,7 @@ async function main() {
       completedBytes: saved.length,
       keptInChrome: true,
       pageMadeKeptInChrome: true,
+      fullscreenButterfly: true,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
       nativeCapture, captureRace
     }) + '\n');

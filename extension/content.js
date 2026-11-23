@@ -13,6 +13,7 @@
   let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
   let previewRemovedAt = 0, previewPointerDistance = Infinity, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
+  let fullscreenPlayer = false;
   let drag = null, movedPerch = null, suppressDragClick = false, suppressDragClickTimer = 0, pointerMovedAt = 0;
   let lastPointerPosition = null;
   let contextNotice = null, contextNoticeTimer = 0;
@@ -611,16 +612,17 @@
   document.addEventListener('fullscreenchange', () => {
     if (!alive()) return;
     pointer = null;
+    lastPointerPosition = null;
     button?.blur();
     stopFullscreenIdle();
-    if (document.fullscreenElement) wakeFullscreen();
+    fullscreenPlayer = false;
     if (host) mount();
     selectPlayer();
   }, { passive: true, signal });
   document.addEventListener('visibilitychange', () => {
     if (!alive()) return;
     if (document.hidden) stopFullscreenIdle();
-    else if (document.fullscreenElement) wakeFullscreen();
+    else if (fullscreenPlayer) wakeFullscreen();
     updateFlyVisibility();
   }, { signal });
   document.addEventListener('keydown', e => {
@@ -656,7 +658,6 @@
       window.addEventListener('scroll', schedule, { passive: true, capture: true, signal });
       window.addEventListener('resize', schedule, { passive: true, signal });
     }
-    if (document.fullscreenElement) wakeFullscreen();
     place();
   }
 
@@ -666,6 +667,7 @@
     activePreview = null;
     companion?.stopIdle();
     stopFullscreenIdle();
+    fullscreenPlayer = false;
     drag = null;
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
@@ -698,9 +700,21 @@
     } else {
       const rect = visiblePlayer(video);
       button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
-      if (button.hidden) { perch = null; closePanel(); return; }
-      perch = playerPerch(rect, Boolean(fullscreen));
-      companion.setPerch(perch.x, perch.y, perch.faceLeft, Boolean(fullscreen), { continuous, immediate: !!drag?.moved });
+      if (button.hidden) {
+        fullscreenPlayer = false;
+        stopFullscreenIdle();
+        perch = null;
+        closePanel();
+        return;
+      }
+      const watchingFullscreen = Boolean(fullscreen) || fillsFullscreen(rect);
+      if (watchingFullscreen !== fullscreenPlayer) {
+        fullscreenPlayer = watchingFullscreen;
+        if (watchingFullscreen) wakeFullscreen();
+        else stopFullscreenIdle();
+      }
+      perch = playerPerch(rect, fullscreenPlayer);
+      companion.setPerch(perch.x, perch.y, perch.faceLeft, fullscreenPlayer, { continuous, immediate: !!drag?.moved });
     }
     if (!perch) return detach();
     const { x, y, faceLeft } = perch;
@@ -716,6 +730,24 @@
       receipt.style.left = `${beside ? left : Math.max(8, x + FLY_SIZE - receipt.offsetWidth)}px`;
       receipt.style.top = `${Math.max(8, beside ? y + (FLY_SIZE - receipt.offsetHeight) / 2 : y + FLY_SIZE + 5)}px`;
     }
+  }
+
+  function fillsFullscreen(rect) {
+    const fillsWidth = rect.left <= 8 && rect.right >= innerWidth - 8;
+    const fillsHeight = rect.top <= 8 && rect.bottom >= innerHeight - 8;
+    const display = window.screen;
+    // The parent can fullscreen a cross-origin iframe without setting fullscreenElement inside it.
+    if (fillsWidth && fillsHeight && display && Math.abs(display.width - innerWidth) <= 8
+        && Math.abs(display.height - innerHeight) <= 8) return true;
+    if (!fillsWidth && !fillsHeight) return false;
+    // Some players expand a fixed container over the whole tab instead of using the Fullscreen API.
+    for (let parent = video, depth = 0; parent && depth < 6; parent = parent.parentElement, depth++) {
+      if (getComputedStyle(parent).position !== 'fixed') continue;
+      const box = parent.getBoundingClientRect();
+      if (box.left <= 8 && box.top <= 8 && box.right >= innerWidth - 8 && box.bottom >= innerHeight - 8)
+        return true;
+    }
+    return false;
   }
 
   function playerPerch(rect, fullscreen) {
@@ -816,7 +848,7 @@
     if (fullscreenTimer || document.hidden) return;
     function idle() {
       fullscreenTimer = 0;
-      if (!alive() || !document.fullscreenElement || document.hidden) return;
+      if (!alive() || !fullscreenPlayer || document.hidden) return;
       const remaining = FULLSCREEN_IDLE - (Date.now() - pointerMovedAt);
       if (remaining > 0) fullscreenTimer = setTimeout(idle, remaining);
       else updateFlyVisibility();
@@ -828,7 +860,7 @@
     if (!button || !companion) return;
     if (!perch || button.hidden) { companion.setVisible(false); return; }
     const awake = Date.now() - pointerMovedAt < FULLSCREEN_IDLE;
-    const show = !document.hidden && (!document.fullscreenElement || awake || drag
+    const show = !document.hidden && (!fullscreenPlayer || awake || drag
       || panel.classList.contains('show') || !!receiptTimer || button.matches(':focus-visible'));
     button.classList.toggle('show', show);
     companion.setVisible(Boolean(show));
@@ -852,7 +884,10 @@
     if (!moved && !drag) return;
     lastPointerPosition = { x: e.clientX, y: e.clientY };
     pointerMovedAt = Date.now();
-    if (document.fullscreenElement) wakeFullscreen();
+    if (fullscreenPlayer) {
+      wakeFullscreen();
+      if (!drag && !panel?.classList.contains('show') && button?.matches(':focus-visible')) button.blur();
+    }
     pointer = { x: e.clientX, y: e.clientY };
     if (drag) { updateFlyVisibility(); return; }
     if (e.target !== pointerTarget) {
