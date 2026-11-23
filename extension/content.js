@@ -523,7 +523,8 @@
         .x{flex:none;margin-left:auto;border:0;background:none;font-size:18px;color:var(--muted);cursor:pointer;align-self:flex-start;padding:0 2px}
         .output{display:flex;flex-wrap:wrap;min-width:0;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
         .clip{box-sizing:border-box;display:grid;gap:9px;width:calc(100% - 16px);margin:8px 8px 0;padding:10px 11px;
-          border:1px solid var(--border);border-radius:8px;background:var(--paper);font-size:12px;color:var(--text)}
+          border:1px solid var(--border);border-radius:8px;background:var(--surface);font-size:12px;color:var(--text)}
+        .clip:not(.expanded){gap:0;padding:5px 10px}
         .clip[hidden],.clip .fields[hidden],.hint[hidden]{display:none}
         .clip .fields{display:grid;gap:8px;width:100%}
         .clip .trim-values{display:flex;align-items:center;gap:10px;width:100%}
@@ -1332,6 +1333,7 @@
     const clipBox = element('input');
     clipBox.type = 'checkbox';
     clipBox.checked = draft.enabled;
+    clip.classList.toggle('expanded', clipBox.checked);
     clipToggle.append(clipBox, element('span', '', 'Trim'));
     const clipFields = element('div', 'fields');
     const clipError = element('div', 'clip-error');
@@ -1422,7 +1424,13 @@
     const clipNote = element('small', 'hint');
     clipNote.className = 'clip-note';
     clipNote.setAttribute('role', 'status');
-    clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); saveDraft(); place(true); };
+    clipBox.onchange = () => {
+      draft.enabled = clipBox.checked;
+      clip.classList.toggle('expanded', clipBox.checked);
+      refreshClip();
+      saveDraft();
+      place(true);
+    };
     clip.append(clipToggle, clipFields, clipNote, clipError);
 
     function refreshClip() {
