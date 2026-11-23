@@ -39,6 +39,42 @@ globalThis.VesperPlayerSource = (() => {
       const index = parts.findIndex(part => part === 'reel' || part === 'videos');
       const id = url.searchParams.get('v') || (index >= 0 ? parts[index + 1] : null);
       if (/^\d+$/.test(id || '')) return `facebook:${id}`;
+    } else if (host === 'redd.it' || host === 'v.redd.it') {
+      const id = parts[0];
+      if (/^[a-z0-9]+$/i.test(id || '')) return host === 'v.redd.it' ? `reddit-video:${id}` : `reddit:${id}`;
+    } else if (/(?:^|\.)reddit\.com$/.test(host)) {
+      const comments = parts.indexOf('comments');
+      const id = comments >= 0 ? parts[comments + 1] : null;
+      if (/^[a-z0-9]+$/i.test(id || '')) return `reddit:${id}`;
+    } else if (/(?:^|\.)vimeo\.com$/.test(host)) {
+      const idIndex = host === 'player.vimeo.com' && parts[0] === 'video' ? 1
+        : parts.findIndex(part => part.length >= 3 && /^\d+$/.test(part));
+      const id = parts[idIndex];
+      if (/^\d+$/.test(id || '') && (host !== 'player.vimeo.com' || idIndex === 1)) {
+        const pathHash = host === 'player.vimeo.com' ? null : parts[idIndex + 1];
+        const queryHash = url.searchParams.get('h');
+        const hash = pathHash && /^[0-9a-f]{8,12}$/i.test(pathHash) ? pathHash
+          : queryHash && /^[0-9a-f]{8,12}$/i.test(queryHash) ? queryHash : null;
+        if (queryHash && !/^[0-9a-f]{8,12}$/i.test(queryHash)) return url.href;
+        return `vimeo:${id}${hash ? ':h:' + hash : ''}`;
+      }
+    } else if (/(?:^|\.)bilibili\.com$/.test(host)) {
+      const video = parts.indexOf('video');
+      const id = video >= 0 ? parts[video + 1] : null;
+      if (/^BV[A-Za-z0-9]{10}$/.test(id || '')) {
+        const page = url.searchParams.get('p');
+        if (page !== null && !/^[1-9]\d{0,4}$/.test(page)) return url.href;
+        return `bilibili:${id}${page && page !== '1' ? ':p:' + page : ''}`;
+      }
+      if (/^av\d+$/i.test(id || '')) {
+        const page = url.searchParams.get('p');
+        if (page !== null && !/^[1-9]\d{0,4}$/.test(page)) return url.href;
+        return `bilibili:${id.toLowerCase()}${page && page !== '1' ? ':p:' + page : ''}`;
+      }
+    } else {
+      const peertubeId = parts.length === 2 && parts[0] === 'w' ? parts[1]
+        : parts.length === 3 && parts[0] === 'videos' && ['watch', 'embed'].includes(parts[1]) ? parts[2] : null;
+      if (/^[a-z0-9_-]{6,40}$/i.test(peertubeId || '')) return `peertube:${url.origin}:${peertubeId}`;
     }
     return url.href;
   }

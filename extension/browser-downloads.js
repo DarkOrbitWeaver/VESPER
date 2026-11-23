@@ -14,6 +14,8 @@ const createdDownloads = new Map();
 const requestChains = new Map();
 const blockedRequests = new Map();
 const browserOperations = new Map();
+let capturePreflightPromise = null;
+let capturePreflightAt = 0;
 let recordWrites = Promise.resolve();
 let captureWrites = Promise.resolve();
 let decisionWrites = Promise.resolve();
@@ -262,6 +264,7 @@ async function rememberRequestRedirect(details, generation, admissionGeneration 
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
 async function observeDownloadResponse(details, generation, admissionGeneration = captureAdmissionGeneration) {
   if (!(await captureCanBegin(generation, admissionGeneration))) return;
+  if (isPreflightCandidate(details)) void preflightNativeCapture(generation, admissionGeneration);
   const url = withoutFragment(details.url);
   const chain = updateRequestChain(details.requestId, url, details.method, details.statusCode);
   if (details.statusCode !== 200 && details.statusCode !== 206) {
@@ -307,6 +310,30 @@ async function observeDownloadResponse(details, generation, admissionGeneration 
   }
   await saveCaptureState(generation);
   for (const item of captured) void captureChromeDownloadSafely(item, generation);
+}
+
+function isPreflightCandidate(details) {
+  if (!details || details.incognito || details.method !== 'GET'
+      || !['main_frame', 'sub_frame', 'other'].includes(details.type)
+      || details.statusCode !== 200 && details.statusCode !== 206) return false;
+
+  const disposition = details.responseHeaders?.find(header =>
+    header.name.toLowerCase() === 'content-disposition')?.value;
+  if (!/^attachment\b/i.test(disposition?.trim() || '')) return false;
+
+  const initiator = details.initiator || details.documentUrl || details.originUrl;
+  return !matchesNeverCaptureHost({ url: details.url, referrer: initiator });
+}
+
+function preflightNativeCapture(generation, admissionGeneration) {
+  if (capturePreflightPromise) return capturePreflightPromise;
+  if (Date.now() - capturePreflightAt < 5000) return Promise.resolve();
+  capturePreflightAt = Date.now();
+  capturePreflightPromise = (async () => {
+    if (!(await captureCanBegin(generation, admissionGeneration))) return;
+    await nativeRequest(envelope('capture-preflight'), 16000);
+  })().catch(() => {}).finally(() => { capturePreflightPromise = null; });
+  return capturePreflightPromise;
 }
 
 // Only document and attachment requests can sit behind a Chrome download. Listening for every XHR and

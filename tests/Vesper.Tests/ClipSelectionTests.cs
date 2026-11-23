@@ -60,7 +60,7 @@ public sealed class ClipSelectionTests
             null, null, CanUseFullFileClip: true);
         Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(mp4Source));
         Assert.Contains("only the segments", ClipSelection.Notice(ClipMode.Segments), StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("full file, then trims", ClipSelection.Notice(ClipMode.FullFile));
+        Assert.Equal("", ClipSelection.Notice(ClipMode.FullFile));
     }
 
     [Theory]

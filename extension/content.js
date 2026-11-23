@@ -466,6 +466,15 @@
     return (h ? `${h}:${String(m).padStart(2, '0')}` : String(m)) + ':' + secondsText;
   }
 
+  function clipAvailability(option, seconds, live = false) {
+    if (live) return { available: false, reason: "Trim isn't available for live streams." };
+    if (!Number.isFinite(seconds) || seconds < 0.1 || seconds > 31_536_000)
+      return { available: false, reason: 'Trim needs a known media length.' };
+    if (option?.canClip !== true)
+      return { available: false, reason: "This format can't be trimmed. Choose another format." };
+    return { available: true, reason: option.clipUsesWholeFile ? '' : 'The cut follows segment boundaries and may shift slightly.' };
+  }
+
   function element(tag, className, text = '') {
     const el = document.createElement(tag);
     if (className) el.className = className;
@@ -495,7 +504,7 @@
         .fly-fallback{display:grid;place-items:center;width:29px;height:29px;border-radius:7px;
           background:var(--green);color:#fffbee;font-size:19px;pointer-events:none}
         .fly.companion-ready .fly-fallback{display:none}
-        .panel{position:fixed;width:316px;max-width:calc(100vw - 16px);max-height:min(630px,calc(100vh - 16px));
+        .panel{position:fixed;width:340px;max-width:calc(100vw - 16px);max-height:min(630px,calc(100vh - 16px));
           background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;display:none;
           box-shadow:0 7px 22px #0003;overflow-x:hidden;overflow-y:auto;font-size:13px;transform-origin:top right}
         .panel.show{display:block;animation:picker-open .16s ease-out}
@@ -513,21 +522,23 @@
           overflow:hidden;overflow-wrap:anywhere}.d{font-size:11px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}
         .x{flex:none;margin-left:auto;border:0;background:none;font-size:18px;color:var(--muted);cursor:pointer;align-self:flex-start;padding:0 2px}
         .output{display:flex;flex-wrap:wrap;min-width:0;justify-content:flex-end;align-items:center;gap:8px;padding:8px 12px 0;color:var(--muted);font-size:11px}
-        .clip{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px 0;font-size:12px;color:var(--text)}
+        .clip{box-sizing:border-box;display:grid;gap:9px;width:calc(100% - 16px);margin:8px 8px 0;padding:10px 11px;
+          border:1px solid var(--border);border-radius:8px;background:var(--paper);font-size:12px;color:var(--text)}
         .clip[hidden],.clip .fields[hidden],.hint[hidden]{display:none}
-        .clip .fields{display:grid;gap:5px;width:100%}
-        .clip .trim-values{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%}
-        .clip .trim-value{display:grid;grid-template-columns:auto minmax(64px,82px);gap:6px;align-items:center;color:var(--muted);font-size:11px}
-        .clip .trim-value input{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:3px 6px;text-align:center}
-        .clip .trim-range{--range-start:0%;--range-end:100%;position:relative;width:100%;height:22px;touch-action:none;
+        .clip .fields{display:grid;gap:8px;width:100%}
+        .clip .trim-values{display:flex;align-items:center;gap:10px;width:100%}
+        .clip .trim-value{display:grid;grid-template-columns:minmax(0,1fr) minmax(64px,92px);flex:1 1 0;min-width:0;gap:7px;align-items:center;color:var(--muted);font-size:11px}
+        .clip .trim-value input{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font:inherit;padding:5px 7px;text-align:center}
+        .clip .trim-range{--range-start:0%;--range-end:100%;position:relative;width:100%;height:28px;touch-action:none;
           background:linear-gradient(to right,var(--border) 0,var(--border) var(--range-start),var(--green) var(--range-start),var(--green) var(--range-end),var(--border) var(--range-end),var(--border) 100%) center/100% 4px no-repeat}
         .clip .trim-range input[type=range]{position:absolute;inset:0;width:100%;height:100%;margin:0;appearance:none;background:transparent;pointer-events:none;accent-color:var(--green)}
         .clip .trim-range input[type=range]::-webkit-slider-runnable-track{height:4px;background:transparent}
-        .clip .trim-range input[type=range]::-webkit-slider-thumb{appearance:none;width:14px;height:14px;margin-top:-5px;border:2px solid var(--green);border-radius:50%;background:var(--surface);pointer-events:auto;cursor:ew-resize}
+        .clip .trim-range input[type=range]::-webkit-slider-thumb{appearance:none;width:16px;height:16px;margin-top:-6px;border:2px solid var(--green);border-radius:50%;background:var(--surface);pointer-events:auto;cursor:ew-resize}
         .clip .trim-range input[type=range]:focus-visible::-webkit-slider-thumb{outline:2px solid var(--text);outline-offset:2px}
         .clip input[type=checkbox]{accent-color:var(--green);margin:0}
-        .clip>label{display:flex;gap:7px;align-items:center}
+        .clip>label{display:flex;gap:8px;align-items:center;min-height:20px;font-weight:600}
         .clip-error{color:var(--red);font-size:11px}
+        .clip-note{color:var(--muted);font-size:11px;line-height:1.35}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
         .output[hidden]{display:none}
         :is(.output,.audio-track) select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
@@ -542,7 +553,7 @@
         .icon.best{color:var(--gold)}.icon.balanced{color:var(--blue)}.icon.audio{color:var(--violet)}
         .kind{flex:none;max-width:35%;overflow:hidden;text-overflow:ellipsis;font-size:10px;color:var(--sage);padding:2px 4px;border-radius:4px;background:var(--wash);margin-left:auto}
         .tick{width:13px;flex:none;color:var(--sage)}
-        .more{display:block;width:calc(100% - 16px);margin:0 8px 8px;font-size:12px}
+        .more{display:block;width:calc(100% - 16px);margin:8px 8px 10px;font-size:12px}
         .languages summary{box-sizing:border-box;list-style:none;text-align:center}
         .languages summary::-webkit-details-marker{display:none}
         .languages summary::after{content:' ▾'}
@@ -1085,6 +1096,12 @@
     const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
     const poster = current ? player.poster || (!isPreview && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
     const duration = current && Number.isFinite(player.duration) ? player.duration : null;
+    const playerFacts = current ? {} : null;
+    if (playerFacts) {
+      if (Number.isFinite(player.duration) && player.duration > 0) playerFacts.durationSeconds = player.duration;
+      if (Number.isFinite(player.videoHeight) && player.videoHeight > 0) playerFacts.height = player.videoHeight;
+      if (player.duration === Infinity) playerFacts.live = true;
+    }
     if (player.mediaKeys || protectedVideos.has(player))
       return renderShell(title, poster, duration, element('div', 'msg bad', 'This video is protected by DRM.'));
 
@@ -1097,6 +1114,7 @@
       playerHasMedia: current && (player.readyState >= 1 || player.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       mutedLoop: current && !isPreview && isMutedLoop(player, src),
+      playerFacts: playerFacts && Object.keys(playerFacts).length ? playerFacts : undefined,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
@@ -1114,10 +1132,12 @@
       return renderShell(title, poster, duration, message);
     }
     const formats = result.data;
-    if (formats.sourceChoices?.length) return renderSourceChoices(title, poster, duration, formats);
+    formats.playerLive = playerFacts?.live === true || formats.isLive === true;
+    const pickerDuration = formats.playerLive ? null : formats.duration ?? duration;
+    if (formats.sourceChoices?.length) return renderSourceChoices(title, poster, pickerDuration, formats);
     const restored = restorePickerDraft(formats, targetKey, player);
     choice = restored.choice;
-    renderChoices(formats.title || title, formats.thumbnail || poster, formats.duration ?? duration,
+    renderChoices(formats.title || title, formats.thumbnail || poster, pickerDuration,
       formats, false, restored.useOriginal, restored.useM4a);
   }
 
@@ -1317,7 +1337,8 @@
     const clipError = element('div', 'clip-error');
     clipError.setAttribute('role', 'status');
     clipError.hidden = true;
-    const hasDuration = Number.isFinite(seconds) && seconds >= 0.1;
+    const hasDuration = formats.playerLive !== true && Number.isFinite(seconds)
+      && seconds >= 0.1 && seconds <= 31_536_000;
     const startField = element('input'), endField = element('input');
     const timeFields = element('div', 'trim-values');
     for (const [field, key, label] of [[startField, 'start', 'Start'], [endField, 'end', 'End']]) {
@@ -1399,20 +1420,24 @@
     clipFields.append(timeFields);
     if (rangeTrack) clipFields.append(rangeTrack);
     const clipNote = element('small', 'hint');
+    clipNote.className = 'clip-note';
+    clipNote.setAttribute('role', 'status');
     clipBox.onchange = () => { draft.enabled = clipBox.checked; refreshClip(); saveDraft(); place(true); };
-    clip.append(clipToggle, clipFields, clipError);
+    clip.append(clipToggle, clipFields, clipNote, clipError);
 
     function refreshClip() {
-      const canClip = !!choice?.canClip;
-      clip.hidden = !canClip && !draft.enabled;
+      const support = clipAvailability(choice, seconds, formats.playerLive === true);
+      const canClip = support.available;
+      clip.hidden = false;
+      clipBox.disabled = !canClip && !draft.enabled;
       clipFields.hidden = !canClip || !draft.enabled;
-      clipNote.hidden = !draft.enabled;
+      clipNote.hidden = canClip && !draft.enabled;
       clipError.hidden = true;
-      clipNote.textContent = !canClip ? 'Choose a format that supports trimming, or turn Trim off.'
-        : choice.clipUsesWholeFile ? 'Downloads the full file, then trims to this range.'
-        : 'Downloads only the segments in this range; the cut may shift slightly.';
+      clipNote.textContent = support.reason;
+      for (const action of downloadButtons)
+        action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !canClip;
     }
-    const body = [output, list, clip, clipNote];
+    const body = [output, list, clip];
     if (noticeText()) {
       selectionNotice = element('div', 'msg', noticeText());
       body.unshift(selectionNotice);
@@ -1485,18 +1510,18 @@
     for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
-      action.disabled = !!formats.selectionNeedsChoice;
+      action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !clipAvailability(choice, seconds, formats.playerLive === true).available;
       downloadButtons.push(action);
       action.onclick = () => {
         if (!action.isConnected) return;
         let range;
         if (draft.enabled) {
+          const support = clipAvailability(choice, seconds, formats.playerLive === true);
           const start = draft.start.trim() ? parseClock(draft.start) : 0;
           let end = draft.end.trim() ? parseClock(draft.end) : hasDuration ? seconds : null;
           if (hasDuration && end !== null && end <= seconds + 0.005) end = Math.min(end, seconds);
-          if (!choice.canClip || start === null || end === null || end <= start || hasDuration && end > seconds) {
-            clipError.textContent = choice.canClip ? 'Enter a valid start and end time within the video.'
-              : 'Turn Trim off or choose another format.';
+          if (!support.available || start === null || end === null || end <= start || end > seconds) {
+            clipError.textContent = !support.available ? support.reason : 'Enter a valid start and end time within the media.';
             clipError.hidden = false;
             place(true);
             return;
@@ -1520,14 +1545,14 @@
       const labels = element('span');
       labels.append(element('b', '', source.label), element('small', '', source.detail));
       option.append(element('span', 'icon balanced', '›'), labels);
-      option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds); };
+      option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds, formats.playerLive === true); };
       list.append(option);
     }
     const prompt = formats.verifiedSources ? 'Choose the source that matches your video.' : 'Check a video source to see its formats.';
     renderShell(title, poster, seconds, element('div', 'msg', prompt), list);
   }
 
-  async function inspectSource(token, title, poster, seconds) {
+  async function inspectSource(token, title, poster, seconds, playerLive = false) {
     if (!panelMedia || !isCurrentRequest(panelRequest)) return;
     const request = panelRequest;
     const loading = element('div', 'msg', 'Checking selected stream…');
@@ -1538,9 +1563,10 @@
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.choices?.length) {
       const formats = result.data;
+      formats.playerLive = playerLive || formats.isLive === true;
       choice = formats.choices[0];
       return renderChoices(formats.title || title, formats.thumbnail || poster,
-        formats.duration ?? seconds, formats);
+        formats.playerLive ? null : formats.duration ?? seconds, formats);
     }
     const message = result?.code === 'unavailable'
       ? element('div', 'msg bad', 'This source couldn’t be opened.')

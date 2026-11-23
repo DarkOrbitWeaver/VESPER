@@ -101,6 +101,42 @@ public sealed class MediaMergeTests
         });
     }
 
+    [Fact]
+    public async Task LocalM4aAudioClip_PublishesOnlyTheSelectedAacPackets()
+    {
+        await using var server = new FaultServer();
+        byte[] audio = AacFmp4();
+        using var source = new MemoryStream(audio);
+        DemuxedTrack sourceTrack = Track(source, TrackKind.Audio);
+        server.Extra["/clip/audio.m4a"] = audio;
+        await server.StartAsync();
+        using var h = new Harness();
+
+        var plan = new MediaMergePlan
+        {
+            OutputContainer = "m4a",
+            RequireAudio = true,
+            ClipRange = new MediaTimeRange(0.25, 0.7),
+            Tracks = [new MergeTrack("audio", "aac", server.Url("/clip/audio.m4a"), audio.Length,
+                "m4a", "aac", "audio-aac")]
+        };
+        Assert.True(plan.CanClipLocalMp4);
+        AddResult added = h.Engine.Add(new AddRequest(plan.Tracks[0].Url, FileName: "clip.m4a",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+
+        JobSnapshot done = await h.WaitAsync(added.JobId,
+            job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        DemuxedTrack clipped = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+        Assert.Equal("aac", clipped.Codec);
+        Assert.True(clipped.Samples.Count < sourceTrack.Samples.Count);
+        Mp4EditListEntry edit = Assert.Single(clipped.EditList!);
+        Assert.Equal(0.45, edit.SegmentDuration / (double)clipped.EditMovieTimescale, 7);
+    }
+
     private static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
     private static byte[] AacFmp4() => [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
     private static byte[] TinyPng() => Convert.FromBase64String(
@@ -996,7 +1032,7 @@ public sealed class MediaMergeTests
         }, preferences);
         Assert.Null(unsupported.Error);
         Assert.Equal(JobKind.Http, unsupported.Choice!.Kind);
-        Assert.Contains("unsupported", unsupported.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("weren't available", unsupported.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
         Assert.Single(MediaTransferBridge.ExpandSubtitleChoices([unsupported.Choice]));
     }
 
@@ -1076,7 +1112,7 @@ public sealed class MediaMergeTests
         Assert.Null(prepared.Error);
         Assert.Equal(JobKind.Merge, prepared.Choice!.Kind);
         Assert.Equal(0, prepared.Choice.EmbeddedSubtitleCount);
-        Assert.Contains("at most 25", prepared.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("too many subtitles", prepared.Choice.SubtitleNotice, StringComparison.OrdinalIgnoreCase);
         Assert.True(MediaMergePlan.TryParse(prepared.Choice.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
         Assert.Empty(plan.Subtitles);
         MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice])];
@@ -1118,7 +1154,7 @@ public sealed class MediaMergeTests
         Assert.Null(prepared.Error);
         Assert.Equal(JobKind.Http, prepared.Choice!.Kind);
         Assert.Equal(selectedEnglish.Url, Assert.Single(prepared.Choice.SubtitleTracks!).Url);
-        Assert.Contains("media and supported sidecars remain queued", prepared.Choice.SubtitleNotice,
+        Assert.Contains("saved as separate files", prepared.Choice.SubtitleNotice,
             StringComparison.OrdinalIgnoreCase);
         MediaDownloadChoice[] jobs = [.. MediaTransferBridge.ExpandSubtitleChoices([prepared.Choice])];
         Assert.Equal(2, jobs.Length);

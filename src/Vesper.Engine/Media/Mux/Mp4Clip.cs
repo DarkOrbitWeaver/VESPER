@@ -4,9 +4,12 @@ internal static class Mp4Clip
 {
     internal static void Apply(IReadOnlyList<DemuxedTrack> tracks, MediaTimeRange range, CancellationToken ct)
     {
-        if (!range.IsValid || tracks.Count != 2 || tracks.Count(track => track is { Kind: TrackKind.Video, Codec: "h264" }) != 1
-            || tracks.Count(track => track is { Kind: TrackKind.Audio, Codec: "aac" }) != 1)
-            throw new MediaContainerException("This MP4 clip needs one H.264 video and one AAC audio track.");
+        bool audioOnly = tracks is [{ Kind: TrackKind.Audio, Codec: "aac" }];
+        bool audioAndVideo = tracks.Count == 2
+            && tracks.Count(track => track is { Kind: TrackKind.Video, Codec: "h264" }) == 1
+            && tracks.Count(track => track is { Kind: TrackKind.Audio, Codec: "aac" }) == 1;
+        if (!range.IsValid || !audioOnly && !audioAndVideo)
+            throw new MediaContainerException("This MP4 clip needs one AAC audio track, optionally with one H.264 video track.");
 
         long from = TimeSpan.FromSeconds(range.StartSeconds).Ticks;
         long to = TimeSpan.FromSeconds(range.EndSeconds).Ticks;

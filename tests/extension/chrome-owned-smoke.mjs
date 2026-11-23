@@ -47,6 +47,7 @@ function installRaceBridge() {
     }
     smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
     const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
+    if (message.type === 'capture-preflight') return reply({ data: { ready: true } });
     if (message.type === 'hello')
       return setTimeout(() => reply({ data: { siteRules: { neverCaptureHosts: [] } } }), 650);
     if (message.type === 'browser-capture' || message.type === 'browser-submit')
@@ -493,6 +494,9 @@ async function main() {
         assert.equal(reachedAccept, fixture === 'policy-window' || fixture === 'delayed',
           'Unexpected capture path: ' + JSON.stringify({ captureRace, calls }));
       }
+      const preflights = await evaluate('Read capture preflights',
+        "__ownershipSmoke.raceCalls.filter(call => call.type === 'capture-preflight')");
+      assert.equal(preflights.length, 1, 'A burst of attachment responses should share one native preflight.');
     }
     let nativeCapture = null;
     if (nativeHostTest) {

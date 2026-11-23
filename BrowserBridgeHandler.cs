@@ -25,6 +25,10 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                     version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
             }
 
+            case "capture-preflight":
+                return BridgeResponse.Success(request.Id, "VESPER is ready for a browser download.",
+                    data: new { ready = true });
+
             case "probe":
                 return BridgeResponse.Success(request.Id, data: await engine.ProbeMediaAsync(request.Url!, ct));
 

@@ -91,10 +91,12 @@ test('opening the popup shows the installed extension version without checking t
 test('the media picker wraps long metadata and keeps horizontal overflow inside its bounds', () => {
   const content = source('content');
   assert.match(content, /\.panel\{[^}]*overflow-x:hidden;overflow-y:auto/);
+  assert.match(content, /\.panel\{position:fixed;width:340px/);
   assert.match(content, /\.head>div:nth-child\(2\)\{flex:1 1 auto;min-width:0/);
   assert.match(content, /\.t\{display:-webkit-box;[^}]*-webkit-line-clamp:2;[^}]*overflow-wrap:anywhere/);
   assert.match(content, /:is\(\.output,\.audio-track\) select\{max-width:100%;min-width:0/);
   assert.match(content, /\.opt>span:nth-child\(2\)\{flex:1 1 auto;min-width:0;overflow-wrap:anywhere/);
+  assert.match(content, /\.clip\{box-sizing:border-box;display:grid;gap:9px;[^}]*border-radius:8px/);
 });
 
 test('subtitle embedding stays opt-in and travels with the native media selection', () => {
@@ -114,8 +116,11 @@ test('ended media stays bound to its player and selected range notice explains w
   assert.match(content, /playerHasMedia: current &&/);
   assert.match(content, /newPlayerPlaying/);
   assert.match(content, /overlapsFrame >= frameArea \* 0\.5/);
-  assert.match(content, /Downloads only the segments in this range; the cut may shift slightly/);
-  assert.match(content, /Downloads the full file, then trims to this range/);
+  assert.match(content, /The cut follows segment boundaries and may shift slightly/);
+  assert.doesNotMatch(content, /Downloads the full file, then trims to this range/);
+  assert.match(content, /clip\.hidden = false/);
+  assert.match(content, /draft\.enabled && !canClip/);
+  assert.match(content, /playerFacts: playerFacts && Object\.keys\(playerFacts\)\.length \? playerFacts : undefined/);
 });
 
 test('the butterfly clears fullscreen focus and tries safer edge perches first', () => {
@@ -136,6 +141,8 @@ test('browser playlist browsing only opens the native picker from resolver colle
   assert.match(background, /const trustedContentPage = sender\.tab \? mediaPage\(\{\}, sender\)\?\.href : null/);
   assert.match(options, /resolved\.Collection is \{ \} collection/);
   assert.match(options, /hasRelatedCollection = HasRelatedCollection\(item\)/);
+  assert.match(options, /isLive = item\.IsLive/);
+  assert.match(content, /formats\.playerLive = playerFacts\?\.live === true \|\| formats\.isLive === true/);
 });
 
 test('butterfly motion responds to Animate and Off', () => {
@@ -527,7 +534,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
     onPointer, consider, refreshPlayer, setSelectPlayer: fn => { selectPlayer = fn; },
     activePreview: () => activePreview, holdMissingPreview, loadFormats,
-    choiceKey: pickerOptionKey, restorePickerDraft,
+    choiceKey: pickerOptionKey, restorePickerDraft, clipAvailability,
     setRetainedPickerDraft: draft => { retainedPickerDraft = draft; },
     setPanelForTest: player => {
       const binding = playback.get(player);
@@ -573,6 +580,25 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   assert.equal(formatRequest.pageUrl, item);
   assert.equal(formatRequest.playerUrl, '');
   assert.equal(formatRequest.playerPlaying, false);
+  assert.equal(formatRequest.playerFacts, undefined, 'a stale player binding sends no player facts');
+
+  video.readyState = 1;
+  video.duration = 95;
+  video.videoHeight = 720;
+  await window.__testContent.loadFormats();
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { durationSeconds: 95, height: 720 });
+
+  video.duration = Infinity;
+  await window.__testContent.loadFormats();
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { height: 720, live: true });
+
+  const trim = window.__testContent.clipAvailability;
+  const audioAac = trim({ canClip: true, clipUsesWholeFile: true, container: 'M4A' }, 95);
+  assert.equal(audioAac.available, true);
+  assert.equal(audioAac.reason, '', 'a supported AAC trim does not show a generic download paragraph');
+  assert.match(trim({ canClip: true }, 0).reason, /known media length/);
+  assert.match(trim({ canClip: true }, Infinity, true).reason, /live streams/);
+  assert.match(trim({ canClip: false }, 95).reason, /can't be trimmed/);
 
   const best = { index: 0, label: 'Best quality', detail: '1080p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };
   const balanced = { index: 1, label: 'Balanced', detail: '720p H264 + audio', container: 'MP4', canClip: true, clipUsesWholeFile: true };

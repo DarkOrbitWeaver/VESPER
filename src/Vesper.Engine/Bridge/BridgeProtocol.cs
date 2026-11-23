@@ -73,7 +73,7 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
+            if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
                 or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed"))
             { error = "Unknown request type."; return false; }
 

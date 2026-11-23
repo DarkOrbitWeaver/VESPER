@@ -453,6 +453,16 @@ public class BridgeProtocolTests
 
     [Fact] public void Hello_is_accepted() => Assert.True(BridgeProtocol.TryParse(Msg("\"type\":\"hello\""), out BridgeRequest r, out _) && r.Type == "hello");
 
+    [Fact]
+    public void Capture_preflight_is_an_address_free_native_command()
+    {
+        string request = Msg("\"type\":\"capture-preflight\"");
+        Assert.True(BridgeProtocol.TryParse(request, out BridgeRequest parsed, out string error), error);
+        Assert.Equal("capture-preflight", parsed.Type);
+        Assert.Null(parsed.Url);
+        Assert.Empty(parsed.Items);
+    }
+
     [Theory]
     [InlineData("{\"id\":\"req-12345678\",\"type\":\"hello\"}")]                                  // no version
     [InlineData("{\"v\":2,\"id\":\"req-12345678\",\"type\":\"hello\"}")]                          // wrong version

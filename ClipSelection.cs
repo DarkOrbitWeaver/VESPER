@@ -15,7 +15,6 @@ internal static class ClipSelection
 {
     internal const double LongestSeconds = 31_536_000;
     internal const string SegmentNotice = "Downloads only the segments in this range; the cut may shift slightly.";
-    internal const string FullFileNotice = "Downloads the full file, then trims to this range.";
 
     internal static ClipMode ModeFor(MediaDownloadChoice choice)
     {
@@ -27,7 +26,11 @@ internal static class ClipSelection
     internal static ClipMode ModeFor(MediaOutput output, JobKind kind) =>
         output == MediaOutput.Wav && (kind is JobKind.Http or JobKind.Merge) ? ClipMode.FullFile : ClipMode.Segments;
 
-    internal static string Notice(ClipMode mode) => mode == ClipMode.FullFile ? FullFileNotice : SegmentNotice;
+    internal static string Notice(ClipMode mode) => mode switch
+    {
+        ClipMode.Segments => SegmentNotice,
+        _ => ""
+    };
 
     // Why trimming is unavailable, or null when it can be used.
     internal static string? UnavailableReason(bool isLive, TimeSpan? duration, ClipMode mode)

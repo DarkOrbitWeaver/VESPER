@@ -269,12 +269,19 @@ internal static class MediaTransferBridge
 
     private static bool CanClipLocalMp4Tracks(IReadOnlyList<MediaRepresentation> tracks, string? outputContainer)
     {
-        if (outputContainer != "mp4" || tracks.Count is < 1 or > 2
+        if (tracks.Count is < 1 or > 2
             || tracks.Any(track => track.Protocol != StreamProtocol.Http || track.IsLive
-                || track.FileSize is not > 0 || track.FileSizeIsEstimate
+                || track.FileSize is not (> 0 and <= MediaMergePlan.MaxTrackBytes) || track.FileSizeIsEstimate
                 || string.IsNullOrWhiteSpace(track.ContentIdentity) || HasIncompatibleAacProfile(track)))
             return false;
 
+        if (outputContainer == "m4a")
+            return tracks.Count == 1 && tracks[0] is
+            {
+                Content: StreamContent.AudioOnly, Container: "mp4" or "m4a", AudioCodec: "aac"
+            };
+
+        if (outputContainer != "mp4") return false;
         if (tracks.Count == 1)
         {
             return tracks[0] is

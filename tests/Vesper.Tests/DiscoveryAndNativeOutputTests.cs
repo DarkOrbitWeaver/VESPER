@@ -267,6 +267,91 @@ public sealed class DiscoveryAndNativeOutputTests
     }
 
     [Fact]
+    public void Audio_only_aac_m4a_can_use_the_native_clip_plan()
+    {
+        var audio = new MediaRepresentation
+        {
+            Id = "audio-aac", Url = new Uri("https://cdn.example.test/song.m4a"),
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", RawCodecs = "mp4a.40.2",
+            FileSize = 524_288, ContentIdentity = "audio-aac:modified:524288"
+        };
+        MediaItem item = new()
+        {
+            SourceUrl = new Uri("https://audio.example.test/song"), Provider = "fixture", MediaId = "song",
+            Title = "Song", Kind = MediaKind.Audio, Duration = TimeSpan.FromSeconds(60), Representations = [audio]
+        };
+
+        MediaDownloadChoice full = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(full));
+
+        MediaDownloadChoice clipped = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a,
+            clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+        Assert.Equal(JobKind.Merge, clipped.Kind);
+        Assert.True(MediaMergePlan.TryParse(clipped.MediaPlanJson, false, out MediaMergePlan plan, out string error), error);
+        Assert.Equal("m4a", plan.OutputContainer);
+        Assert.False(plan.RequireVideo);
+        Assert.Equal(new MediaTimeRange(10, 25), plan.ClipRange);
+        Assert.True(plan.CanClipLocalMp4);
+        Assert.True(MediaTransferBridge.SupportsTimeRange(full));
+    }
+
+    [Fact]
+    public void Audio_only_hls_range_uses_the_segment_transfer_plan()
+    {
+        var audio = new MediaRepresentation
+        {
+            Id = "hls-audio", Url = new Uri("https://cdn.example.test/audio/index.m3u8"),
+            Protocol = StreamProtocol.Hls, Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac",
+            Segments = new SegmentPlan
+            {
+                Segments = [new MediaSegment(new Uri("https://cdn.example.test/audio/part.m4s"), 60, StartSeconds: 0)],
+                TotalDurationSeconds = 60, IsFragmentedMp4 = true
+            }
+        };
+        MediaItem item = new()
+        {
+            SourceUrl = new Uri("https://audio.example.test/song"), Provider = "fixture", Title = "Song",
+            Kind = MediaKind.Audio, Duration = TimeSpan.FromSeconds(60), Representations = [audio]
+        };
+
+        MediaDownloadChoice clipped = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+
+        Assert.Equal(JobKind.Hls, clipped.Kind);
+        Assert.Equal(ClipMode.Segments, ClipSelection.ModeFor(clipped));
+        Assert.Equal(new MediaTimeRange(10, 25), JsonSerializer.Deserialize<MediaTimeRange>(clipped.MediaPlanJson!));
+    }
+
+    [Fact]
+    public void Opus_and_mp3_outputs_do_not_claim_audio_clipping()
+    {
+        var opus = new MediaRepresentation
+        {
+            Id = "audio-opus", Url = new Uri("https://cdn.example.test/song.webm"),
+            Content = StreamContent.AudioOnly, Container = "webm", AudioCodec = "opus",
+            FileSize = 524_288, ContentIdentity = "audio-opus:modified:524288"
+        };
+        MediaItem item = new()
+        {
+            SourceUrl = new Uri("https://audio.example.test/song"), Provider = "fixture", MediaId = "song",
+            Title = "Song", Kind = MediaKind.Audio, Duration = TimeSpan.FromSeconds(60), Representations = [opus]
+        };
+
+        MediaDownloadChoice opusChoice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, output: MediaOutputPreference.Opus).Choice);
+        Assert.Equal(ClipMode.None, ClipSelection.ModeFor(opusChoice));
+        Assert.Null(MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly,
+            output: MediaOutputPreference.Opus, clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+
+        var mp3Clip = MediaTransferBridge.Prepare(item, FormatPreferences.AudioOnly,
+            output: MediaOutputPreference.Mp3, clipStartSeconds: 10, clipEndSeconds: 25);
+        Assert.Null(mp3Clip.Choice);
+        Assert.Contains("MP3 clipping", mp3Clip.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Local_mp4_range_refuses_selected_subtitles_and_unsafe_sources()
     {
         MediaRepresentation stream = MuxedMp4("137", "youtube:video:137:modified:2097152");

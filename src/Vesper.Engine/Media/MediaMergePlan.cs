@@ -64,14 +64,19 @@ public sealed record MediaMergePlan
 
     internal bool IsSegmented => Tracks.Any(track => track.Source is not null);
     [JsonIgnore]
-    public bool CanClipLocalMp4 => OutputContainer == "mp4" && RequireVideo && RequireAudio
-        && OutputRange is null && Subtitles is { Count: 0 }
-        && (Tracks is [var single] && IsClipVideo(single, "muxed")
-            || Tracks is { Count: 2 } && Tracks.Any(track => IsClipVideo(track, "video"))
-            && Tracks.Any(track => track is { Role: "audio", Source: null, Container: "mp4" or "m4a", Codec: "aac", Size: > 0 and <= MaxTrackBytes }));
+    public bool CanClipLocalMp4 => OutputRange is null && Subtitles is { Count: 0 }
+        && (OutputContainer == "mp4" && RequireVideo && RequireAudio
+            && (Tracks is [var single] && IsClipVideo(single, "muxed")
+                || Tracks is { Count: 2 } && Tracks.Any(track => IsClipVideo(track, "video"))
+                && Tracks.Any(track => track is { Role: "audio", Source: null, Container: "mp4" or "m4a", Codec: "aac", Size: > 0 and <= MaxTrackBytes }))
+            || OutputContainer == "m4a" && RequireAudio && !RequireVideo
+                && Tracks is [var audio] && IsClipAudio(audio));
 
     private static bool IsClipVideo(MergeTrack? track, string role) => track is
         { Source: null, Container: "mp4", Codec: "h264", Size: > 0 and <= MaxTrackBytes } && track.Role == role;
+
+    private static bool IsClipAudio(MergeTrack? track) => track is
+        { Role: "audio", Source: null, Container: "mp4" or "m4a", Codec: "aac", Identity.Length: > 0, Size: > 0 and <= MaxTrackBytes };
 
     internal long OffsetOf(int index)
     {

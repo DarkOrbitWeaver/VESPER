@@ -62,12 +62,14 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Theory]
-    [InlineData(MediaOutput.Wav, JobKind.Http, "full file, then trims")]
+    [InlineData(MediaOutput.Wav, JobKind.Http, "")]
     [InlineData(MediaOutput.Wav, JobKind.Hls, "cut may shift slightly")]
     [InlineData(MediaOutput.Original, JobKind.Merge, "cut may shift slightly")]
     public void ClipNoticeMatchesTheActualRangeBehavior(MediaOutput output, JobKind kind, string expected)
     {
-        Assert.Contains(expected, MediaDiscoveryForm.ClipBehaviorNotice(output, kind), StringComparison.OrdinalIgnoreCase);
+        string notice = MediaDiscoveryForm.ClipBehaviorNotice(output, kind);
+        if (expected.Length == 0) Assert.Equal("", notice);
+        else Assert.Contains(expected, notice, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -92,6 +94,52 @@ public sealed class MediaDiscoveryFormTests
             Assert.Contains("Original format", video.AccessibleDescription);
             Assert.Equal("M4A (compatible)", audio.SelectedText);
             Assert.Contains("Original audio", audio.AccessibleDescription);
+        });
+    }
+
+    [Fact]
+    public void AudioOnlyM4aKeepsTrimAvailableAndBuildsAnAacClip()
+    {
+        OnSta(() =>
+        {
+            MediaRepresentation audio = new()
+            {
+                Id = "audio-aac", Url = new Uri("https://sample.example.test/song.m4a"),
+                Content = Vesper.MediaResolver.Models.StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", RawCodecs = "mp4a.40.2",
+                FileSize = 524_288, ContentIdentity = "audio-aac:modified:524288"
+            };
+            MediaItem sample = Item("sample", [audio]) with { Kind = MediaKind.Audio, Duration = TimeSpan.FromSeconds(60) };
+            using var form = new MediaDiscoveryForm(new VesperPreferences(), sample.SourceUrl, sample);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(-form.Width - 80, -form.Height - 80);
+            form.Show();
+            Application.DoEvents();
+
+            const System.Reflection.BindingFlags members =
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            T Control<T>(string name) => (T)typeof(MediaDiscoveryForm).GetField(name, members)!.GetValue(form)!;
+            typeof(MediaDiscoveryForm).GetMethod("SelectPreset", members)!.Invoke(form, [3]);
+            var trim = Control<CheckBox>("_clipCheck");
+            Assert.True(trim.Visible);
+            Assert.True(trim.Enabled);
+
+            trim.Checked = true;
+            Control<TextBox>("_clipStart").Text = "00:10";
+            Control<TextBox>("_clipEnd").Text = "00:25";
+            Application.DoEvents();
+
+            Assert.Contains("00:00:10 to 00:00:25 selected", Control<Label>("_clipNote").Text,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("downloads the full file", Control<Label>("_clipNote").Text,
+                StringComparison.OrdinalIgnoreCase);
+            var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;
+            var result = ((MediaDownloadChoice? Choice, string? Error))prepare.Invoke(form, null)!;
+            Assert.Null(result.Error);
+            Assert.Equal(JobKind.Merge, result.Choice!.Kind);
+            MediaMergePlan plan = Assert.IsType<MediaMergePlan>(
+                System.Text.Json.JsonSerializer.Deserialize<MediaMergePlan>(result.Choice.MediaPlanJson!));
+            Assert.Equal("m4a", plan.OutputContainer);
+            Assert.Equal(new MediaTimeRange(10, 25), plan.ClipRange);
         });
     }
 
@@ -205,7 +253,7 @@ public sealed class MediaDiscoveryFormTests
     }
 
     [Fact]
-    public void Default_compatible_mp4_clip_discloses_full_source_before_submit()
+    public void Default_compatible_mp4_clip_shows_the_selected_range_before_submit()
     {
         OnSta(() =>
         {
@@ -237,7 +285,8 @@ public sealed class MediaDiscoveryFormTests
             Control<TextBox>("_clipEnd").Text = "00:25";
             Application.DoEvents();
 
-            Assert.Contains("downloads the full file, then trims", note.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("00:00:10 to 00:00:25 selected", note.Text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("downloads the full file", note.Text, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("decodes", note.Text, StringComparison.OrdinalIgnoreCase);
             Assert.True(download.Enabled);
             var prepare = typeof(MediaDiscoveryForm).GetMethod("PrepareCurrentChoice", members)!;

@@ -2,7 +2,7 @@
 // user opted to hand off, a media request, or recovery of an unfinished handoff. It holds no native connection.
 'use strict';
 
-importScripts('player-source.js');
+importScripts('player-source.js', 'media-evidence.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
@@ -13,7 +13,7 @@ const SOURCE_TTL = 10 * 60_000;
 // click after long playback can still use them. Navigation clears them; signed links are revalidated.
 const PLAYER_SOURCE_TTL = 60 * 60_000;
 // Picker verification: a few strong candidates checked in parallel, each through the one-source command.
-const VERIFY_LIMIT = 3;
+const VERIFY_LIMIT = 5;
 const VERIFY_DEADLINE_MS = 20_000;
 // Tabs with a video element get a short-lived listener for manifests identified only by Content-Type.
 const MANIFEST_WATCH_MS = 3 * 60_000;
@@ -706,13 +706,16 @@ function sourceLabel(source) {
 
 function verifiedSourceLabel(source, reply) {
   const data = reply.data;
+  const facts = VesperMediaEvidence.mediaFacts(reply);
   const format = source.kind === 'direct' ? typeName(source.mime) : source.kind.toUpperCase();
   const count = new Set([...data.choices, ...(data.more || [])].map(choice => choice.index)).size;
-  const duration = clockText(data.duration);
+  const duration = facts.live === true ? '' : clockText(facts.durationSeconds);
   const best = data.choices[0];
   return {
     token: source.token,
-    label: [duration, format, count > 1 ? `${count} formats` : '1 format'].filter(Boolean).join(' · '),
+    label: [duration, facts.live === true ? 'Live' : '', facts.height ? `${facts.height}p` : '',
+      VesperMediaEvidence.trackLabel(facts), format,
+      count > 1 ? `${count} formats` : '1 format'].filter(Boolean).join(' · '),
     detail: best?.detail || best?.label || ''
   };
 }
@@ -810,6 +813,7 @@ async function playerOptions(message, sender) {
   const identity = VesperPlayerSource.identity(page.href);
   const youTube = isYouTubePage(page);
   const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
+  const player = binding ? VesperMediaEvidence.playerFacts(message.playerFacts) : {};
   const source = binding && VesperPlayerSource.http(message.playerUrl);
   const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
   const mutedLoop = message.mutedLoop === true && !!source && (sender.frameId ?? 0) === 0;
@@ -819,12 +823,13 @@ async function playerOptions(message, sender) {
   const prefetch = message.prefetch === true;
   const auth = route !== 'chrome' && !prefetch
     ? await mediaAuthorization(page.href, sender, { userGesture: true }) : {};
-  const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href, route, mutedLoop].join('|');
+  const lookupKey = [tab, frame, sender.documentId, identity, message.generation, source?.href, manifest?.href,
+    route, mutedLoop].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
   // A click can use sign-in even while a background lookup is in flight.
-  const pendingKey = prefetch ? lookupKey + '|prefetch' : auth.authorized ? lookupKey + '|signed' : lookupKey;
+  const pendingKey = [lookupKey, prefetch ? 'prefetch' : auth.authorized ? 'signed' : '', JSON.stringify(player)].join('|');
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   if (prefetch) {
     const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats');
@@ -834,27 +839,30 @@ async function playerOptions(message, sender) {
     const state = await tabState(tab);
     const now = Date.now();
     const changedAt = Number.isFinite(message.mediaChangedAt) ? message.mediaChangedAt : 0;
-    const changeCutoff = changedAt > 0 ? changedAt - 2000 : 0;
+    const directCutoff = changedAt > 0 ? changedAt - 2_000 : 0;
     const currentEvidence = source => sender.documentId && source.documentId === sender.documentId
       && (source.frameId ?? 0) === frame && Number.isFinite(source.seen)
-      && source.seen >= Math.max(now - sourceLifetime(source), changeCutoff) && source.seen <= now + 1000;
-    const observed = url => state.sources.find(s => currentEvidence(s) && s.url === url.href);
+      && source.seen >= now - sourceLifetime(source) && source.seen <= now + 1000;
+    const observed = url => state.sources.find(s => currentEvidence(s) && s.seen >= directCutoff && s.url === url.href);
     const matching = source ? observed(source) : null;
     const candidate = url => {
       const evidence = observed(url);
       return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
     };
-    const matchedManifest = manifest && observed(manifest);
+    const manifestIsCurrent = evidence => Number.isInteger(message.generation) && message.generation > 0 && changedAt > 0
+      && evidence.seen >= changedAt - 15_000 && evidence.seen <= now + 1000;
+    const matchedManifest = manifest && state.sources.find(source => currentEvidence(source)
+      && source.url === manifest.href && manifestIsCurrent(source));
     const possibleSources = [];
     const playerActiveOrLoaded = message.playerPlaying === true || message.playerHasMedia === true;
     if (!matchedManifest && source === null && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
-      const sourceLimit = changedAt + 15_000;
       for (const evidence of state.sources) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
-        const recent = evidence.seen >= sourceCutoff && evidence.seen <= sourceLimit;
+        const recent = evidence.seen >= sourceCutoff;
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
-        if (currentEvidence(evidence) && recent && (isManifest || isWholeDirectSource(evidence))
+        if (currentEvidence(evidence) && recent
+            && (isManifest || evidence.seen >= directCutoff && isWholeDirectSource(evidence))
             && !possibleSources.some(item => item.url === evidence.url))
           possibleSources.push(evidence);
       }
@@ -902,10 +910,14 @@ async function playerOptions(message, sender) {
           generation: message.generation, playerUrl: message.playerUrl, title: pickerTitle };
         const ranked = rankObservedSources(possibleSources, changedAt);
         const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), { auth, pageUrl: page.href, title: pickerTitle });
-        const usable = checked.filter(result => result.reply?.ok && result.reply.data?.choices?.length);
+        const ordered = checked.map((result, index) => ({ result, index,
+          score: evidenceStrength(result.source, changedAt)
+            + VesperMediaEvidence.score(player, VesperMediaEvidence.mediaFacts(result.reply))
+        })).sort((a, b) => b.score - a.score || a.index - b.index).map(entry => entry.result);
+        const usable = ordered.filter(result => result.reply?.ok && result.reply.data?.choices?.length);
         // Timing found these, so the user confirms which one is this player, even when only one
         // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
-        // Verified sources stay separate unless the site proves they are one video.
+        // A matching duration or label does not prove two URLs are the same source.
         if (usable.length > 0) {
           const sourceChoices = rememberSourceSelections(usable.map(result =>
             ({ ...result.source, verified: result.reply })), context);
@@ -914,7 +926,7 @@ async function playerOptions(message, sender) {
         const unchecked = ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4);
         if (unchecked.length > 0)
           return { ok: true, data: { title: pickerTitle, sourceChoices: rememberSourceSelections(unchecked, context) } };
-        const refusal = bestRefusal(checked);
+        const refusal = bestRefusal(ordered);
         if (refusal) return refusal;
         return { ok: false, code: 'no-reusable-source',
           message: 'This player’s video isn’t available as a file or stream VESPER can reuse.' };

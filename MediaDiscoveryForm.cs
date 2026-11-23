@@ -975,7 +975,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             {
                 result = Prepare(_item, prefs, SelectedExactRepresentation(), OutputPreference(prefs), start, end);
                 if (result.Choice is null) clipError = result.Error ?? "This trim isn't available for the source.";
-                else clipText = ClipRangeSummary(start, end, _item.Duration!.Value.TotalSeconds) + ". " + ClipSelection.Notice(mode);
+                else
+                {
+                    clipText = ClipRangeSummary(start, end, _item.Duration!.Value.TotalSeconds);
+                    string notice = ClipSelection.Notice(mode);
+                    if (notice.Length > 0) clipText += ". " + notice;
+                }
             }
             if (clipError.Length > 0) clipText = clipError;
         }

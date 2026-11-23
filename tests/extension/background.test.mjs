@@ -22,6 +22,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   let onMessage, onCreated, onChanged, onFilename, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked, onInstalled, onStorageChanged;
   const sent = [];
   const policyRequests = [];
+  const preflights = [];
   const actions = [];
   const cookieLookups = [];
   const badges = [];
@@ -62,6 +63,11 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       id: 'vesper-test',
       onMessage: { addListener: fn => { onMessage = fn; } }, onInstalled: { addListener: fn => { onInstalled = fn; } }, onStartup: event, lastError: undefined,
       sendNativeMessage: (host, message, cb) => {
+        if (message.type === 'capture-preflight') {
+          preflights.push(message);
+          cb({ ok: true, data: { ready: true } });
+          return;
+        }
         if (message.type === 'hello') policyRequests.push(message);
         else {
           actions.push('native');
@@ -188,7 +194,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
-  return { describe: context.__describe, sent, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
+  return { describe: context.__describe, sent, preflights, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
     localData: localSeed, manifestWatchers, filename: item => {
       let suggested;
       onFilename(item, suggestion => { suggested = suggestion; });
@@ -293,6 +299,20 @@ async function waitFor(condition, message) {
   }
   assert.ok(condition(), message);
 }
+
+test('one native preflight covers an attachment burst without sending its URL', async () => {
+  const file = activeDownload();
+  const app = load({}, { prefs: { intercept: true, route: 'auto' } });
+  await observe(app, file, { requestId: 'attachment-one' });
+  await waitFor(() => app.preflights.length === 1, 'The first attachment did not preflight VESPER.');
+
+  await observe(app, { ...file, url: 'https://example.com/files/second.zip?token=private' },
+    { requestId: 'attachment-two' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  assert.equal(app.preflights.length, 1);
+  assert.doesNotMatch(JSON.stringify(app.preflights[0]), /example\.com|private/);
+});
 
 test('automatic handoff verifies the response before pausing Chrome and accepts before monitoring', async () => {
   const file = activeDownload();
@@ -1595,16 +1615,19 @@ test('a blob player only receives its declared manifest from its current frame a
   const previous = 'https://example.com/first';
   const current = 'https://example.com/second';
   const sender = { url: previous, tab: { id: 5, url: previous }, documentId: 'main-document' };
+  const changedAt = Date.now();
   const observe = (url, documentId = 'main-document') => app.onMedia({
-    url, documentId, frameId: 0, tabId: 5, method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: Date.now()
+    url, documentId, frameId: 0, tabId: 5, method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt
   });
   await Promise.all([observe('https://cdn.example/first.m3u8'), observe('https://cdn.example/second.m3u8'),
     observe('https://cdn.example/iframe.m3u8', 'iframe-document')]);
   await app.message({ type: 'media-options', pageUrl: current, playerPageUrl: current,
-    playerUrl: 'blob:https://example.com/video', manifestUrl: 'https://cdn.example/second.m3u8' }, sender);
+    playerUrl: 'blob:https://example.com/video', manifestUrl: 'https://cdn.example/second.m3u8',
+    generation: 1, mediaChangedAt: changedAt }, sender);
   assert.deepEqual([...app.sent[0].candidates.map(c => c.url)], ['https://cdn.example/second.m3u8']);
   await app.message({ type: 'media-options', pageUrl: current, playerPageUrl: current,
-    playerUrl: 'blob:https://example.com/video', manifestUrl: 'https://cdn.example/iframe.m3u8' }, sender);
+    playerUrl: 'blob:https://example.com/video', manifestUrl: 'https://cdn.example/iframe.m3u8',
+    generation: 1, mediaChangedAt: changedAt }, sender);
   assert.equal(app.sent[1].candidates.length, 0);
 });
 
@@ -1627,7 +1650,7 @@ test('a blob player confirms even a single inferred manifest; VESPER checks only
   const options = await app.message(message, sender);
 
   assert.equal(options.data.sourceChoices.length, 1);
-  assert.match(options.data.sourceChoices[0].label, /^1:01 · HLS · 1 format$/);
+  assert.match(options.data.sourceChoices[0].label, /^1:01 · 720p · HLS · 1 format$/);
   assert.equal(app.sent.length, 1);
   assert.ok(onlyExactChecks(app), 'only the one-source check may receive an inferred candidate');
   assert.deepEqual([...app.sent[0].candidates.map(candidate => candidate.url)],
@@ -1674,7 +1697,7 @@ test('an Instagram blob player can choose a complete browser-observed video resp
   assert.equal(options.ok, true);
   assert.equal(options.data.sourceChoices.length, 1);
   assert.equal(JSON.stringify(options.data.sourceChoices).includes('signature='), false);
-  assert.equal(options.data.sourceChoices[0].label, '0:15 · MP4 · 1 format');
+  assert.equal(options.data.sourceChoices[0].label, '0:15 · 720p · MP4 · 1 format');
   assert.match(options.data.sourceChoices[0].detail, /MP4/);
   assert.equal(app.sent.length, 2);
   assert.equal(app.sent[0].candidates.length, 0);
@@ -1727,7 +1750,7 @@ test('a paused or ended blob player can use its recent manifest after a late cli
     mediaChangedAt: changedAt }, sender);
   assert.equal(result.ok, true);
   assert.equal(result.data?.sourceChoices?.length, 1);
-  assert.equal(result.data.sourceChoices[0].label, '1:01 · HLS · 1 format');
+  assert.equal(result.data.sourceChoices[0].label, '1:01 · 720p · HLS · 1 format');
 });
 
 test('a manifest observed long ago still serves a late click while the page is open', async () => {
@@ -1742,7 +1765,24 @@ test('a manifest observed long ago still serves a late click while the page is o
   const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
     playerUrl: 'blob:https://video.example/player', generation: 2, playerPlaying: true, mediaChangedAt: changedAt }, sender);
   assert.equal(result.data?.sourceChoices?.length, 1);
-  assert.match(result.data.sourceChoices[0].label, /^40:00 · HLS/);
+  assert.match(result.data.sourceChoices[0].label, /^40:00 · 720p · HLS/);
+});
+
+test('a manifest refreshed after playback starts is available to a later picker click', async () => {
+  const app = load({ 'media-options': { ok: true }, 'media-source-options': checkedSource(2400) });
+  const page = 'https://video.example/watch/refreshed';
+  const sender = { url: page, tab: { id: 32 }, frameId: 0, documentId: 'refreshed-doc' };
+  const changedAt = Date.now();
+  app.advanceTime(30_000);
+  await app.onMedia({ url: 'https://cdn.video.example/vod/master.m3u8', tabId: 32,
+    frameId: 0, documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+    timeStamp: changedAt + 30_000,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 3, playerPlaying: true,
+    mediaChangedAt: changedAt }, sender);
+  assert.equal(result.data?.sourceChoices?.length, 1);
+  assert.match(result.data.sourceChoices[0].label, /^40:00 · 720p · HLS/);
 });
 
 test('an extensionless manifest is observed only for the watched tab and gets an exact check', async () => {
@@ -1812,6 +1852,137 @@ test('evidence strength orders verification: an element-requested, typed manifes
   ], changedAt);
   assert.deepEqual([...ranked.map(source => source.url)],
     ['https://a.example/x', 'https://a.example/clip.mp4', 'https://a.example/late.mp4']);
+});
+
+test('the active player can recover its observed manifest during a late click', async () => {
+  const page = 'https://video.example/watch/episode-2';
+  const sender = { url: page, tab: { id: 35 }, frameId: 2, documentId: 'episode-2-doc' };
+  const manifestUrl = 'https://cdn.video.example/episode-2/master.m3u8';
+  const app = load({ 'media-options': { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } } });
+  const changedAt = Date.now();
+  await app.onMedia({ url: manifestUrl, tabId: 35, frameId: 2, documentId: sender.documentId,
+    method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt - 10_000,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  app.advanceTime(25 * 60_000);
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', manifestUrl, generation: 7,
+    playerPlaying: true, mediaChangedAt: changedAt, playerFacts: { durationSeconds: 720, height: 1080 } }, sender);
+
+  assert.equal(result.ok, true);
+  const request = app.sent.find(message => message.type === 'media-options');
+  assert.equal(request.candidates[0].url, manifestUrl);
+  assert.equal(app.sent.some(message => message.type === 'media-source-options'), false);
+});
+
+test('an observed manifest from another document or frame is not reused for this player', async () => {
+  const page = 'https://video.example/watch/current';
+  const sender = { url: page, tab: { id: 36 }, frameId: 2, documentId: 'current-doc' };
+  const staleManifest = 'https://cdn.video.example/watch/old.m3u8';
+  const app = load({ 'media-options': { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } } });
+  for (const [frameId, documentId, url] of [
+    [2, 'old-doc', staleManifest], [3, 'current-doc', 'https://cdn.video.example/frame.m3u8']
+  ]) {
+    await app.onMedia({ url, tabId: 36, frameId, documentId, method: 'GET', statusCode: 200,
+      type: 'xmlhttprequest', timeStamp: Date.now(),
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  }
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', manifestUrl: staleManifest, generation: 8,
+    playerPlaying: true, mediaChangedAt: Date.now(), playerFacts: { durationSeconds: 120 } }, sender);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual([...app.sent.find(message => message.type === 'media-options').candidates], []);
+  assert.equal(app.sent.some(message => message.type === 'media-source-options'), false);
+});
+
+test('verified duration, height and track facts rank source choices and make labels distinct', async () => {
+  const page = 'https://video.example/watch/movie';
+  const sender = { url: page, tab: { id: 37 }, frameId: 0, documentId: 'movie-doc' };
+  const changedAt = Date.now();
+  const sources = [
+    ['https://cdn.video.example/trailer.m3u8', 30, 1080, true],
+    ['https://cdn.video.example/720.m3u8', 720, 720, false],
+    ['https://cdn.video.example/main.m3u8', 720, 1080, true]
+  ];
+  const verified = new Map(sources.map(([url, duration, height, hasAudio]) => [url, {
+    ok: true,
+    data: { mediaSession: 'a'.repeat(32), duration, height, hasAudio, hasVideo: true,
+      choices: [{ index: 0, label: 'Best quality', detail: `${height}p · H.264${hasAudio ? ' + AAC' : ''}` }] }
+  }]));
+  const app = load({ 'media-options': { ok: false, code: 'no-media' },
+    'media-source-options': request => verified.get(request.candidates[0].url) });
+  for (const [url] of sources) {
+    await app.onMedia({ url, tabId: 37, frameId: 0, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt + 100,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  }
+
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 9, playerPlaying: true,
+    mediaChangedAt: changedAt, playerFacts: { durationSeconds: 720, height: 1080 } }, sender);
+
+  assert.deepEqual([...result.data.sourceChoices.map(choice => choice.label)], [
+    '12:00 · 1080p · audio + video · HLS · 1 format',
+    '12:00 · 720p · video only · HLS · 1 format',
+    '0:30 · 1080p · audio + video · HLS · 1 format'
+  ]);
+  assert.equal(result.data.verifiedSources, true);
+  assert.equal(result.data.choices, undefined, 'the player facts rank choices but do not select a stream');
+
+  const unknown = app.evaluate(`VesperMediaEvidence.mediaFacts({ ok: true, data: {
+    duration: 60, choices: [{ index: 0, label: 'Best quality', detail: 'HLS' }] } })`);
+  assert.equal(unknown.hasAudio, undefined);
+  assert.equal(unknown.hasVideo, undefined);
+  const explicitTrackList = app.evaluate(`VesperMediaEvidence.mediaFacts({ ok: true, data: {
+    audioTracks: [{ kind: 'audio' }], choices: [{ detail: 'audio not confirmed' }] } })`);
+  assert.equal(explicitTrackList.hasAudio, true);
+  assert.equal(app.evaluate('VesperMediaEvidence.trackLabel(VesperMediaEvidence.mediaFacts({ data: { choices: [] } }))'), '');
+  const live = app.evaluate(`VesperMediaEvidence.mediaFacts({ data: { isLive: true,
+    choices: [{ detail: '1080p H.264 with audio' }] } })`);
+  assert.equal(live.live, true);
+  assert.equal(live.hasAudio, true);
+  assert.equal(live.hasVideo, true);
+});
+
+test('source verification checks at most five exact URLs', async () => {
+  const page = 'https://video.example/watch/long-list';
+  const sender = { url: page, tab: { id: 38 }, frameId: 0, documentId: 'long-list-doc' };
+  const changedAt = Date.now();
+  const app = load({ 'media-options': { ok: false, code: 'no-media' },
+    'media-source-options': checkedSource() });
+  for (let index = 0; index < 7; index++) {
+    await app.onMedia({ url: `https://cdn.video.example/${index}.m3u8`, tabId: 38, frameId: 0,
+      documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+      timeStamp: changedAt + index,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  }
+
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+    playerUrl: 'blob:https://video.example/player', generation: 10, playerPlaying: true,
+    mediaChangedAt: changedAt, playerFacts: { durationSeconds: 61 } }, sender);
+
+  assert.equal(app.sent.filter(message => message.type === 'media-source-options').length, 5);
+});
+
+test('known adapter permalinks share identity without merging different episodes or servers', async () => {
+  const app = load();
+  const identity = app.evaluate('VesperPlayerSource.identity');
+  assert.equal(identity('https://old.reddit.com/r/video/comments/abc123/title'),
+    identity('https://redd.it/abc123'));
+  assert.notEqual(identity('https://redd.it/abc123'), identity('https://v.redd.it/abc123/DASHPlaylist.mpd'));
+  assert.equal(identity('https://vimeo.com/channels/staff/12345678/deadbeef'),
+    identity('https://player.vimeo.com/video/12345678?h=deadbeef'));
+  assert.notEqual(identity('https://vimeo.com/12345678/deadbeef'), identity('https://vimeo.com/12345678/cafebabe'));
+  assert.equal(identity('https://www.bilibili.com/video/BV1Q541167Qg?p=1'), 'bilibili:BV1Q541167Qg');
+  assert.equal(identity('https://www.bilibili.com/video/BV1Q541167Qg?p=2'), 'bilibili:BV1Q541167Qg:p:2');
+  assert.notEqual(identity('https://tube.example/videos/watch/abcdef123456'),
+    identity('https://mirror.example/videos/watch/abcdef123456'));
+  assert.notEqual(identity('https://tube.example:8443/videos/watch/abcdef123456'),
+    identity('https://tube.example/videos/watch/abcdef123456'));
+  assert.equal(identity('https://generic.example/watch/abcdef123456'),
+    'https://generic.example/watch/abcdef123456');
 });
 
 test('an Instagram carousel with multiple observed videos requires the user to choose one', async () => {
@@ -2088,6 +2259,19 @@ test('a Chrome route uses one observed complete file and rejects stale or foreig
   assert.equal((await app.message(select, sender)).ok, true);
   assert.equal((await app.message(select, sender)).ok, true);
   assert.deepEqual(app.actions, ['chrome-start']);
+});
+
+test('a new player generation cannot reuse an old direct-file response on the same URL', async () => {
+  const app = load({}, { prefs: { route: 'chrome' } });
+  const page = 'https://video.example/watch/current';
+  const playerUrl = 'https://video.example/player.mp4';
+  const sender = { url: page, tab: { id: 9 }, frameId: 0, documentId: 'current' };
+  const changedAt = Date.now();
+  await app.onMedia({ url: playerUrl, documentId: 'current', frameId: 0, tabId: 9, method: 'GET', statusCode: 200,
+    type: 'media', timeStamp: changedAt - 10_000, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+  const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl,
+    generation: 2, mediaChangedAt: changedAt }, sender);
+  assert.equal(result.code, 'chrome-format');
 });
 
 test('a browser format choice survives a service worker restart without starting twice', async () => {
@@ -2532,7 +2716,7 @@ test('prepared formats are reused, refreshed on request and expire quickly', asy
   assert.equal(prefetched.ok, true);
   assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
 
-  const click = await app.message(videoOptionsMessage(videoPage), videoSender);
+  const click = await app.message(videoOptionsMessage(videoPage, { playerFacts: { durationSeconds: 61, height: 720 } }), videoSender);
   assert.deepEqual(click.data.choices, mediaOptionsReply.data.choices);
   assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
 
