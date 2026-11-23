@@ -124,7 +124,7 @@ public sealed partial class DownloadEngine
         using var timing = ProcessingTiming.Measure(job.Id, ProcessingPhase.Publish, prepared?.Bytes ?? job.TotalBytes ?? 0);
         string source = prepared?.Path ?? job.PartialPath;
         long? expectedLength = prepared?.Bytes ?? job.TotalBytes;
-        if (!IsPublicationFile(job, source, expectedLength))
+        if (!IsPublicationFile(job, source, expectedLength, staged: true))
             return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published is missing or changed.");
 
         const FileShare share = FileShare.Read | FileShare.Delete;
@@ -183,7 +183,7 @@ public sealed partial class DownloadEngine
 
                 if (OperatingSystem.IsWindows())
                 {
-                    if (!PathSafety.TryMoveTemporaryFile(source, target, expectedSourceIdentity, out string moveError))
+                    if (!PathSafety.TryPublishTemporaryFile(source, target, expectedSourceIdentity, out string moveError))
                     {
                         bool sourceStillMatches = PathSafety.PathStillNamesFile(source, file, digest);
                         if (File.Exists(target) && sourceStillMatches) continue;
@@ -195,13 +195,13 @@ public sealed partial class DownloadEngine
                 else
                 {
                     try { File.Move(source, target, overwrite: false); }
-                    catch (IOException) when (File.Exists(target) && IsPublicationFile(job, source, expectedLength))
+                    catch (IOException) when (File.Exists(target) && IsPublicationFile(job, source, expectedLength, staged: true))
                     {
                         continue;   // someone created that name in the meantime: pick the next free one
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
-                        if (!IsPublicationFile(job, source, expectedLength))
+                        if (!IsPublicationFile(job, source, expectedLength, staged: true))
                             return RunOutcome.NeedsAttention("publication-pending", "Could not confirm where the file was saved. Resume to check again.");
 
                         return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + ex.Message);
@@ -290,14 +290,8 @@ public sealed partial class DownloadEngine
 
     private void Recover()
     {
-        var manifestFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Options.DefaultFolder };
-        if (Directory.Exists(Options.DefaultFolder))
-        {
-            try { foreach (string sub in Directory.EnumerateDirectories(Options.DefaultFolder)) manifestFolders.Add(sub); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            { Log(null, "manifest-replacement", "Recovery folders could not be fully scanned: " + ex.Message); }
-        }
-        foreach (string folder in manifestFolders.Where(Directory.Exists))
+        string[] manifestFolders = RecoveryFolders();
+        foreach (string folder in manifestFolders)
             RecoveryManifest.RecoverInterruptedReplacements(folder,
                 message => Log(null, "manifest-replacement", message));
 
@@ -306,7 +300,7 @@ public sealed partial class DownloadEngine
             if (_store.RecoveredFromCorruption)
             {
                 Log(null, "db-corrupt", $"Database was damaged and quarantined as {Path.GetFileName(_store.CorruptBackupPath)}.");
-                ImportManifests();
+                ImportManifests(manifestFolders);
                 _store.FinishQuarantineRecovery();
             }
 
@@ -370,7 +364,7 @@ public sealed partial class DownloadEngine
 
         bool targetMatches = false;
         using FileStream? published = target is null ? null : OpenPublicationFile(job, target, out targetMatches);
-        if (target is not null && targetMatches && PublicationPathIsMissing(job, stage))
+        if (target is not null && targetMatches && PublicationPathIsMissing(job, stage, staged: true))
         {
             string? fileIdentity = published is null ? null : TryGetPublishedFileIdentity(published.SafeFileHandle);
             MarkPublished(saved, target, fileIdentity);
@@ -386,10 +380,10 @@ public sealed partial class DownloadEngine
         if (targetAvailable)
         {
             if (target is null || PublicationDigest(job) is null)
-                stageMatches = IsPublicationFile(job, stage, expectedLength);
+                stageMatches = IsPublicationFile(job, stage, expectedLength, staged: true);
             else
             {
-                using FileStream? stagedFile = OpenPublicationFile(job, stage, out stageMatches);
+                using FileStream? stagedFile = OpenPublicationFile(job, stage, out stageMatches, staged: true);
             }
         }
         if (stageMatches)
@@ -418,7 +412,7 @@ public sealed partial class DownloadEngine
         ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
     }
 
-    private static bool IsPublicationPath(DownloadJob job, string path)
+    private static bool IsPublicationPath(DownloadJob job, string path, bool staged)
     {
         if (!Path.IsPathFullyQualified(path) || !Path.IsPathFullyQualified(job.DestinationFolder)) return false;
         try
@@ -426,13 +420,14 @@ public sealed partial class DownloadEngine
             string folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.DestinationFolder));
             string? parent = Path.GetDirectoryName(Path.GetFullPath(path));
             StringComparison comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            return string.Equals(folder, parent, comparison) && PathSafety.TryCheckUnlinkedDirectory(folder, out _);
+            return parent is not null && (string.Equals(folder, parent, comparison) || staged && PartialFile.IsStagingFolder(parent, folder))
+                && PathSafety.TryCheckUnlinkedDirectory(parent, out _);
         }
         catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException) { return false; }
     }
 
-    private static bool IsPublicationFile(DownloadJob job, string path, long? length = null) =>
-        IsPublicationPath(job, path)
+    private static bool IsPublicationFile(DownloadJob job, string path, long? length = null, bool staged = false) =>
+        IsPublicationPath(job, path, staged)
         && PathSafety.Inspect(path) is { Exists: true, IsReparsePoint: false, IsCloudPlaceholder: false, IsDirectory: false } file
         && (length is null || file.Length == length);
 
@@ -447,9 +442,9 @@ public sealed partial class DownloadEngine
         { return false; }
     }
 
-    private static bool PublicationPathIsMissing(DownloadJob job, string path)
+    private static bool PublicationPathIsMissing(DownloadJob job, string path, bool staged = false)
     {
-        if (!IsPublicationPath(job, path)) return false;
+        if (!IsPublicationPath(job, path, staged)) return false;
         try { File.GetAttributes(path); }
         catch (FileNotFoundException) { return true; }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
@@ -467,12 +462,12 @@ public sealed partial class DownloadEngine
     }
 
     // Keep the verified output open until the completion row commits.
-    private static FileStream? OpenPublicationFile(DownloadJob job, string path, out bool matches)
+    private static FileStream? OpenPublicationFile(DownloadJob job, string path, out bool matches, bool staged = false)
     {
         matches = false;
         string? digest = PublicationDigest(job);
         long? length = job.PendingConversionBytes ?? job.TotalBytes;
-        if (digest is null || length is null || !IsPublicationFile(job, path)) return null;
+        if (digest is null || length is null || !IsPublicationFile(job, path, staged: staged)) return null;
 
         bool isConversionStage = job.PendingConversionBytes is not null
             && SamePublicationPath(path, PublicationStagePath(job));
@@ -504,7 +499,7 @@ public sealed partial class DownloadEngine
             file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
             if (expectedIdentity is not null)
                 PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, expectedIdentity);
-            if (IsPublicationFile(job, path))
+            if (IsPublicationFile(job, path, staged: staged))
             {
                 matches = file.Length == length
                     && Convert.ToHexString(SHA256.HashData(file)).Equals(digest, StringComparison.OrdinalIgnoreCase);
@@ -622,18 +617,32 @@ public sealed partial class DownloadEngine
         job.PendingConversionIdentity = null;
     }
 
-    /// <summary>After a database loss, partial files with a valid recovery manifest come back as "needs link" entries.</summary>
-    private void ImportManifests()
+    private string[] RecoveryFolders()
     {
         var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Options.DefaultFolder };
         if (Directory.Exists(Options.DefaultFolder))
         {
-            try { foreach (string sub in Directory.EnumerateDirectories(Options.DefaultFolder)) folders.Add(sub); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* unreadable subfolders are skipped */ }
+            try
+            {
+                foreach (string sub in Directory.EnumerateDirectories(Options.DefaultFolder))
+                    if (!PartialFile.IsStagingFolder(sub, Options.DefaultFolder)) folders.Add(sub);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { Log(null, "manifest-replacement", "Recovery folders could not be fully scanned: " + ex.Message); }
         }
+        foreach (DownloadJob job in _jobs.Values)
+            if (PathSafety.TryGetFullPath(job.DestinationFolder, out string destination, out _)) folders.Add(destination);
 
+        return folders.SelectMany(folder => new[] { folder, PartialFile.StagingFolder(folder) })
+            .Where(folder => Directory.Exists(folder) && PathSafety.TryCheckUnlinkedDirectory(folder, out _))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    /// <summary>After a database loss, partial files with a valid recovery manifest come back as "needs link" entries.</summary>
+    private void ImportManifests(string[] folders)
+    {
         long order = 0;
-        foreach (string folder in folders.Where(Directory.Exists))
+        foreach (string folder in folders)
         {
             foreach (string manifest in Directory.EnumerateFiles(folder, "*.vpart" + RecoveryManifest.Extension))
             {

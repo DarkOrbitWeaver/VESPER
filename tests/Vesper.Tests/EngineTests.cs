@@ -48,6 +48,11 @@ public class SequentialAndResumeTests
         JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.Equal(server.V1.Length, done.CommittedBytes);
+        Assert.Equal(h.Downloads, Path.GetDirectoryName(done.FinalPath));
+        string staging = PartialFile.StagingFolder(h.Downloads);
+        Assert.Equal(staging, Path.GetDirectoryName(done.PartialPath));
+        if (OperatingSystem.IsWindows())
+            Assert.True(File.GetAttributes(staging).HasFlag(FileAttributes.Hidden));
         Assert.Single(h.Files());                                                  // the .vpart staging file is gone
         Assert.False(File.Exists(done.PartialPath));
     }
@@ -770,7 +775,10 @@ public class CrashRecoveryTests
         using var h = new Harness();
         Guid id = h.Add(server.Url("/expires-after-truncate"), "lost.bin");
         JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.Empty(Directory.GetFiles(h.Downloads));
         h.Engine.Dispose();
+        Assert.True(RecoveryManifest.TryRecover(RecoveryManifest.PathFor(stalled.PartialPath), out DownloadJob manifest, out string problem), problem);
+        Assert.Equal(h.Downloads, manifest.DestinationFolder);
 
         string database = Path.Combine(h.Data, "vesper.db");
         File.WriteAllText(database, "garbage" + new string('z', 4096));
@@ -788,6 +796,7 @@ public class CrashRecoveryTests
         JobSnapshot recovered = h.Engine.Snapshot(id)!;
         Assert.Equal(JobState.NeedsLink, recovered.State);
         Assert.True(recovered.CommittedBytes > 0 && recovered.CommittedBytes <= stalled.CommittedBytes);
+        Assert.Equal(stalled.PartialPath, recovered.PartialPath);
         Assert.True(File.Exists(stalled.PartialPath));
         Assert.False(File.Exists(database + ".quarantine-pending"));
     }

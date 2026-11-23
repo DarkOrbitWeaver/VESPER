@@ -263,7 +263,7 @@ public sealed class EngineReliabilityTests
         byte[] bytes = [1, 2, 3, 4];
         await File.WriteAllBytesAsync(snapshot.PartialPath, bytes);
         h.OwnFixturePartial(id);
-        string backup = Path.Combine(h.Downloads, $".vesper-rollback-{id:N}-{new string('B', 64)}");
+        string backup = Path.Combine(Path.GetDirectoryName(snapshot.PartialPath)!, $".vesper-rollback-{id:N}-{new string('B', 64)}");
         await File.WriteAllBytesAsync(backup, bytes);
 
         CancelDownloadResult result = await h.Engine.CancelDownloadAsync(id);

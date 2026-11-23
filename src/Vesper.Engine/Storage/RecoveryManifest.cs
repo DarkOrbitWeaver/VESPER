@@ -263,7 +263,7 @@ internal static class RecoveryManifest
         try
         {
             string? folder = Path.GetDirectoryName(Path.GetFullPath(finalPath));
-            if (folder is null || !SamePath(folder, job.DestinationFolder)) return false;
+            if (folder is null || !SamePath(folder, Path.TrimEndingDirectorySeparator(job.DestinationFolder))) return false;
 
             using SafeFileHandle published = PathSafety.OpenTemporaryHandle(finalPath, FileMode.Open,
                 FileAccess.Read, FileShare.Read | FileShare.Delete);
@@ -428,8 +428,11 @@ internal static class RecoveryManifest
 
         string partial = manifestPath[..^Extension.Length];
         string folder = Path.GetDirectoryName(Path.GetFullPath(manifestPath)) ?? "";
-        if (!SamePath(partial, job.PartialPath) || !SamePath(folder, job.DestinationFolder)
-            || body.Destination is not { Length: > 0 } destination || !SamePath(destination, folder))
+        string jobDestination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.DestinationFolder));
+        if (!SamePath(partial, job.PartialPath)
+            || (!SamePath(folder, jobDestination) && !PartialFile.IsStagingFolder(folder, jobDestination))
+            || body.Destination is not { Length: > 0 } destination
+            || !SamePath(Path.TrimEndingDirectorySeparator(destination), jobDestination))
             return false;
 
         if (string.Equals(body.PartialIdentity, job.PartialIdentity, StringComparison.Ordinal)) return true;
@@ -524,10 +527,11 @@ internal static class RecoveryManifest
             if (string.IsNullOrWhiteSpace(body.Destination))
             { problem = "the recovery file names an invalid folder"; return false; }
             string destination;
-            try { destination = Path.GetFullPath(body.Destination); }
+            try { destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(body.Destination)); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
             { problem = "the recovery file names an invalid folder"; return false; }
-            if (!string.Equals(destination, here, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(destination, here, StringComparison.OrdinalIgnoreCase)
+                && !PartialFile.IsStagingFolder(here, destination))
             { problem = "the recovery file names a different folder"; return false; }
 
             SafeFileHandle saved;
@@ -548,7 +552,7 @@ internal static class RecoveryManifest
                 {
                     string published = Path.GetFullPath(publishedPath);
                     string? publishedDirectory = Path.GetDirectoryName(published);
-                    if (!string.Equals(publishedDirectory, here, StringComparison.OrdinalIgnoreCase)
+                    if (!string.Equals(publishedDirectory, destination, StringComparison.OrdinalIgnoreCase)
                         || body.PartialIdentity is null
                         || !string.Equals(body.PartialIdentity, publishedIdentity, StringComparison.Ordinal))
                     { problem = "the recovery file does not match the published file"; return false; }
@@ -581,7 +585,7 @@ internal static class RecoveryManifest
                 {
                     Id = body.JobId, Kind = (JobKind)body.Kind,
                     SourceUrl = UrlPolicy.Redact(body.Url), FileName = fileName, NameLocked = true,
-                    DestinationFolder = here, PartialPath = partial, PartialIdentity = body.PartialIdentity, TotalBytes = body.Total, Extents = extents,
+                    DestinationFolder = destination, PartialPath = partial, PartialIdentity = body.PartialIdentity, TotalBytes = body.Total, Extents = extents,
                     FinalResourceIdentity = body.FinalResourceIdentity,
                     State = body.Kind == (int)JobKind.Http ? JobState.NeedsLink : JobState.NeedsAttention, Reason = "restored",
                     Message = body.Kind == (int)JobKind.Http ? "Restored from a recovery file. Provide the download link again to continue."

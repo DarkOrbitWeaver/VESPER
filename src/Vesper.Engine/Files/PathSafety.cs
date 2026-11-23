@@ -252,8 +252,11 @@ public static class PathSafety
     internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity, out string error)
         => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null);
 
+    internal static bool TryPublishTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity, out string error)
+        => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null, publish: true);
+
     internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity,
-        out string error, Action? duringMove)
+        out string error, Action? duringMove, bool publish = false)
     {
         error = "";
         if (!OperatingSystem.IsWindows())
@@ -273,15 +276,16 @@ public static class PathSafety
         string? targetDirectory = Path.GetDirectoryName(target);
         string sourceName = Path.GetFileName(source);
         string targetName = Path.GetFileName(target);
+        bool sameDirectory = string.Equals(sourceDirectory, targetDirectory, StringComparison.OrdinalIgnoreCase);
         if (sourceDirectory is null || targetDirectory is null
-            || !string.Equals(sourceDirectory, targetDirectory, StringComparison.OrdinalIgnoreCase)
+            || (!sameDirectory && (!publish || !PartialFile.IsStagingFolder(sourceDirectory, targetDirectory)))
             || sourceName.Length == 0 || targetName.Length == 0
             || sourceName.Contains(':') || targetName.Contains(':'))
         {
-            error = "Temporary file moves must use two file names in the same folder.";
+            error = "The temporary file cannot be moved between these folders.";
             return false;
         }
-        if (string.Equals(sourceName, targetName, StringComparison.OrdinalIgnoreCase))
+        if (sameDirectory && string.Equals(sourceName, targetName, StringComparison.OrdinalIgnoreCase))
         {
             error = "The temporary source and target names are the same.";
             return false;
@@ -290,6 +294,7 @@ public static class PathSafety
         try
         {
             using SafeFileHandle directory = OpenTemporaryDirectoryHandle(sourceDirectory);
+            using SafeFileHandle? publishDirectory = sameDirectory ? null : OpenTemporaryDirectoryHandle(targetDirectory);
             using SafeFileHandle sourceFile = OpenTemporaryHandle(source, FileMode.Open, FileAccess.Read,
                 FileShare.Read, allowDelete: true);
             if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(sourceFile), StringComparison.Ordinal))

@@ -174,6 +174,7 @@ public sealed partial class DownloadEngine
         if (!PathSafety.TryResolveFolder(folderText, create: true, out string folder, out string folderError)
             || !PathSafety.TryCheckUnlinkedDirectory(folder, out folderError))
             return new AddResult(AddStatus.DestinationUnavailable, Guid.Empty, folderError);
+        folder = Path.TrimEndingDirectorySeparator(folder);
 
         lock (_lock)
         {
@@ -219,12 +220,13 @@ public sealed partial class DownloadEngine
 
             var id = Guid.NewGuid();
             string partialName = FileNames.Sanitize(name) + "." + id.ToString("N")[..8] + ".vpart";
+            string stagingFolder = PartialFile.PrepareStagingFolder(folder);
             long order = _jobs.Count == 0 ? 0 : request.StartNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : _jobs.Values.Max(j => j.QueueOrder) + 1;
 
             var job = new DownloadJob
             {
                 Id = id, Kind = request.Kind, SourceUrl = uri.AbsoluteUri, FileName = name, NameLocked = request.FileName is { Length: > 0 },
-                DestinationFolder = folder, PartialPath = Path.Combine(folder, partialName),
+                DestinationFolder = folder, PartialPath = Path.Combine(stagingFolder, partialName),
                 State = request.InitiallyPaused ? JobState.Paused : JobState.Queued,
                 Priority = request.Priority, QueueOrder = order, Category = category, Referer = request.Referer, UserAgent = request.UserAgent,
                 ExpectedSha256 = expected, PieceMapJson = request.PieceMapJson, MediaState = request.MediaState,

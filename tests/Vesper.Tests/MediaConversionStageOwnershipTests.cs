@@ -156,7 +156,7 @@ public sealed class MediaConversionStageOwnershipTests
         Assert.Equal("audio.m4a", done.FileName);
         Assert.NotNull(convertedBytes);
         Assert.Equal(convertedBytes, File.ReadAllBytes(done.FinalPath!));
-        Assert.Empty(Directory.GetFiles(harness.Downloads, ".vesper-rollback-*"));
+        Assert.DoesNotContain(harness.Files(), path => Path.GetFileName(path).StartsWith(".vesper-rollback-", StringComparison.Ordinal));
     }
 
     [WindowsFact]
@@ -196,7 +196,7 @@ public sealed class MediaConversionStageOwnershipTests
         Assert.NotNull(stageIdentity);
         Assert.Equal(Marker, File.ReadAllText(stagePath));
         Assert.Equal(sourceBytes, File.ReadAllBytes(done.FinalPath!));
-        string backup = Path.Combine(harness.Downloads, $".vesper-rollback-{added.JobId:N}-{stageIdentity}");
+        string backup = Path.Combine(Path.GetDirectoryName(stagePath)!, $".vesper-rollback-{added.JobId:N}-{stageIdentity}");
         Assert.Equal(convertedBytes, File.ReadAllBytes(backup));
         using var backupFile = File.OpenHandle(backup, FileMode.Open, FileAccess.Read, FileShare.Read);
         Assert.Equal(stageIdentity, PathSafety.TemporaryFileIdentity(backupFile));

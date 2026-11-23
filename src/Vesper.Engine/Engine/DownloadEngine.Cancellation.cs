@@ -140,7 +140,7 @@ public sealed partial class DownloadEngine
                 return false;
             }
             partial = Path.GetFullPath(job.PartialPath);
-            folder = Path.GetFullPath(job.DestinationFolder);
+            folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.DestinationFolder));
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
@@ -150,8 +150,10 @@ public sealed partial class DownloadEngine
 
         string suffix = "." + job.Id.ToString("N")[..8] + ".vpart";
         string name = Path.GetFileName(partial);
+        string partialFolder = Path.GetDirectoryName(partial)!;
+        bool staged = PartialFile.IsStagingFolder(partialFolder, folder);
         if (!name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) || name.Length <= suffix.Length
-            || !string.Equals(Path.GetDirectoryName(partial), folder, StringComparison.OrdinalIgnoreCase))
+            || (!staged && !string.Equals(partialFolder, folder, StringComparison.OrdinalIgnoreCase)))
         {
             error = "The temporary file no longer matches this download.";
             return false;
@@ -174,8 +176,17 @@ public sealed partial class DownloadEngine
         var opened = new List<(string Path, SafeFileHandle Handle)>();
         try
         {
+            if (staged)
+            {
+                if (!PathSafety.TryCheckUnlinkedDirectory(folder, out error)) return false;
+                try { File.GetAttributes(partialFolder); }
+                catch (FileNotFoundException) { return true; }
+                catch (DirectoryNotFoundException) { return true; }
+            }
+            if (!PathSafety.TryCheckUnlinkedDirectory(partialFolder, out error)) return false;
+
             string rollbackPattern = $".vesper-rollback-{job.Id:N}-*";
-            string? rollback = Directory.EnumerateFiles(folder, rollbackPattern, SearchOption.TopDirectoryOnly).FirstOrDefault();
+            string? rollback = Directory.EnumerateFiles(partialFolder, rollbackPattern, SearchOption.TopDirectoryOnly).FirstOrDefault();
             if (rollback is not null)
             {
                 error = "A conversion backup has no saved ownership proof. Move it out of the download folder: "

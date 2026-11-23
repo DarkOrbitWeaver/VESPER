@@ -527,7 +527,13 @@ internal sealed class Harness : IDisposable
 
     public Task<JobSnapshot> WaitForStateAsync(Guid id, JobState state, int seconds = 30) => WaitAsync(id, s => s.State == state, seconds);
 
-    public string[] Files() => Directory.GetFiles(Downloads);
+    public string[] Files()
+    {
+        string staging = PartialFile.StagingFolder(Downloads);
+        return Directory.Exists(staging)
+            ? [.. Directory.GetFiles(Downloads), .. Directory.GetFiles(staging)]
+            : Directory.GetFiles(Downloads);
+    }
 
     public void Dispose()
     {
