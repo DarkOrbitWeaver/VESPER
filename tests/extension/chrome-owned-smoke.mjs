@@ -47,7 +47,8 @@ function installRaceBridge() {
     }
     smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
     const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
-    if (message.type === 'capture-preflight') return reply({ data: { ready: true } });
+    if (message.type === 'capture-preflight')
+      return reply({ data: { ready: true, siteRules: { neverCaptureHosts: [] } } });
     if (message.type === 'hello')
       return setTimeout(() => reply({ data: { siteRules: { neverCaptureHosts: [] } } }), 650);
     if (message.type === 'browser-capture' || message.type === 'browser-submit')
@@ -491,7 +492,7 @@ async function main() {
         captureRace.push({ fixture, attempted, reachedAccept, bytes: file.fileSize });
         if (fixture === 'during-check') assert.ok(attempted, 'No native check was in flight when Chrome started.');
         assert.equal(calls.some(call => call.type === 'hello'), false, 'Unsigned capture sent a separate policy request.');
-        assert.equal(reachedAccept, fixture === 'policy-window' || fixture === 'delayed',
+        assert.equal(reachedAccept, fixture === 'during-check' || fixture === 'policy-window' || fixture === 'delayed',
           'Unexpected capture path: ' + JSON.stringify({ captureRace, calls }));
       }
       const preflights = await evaluate('Read capture preflights',

@@ -82,6 +82,31 @@ public sealed class SiteRuleSettingsTests : IDisposable
         Assert.DoesNotContain(_root, data.RootElement.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task Browser_capture_preflight_exposes_fresh_site_rules()
+    {
+        var preferences = new VesperPreferences
+        {
+            SiteRules =
+            [
+                new SiteRule { Host = "safe.example", NeverCapture = true, Folder = Path.Combine(_root, "private folder") },
+                new SiteRule { Host = "audio.example", AlwaysAudio = true, Folder = Path.Combine(_root, "another private folder") }
+            ]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => preferences);
+
+        BridgeResponse response = await bridge.HandleAsync(new BridgeRequest("capture-preflight-rules", "capture-preflight", "ask", null, []),
+            CancellationToken.None);
+        using JsonDocument data = JsonDocument.Parse(JsonSerializer.Serialize(response.Data, BridgeProtocol.Json));
+
+        Assert.True(response.Ok);
+        Assert.True(data.RootElement.GetProperty("ready").GetBoolean());
+        string[] hosts = data.RootElement.GetProperty("siteRules").GetProperty("neverCaptureHosts")
+            .EnumerateArray().Select(value => value.GetString()!).ToArray();
+        Assert.Equal(new[] { "safe.example" }, hosts);
+        Assert.DoesNotContain(_root, data.RootElement.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     [Theory]
     [InlineData("browser-submit")]
     [InlineData("browser-capture")]

@@ -12,7 +12,10 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const extension = join(root, 'extension');
 const chromePath = process.env.CHROME_PATH;
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const bytes = Buffer.alloc(1024 * 1024, 0x5a);
+const streamBytes = Buffer.alloc(32 * 1024 * 1024, 0x5a);
+const streamChunk = streamBytes.subarray(0, 256 * 1024);
 const downloads = [];
 
 class Cdp {
@@ -97,11 +100,12 @@ async function main() {
   const listener = 'chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {';
   assert.equal(managedSource.split(listener).length - 1, 1, 'Expected one VESPER filename listener.');
   managedSource = managedSource.replace(listener, `chrome.downloads.onDeterminingFilename?.addListener((item, originalSuggest) => {
-  globalThis.__filenameTiming.push({ type: 'filename', id: item.id, at: Date.now(),
-    bytesReceived: item.bytesReceived, filename: item.filename, state: item.state });
+  const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
+  globalThis.__filenameTiming.push({ type: 'filename', id: item.id, testId, at: Date.now(),
+    bytesReceived: item.bytesReceived, filename: item.filename, state: item.state, paused: item.paused });
   const suggest = (...args) => {
     const finish = () => {
-      globalThis.__filenameTiming.push({ type: 'suggest', id: item.id, at: Date.now() });
+      globalThis.__filenameTiming.push({ type: 'suggest', id: item.id, testId, at: Date.now() });
       originalSuggest(...args);
     };
     const wait = Number(globalThis.__filenameDelay) || 0;
@@ -120,6 +124,37 @@ async function main() {
       const destination = url.searchParams.get('destination');
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       response.end(`<!doctype html><title>Download fixture</title><a id="download" href="${destination}">Download</a>`);
+      return;
+    }
+    if (url.pathname === '/stream') {
+      const id = url.searchParams.get('id');
+      const event = { id, start: Date.now(), firstBodyAt: null, endAt: null, bytesSent: 0, closedAt: null };
+      serverEvents.push(event);
+      response.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="hold-' + id + '.bin"',
+        'Content-Length': streamBytes.length,
+        'ETag': '"vesper-hold-v1"',
+        'Cache-Control': 'no-store'
+      });
+      response.flushHeaders();
+      event.firstBodyAt = Date.now();
+      let offset = 0;
+      const pump = () => {
+        if (response.destroyed) return;
+        if (offset >= streamBytes.length) {
+          response.end(() => { event.endAt = Date.now(); });
+          return;
+        }
+        const end = Math.min(offset + streamChunk.length, streamBytes.length);
+        const accepted = response.write(streamBytes.subarray(offset, end));
+        offset = end;
+        event.bytesSent = offset;
+        if (accepted) setTimeout(pump, 25);
+        else response.once('drain', () => setTimeout(pump, 25));
+      };
+      response.on('close', () => { event.closedAt = Date.now(); });
+      pump();
       return;
     }
     if (url.pathname !== '/download') {
@@ -190,10 +225,16 @@ async function main() {
     const expression = `(async () => {
       await chrome.storage.sync.set({ intercept: false, route: 'chrome' });
       globalThis.__filenameTiming ||= [];
-      chrome.downloads.onCreated.addListener(item => __filenameTiming.push({
-        type: 'created', id: item.id, at: Date.now(), bytesReceived: item.bytesReceived,
-        filename: item.filename, state: item.state
-      }));
+      chrome.downloads.onCreated.addListener(item => {
+        const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
+        __filenameTiming.push({ type: 'created', id: item.id, testId, at: Date.now(),
+          bytesReceived: item.bytesReceived, filename: item.filename, state: item.state, paused: item.paused });
+        if (globalThis.__pauseOnCreated === true) {
+          chrome.downloads.pause(item.id).then(() => __filenameTiming.push({ type: 'paused', id: item.id,
+            testId, at: Date.now() }), error => __filenameTiming.push({ type: 'pause-error', id: item.id,
+            testId, at: Date.now(), message: String(error) }));
+        }
+      });
       chrome.downloads.onChanged.addListener(change => {
         if (change.bytesReceived || change.state) __filenameTiming.push({
           type: 'changed', id: change.id, at: Date.now(),
@@ -263,7 +304,66 @@ async function main() {
         suggestAt: atSuggest.event.at, finalBytes: complete.fileSize
       });
     }
+
+    const holdRuns = [];
+    for (const pauseOnCreated of [false, true]) {
+      const id = pauseOnCreated ? 'stream-hold-paused' : 'stream-hold-open';
+      const before = await evaluateWorker(browser, workerSession, '__filenameTiming.length');
+      await browser.send('Runtime.evaluate', { expression: `globalThis.__filenameDelay = 1800; globalThis.__pauseOnCreated = ${pauseOnCreated}` }, workerSession);
+      const destination = `/stream?id=${id}`;
+      await browser.send('Page.navigate',
+        { url: `http://127.0.0.1:${port}/launch?destination=${encodeURIComponent(destination)}` }, session);
+      await browser.send('Runtime.evaluate', {
+        expression: "document.querySelector('#download').click()", userGesture: true
+      }, session);
+      const serverEvent = await until(async () => serverEvents.find(event => event.id === id),
+        8000, 'Streaming fixture did not start: ' + id);
+      const samples = [];
+      let observed = [];
+      let downloadItem = null;
+      let suggestion;
+      let serverBytesAtSuggest = null;
+      const sampleDeadline = Date.now() + 8000;
+      while (!suggestion && Date.now() < sampleDeadline) {
+        observed = await evaluateWorker(browser, workerSession,
+          `__filenameTiming.slice(${before}).filter(item => item.testId === '${id}')`);
+        const created = observed.find(item => item.type === 'created');
+        if (created) {
+          downloadItem = await evaluateWorker(browser, workerSession,
+            `chrome.downloads.search({ id: ${created.id} }).then(items => items[0] || null)`);
+          samples.push({ at: Date.now(), serverBytesSent: serverEvent.bytesSent,
+            bytesReceived: downloadItem?.bytesReceived ?? null, state: downloadItem?.state ?? null,
+            paused: downloadItem?.paused ?? null });
+        }
+        suggestion = observed.find(item => item.type === 'suggest');
+        if (suggestion) serverBytesAtSuggest = serverEvent.bytesSent;
+        if (!suggestion) await delay(100);
+      }
+      assert.ok(suggestion, 'The filename hold did not settle: ' + id);
+      const currentDownload = await evaluateWorker(browser, workerSession,
+        `chrome.downloads.search({ id: ${downloadItem?.id ?? -1} }).then(items => items[0] || null)`);
+      if (currentDownload?.paused) {
+        await evaluateWorker(browser, workerSession, `chrome.downloads.resume(${currentDownload.id})`);
+      }
+      const complete = await until(async () => evaluateWorker(browser, workerSession,
+        `chrome.downloads.search({ id: ${currentDownload?.id ?? -1} }).then(items => items.find(item => item.state === 'complete'))`),
+      20000, 'Streaming fixture did not complete: ' + id);
+      const saved = await readFile(complete.filename);
+      assert.equal(saved.compare(streamBytes), 0, 'The held Chrome download changed bytes: ' + id);
+      observed = await evaluateWorker(browser, workerSession,
+        `__filenameTiming.slice(${before}).filter(item => item.testId === '${id}')`);
+      const filenameEvent = observed.find(item => item.type === 'filename');
+      const pausedEvent = observed.find(item => item.type === 'paused');
+      holdRuns.push({ id, pauseOnCreated, chromeVersion, firstBodyAfterRequestMs: serverEvent.firstBodyAt - serverEvent.start,
+        filenameAfterFirstBodyMs: filenameEvent ? filenameEvent.at - serverEvent.firstBodyAt : null,
+        suggestAfterFilenameMs: filenameEvent && suggestion ? suggestion.at - filenameEvent.at : null,
+        serverBytesAtSuggest, serverBytesAtEnd: serverEvent.bytesSent,
+        pauseEvent: pausedEvent || observed.find(item => item.type === 'pause-error') || null,
+        bytesReceivedAtFilename: filenameEvent?.bytesReceived ?? null, samples,
+        finalBytes: complete.fileSize, finalPath: complete.filename });
+    }
     process.stdout.write(JSON.stringify({ ok: true, browser: chromeVersion, measurements: downloads }, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({ filenameHold: holdRuns }, null, 2) + '\n');
   } finally {
     browser?.close();
     if (chrome && chrome.exitCode === null) {

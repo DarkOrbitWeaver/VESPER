@@ -9,7 +9,8 @@ const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].inc
 
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
-  localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }], playerPicker = false } = {}) {
+  localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }],
+  preflightReady = false, playerPicker = false } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -65,7 +66,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       sendNativeMessage: (host, message, cb) => {
         if (message.type === 'capture-preflight') {
           preflights.push(message);
-          cb({ ok: true, data: { ready: true } });
+          cb({ ok: true, data: { ready: preflightReady, siteRules: { neverCaptureHosts: [] } } });
           return;
         }
         if (message.type === 'hello') policyRequests.push(message);
@@ -312,6 +313,37 @@ test('one native preflight covers an attachment burst without sending its URL', 
 
   assert.equal(app.preflights.length, 1);
   assert.doesNotMatch(JSON.stringify(app.preflights[0]), /example\.com|private/);
+});
+
+test('a warm preflight pauses a validated attachment before starting native staging', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, preflightReady: true });
+  await observe(app, file);
+  await waitFor(() => app.preflights.length === 1, 'The native helper did not preflight the attachment.');
+
+  await app.onCreated(file);
+
+  assert.equal(file.paused, true);
+  assert.equal(app.actions[0], 'pause');
+  assert.equal(app.actions[1], 'native');
+  assert.equal(app.sent[0].type, 'browser-capture');
+  assert.equal(app.sent[1].operation, 'accept');
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+});
+
+test('early capture resumes the Chrome stream when native staging fails', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': { ok: false, code: 'network', message: 'The server refused VESPER.' },
+    'browser-transfer': transfer('failed') }, { download: file, preflightReady: true });
+  await observe(app, file);
+  await waitFor(() => app.preflights.length === 1, 'The native helper did not preflight the attachment.');
+
+  await app.onCreated(file);
+
+  assert.equal(file.paused, false);
+  assert.deepEqual(app.actions, ['pause', 'native', 'native', 'resume']);
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'stand-down');
 });
 
 test('automatic handoff verifies the response before pausing Chrome and accepts before monitoring', async () => {

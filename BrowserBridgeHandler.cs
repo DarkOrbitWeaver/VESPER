@@ -18,8 +18,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 VesperPreferences current = preferences();
                 return BridgeResponse.Success(request.Id, "VESPER is running.",
                     data: new { app = "VESPER", handoff = current.BrowserAction.ToString().ToLowerInvariant(),
-                        siteRules = new { neverCaptureHosts = SiteRule.Normalize(current.SiteRules)
-                            .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray() },
+                        siteRules = CurrentBrowserSiteRules(),
                         managedDownloads = true,
                         build = Vesper.Shared.BuildInfo.Version(typeof(BrowserBridgeHandler).Assembly) },
                     version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
@@ -27,7 +26,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             case "capture-preflight":
                 return BridgeResponse.Success(request.Id, "VESPER is ready for a browser download.",
-                    data: new { ready = true });
+                    data: new { ready = true, siteRules = CurrentBrowserSiteRules() });
 
             case "probe":
                 return BridgeResponse.Success(request.Id, data: await engine.ProbeMediaAsync(request.Url!, ct));
@@ -259,6 +258,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         SiteRule.ForPage(siteRules, item.Referer)?.NeverCapture == true
         || SiteRule.ForPage(siteRules, item.OriginalUrl)?.NeverCapture == true
         || SiteRule.ForPage(siteRules, item.Url)?.NeverCapture == true;
+
+    private object CurrentBrowserSiteRules() => new
+    {
+        neverCaptureHosts = SiteRule.Normalize(preferences().SiteRules)
+            .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray()
+    };
 
     internal string? SiteFolderFor(IReadOnlyList<BridgeItem> items)
     {
