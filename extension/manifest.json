@@ -58,7 +58,8 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "icons/vesper-companion-atlas.png"
+        "icons/vesper-companion-atlas.png",
+        "icons/vesper-32.png"
       ],
       "matches": [
         "http://*/*",

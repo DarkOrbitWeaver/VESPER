@@ -1174,8 +1174,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'native-picker': {
         const tabId = sender.tab?.id ?? message.tabId;
         const state = await tabState(tabId);
-        const trustedContentPage = sender.tab ? mediaPage({}, sender)?.href : null;
-        const pageUrl = trustedContentPage || message.pageUrl || (await chrome.tabs.get(tabId))?.url;
+        const trustedContentPage = sender.tab ? mediaPage(message, sender)?.href : null;
+        const framePage = sender.tab ? mediaPage({}, sender)?.href : null;
+        const pageUrl = sender.tab ? trustedContentPage || framePage
+          : message.pageUrl || (await chrome.tabs.get(tabId))?.url;
         if (!/^https?:/i.test(pageUrl || ''))
           return { ok: false, code: 'invalid', message: 'This page address cannot be inspected.' };
         // Media authorization follows the same approved, page-scoped path as media options.

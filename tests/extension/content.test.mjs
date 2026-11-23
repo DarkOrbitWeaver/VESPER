@@ -136,9 +136,9 @@ test('browser playlist browsing only opens the native picker from resolver colle
   const background = source('background');
   const options = readFileSync(new URL('../../BrowserMediaOptions.cs', import.meta.url), 'utf8');
   assert.match(content, /result\.data\?\.hasRelatedCollection/);
-  assert.match(content, /type: 'native-picker', title/);
+  assert.match(content, /type: 'native-picker', pageUrl, title/);
   assert.match(content, /formats\.hasRelatedCollection && !formats\.browserChoice/);
-  assert.match(background, /const trustedContentPage = sender\.tab \? mediaPage\(\{\}, sender\)\?\.href : null/);
+  assert.match(background, /const trustedContentPage = sender\.tab \? mediaPage\(message, sender\)\?\.href : null/);
   assert.match(options, /resolved\.Collection is \{ \} collection/);
   assert.match(options, /hasRelatedCollection = HasRelatedCollection\(item\)/);
   assert.match(options, /isLive = item\.IsLive/);

@@ -78,6 +78,7 @@ internal sealed partial class BrowserBridgeHandler
                 title = collection.Title,
                 provider = collection.Provider,
                 hasRelatedCollection = true,
+                collectionKind = collection.Kind.ToString().ToLowerInvariant(),
                 collectionIsDynamic = collection.IsDynamic,
                 collectionIsComplete = collection.IsComplete
             });
@@ -190,6 +191,7 @@ internal sealed partial class BrowserBridgeHandler
                     item.Title,
                     item.Provider,
                     hasRelatedCollection = true,
+                    collectionKind = item.Related!.Kind.ToString().ToLowerInvariant(),
                     collectionIsDynamic = item.Related!.IsDynamic
                 });
             return BridgeResponse.Fail(requestId, "unavailable", playable.Representations.Count == 0
@@ -232,6 +234,7 @@ internal sealed partial class BrowserBridgeHandler
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
             choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,
             hasRelatedCollection = HasRelatedCollection(item),
+            collectionKind = item.Related?.Kind.ToString().ToLowerInvariant(),
             audioTracks = item.AudioTracks.Select((track, index) => new { track.Id,
                 label = (track.Name ?? track.Language ?? "Audio") + (track.IsDefault ? " · original" : "") + " · " + (index + 1) }),
             subtitleOptions = SelectableSubtitleTracks(item.Subtitles)

@@ -541,6 +541,8 @@
         .clip-error{color:var(--red);font-size:11px}
         .clip-note{color:var(--muted);font-size:11px;line-height:1.35}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
+        .collection-browse{flex:none;width:34px;height:34px;margin-right:auto;padding:4px;display:grid;place-items:center;line-height:0}
+        .collection-browse img{display:block;width:24px;height:24px;object-fit:contain}
         .output[hidden]{display:none}
         :is(.output,.audio-track) select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
           color-scheme:inherit;padding:4px 6px;font:inherit;cursor:pointer}
@@ -1120,11 +1122,15 @@
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
         && !result.data?.choices?.length && !result.data?.sourceChoices?.length) {
+      const name = collectionName(result.data.collectionKind);
       const note = result.data.collectionIsDynamic
-        ? 'This is a changing playlist snapshot. Choose entries and one quality in VESPER.'
-        : 'Choose playlist entries and one quality in VESPER. Nothing is added until you confirm.';
-      const controls = collectionPickerControls(title, request);
-      return renderShell(result.data.title || title, poster, duration, element('div', 'msg', note), ...controls);
+        ? `This is a changing ${name} snapshot. Choose its entries and one quality in VESPER.`
+        : 'Choose the items and quality in VESPER. Nothing is added until you confirm.';
+      const controls = collectionPickerControls(title, request, result.data.collectionKind);
+      const footer = element('div', 'foot');
+      footer.append(controls.browse);
+      return renderShell(result.data.title || title, poster, duration,
+        element('div', 'msg', note), controls.status, footer);
     }
     if (!result?.ok || (!result.data?.choices?.length && !result.data?.sourceChoices?.length)) {
       const message = errorMessage(result);
@@ -1173,22 +1179,35 @@
     return close;
   }
 
-  function collectionPickerControls(title, request) {
-    const browse = element('button', 'vesper-button', 'Browse playlist in VESPER');
+  function collectionName(kind) {
+    return ({ playlist: 'playlist', dynamicmix: 'mix', album: 'album',
+      channel: 'channel', feed: 'feed', shortformfeed: 'feed' })[kind] || 'collection';
+  }
+
+  function collectionPickerControls(title, request, kind) {
+    const actionLabel = `Browse ${collectionName(kind)} in VESPER`;
+    const browse = element('button', 'vesper-button collection-browse');
+    browse.title = actionLabel;
+    browse.setAttribute('aria-label', actionLabel);
+    const icon = element('img');
+    icon.src = chrome.runtime.getURL('icons/vesper-32.png');
+    icon.alt = '';
+    browse.append(icon);
     const status = element('small', 'hint', 'VESPER will show the available entries and their quality matches.');
     status.hidden = true;
     browse.onclick = async () => {
       if (!panelMedia || !isCurrentRequest(request) || browse.disabled) return;
+      const pageUrl = panelMedia.pageUrl;
       browse.disabled = true;
-      browse.textContent = 'Opening VESPER…';
+      browse.title = 'Opening VESPER…';
       status.hidden = false;
       status.textContent = 'Choose checked entries and confirm in VESPER.';
       status.classList.remove('bad');
       try {
-        const reply = await send({ type: 'native-picker', title });
+        const reply = await send({ type: 'native-picker', pageUrl, title });
         if (!isCurrentRequest(request)) return;
         browse.disabled = false;
-        browse.textContent = 'Browse playlist in VESPER';
+        browse.title = actionLabel;
         if (reply?.ok) {
           const accepted = (reply.results || []).filter(result => ['queued', 'started', 'already-submitted'].includes(result.status)).length;
           status.textContent = `${accepted} item(s) accepted in VESPER.`;
@@ -1199,7 +1218,7 @@
       } catch {
         if (!isCurrentRequest(request)) return;
         browse.disabled = false;
-        browse.textContent = 'Browse playlist in VESPER';
+        browse.title = actionLabel;
         status.textContent = 'VESPER could not open the playlist picker.';
         status.classList.add('bad');
       }
@@ -1225,6 +1244,7 @@
     list.setAttribute('aria-label', 'Download format');
     const rows = [];
     const downloadButtons = [];
+    let collectionControls = null;
     let selectionNotice = null;
     const noticeText = () => [formats.selectionNotice, formats.trackNotice].filter(Boolean).join(' ');
     function saveDraft() {
@@ -1512,9 +1532,12 @@
       };
       body.push(more);
     }
-    if (formats.hasRelatedCollection && !formats.browserChoice)
-      body.push(...collectionPickerControls(title, request));
+    if (formats.hasRelatedCollection && !formats.browserChoice) {
+      collectionControls = collectionPickerControls(title, request, formats.collectionKind);
+      body.push(collectionControls.status);
+    }
     const footer = element('div', 'foot');
+    if (collectionControls) footer.append(collectionControls.browse);
     for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
