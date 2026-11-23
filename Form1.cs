@@ -329,14 +329,15 @@ public partial class Form1 : Form
         catch (InvalidOperationException) { /* the window is closing */ }
     }
 
-    internal async Task<bool> ApplyBrowserActivityAsync(BrowserActivity activity, CancellationToken ct)
+    internal async Task<bool> ApplyBrowserActivityAsync(BrowserActivity activity, CancellationToken ct, bool reconcile = true)
     {
         if (IsDisposed || !IsHandleCreated) return false;
         var applied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         PostToUi(() =>
         {
             var current = activity.Files.Select(file => file.Id).ToHashSet(StringComparer.Ordinal);
-            bool structure = RemoveBrowserRows(item => item.BrowserProfile == activity.Profile && !current.Contains(item.BrowserFile!.Id));
+            bool structure = reconcile
+                && RemoveBrowserRows(item => item.BrowserProfile == activity.Profile && !current.Contains(item.BrowserFile!.Id));
             var changed = new List<Guid>();
             foreach (BrowserActiveFile file in activity.Files)
             {
@@ -1055,13 +1056,15 @@ public partial class Form1 : Form
         _pause.Click += (_, _) =>
         {
             foreach (var row in _grid.CheckedItems)
-                if (row.BrowserFile is { Paused: false }) ControlBrowserDownload(row, "pause");
+                if (row.BrowserFile is { Managed: true }) continue;
+                else if (row.BrowserFile is { Paused: false }) ControlBrowserDownload(row, "pause");
                 else if (row.Snapshot is { } s) _engine?.Pause(s.Id);
         };
         _resume.Click += (_, _) =>
         {
             foreach (var row in _grid.CheckedItems)
-                if (row.BrowserFile is { Paused: true, CanResume: true }) ControlBrowserDownload(row, "resume");
+                if (row.BrowserFile is { Managed: true }) continue;
+                else if (row.BrowserFile is { Paused: true, CanResume: true }) ControlBrowserDownload(row, "resume");
                 else if (row.Snapshot is { } s) _engine?.Resume(s.Id);
         };
         _remove.Click += async (_, _) => await RemoveOrCancelSelectedAsync();
@@ -1386,7 +1389,8 @@ public partial class Form1 : Form
 
         _selectedLabel.Text = $"{count} selected";
         var selected = _grid.CheckedItems;
-        _pause.Enabled = selected.Any(r => r.Status is JobStatus.Downloading or JobStatus.Queued or JobStatus.Resolving or JobStatus.WaitingRetry or JobStatus.Waiting);
+        _pause.Enabled = selected.Any(r => r.BrowserFile is not { Managed: true }
+            && (r.Status is JobStatus.Downloading or JobStatus.Queued or JobStatus.Resolving or JobStatus.WaitingRetry or JobStatus.Waiting));
         _resume.Enabled = selected.Any(r => r.BrowserFile is { Paused: true, CanResume: true }
             || r.Snapshot is { IsCleanupPending: false, State: JobState.Paused or JobState.Failed or JobState.NeedsAttention });
         JobSnapshot[] native = [.. selected.Where(r => r.Snapshot is not null).Select(r => r.Snapshot!)];
@@ -1844,6 +1848,12 @@ public partial class Form1 : Form
     {
         if (_menuTarget?.BrowserFile is { } browser)
         {
+            if (browser.Managed)
+            {
+                foreach (var (_, command) in _menuCommands) command.Available = false;
+                _bandwidthMenu.Available = _priorityMenu.Available = false;
+                return;
+            }
             foreach (var (name, command) in _menuCommands)
                 command.Available = name == "Cancel download" || name == "Pause" && !browser.Paused
                     || name == "Resume" && browser.Paused && browser.CanResume;

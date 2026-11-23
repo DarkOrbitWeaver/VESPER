@@ -129,7 +129,9 @@ internal sealed class DownloadItem
         Size = file.Length is long length ? Formatting.Bytes(length) : "Unknown";
         Status = file.Paused ? JobStatus.Paused : JobStatus.Downloading;
         Percent = file.Length is > 0 ? (int)Math.Clamp(100d * file.Received / file.Length.Value, 0, 99) : null;
-        Transfer = file.Received > 0 ? Formatting.Bytes(file.Received) + " received" : "Waiting for data…";
+        Transfer = file.Managed
+            ? file.Length is long expectedLength ? Formatting.Bytes(Math.Min(file.Received, expectedLength)) + " of " + Formatting.Bytes(expectedLength) : Formatting.Bytes(file.Received) + " received"
+            : file.Received > 0 ? Formatting.Bytes(file.Received) + " received" : "Waiting for data…";
         RefreshSearchIndex();
     }
 

@@ -34,7 +34,8 @@ internal static class Program
                 else
                 {
                     id = request.Id;
-                    persistent = request.Type == "browser-activity";
+                    persistent = request.Type == "browser-activity"
+                        || request.Type == "browser-managed" && request.Operation == "watch";
                     reply = await HandleAsync(request, json, overall.Token);
                 }
                 await BridgeProtocol.WriteFrameAsync(output, reply, overall.Token);
@@ -54,6 +55,7 @@ internal static class Program
     {
         string pipe = BridgePipe.NameForCurrentUser();
         bool bringReviewForward = request.Type is "batch-review" or "media-picker"
+            || request.Type == "browser-managed" && request.Operation == "connect"
             || request.Type == "submit" && (request.Mode == "ask" || request.Items.Count > 1
                 || request.Items.Any(item => item.Sha256 is not null));
 
@@ -61,7 +63,9 @@ internal static class Program
         if (answer is not null) return answer;
 
         // A browser download or format request can wake the desktop.
-        if (request is { Type: "browser-activity", Operation: "watch" } || !TryStartApp())
+        if (request is { Type: "browser-activity", Operation: "watch" }
+            || request is { Type: "browser-managed", Operation: "watch" or "complete" }
+            || !TryStartApp())
             return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
 
         DateTime deadline = DateTime.UtcNow + LaunchWait;

@@ -19,7 +19,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       remove: async key => { for (const name of Array.isArray(key) ? key : [key]) delete data[name]; }
     };
   };
-  let onMessage, onCreated, onChanged, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked, onInstalled, onStorageChanged;
+  let onMessage, onCreated, onChanged, onFilename, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked, onInstalled, onStorageChanged;
   const sent = [];
   const policyRequests = [];
   const actions = [];
@@ -110,6 +110,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     downloads: {
       onCreated: { addListener: fn => { onCreated = fn; } },
       onChanged: { addListener: fn => { onChanged = fn; } },
+      onDeterminingFilename: { addListener: fn => { onFilename = fn; } },
       search: async ({ id, state, startedAfter, startedBefore, limit }) => {
         if (failDownloadSearch) throw new Error('Chrome download search failed.');
         return downloadHistory
@@ -188,7 +189,11 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
-    localData: localSeed, manifestWatchers,
+    localData: localSeed, manifestWatchers, filename: item => {
+      let suggested;
+      onFilename(item, suggestion => { suggested = suggestion; });
+      return suggested;
+    },
     install: () => onInstalled(),
     finishDownloadCancel: () => finishDownloadCancel?.(),
     deferDigestAt: callsAhead => { deferredDigestCall = digestCalls + callsAhead; },
@@ -2224,7 +2229,7 @@ test('a rate-limited lookup does not start a new request using Chrome', async ()
   assert.deepEqual(app.actions, ['native']);
 });
 
-test('Chrome-owned downloads are never mirrored to VESPER or controlled through a native activity port', async () => {
+test('a new blob is tracked in VESPER while Chrome keeps the original connection', async () => {
   const download = { id: 7, url: 'blob:https://example.com/private',
     filename: 'C:\\Downloads\\archive.zip', state: 'in_progress',
     danger: 'safe', startTime: '2026-10-10T08:00:00.000Z', totalBytes: 500,
@@ -2232,10 +2237,56 @@ test('Chrome-owned downloads are never mirrored to VESPER or controlled through 
   const app = load({}, { download, activity: true });
   await app.onCreated(download);
   await app.recover();
-  assert.equal(app.ports.length, 0);
+  const port = app.ports[0];
+  assert.ok(port);
+  assert.equal(port.posted[0].type, 'browser-managed');
+  assert.equal(port.posted[0].operation, 'watch');
+  assert.equal(port.posted[0].files[0].received, 20);
+  assert.equal(port.posted[0].files[0].hosts[0], 'example.com');
   assert.deepEqual(app.sent, []);
   assert.deepEqual(app.actions, []);
   assert.equal(download.state, 'in_progress');
+  assert.equal(app.filename(download), undefined);
+  port.reply({ ok: true, data: { managedDownloads: true, siteRules: { neverCaptureHosts: ['blocked.example'] } } });
+  assert.equal(app.filename(download).filename, 'VESPER/archive.zip');
+  assert.equal(app.filename({ ...download, referrer: 'https://blocked.example/' }), undefined);
+  assert.equal(app.filename({ ...download, incognito: true }), undefined);
+});
+
+test('Continue in VESPER follows a non-resumable transfer without acting on the Chrome connection', async () => {
+  const download = { id: 9, url: 'https://example.com/export', filename: 'C:\\Downloads\\export.zip',
+    state: 'in_progress', danger: 'safe', startTime: '2026-10-10T08:00:00.000Z',
+    bytesReceived: 25, canResume: false };
+  const app = load({ 'browser-managed': { ok: true } }, { download, activity: true, prefs: { intercept: false } });
+  const list = await app.message({ type: 'managed-downloads' });
+  assert.equal(list.files[0].id, download.id);
+  const action = { type: 'continue-managed', id: download.id, startTime: download.startTime };
+  const page = { tab: { id: 2, url: download.url } };
+  assert.equal((await app.message(action, page)).ok, false);
+  assert.equal((await app.message({ ...action, startTime: '2026-10-10T08:00:01.000Z' })).ok, false);
+  assert.equal((await app.message(action)).ok, true);
+  assert.deepEqual(app.actions, ['native']);
+  assert.equal(app.sent[0].operation, 'connect');
+  assert.equal((await app.message({ type: 'managed-downloads' })).files.length, 0);
+  assert.equal(download.state, 'in_progress');
+});
+
+test('an enrolled Chrome file can finish while the extension worker is asleep', async () => {
+  const download = { id: 12, url: 'blob:https://example.com/export', filename: 'D:\\Chosen\\export.zip',
+    state: 'in_progress', danger: 'safe', startTime: '2026-10-10T08:00:00.000Z', bytesReceived: 25 };
+  const first = load({}, { download, activity: true });
+  await first.onCreated(download);
+  await first.recover();
+  const receipt = first.ports[0].posted[0].files[0].id;
+  first.stopWorker();
+  Object.assign(download, { state: 'complete', fileSize: 50, exists: true });
+  const next = load({ 'browser-managed': { ok: true } }, { download, activity: true, localData: first.localData });
+  await next.recover();
+  const result = next.sent.find(message => message.operation === 'complete');
+  assert.equal(result.downloadId, receipt);
+  assert.equal(result.path, download.filename);
+  assert.equal(result.length, 50);
+  assert.deepEqual(next.actions, ['native']);
 });
 
 test('format submission uses an opaque selection and rejects an out-of-range choice', async () => {

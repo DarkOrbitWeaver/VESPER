@@ -25,6 +25,65 @@ public sealed class BrowserDownloadTests
     }
 
     [Fact]
+    public void ManagedActivityRequiresObservedHostsAndMarksTheOriginalTransferReadOnly()
+    {
+        const string sample = """
+            {"v":1,"id":"managed-connect-1","type":"browser-managed","operation":"connect","profile":"demo-profile",
+             "files":[{"id":"c-demo-profile-7-abc","name":"leaf.zip","received":128,"length":256,
+                       "start":1760000000000,"hosts":["WWW.EXAMPLE.COM","www.example.com"]}]}
+            """;
+
+        Assert.True(BridgeProtocol.TryParse(sample, out BridgeRequest request, out string error), error);
+        BrowserActiveFile file = Assert.Single(request.Activity!.Files);
+        Assert.True(file.Managed);
+        Assert.False(file.CanResume);
+        Assert.Equal(new[] { "www.example.com" }, file.Hosts);
+        Assert.False(BridgeProtocol.TryParse(sample.Replace("\"hosts\":[\"WWW.EXAMPLE.COM\",\"www.example.com\"]", "\"hosts\":[]"),
+            out _, out _));
+        Assert.False(BridgeProtocol.TryParse(sample.Replace("www.example.com", "example.com/path"), out _, out _));
+    }
+
+    [Fact]
+    public void ManagedCompletionRequiresAProfileBoundReceiptAndObservedHost()
+    {
+        const string sample = """
+            {"v":1,"id":"managed-complete-1","type":"browser-managed","operation":"complete",
+             "profile":"demo-profile","downloadId":"c-demo-profile-7-abc","path":"C:\\Users\\person\\Downloads\\VESPER\\leaf.zip",
+             "length":256,"hosts":["example.com"]}
+            """;
+
+        Assert.True(BridgeProtocol.TryParse(sample, out BridgeRequest request, out string error), error);
+        Assert.Equal("c-demo-profile-7-abc", request.CompletedFile!.DownloadId);
+        Assert.Equal(new[] { "example.com" }, request.CompletedFile.Hosts);
+        Assert.False(BridgeProtocol.TryParse(sample.Replace("c-demo-profile-7-abc", "c-someone-7-abc"), out _, out _));
+        Assert.False(BridgeProtocol.TryParse(sample.Replace("\"hosts\":[\"example.com\"]", "\"hosts\":[]"), out _, out _));
+    }
+
+    [Fact]
+    public void RegisteringManagedChromeFileAddsAReadOnlyReferenceAndIsIdempotent()
+    {
+        using var harness = new Harness();
+        string destination = Path.Combine(harness.Root, "chrome-custom-folder");
+        Directory.CreateDirectory(destination);
+        string path = Path.Combine(destination, "saved.zip");
+        byte[] bytes = [1, 2, 3, 4, 5];
+        File.WriteAllBytes(path, bytes);
+        var file = new BrowserCompletedFile("demo-profile", "c-demo-profile-7-abc", path, bytes.Length, ["example.com"]);
+
+        AddResult first = harness.Engine.RegisterBrowserDownload(file);
+        AddResult duplicate = harness.Engine.RegisterBrowserDownload(file);
+
+        Assert.True(first.Ok, first.Message);
+        Assert.Equal(AddStatus.AlreadySubmitted, duplicate.Status);
+        JobSnapshot saved = harness.Engine.Snapshot(first.JobId)!;
+        Assert.Equal(JobKind.BrowserFile, saved.Kind);
+        Assert.Equal(JobState.Completed, saved.State);
+        Assert.Equal(path, saved.FinalPath);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+        Assert.True(File.Exists(path));
+    }
+
+    [Fact]
     public async Task ADiscoveryCooldownDefersAnotherRequestOnTheSameRoute()
     {
         var options = new EngineOptions { DataDirectory = Path.GetTempPath() };

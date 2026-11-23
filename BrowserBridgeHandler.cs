@@ -20,6 +20,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                     data: new { app = "VESPER", handoff = current.BrowserAction.ToString().ToLowerInvariant(),
                         siteRules = new { neverCaptureHosts = SiteRule.Normalize(current.SiteRules)
                             .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray() },
+                        managedDownloads = true,
                         build = Vesper.Shared.BuildInfo.Version(typeof(BrowserBridgeHandler).Assembly) },
                     version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
             }
@@ -46,6 +47,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);
 
+            case "browser-managed":
+                return await ManageChromeDownloadAsync(request, ct);
+
             case "browser-activity":
                 // Chrome-owned downloads must never appear as VESPER jobs, even from older extensions.
                 return BridgeResponse.Fail(request.Id, "chrome-owned", "Chrome downloads stay in Chrome.");
@@ -53,6 +57,61 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             default:
                 return BridgeResponse.Fail(request.Id, "invalid", "Unknown request.");
         }
+    }
+
+    private async Task<BridgeResponse> ManageChromeDownloadAsync(BridgeRequest request, CancellationToken ct)
+    {
+        if (request.Operation == "complete")
+        {
+            BrowserCompletedFile file = request.CompletedFile!;
+            if (BlockedHost(file.Hosts, preferences().SiteRules) is not null)
+                return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
+            AddResult result = engine.RegisterBrowserDownload(file);
+            if (result.Ok) owner.FinishBrowserActivity(file.DownloadId);
+            return result.Ok
+                ? BridgeResponse.Success(request.Id, result.Message, data: new { jobId = result.JobId })
+                : BridgeResponse.Fail(request.Id, result.Status == AddStatus.Busy ? "busy" : "invalid-file", result.Message);
+        }
+
+        BrowserActivity activity = request.Activity!;
+        BrowserActivity allowed = FilterManagedActivity(activity, preferences().SiteRules, out string[] blocked);
+        if (request.Operation == "connect")
+        {
+            if (blocked.Length > 0)
+                return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
+            owner.RequestShow();
+            await owner.ApplyBrowserActivityAsync(allowed, ct, reconcile: false);
+            IReadOnlyList<string> neverCaptureHosts = SiteRule.Normalize(preferences().SiteRules)
+                .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray();
+            return BridgeResponse.Success(request.Id, data: new { managedDownloads = true, siteRules = new { neverCaptureHosts }, blocked });
+        }
+
+        return await WatchManagedBrowserActivityAsync(request.Id, allowed, blocked, ct);
+    }
+
+    private static BrowserActivity FilterManagedActivity(BrowserActivity activity, IEnumerable<SiteRule>? rules,
+        out string[] blocked)
+    {
+        var allowedFiles = new List<BrowserActiveFile>();
+        var blockedFiles = new List<string>();
+        foreach (BrowserActiveFile file in activity.Files)
+        {
+            if (BlockedHost(file.Hosts!, rules) is not null) blockedFiles.Add(file.Id);
+            else allowedFiles.Add(file);
+        }
+        blocked = [.. blockedFiles];
+        return new BrowserActivity(activity.Profile, allowedFiles);
+    }
+
+    private static string? BlockedHost(IReadOnlyList<string> hosts, IEnumerable<SiteRule>? rules)
+    {
+        IReadOnlyList<SiteRule> siteRules = SiteRule.Normalize(rules);
+        foreach (string host in hosts)
+        {
+            string address = host.Contains(':') ? "https://[" + host + "]/" : "https://" + host + "/";
+            if (SiteRule.ForPage(siteRules, address) is { NeverCapture: true }) return host;
+        }
+        return null;
     }
 
     /// <summary>

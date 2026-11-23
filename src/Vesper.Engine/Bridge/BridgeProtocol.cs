@@ -16,7 +16,7 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
     IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
-    bool EmbedSubtitles = false);
+    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -74,7 +74,7 @@ public static class BridgeProtocol
 
             string type = Str(root, "type") ?? "";
             if (type is not ("hello" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
-                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity"))
+                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed"))
             { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
@@ -90,6 +90,7 @@ public static class BridgeProtocol
             List<string>? subtitleLanguages = null;
             bool autoSubtitles = false;
             bool embedSubtitles = false;
+            BrowserCompletedFile? completedFile = null;
             BridgeItem? mediaAuth = null;
             BrowserTransferProof? browserProof = null;
             BrowserActivity? activity = null;
@@ -221,12 +222,34 @@ public static class BridgeProtocol
                 if (operation is not ("connect" or "watch") || !TryBrowserActivity(root, out activity))
                 { error = "Invalid Chrome download activity."; return false; }
             }
+            else if (type == "browser-managed")
+            {
+                operation = Str(root, "operation");
+                if (operation is "connect" or "watch")
+                {
+                    if (!TryBrowserActivity(root, managed: true, out activity))
+                    { error = "Invalid managed Chrome download activity."; return false; }
+                }
+                else if (operation == "complete")
+                {
+                    string? profile = Str(root, "profile"), downloadId = Str(root, "downloadId");
+                    string? path = Str(root, "path");
+                    if (!TryProfile(profile) || !IsManagedDownloadId(downloadId, profile!)
+                        || path is not { Length: > 0 and <= 4096 } || path.Any(char.IsControl)
+                        || !TryLength(root, "length", out long? completedLength) || completedLength is null
+                        || !TryBrowserHosts(root, out IReadOnlyList<string> hosts) || hosts.Count == 0)
+                    { error = "Invalid completed managed download."; return false; }
+                    completedFile = new BrowserCompletedFile(profile!, downloadId!, path, completedLength.Value, hosts);
+                }
+                else
+                { error = "Invalid managed Chrome download operation."; return false; }
+            }
             bool confirmTransfer = browserSubmit || type == "submit" && items.Count == 1
                 && root.TryGetProperty("confirmTransfer", out JsonElement confirm) && confirm.ValueKind == JsonValueKind.True;
             string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
                 confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
-                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles);
+                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
@@ -269,11 +292,14 @@ public static class BridgeProtocol
         return true;
     }
 
-    private static bool TryBrowserActivity(JsonElement root, out BrowserActivity? activity)
+    private static bool TryBrowserActivity(JsonElement root, out BrowserActivity? activity) =>
+        TryBrowserActivity(root, managed: false, out activity);
+
+    private static bool TryBrowserActivity(JsonElement root, bool managed, out BrowserActivity? activity)
     {
         activity = null;
         string? profile = Str(root, "profile");
-        if (profile is not { Length: >= 8 and <= 36 } || profile.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-')
+        if (!TryProfile(profile)
             || !root.TryGetProperty("files", out var array) || array.ValueKind != JsonValueKind.Array || array.GetArrayLength() > 32)
             return false;
         var files = new List<BrowserActiveFile>();
@@ -289,9 +315,59 @@ public static class BridgeProtocol
                 || !TryLength(entry, "start", out var start) || start is not (>= 946684800000L and <= 253402300799999L)) return false;
             bool paused = entry.TryGetProperty("paused", out var pause) && pause.ValueKind == JsonValueKind.True;
             bool canResume = entry.TryGetProperty("canResume", out var resume) && resume.ValueKind == JsonValueKind.True;
-            files.Add(new(id, name, received.Value, length, DateTimeOffset.FromUnixTimeMilliseconds(start.Value).UtcDateTime, paused, canResume));
+            IReadOnlyList<string> hosts = Array.Empty<string>();
+            if (managed && (!TryBrowserHosts(entry, out hosts) || hosts.Count == 0)) return false;
+            files.Add(new(id, name, received.Value, length, DateTimeOffset.FromUnixTimeMilliseconds(start.Value).UtcDateTime,
+                managed ? false : paused, managed ? false : canResume, hosts, managed));
         }
-        activity = new(profile, files);
+        activity = new(profile!, files);
+        return true;
+    }
+
+    private static bool TryProfile(string? profile) =>
+        profile is { Length: >= 8 and <= 36 } && profile.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
+
+    private static bool IsManagedDownloadId(string? id, string profile) =>
+        IsRequestId(id) && id!.StartsWith("c-" + profile + "-", StringComparison.Ordinal);
+
+    private static bool TryBrowserHosts(JsonElement root, out IReadOnlyList<string> hosts)
+    {
+        hosts = Array.Empty<string>();
+        if (!root.TryGetProperty("hosts", out JsonElement array) || array.ValueKind != JsonValueKind.Array
+            || array.GetArrayLength() > 8) return false;
+
+        var normalized = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (JsonElement entry in array.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.String || entry.GetString() is not { Length: > 0 and <= 253 } value
+                || !TryNormalizeBrowserHost(value, out string host)) return false;
+            normalized.Add(host);
+        }
+        hosts = normalized.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+        return true;
+    }
+
+    private static bool TryNormalizeBrowserHost(string value, out string host)
+    {
+        host = "";
+        if (!string.Equals(value, value.Trim(), StringComparison.Ordinal) || value.EndsWith('.')
+            || value.Contains('/') || value.Contains('\\') || value.Contains('@')
+            || value.Contains('?') || value.Contains('#') || value.Contains('*') || value.Any(char.IsControl))
+            return false;
+        string ipText = value.StartsWith('[') && value.EndsWith(']') ? value[1..^1] : value;
+        if (System.Net.IPAddress.TryParse(ipText, out System.Net.IPAddress? address))
+        {
+            host = address.ToString().ToLowerInvariant();
+            return true;
+        }
+        if (value.Contains(':')) return false;
+        try { value = new System.Globalization.IdnMapping().GetAscii(value).ToLowerInvariant(); }
+        catch (ArgumentException) { return false; }
+        if (Uri.CheckHostName(value) != UriHostNameType.Dns || value.Length > 253) return false;
+        foreach (string label in value.Split('.'))
+            if (label.Length is 0 or > 63 || label[0] == '-' || label[^1] == '-'
+                || label.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-')) return false;
+        host = value;
         return true;
     }
 

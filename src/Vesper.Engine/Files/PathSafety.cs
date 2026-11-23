@@ -60,6 +60,44 @@ public static class PathSafety
         return p.StartsWith(r, StringComparison.OrdinalIgnoreCase);
     }
 
+    internal static bool TryGetBrowserDownload(BrowserCompletedFile file, out string path, out string? identity)
+    {
+        path = "";
+        identity = null;
+        string value = file.Path;
+        if (file.Length < 0 || value.Length is < 1 or > 4096 || value.Any(char.IsControl)
+            || !Path.IsPathFullyQualified(value) || value.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Contains("..")
+            || OperatingSystem.IsWindows() && (value.Length < 3 || !char.IsAsciiLetter(value[0])
+                || value[1] != ':' || value[2] is not ('\\' or '/') || value.AsSpan(2).Contains(':')))
+            return false;
+
+        try
+        {
+            string full = Path.GetFullPath(value);
+            if (full.EndsWith(".crdownload", StringComparison.OrdinalIgnoreCase)
+                || OperatingSystem.IsWindows() && new DriveInfo(Path.GetPathRoot(full)!).DriveType == DriveType.Network)
+                return false;
+
+            using SafeFileHandle saved = OpenTemporaryHandle(full, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (RandomAccess.GetLength(saved) != file.Length) return false;
+            identity = TemporaryFileIdentity(saved);
+            if (OperatingSystem.IsWindows() && identity is null) return false;
+
+            using SafeFileHandle current = OpenTemporaryHandle(full, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (RandomAccess.GetLength(current) != file.Length
+                || identity is not null && !string.Equals(identity, TemporaryFileIdentity(current), StringComparison.Ordinal))
+                return false;
+
+            path = full;
+            return true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
+        {
+            identity = null;
+        }
+        return false;
+    }
+
     internal static bool TryCheckUnlinkedDirectory(string folder, out string error)
     {
         try

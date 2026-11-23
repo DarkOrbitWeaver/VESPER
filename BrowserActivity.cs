@@ -18,15 +18,18 @@ internal sealed partial class BrowserBridgeHandler
     private readonly Dictionary<string, ProfileWatch> _browserWatches = new(StringComparer.Ordinal);
     private readonly object _browserWatchLock = new();
 
-    private async Task<BridgeResponse> WatchBrowserActivityAsync(BridgeRequest request, CancellationToken ct)
+    private Task<BridgeResponse> WatchBrowserActivityAsync(BridgeRequest request, CancellationToken ct) =>
+        WatchManagedBrowserActivityAsync(request.Id, request.Activity!, [], ct);
+
+    private async Task<BridgeResponse> WatchManagedBrowserActivityAsync(string requestId, BrowserActivity activity,
+        IReadOnlyList<string> blocked, CancellationToken ct)
     {
-        var activity = request.Activity!;
         if (activity.Files.Count == 0)
         {
             lock (_browserWatchLock)
                 if (_browserWatches.Remove(activity.Profile, out var closed)) Release(closed);
             await owner.ApplyBrowserActivityAsync(activity, ct);
-            return BridgeResponse.Success(request.Id);
+            return BridgeResponse.Success(requestId, data: ManagedWatchData(blocked));
         }
 
         ProfileWatch watch;
@@ -36,7 +39,7 @@ internal sealed partial class BrowserBridgeHandler
         {
             if (!_browserWatches.TryGetValue(activity.Profile, out watch!))
             {
-                if (_browserWatches.Count >= 8) return BridgeResponse.Fail(request.Id, "busy", "Too many browser connections.");
+                if (_browserWatches.Count >= 8) return BridgeResponse.Fail(requestId, "busy", "Too many browser connections.");
                 _browserWatches[activity.Profile] = watch = new ProfileWatch();
                 watch.Expiry = new System.Threading.Timer(_ => ExpireBrowserWatch(activity.Profile, watch));
             }
@@ -52,11 +55,11 @@ internal sealed partial class BrowserBridgeHandler
         catch (TimeoutException) { }
         lock (_browserWatchLock)
         {
-            if (watch.Revision != revision) return BridgeResponse.Success(request.Id);
+            if (watch.Revision != revision) return BridgeResponse.Success(requestId, data: ManagedWatchData(blocked));
             BrowserCommand[] commands = watch.Commands.Values.Where(command => watch.Files.Contains(command.Id)).ToArray();
             watch.Commands.Clear();
             if (watch.Changed.Task.IsCompleted) watch.Changed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            return BridgeResponse.Success(request.Id, data: new { commands });
+            return BridgeResponse.Success(requestId, data: ManagedWatchData(blocked, commands));
         }
     }
 
@@ -102,5 +105,12 @@ internal sealed partial class BrowserBridgeHandler
         watch.Expiry?.Dispose();
         watch.Commands.Clear();
         watch.Changed.TrySetResult();
+    }
+
+    private object ManagedWatchData(IReadOnlyList<string> blocked, BrowserCommand[]? commands = null)
+    {
+        IReadOnlyList<string> neverCaptureHosts = SiteRule.Normalize(preferences().SiteRules)
+            .Where(rule => rule.NeverCapture).Select(rule => rule.Host).ToArray();
+        return new { managedDownloads = true, siteRules = new { neverCaptureHosts }, commands, blocked };
     }
 }

@@ -38,7 +38,13 @@ const delay = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 function installRaceBridge() {
   const smoke = globalThis.__ownershipSmoke;
   smoke.raceCalls = [];
+  smoke.managed = [];
   const simulate = (_host, message, callback) => {
+    if (message.type === 'browser-managed') {
+      smoke.managed.push(message);
+      callback({ v: 1, id: message.id, ok: true });
+      return;
+    }
     smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
     const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
     if (message.type === 'hello')
@@ -50,6 +56,20 @@ function installRaceBridge() {
     throw new Error('Unexpected native request in capture race test: ' + message.type);
   };
   chrome.runtime.sendNativeMessage = simulate;
+  chrome.runtime.connectNative = () => {
+    let messageListener, disconnected, closed = false;
+    return {
+      onMessage: { addListener(listener) { messageListener = listener; } },
+      onDisconnect: { addListener(listener) { disconnected = listener; } },
+      disconnect() { closed = true; disconnected?.(); },
+      postMessage(message) {
+        smoke.managed.push(message);
+        setTimeout(() => {
+          if (!closed) messageListener({ ok: true, data: { managedDownloads: true, siteRules: { neverCaptureHosts: [] } } });
+        }, 40);
+      }
+    };
+  };
   if (chrome.runtime.sendNativeMessage !== simulate) throw new Error('Could not install the simulated native helper.');
 }
 
@@ -148,6 +168,21 @@ async function main() {
     if (request.url === '/page') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end('<!doctype html><title>VESPER smoke fixture</title><body></body>');
+      return;
+    }
+    if (captureRaceTest && request.url === '/single-post') {
+      if (request.method !== 'POST' || serverRequests.filter(entry => entry.path === '/single-post').length !== 1) {
+        response.writeHead(403).end();
+        return;
+      }
+      response.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="vesper-single-post.bin"',
+        'Content-Length': bytes.length,
+        'Cache-Control': 'no-store'
+      });
+      response.flushHeaders();
+      setTimeout(() => response.end(bytes), 600);
       return;
     }
     if (request.url === '/player') {
@@ -358,6 +393,7 @@ async function main() {
         + "if (chrome.runtime.sendNativeMessage !== guard) throw new Error('Could not guard the installed native host');";
     await evaluate("Configure Chrome ownership", "(async () => { await chrome.storage.sync.set({ intercept: false, route: 'chrome' });"
       + "globalThis.__ownershipSmoke = { created: [], changed: [], nativeCalls: 0, nativeMessages: [] };"
+      + (captureRaceTest ? '' : 'chrome.runtime.connectNative = undefined;')
       + messagingHook
       + "chrome.downloads.onCreated.addListener(d => __ownershipSmoke.created.push("
       + "{ id:d.id, state:d.state, bytesReceived:d.bytesReceived, totalBytes:d.totalBytes, name:d.filename?.split(/[\\\\/]/).pop() }));"
@@ -402,7 +438,7 @@ async function main() {
     const generated = await browser.send('Runtime.evaluate', { expression:
       "(() => { const link = document.createElement('a');"
       + "link.href = URL.createObjectURL(new Blob([new Uint8Array(262144).fill(90)]));"
-      + "link.download = 'vesper-page-made-fixture.bin'; document.body.append(link); link.click(); })()"
+      + "link.download = 'vesper-page-made-fixture.bin'; document.body.append(link); link.click(); URL.revokeObjectURL(link.href); })()"
     }, tab);
     assert.ok(!generated.exceptionDetails, 'Could not create the isolated Blob download.');
     await waitFor(async () => {
@@ -415,7 +451,24 @@ async function main() {
       return capture.vesperCaptureDecisions?.some(entry => entry.outcome === 'page-made');
     }, 5000, 'The extension did not record that Chrome owns the page-generated download.');
     let captureRace = null;
+    let managedDownloads = null;
     if (captureRaceTest) {
+      await waitFor(async () => {
+        const reports = await evaluate('Read blob completion', '__ownershipSmoke.managed');
+        return reports.some(item => item.operation === 'complete' && item.path.endsWith(blobName));
+      }, 5000, 'VESPER did not receive the completed blob.');
+      await browser.send('Runtime.evaluate', { expression:
+        "(() => { const form = document.createElement('form'); form.method = 'POST'; form.action = '/single-post';"
+        + "document.body.append(form); form.submit(); })()"
+      }, tab);
+      const post = await waitFor(async () => {
+        const reports = await evaluate('Read POST completion', '__ownershipSmoke.managed');
+        return reports.find(item => item.operation === 'complete' && item.path.endsWith('vesper-single-post.bin'));
+      }, 5000, 'VESPER did not receive the completed one-use POST.');
+      assert.ok(post.path.startsWith(downloadFolder));
+      assert.equal((await readFile(post.path)).compare(bytes), 0);
+      assert.deepEqual(serverRequests.filter(entry => entry.path === '/single-post').map(entry => entry.method), ['POST']);
+      managedDownloads = { blob: true, oneUsePost: true };
       captureRace = [];
       for (const fixture of ['fast', 'during-check', 'policy-window', 'delayed']) {
         const name = `vesper-race-${fixture}.bin`;
@@ -592,7 +645,7 @@ async function main() {
       pageMadeKeptInChrome: true,
       fullscreenButterfly: true,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
-      nativeCapture, captureRace
+      nativeCapture, captureRace, managedDownloads
     }) + '\n');
   }
   finally {

@@ -1066,7 +1066,7 @@ const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-option
 const PAUSE_BLOCKED_COMMANDS = new Set(['smart-submit', 'media-options', 'media-select', 'media-source-select',
   'browser-media-select', 'native-picker', 'retry', 'submit']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
-  'native-picker', 'describe', 'retry', 'submit']);
+  'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed']);
 
 function commandsFor(sender) {
   if (!sender || sender.id !== chrome.runtime.id) return null;
@@ -1124,6 +1124,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await cacheNeverCaptureHosts(reply);
         return reply;
       }
+      case 'managed-downloads': return { ok: true, files: await listManagedCandidates() };
+      case 'continue-managed': return continueManagedDownload(message.id, message.startTime);
       case 'media-options': return playerOptions(message, sender);
       case 'media-source-select': return selectMediaSource(message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
@@ -1229,7 +1231,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.contextMenus.removeAll();
   await updateVesperContextMenus(await extensionPaused());
-  chrome.contextMenus.create({ id: 'vesper-transfers', title: 'Unconfirmed VESPER requests…', contexts: ['action'] });
+  chrome.contextMenus.create({ id: 'vesper-transfers', title: 'VESPER transfers…', contexts: ['action'] });
   await updateBadge();
   await recoverChromeDownloads();
 });
@@ -1319,3 +1321,4 @@ async function flash(tabId, reply, frameId = 0) {
 // ---------------------------------------------------------------- Chrome downloads
 
 importScripts('browser-downloads.js');
+importScripts('browser-managed.js');

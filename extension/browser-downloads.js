@@ -141,7 +141,7 @@ function setCapturePreferences(next) {
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === 'local' && changes.vesperPaused) {
     capturePauseRevision++;
-    return setCapturePaused(changes.vesperPaused.newValue === true);
+    return setCapturePaused(changes.vesperPaused.newValue === true).then(() => refreshManagedDownloads());
   }
   if (areaName !== 'sync' || (!changes.intercept && !changes.route)) return;
   captureSettingsRevision++;
@@ -516,6 +516,7 @@ async function armBrowserRecovery() {
 function moveChromeDownload(id, mode, automatic = false, admissionGeneration = captureAdmissionGeneration) {
   if (!Number.isSafeInteger(id) || id < 0) return Promise.resolve(chromeKeeps('Choose a Chrome download.'));
   return inBrowserOrder(id, async () => {
+    if (manualManagedDownloads.has(id)) return chromeKeeps();
     const generation = captureGeneration;
     if (automatic && !(await captureCanBegin(generation, admissionGeneration))) return chromeKeeps();
     const item = await getChromeDownload(id);
@@ -993,13 +994,14 @@ async function recoverChromeDownloads() {
   await Promise.allSettled(records.map(([key, record]) =>
     inBrowserOrder(Number(key), () => reconcileChromeDownload(Number(key), record))));
   if (Object.values(await readBrowserRecords()).some(needsRecovery)) await armBrowserRecovery();
+  await refreshManagedDownloads();
 }
 
 
 async function captureChromeDownload(item, generation = captureGeneration, admissionGeneration = captureAdmissionGeneration) {
   await captureStateReady;
   if (item?.state === 'complete') {
-    // Too late to take over, and Chrome's file is not VESPER's to list. Just stand down if we had started one.
+    // Chrome completed its file. Release any native handoff attempt still waiting for it.
     const removed = createdDownloads.delete(item.id);
     const hadWaiting = awaitingResponses.delete(item.id);
     if (captureEnabled && generation === captureGeneration && (hadWaiting || removed))
@@ -1067,7 +1069,9 @@ chrome.downloads.onCreated.addListener(item => {
       createdDownloads.set(item.id, { startTime: item.startTime, seen, admissionGeneration });
       await saveCaptureState(generation);
     }
-    await captureChromeDownloadSafely(item, generation, admissionGeneration);
+    await Promise.all([captureChromeDownloadSafely(item, generation, admissionGeneration),
+      enrollAutomaticChromeDownload(item).catch(() => {})]);
+    void refreshManagedDownloads();
   }).catch(() => {});
 });
 chrome.downloads.onChanged.addListener(async change => {
@@ -1080,9 +1084,15 @@ chrome.downloads.onChanged.addListener(async change => {
     } else if (change.state?.current === 'complete' || ['safe', 'deepScannedSafe'].includes(change.danger?.current)
         || change.finalUrl || change.totalBytes || change.fileSize) {
       const item = await getChromeDownload(change.id);
-      if (item?.state === 'complete') await captureChromeDownloadSafely(item);
-      else if (recentlyCreated(item) && await captureIsEnabled()) await captureChromeDownloadSafely(item);
+      if (item?.state === 'complete') {
+        if (recentlyCreated(item) && await captureIsEnabled()) await enrollAutomaticChromeDownload(item).catch(() => {});
+        await captureChromeDownloadSafely(item);
+      }
+      else if (recentlyCreated(item) && await captureIsEnabled()) {
+        await Promise.all([captureChromeDownloadSafely(item), enrollAutomaticChromeDownload(item).catch(() => {})]);
+      }
     }
+    void refreshManagedDownloads();
   } catch { /* The existing Chrome file or its recovery record is still available. */ }
 });
 

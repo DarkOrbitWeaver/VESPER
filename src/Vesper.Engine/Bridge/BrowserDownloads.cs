@@ -12,8 +12,12 @@ public sealed record BrowserTransferProof(long? Length, string? ETag, string? Co
             && type.Parameters.Count == 0 && type.MediaType == ContentType);
 }
 
+/// <summary>A finished file written by Chrome. VESPER only records the existing file.</summary>
+public sealed record BrowserCompletedFile(string Profile, string DownloadId, string Path, long Length,
+    IReadOnlyList<string> Hosts);
+
 /// <summary>Display and control information for a live Chrome download, without its URL, path or credentials.</summary>
 public sealed record BrowserActiveFile(string Id, string Name, long Received, long? Length, DateTime StartedUtc,
-    bool Paused, bool CanResume);
+    bool Paused, bool CanResume, IReadOnlyList<string>? Hosts = null, bool Managed = false);
 
 public sealed record BrowserActivity(string Profile, IReadOnlyList<BrowserActiveFile> Files);

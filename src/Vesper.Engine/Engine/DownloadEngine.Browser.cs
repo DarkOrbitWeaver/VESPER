@@ -2,6 +2,56 @@ namespace Vesper.Engine;
 
 public sealed partial class DownloadEngine
 {
+    /// <summary>Records a finished Chrome file at its saved location without copying or changing it.</summary>
+    public AddResult RegisterBrowserDownload(BrowserCompletedFile file)
+    {
+        if (file.Profile is not { Length: >= 8 and <= 36 }
+            || !file.Profile.All(character => char.IsAsciiLetterOrDigit(character) || character == '-')
+            || !BridgeProtocol.IsRequestId(file.DownloadId)
+            || !file.DownloadId.StartsWith("c-" + file.Profile + "-", StringComparison.Ordinal)
+            || file.Hosts is not { Count: > 0 })
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "Invalid browser download id.");
+        if (!PathSafety.TryGetBrowserDownload(file, out string path, out string? identity))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "The Chrome file is outside the approved download folders or has changed.");
+
+        string submission = "chrome-managed:" + file.DownloadId;
+        AddResult result;
+        lock (_lock)
+        {
+            if (_store.TryGetSubmission(submission, out Guid accepted) && _jobs.ContainsKey(accepted))
+                return new AddResult(AddStatus.AlreadySubmitted, accepted, "This Chrome download is already in VESPER.");
+
+            string? origin = file.Hosts.Count > 0
+                ? file.Hosts[0].Contains(':') ? "https://[" + file.Hosts[0] + "]/" : "https://" + file.Hosts[0] + "/"
+                : null;
+            string name = Path.GetFileName(path);
+            var job = new DownloadJob
+            {
+                Kind = JobKind.BrowserFile,
+                SourceUrl = origin ?? "https://download.invalid/",
+                OriginalPageUrl = origin,
+                FileName = name,
+                NameLocked = true,
+                FinalPath = path,
+                PublishedFileIdentity = identity,
+                DestinationFolder = Path.GetDirectoryName(path)!,
+                Category = FileNames.CategoryFor(name),
+                TotalBytes = file.Length,
+                State = JobState.Completed,
+                CompletedUtc = DateTime.UtcNow,
+                QueueOrder = _jobs.Count == 0 ? 0 : _jobs.Values.Min(existing => existing.QueueOrder) - 1
+            };
+            if (file.Length > 0) job.Extents.Add(new ByteRange(0, file.Length));
+            SaveLocked(job, submission);
+            _jobs[job.Id] = job;
+            Changed(job);
+            Log(job.Id, "chrome-managed", "Chrome completed the enrolled download.");
+            result = new AddResult(AddStatus.Added, job.Id, "Added the file saved by Chrome.");
+        }
+        FlushOutbox();
+        return result;
+    }
+
     internal static RunOutcome BrowserFallbackOutcome => new(JobState.Cancelled, "browser-fallback", "Chrome can continue this download.");
 
     private DownloadJob? BrowserTransferLocked(string transferId) =>
