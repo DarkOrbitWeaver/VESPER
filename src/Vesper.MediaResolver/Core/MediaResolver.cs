@@ -130,6 +130,31 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         if (request.Browser is { } message)
             request.ValidatedBrowser = BrowserMessageValidator.Validate(message, svc.Now, _options);
 
+        if (request.Options.ExactBrowserAssetGroup)
+        {
+            if (request.Browser is not { Candidates.Count: >= 2 and <= 5 } raw
+                || request.ValidatedBrowser is not { Candidates.Count: >= 2 and <= 5 } validated
+                || validated.Candidates.Count != raw.Candidates.Count
+                || !BrowserAssetIdentity.CanGroup(request.Url, validated.Candidates.Select(c => c.Url)))
+                return MediaDiscoveryResult.Failure(MediaErrors.Invalid("The observed sources do not share a supported media asset identity."));
+            // No page lookup, unrelated adapter fallback or embed traversal.
+            var group = await GetAdapter(GenericAdapter.Descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
+            if (group.Item is { } item)
+            {
+                string? asset = BrowserAssetIdentity.XVideo(validated.Candidates[0].Url);
+                // A manifest may point to another asset or delivery namespace.
+                // Do not silently fold those tracks into this group.
+                bool Matches(Uri url) => BrowserAssetIdentity.XVideo(url) == asset;
+                var reps = item.Representations.Where(rep => Matches(rep.Url)
+                    && (rep.ManifestUrl is null || Matches(rep.ManifestUrl))
+                    && (rep.Segments is null || (rep.Segments.InitializationUrl is null || Matches(rep.Segments.InitializationUrl))
+                        && rep.Segments.Segments.All(segment => Matches(segment.Url)))).ToArray();
+                if (reps.Length != item.Representations.Count)
+                    return MediaDiscoveryResult.Failure(MediaErrors.Invalid("A grouped source referred to a different asset. Check its sources separately."));
+            }
+            return ResultFinalizer.Finalize(group, _options, svc.Now);
+        }
+
         if (request.Options.ExactBrowserSource)
         {
             if (request.Browser is not { Candidates.Count: 1 } || request.ValidatedBrowser is not { Candidates.Count: 1 })

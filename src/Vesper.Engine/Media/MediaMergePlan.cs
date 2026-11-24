@@ -11,7 +11,9 @@ namespace Vesper.Engine;
 /// and content length). It is what allows a refreshed signed URL to continue committed bytes; titles or video ids never do.
 /// </summary>
 public sealed record MergeTrack(string Role, string FormatId, string Url, long Size, string Container,
-    string? Codec = null, string? Identity = null, string? Language = null, MergeMediaSource? Source = null);
+    string? Codec = null, string? Identity = null, string? Language = null, MergeMediaSource? Source = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ResourceETag = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ResourceUrlSha256 = null);
 
 public sealed record MergeSubtitle(string Url, string Format, string Language, string? Name = null);
 
@@ -102,6 +104,9 @@ public sealed record MediaMergePlan
             {
                 sb.Append("|T:").Append(t.Role).Append(',').Append(t.FormatId).Append(',').Append(t.Size).Append(',')
                   .Append(t.Container).Append(',').Append(t.Codec).Append(',').Append(t.Identity).Append(',').Append(t.Language);
+                if (t.ResourceETag is not null)
+                    sb.Append(",R:").Append(t.ResourceUrlSha256).Append(',')
+                        .Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(t.ResourceETag))));
                 if (t.Source is not null)
                     sb.Append(",S:").Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(t.Source)))));
             }
@@ -166,6 +171,17 @@ public sealed record MediaMergePlan
                     || (t.Identity?.Length ?? 0) > 512 || (t.Codec?.Length ?? 0) > 64 || (t.Language?.Length ?? 0) > 35
                     || t.Url is not { Length: > 0 and <= 16384 } || !UrlPolicy.TryParse(t.Url, out var uri, out _)) return false;
                 UrlPolicy.EnsureAllowed(uri, allowPrivate);
+                if ((t.ResourceETag is null) != (t.ResourceUrlSha256 is null)) return false;
+                if (t.ResourceETag is { } resourceTag)
+                {
+                    if (t.Source is not null || resourceTag.Length > 256
+                        || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(resourceTag, out var tag)
+                        || tag.IsWeak || tag.Tag == "*" || t.ResourceUrlSha256 is not { Length: 64 } hash
+                        || !hash.All(Uri.IsHexDigit)) return false;
+                    string identity = "http-v1:" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+                        hash + "|" + resourceTag + "|" + t.Size.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+                    if (t.Identity != identity) return false;
+                }
                 if (t.Source is { } source && !ValidSource(t, source, allowPrivate)) return false;
                 if (t.Role == "video") videos++;
                 else if (t.Role == "audio") audios++;

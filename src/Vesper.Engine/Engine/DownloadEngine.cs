@@ -166,7 +166,7 @@ public sealed partial class DownloadEngine : IDisposable
     private void Changed(DownloadJob job) => _outbox.Enqueue(SnapshotLocked(job));
 
     private static bool IsDuplicateCandidate(DownloadJob job) =>
-        job.Kind != JobKind.BrowserFile && job.State is not (JobState.Completed or JobState.Cancelled);
+        job.Kind is not (JobKind.BrowserFile or JobKind.BrowserStream) && job.State is not (JobState.Completed or JobState.Cancelled);
 
     private static bool TryGetDuplicateKey(DownloadJob job, out DuplicateKey key)
     {
@@ -687,6 +687,7 @@ public sealed partial class DownloadEngine : IDisposable
             _disposed = true;
             running = [.. _sessions.Values.Select(s => { s.Intent = StopIntent.Shutdown; s.Cts.Cancel(); return s.RunTask ?? Task.CompletedTask; })];
         }
+        _browserBodies?.Dispose();
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
         DisposeMeteredNetworkWatcher();
         try { Task.WaitAll(running, TimeSpan.FromSeconds(20)); }

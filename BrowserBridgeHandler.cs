@@ -36,6 +36,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             case "media-options":
             case "media-source-options":
+            case "media-group-options":
                 return await MediaOptionsAsync(request, ct);
 
             case "media-select":
@@ -46,6 +47,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "browser-submit":
             case "browser-capture":
                 return await SubmitAsync(request, ct);
+
+            case "browser-body":
+                if (request.BrowserBody is { Operation: "begin", Origin: { } origin }
+                    && SiteRule.ForPage(SiteRule.Normalize(preferences().SiteRules), origin) is { NeverCapture: true })
+                    return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
+                return await engine.ReceiveBrowserBodyAsync(request.Id, request.BrowserBody!, ct);
 
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);

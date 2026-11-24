@@ -458,11 +458,14 @@ internal sealed class Harness : IDisposable
     public DownloadEngine Engine { get; private set; }
 
     private readonly Action<string, string, string, MediaOutput, CancellationToken>? _convertMedia;
+    private readonly long _freeSpaceReserve;
 
     public Harness(Action<string>? failpoint = null, Action<EngineOptions>? tweak = null,
-        Action<string, string, string, MediaOutput, CancellationToken>? convertMedia = null)
+        Action<string, string, string, MediaOutput, CancellationToken>? convertMedia = null,
+        long freeSpaceReserve = 64L * 1024 * 1024)
     {
         _convertMedia = convertMedia;
+        _freeSpaceReserve = freeSpaceReserve;
         Directory.CreateDirectory(Downloads);
         Engine = Start(failpoint, tweak);
     }
@@ -482,7 +485,8 @@ internal sealed class Harness : IDisposable
             StallTimeout = TimeSpan.FromSeconds(5),
             Failpoint = failpoint,
             ConvertMedia = _convertMedia,
-            DefaultFolder = Downloads
+            DefaultFolder = Downloads,
+            FreeSpaceReserve = _freeSpaceReserve
         };
         tweak?.Invoke(options);
         return DownloadEngine.Start(options);

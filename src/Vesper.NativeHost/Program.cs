@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Pipes;
 using System.Text.Json;
 using Vesper.Engine;
 
@@ -18,6 +19,8 @@ internal static class Program
         using Stream input = Console.OpenStandardInput();
         using Stream output = Console.OpenStandardOutput();
         string id = "unknown000";
+        NamedPipeClientStream? bodyPipe = null;
+        string? bodyTransferId = null;
         try
         {
             while (true)
@@ -34,9 +37,35 @@ internal static class Program
                 else
                 {
                     id = request.Id;
-                    persistent = request.Type == "browser-activity"
+                    persistent = request.Type is "browser-activity" or "browser-body"
                         || request.Type == "browser-managed" && request.Operation == "watch";
-                    reply = await HandleAsync(request, json, overall.Token);
+                    if (request.BrowserBody is { Session: true } body)
+                    {
+                        if (bodyPipe is null && body.Operation == "begin")
+                        {
+                            bodyPipe = await OpenBodyPipeAsync(overall.Token);
+                            bodyTransferId = body.TransferId;
+                        }
+                        if (bodyPipe is null || body.TransferId != bodyTransferId)
+                            reply = Serialize(BridgeResponse.Fail(id, "app-unavailable", "The browser copy session is unavailable."));
+                        else
+                        {
+                            // Never reconnect/replay a frame after writing to the desktop.
+                            TimeSpan timeout = body.Operation == "finish" ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(2);
+                            overall.CancelAfter(timeout + TimeSpan.FromSeconds(10));
+                            reply = await BridgePipe.ExchangeAsync(bodyPipe, json, timeout, overall.Token);
+                        }
+                        persistent = bodyPipe is not null && body.Operation is "begin" or "append";
+                    }
+                    else if (bodyPipe is not null)
+                    {
+                        reply = Serialize(BridgeResponse.Fail(id, "invalid", "A browser copy cannot change command types."));
+                        persistent = false;
+                    }
+                    else
+                    {
+                        reply = await HandleAsync(request, json, overall.Token);
+                    }
                 }
                 await BridgeProtocol.WriteFrameAsync(output, reply, overall.Token);
                 // connectNative holds a port only for live Chrome downloads. Other commands stay one-shot.
@@ -49,6 +78,31 @@ internal static class Program
             catch (IOException) { /* Chrome already closed the pipe */ }
             return 1;
         }
+        finally
+        {
+            if (bodyPipe is not null) await bodyPipe.DisposeAsync();
+        }
+    }
+
+    private static async Task<NamedPipeClientStream?> OpenBodyPipeAsync(CancellationToken ct)
+    {
+        string pipe = BridgePipe.NameForCurrentUser();
+        async Task<NamedPipeClientStream?> TryConnect()
+        {
+            try { return await BridgePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(500), ct); }
+            catch (TimeoutException) { return null; }
+            catch (IOException) { return null; }
+        }
+        NamedPipeClientStream? connected = await TryConnect();
+        if (connected is not null || !TryStartApp()) return connected;
+        DateTime deadline = DateTime.UtcNow + LaunchWait;
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(300, ct);
+            connected = await TryConnect();
+            if (connected is not null) return connected;
+        }
+        return null;
     }
 
     private static async Task<string> HandleAsync(BridgeRequest request, string rawJson, CancellationToken ct)
@@ -65,6 +119,7 @@ internal static class Program
         // A browser download or format request can wake the desktop.
         if (request is { Type: "browser-activity", Operation: "watch" }
             || request is { Type: "browser-managed", Operation: "watch" or "complete" }
+            || request is { Type: "browser-body", BrowserBody.Operation: not "begin" }
             || !TryStartApp())
             return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
 

@@ -37,7 +37,8 @@ internal sealed class CandidateProcessor
         _o = options;
     }
 
-    public async Task<CandidateOutcome> ProcessAsync(IEnumerable<MediaCandidate> candidates, MediaRequestContext ctx, CancellationToken ct)
+    public async Task<CandidateOutcome> ProcessAsync(IEnumerable<MediaCandidate> candidates, MediaRequestContext ctx, CancellationToken ct,
+        bool exactAssetGroup = false)
     {
         var outcome = new CandidateOutcome();
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -63,6 +64,14 @@ internal sealed class CandidateProcessor
                 if (!probe.IsSuccess)
                 {
                     outcome.Problems.Add(MediaErrors.FromHttpStatus(probe.StatusCode, c.Url));
+                    continue;
+                }
+
+                // The observed asset key must survive redirects before a direct
+                // representation is allowed to join a grouped picker.
+                if (exactAssetGroup && BrowserAssetIdentity.XVideo(c.Url) != BrowserAssetIdentity.XVideo(probe.FinalUrl))
+                {
+                    outcome.Problems.Add(MediaErrors.Invalid("A source redirected to a different media asset."));
                     continue;
                 }
 
@@ -159,9 +168,26 @@ internal sealed class CandidateProcessor
             || (!ctype.StartsWith("video/") && ext is not null && MediaCandidate.AudioExtensions.Contains(ext))
             || (!ctype.StartsWith("video/") && c.MimeType?.StartsWith("audio/") == true);
 
+        string? resourceHash = null, contentIdentity = null;
+        if (facts is not null && p.StrongETag is { } tag && p.ContentLength is > 0)
+        {
+            resourceHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(p.FinalUrl.AbsoluteUri)));
+            contentIdentity = "http-v1:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(resourceHash + "|" + tag + "|" +
+                    p.ContentLength.Value.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+        }
+
         return new MediaRepresentation
         {
             Id = $"direct-{index}",
+            ResourceETag = resourceHash is not null ? p.StrongETag : null,
+            ResourceUrlSha256 = resourceHash,
+            ContentIdentity = contentIdentity,
+            // An unreadable track table cannot establish equivalent quality.
+            // Keep its endpoint distinct instead of discarding a potential file.
+            DeliveryId = facts is null ? Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(c.Url.AbsoluteUri))) : null,
             Url = c.Url,
             Protocol = StreamProtocol.Http,
             Content = audio ? StreamContent.AudioOnly

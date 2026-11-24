@@ -16,7 +16,7 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
     IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
-    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null);
+    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -73,8 +73,8 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-select"
-                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed"))
+            if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-group-options" or "media-select"
+                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed" or "browser-body"))
             { error = "Unknown request type."; return false; }
 
             string mode = Str(root, "mode") ?? "ask";
@@ -91,11 +91,12 @@ public static class BridgeProtocol
             bool autoSubtitles = false;
             bool embedSubtitles = false;
             BrowserCompletedFile? completedFile = null;
+            BrowserBodyRequest? browserBody = null;
             BridgeItem? mediaAuth = null;
             BrowserTransferProof? browserProof = null;
             BrowserActivity? activity = null;
             string? transferId = null, operation = null;
-            bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options";
+            bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options" or "media-group-options";
             bool browserSubmit = type is "browser-submit" or "browser-capture";
             if (type == "probe" || mediaLookup)
             {
@@ -129,6 +130,8 @@ public static class BridgeProtocol
                 }
                 if (type == "media-source-options" && hints.Count != 1)
                 { error = "Checking a media source requires exactly one hint."; return false; }
+                if (type == "media-group-options" && hints.Count is < 2 or > 5)
+                { error = "Checking a media group requires two to five hints."; return false; }
             }
             else if (type == "media-select")
             {
@@ -209,6 +212,11 @@ public static class BridgeProtocol
                     { error = "Invalid browser download proof."; return false; }
                 }
             }
+            else if (type == "browser-body")
+            {
+                if (!TryBrowserBody(root, out browserBody))
+                { error = "Invalid browser body transfer."; return false; }
+            }
             else if (type == "browser-transfer")
             {
                 transferId = Str(root, "transferId");
@@ -249,13 +257,74 @@ public static class BridgeProtocol
             string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
                 confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
-                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile);
+                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile, browserBody);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
             error = "Malformed message.";
             return false;
+        }
+    }
+
+    private static bool TryBrowserBody(JsonElement root, out BrowserBodyRequest? request)
+    {
+        request = null;
+        string? operation = Str(root, "operation"), transferId = Str(root, "transferId");
+        if (!IsRequestId(transferId)) return false;
+        bool session = false;
+        if (root.TryGetProperty("session", out JsonElement sessionValue))
+        {
+            if (sessionValue.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) return false;
+            session = sessionValue.GetBoolean();
+        }
+        switch (operation)
+        {
+            case "begin":
+            {
+                string? origin = Str(root, "origin"), name = Str(root, "fileName");
+                if (origin is not { Length: > 0 and <= 512 }
+                    || !Uri.TryCreate(origin, UriKind.Absolute, out Uri? page)
+                    || page.Scheme is not ("http" or "https") || page.UserInfo.Length != 0
+                    || page.AbsoluteUri != page.GetLeftPart(UriPartial.Authority) + "/"
+                    || name is not { Length: > 0 and <= 255 } || name.Any(char.IsControl)
+                    || name.IndexOfAny(['/', '\\', ':']) >= 0
+                    || !TryLength(root, "length", out long? length) || length is null or < 1 or > BrowserBodyReceiver.MaxBytes)
+                    return false;
+                request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length, Session: session);
+                return true;
+            }
+            case "append":
+            {
+                string? encoded = Str(root, "chunk"), digest = Str(root, "digest");
+                if (encoded is not { Length: > 0 } || encoded.Length > ((BrowserBodyReceiver.ChunkBytes + 2) / 3) * 4
+                    || digest is not { Length: 64 } || !digest.All(Uri.IsHexDigit)
+                    || !TryLength(root, "offset", out long? offset) || offset is null or > BrowserBodyReceiver.MaxBytes)
+                    return false;
+                byte[] bytes = Convert.FromBase64String(encoded);
+                if (bytes.Length is < 1 or > BrowserBodyReceiver.ChunkBytes
+                    || offset.Value > BrowserBodyReceiver.MaxBytes - bytes.Length) return false;
+                request = new(operation, transferId!, Offset: offset, Bytes: bytes, Digest: digest, Session: session);
+                return true;
+            }
+            case "status":
+            {
+                if (session) return false;
+                string? origin = Str(root, "origin");
+                if (origin is not { Length: > 0 and <= 512 }
+                    || !Uri.TryCreate(origin, UriKind.Absolute, out Uri? page)
+                    || page.Scheme is not ("http" or "https") || page.UserInfo.Length != 0
+                    || page.AbsoluteUri != page.GetLeftPart(UriPartial.Authority) + "/")
+                    return false;
+                request = new(operation, transferId!, page.AbsoluteUri);
+                return true;
+            }
+            case "finish":
+            case "abort":
+                request = new(operation, transferId!, Session: session);
+                return true;
+            default:
+                return false;
         }
     }
 

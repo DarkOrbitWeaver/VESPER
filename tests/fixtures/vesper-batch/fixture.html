@@ -1,0 +1,43 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>VESPER local batch acceptance fixture</title>
+<style>body{font:16px system-ui;max-width:850px;margin:24px auto}nav{display:flex;flex-wrap:wrap;gap:7px}button{padding:8px 12px;cursor:pointer}button[aria-selected=true]{background:#244b35;color:white}#download:disabled{opacity:.6}#content{padding:16px;background:#eee;margin:15px 0}</style></head><body>
+<h1>10 items, one delayed Download button</h1><p>Local regression fixture. No third-party media, credentials, sounds, or tracking.</p>
+<nav role="tablist" id="episodes"></nav>
+<section id="content" data-current-item="episode-01">Episode 1 is ready</section>
+<button id="download" data-item-id="episode-01" data-download-url="/files/episode-01.zip">Download</button>
+<p id="notice" role="status"></p>
+<script>
+(() => {
+ 'use strict';
+ const nav=document.getElementById('episodes'), action=document.getElementById('download');
+ const content=document.getElementById('content'), notice=document.getElementById('notice');
+ let epoch=0;
+ for(let i=1;i<=10;i++){
+  const id='episode-'+String(i).padStart(2,'0');
+  const button=document.createElement('button');button.type='button';
+  button.setAttribute('role','tab');button.setAttribute('data-item-id',id);
+  button.setAttribute('aria-selected',i===1?'true':'false');button.textContent='Episode '+i;
+  button.addEventListener('click',()=>{
+   const myEpoch=++epoch;
+   for(const el of nav.children) el.setAttribute('aria-selected',el===button?'true':'false');
+   content.textContent='Loading '+id+'…';content.dataset.currentItem=id;
+   notice.textContent='The shared button still points to the previous episode.';
+   // The ready control intentionally updates well AFTER the navigation highlight.
+   const delay=i===3?1800:250+(i%4)*180;
+   setTimeout(()=>{
+    if(epoch!==myEpoch)return;
+    action.setAttribute('data-item-id',id);
+    action.setAttribute('data-download-url','/files/'+id+'.zip');
+    content.textContent=id+' is ready';notice.textContent='Button now belongs to '+id;
+   },delay);
+  });
+  nav.append(button);
+ }
+ action.addEventListener('click',()=>{
+  const id=action.dataset.itemId;
+  if(content.dataset.currentItem!==id){notice.textContent='STALE BUTTON CLICK: '+id;return;}
+  const anchor=document.createElement('a');anchor.download=id+'.zip';anchor.href=action.dataset.downloadUrl;
+  anchor.click();anchor.remove();
+  notice.textContent='Browser download requested for '+id;
+ });
+})();
+</script></body></html>

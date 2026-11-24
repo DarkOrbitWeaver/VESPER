@@ -79,24 +79,25 @@ public sealed partial class DownloadEngine
     }
 
     private static bool TryCreateMergeCredentials(MediaMergePlan plan, Uri requestUrl,
-        IReadOnlyDictionary<string, string>? supplied, out RequestCredentials? credentials, out string error)
+        IReadOnlyDictionary<string, string>? supplied, out RequestCredentials? credentials, out string error,
+        bool allowSegmented = false)
     {
         credentials = null;
         error = "";
         if (supplied is not { Count: > 0 }) return true;
-        if (plan.IsSegmented || plan.Tracks.Count == 0
+        if ((!allowSegmented && plan.IsSegmented) || plan.Tracks.Count == 0
             || !UrlPolicy.TryParse(plan.Tracks[0].Url, out Uri first, out _)
             || !UrlPolicy.IsSameOrigin(requestUrl, first))
         {
-            error = "Credentials are supported only for direct merge tracks on the source origin.";
+            error = "The merge credentials require compatible tracks on one source origin.";
             return false;
         }
         foreach (MergeTrack track in plan.Tracks)
         {
-            if (track.Source is not null || !UrlPolicy.TryParse(track.Url, out Uri target, out _)
+            if ((!allowSegmented && track.Source is not null) || !UrlPolicy.TryParse(track.Url, out Uri target, out _)
                 || !UrlPolicy.IsSameOrigin(first, target))
             {
-                error = "Credentials cannot be used with segmented or cross-origin merge tracks.";
+                error = "The requested credential scope is not supported for these merge tracks.";
                 return false;
             }
         }

@@ -522,8 +522,9 @@ public sealed class MediaSourceRescueTests
         var context = new Vesper.MediaResolver.Models.MediaRequestContext
         {
             CookieHeader = "session=authorized",
-            CredentialOrigin = new Uri("https://example.com/"),
-            CredentialHosts = ["example.com"]
+            // Both direct tracks below are served by this exact CDN origin.
+            CredentialOrigin = new Uri("https://cdn.example.com/"),
+            CredentialHosts = ["cdn.example.com"]
         };
         var sameOrigin = Item(
             Rep("137", true, "mp4", "h264", new Uri("https://cdn.example.com/video"), context),

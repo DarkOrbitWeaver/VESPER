@@ -21,6 +21,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
     };
   };
   let onMessage, onCreated, onChanged, onFilename, onHeaders, onRedirect, onMedia, onAlarm, onContextClicked, onInstalled, onStorageChanged;
+  const redirectListeners = [];
   const sent = [];
   const policyRequests = [];
   const preflights = [];
@@ -84,6 +85,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       }
     },
     webRequest: {
+      onBeforeRequest: { addListener: () => {} },
       onResponseStarted: {
         addListener: (fn, filter) => {
           if (filter?.tabId !== undefined) manifestWatchers.set(filter.tabId, fn);
@@ -94,7 +96,10 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
         }
       },
       onHeadersReceived: { addListener: fn => { onHeaders = fn; } },
-      onBeforeRedirect: { addListener: fn => { onRedirect = fn; } }
+      onBeforeRedirect: { addListener: fn => {
+        redirectListeners.push(fn);
+        onRedirect = details => { for (const listener of redirectListeners) listener(details); };
+      } }
     },
     tabs: {
       onUpdated: event, onRemoved: event, query: async () => [],
@@ -192,7 +197,11 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const context = { chrome, URL, Date: TestDate, TextEncoder, Uint8Array, crypto: { subtle, randomUUID: () => `test-uuid-${++sequence}-aaaa` }, navigator: { userAgent: 'test' }, setTimeout: testSetTimeout, clearTimeout: testClearTimeout, console };
   vm.createContext(context);
   context.importScripts = (...files) => {
-    for (const file of files) vm.runInContext(readFileSync(new URL(`../../extension/${file}`, import.meta.url), 'utf8'), context);
+    for (const file of files) {
+      const path = `../../extension/${file}`;
+      const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+      vm.runInContext(source, context);
+    }
   };
   vm.runInContext(readFileSync(new URL('../../extension/background.js', import.meta.url), 'utf8') + '\n;globalThis.__describe = describe;', context);
   return { describe: context.__describe, sent, preflights, policyRequests, actions, cookieLookups, badges, contextMenuItems, tabMessages, local, sessionData, downloadHistory, timerDelays, onCreated, onChanged, onHeaders, onRedirect, onMedia, onContextClicked, ports,
@@ -544,6 +553,7 @@ test('automatic capture checks the referrer, original URL and final URL hosts', 
       localData: { signInHosts: [new URL(scenario.finalUrl).hostname] }
     });
 
+    await app.onRedirect({url: file.url, redirectUrl: file.finalUrl, requestId: 'download-request', method: 'GET', type: 'main_frame'});
     await observe(app, file);
     await app.onCreated(file);
 
@@ -1642,6 +1652,34 @@ test('YouTube playlist changes use the live watch URL and omit the previous play
   assert.equal(app.sent[0].pageTitle, undefined);
 });
 
+test('native collection picker uses the supplied same-frame URL and rejects another origin', async () => {
+  const app = load({ 'media-picker': { ok: true } });
+  const home = 'https://www.youtube.com/';
+  const page = home + 'watch?v=abcdefghijk&list=PLexample';
+  const sender = { url: home, tab: { id: 5, url: home }, frameId: 0, documentId: 'collection' };
+  assert.equal((await app.message({ type: 'native-picker', pageUrl: page, title: 'Playlist' }, sender)).ok, true);
+  assert.equal(app.sent.at(-1).type, 'media-picker');
+  assert.equal(app.sent.at(-1).url, page);
+  const count = app.sent.length;
+  for (const url of ['https://other.example/playlist', 'javascript:alert(1)', 'https://user@www.youtube.com/playlist'])
+    assert.equal((await app.message({ type: 'native-picker', pageUrl: url }, sender)).code, 'invalid');
+  assert.equal(app.sent.length, count);
+});
+
+test('format cache does not reuse collection metadata for another playlist containing the same video', async () => {
+  const app = load({ 'media-options': message => ({ ok: true, data: {
+    choices: [{ index: 0, label: 'Best quality' }], collectionUrl: message.url, hasRelatedCollection: true
+  } }) });
+  const first = 'https://www.youtube.com/watch?v=abcdefghijk&list=PLfirst';
+  const second = 'https://www.youtube.com/watch?v=abcdefghijk&list=PLsecond';
+  const sender = { url: first, tab: { id: 5, url: first }, frameId: 0, documentId: 'collection' };
+  const options = pageUrl => app.message({ type: 'media-options', pageUrl, playerPageUrl: pageUrl, generation: 1 }, sender);
+  assert.equal((await options(first)).data.collectionUrl, first);
+  assert.equal((await options(second)).data.collectionUrl, second);
+  assert.equal((await options(second)).data.collectionUrl, second);
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 2);
+});
+
 test('a blob player only receives its declared manifest from its current frame and page', async () => {
   const app = load({ 'media-options': { ok: true } });
   const previous = 'https://example.com/first';
@@ -2608,14 +2646,13 @@ test('sign-in context is used only during a fresh capture and a failed attempt d
 // The browser stamps this sender; a web page cannot forge the extension's own origin.
 const contentScript = { tab: { id: 7, url: 'https://shop.example/item' }, url: 'https://shop.example/item', frameId: 0, documentId: 'doc-1' };
 
-test('the native collection picker ignores a page-supplied URL from content scripts', async () => {
+test('the native collection picker rejects a page-supplied cross-origin URL instead of opening the wrong page', async () => {
   const app = load({ 'media-picker': { ok: true } });
   const result = await app.message({ type: 'native-picker', pageUrl: 'https://attacker.example/playlist' }, contentScript);
 
-  assert.equal(result.ok, true);
-  const request = app.sent.find(message => message.type === 'media-picker');
-  assert.equal(request.url, contentScript.url);
-  assert.notEqual(request.url, 'https://attacker.example/playlist');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid');
+  assert.equal(app.sent.some(message => message.type === 'media-picker'), false);
 });
 
 test('a content script cannot use the commands reserved for VESPER pages', async () => {
@@ -3190,14 +3227,14 @@ test('the clicked TikTok card takes precedence over its temporary preview file',
   assert.equal(app.sent[0].url, page);
 });
 
-test('a link without a usable web address explains the failure in the clicked frame', async () => {
+test('an unavailable generated file explains the failure in the clicked frame', async () => {
   const app = load();
   await app.onContextClicked({ menuItemId: 'vesper-download', linkUrl: 'blob:https://example.com/item', frameId: 2 }, { id: 3 });
   assert.equal(app.sent.length, 0);
   const notice = app.tabMessages.at(-1);
   assert.equal(notice.options.frameId, 2);
   assert.equal(notice.message.type, 'vesper-context-notice');
-  assert.match(notice.message.reply.message, /web address/);
+  assert.match(notice.message.reply.message, /browser file is no longer available/);
 });
 
 test('right-clicking a blob video opens the media picker for the page instead of failing silently', async () => {
@@ -3349,4 +3386,332 @@ test('CHIPS lookup uses the browser-stamped frame partition', async () => {
   assert.equal(result.length, 1);
   assert.equal(result[0].name, 'partition');
   assert.equal(app.evaluate('cookieQueries[1].partitionKey.topLevelSite'), 'https://top.example');
+});
+
+test('resource witnesses enter the five-source verification budget before weaker candidates', async () => {
+  const page = 'https://video.example/watch/resource-witness';
+  const sender = { url: page, tab: { id: 38 }, frameId: 0, documentId: 'witness-budget-doc' };
+  const changedAt = Date.now();
+  const app = load({ 'media-options': { ok: false, code: 'no-media' },
+    'media-source-options': checkedSource() });
+  const actual = 'https://cdn.video.example/actual.m3u8';
+  try {
+    for (let index = 0; index < 7; index++) {
+      await app.onMedia({ url: `https://cdn.video.example/noise-${index}.m3u8`, tabId: 38, frameId: 0,
+        documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+        timeStamp: changedAt + index, responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+    }
+    await app.onMedia({ url: actual, tabId: 38, frameId: 0, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt - 12000,
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+    const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+      playerUrl: 'blob:https://video.example/player', generation: 10, playerPlaying: true,
+      mediaChangedAt: changedAt, resourceUrls: [actual] }, sender);
+    const checks = app.sent.filter(message => message.type === 'media-source-options');
+    assert.equal(checks.length, 5);
+    assert.equal(checks[0].candidates[0].url, actual);
+    assert.ok(result.data?.sourceChoices?.length);
+  } finally { app.stopWorker(); }
+});
+
+test('watched video tabs discover extensionless complete media without accepting segments or unrelated data', async () => {
+  const app = load({ 'media-source-options': checkedSource() });
+  const page = 'https://video.example/watch/typed-media';
+  const sender = { url: page, tab: { id: 34 }, frameId: 0, documentId: 'typed-media-doc' };
+  const changedAt = Date.now();
+  const actual = 'https://unfamiliar-cdn.example/object?id=42';
+  try {
+    await app.message({ type: 'media-element', watching: true }, sender);
+    const observe = app.manifestWatchers.get(34);
+    const report = (url, mime, overrides = {}) => observe({ url, tabId: 34, frameId: 0,
+      documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+      timeStamp: changedAt, responseHeaders: [{ name: 'Content-Type', value: mime }], ...overrides });
+    await report(actual, 'video/mp4');
+    await report('https://unfamiliar-cdn.example/object?segment=1', 'video/mp4');
+    await report('https://unfamiliar-cdn.example/unrelated', 'application/json');
+    await report('https://unfamiliar-cdn.example/other-tab', 'video/mp4', { tabId: 999 });
+    await report('https://unfamiliar-cdn.example/post-only', 'video/mp4', { method: 'POST' });
+    const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+      playerUrl: 'blob:https://video.example/player', generation: 1, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+    assert.equal(result.data?.sourceChoices?.length, 1);
+    assert.deepEqual(app.sent.filter(message => message.type === 'media-source-options')
+      .map(message => message.candidates[0].url), [actual]);
+  } finally { app.stopWorker(); }
+});
+
+test('playback transitions renew a watched tab without adding duplicate listeners', async () => {
+  const app = load();
+  const sender = { url: 'https://video.example/watch', tab: { id: 52 }, frameId: 0, documentId: 'renew-doc' };
+  try {
+    await app.message({ type: 'media-element', watching: true }, sender);
+    const first = app.manifestWatchers.get(52);
+    app.advanceTime(120000);
+    await app.message({ type: 'media-element', watching: true }, sender);
+    assert.equal(app.manifestWatchers.get(52), first);
+    app.advanceTime(120000);
+    await app.message({ type: 'media-element', watching: true }, sender);
+    assert.equal(app.manifestWatchers.get(52), first);
+    assert.equal(app.manifestWatchers.size, 1);
+  } finally { app.stopWorker(); }
+});
+
+test('probe diversity does not let signed variants crowd out other media families', () => {
+  const app = load({});
+  try {
+    const rank = app.evaluate('rankObservedSources');
+    const changedAt = 1000000;
+    const variant = i => ({url: 'https://cdn.test/video.m3u8?quality=720&sig=' + i, kind:'hls', seen:changedAt+i});
+    const other = {url:'https://cdn.test/video.m3u8?quality=1080&sig=x',kind:'hls',seen:changedAt+1000};
+    const unrelated = {url:'https://cdn.test/other.mpd',kind:'dash',seen:changedAt+2000};
+    const sources = [...Array.from({length:6},(_,i)=>variant(i)),other,unrelated];
+    const ranked = rank(sources,changedAt);
+    assert.equal(ranked[0].url, sources[0].url);
+    assert.ok(ranked.slice(0,3).includes(other));
+    assert.ok(ranked.slice(0,3).includes(unrelated));
+    assert.deepEqual(new Set([...ranked]),new Set(sources));
+  } finally { app.stopWorker(); }
+});
+
+test('generated blob context action is sent only to the clicked frame, never native as a URL', async () => {
+  const app=load({});
+  try {
+    await app.onContextClicked({menuItemId:'vesper-download',linkUrl:'blob:https://example.com/test-blob',frameId:7}, {id:4,url:'https://example.com/'});
+    assert.equal(app.sent.length,0);
+    assert.ok(app.tabMessages.some(m=>m.tabId===4 && m.options.frameId===7 && m.message.type==='vesper-copy-generated'));
+  } finally {app.stopWorker();}
+});
+test('body receipt is read-only and bound to the original tab, frame and document', async () => {
+  const id='10945678-1234-1234-1234-123456789abc';
+  const sender={tab:{id:8},frameId:1,documentId:'doc-receipt-01',url:'https://example.com/private'};
+  const app=load({'browser-body':{ok:true,data:{accepted:true,jobId:'job',offset:12}}});
+  try {
+    await app.evaluate('rememberBodyReceipt') (id,{...sender,id:'vesper-test'});
+    assert.equal((await app.message({type:'browser-body-status',transferId:id},{...sender,documentId:'other-document'})).ok,false);
+    assert.equal(app.sent.length,0);
+    assert.equal((await app.message({type:'browser-body-status',transferId:id},sender)).ok,true);
+    assert.equal(app.sent[0].operation,'status');
+    assert.equal(app.sent[0].origin,'https://example.com/');
+  } finally {app.stopWorker();}
+});
+test('conflicting cross-document attachment responses with identical validators are ambiguous', async () => {
+  const file=activeDownload();
+  const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{download:file});
+  try {
+    for (const tabId of [3,4]) await app.onHeaders({url:file.url,requestId:'conflict-'+tabId,tabId,frameId:0,
+      documentId:'document-'+tabId,method:'GET',type:'main_frame',statusCode:200,responseHeaders:responseHeaders(zipHeaders)});
+    await app.onCreated(file);
+    assert.equal(app.sent.filter(isBrowserSubmission).length,0);
+    assert.equal(file.paused,false);
+    assert.equal(outcomeOf(app),'changed');
+  } finally {app.stopWorker();}
+});
+
+test('browser-session acquisition requires the exact current media document and a strong range validator', async () => {
+  const page='https://video.example/watch/1', url='https://video.example/media/movie.mp4';
+  const sender={tab:{id:71},frameId:0,documentId:'media-document-71',url:page};
+  const app=load({'media-options':{ok:false,code:'sign-in',message:'Browser session required'}});
+  const changedAt=Date.now();
+  const selection={pageUrl:page,playerPageUrl:page,playerUrl:url,generation:1,mediaChangedAt:changedAt,playerHasMedia:true};
+  const request={type:'browser-body-media-proof',...selection};
+  try {
+    const report=(tag,other={})=>app.onMedia({url,tabId:71,frameId:0,documentId:sender.documentId,
+      method:'GET',statusCode:206,type:'media',timeStamp:changedAt,
+      responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Range':'bytes 0-999/700000',
+        'Content-Length':'1000',ETag:tag}),...other});
+    await report('"movie-v1"');
+    const options=await app.message({type:'media-options',...selection},sender);
+    assert.equal(options.data?.browserBodyAvailable,true);
+    const proof=await app.message(request,sender);
+    assert.equal(proof.ok,true);
+    assert.equal(proof.data.etag,'"movie-v1"');
+    assert.equal(proof.data.length,700000);
+    assert.equal((await app.message(request,{...sender,documentId:'other-document'})).ok,false);
+    assert.equal((await app.message({...request,playerUrl:'https://cdn.example/movie.mp4'},sender)).ok,false);
+    assert.equal((await app.message({...request,mediaChangedAt:changedAt+60000},sender)).ok,false);
+    await report('"different-version"');
+    assert.equal((await app.message(request,sender)).ok,false);
+  } finally {app.stopWorker();}
+});
+test('Chrome-only routing cannot request a browser-native media proof', async () => {
+  const app=load({}, {prefs:{route:'chrome'}});
+  try {
+    const result=await app.message({type:'browser-body-media-proof',playerUrl:'https://example.test/a.mp4'},
+      {tab:{id:1},frameId:0,documentId:'proof-doc-1',url:'https://example.test/'});
+    assert.equal(result.ok,false);
+    assert.equal(app.sent.length,0);
+  } finally {app.stopWorker();}
+});
+
+test('incompatible installed helper produces one useful error and no unchecked stream choices', async()=>{
+  const page='https://x.com/example/status/1234567890', changedAt=Date.now();
+  const sender={url:page,tab:{id:74},frameId:0,documentId:'x-helper-version-test'};
+  const app=load({'media-source-options':{ok:false,code:'invalid',message:'Unknown request type.'}});
+  try {
+    for(let i=0;i<9;i++) await app.onMedia({url:'https://cdn.test/video'+i+'.m3u8',tabId:74,frameId:0,documentId:sender.documentId,
+      method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':'application/vnd.apple.mpegurl'})});
+    const result=await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://x.com/fixture',
+      generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
+    assert.equal(result.code,'desktop-version-mismatch');
+    assert.equal(result.data?.sourceChoices,undefined);
+    assert.equal(app.sent.filter(m=>m.type==='media-source-options').length,5);
+  } finally {app.stopWorker();}
+});
+test('additional source candidates must pass verification before appearing in the picker', async()=>{
+  const page='https://x.com/example/status/1234567890', changedAt=Date.now();
+  const sender={url:page,tab:{id:75},frameId:0,documentId:'x-verified-sources-test'};
+  let count=0;
+  const app=load({'media-source-options':()=>++count===7?checkedSource(11):{ok:false,code:'source-unavailable'}});
+  try {
+    for(let i=0;i<9;i++) await app.onMedia({url:'https://cdn.test/video'+i+'.m3u8',tabId:75,frameId:0,documentId:sender.documentId,
+      method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':'application/vnd.apple.mpegurl'})});
+    const result=await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://x.com/fixture',
+      generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
+    assert.equal(result.ok,true);
+    assert.equal(result.data.verifiedSources,true);
+    assert.equal(result.data.sourceChoices.length,1);
+    assert.equal(count,9);
+  } finally {app.stopWorker();}
+});
+test('only identical verified delivery fingerprints collapse, not identical qualities',()=>{
+  const app=load();
+  try {
+    const distinct=app.evaluate('distinctVerifiedDeliveries');
+    const reply=fingerprint=>({reply:{ok:true,data:{deliveryFingerprint:fingerprint,choices:[{label:'480p'}]}}});
+    const items=[reply('a'.repeat(64)),reply('a'.repeat(64)),reply('b'.repeat(64)),reply(undefined)];
+    assert.deepEqual([...distinct(items,false)],[items[0],items[2],items[3]]);
+    assert.equal(distinct(items,true).length,4);
+  } finally {app.stopWorker();}
+});
+test('X post identity is stable across query strings and distinguishes explicit video indexes',()=>{
+  const app=load();
+  try {
+    const identity=app.evaluate('VesperPlayerSource.identity');
+    assert.equal(identity('https://x.com/example/status/1234567890?s=20'),'x:1234567890');
+    assert.equal(identity('https://twitter.com/example/status/1234567890'),'x:1234567890');
+    assert.notEqual(identity('https://x.com/example/status/1234567890/video/1'),identity('https://x.com/example/status/1234567890/video/2'));
+    assert.equal(identity('https://x.com/example'),'https://x.com/example');
+  } finally {app.stopWorker();}
+});
+
+test('X grouped picker checks same-asset variants together and separates different asset IDs',async()=>{
+  const page='https://x.com/example/status/1234567890',changedAt=Date.now();
+  const sender={url:page,tab:{id:78},frameId:0,documentId:'x-group-test'};
+  const base='https://video.twimg.com/ext_tw_video/9876543210/pu/';
+  const app=load({'media-group-options':checkedSource(18),'media-source-options':checkedSource(11)});
+  try {
+    for(const url of [base+'pl/master.m3u8',base+'vid/480x480/file.mp4','https://video.twimg.com/ext_tw_video/9876543211/pu/pl/other.m3u8']){
+      const mime=url.endsWith('.mp4')?'video/mp4':'application/vnd.apple.mpegurl';
+      await app.onMedia({url,tabId:78,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'xmlhttprequest',
+        timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':mime})});
+    }
+    const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://x.com/fixture',
+      generation:1,playerPlaying:true,mediaChangedAt:changedAt};
+    const result=await app.message(request,sender);
+    assert.equal(result.ok,true);
+    assert.equal(result.data.sourceChoices.length,2);
+    assert.equal(app.sent.filter(m=>m.type==='media-group-options').length,1);
+    const grouped=app.sent.find(m=>m.type==='media-group-options');
+    assert.equal(grouped.candidates.length,2);
+    assert.ok(grouped.candidates.every(c=>c.url.startsWith(base)));
+    assert.equal(app.sent.filter(m=>m.type==='media-source-options').length,1);
+    const row=result.data.sourceChoices.find(c=>c.label.startsWith('0:18'));
+    const selected=await app.message({type:'media-source-select',sourceChoice:row.token,pageUrl:page,generation:1,playerUrl:request.playerUrl},sender);
+    assert.equal(selected.ok,true);
+    assert.equal(selected.data.duration,18);
+  }finally{app.stopWorker();}
+});
+test('provider grouping never trusts a lookalike CDN or profile URL',()=>{
+  const app=load();
+  try{
+    const group=app.evaluate('groupObservedAssets');
+    const source=url=>({url,kind:'direct'});
+    const urls=[source('https://video.twimg.com/ext_tw_video/9876543210/pu/vid/a.mp4'),
+      source('https://video.twimg.com/ext_tw_video/9876543210/pu/vid/b.mp4'),
+      source('https://video.twimg.com.evil.example/ext_tw_video/9876543210/pu/vid/c.mp4')];
+    assert.equal(group(urls,'x:1234567890').length,2);
+    assert.equal(group(urls,'https://x.com/example').length,3);
+  }finally{app.stopWorker();}
+});
+
+test('rejected grouping checks original members independently rather than losing valid formats',async()=>{
+  const app=load({'media-group-options':{ok:false,code:'invalid',message:'Different media asset'},
+    'media-source-options':request=>request.candidates[0].url.endsWith('a.mp4')?checkedSource(18):{ok:false,code:'source-unavailable'}});
+  const base='https://video.twimg.com/ext_tw_video/9876543210/pu/vid/';
+  try{
+    const verify=app.evaluate('verifyObservedSources');
+    const members=[{url:base+'a.mp4',kind:'direct'},{url:base+'b.mp4',kind:'direct'}];
+    const checked=await verify([{...members[0],group:members}],{auth:{},pageUrl:'https://x.com/user/status/1234567890',title:'Fixture'});
+    assert.equal(checked.length,2);
+    assert.equal(checked.filter(r=>r.reply.ok).length,1);
+    assert.equal(checked.find(r=>r.reply.ok).source.url,base+'a.mp4');
+    assert.equal(app.sent.length,3);
+  }finally{app.stopWorker();}
+});
+test('strict recipe subset is suppressed only when auxiliary tracks are also identical',()=>{
+  const app=load();
+  try {
+    const distinct=app.evaluate('distinctVerifiedDeliveries');
+    const a='a'.repeat(64),b='b'.repeat(64),x='c'.repeat(64),y='d'.repeat(64);
+    const source=(recipes,tracks)=>({reply:{ok:true,data:{deliveryRecipeFingerprints:recipes,deliveryTrackFingerprint:tracks,choices:[{label:'Video'}]}}});
+    const smaller=source([a],x),larger=source([a,b],x),different=source([a],y),unknown=source([a],undefined);
+    assert.deepEqual([...distinct([smaller,larger,different,unknown],false)],[larger,different,unknown]);
+    assert.equal(distinct([smaller,larger],true).length,2);
+  } finally {app.stopWorker();}
+});
+test('cross-origin browser proof requires observed exposed validator and exact CORS permission',async()=>{
+  const page='https://video.example/watch',url='https://cdn.example/file.mp4',changedAt=Date.now();
+  const sender={tab:{id:83},frameId:0,documentId:'cors-proof-83',url:page};
+  const request={type:'browser-body-media-proof',pageUrl:page,playerPageUrl:page,playerUrl:url,generation:1,mediaChangedAt:changedAt,playerHasMedia:true};
+  const app=load({}, {prefs:{useSignIn:true}});
+  try {
+    const report=headers=>app.onMedia({url,tabId:83,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'media',
+      timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Length':'10000',ETag:'"asset-v1"',...headers})});
+    await report({'Access-Control-Allow-Origin':'*'});
+    assert.equal((await app.message(request,sender)).ok,false);
+    await report({'Access-Control-Allow-Origin':'*','Access-Control-Expose-Headers':'ETag'});
+    assert.equal((await app.message(request,sender)).data.credentials,'omit');
+    assert.equal((await app.message({...request,playerCrossOrigin:'use-credentials'},sender)).ok,false);
+    await report({'Access-Control-Allow-Origin':'https://video.example','Access-Control-Allow-Credentials':'true','Access-Control-Expose-Headers':'ETag'});
+    assert.equal((await app.message({...request,playerCrossOrigin:'use-credentials'},sender)).data.credentials,'include');
+    assert.equal((await app.message(request,{...sender,documentId:'cors-other-doc'})).ok,false);
+  } finally {app.stopWorker();}
+});
+
+test('stale attachment evidence cannot take over a new download', async()=>{
+  const file=activeDownload();
+  const app=load({'browser-capture':started,'browser-submit':started},{download:file,prefs:{intercept:true,route:'auto'}});
+  await observe(app,file,{requestId:'old-attachment'});
+  await waitFor(()=>!!app.evaluate('recentResponse('+JSON.stringify(file.url)+')'),'Attachment response was not recorded');
+  app.advanceTime(16000);
+  await app.onCreated(file);
+  await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(app.sent.filter(isBrowserSubmission).length,0);
+  assert.equal(file.paused,false);
+});
+test('verified XHR media accepts anonymous CORS wildcard exposure but not credentialed wildcard',async()=>{
+  const app=load(), page='https://example.com/watch', url='https://cdn.example.com/movie.mp4';
+  const changedAt=Date.now();
+  const sender={url:page,tab:{id:7},frameId:0,documentId:'doc-body-1'};
+  const msg={playerUrl:url,pageUrl:page,playerPageUrl:page,generation:1,mediaChangedAt:changedAt};
+  await app.onMedia({url,tabId:7,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,
+    type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:[
+      {name:'Content-Type',value:'video/mp4'},{name:'Content-Length',value:'700000'},
+      {name:'ETag',value:'"v1"'},{name:'Access-Control-Allow-Origin',value:'*'},
+      {name:'Access-Control-Expose-Headers',value:'*'}]});
+  const proof=await app.message({...msg,type:'browser-body-media-proof'},sender);
+  assert.equal(proof.ok,true);
+  assert.equal(proof.data.credentials,'omit');
+  const refused=await app.message({...msg,type:'browser-body-media-proof',playerCrossOrigin:'use-credentials'},sender);
+  assert.equal(refused.ok,false);
+});
+test('out-of-order media callbacks cannot restore an obsolete ETag or CORS policy',async()=>{
+  const app=load(), url='https://cdn.example.com/movie.mp4', at=Date.now();
+  const base={url,documentId:'doc-body-1',frameId:0,kind:'direct',mime:'video/mp4',bytes:700000};
+  await app.evaluate('addSource(7,'+JSON.stringify({...base,seen:at,validator:'"v2"',corsOrigin:null})+')');
+  await app.evaluate('addSource(7,'+JSON.stringify({...base,seen:at-500,validator:'"v1"',corsOrigin:'*'})+')');
+  const state=await app.evaluate('tabState(7)');
+  assert.equal(state.sources.length,1);
+  assert.equal(state.sources[0].validator,'"v2"');
+  assert.equal(state.sources[0].corsOrigin,null);
+  assert.equal(state.sources[0].conflictingValidator,true);
 });

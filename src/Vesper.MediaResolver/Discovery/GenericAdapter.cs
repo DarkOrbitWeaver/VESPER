@@ -87,7 +87,10 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
             ?? (meta is not null ? new MediaRequestContext { Referer = UrlUtil.WithoutFragment(pageUrl).AbsoluteUri } : MediaRequestContext.Empty);
         if (additionalCandidates is not null) candidates.AddRange(additionalCandidates);
 
-        var outcome = await _svc.Candidates.ProcessAsync(candidates, ctx, ct).ConfigureAwait(false);
+        var outcome = await _svc.Candidates.ProcessAsync(candidates, ctx, ct, request.Options.ExactBrowserAssetGroup).ConfigureAwait(false);
+        if (request.Options.ExactBrowserAssetGroup
+            && outcome.Problems.FirstOrDefault(problem => problem.Code == MediaErrorCode.InvalidInput) is { } invalid)
+            return MediaDiscoveryResult.Failure(invalid);
 
         if (outcome.Representations.Count == 0)
         {

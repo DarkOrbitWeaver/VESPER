@@ -169,7 +169,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         try
         {
             RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
-            using var response = await http.SendAsync(uri, new RequestSpec(from, toInclusive, Referer: Job.Referer,
+            using var response = await http.SendAsync(uri, new RequestSpec(from, toInclusive, IfRangeEtag: track.ResourceETag, Referer: Job.Referer,
                 UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
                 CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl), ct).ConfigureAwait(false);
             int status = (int)response.StatusCode;
@@ -182,6 +182,13 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     HttpFacts.RetryAfter(response, DateTimeOffset.UtcNow)),
                 _ => RunOutcome.NeedsAttention("http-status", $"The media server answered HTTP {status}.")
             });
+            if (track.ResourceETag is { } tag)
+            {
+                Uri final = response.RequestMessage?.RequestUri ?? uri;
+                string hash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(final.AbsoluteUri)));
+                if (response.Headers.ETag?.ToString() != tag || hash != track.ResourceUrlSha256)
+                    throw new RunnerStop(Stop("The selected media file changed after verification. Saved track data was kept."));
+            }
             if (!HttpFacts.IsIdentityEncoded(response) || HttpFacts.IsHtml(response))
                 throw new RunnerStop(Stop("The media server sent compressed data or an HTML page."));
             var check = HttpFacts.CheckRangeResponse(response, from, toInclusive);

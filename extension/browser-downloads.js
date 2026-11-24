@@ -254,7 +254,7 @@ async function persistRequestChainsForDownload(item, generation) {
 }
 
 async function rememberRequestRedirect(details, generation, admissionGeneration = captureAdmissionGeneration) {
-  if (!(await captureCanBegin(generation, admissionGeneration))) return;
+  if (details.incognito || !(await captureCanBegin(generation, admissionGeneration))) return;
   const chain = updateRequestChain(details.requestId, withoutFragment(details.url), details.method);
   if (chain && typeof details.redirectUrl === 'string') {
     chain.currentUrl = withoutFragment(details.redirectUrl);
@@ -266,7 +266,7 @@ async function rememberRequestRedirect(details, generation, admissionGeneration 
 
 // Remember only the response facts needed to identify an attachment. No request bodies or credential headers.
 async function observeDownloadResponse(details, generation, admissionGeneration = captureAdmissionGeneration) {
-  if (!(await captureCanBegin(generation, admissionGeneration))) return;
+  if (details.incognito || !(await captureCanBegin(generation, admissionGeneration))) return;
   if (isPreflightCandidate(details)) void preflightNativeCapture(generation, admissionGeneration);
   const url = withoutFragment(details.url);
   const chain = updateRequestChain(details.requestId, url, details.method, details.statusCode);
@@ -288,16 +288,23 @@ async function observeDownloadResponse(details, generation, admissionGeneration 
   if (!attachment && !fileResponse && mime !== 'application/octet-stream') return;
   if (chain?.replayable) chain.persisted = true;
   const old = responses.get(url);
+  const scope = Number.isSafeInteger(details.tabId) && details.tabId >= 0
+    ? [details.tabId, details.frameId ?? 0, details.documentId || ''].join(':') : undefined;
+  const originalUrl = chain?.originalUrl;
   const conflicts = old && Date.now() - old.seen <= RESPONSE_LIFETIME
     && (!old.replay || old.etag && etag && old.etag !== etag
-        || old.length !== undefined && length !== undefined && old.length !== length);
+        || old.length !== undefined && length !== undefined && old.length !== length
+        || old.contentType && mime && old.contentType !== mime
+        || old.originalUrl && originalUrl && old.originalUrl !== originalUrl
+        || old.scope && scope && old.scope !== scope && old.requestId !== details.requestId);
   // "why" is the plain reason VESPER must not fetch this file again by itself. The popup explains it.
   let why;
   if (!chain?.replayable || details.method !== 'GET') why = 'form';
   else if (encoding && encoding !== 'identity') why = 'compressed';
   else if (conflicts) why = old.why || 'changed';
   responses.delete(url);
-  responses.set(url, { seen: Date.now(), replay: !why, why, length, etag, contentType: mime, attachment });
+  responses.set(url, { seen: Date.now(), replay: !why, why, length, etag, contentType: mime, attachment,
+    originalUrl, scope, requestId: details.requestId });
   const waiting = chain ? [...awaitingResponses.values()].filter(entry =>
     entry.url === chain.originalUrl || entry.url === chain.currentUrl) : [];
   const captured = [];
@@ -371,15 +378,29 @@ chrome.webRequest.onBeforeRedirect.addListener(details => {
 
 function recentResponse(url) {
   const observed = responses.get(url);
-  return observed && Date.now() - observed.seen <= RESPONSE_LIFETIME ? observed : undefined;
+  return observed && Date.now() >= observed.seen && Date.now() - observed.seen <= RESPONSE_LIFETIME ? observed : undefined;
+}
+
+// A stored response can outlive a different click of the same URL. Tie it to
+// the short-lived onCreated observation, not just the response cache's retention.
+function responseForDownload(item) {
+  const observed = recentResponse(browserUrl(item));
+  const created = createdDownloads.get(item?.id);
+  if (!observed || !created || created.startTime !== item.startTime
+      || observed.seen < created.seen - NEW_DOWNLOAD_WINDOW) return undefined;
+  if (Number.isSafeInteger(item.tabId) && observed.scope
+      && Number(observed.scope.split(':', 1)[0]) !== item.tabId) return undefined;
+  return observed;
 }
 
 // VESPER needs a strong ETag before it can verify that a new request returns Chrome's representation.
 // Without one, "reason" says in one word why Chrome keeps the download.
 function downloadProof(item, manual) {
-  const hint = recentResponse(browserUrl(item));
+  const hint = responseForDownload(item);
   if (!hint && !manual) return { reason: 'unseen' };
   if (hint && !hint.replay) return { reason: hint.why || 'form' };
+  // A response for another redirect chain is not proof for this Chrome download.
+  if (hint?.originalUrl && hint.originalUrl !== startUrl(item)) return { reason: 'changed' };
   const size = knownSize(item);
   if (size !== undefined && hint?.length !== undefined && size !== hint.length) return { reason: 'changed' };
   if (!hint?.etag) return { reason: 'no-validator' };
@@ -388,7 +409,7 @@ function downloadProof(item, manual) {
 }
 
 function canPauseBeforeNative(item, proof) {
-  const response = recentResponse(browserUrl(item));
+  const response = responseForDownload(item);
   const now = Date.now();
   return capturePreflightReadyAt > 0 && now >= capturePreflightReadyAt
     && now - capturePreflightReadyAt <= EARLY_CAPTURE_WINDOW
@@ -1003,6 +1024,12 @@ async function finishBrowserHandoff(id, record) {
         try {
           await chrome.downloads.cancel(id);
           const cancelled = await getChromeDownload(id);
+          // This path already has native completion proof. Credit the batch only
+          // after our cancellation is confirmed for the exact zero-byte item.
+          if (captureEnabled && !record.preserveChrome && sameDownload(cancelled, record)
+              && cancelled.state === 'interrupted' && cancelled.bytesReceived === 0
+              && cancelled.error === 'USER_CANCELED')
+            await globalThis.VesperBatchEvents?.noteNativeCompletion(id, record.startTime).catch(() => {});
           if (sameDownload(cancelled, record) && cancelled.state === 'interrupted'
               && cancelled.error?.startsWith('USER_')) {
             await writeBrowserRecord(id, captureEnabled
@@ -1154,7 +1181,7 @@ async function captureChromeDownload(item, generation = captureGeneration, admis
   const url = browserUrl(item);
   const { proof, reason } = downloadProof(item, false);
   if (!proof) {
-    if (!recentResponse(url)) await rememberWaitingResponse(item, url, generation);
+    if (!responseForDownload(item)) await rememberWaitingResponse(item, url, generation);
     else if (awaitingResponses.delete(item.id)) await saveCaptureState(generation);
     if (wanted && await captureCanBegin(generation, admissionGeneration)) await noteDecision(item, reason);
     return;

@@ -33,6 +33,11 @@ string? fixture = Value("--fixture");
 string url = Value("--url") ?? "https://www.youtube.com/watch?v=EK3tCffac5k";
 bool warm = args.Contains("--warm"), proxy = args.Contains("--system-proxy"), poster = args.Contains("--thumbnail");
 string? destination = Value("--download");
+// Opt-in for the developer-controlled loopback comparison only.
+bool localFixture = args.Contains("--local-fixture");
+if (localFixture && (!Uri.TryCreate(url, UriKind.Absolute, out var loopback)
+    || loopback.Scheme != "http" || loopback.Host != "127.0.0.1" || loopback.IsDefaultPort || fixture is not null))
+    throw new ArgumentException("--local-fixture requires an explicit loopback test server.");
 int cancelMs = int.TryParse(Value("--cancel-ms"), out int c) ? Math.Clamp(c, 1, 60_000) : 0;
 DefaultMediaResolver? shared = warm ? NewResolver() : null;
 try
@@ -103,7 +108,7 @@ try
         }));
 #if !BASELINE
         if (destination is not null && result?.Item is { } media)
-            await DownloadAsync(media, destination, lifetime.Token);
+            await DownloadAsync(media, destination, lifetime.Token, localFixture);
         if (args.Contains("--collection") && result?.Collection is { } collection
             && int.TryParse(Value("--queue-items"), out int selected) && selected > 0)
             await QueueSelectedAsync(resolver, collection, Math.Min(selected, 5), Value("--queue-folder") ?? Path.Combine(Path.GetTempPath(), "vesper-queue-smoke"), lifetime.Token);
@@ -121,7 +126,7 @@ try
 finally { shared?.Dispose(); }
 
 string? Value(string key) { int index = Array.IndexOf(args, key); return index >= 0 && index + 1 < args.Length ? args[index + 1] : null; }
-DefaultMediaResolver NewResolver() => new(new ResolverOptions { UseSystemProxy = proxy }, fixture is null ? null : new FixtureHandler(fixture));
+DefaultMediaResolver NewResolver() => new(new ResolverOptions { UseSystemProxy = proxy, AllowPrivateNetworks = localFixture }, fixture is null ? null : new FixtureHandler(fixture));
 
 #if !BASELINE
 static async Task QueueSelectedAsync(DefaultMediaResolver resolver, MediaCollection collection, int selected, string folder, CancellationToken ct)
@@ -155,21 +160,37 @@ static async Task QueueSelectedAsync(DefaultMediaResolver resolver, MediaCollect
         states = engine.Snapshots().Select(j => j.State.ToString()).ToArray(), bodiesDownloaded = false }));
 }
 
-static async Task DownloadAsync(MediaItem item, string destination, CancellationToken ct)
+static async Task DownloadAsync(MediaItem item, string destination, CancellationToken ct, bool localFixture)
 {
     var choices = VESPER.MediaTransferBridge.PlayableOnly(item).Representations;
     var selected = choices.OrderByDescending(r => r.HasVideo).ThenByDescending(r => r.Height ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).FirstOrDefault();
     if (selected is null) { Console.WriteLine("{\"transfer\":\"unsupported\"}"); return; }
-    var prepared = VESPER.MediaTransferBridge.Prepare(item,
-        Vesper.MediaResolver.Formats.FormatPreferences.BestQuality with { AllowMuxing = false }, selected);
-    if (prepared.Choice is not { } choice) { Console.WriteLine(JsonSerializer.Serialize(new { transfer = "unavailable", reason = prepared.Error })); return; }
+    AddRequest download;
+    if (localFixture)
+    {
+        // Production planning intentionally rejects private destinations. For this
+        // local-only test exercise the verified HTTP representation and real engine
+        // without changing that policy. No adaptive/remux claims from this path.
+        if (selected.Protocol != StreamProtocol.Http || selected.Url.Scheme != "http"
+            || selected.Url.Host != "127.0.0.1" || selected.Url.Port != item.SourceUrl.Port)
+        { Console.WriteLine("{\"transfer\":\"unsupported-local-fixture\"}"); return; }
+        download = new AddRequest(selected.Url.AbsoluteUri, FileName: "fixture.mp4",
+            Referer: selected.Context.Referer, Kind: JobKind.Http);
+    }
+    else
+    {
+        var prepared = VESPER.MediaTransferBridge.Prepare(item,
+            Vesper.MediaResolver.Formats.FormatPreferences.BestQuality with { AllowMuxing = false }, selected);
+        if (prepared.Choice is not { } choice) { Console.WriteLine(JsonSerializer.Serialize(new { transfer = "unavailable", reason = prepared.Error })); return; }
+        download = new AddRequest(choice.Url, FileName: choice.FileName, Referer: choice.Referer, UserAgent: choice.UserAgent,
+            Kind: choice.Kind, OriginalPageUrl: choice.OriginalPageUrl, MediaProvider: choice.Provider, MediaId: choice.MediaId,
+            MediaFormatId: choice.FormatId, MediaPlanJson: choice.MediaPlanJson);
+    }
     string root = Path.GetFullPath(destination); Directory.CreateDirectory(root);
     // Isolated state, never the user's normal VESPER database. Downloaded files always use the engine's collision protection.
     string state = Path.Combine(root, ".vesper-benchmark-" + Guid.NewGuid().ToString("N"));
-    using var engine = DownloadEngine.Start(new EngineOptions { DataDirectory = state, DefaultFolder = root, MaxConcurrentJobs = 1 });
-    var added = engine.Add(new AddRequest(choice.Url, FileName: choice.FileName, Referer: choice.Referer, UserAgent: choice.UserAgent,
-        Kind: choice.Kind, OriginalPageUrl: choice.OriginalPageUrl, MediaProvider: choice.Provider, MediaId: choice.MediaId,
-        MediaFormatId: choice.FormatId, MediaPlanJson: choice.MediaPlanJson));
+    using var engine = DownloadEngine.Start(new EngineOptions { DataDirectory = state, DefaultFolder = root, MaxConcurrentJobs = 1, AllowPrivateNetworks = localFixture });
+    var added = engine.Add(download);
     if (!added.Ok) { Console.WriteLine(JsonSerializer.Serialize(new { transfer = "rejected", reason = added.Message })); return; }
     var watch = Stopwatch.StartNew();
     try

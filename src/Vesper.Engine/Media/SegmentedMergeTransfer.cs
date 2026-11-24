@@ -416,8 +416,10 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         session.AddConnection();
         try
         {
+            RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
             using HttpResponseMessage response = await http.SendAsync(uri, new RequestSpec(offset, end, Referer: Job.Referer,
-                UserAgent: Job.UserAgent, CredentialOrigin: Job.SourceUrl), ct).ConfigureAwait(false);
+                UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
+                CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl), ct).ConfigureAwait(false);
             finalUri?.Invoke(response.RequestMessage?.RequestUri ?? uri);
             int status = (int)response.StatusCode;
             if (status is not (200 or 206)) throw StatusStop(status, response);

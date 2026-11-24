@@ -158,6 +158,50 @@ public sealed class DashTransferTests
         Assert.Equal(Expected.Length, job.CommittedBytes);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AuthenticatedDashAndSegmentedMergeKeepCredentialsOnTheConsentedOrigin(bool merge)
+    {
+        await using var source = await FixtureServer.StartAsync();
+        await using var remote = await FixtureServer.StartAsync();
+        const string secret = "session=fixture-private";
+        source.RequiredCookie = secret;
+        remote.RejectCredentials = true;
+        var credentials = new Dictionary<string, string> { ["Cookie"] = secret, ["Authorization"] = "Bearer fixture-private" };
+        DashDownloadPlan cross(DashDownloadPlan plan) => plan with
+        {
+            Fragments = plan.Fragments.Select((part, i) => i == 1
+                ? part with { Url = remote.Url("/av-2.m4s") } : part).ToArray()
+        };
+        string planJson;
+        if (merge)
+        {
+            var plan = SegmentedPlan(source);
+            planJson = (plan with { Tracks = plan.Tracks.Select(t => t with
+                { Source = t.Source! with { Dash = cross(t.Source!.Dash!) } }).ToArray() }).ToJson();
+        }
+        else planJson = cross(source.Plan(ranges: false)).ToJson();
+
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(source.Url("/manifest.mpd"), FileName: "authenticated.mp4",
+            Kind: merge ? JobKind.Merge : JobKind.Dash, MediaPlanJson: planJson, Secrets: credentials));
+        Assert.True(added.Ok, added.Message);
+        var done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.NeedsLink or JobState.Failed);
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        Assert.NotNull(done.FinalPath);
+        Assert.True(source.Hits("/av-init.mp4") > 0);
+        Assert.True(remote.Hits("/av-2.m4s") > 0);
+        Assert.Equal(0, source.BadCredentialRequests);
+        Assert.Equal(0, remote.BadCredentialRequests);
+        if (!merge) Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        else
+        {
+            using var output = File.OpenRead(done.FinalPath!);
+            Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(t => t.Kind));
+        }
+    }
+
     [Fact]
     public async Task DashTimeRange_UsesWholeFragmentsAndPreservesTheInitialization()
     {
@@ -458,6 +502,9 @@ public sealed class DashTransferTests
         private string _base = "";
         internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst, OversizedRangeBody;
         internal int FragmentDelayMs;
+        internal string? RequiredCookie;
+        internal bool RejectCredentials;
+        internal int BadCredentialRequests;
         internal int MaxActiveFragmentRequests => Volatile.Read(ref _maxActiveFragmentRequests);
         internal TaskCompletionSource FirstFragmentStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal string Url(string path) => _base + path;
@@ -488,6 +535,14 @@ public sealed class DashTransferTests
         private async Task ServeAsync(HttpContext context)
         {
             string path = context.Request.Path.Value!; _hits.AddOrUpdate(path, 1, (_, n) => n + 1);
+            if (RequiredCookie is { } required && (context.Request.Headers.Cookie != required
+                    || context.Request.Headers.Authorization != "Bearer fixture-private")
+                || RejectCredentials && (context.Request.Headers.ContainsKey("Cookie") || context.Request.Headers.ContainsKey("Authorization")))
+            {
+                Interlocked.Increment(ref BadCredentialRequests);
+                context.Response.StatusCode = 403;
+                return;
+            }
             if (path == "/av-2.m4s" && ExpireSecond) { context.Response.StatusCode = 403; return; }
             if (!_objects.TryGetValue(path, out var data)) { context.Response.StatusCode = 404; return; }
             bool isFragment = path.EndsWith(".m4s", StringComparison.Ordinal);

@@ -40,6 +40,13 @@
   ],
   "content_scripts": [
     {
+      "matches": ["https://*.youtube.com/*"],
+      "js": ["youtube-player-witness.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
       "matches": [
         "http://*/*",
         "https://*/*"
@@ -48,7 +55,12 @@
         "theme.js",
         "player-source.js",
         "vesper-companion.js",
+        "vesper-intelligence.js",
+        "vesper-intent-features.js",
+        "vesper-intent-model.js",
+        "browser-body.js",
         "content.js",
+        "vesper-smart-batch.js",
         "smart-select.js"
       ],
       "run_at": "document_idle",

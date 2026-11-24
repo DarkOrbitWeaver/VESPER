@@ -10,7 +10,8 @@ internal sealed partial class BrowserBridgeHandler
 {
     private sealed record ChoiceRecipe(FormatPreferences Preferences, MediaRepresentation? Exact, MediaOutputPreference Output);
     private sealed record MediaSession(DateTimeOffset Expires, MediaDownloadChoice[] Choices, MediaItem Item, ChoiceRecipe[] Recipes);
-    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container, bool CanClip, bool ClipUsesWholeFile);
+    private sealed record BrowserOption(int Index, string Label, string Detail, string? Container, bool CanClip, bool ClipUsesWholeFile,
+        int? Height = null, bool? HasVideo = null, bool? HasAudio = null, long? SizeBytes = null, bool SizeEstimated = false);
     private readonly Dictionary<Guid, MediaSession> _mediaSessions = [];
     private readonly object _mediaSessionsLock = new();
 
@@ -69,7 +70,8 @@ internal sealed partial class BrowserBridgeHandler
             Options = new DiscoveryOptions
             {
                 CollectionIntent = CollectionIntent.ItemOnly,
-                ExactBrowserSource = request.Type == "media-source-options"
+                ExactBrowserSource = request.Type == "media-source-options",
+                ExactBrowserAssetGroup = request.Type == "media-group-options"
             }
         }, discovery.Token);
         if (resolved.Collection is { } collection)
@@ -79,13 +81,14 @@ internal sealed partial class BrowserBridgeHandler
                 provider = collection.Provider,
                 hasRelatedCollection = true,
                 collectionKind = collection.Kind.ToString().ToLowerInvariant(),
+                collectionUrl = collection.SourceUrl.AbsoluteUri,
                 collectionIsDynamic = collection.IsDynamic,
                 collectionIsComplete = collection.IsComplete
             });
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
-            if (request.Type == "media-source-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
+            if (request.Type is "media-source-options" or "media-group-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
                 return BridgeResponse.Fail(request.Id, "source-unavailable", "VESPER couldn't verify this source. Go back to try another source.");
             string code = MapResolverError(error?.Code);
             var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
@@ -129,8 +132,36 @@ internal sealed partial class BrowserBridgeHandler
                 recipes.Add(recipe ?? new ChoiceRecipe(FormatPreferences.BestQuality, null, MediaOutputPreference.Original));
             }
             var clipMode = ClipSelection.ModeFor(job);
-            return new BrowserOption(index, label, job.DisplayDetail, job.DisplayContainer,
-                clipMode != ClipMode.None, clipMode == ClipMode.FullFile);
+            // Report the chosen recipe's facts, not the tallest unrelated representation.
+            var tracks = playable.Representations.Where(rep => job.FormatId?.Split('+').Contains(rep.Id, StringComparer.Ordinal) == true).ToArray();
+            var video = tracks.FirstOrDefault(rep => rep.HasVideo);
+            bool? hasVideo = tracks.Length == 0 ? null : tracks.Any(rep => rep.HasVideo);
+            bool? hasAudio = tracks.Any(rep => rep.HasAudio && !rep.AudioUnverified) ? true
+                : tracks.Length == 0 || tracks.Any(rep => rep.AudioUnverified) ? null : false;
+            if (job.Output is MediaOutput.M4a or MediaOutput.Mp3 or MediaOutput.Opus or MediaOutput.Wav)
+            { hasVideo = false; video = null; }
+            long? size = null;
+            bool estimate = false;
+            if (job.Output == MediaOutput.Original && tracks.Length > 0)
+            {
+                if (tracks.All(rep => rep.FileSize is > 0))
+                {
+                    double sum = tracks.Sum(rep => (double)rep.FileSize!.Value);
+                    if (sum < long.MaxValue) size = (long)sum;
+                    estimate = job.Kind != JobKind.Http || tracks.Any(rep => rep.FileSizeIsEstimate);
+                }
+                else if (item.Duration is { TotalSeconds: > 0 } duration && tracks.All(rep => rep.BitrateKbps is > 0))
+                {
+                    double bytes = tracks.Sum(rep => (double)rep.BitrateKbps!.Value) * 125 * duration.TotalSeconds;
+                    if (bytes is > 0 and < long.MaxValue) size = (long)bytes;
+                    estimate = true;
+                }
+            }
+            string container = job.Kind == JobKind.Hls && job.Output == MediaOutput.Original
+                ? (tracks.FirstOrDefault()?.Container ?? "Video").ToUpperInvariant() : job.DisplayContainer;
+            return new BrowserOption(index, label, job.DisplayDetail, container,
+                clipMode != ClipMode.None, clipMode == ClipMode.FullFile,
+                video?.Height, hasVideo, hasAudio, size, estimate);
         }
         void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
         {
@@ -192,6 +223,7 @@ internal sealed partial class BrowserBridgeHandler
                     item.Provider,
                     hasRelatedCollection = true,
                     collectionKind = item.Related!.Kind.ToString().ToLowerInvariant(),
+                    collectionUrl = item.Related!.Url.AbsoluteUri,
                     collectionIsDynamic = item.Related!.IsDynamic
                 });
             return BridgeResponse.Fail(requestId, "unavailable", playable.Representations.Count == 0
@@ -224,17 +256,33 @@ internal sealed partial class BrowserBridgeHandler
         {
             foreach (Guid expired in _mediaSessions.Where(entry => entry.Value.Expires <= now).Select(entry => entry.Key).ToArray())
                 _mediaSessions.Remove(expired);
-            if (_mediaSessions.Count >= 6) _mediaSessions.Remove(_mediaSessions.MinBy(entry => entry.Value.Expires).Key);
+            if (_mediaSessions.Count >= 12) _mediaSessions.Remove(_mediaSessions.MinBy(entry => entry.Value.Expires).Key);
             _mediaSessions[session] = new MediaSession(now.AddMinutes(5), jobs.ToArray(), playable, recipes.ToArray());
         }
+        // Compare actual executable transfer recipes, not quality labels or
+        // duration. Different URLs, track plans or outputs are not equivalent.
+        // Only an opaque digest leaves the native resolver.
+        var deliveryRecipes = jobs.Select(job => System.Text.Json.JsonSerializer.Serialize(new
+        {
+            job.Url, job.Kind, job.MediaPlanJson, job.Output, job.FormatId,
+            job.Quality, job.Referer, job.UserAgent, job.MediaMetadataJson,
+            Subtitles = job.SubtitleTracks?.Select(track => new { track.Url, track.Language, track.Format })
+        })).Distinct(StringComparer.Ordinal).OrderBy(recipe => recipe, StringComparer.Ordinal).ToArray();
+        string deliveryFingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(deliveryRecipes)));
+        var deliveryRecipeFingerprints = deliveryRecipes.Select(recipe =>
+            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(recipe)))).ToArray();
+        string deliveryTrackFingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { item.AudioTracks, item.Subtitles, item.Duration, item.IsLive, item.Related })));
         return BridgeResponse.Success(requestId, data: new
         {
-            mediaSession = session.ToString("N"), item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
+            mediaSession = session.ToString("N"), deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             isLive = item.IsLive,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
             choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,
             hasRelatedCollection = HasRelatedCollection(item),
             collectionKind = item.Related?.Kind.ToString().ToLowerInvariant(),
+            collectionUrl = HasRelatedCollection(item) ? item.Related!.Url.AbsoluteUri : null,
             audioTracks = item.AudioTracks.Select((track, index) => new { track.Id,
                 label = (track.Name ?? track.Language ?? "Audio") + (track.IsDefault ? " · original" : "") + " · " + (index + 1) }),
             subtitleOptions = SelectableSubtitleTracks(item.Subtitles)
@@ -266,7 +314,20 @@ internal sealed partial class BrowserBridgeHandler
             }
         }
         if (job is null || job.ExpiresAt is { } expires && expires <= DateTimeOffset.UtcNow)
+        {
+            // The worker may retry the original request after its format session
+            // expired. A durable acceptance is not authority to create another job.
+            var accepted = new List<BridgeResult>();
+            if (engine.FindAcceptedSubmission(request.Id + ":0") is Guid first)
+            {
+                accepted.Add(new BridgeResult("", "already-submitted", first.ToString("D"), "Previously accepted."));
+                for (int i = 1; i < 64; i++)
+                    if (engine.FindAcceptedSubmission(request.Id + ":" + i) is Guid extra)
+                        accepted.Add(new BridgeResult("", "already-submitted", extra.ToString("D"), "Previously accepted."));
+                return BridgeResponse.Success(request.Id, message: "The original download was accepted. Check any requested subtitle jobs before retrying.", results: accepted.ToArray());
+            }
             return BridgeResponse.Fail(request.Id, "expired-selection", "These formats have expired. Refresh them to try again.");
+        }
         if (request.Clip is not null || request.AudioTrackId is not null || request.SubtitleLanguages is not null
             || request.EmbedSubtitles)
         {

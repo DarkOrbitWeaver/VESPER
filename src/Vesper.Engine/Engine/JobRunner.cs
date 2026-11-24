@@ -41,6 +41,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 JobKind.Dash => await new DashTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
                 JobKind.Merge => await new MergeTransfer(engine, session, http).RunAsync(ct).ConfigureAwait(false),
                 JobKind.Http => await TransferAsync(ct).ConfigureAwait(false),
+                JobKind.BrowserStream => await FinishBrowserCopyAsync(ct).ConfigureAwait(false),
                 _ => RunOutcome.NeedsAttention("unsupported-kind", "This download requires a newer engine. Saved data was kept.")
             };
         }
@@ -110,6 +111,19 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     }
 
     // ---- main flow ---------------------------------------------------------------------------------------------
+
+    private async Task<RunOutcome> FinishBrowserCopyAsync(CancellationToken ct)
+    {
+        // This is a finite browser-supplied body, not a downloadable HTTP URL.
+        // Neither restart nor a missing partial may turn it into a network replay.
+        if (Job.TotalBytes is not long total || total <= 0 || !Job.Extents.Covers(0, total)
+            || Job.ExpectedSha256 is not { Length: 64 })
+            return RunOutcome.NeedsAttention("browser-copy-incomplete", "The browser copy is incomplete. Select the file again in your browser.");
+        PartialFile file = session.OpenFile(create: false);
+        if (file.Length != total)
+            return RunOutcome.NeedsAttention("browser-copy-incomplete", "The browser copy changed on disk. Saved data was kept.");
+        return await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
+    }
 
     private async Task<RunOutcome> TransferAsync(CancellationToken ct)
     {

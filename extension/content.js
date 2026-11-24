@@ -14,6 +14,7 @@
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
   let previewRemovedAt = 0, previewPointerDistance = Infinity, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
   let fullscreenPlayer = false;
+  let manualPlayer = null; // A deliberate drag overrides automatic largest-player selection.
   let drag = null, movedPerch = null, suppressDragClick = false, suppressDragClickTimer = 0, pointerMovedAt = 0;
   let lastPointerPosition = null;
   let contextNotice = null, contextNoticeTimer = 0;
@@ -25,11 +26,17 @@
   let extensionPaused = false, extensionPreferencesReady = false;
   let hiddenButterflyHosts = new Set();
   let retainedPickerDraft = null;
+  let activeBrowserCopy = null;
+  let generatedCopy = null;
   const still = () => motionMode === 'still';
   const butterflyHidden = () => extensionPaused || hiddenButterflyHosts.has((location.hostname || '').toLowerCase());
   function onExtensionPreferencesChanged(changes, areaName) {
     if (areaName !== 'local') return;
     if (changes.vesperPaused) extensionPaused = changes.vesperPaused.newValue === true;
+    if (extensionPaused) {
+      activeBrowserCopy?.controller.abort();
+      generatedCopy?.controller.abort();
+    }
     if (changes.vesperHiddenButterflyHosts) {
       const hosts = changes.vesperHiddenButterflyHosts.newValue;
       hiddenButterflyHosts = new Set(Array.isArray(hosts)
@@ -42,6 +49,13 @@
   chrome.storage?.onChanged?.addListener?.(onExtensionPreferencesChanged);
   const protectedVideos = new WeakSet();
   const playback = new WeakMap();
+  const mediaLedger = VesperIntelligence.createMediaLedger();
+  const playerEvidenceKeys = new WeakMap();
+  let evidenceSerial = 0, resourceObserver = null;
+  function evidenceKey(el) {
+    if (!playerEvidenceKeys.has(el)) playerEvidenceKeys.set(el, 'player-' + ++evidenceSerial);
+    return playerEvidenceKeys.get(el);
+  }
   const prefetchedPlayers = new WeakMap();
   let generation = 0;
   const observed = new Set();
@@ -61,7 +75,11 @@
   function retire() {
     if (signal.aborted) return;
     lifetime.abort();
+    activeBrowserCopy?.controller.abort();
+    generatedCopy?.controller.abort();
     visibility.disconnect();
+    resourceObserver?.disconnect();
+    resourceObserver = null;
     observed.clear();
     unwatchMotion?.();
     retainedPickerDraft = null;
@@ -102,7 +120,8 @@
     mediaChangedAt = Date.now();
     endedPlayer = null;
     clearTimeout(endedPlayerTimer);
-    movedPerch = null;
+    // SPA navigation can leave an intentionally pinned floating player alive.
+    if (!manualPlayer?.isConnected) { manualPlayer = null; movedPerch = null; }
     activePreview = null;
     pointerTarget = null;
     if (panelMedia || receiptTimer) closePanel();
@@ -136,14 +155,14 @@
 
   // ------------------------------------------------------------ noticing media
 
-  function visiblePlayer(el) {
+  function visiblePlayer(el, minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT) {
     const ended = isCurrentEndedPlayer(el);
     if (!el?.isConnected || intersecting.get(el) === false && !ended) return null;
     const r = el.getBoundingClientRect();
     const style = getComputedStyle(el);
     const hidden = style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0';
     if (!hidden) {
-      const rect = clippedPlayerRect(r);
+      const rect = clippedPlayerRect(r, minWidth, minHeight);
       if (rect) return rect;
     }
     if (!ended) return null;
@@ -161,18 +180,18 @@
       const closeSize = parentBox.width >= original.width * 0.5 && parentBox.width <= original.width * 2
         && parentBox.height >= original.height * 0.5 && parentBox.height <= original.height * 2;
       if (overlapsFrame >= frameArea * 0.5 && closeSize) {
-        const parentRect = clippedPlayerRect(parentBox);
+        const parentRect = clippedPlayerRect(parentBox, minWidth, minHeight);
         if (parentRect) return parentRect;
       }
     }
     return null;
   }
 
-  function clippedPlayerRect(rect) {
+  function clippedPlayerRect(rect, minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT) {
     if (!rect) return null;
     const left = Math.max(0, rect.left), right = Math.min(innerWidth, rect.right);
     const top = Math.max(0, rect.top), bottom = Math.min(innerHeight, rect.bottom);
-    return right - left < MIN_WIDTH || bottom - top < MIN_HEIGHT ? null : { left, top, right, bottom };
+    return right - left < minWidth || bottom - top < minHeight ? null : { left, top, right, bottom };
   }
 
   function isCurrentEndedPlayer(el) {
@@ -218,7 +237,7 @@
           const url = new URL(link.href);
           if (url.origin !== origin) continue;
           const identity = VesperPlayerSource.identity(url.href);
-          if (/^(youtube|instagram|tiktok|facebook):/.test(identity || '')) pages.set(identity, url.href);
+          if (/^(youtube|instagram|tiktok|facebook|x):/.test(identity || '')) pages.set(identity, url.href);
         } catch { /* Ignore malformed page links. */ }
       }
       if (pages.size !== 1) continue;
@@ -268,18 +287,49 @@
     selectPlayer();
   }
 
+  function activeYouTubePage(el, contextPage) {
+    if (!/(?:^|\.)youtube\.com$/i.test(location.hostname || '')) return null;
+    // The page-world witness is invoked on demand for this exact video element.
+    // A DOM hint is never an authorization; the native resolver verifies the ID.
+    try { el?.dispatchEvent(new Event('vesper-youtube-identity-request', { bubbles: true })); }
+    catch { return null; }
+    const id = el?.getAttribute?.('data-vesper-youtube-video-id');
+    if (!/^[A-Za-z0-9_-]{11}$/.test(id || '')) return null;
+    const page = new URL('/watch', location.origin);
+    page.searchParams.set('v', id);
+    try {
+      // The live watch page may retain a playlist that the player card omits.
+      for (const value of [location.href, contextPage]) {
+        if (!value) continue;
+        const context = new URL(value);
+        if (context.origin !== page.origin || context.pathname !== '/watch' || context.searchParams.get('v') !== id) continue;
+        const list = context.searchParams.get('list');
+        if (/^[\w-]{2,128}$/.test(list || '')) page.searchParams.set('list', list);
+        break;
+      }
+    } catch { /* The player ID still identifies the video without a playlist context. */ }
+    return page.href;
+  }
+
   function pageForPlayer(el) {
-    return cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
+    const contextPage = cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
+    return activeYouTubePage(el, contextPage) || contextPage;
   }
 
   function selectPlayer() {
     if (!alive()) return;
     if (!extensionPreferencesReady) return;
     if (butterflyHidden()) { detach(true); return; }
-    if (drag && visiblePlayer(video)) { place(true); return; }
+    if (drag && (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))) { place(true); return; }
     if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
     if (holdMissingPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
+    if (manualPlayer && !manualPlayer.isConnected) manualPlayer = null;
+    if (manualPlayer && (!fullscreen || fullscreen.contains(manualPlayer))) {
+      if (video !== manualPlayer) attach(manualPlayer);
+      else place();
+      return;
+    }
     let best = null, bestArea = 0;
     if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))) {
       const rect = visiblePlayer(activePreview.player);
@@ -309,10 +359,38 @@
 
   // Lets the background briefly watch this tab for manifests named only by Content-Type.
   let announcedVideoAt = 0;
+  function watchMediaResources() {
+    if (resourceObserver || typeof PerformanceObserver === 'undefined') return;
+    try {
+      resourceObserver = new PerformanceObserver(list => {
+        if (!observed.size || !alive()) return;
+        const players = [...observed].filter(el => el.isConnected && (el.readyState >= 1 || !el.paused));
+        for (const entry of list.getEntries().slice(-24)) {
+          if (entry.entryType !== 'resource'
+              || !['fetch', 'xmlhttprequest', 'video', 'audio', 'other'].includes(entry.initiatorType)) continue;
+          const url = VesperIntelligence.http(entry.name)?.href;
+          const mime = typeof entry.contentType === 'string' ? entry.contentType : '';
+          const kind = VesperIntelligence.sourceKind(url || '', mime);
+          if (!url || kind === 'fragment'
+              || kind === 'unknown' && !['video', 'audio'].includes(entry.initiatorType)) continue;
+          const matchingPlayers = players.filter(el => VesperPlayerSource.http(playerSource(el))?.href === url);
+          // Being the sole playing element does not bind all fetches on the page to it.
+          const player = matchingPlayers.length === 1 ? matchingPlayers[0] : null;
+          const start = Number.isFinite(entry.startTime) && entry.startTime >= 0
+            ? performance.timeOrigin + entry.startTime : null;
+          if (!Number.isFinite(start)) continue;
+          mediaLedger.record({ scope: location.origin, url, mime, type: 'resource',
+            playerKey: player ? evidenceKey(player) : null, at: start });
+        }
+      });
+      resourceObserver.observe({ type: 'resource', buffered: true });
+    } catch { resourceObserver = null; }
+  }
   function announceVideoElement() {
     const now = Date.now();
     if (now - announcedVideoAt < 60_000) return;
     announcedVideoAt = now;
+    watchMediaResources();
     send({ type: 'media-element', watching: true }).catch(() => {});   // a hint only; never surfaces errors
   }
 
@@ -326,6 +404,8 @@
       announceVideoElement();
     }
     const page = pageForPlayer(el);
+    mediaLedger.playback({ key: evidenceKey(el), scope: location.origin, pageUrl: page,
+      mediaUrl: src, stableId: VesperPlayerSource.identity(page) || '', duration: el.duration });
     const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
     if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)
         && !(isCurrentEndedPlayer(el) && !src)) {
@@ -392,7 +472,14 @@
     }
     consider(e.target);
     refreshPlayer(e.target);
-    if (e.target === video) prefetchPlayer(e.target);
+    if (e.target === video) {
+      announceVideoElement();
+      prefetchPlayer(e.target);
+    }
+  }, { capture: true, passive: true, signal });
+  // Renew on deliberate playback transitions, not a background timer or timeupdate loop.
+  document.addEventListener('seeking', e => {
+    if (alive() && e.target === video) announceVideoElement();
   }, { capture: true, passive: true, signal });
   document.addEventListener('ended', e => {
     if (!alive()) return;
@@ -402,6 +489,12 @@
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
     if (!alive()) return;
+    if (e.target instanceof HTMLMediaElement) {
+      const page = pageForPlayer(e.target);
+      mediaLedger.playback({ key: evidenceKey(e.target), scope: location.origin,
+        pageUrl: page, mediaUrl: playerSource(e.target),
+        stableId: VesperPlayerSource.identity(page) || '', event: type });
+    }
     if (type === 'loadstart') {
       protectedVideos.delete(e.target);
       playback.delete(e.target);
@@ -472,7 +565,9 @@
       return { available: false, reason: 'Trim needs a known media length.' };
     if (option?.canClip !== true)
       return { available: false, reason: "This format can't be trimmed. Choose another format." };
-    return { available: true, reason: option.clipUsesWholeFile ? '' : 'The cut follows segment boundaries and may shift slightly.' };
+    return { available: true, reason: option.clipUsesWholeFile
+      ? seconds > 1200 ? 'Downloads the full video, then trims it on your PC.' : ''
+      : 'The cut follows segment boundaries and may shift slightly.' };
   }
 
   function element(tag, className, text = '') {
@@ -541,6 +636,7 @@
         .clip-error{color:var(--red);font-size:11px}
         .clip-note{color:var(--muted);font-size:11px;line-height:1.35}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
+        .hint.bad{color:var(--red)}
         .collection-browse{flex:none;width:34px;height:34px;margin-right:auto;padding:4px;display:grid;place-items:center;line-height:0}
         .collection-browse img{display:block;width:24px;height:24px;object-fit:contain}
         .output[hidden]{display:none}
@@ -556,7 +652,7 @@
         .icon.best{color:var(--gold)}.icon.balanced{color:var(--blue)}.icon.audio{color:var(--violet)}
         .kind{flex:none;max-width:35%;overflow:hidden;text-overflow:ellipsis;font-size:10px;color:var(--sage);padding:2px 4px;border-radius:4px;background:var(--wash);margin-left:auto}
         .tick{width:13px;flex:none;color:var(--sage)}
-        .more{display:block;width:calc(100% - 16px);margin:8px 8px 10px;font-size:12px}
+        .more{display:block;width:calc(100% - 16px);margin:8px 8px 0;font-size:12px;min-height:32px}
         .languages summary{box-sizing:border-box;list-style:none;text-align:center}
         .languages summary::-webkit-details-marker{display:none}
         .languages summary::after{content:' ▾'}
@@ -568,8 +664,9 @@
         .subtitle-choice input{flex:none;margin:2px 0 0;accent-color:var(--green)}
         .subtitle-choice:has(input:disabled){color:var(--muted)}
         .language-fields small.hint{padding:0 0 0 21px}
-        .foot{display:flex;gap:8px;justify-content:flex-end;padding:10px 12px;border-top:1px solid var(--border);
+        .foot{display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:10px 12px;border-top:1px solid var(--border);
           position:sticky;bottom:0;background:var(--surface)}
+        .picker-foot{margin-top:8px}
         .msg{padding:14px;font-size:12.5px;line-height:1.45}.msg.bad{color:var(--red)}
         .link{border:0;background:none;color:var(--blue);text-decoration:underline;cursor:pointer;font-size:12.5px;padding:0}
     `;
@@ -677,6 +774,7 @@
 
   function detach(preservePickerDraft = false) {
     if (!preservePickerDraft) retainedPickerDraft = null;
+    manualPlayer = null;
     listening = false;
     activePreview = null;
     companion?.stopIdle();
@@ -712,7 +810,7 @@
       if (!perch || !panelMedia || !panel?.classList.contains('show')) return detach();
       button.hidden = true;
     } else {
-      const rect = visiblePlayer(video);
+      const rect = manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video);
       button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
       if (button.hidden) {
         fullscreenPlayer = false;
@@ -766,10 +864,13 @@
 
   function playerPerch(rect, fullscreen) {
     if (movedPerch) {
-      const width = rect.right - rect.left - FLY_SIZE;
-      const height = rect.bottom - rect.top - FLY_SIZE;
-      const x = Math.max(8, Math.min(rect.left + width * movedPerch.x, innerWidth - FLY_SIZE - 8));
-      const y = Math.max(8, Math.min(rect.top + height * movedPerch.y, innerHeight - FLY_SIZE - 8));
+      // Bind manual positions to the *unclipped* element box. A clipped rect
+      // changes as the page scrolls and otherwise makes the butterfly jump.
+      const anchor = video.getBoundingClientRect();
+      const width = anchor.right - anchor.left - FLY_SIZE;
+      const height = anchor.bottom - anchor.top - FLY_SIZE;
+      const x = Math.max(8, Math.min(anchor.left + width * movedPerch.x, innerWidth - FLY_SIZE - 8));
+      const y = Math.max(8, Math.min(anchor.top + height * movedPerch.y, innerHeight - FLY_SIZE - 8));
       return { x, y, faceLeft: movedPerch.x > 0.5 };
     }
     const preview = activePreview?.player === video && !fullscreen;
@@ -808,46 +909,76 @@
     button.setPointerCapture(e.pointerId);
   }
 
+  function dragPerch(rect, x, y, grabX, grabY) {
+    // A manual perch can occupy any visible free space, not only 44px outside
+    // the player's rectangle. The viewport clamp keeps the control clickable.
+    const left = Math.max(8, Math.min(x - grabX, innerWidth - FLY_SIZE - 8));
+    const top = Math.max(8, Math.min(y - grabY, innerHeight - FLY_SIZE - 8));
+    return {
+      x: (left - rect.left) / Math.max(1, rect.right - rect.left - FLY_SIZE),
+      y: (top - rect.top) / Math.max(1, rect.bottom - rect.top - FLY_SIZE)
+    };
+  }
+
   function moveDrag(e) {
     if (drag?.id !== e.pointerId || drag.player !== video) return;
     if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 5) return;
-    const rect = visiblePlayer(video);
+    const rect = manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video);
     if (!rect) return;
     drag.moved = true;
+    drag.lastX = e.clientX;
+    drag.lastY = e.clientY;
     button.classList.add('dragging');
-    const fraction = (value, size, low, high) => Math.max(low, Math.min(high, value / Math.max(1, size)));
-    const width = rect.right - rect.left - FLY_SIZE;
-    const height = rect.bottom - rect.top - FLY_SIZE;
-    const leftRoom = Math.min(FLY_SIZE, Math.max(0, rect.left - 8));
-    const rightRoom = Math.min(FLY_SIZE, Math.max(0, innerWidth - 8 - rect.right));
-    const topRoom = Math.min(FLY_SIZE, Math.max(0, rect.top - 8));
-    const bottomRoom = Math.min(FLY_SIZE, Math.max(0, innerHeight - 8 - rect.bottom));
-    movedPerch = {
-      x: fraction(e.clientX - drag.grabX - rect.left, width, -leftRoom / Math.max(1, width),
-        (width + rightRoom) / Math.max(1, width)),
-      y: fraction(e.clientY - drag.grabY - rect.top, height, -topRoom / Math.max(1, height),
-        (height + bottomRoom) / Math.max(1, height))
-    };
+    movedPerch = dragPerch(video.getBoundingClientRect(), e.clientX, e.clientY, drag.grabX, drag.grabY);
     place(true);
+  }
+
+  function dropTarget(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    let closest = null, bestDistance = 68;
+    for (const player of observed) {
+      if (player === video || !player.isConnected) continue;
+      const fullscreen = document.fullscreenElement;
+      if (fullscreen && !fullscreen.contains(player)) continue;
+      if (player.readyState < 1 && !playerSource(player)) continue;
+      const rect = visiblePlayer(player, 110, 70);
+      if (!rect) continue;
+      const dx = Math.max(rect.left - x, x - rect.right, 0);
+      const dy = Math.max(rect.top - y, y - rect.bottom, 0);
+      const distance = Math.hypot(dx, dy);
+      if (distance < bestDistance) { closest = player; bestDistance = distance; }
+    }
+    return closest;
   }
 
   function finishDrag(e) {
     if (drag?.id !== e.pointerId) return;
-    suppressDragClick = drag.moved;
+    const last = drag;
+    suppressDragClick = last.moved;
     clearTimeout(suppressDragClickTimer);
-    suppressDragClickTimer = drag.moved ? setTimeout(() => {
+    suppressDragClickTimer = last.moved ? setTimeout(() => {
       suppressDragClick = false;
       suppressDragClickTimer = 0;
     }, 300) : 0;
     drag = null;
     button?.classList.remove('dragging');
+    if (last.moved && e.type !== 'pointercancel') {
+      const x = Number.isFinite(e.clientX) ? e.clientX : last.lastX;
+      const y = Number.isFinite(e.clientY) ? e.clientY : last.lastY;
+      const next = dropTarget(x, y);
+      if (next && visiblePlayer(next, 110, 70)) {
+        movedPerch = dragPerch(next.getBoundingClientRect(), x, y, last.grabX, last.grabY);
+        manualPlayer = next;
+        attach(next); // The companion animates the flight unless reduced motion is on.
+      } else manualPlayer = video;
+    }
     updateFlyVisibility();
   }
 
   function schedule() {
     if (alive() && !frame) frame = requestAnimationFrame(() => {
       frame = 0;
-      if (visiblePlayer(video)) place(true);
+      if (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video)) place(true);
       else selectPlayer();
     });
   }
@@ -1077,6 +1208,15 @@
     receipt.textContent = '';
     const request = ++panelRequest;
     const player = video;
+    // Reopening the butterfly must not start a second copy of the same Blob.
+    if (activeBrowserCopy && activeBrowserCopy.player === player) {
+      panelMedia = { ...activeBrowserCopy.panelMedia };
+      panel.classList.add('show');
+      button.setAttribute('aria-expanded', 'true');
+      companion.setPickerOpen(true, false, true);
+      updateFlyVisibility();
+      return showBrowserCopy(activeBrowserCopy, request);
+    }
     const preview = activePreview?.player === player ? activePreview : null;
     const ended = isCurrentEndedPlayer(player);
     const src = playerSource(player) || preview?.binding?.src || (ended ? endedPlayer.binding.src : '');
@@ -1089,7 +1229,7 @@
     const savedDraft = retainedPickerDraft?.targetKey === targetKey && retainedPickerDraft.player === player;
     if (retainedPickerDraft && !savedDraft) retainedPickerDraft = null;
     refresh = refresh || savedDraft;
-    panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), targetKey,
+    panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), documentPage: pageAddress(), targetKey,
       player, pageUrl: targetPage, src, generation: current ? binding.generation : 0 };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
@@ -1117,7 +1257,10 @@
       playerHasMedia: current && (player.readyState >= 1 || player.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
       mutedLoop: current && !isPreview && isMutedLoop(player, src),
+      playerCrossOrigin: current ? player.crossOrigin : undefined,
       playerFacts: playerFacts && Object.keys(playerFacts).length ? playerFacts : undefined,
+      // Timing hints only reorder sources independently checked by the resolver.
+      resourceUrls: current ? mediaLedger.matches(evidenceKey(player)).map(item => item.url).slice(0, 12) : undefined,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
@@ -1126,7 +1269,7 @@
       const note = result.data.collectionIsDynamic
         ? `This is a changing ${name} snapshot. Choose its entries and one quality in VESPER.`
         : 'Choose the items and quality in VESPER. Nothing is added until you confirm.';
-      const controls = collectionPickerControls(title, request, result.data.collectionKind);
+      const controls = collectionPickerControls(title, request, result.data);
       const footer = element('div', 'foot');
       footer.append(controls.browse);
       return renderShell(result.data.title || title, poster, duration,
@@ -1136,6 +1279,27 @@
       const message = errorMessage(result);
       if (!['protected', 'blocked', 'chrome-format'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
+      // Explicitly selected, readable Blob or independently observed finite
+      // HTTPS representation. Never automatically retry a network request.
+      const local = globalThis.VesperBrowserBody?.localBlob(src, location.origin);
+      const conditional = result?.data?.browserBodyAvailable === true;
+      const eligible = ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
+        'site-refused', 'source-expired', 'sign-in', 'unsupported', 'chrome-format'].includes(result?.code)
+        && current && !activeBrowserCopy && !player.mediaKeys && !protectedVideos.has(player)
+        && (conditional || local && result?.code !== 'chrome-format');
+      if (eligible) {
+        const action = element('button', 'vesper-button', 'Save browser file');
+        action.onclick = () => {
+          if (action.isConnected && isCurrentRequest(request))
+            void startBrowserCopy({ player, src, title, poster, duration });
+        };
+        const footer = element('div', 'foot');
+        footer.append(action);
+        return renderShell(title, poster, duration, message,
+          element('div', 'msg', conditional
+            ? 'Save this verified file through your browser session.'
+            : 'Try the original file available inside this browser. Not all player streams are readable files.'), footer);
+      }
       return renderShell(title, poster, duration, message);
     }
     const formats = result.data;
@@ -1146,6 +1310,74 @@
     choice = restored.choice;
     renderChoices(formats.title || title, formats.thumbnail || poster, pickerDuration,
       formats, false, restored.useOriginal, restored.useM4a);
+  }
+
+  function showBrowserCopy(copy, request) {
+    const status = element('div', 'msg', copy.status);
+    status.setAttribute('role', 'status');
+    copy.statusElement = status;
+    copy.request = request;
+    const footer = element('div', 'foot');
+    const cancel = element('button', 'vesper-button', 'Cancel copy');
+    cancel.onclick = () => {
+      copy.controller.abort();
+      cancel.disabled = true;
+      status.textContent = 'Stopping browser copy…';
+    };
+    footer.append(cancel);
+    renderShell(copy.title, copy.poster, copy.duration, status, footer);
+  }
+
+  async function startBrowserCopy({ player, src, title, poster, duration }) {
+    if (activeBrowserCopy || generatedCopy || !panelMedia || !isCurrentRequest(panelRequest)
+        || player.mediaKeys || protectedVideos.has(player) || playerSource(player) !== src) return;
+    const controller = new AbortController();
+    const copy = { player, src, title, poster, duration, controller,
+      panelMedia: { ...panelMedia }, status: 'Opening browser file…' };
+    activeBrowserCopy = copy;
+    showBrowserCopy(copy, panelRequest);
+    // Closing the picker is not cancellation. Navigation/extension retirement,
+    // pause, or the explicit Cancel copy action ends the volatile transfer.
+    let lastUpdate = 0;
+    try {
+      let mediaProof = null;
+      if (!VesperBrowserBody.localBlob(src, location.origin)) {
+        const binding = playback.get(player);
+        if (!binding || binding.src !== src || binding.generation !== copy.panelMedia.generation)
+          throw new Error('The selected player changed.');
+        const reply = await send({ type: 'browser-body-media-proof', playerUrl: src,
+          pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
+          generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
+        if (!reply?.ok || controller.signal.aborted || playback.get(player) !== binding
+            || playerSource(player) !== src || player.mediaKeys || protectedVideos.has(player))
+          throw new Error('No verified browser file is available.');
+        mediaProof = reply.data;
+      }
+      await VesperBrowserBody.copyBlob({ url: src, origin: location.origin, title, mediaProof, signal: controller.signal,
+        onProgress(received, total) {
+          if (player.mediaKeys || protectedVideos.has(player)) { controller.abort(); return; }
+          const now = Date.now();
+          if (received !== total && now - lastUpdate < 150) return;
+          lastUpdate = now;
+          copy.status = received === total ? 'Checking and accepting browser file…'
+            : 'Copying browser file · ' + Math.floor(received * 100 / total) + '%';
+          if (copy.statusElement?.isConnected) copy.statusElement.textContent = copy.status;
+        } });
+      if (copy.request === panelRequest && isCurrentRequest(copy.request))
+        await confirmSend('Browser file accepted by VESPER', copy.request);
+    } catch (error) {
+      if (copy.request === panelRequest && isCurrentRequest(copy.request)) {
+        const uncertain = error?.code === 'uncertain-finish';
+        const message = element('div', 'msg bad', uncertain
+          ? 'Copy outcome is uncertain. Check the VESPER queue before attempting another copy.'
+          : controller.signal.aborted ? 'Browser copy stopped. No completion was confirmed.'
+          : 'This browser file could not be copied. No completion was confirmed.');
+        if (!uncertain) appendRetry(message, () => loadFormats(true));
+        renderShell(title, poster, duration, message);
+      }
+    } finally {
+      if (activeBrowserCopy === copy) activeBrowserCopy = null;
+    }
   }
 
   function declaredManifest(identity) {
@@ -1184,8 +1416,10 @@
       channel: 'channel', feed: 'feed', shortformfeed: 'feed' })[kind] || 'collection';
   }
 
-  function collectionPickerControls(title, request, kind) {
-    const actionLabel = `Browse ${collectionName(kind)} in VESPER`;
+  function collectionPickerControls(title, request, formats) {
+    const name = collectionName(formats.collectionKind);
+    const actionLabel = `Browse ${name} in VESPER`;
+    const openedPage = panelMedia?.documentPage || pageAddress();
     const browse = element('button', 'vesper-button collection-browse');
     browse.title = actionLabel;
     browse.setAttribute('aria-label', actionLabel);
@@ -1193,19 +1427,33 @@
     icon.src = chrome.runtime.getURL('icons/vesper-32.png');
     icon.alt = '';
     browse.append(icon);
-    const status = element('small', 'hint', 'VESPER will show the available entries and their quality matches.');
+    const status = element('small', 'hint');
+    status.setAttribute('role', 'status');
     status.hidden = true;
     browse.onclick = async () => {
-      if (!panelMedia || !isCurrentRequest(request) || browse.disabled) return;
-      const pageUrl = panelMedia.pageUrl;
+      if (!browse.isConnected || !panelMedia || !isCurrentRequest(request) || browse.disabled) return;
+      const selected = VesperPlayerSource.http(panelMedia.pageUrl);
+      const collection = VesperPlayerSource.http(formats.collectionUrl);
+      const frame = VesperPlayerSource.http(pageAddress());
+      // Keep the resolver's collection URL when it belongs to this frame's origin.
+      const pageUrl = collection && collection.origin === frame?.origin ? collection.href
+        : selected && selected.origin === frame?.origin ? selected.href : null;
+      if (!pageUrl || openedPage !== pageAddress()) {
+        status.hidden = false;
+        status.textContent = 'The page changed or the collection address is unavailable. Reopen the picker.';
+        status.classList.add('bad');
+        place(true);
+        return;
+      }
       browse.disabled = true;
       browse.title = 'Opening VESPER…';
       status.hidden = false;
       status.textContent = 'Choose checked entries and confirm in VESPER.';
       status.classList.remove('bad');
+      place(true);
       try {
         const reply = await send({ type: 'native-picker', pageUrl, title });
-        if (!isCurrentRequest(request)) return;
+        if (!browse.isConnected || !isCurrentRequest(request)) return;
         browse.disabled = false;
         browse.title = actionLabel;
         if (reply?.ok) {
@@ -1215,15 +1463,17 @@
           status.textContent = errorMessage(reply).textContent;
           status.classList.toggle('bad', reply?.code !== 'cancelled');
         }
+        place(true);
       } catch {
-        if (!isCurrentRequest(request)) return;
+        if (!browse.isConnected || !isCurrentRequest(request)) return;
         browse.disabled = false;
         browse.title = actionLabel;
-        status.textContent = 'VESPER could not open the playlist picker.';
+        status.textContent = `VESPER could not open this ${name}.`;
         status.classList.add('bad');
+        place(true);
       }
     };
-    return [browse, status];
+    return { browse, status };
   }
 
   function renderChoices(title, poster, seconds, formats, expanded = false, useOriginal = false, useM4a = true) {
@@ -1234,7 +1484,12 @@
     const presets = audioChoice ? originalPresets.map(c => c.label === 'Audio only' ? audioChoice : c) : originalPresets;
     const intent = formats.intent ||= { audioTrack: null, subtitles: [], includeAutoSubtitles: false, embedSubtitles: false };
     const draft = formats.trimDraft ||= { enabled: false, start: '', end: '' };
-    const moreFormats = formats.more || [];
+    const visibleIndexes = new Set(presets.map(option => option.index));
+    const moreFormats = (formats.more || []).filter(option => {
+      if (visibleIndexes.has(option.index)) return false;
+      visibleIndexes.add(option.index);
+      return true;
+    });
     const all = expanded ? [...presets, ...moreFormats] : presets;
     const output = element('label', 'output', 'Output');
     const mode = element('select');
@@ -1299,7 +1554,12 @@
       const option = element('button', 'opt');
       option.setAttribute('role', 'radio');
       const labels = element('span');
-      labels.append(element('b', '', c.label), element('small', '', c.detail || ''));
+      const size = Number.isSafeInteger(c.sizeBytes) && c.sizeBytes > 0
+        ? (c.sizeEstimated ? '≈ ' : '') + (c.sizeBytes >= 1073741824
+          ? (c.sizeBytes / 1073741824).toFixed(2) + ' GB'
+          : (c.sizeBytes / 1048576).toFixed(1) + ' MB') : '';
+      labels.append(element('b', '', c.label),
+        element('small', '', [c.detail, size].filter(Boolean).join(' · ')));
       const [icon, tone] = { 'Best quality': ['♕', 'best'], Balanced: ['▣', 'balanced'],
         Smallest: ['⌁', ''], 'Audio only': ['♫', 'audio'] }[c.label] || ['›', ''];
       const mark = element('span', 'icon ' + tone, icon);
@@ -1533,11 +1793,19 @@
       body.push(more);
     }
     if (formats.hasRelatedCollection && !formats.browserChoice) {
-      collectionControls = collectionPickerControls(title, request, formats.collectionKind);
+      collectionControls = collectionPickerControls(title, request, formats);
       body.push(collectionControls.status);
     }
-    const footer = element('div', 'foot');
+    const footer = element('div', 'foot picker-foot');
     if (collectionControls) footer.append(collectionControls.browse);
+    if (formats.browserChoice && formats.browserBodyAvailable) {
+      const browserSave = element('button', 'vesper-button', 'Save with VESPER');
+      browserSave.onclick = () => {
+        if (!browserSave.isConnected || !isCurrentRequest(request)) return;
+        void startBrowserCopy({ player: panelMedia.player, src: panelMedia.src, title, poster, duration: seconds });
+      };
+      footer.append(browserSave);
+    }
     for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
       const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
@@ -1571,16 +1839,29 @@
     const list = element('div', 'list');
     list.setAttribute('role', 'group');
     list.setAttribute('aria-label', 'Other video sources');
+    const matchesLength = source => Number.isFinite(seconds) && seconds > 0
+      && Number.isFinite(source.durationSeconds) && Math.abs(source.durationSeconds - seconds) <= Math.max(1, seconds * 0.03);
+    const hasMatch = formats.sourceChoices.some(matchesLength);
+    const other = element('details', 'languages');
+    other.append(element('summary', 'vesper-button more', 'Other detected videos'));
+    const alternateList = element('div', 'list');
+    other.append(alternateList);
+    other.ontoggle = () => { if (other.isConnected) place(true); };
     for (const source of formats.sourceChoices) {
       const option = element('button', 'opt');
       const labels = element('span');
-      labels.append(element('b', '', source.label), element('small', '', source.detail));
+      labels.append(element('b', '', source.displayLabel || source.label),
+        element('small', '', source.displayDetail || source.detail));
       option.append(element('span', 'icon balanced', '›'), labels);
       option.onclick = () => { if (option.isConnected) void inspectSource(source.token, title, poster, seconds, formats.playerLive === true); };
-      list.append(option);
+      // Duration can rank alternatives, but never establishes identity. Keep
+      // other videos accessible instead of silently replacing the user's video.
+      (hasMatch && !matchesLength(source) ? alternateList : list).append(option);
     }
-    const prompt = formats.verifiedSources ? 'Choose the source that matches your video.' : 'Check a video source to see its formats.';
-    renderShell(title, poster, seconds, element('div', 'msg', prompt), list);
+    const prompt = formats.sourceChoices.length === 1 ? 'Available video · choose to see formats.'
+      : 'Choose the video that matches your player.';
+    renderShell(title, poster, seconds, element('div', 'msg', prompt), list,
+      ...(alternateList.childElementCount ? [other] : []));
   }
 
   async function inspectSource(token, title, poster, seconds, playerLive = false) {
@@ -1666,6 +1947,7 @@
       'host-missing': 'Open VESPER Settings, then use Repair helper under Browser.',
       'app-unavailable': 'Could not connect to the desktop helper.',
       'host-error': 'The connection to VESPER failed.',
+      'desktop-version-mismatch': 'Update VESPER and its browser helper together. This extension needs a newer desktop build.',
       duplicate: 'This link is already in VESPER.',
       cancelled: 'Cancelled in VESPER.',
       timeout: 'VESPER didn’t answer in time.',
@@ -1706,6 +1988,35 @@
     contextNoticeTimer = setTimeout(() => { contextNotice?.remove(); contextNotice = null; }, 5000);
   }
 
+  // Explicit browser context-menu action; no interception of the site's own click.
+  // The same finite-body route is used for files generated locally in the page.
+  function copyGeneratedLink(url) {
+    if (extensionPaused || generatedCopy || activeBrowserCopy)
+      return { ok: false, message: 'Another browser copy is active, or VESPER is paused.' };
+    const link = VesperBrowserBody.generatedLink(document.querySelectorAll('a[download],area[download]'), url, location.origin);
+    if (!link) return { ok: false, message: 'The original download link is no longer available or has an ambiguous filename.' };
+    const controller = new AbortController();
+    const copy = { controller };
+    generatedCopy = copy;
+    let last = 0;
+    showContextNotice({ message: 'Opening browser file…' });
+    void VesperBrowserBody.copyBlob({ url: link.url, origin: location.origin, generated: link, signal: controller.signal,
+      onProgress(received, total) {
+        const now = Date.now();
+        if (received !== total && now - last < 1000) return;
+        last = now;
+        showContextNotice({ message: received === total ? 'Checking and accepting browser file…'
+          : 'Copying browser file · ' + Math.floor(received * 100 / total) + '%' });
+      } }).then(() => {
+      showContextNotice({ message: 'Browser file accepted by VESPER.' });
+    }).catch(() => {
+      if (!signal.aborted) showContextNotice({ message: controller.signal.aborted
+        ? 'Browser copy stopped. No completion was confirmed.'
+        : 'Browser copy could not be confirmed. Check VESPER before retrying.' });
+    }).finally(() => { if (generatedCopy === copy) generatedCopy = null; });
+    return { ok: true };
+  }
+
   function applyMotion() {
     if (!alive()) return;
     host?.toggleAttribute('data-vesper-still', still());
@@ -1721,6 +2032,10 @@
     if (message?.type === 'vesper-context-notice' && alive()) {
       showContextNotice(message.reply);
       sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type === 'vesper-copy-generated' && alive()) {
+      sendResponse(copyGeneratedLink(message.url));
       return false;
     }
     if (message?.type === 'vesper-open-picker') {
@@ -1744,7 +2059,11 @@
     }
     return false;
   });
-  window.addEventListener('pagehide', e => { if (e.persisted) companion?.setVisible(false); else retire(); }, { signal });
+  window.addEventListener('pagehide', e => {
+    activeBrowserCopy?.controller.abort();
+    generatedCopy?.controller.abort();
+    if (e.persisted) companion?.setVisible(false); else retire();
+  }, { signal });
   window.addEventListener('pageshow', refreshPlayers, { signal });
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;

@@ -30,6 +30,7 @@ public sealed record ProbeResult(Uri FinalUrl, int StatusCode, string? ContentTy
 {
     public bool IsSuccess => !InvalidExtent && StatusCode is 200 or 206;
     internal bool InvalidExtent { get; init; }
+    internal string? StrongETag { get; init; }
 }
 
 public sealed record MediaRangeProbeResult(int StatusCode, bool IsValid, string Detail);
@@ -255,6 +256,7 @@ public sealed class SecureHttpClient : IDisposable
             || headers.ContentLength is long declared && declared != last + 1
             || (get.RequestMessage?.RequestUri ?? url) != probe.FinalUrl
             || probe.ContentLength is long expected && expected != total
+            || probe.StrongETag is { } expectedTag && get.Headers.ETag?.ToString() != expectedTag
             || headers.ContentEncoding.Any(value => !value.Equals("identity", StringComparison.OrdinalIgnoreCase)))
             return null;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -306,7 +308,12 @@ public sealed class SecureHttpClient : IDisposable
         bool ranges = resp.StatusCode == HttpStatusCode.PartialContent ||
                       resp.Headers.AcceptRanges.Contains("bytes");
         return new ProbeResult(resp.RequestMessage?.RequestUri ?? fallbackUrl, (int)resp.StatusCode,
-            h.ContentType?.MediaType, length, ranges, h.ContentDisposition?.FileName?.Trim('"'));
+            h.ContentType?.MediaType, length, ranges, h.ContentDisposition?.FileName?.Trim('"'))
+        {
+            StrongETag = resp.Headers.ETag is { IsWeak: false } tag && tag.Tag != "*" && tag.Tag.Length <= 256
+                && h.ContentEncoding.All(value => value.Equals("identity", StringComparison.OrdinalIgnoreCase))
+                ? tag.ToString() : null
+        };
     }
 
     // ---- internals --------------------------------------------------------------------------------------------

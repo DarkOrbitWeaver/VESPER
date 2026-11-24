@@ -483,9 +483,8 @@ internal static class MediaTransferBridge
         IReadOnlyDictionary<string, string>? secrets = TransferSecrets(ctx, tracks[0].Url);
         if (tracks.Any(track => !SameSecretHeaders(secrets, TransferSecrets(track.Context, track.Url))))
             return (null, "These streams need different credential headers, which a single merge job cannot carry.");
-        if (secrets is not null && tracks.Any(track => track.Protocol != StreamProtocol.Http
-            || !UrlPolicy.IsSameOrigin(tracks[0].Url, track.Url)))
-            return (null, "Credentials are supported only for direct merge tracks on one exact origin.");
+        if (secrets is not null && tracks.Any(track => !UrlPolicy.IsSameOrigin(tracks[0].Url, track.Url)))
+            return (null, "Credentialed merge tracks must share one exact origin.");
         if (tracks.Any(t => t.Container is null || t.Protocol == StreamProtocol.Http && t.FileSize is not > 0
             || t.Protocol == StreamProtocol.Hls && t.Container is not ("mp4" or "m4a" or "ts")
             || t.Protocol == StreamProtocol.Dash && t.Segments is not { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
@@ -536,7 +535,8 @@ internal static class MediaTransferBridge
             }
             mergeTracks.Add(new MergeTrack(role, track.Id, track.Url.AbsoluteUri, source is null ? track.FileSize!.Value : 0,
                 track.Container!, track.HasVideo ? track.VideoCodec : track.AudioCodec, track.ContentIdentity,
-                track.AudioLanguage is { Length: 3 } lang ? lang : null, source));
+                track.AudioLanguage is { Length: 3 } lang ? lang : null, source,
+                source is null ? track.ResourceETag : null, source is null ? track.ResourceUrlSha256 : null));
         }
         var merge = new MediaMergePlan
         {

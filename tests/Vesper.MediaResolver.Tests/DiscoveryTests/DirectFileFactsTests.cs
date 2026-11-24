@@ -115,6 +115,85 @@ public sealed class DirectFileFactsTests
         Assert.All(reads, read => Assert.Equal("bytes=0-262143", read.Headers["Range"]));
     }
 
+    [Fact]
+    public async Task X_asset_group_combines_verified_qualities_without_fetching_the_post()
+    {
+        const string page = "https://x.com/example/status/1234567890";
+        const string low = "https://video.twimg.com/ext_tw_video/9876543210/pu/vid/512x256/low.mp4";
+        const string high = "https://video.twimg.com/ext_tw_video/9876543210/pu/vid/1024x576/high.mp4";
+        var handler = new FakeHttpHandler()
+            .Add(low, Mp4(("vide", "avc1", 512, 256), ("soun", "mp4a", 0, 0)), "video/mp4")
+            .Add(high, Mp4(("vide", "avc1", 1024, 576), ("soun", "mp4a", 0, 0)), "video/mp4");
+        using var resolver = T.Resolver(handler);
+        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        {
+            Url = new(page), Options = new DiscoveryOptions { ExactBrowserAssetGroup = true },
+            Browser = new BrowserDiscoveryMessage
+            {
+                Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
+                Candidates = [new() { Url = low, Kind = "direct" }, new() { Url = high, Kind = "direct" }]
+            }
+        }, CancellationToken.None);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(new int?[] { 256, 576 }, result.Item!.Representations.Select(r => r.Height).Order().ToArray());
+        Assert.All(handler.Requests, request => Assert.Contains(request.Url.AbsoluteUri, new[] { low, high }));
+    }
+
+    [Theory]
+    [InlineData("https://video.twimg.com/ext_tw_video/9876543211/pu/vid/other.mp4")]
+    [InlineData("https://video.twimg.com.evil.example/ext_tw_video/9876543210/pu/vid/other.mp4")]
+    [InlineData("https://video.twimg.com/amplify_video/9876543210/pu/vid/other.mp4")]
+    public async Task X_asset_group_refuses_unrelated_delivery_namespaces_before_network(string other)
+    {
+        const string page = "https://x.com/example/status/1234567890";
+        const string first = "https://video.twimg.com/ext_tw_video/9876543210/pu/vid/first.mp4";
+        var handler = new FakeHttpHandler();
+        using var resolver = T.Resolver(handler);
+        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        {
+            Url = new(page), Options = new DiscoveryOptions { ExactBrowserAssetGroup = true },
+            Browser = new BrowserDiscoveryMessage
+            {
+                Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
+                Candidates = [new() { Url = first, Kind = "direct" }, new() { Url = other, Kind = "direct" }]
+            }
+        }, CancellationToken.None);
+        Assert.False(result.IsSuccess);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Distinct_unidentified_files_are_not_deduplicated_as_same_quality()
+    {
+        var handler = new FakeHttpHandler().AddMedia(VideoUrl, "video/mp4", 1000)
+            .AddMedia(VideoUrl + "/second.mp4", "video/mp4", 2000);
+        var item = await ResolveAsync(handler, VideoUrl, VideoUrl + "/second.mp4");
+        Assert.Equal(2, item.Representations.Count);
+        Assert.All(item.Representations, rep => Assert.Null(rep.Height));
+    }
+
+    [Fact]
+    public async Task Group_rejects_direct_redirect_to_another_asset()
+    {
+        const string page = "https://x.com/example/status/1234567890";
+        const string first = "https://video.twimg.com/ext_tw_video/9876543210/pu/vid/first.mp4";
+        const string second = "https://video.twimg.com/ext_tw_video/9876543210/pu/vid/second.mp4";
+        const string unrelated = "https://video.twimg.com/ext_tw_video/9876543211/pu/vid/third.mp4";
+        var handler = new FakeHttpHandler().AddMedia(first).AddRedirect(second, unrelated).AddMedia(unrelated);
+        using var resolver = T.Resolver(handler);
+        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        {
+            Url = new(page), Options = new DiscoveryOptions { ExactBrowserAssetGroup = true },
+            Browser = new BrowserDiscoveryMessage
+            {
+                Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
+                Candidates = [new() { Url = first, Kind = "direct" }, new() { Url = second, Kind = "direct" }]
+            }
+        }, CancellationToken.None);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(MediaErrorCode.InvalidInput, result.Error!.Code);
+    }
+
     private static async Task<MediaItem> ResolveAsync(FakeHttpHandler handler, params string[] urls)
     {
         using var resolver = T.Resolver(handler);
@@ -166,5 +245,20 @@ public sealed class DirectFileFactsTests
         Encoding.ASCII.GetBytes(type).CopyTo(box, 4);
         payload.CopyTo(box, 8);
         return box;
+    }
+
+    [Theory]
+    [InlineData("\"v1\"", true)]
+    [InlineData("W/\"v1\"", false)]
+    [InlineData(null, false)]
+    public async Task GenericFileIdentityRequiresStrongValidator(string? etag, bool proven)
+    {
+        var h = new FakeHttpHandler().Add(VideoUrl,
+            Mp4(("vide","avc1",1024,576),("soun","mp4a",0,0)), "video/mp4",
+            headers: etag is null ? null : new() { ["ETag"] = etag });
+        var rep = Assert.Single((await ResolveAsync(h, VideoUrl)).Representations);
+        Assert.Equal(proven, rep.ContentIdentity?.StartsWith("http-v1:") == true);
+        Assert.Equal(proven, rep.ResourceETag is not null);
+        Assert.Equal(proven, rep.ResourceUrlSha256 is not null);
     }
 }

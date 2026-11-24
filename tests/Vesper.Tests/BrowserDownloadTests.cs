@@ -247,4 +247,20 @@ public sealed class BrowserDownloadTests
         Assert.True(added.Ok, added.Message);
         return added.JobId;
     }
+
+    [Fact]
+    public async Task AcceptedMediaSubmissionReceiptSurvivesEngineRestart()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var h = new Harness();
+        const string receipt = "fixture-media-request:0";
+        var added = h.Engine.Add(new AddRequest(server.Url("/file"),StartNow:false,RequestId:receipt));
+        Assert.True(added.Ok,added.Message);
+        Assert.Equal(added.JobId,h.Engine.FindAcceptedSubmission(receipt));
+        Assert.Null(h.Engine.FindAcceptedSubmission("not-accepted"));
+        h.Restart();
+        Assert.Equal(added.JobId,h.Engine.FindAcceptedSubmission(receipt));
+        Assert.Single(h.Engine.Snapshots());
+    }
 }

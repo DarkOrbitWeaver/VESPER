@@ -11,6 +11,7 @@ public sealed class DiscoveryOptions
     public bool ResolveEmbeds { get; init; } = true;
     public bool IncludeSubtitles { get; init; } = true;
     public bool ExactBrowserSource { get; init; }
+    public bool ExactBrowserAssetGroup { get; init; }
 
     /// <summary>Internal recursion guard for embedded players.</summary>
     public int EmbedDepth { get; init; }

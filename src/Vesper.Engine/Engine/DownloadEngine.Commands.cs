@@ -82,6 +82,14 @@ public sealed partial class DownloadEngine
         return result;
     }
 
+    /// <summary>Read-only receipt for a durable, already accepted submission. Never starts another job.</summary>
+    public Guid? FindAcceptedSubmission(string requestId)
+    {
+        if (string.IsNullOrWhiteSpace(requestId) || requestId.Length > 256) return null;
+        lock (_lock)
+            return _store.TryGetSubmission(requestId, out Guid id) && _jobs.ContainsKey(id) ? id : null;
+    }
+
     private AddResult AddCore(AddRequest request)
     {
         if (request.RequestId is { Length: > 0 } requestId && _store.TryGetSubmission(requestId, out Guid earlier))
@@ -98,7 +106,7 @@ public sealed partial class DownloadEngine
         try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return new AddResult(AddStatus.Invalid, Guid.Empty, ex.Message); }
 
-        if (!Enum.IsDefined(request.Kind) || request.Kind == JobKind.BrowserFile)
+        if (!Enum.IsDefined(request.Kind) || request.Kind is JobKind.BrowserFile or JobKind.BrowserStream)
             return new AddResult(AddStatus.Invalid, Guid.Empty, "Unsupported job kind.");
         if (request.BrowserProof is { } proof && (request.Kind != JobKind.Http || !proof.IsValid
             || !proof.AwaitingConfirmation || request.Output != MediaOutput.Original || request.RequestId is null))
@@ -107,9 +115,8 @@ public sealed partial class DownloadEngine
             (request.Kind is not (JobKind.Http or JobKind.Merge) || request.MediaProvider is not { Length: > 0 and <= 80 }
              || !string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "Compatible output requires a discovered media download without a file checksum.");
-        if (request.Kind == JobKind.Dash && (!DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out string planError)
-            || request.Secrets is { Count: > 0 }))
-            return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan without persisted credentials is required.");
+        if (request.Kind == JobKind.Dash && !DashDownloadPlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out _, out _))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "A valid clear DASH plan is required.");
         RequestCredentials? mergeCredentials = null;
         if (request.Kind == JobKind.Merge)
         {
@@ -122,7 +129,7 @@ public sealed partial class DownloadEngine
             if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null)
                 return new AddResult(AddStatus.Invalid, Guid.Empty, "A media merge plan cannot use a file checksum or piece map.");
             if (request.Secrets is { Count: > 0 }
-                && !TryCreateMergeCredentials(plan, uri, request.Secrets, out mergeCredentials, out string credentialError))
+                && !TryCreateMergeCredentials(plan, uri, request.Secrets, out mergeCredentials, out string credentialError, allowSegmented: true))
                 return new AddResult(AddStatus.Invalid, Guid.Empty, credentialError);
         }
 
@@ -595,7 +602,7 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id)
-                || _cancelling.Contains(id) || !CanDiscardPartial(job))
+                || job.Kind == JobKind.BrowserStream || _cancelling.Contains(id) || !CanDiscardPartial(job))
                 return false;
 
             DownloadJob preparing = job.CopyForUpdate();

@@ -201,4 +201,27 @@ public class GenericAdapterTests
         Assert.Equal("vimeo", res.Item!.Provider);
         Assert.DoesNotContain(h.Requests, r => r.Url.Host == "ads.generic-fixture.example");
     }
+
+    [Fact]
+    public async Task StructuredPlayerConfigDiscoversOnlyTheDeclaredPlayer()
+    {
+        var h = new FakeHttpHandler().Add($"{Page}/config", """
+            <script type="application/json" id="__NEXT_DATA__">{"props":{"pageProps":{"player":{"sources":[{"src":"/movie.mp4","type":"video/mp4"}]},"recommendations":[{"sources":[{"src":"/ad.m3u8"}]}]}}}</script>
+            """).AddMedia($"{Page}/movie.mp4").AddMedia($"{Page}/ad.m3u8");
+        var result = await Resolve(h, $"{Page}/config");
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal($"{Page}/movie.mp4", Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        Assert.DoesNotContain(h.Requests, r => r.Url.AbsolutePath == "/ad.m3u8");
+    }
+
+    [Fact]
+    public async Task MultipleUnrelatedPlayerConfigsAreNotCombined()
+    {
+        var h = new FakeHttpHandler().Add($"{Page}/feed", """
+            <script type="application/json">{"player":{"sources":[{"src":"/one.mp4"}]},"video":{"sources":[{"src":"/two.m3u8"}]}}</script>
+            """).AddMedia($"{Page}/one.mp4").AddMedia($"{Page}/two.m3u8");
+        var result = await Resolve(h, $"{Page}/feed");
+        Assert.False(result.IsSuccess);
+        Assert.DoesNotContain(h.Requests, r => r.Url.AbsolutePath is "/one.mp4" or "/two.m3u8");
+    }
 }

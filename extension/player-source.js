@@ -35,6 +35,17 @@ globalThis.VesperPlayerSource = (() => {
       const id = host === 'dai.ly' ? parts[0] : url.searchParams.get('video')
         || (video >= 0 ? parts[video + 1]?.split('_')[0] : null);
       if (/^[a-z0-9]{5,12}$/i.test(id || '')) return `dailymotion:${id}`;
+    } else if (['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'].includes(host)) {
+      // Timeline/profile URLs are not video identities. Keep explicit media
+      // indexes separate; a multi-video post must not merge two different clips.
+      const status = parts[0] === 'i' && parts[1] === 'web' ? 2 : 1;
+      const id = parts[status] === 'status' ? parts[status + 1] : null;
+      if (/^\d{5,24}$/.test(id || '')) {
+        const rest = parts.slice(status + 2);
+        if (!rest.length) return 'x:' + id;
+        if (rest.length === 2 && rest[0] === 'video' && /^[1-9]\d?$/.test(rest[1]))
+          return 'x:' + id + ':video:' + rest[1];
+      }
     } else if (/(?:^|\.)facebook\.com$/.test(host)) {
       const index = parts.findIndex(part => part === 'reel' || part === 'videos');
       const id = url.searchParams.get('v') || (index >= 0 ? parts[index + 1] : null);

@@ -19,18 +19,30 @@ public static class BridgePipe
     public static async Task<string> RequestAsync(string pipeName, string json, TimeSpan connectTimeout, TimeSpan replyTimeout,
         CancellationToken ct, bool bringReviewForward = false)
     {
-        await using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-        using (var connect = CancellationTokenSource.CreateLinkedTokenSource(ct))
-        {
-            connect.CancelAfter(connectTimeout);
-            try { await client.ConnectAsync(connect.Token).ConfigureAwait(false); }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                throw new TimeoutException("VESPER is not accepting connections.");   // lets callers tell "not running" from "no answer"
-            }
-        }
+        await using var client = await ConnectAsync(pipeName, connectTimeout, ct).ConfigureAwait(false);
         if (bringReviewForward && OperatingSystem.IsWindows() && GetNamedPipeServerProcessId(client.SafePipeHandle, out uint processId))
             _ = AllowSetForegroundWindow(processId);
+        return await ExchangeAsync(client, json, replyTimeout, ct).ConfigureAwait(false);
+    }
+
+    public static async Task<NamedPipeClientStream> ConnectAsync(string pipeName, TimeSpan timeout, CancellationToken ct)
+    {
+        var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        try
+        {
+            using var connect = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            connect.CancelAfter(timeout);
+            try { await client.ConnectAsync(connect.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            { throw new TimeoutException("VESPER is not accepting connections."); }
+            return client;
+        }
+        catch { client.Dispose(); throw; }
+    }
+
+    // The caller serializes exchanges; the body session never pipelines frames.
+    public static async Task<string> ExchangeAsync(Stream client, string json, TimeSpan replyTimeout, CancellationToken ct)
+    {
         using var reply = CancellationTokenSource.CreateLinkedTokenSource(ct);
         reply.CancelAfter(replyTimeout);
         await BridgeProtocol.WriteFrameAsync(client, json, reply.Token).ConfigureAwait(false);
@@ -152,6 +164,18 @@ public sealed class BridgeServer : IDisposable
                 else
                 {
                     id = request.Id;
+                    if (request.BrowserBody is { Session: true } body)
+                    {
+                        if (body.Operation != "begin")
+                        {
+                            await BridgeProtocol.WriteFrameAsync(pipe,
+                                JsonSerializer.Serialize(BridgeResponse.Fail(id, "invalid", "Start a browser body session first."), BridgeProtocol.Json),
+                                timeout.Token).ConfigureAwait(false);
+                            return;
+                        }
+                        await ServeBodySessionAsync(pipe, request, timeout.Token).ConfigureAwait(false);
+                        return;
+                    }
                     try { response = await _handler(request, timeout.Token).ConfigureAwait(false); }
                     catch (OperationCanceledException) { response = BridgeResponse.Fail(id, "cancelled", "The request timed out."); }
                 }
@@ -160,6 +184,57 @@ public sealed class BridgeServer : IDisposable
             catch (Exception ex) when (ex is IOException or InvalidDataException or OperationCanceledException or ObjectDisposedException)
             {
                 // The peer went away or sent garbage. Nothing to recover; the connection is simply dropped.
+            }
+        }
+    }
+
+    // A session holds one transfer ID and accepts only sequential body commands.
+    // Disconnect cancels unpublished bytes immediately; an accepted job is immutable.
+    private async Task ServeBodySessionAsync(Stream pipe, BridgeRequest begin, CancellationToken firstToken)
+    {
+        string transferId = begin.BrowserBody!.TransferId;
+        bool opened = false, ended = false;
+        try
+        {
+            BridgeResponse initial = await _handler(begin, firstToken).ConfigureAwait(false);
+            opened = initial.Ok;
+            await BridgeProtocol.WriteFrameAsync(pipe, JsonSerializer.Serialize(initial, BridgeProtocol.Json), firstToken).ConfigureAwait(false);
+            if (!opened) return;
+            while (true)
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                timeout.CancelAfter(TimeSpan.FromMinutes(2));
+                string? json = await BridgeProtocol.ReadFrameAsync(pipe, timeout.Token).ConfigureAwait(false);
+                if (json is null) return;
+                if (!BridgeProtocol.TryParse(json, out BridgeRequest request, out _)
+                    || request.BrowserBody is not { Session: true } body
+                    || body.TransferId != transferId || body.Operation is not ("append" or "finish" or "abort"))
+                {
+                    await BridgeProtocol.WriteFrameAsync(pipe,
+                        JsonSerializer.Serialize(BridgeResponse.Fail("invalid000", "invalid", "Browser body session changed."), BridgeProtocol.Json),
+                        timeout.Token).ConfigureAwait(false);
+                    return;
+                }
+                if (body.Operation == "finish") timeout.CancelAfter(TimeSpan.FromMinutes(10));
+                BridgeResponse response = await _handler(request, timeout.Token).ConfigureAwait(false);
+                ended = response.Ok && body.Operation is "finish" or "abort";
+                await BridgeProtocol.WriteFrameAsync(pipe, JsonSerializer.Serialize(response, BridgeProtocol.Json), timeout.Token).ConfigureAwait(false);
+                if (ended || !response.Ok) return;
+            }
+        }
+        finally
+        {
+            if (opened && !ended)
+            {
+                // This may race a successful finish whose reply was lost. The engine
+                // treats abort of an already accepted ID as a read-only receipt.
+                using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try
+                {
+                    await _handler(begin with { BrowserBody = new BrowserBodyRequest("abort", transferId) }, cleanup.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException) { }
             }
         }
     }

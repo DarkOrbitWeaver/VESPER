@@ -1735,4 +1735,43 @@ public sealed class MediaMergeTests
         Assert.Null(done.FinalPath);
         Assert.True(File.Exists(done.PartialPath), "downloaded track data must be kept");
     }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task GenericMp4ClipChecksStrongResourceValidatorBeforeWriting(bool matching)
+    {
+        await using var server = new FaultServer();
+        byte[] file = [.. Fixture("av-init.mp4"), .. Fixture("av-1.m4s"), .. Fixture("av-2.m4s"), .. Fixture("av-3.m4s")];
+        server.Extra["/clip/verified.mp4"] = file;
+        await server.StartAsync();
+        string url = server.Url("/clip/verified.mp4");
+        string tag = matching ? "\"x\"" : "\"wrong\"";
+        string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(url)));
+        string identity = "http-v1:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(hash + "|" + tag + "|" + file.LongLength.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+        var plan = new MediaMergePlan
+        {
+            Version = 3, OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            ClipRange = new MediaTimeRange(0.1, 0.7),
+            Tracks = [new MergeTrack("muxed","verified",url,file.Length,"mp4","h264",identity,
+                ResourceETag:tag,ResourceUrlSha256:hash)]
+        };
+        using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(url, FileName:"verified.mp4",Kind:JobKind.Merge,MediaPlanJson:plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        var done = await h.WaitAsync(added.JobId,j=>j.State is JobState.Completed or JobState.NeedsAttention or JobState.NeedsLink or JobState.Failed);
+        if (matching)
+        {
+            Assert.True(done.State == JobState.Completed, $"{done.State}: {done.Message}");
+            using var output = File.OpenRead(done.FinalPath!);
+            Assert.Equal(2, MediaMerger.Demux(output,output.Length,default).Count);
+        }
+        else
+        {
+            Assert.NotEqual(JobState.Completed,done.State);
+            Assert.Null(done.FinalPath);
+            Assert.Equal(0,done.CommittedBytes);
+        }
+    }
 }

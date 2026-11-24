@@ -20,6 +20,12 @@
     } catch { return null; }
   };
 
+  function generatedAnchor(element) {
+    const value = element.href;
+    return element.hasAttribute('download') && globalThis.VesperBrowserBody?.localBlob(value, location.origin)
+      ? value : null;
+  }
+
   function fileDetails(element, url, player) {
     const name = element.getAttribute('download') || new URL(url).pathname.split('/').pop() || '';
     const extension = /\.([a-z0-9]{1,8})$/i.exec(name)?.[1];
@@ -68,29 +74,33 @@
     section.setAttribute('role', 'dialog'); section.setAttribute('aria-modal', 'true'); section.setAttribute('aria-label', 'Smart Select files');
     const heading = document.createElement('h2'); heading.textContent = 'Smart Select';
     const help = document.createElement('p');
-    help.textContent = 'Choose files to review in the desktop app. Use the butterfly for videos that play on the page.';
+    help.textContent = 'Choose files to review in VESPER, or copy generated browser files directly. Use the butterfly for playing videos.';
     const filter = document.createElement('input'); filter.type = 'search'; filter.placeholder = 'Filter by name, address or file type'; filter.setAttribute('aria-label', 'Filter files');
     const list = document.createElement('ul');
     const status = document.createElement('p'); status.setAttribute('role', 'status');
     const footer = document.createElement('footer');
     const close = document.createElement('button'); close.textContent = 'Cancel';
     const all = document.createElement('button'); all.textContent = 'Select visible';
+    const guided = document.createElement('button'); guided.textContent = 'Guided batch…';
+    guided.addEventListener('click', () => { finish(); globalThis.VesperSmartBatch?.open(); });
     const review = document.createElement('button'); review.textContent = 'Review in VESPER';
-    const selected = new Set(); let candidates = []; let scheduled = false;
+    const selected = new Set(), settled = new Set(), uncertain = new Set();
+    let candidates = [], scheduled = false, copying = false, copyController = null, copyStatus = '';
     const previousFocus = document.activeElement;
     function scheduleCollect() {
-      if (scheduled) return;
+      if (scheduled || copying) return;
       scheduled = true;
       queueMicrotask(() => { if (panel === host) collect(); });
     }
     function finish() {
+      copyController?.abort();
       document.removeEventListener('loadedmetadata', scheduleCollect, true);
       observer?.disconnect(); observer = null;
       host.remove(); panel = null; previousFocus?.focus?.();
     }
     function collect() {
       scheduled = false;
-      const found = new Map();
+      const found = new Map(), generated = new Map(), ambiguous = new Set();
       const players = new Map();
       for (const player of document.querySelectorAll('video, audio')) {
         const source = player.currentSrc && http(player.currentSrc);
@@ -98,12 +108,20 @@
       }
       for (const element of document.querySelectorAll(LINK_SELECTOR)) {
         if (found.size >= 1000) break;
-        const url = http(element.getAttribute('href') || element.dataset.downloadUrl || element.dataset.url || element.dataset.href);
+        const blob = generatedAnchor(element);
+        if (blob) {
+          const filename = element.getAttribute('download') || '';
+          if (generated.has(blob) && generated.get(blob) !== filename) ambiguous.add(blob);
+          else generated.set(blob, filename);
+          if (ambiguous.has(blob)) { found.delete(blob); continue; }
+        }
+        const url = blob || http(element.getAttribute('href') || element.dataset.downloadUrl || element.dataset.url || element.dataset.href);
         if (!url || found.has(url) || url.split('#')[0] === location.href.split('#')[0]) continue;
         const details = fileDetails(element, url, players.get(url));
         if (!details) continue;
         const label = (element.textContent?.trim() || element.getAttribute('aria-label') || element.getAttribute('download') || new URL(url).pathname.split('/').pop() || 'File').trim().replace(/\s+/g, ' ').slice(0, 200);
-        found.set(url, { url, label, ...details, sha256: publisherChecksum(element, url) });
+        found.set(url, { url, label, ...details, generated: Boolean(blob), originalName: blob ? generated.get(blob) : undefined,
+          sha256: blob ? null : publisherChecksum(element, url) });
       }
       candidates = [...found.values()];
       for (const url of selected) if (!found.has(url)) selected.delete(url);
@@ -117,7 +135,7 @@
       for (const candidate of visible) {
         const item = document.createElement('li'), label = document.createElement('label');
         const check = document.createElement('input'); check.type = 'checkbox'; check.checked = selected.has(candidate.url);
-        check.disabled = !check.checked && selected.size >= 50;
+        check.disabled = copying || settled.has(candidate.url) || uncertain.has(candidate.url) || !check.checked && selected.size >= 50;
         check.addEventListener('change', () => { check.checked ? selected.add(candidate.url) : selected.delete(candidate.url); render(); });
         const text = document.createElement('span'); text.textContent = candidate.label;
         const address = document.createElement('small');
@@ -125,24 +143,79 @@
         const url = new URL(candidate.url);
         const duration = candidate.duration !== undefined ? ` · ${durationText(candidate.duration)}`
           : ['Audio', 'Video'].includes(candidate.media) ? ' · Duration unknown' : '';
-        address.textContent = `${candidate.type}${duration} · ${url.host}${url.pathname}`;
+        address.textContent = candidate.generated
+          ? `${candidate.type} · Generated browser file${settled.has(candidate.url) ? ' · Accepted' : uncertain.has(candidate.url) ? ' · Check VESPER' : ''}`
+          : `${candidate.type}${duration} · ${url.host}${url.pathname}`;
         text.append(address);
         if (candidate.sha256) { const checksum = document.createElement('small'); checksum.textContent = 'Page SHA-256 available for desktop review'; text.append(checksum); }
         label.append(check, text); item.append(label); list.append(item);
       }
-      status.textContent = candidates.length ? `${selected.size} selected · ${visible.length} matching files. Maximum 50 per review.`
+      const selectedFiles = candidates.filter(item => selected.has(item.url));
+      const blobs = selectedFiles.filter(item => item.generated).length;
+      const mixed = blobs > 0 && blobs < selectedFiles.length;
+      review.textContent = blobs ? 'Copy with VESPER' : 'Review in VESPER';
+      status.textContent = copying || copyStatus ? copyStatus : mixed ? 'Select generated browser files separately from ordinary links.'
+        : candidates.length ? `${selected.size} selected · ${visible.length} matching files. Maximum 50 per review.`
         : 'No direct file links found on this page.';
-      all.disabled = visible.length === 0 || selected.size >= 50;
-      review.disabled = selected.size === 0;
+      all.disabled = copying || visible.length === 0 || selected.size >= 50;
+      guided.disabled = copying;
+      filter.disabled = copying;
+      review.disabled = copying || selected.size === 0 || mixed;
     }
     filter.addEventListener('input', render);
     all.addEventListener('click', () => {
       const query = filter.value.toLowerCase().trim();
-      for (const candidate of candidates) if (selected.size < 50 && matchesFilter(candidate, query)) selected.add(candidate.url);
+      for (const candidate of candidates) if (selected.size < 50 && matchesFilter(candidate, query)
+          && !settled.has(candidate.url) && !uncertain.has(candidate.url)) selected.add(candidate.url);
       render();
     });
     close.addEventListener('click', finish);
+    async function copyGeneratedFiles(files) {
+      if (copying || files.length === 0 || files.some(item => !item.generated)) return;
+      copying = true; copyController = new AbortController();
+      const signal = copyController.signal;
+      let accepted = 0;
+      try {
+        for (const item of files) {
+          if (signal.aborted || panel !== host) break;
+          const link = VesperBrowserBody.generatedLink(document.querySelectorAll('a[download],area[download]'), item.url, location.origin);
+          const anchors = [...document.querySelectorAll('a[download],area[download]')]
+            .filter(el => el.href === item.url);
+          if (!link || !anchors.length || anchors.some(el => (el.getAttribute('download') || '') !== item.originalName)) {
+            copyStatus = 'A generated file changed or disappeared. Remaining copies were not started.';
+            break;
+          }
+          copyStatus = `Copying ${accepted + 1} of ${files.length}…`; render();
+          let lastUpdate = 0;
+          try {
+            await VesperBrowserBody.copyBlob({ url: link.url, origin: location.origin, generated: link, signal,
+              onProgress(received, total) {
+                const now = Date.now();
+                if (now - lastUpdate < 300 && received !== total) return;
+                lastUpdate = now;
+                copyStatus = `Copying ${accepted + 1} of ${files.length} · ${Math.floor(received * 100 / total)}%`;
+                if (panel === host) status.textContent = copyStatus;
+              } });
+            settled.add(item.url); selected.delete(item.url); accepted++;
+          } catch {
+            // The finish reply may have been lost. Never automatically retry
+            // the ambiguous file or silently continue to the rest of the batch.
+            uncertain.add(item.url); selected.delete(item.url);
+            copyStatus = `${accepted} accepted · one copy unconfirmed. Check VESPER before retrying.`;
+            break;
+          }
+        }
+        if (accepted === files.length) copyStatus = `${accepted} browser files accepted by VESPER.`;
+      } finally {
+        copying = false; copyController = null;
+        if (panel === host) collect();
+      }
+    }
     review.addEventListener('click', async () => {
+      const files = candidates.filter(item => selected.has(item.url));
+      if (copying || !files.length) return;
+      if (files.every(item => item.generated)) return copyGeneratedFiles(files);
+      if (files.some(item => item.generated)) return;
       review.disabled = true; status.textContent = 'Review the selected files in the VESPER desktop window…';
       try {
         const reply = await chrome.runtime.sendMessage({ type: 'smart-submit', items: [...selected].map(url => {
@@ -163,7 +236,7 @@
       if (event.shiftKey && index <= 0) { event.preventDefault(); focusable.at(-1)?.focus(); }
       else if (!event.shiftKey && index === focusable.length - 1) { event.preventDefault(); focusable[0]?.focus(); }
     });
-    footer.append(close, all, review); section.append(heading, help, filter, list, status, footer); shadow.append(style, section); document.documentElement.append(host);
+    footer.append(close, all, guided, review); section.append(heading, help, filter, list, status, footer); shadow.append(style, section); document.documentElement.append(host);
     document.addEventListener('loadedmetadata', scheduleCollect, true);
     observer = new MutationObserver(scheduleCollect);
     observer.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['href', 'download', 'src', 'data-url', 'data-href', 'data-download-url'] });

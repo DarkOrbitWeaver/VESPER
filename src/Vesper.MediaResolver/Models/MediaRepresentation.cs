@@ -80,6 +80,11 @@ public sealed record MediaRepresentation
     /// </summary>
     public string? ContentIdentity { get; init; }
 
+    // A strong validator applies only to the exact final HTTP URL, including its query.
+    // These fields never assert equivalence of two distinct delivery endpoints.
+    public string? ResourceETag { get; init; }
+    public string? ResourceUrlSha256 { get; init; }
+
     public MediaRequestContext Context { get; init; } = MediaRequestContext.Empty;
     public Uri? ManifestUrl { get; init; }
     public SegmentPlan? Segments { get; init; }

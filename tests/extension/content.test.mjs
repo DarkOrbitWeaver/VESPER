@@ -4,6 +4,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
+function runContent(context, content = source('content')) {
+  vm.runInContext(source('vesper-intelligence'), context);
+  vm.runInContext(source('browser-body'), context);
+  vm.runInContext(content, context);
+}
 
 test('the butterfly motion picker has Animate and Off', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
@@ -138,11 +143,76 @@ test('browser playlist browsing only opens the native picker from resolver colle
   assert.match(content, /result\.data\?\.hasRelatedCollection/);
   assert.match(content, /type: 'native-picker', pageUrl, title/);
   assert.match(content, /formats\.hasRelatedCollection && !formats\.browserChoice/);
-  assert.match(background, /const trustedContentPage = sender\.tab \? mediaPage\(message, sender\)\?\.href : null/);
+  assert.match(background, /requestedPage\?\.origin === framePage\.origin/);
+  assert.match(options, /collectionUrl = collection\.SourceUrl\.AbsoluteUri/);
+  assert.match(options, /collectionUrl = HasRelatedCollection\(item\) \? item\.Related!\.Url\.AbsoluteUri : null/);
+  assert.match(content, /\.more\{[^}]*margin:8px 8px 0/);
   assert.match(options, /resolved\.Collection is \{ \} collection/);
   assert.match(options, /hasRelatedCollection = HasRelatedCollection\(item\)/);
   assert.match(options, /isLive = item\.IsLive/);
   assert.match(content, /formats\.playerLive = playerFacts\?\.live === true \|\| formats\.isLive === true/);
+});
+
+test('collection controls render an icon and a hidden status and forward the resolved collection', async () => {
+  const sent = [];
+  const document = Object.assign(new EventTarget(), {
+    querySelectorAll: () => [],
+    createElement: tag => ({
+      tagName: tag, isConnected: true, children: [], attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
+      append(...nodes) { this.children.push(...nodes); },
+      classList: { add() {}, remove() {}, toggle() {} }
+    })
+  });
+  const window = new EventTarget();
+  const location = { href: 'https://www.youtube.com/', hostname: 'www.youtube.com', origin: 'https://www.youtube.com' };
+  const context = vm.createContext({
+    window, document, location, AbortController, URL, Event,
+    ResizeObserver: class { observe() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} disconnect() {} },
+    VesperTheme: { available: () => true, watchPreference: () => () => {} },
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} },
+      getURL: path => 'chrome-extension://vesper-test/' + path,
+      sendMessage: async message => { sent.push(message); return { ok: true, results: [{ status: 'queued' }] }; } } }
+  });
+  vm.runInContext(source('player-source'), context);
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.testControls = (formats, selected = location.href, documentPage = location.href) => {
+    panelMedia = { pageUrl: selected, documentPage, documentIdentity: VesperPlayerSource.identity(pageAddress()) };
+    place = () => {};
+    return collectionPickerControls('Example', panelRequest, formats);
+  };
+  window.testYouTubePage = activeYouTubePage;
+  })();`);
+  runContent(context, content);
+  const url = 'https://www.youtube.com/watch?v=abcdefghijk&list=PLexample';
+  for (const [kind, label] of [['playlist', 'playlist'], ['dynamicmix', 'mix'], ['album', 'album']]) {
+    const { browse, status } = window.testControls({ collectionKind: kind, collectionUrl: url });
+    assert.equal(browse.tagName, 'button');
+    assert.equal(browse.title, 'Browse ' + label + ' in VESPER');
+    assert.equal(browse.attributes['aria-label'], browse.title);
+    assert.equal(browse.children.length, 1);
+    assert.equal(browse.children[0].tagName, 'img');
+    assert.equal(status.hidden, true);
+    await browse.onclick();
+    assert.equal(sent.at(-1).pageUrl, url);
+    assert.equal(status.textContent, '1 item(s) accepted in VESPER.');
+    assert.equal(browse.disabled, false);
+  }
+  location.href = url;
+  const stale = window.testControls({ collectionKind: 'playlist', collectionUrl: url });
+  location.href = url.replace('PLexample', 'PLanother');
+  const count = sent.length;
+  await stale.browse.onclick();
+  assert.equal(sent.length, count);
+  const late = window.testControls({ collectionKind: 'playlist', collectionUrl: url }, url, url);
+  await late.browse.onclick();
+  assert.equal(sent.length, count, 'a late response cannot open the old collection');
+  location.href = url;
+  const player = { dispatchEvent() {}, getAttribute: () => 'abcdefghijk' };
+  assert.equal(window.testYouTubePage(player, 'https://www.youtube.com/watch?v=abcdefghijk'), url);
+  const fallback = window.testControls({ collectionKind: 'playlist', collectionUrl: 'https://other.example/list' }, url);
+  await fallback.browse.onclick();
+  assert.equal(sent.at(-1).pageUrl, url);
 });
 
 test('butterfly motion responds to Animate and Off', () => {
@@ -169,7 +239,7 @@ test('butterfly motion responds to Animate and Off', () => {
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testMotion = {
     still, applyMotion, setTargets: (nextHost, nextCompanion) => { host = nextHost; companion = nextCompanion; }
   };\n})();`);
-  vm.runInContext(content, context);
+  runContent(context, content);
 
   const attributes = new Set();
   const stillModes = [];
@@ -212,7 +282,7 @@ test('the context-menu picker reports when its frame has no video player', async
   });
   vm.runInContext(source('theme'), context);
   vm.runInContext(source('player-source'), context);
-  vm.runInContext(source('content'), context);
+  runContent(context);
   await Promise.resolve();
 
   let reply;
@@ -248,7 +318,7 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
       perch = { x: 20, y: 30, faceLeft: false };
     }
   };\n})();`);
-  vm.runInContext(content, context);
+  runContent(context, content);
 
   const calls = [];
   const classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
@@ -266,7 +336,7 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
   window.testPlayer.startDrag(down);
   window.testPlayer.moveDrag({ ...down, clientX: 110, clientY: 70 });
   window.testPlayer.finishDrag(down);
-  assert.deepEqual(calls[0], [116, 76]);
+  assert.deepEqual(calls[0], [105, 65]); // No longer clamped to one butterfly-width outside.
   assert.equal(window.testPlayer.moved(), true);
 
   function advance() {
@@ -313,6 +383,14 @@ test('Smart Select filters navigation links and reports direct file details', ()
   assert.equal(movie.type, 'MP4 video');
   assert.equal(movie.duration, 95);
   assert.equal(context.__details(link, 'https://example.test/movie.mp4').duration, undefined);
+});
+
+test('normal Smart Select opens the guided batch panel on request', () => {
+  const smartSelect = source('smart-select');
+  const guidedBatch = source('vesper-smart-batch');
+  assert.match(smartSelect, /Guided batch/);
+  assert.match(smartSelect, /VesperSmartBatch\?\.open\(\)/);
+  assert.match(guidedBatch, /dataset\.vesperBatch/);
 });
 
 test('Smart Select associates only one clearly labelled SHA-256 with its sole nearby file link', () => {
@@ -369,7 +447,7 @@ test('an orphaned content script disconnects observers and storage listeners on 
   });
   vm.runInContext(source('theme'), context);
   vm.runInContext(source('player-source'), context);
-  vm.runInContext(source('content'), context);
+  runContent(context);
   await Promise.resolve();
   assert.equal(window.__vesperContent, true);
   live = false;
@@ -420,7 +498,7 @@ test('a feed player uses the unique page linked from its card', async () => {
   vm.runInContext(source('theme'), context);
   vm.runInContext(source('player-source'), context);
   const content = source('content').replace(/\}\)\(\);\s*$/, 'window.__testPageForPlayer = pageForPlayer;\n})();');
-  vm.runInContext(content, context);
+  runContent(context, content);
 
   assert.equal(window.__testPageForPlayer(video), item);
   assert.equal(window.__testPageForPlayer(new FakeElement()), home);
@@ -452,7 +530,7 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
   });
   vm.runInContext(source('player-source'), context);
   const content = source('content').replace(/\}\)\(\);\s*$/, `attach = el => { window.testPlayer = el; };\n})();`);
-  vm.runInContext(content, context);
+  runContent(context, content);
 
   const reel = new Video();
   videos.push(reel);
@@ -554,7 +632,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
       renderShell = () => {};
     }
   };\n})();`);
-  vm.runInContext(content, context);
+  runContent(context, content);
   await new Promise(resolve => setImmediate(resolve));
 
   window.__testContent.onPointer({ target: card, clientX: 220, clientY: 100 });
@@ -596,6 +674,8 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const audioAac = trim({ canClip: true, clipUsesWholeFile: true, container: 'M4A' }, 95);
   assert.equal(audioAac.available, true);
   assert.equal(audioAac.reason, '', 'a supported AAC trim does not show a generic download paragraph');
+  assert.equal(trim({ canClip: true, clipUsesWholeFile: true }, 1200).reason, '');
+  assert.match(trim({ canClip: true, clipUsesWholeFile: true }, 1201).reason, /full video, then trims/);
   assert.match(trim({ canClip: true }, 0).reason, /known media length/);
   assert.match(trim({ canClip: true }, Infinity, true).reason, /live streams/);
   assert.match(trim({ canClip: false }, 95).reason, /can't be trimmed/);
@@ -704,7 +784,7 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
       companion = { setPickerOpen() {}, setVisible() {}, pointerMove() {} };
     }
   };\n})();`);
-  vm.runInContext(content, context);
+  runContent(context, content);
   await new Promise(resolve => setImmediate(resolve));
   const page = window.__testContent;
   const runLatestTimer = afterMs => { now += afterMs; scheduled.at(-1).handler(); };

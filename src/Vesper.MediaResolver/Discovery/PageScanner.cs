@@ -40,6 +40,8 @@ internal static class PageScanner
         private readonly int _max;
         private Uri _base;
         private string? _ldTitle;
+        private readonly List<List<MediaCandidate>> _configGroups = new();
+        private int _configBudget = 512;
 
         public State(Uri page, int max)
         {
@@ -137,6 +139,11 @@ internal static class PageScanner
             }
             foreach (var a in ogAudios) AddCandidate(a, metas.GetValueOrDefault("og:audio:type") ?? "audio/*", null, null, null);
 
+            // Structured player configuration is a fallback, not permission to mix
+            // several unrelated videos from a feed or recommendation section.
+            if (_meta.Candidates.Count == 0 && _configGroups.Count == 1)
+                foreach (MediaCandidate candidate in _configGroups[0])
+                    AddCandidate(candidate.Url.AbsoluteUri, candidate.MimeType, candidate.Width, candidate.Height, candidate.Label);
             _meta.Title = Clean(_ldTitle) ?? Clean(metas.GetValueOrDefault("og:title")) ?? Clean(metas.GetValueOrDefault("twitter:title")) ?? Clean(docTitle);
             _meta.Description ??= Clean(metas.GetValueOrDefault("og:description")) ?? Clean(metas.GetValueOrDefault("description"));
             _meta.Thumbnail ??= UrlUtil.Resolve(_base, metas.GetValueOrDefault("og:image") ?? metas.GetValueOrDefault("twitter:image"));
@@ -155,6 +162,33 @@ internal static class PageScanner
                 return;
             }
 
+            // JSON-only bootstrap data. No script evaluation, globals, API calls
+            // or recursive crawling of URLs. A config must declare a source list
+            // or an explicit video/audio source with a media type.
+            string type = tag.Attr("type") ?? "";
+            string id = tag.Attr("id") ?? "";
+            string? json = type.Equals("application/json", StringComparison.OrdinalIgnoreCase)
+                || id is "__NEXT_DATA__" or "__NUXT_DATA__" ? body : null;
+            if (json is null)
+            {
+                string trimmed = body.Trim();
+                foreach (string prefix in new[] { "window.playerConfig =", "window.videoConfig =", "const playerConfig =", "var playerConfig =" })
+                    if (trimmed.StartsWith(prefix, StringComparison.Ordinal))
+                    { json = trimmed[prefix.Length..].Trim().TrimEnd(';'); break; }
+            }
+            if (json is not null)
+            {
+                if (_configBudget > 0 && _configGroups.Count < 2)
+                {
+                    using var config = JsonExt.TryParse(json);
+                    if (config is not null) WalkPlayerConfig(config.RootElement, 0, true);
+                    // Do not also regex-scan structured JSON: that would bypass the
+                    // single-player requirement and include ads/recommendations.
+
+                }
+                return;
+            }
+
             if (body.Contains(".m3u8", StringComparison.OrdinalIgnoreCase) || body.Contains(".mpd", StringComparison.OrdinalIgnoreCase))
             {
                 string cleaned = body.Replace("\\/", "/", StringComparison.Ordinal)
@@ -166,6 +200,41 @@ internal static class PageScanner
                     AddCandidate(m.Value, null, null, null, null);
                     if (++taken >= 6) break;
                 }
+            }
+        }
+
+        private void WalkPlayerConfig(JsonElement node, int depth, bool trusted)
+        {
+            if (depth > 8 || --_configBudget < 0 || _configGroups.Count >= 2 || node.ValueKind != JsonValueKind.Object) return;
+            if (trusted)
+            {
+                var sources = node.P("sources").Items().Concat(node.P("videoSources").Items())
+                    .Concat(node.P("audioSources").Items()).Take(24);
+                var group = new List<MediaCandidate>();
+                foreach (JsonElement entry in sources)
+                {
+                    string? value = entry.ValueKind == JsonValueKind.String ? entry.GetString()
+                        : entry.P("src").Str() ?? entry.P("file").Str() ?? entry.P("url").Str();
+                    string? mime = entry.P("type").Str() ?? entry.P("mimeType").Str();
+                    Uri? uri = UrlUtil.Resolve(_base, value);
+                    if (uri is null || uri.Scheme is not ("https" or "http")) continue;
+                    CandidateKind kind = MediaCandidate.Classify(uri, mime);
+                    if (kind == CandidateKind.Unknown || group.Any(c => c.Url == uri)) continue;
+                    int? width = entry.P("width").Int(), height = entry.P("height").Int();
+                    group.Add(new MediaCandidate(UrlUtil.WithoutFragment(uri), kind, mime,
+                        width is > 0 and <= 16384 ? width : null, height is > 0 and <= 16384 ? height : null,
+                        null, null, Clean(entry.P("label").Str())));
+                }
+                if (group.Count != 0) { _configGroups.Add(group); return; }
+            }
+            // Walk only application/player containers, not general arrays,
+            // advertising configuration, unrelated links or recommendations.
+            foreach (var property in node.EnumerateObject())
+            {
+                if (_configBudget <= 0 || _configGroups.Count >= 2) break;
+                bool player = property.Name is "player" or "playerConfig" or "videoConfig" or "video" or "media" or "playback";
+                bool wrapper = property.Name is "props" or "pageProps" or "data" or "config" or "state";
+                if (player || wrapper) WalkPlayerConfig(property.Value, depth + 1, player);
             }
         }
 
