@@ -243,6 +243,53 @@ public sealed class SecureHttpClient : IDisposable
     /// Reads at most <paramref name="maxBytes"/> from the start of a file with one ranged GET.
     /// Null when the server does not honour the range or encodes the body, so nothing larger is ever pulled.
     /// </summary>
+    internal async Task<(ProbeResult Probe, byte[]? Start)> ProbeWithStartAsync(Uri url, MediaRequestContext? ctx, int maxBytes, CancellationToken ct)
+    {
+        HttpResponseMessage get;
+        try
+        {
+            get = await SendAsync(HttpMethod.Get, url, ctx, ct,
+                req => req.Headers.Range = new RangeHeaderValue(0, maxBytes - 1)).ConfigureAwait(false);
+        }
+        catch (MediaResolverException ex) when (ex.Error.Code == MediaErrorCode.NetworkFailure)
+        {
+            return (await ProbeAsync(url, ctx, ct).ConfigureAwait(false), null);
+        }
+        using (get)
+        {
+            var headers = get.Content.Headers;
+            var probe = ToProbe(get, url);
+            bool identity = headers.ContentEncoding.All(value => value.Equals("identity", StringComparison.OrdinalIgnoreCase));
+            if (get.StatusCode == HttpStatusCode.PartialContent && identity
+                && headers.ContentRange is { From: 0, To: long last, Length: > 0 } range
+                && range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
+                && last >= 0 && last == Math.Min(maxBytes, range.Length!.Value) - 1
+                && (headers.ContentLength is not long declared || declared == last + 1))
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(_o.RequestTimeout);
+                try
+                {
+                    await using Stream body = await get.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+                    byte[] bytes = new byte[(int)(last + 1)];
+                    await body.ReadExactlyAsync(bytes, timeout.Token).ConfigureAwait(false);
+                    return (probe, bytes);
+                }
+                catch (Exception ex) when (ex is IOException or HttpRequestException
+                    || ex is OperationCanceledException && !ct.IsCancellationRequested)
+                { return (probe, null); }
+            }
+            if (get.StatusCode == HttpStatusCode.OK && !headers.Contains("Content-Range"))
+                return (probe with { AcceptsRanges = false }, null);
+            if (get.StatusCode is HttpStatusCode.OK or HttpStatusCode.PartialContent)
+                return (probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false }, null);
+            if (get.StatusCode is not (HttpStatusCode.MethodNotAllowed or HttpStatusCode.NotImplemented or HttpStatusCode.RequestedRangeNotSatisfiable))
+                return (probe, null);
+        }
+        // Compatibility with servers that reject range GETs but serve HEAD/normal GET.
+        return (await ProbeAsync(url, ctx, ct).ConfigureAwait(false), null);
+    }
+
     internal async Task<byte[]?> ReadStartAsync(Uri url, MediaRequestContext? ctx, ProbeResult probe, int maxBytes,
         CancellationToken ct)
     {

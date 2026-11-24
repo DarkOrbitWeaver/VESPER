@@ -57,11 +57,19 @@ internal static class BrowserMessageValidator
                 "direct" => CandidateKind.Direct,
                 _ => MediaCandidate.Classify(u, c.MimeType)
             };
+            if (c.ObservedLength is not null || c.ObservedETag is not null)
+            {
+                if (kind != CandidateKind.Direct || c.ObservedLength is not (> 0 and <= 17_179_869_184)
+                    || c.ObservedETag is not { Length: > 2 and <= 256 } observedTag
+                    || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
+                    || tag.IsWeak || tag.Tag == "*" || tag.ToString() != observedTag)
+                    continue;
+            }
             v.Candidates.Add(new MediaCandidate(
                 UrlUtil.WithoutFragment(u), kind, Short(c.MimeType, 80), Dim(c.Width), Dim(c.Height),
                 c.Bitrate is > 0 and < 10_000_000_000 ? c.Bitrate : null,
                 c.DurationSeconds is > 0 and < 8_640_000 ? c.DurationSeconds : null,
-                Short(c.Label, 80), c.MutedLoop));
+                Short(c.Label, 80), c.MutedLoop, c.ObservedLength, c.ObservedETag));
         }
         if (m.Candidates.Count > MaxCandidates) v.Warnings.Add($"Only the first {MaxCandidates} candidates were considered");
 

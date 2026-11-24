@@ -565,6 +565,20 @@ public class BridgeProtocolTests
         if (valid) Assert.Single(parsed.Candidates!);
     }
 
+    [Fact]
+    public void Playback_fingerprints_are_bounded_deduplicated_and_media_only()
+    {
+        string digest = new('a', 64);
+        string good = System.Text.Json.JsonSerializer.Serialize(new[] { digest, digest.ToUpperInvariant() });
+        const string lookup = "\"type\":\"media-source-options\",\"url\":\"https://example.com/watch\",\"candidates\":[{\"url\":\"https://cdn.example.com/a.m3u8\"}],";
+        Assert.True(BridgeProtocol.TryParse(Msg(lookup + "\"playbackFingerprints\":" + good), out var parsed, out string why), why);
+        Assert.Equal(digest, Assert.Single(parsed.PlaybackFingerprints!));
+        foreach (string bad in new[] { "null", "[1]", "[\"not-a-digest\"]",
+            System.Text.Json.JsonSerializer.Serialize(Enumerable.Repeat(digest, 13)) })
+            Assert.False(BridgeProtocol.TryParse(Msg(lookup + "\"playbackFingerprints\":" + bad), out _, out _));
+        Assert.False(BridgeProtocol.TryParse(Msg("\"type\":\"hello\",\"playbackFingerprints\":" + good), out _, out _));
+    }
+
     [Theory]
     [InlineData("queue", 2, true)]
     [InlineData("download", 63, true)]

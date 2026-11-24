@@ -186,7 +186,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             {
                 Uri final = response.RequestMessage?.RequestUri ?? uri;
                 string hash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(final.AbsoluteUri)));
-                if (response.Headers.ETag?.ToString() != tag || hash != track.ResourceUrlSha256)
+                if (response.Headers.ETag?.ToString() != tag || hash != track.ResourceUrlSha256
+                    || response.Content.Headers.ContentRange?.Length != track.Size)
                     throw new RunnerStop(Stop("The selected media file changed after verification. Saved track data was kept."));
             }
             if (!HttpFacts.IsIdentityEncoded(response) || HttpFacts.IsHtml(response))
@@ -551,13 +552,20 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             || !await MatchesAsync(hasTracks ? tracks : partial, tracksLength, tracksSha, ct, expectedTracksIdentity).ConfigureAwait(false))
             throw new RunnerStop(Stop("The files from the interrupted merge do not match the saved swap."));
 
-        using var output = PathSafety.OpenTemporaryStream(hasStage ? stage : partial, FileMode.Open, FileAccess.Read,
-            FileShare.Read | FileShare.Delete, 1 << 16, FileOptions.SequentialScan);
-        try { PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, muxIdentity); }
-        catch (IOException) { throw new RunnerStop(Stop("The merged output no longer has its saved file identity. Saved data was kept.")); }
+        using var outputHandle = PathSafety.OpenTemporaryHandle(hasStage ? stage : partial, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, FileOptions.SequentialScan, writeAttributes: !hasStage);
+        using var output = new FileStream(outputHandle, FileAccess.Read, 1 << 16);
+        string? actualMuxIdentity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
+        bool movedWithChangedTimestamp = !hasStage && PathSafety.SameFileId(muxIdentity, actualMuxIdentity);
+        if (actualMuxIdentity != muxIdentity && !movedWithChangedTimestamp)
+            throw new RunnerStop(Stop("The merged output no longer has its saved file identity. Saved data was kept."));
         if (output.Length != muxLength || !Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false))
             .Equals(muxSha, StringComparison.OrdinalIgnoreCase))
             throw new RunnerStop(Stop("The output from the interrupted merge does not match the saved swap."));
+        // Recovery of a rename completed before the timestamp could be restored.
+        // The durable cursor, same file ID and exact output hash must all agree.
+        if (actualMuxIdentity != muxIdentity)
+            PathSafety.RestoreMovedTemporaryIdentity(output.SafeFileHandle, muxIdentity);
 
         ct.ThrowIfCancellationRequested();
         if (!hasTracks)

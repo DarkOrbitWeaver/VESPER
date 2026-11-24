@@ -12,7 +12,8 @@ public static class HlsRepresentationBuilder
     /// <param name="masterUrl">Final master URL used to resolve relative references.</param>
     /// <param name="ctx">Authorized request context for manifests and media.</param>
     /// <param name="probe">One fetched media playlist used to learn container type, protection and duration (may be null).</param>
-    public static ManifestResult FromMaster(HlsMasterPlaylist master, Uri masterUrl, MediaRequestContext ctx, HlsMediaPlaylist? probe)
+    /// <param name="probedVariant">The exact variant whose playlist was inspected (if known).</param>
+    public static ManifestResult FromMaster(HlsMasterPlaylist master, Uri masterUrl, MediaRequestContext ctx, HlsMediaPlaylist? probe, Uri? probedVariant = null)
     {
         bool fmp4 = probe?.HasInitSegment == true;
         string? videoContainer = probe is null ? null : fmp4 ? "mp4" : "ts";
@@ -56,6 +57,8 @@ public static class HlsRepresentationBuilder
                 Id = Unique(usedIds, idBase),
                 Url = v.Url,
                 ManifestUrl = masterUrl,
+                PlaybackEvidenceUrls = probe is not null && v.Url == probedVariant
+                    ? SampleSegments(probe) : [],
                 Protocol = StreamProtocol.Hls,
                 Content = content,
                 Container = videoContainer,
@@ -154,6 +157,18 @@ public static class HlsRepresentationBuilder
             Requirements = requirements
         };
         return new ManifestResult([rep], [], [], TimeSpan.FromSeconds(p.TotalDuration));
+    }
+
+    // Evidence only; this does not turn the probed variant into an acquisition plan.
+    // Sample across the timeline instead of retaining a second complete playlist.
+    private static IReadOnlyList<Uri> SampleSegments(HlsMediaPlaylist playlist)
+    {
+        const int limit = 128;
+        int count = playlist.Segments.Count;
+        if (count <= limit) return playlist.Segments.Select(s => s.Url).Distinct().ToArray();
+        return Enumerable.Range(0, limit)
+            .Select(i => playlist.Segments[(int)((long)i * (count - 1) / (limit - 1))].Url)
+            .Distinct().ToArray();
     }
 
     private static string Unique(HashSet<string> used, string id)

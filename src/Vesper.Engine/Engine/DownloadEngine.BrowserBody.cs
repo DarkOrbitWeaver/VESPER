@@ -1,6 +1,3 @@
-using System.Buffers;
-using System.Security.Cryptography;
-
 namespace Vesper.Engine;
 
 /// <summary>Commands for the opt-in browser-byte receiver. No browser-provided paths or credentials.</summary>
@@ -31,25 +28,24 @@ public sealed partial class DownloadEngine
             // Status is read-only and cannot open a receiver or restart a transfer.
             if (request.Operation == "status")
                 return BridgeResponse.Fail(requestId, "missing", "No durable browser receipt was found.");
-            receiver = _browserBodies ??= new BrowserBodyReceiver(Options.DataDirectory);
+            receiver = _browserBodies ??= new BrowserBodyReceiver(Options.DataDirectory, BrowserBodyDestination);
         }
 
         BrowserBodyReceiver.Reply reply;
         switch (request.Operation)
         {
             case "begin" when request.Origin is not null && request.FileName is not null && request.Length is long length:
-                if (length is < 1 or > BrowserBodyReceiver.MaxBytes || !CanStageBrowserBody(request.FileName, length))
-                    return BridgeResponse.Fail(requestId, "storage", "Not enough free space for the browser file and verified destination copy.");
                 reply = await receiver.BeginAsync(request.TransferId, request.Origin, request.FileName, length, ct, request.Session)
                     .ConfigureAwait(false);
+                if (reply.Code == "storage")
+                    return BridgeResponse.Fail(requestId, "storage", "Not enough free space for the browser file, or its folder is unavailable.");
                 break;
             case "append" when request.Offset is long offset && request.Bytes is not null && request.Digest is not null:
                 reply = await receiver.AppendAsync(request.TransferId, offset, request.Bytes, request.Digest, ct).ConfigureAwait(false);
                 break;
             case "finish":
                 reply = await receiver.FinishAsync(request.TransferId,
-                    (origin, name, size, digest, body, token) =>
-                        AcceptBrowserBodyAsync(request.TransferId, origin, name, size, digest, body, token), ct).ConfigureAwait(false);
+                    (body, digest, token) => Task.FromResult(AcceptBrowserBody(request.TransferId, body, digest)), ct).ConfigureAwait(false);
                 break;
             case "abort":
                 await receiver.AbortAsync(request.TransferId, ct).ConfigureAwait(false);
@@ -62,118 +58,64 @@ public sealed partial class DownloadEngine
         return BridgeResponse.Success(requestId, data: new { offset = reply.Offset, accepted = reply.JobId is not null, jobId = reply.JobId });
     }
 
-    private bool CanStageBrowserBody(string name, long length)
+    // The same destination rules as an ordinary download, checked once before any byte is written.
+    // Bytes land in this folder's staging area, so only one copy of the file ever needs space.
+    private string? BrowserBodyDestination(string name, long length)
     {
-        string destination = Options.CategorySubfolders
-            ? Path.Combine(Options.DefaultFolder, FileNames.CategoryFor(FileNames.Sanitize(name))) : Options.DefaultFolder;
-        try
-        {
-            string? inboxRoot = Path.GetPathRoot(Path.GetFullPath(Options.DataDirectory));
-            string? destinationRoot = Path.GetPathRoot(Path.GetFullPath(destination));
-            if (inboxRoot is null || destinationRoot is null) return false;
-            var inbox = new DriveInfo(inboxRoot);
-            var output = new DriveInfo(destinationRoot);
-            long reserve = Math.Max(0, Options.FreeSpaceReserve);
-            if (inboxRoot.Equals(destinationRoot, StringComparison.OrdinalIgnoreCase))
-                return inbox.IsReady && inbox.AvailableFreeSpace - reserve >= length * 2;
-            return inbox.IsReady && output.IsReady && inbox.AvailableFreeSpace - reserve >= length
-                && output.AvailableFreeSpace - reserve >= length;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
-    }
-
-    // The inbox is volatile and delete-on-close. Only a byte-exact complete copy
-    // becomes a durable engine job, via the ordinary owned-partial publication path.
-    private async Task<AddResult> AcceptBrowserBodyAsync(string transferId, string origin, string name,
-        long length, string digest, Stream body, CancellationToken ct)
-    {
-        if (!TryNormalizeSha256(digest, out string expected))
-            return new(AddStatus.Invalid, Guid.Empty, "Invalid browser copy integrity proof.");
-        name = FileNames.Sanitize(name);
-        string category = FileNames.CategoryFor(name);
+        string category = FileNames.CategoryFor(FileNames.Sanitize(name));
         string destination = Options.CategorySubfolders ? Path.Combine(Options.DefaultFolder, category) : Options.DefaultFolder;
-        if (!PathSafety.TryResolveFolder(destination, create: true, out string folder, out string error)
-            || !PathSafety.TryCheckUnlinkedDirectory(folder, out error))
-            return new(AddStatus.DestinationUnavailable, Guid.Empty, error);
+        if (!PathSafety.TryResolveFolder(destination, create: true, out string folder, out _)
+            || !PathSafety.TryCheckUnlinkedDirectory(folder, out _))
+            return null;
         folder = Path.TrimEndingDirectorySeparator(folder);
-        // Other downloads or applications can consume space during the transfer.
         try
         {
             var drive = new DriveInfo(Path.GetPathRoot(folder)!);
-            if (!drive.IsReady || drive.AvailableFreeSpace - Math.Max(0, Options.FreeSpaceReserve) < length)
-                return new(AddStatus.DestinationUnavailable, Guid.Empty, "Not enough free space to publish the browser file.");
+            return drive.IsReady && drive.AvailableFreeSpace - Math.Max(0, Options.FreeSpaceReserve) >= length ? folder : null;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        { return new(AddStatus.DestinationUnavailable, Guid.Empty, "Cannot check free space at the destination."); }
-        Guid id = Guid.NewGuid();
-        string staging = PartialFile.PrepareStagingFolder(folder);
-        string path = Path.Combine(staging, FileNames.Sanitize(name) + "." + id.ToString("N")[..8] + ".vpart");
-        using PartialFile file = PartialFile.Open(path, FileMode.CreateNew, allowDelete: true);
-        bool committed = false;
-        bool saveAttempted = false;
-        try
-        {
-            string? identity = file.CaptureIdentity();
-            if (OperatingSystem.IsWindows() && identity is null)
-                throw new IOException("Cannot establish the staged browser file identity.");
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
-            try
-            {
-                long offset = 0;
-                while (offset < length)
-                {
-                    int count = await body.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, length - offset)), ct)
-                        .ConfigureAwait(false);
-                    if (count == 0) throw new IOException("The browser copy ended early.");
-                    await file.WriteAsync(buffer.AsMemory(0, count), offset, ct).ConfigureAwait(false);
-                    hash.AppendData(buffer, 0, count);
-                    offset += count;
-                }
-                if (await body.ReadAsync(buffer.AsMemory(0, 1), ct).ConfigureAwait(false) != 0
-                    || !expected.Equals(Convert.ToHexString(hash.GetHashAndReset()), StringComparison.OrdinalIgnoreCase))
-                    throw new IOException("The browser copy failed its transport integrity check.");
-            }
-            finally { ArrayPool<byte>.Shared.Return(buffer, clearArray: true); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+    }
 
-            file.Flush();
-            ct.ThrowIfCancellationRequested();
-            var job = new DownloadJob
-            {
-                Id = id, Kind = JobKind.BrowserStream, SourceUrl = origin, OriginalPageUrl = origin,
-                FileName = name, NameLocked = true, DestinationFolder = folder, PartialPath = path,
-                PartialIdentity = identity, TotalBytes = length, ExpectedSha256 = expected,
-                State = JobState.Queued, Category = category, NonResumable = true
-            };
-            job.Extents.Add(new ByteRange(0, length));
-            lock (_lock)
-            {
-                if (_disposed) return new(AddStatus.Busy, Guid.Empty, "VESPER is closing.");
-                string submission = BrowserBodySubmission + transferId;
-                if (_store.TryGetSubmission(submission, out Guid prior) && _jobs.ContainsKey(prior))
-                    return new(AddStatus.AlreadySubmitted, prior, "The browser copy was already accepted.");
-                if (_jobs.Count != 0 && _jobs.Values.Min(x => x.QueueOrder) == long.MinValue)
-                    RebaseQueueOrdersLocked();
-                job.QueueOrder = _jobs.Count == 0 ? 0 : _jobs.Values.Min(x => x.QueueOrder) - 1;
-                saveAttempted = true;
-                SaveLocked(job, submission);
-                committed = true;
-                file.MarkIdentitySaved();
-                WriteManifest(job, file.Handle);
-                // Do not expose a queued job while its transfer handle is still held.
-                file.Dispose();
-                _jobs[id] = job;
-                Changed(job);
-            }
-        }
-        finally
+    // The partial is already complete and hashed. Only a byte-exact copy becomes a durable engine job,
+    // which then verifies the SHA-256 from disk and publishes through the ordinary owned-partial path.
+    private AddResult AcceptBrowserBody(string transferId, BrowserBodyReceiver.Transfer body, string digest)
+    {
+        if (!TryNormalizeSha256(digest, out string expected))
+            return new(AddStatus.Invalid, Guid.Empty, "Invalid browser copy integrity proof.");
+        string category = FileNames.CategoryFor(body.Name);
+        Guid id = Guid.NewGuid();
+        var job = new DownloadJob
         {
-            // If a persistence operation has an uncertain outcome, retain the
-            // partial rather than delete something that durable state could own.
-            if (!committed && !saveAttempted)
-                file.DeleteUnclaimedNewFile();
+            Id = id, Kind = JobKind.BrowserStream, SourceUrl = body.Origin, OriginalPageUrl = body.Origin,
+            FileName = body.Name, NameLocked = true, DestinationFolder = body.Folder, PartialPath = body.File.Path,
+            PartialIdentity = body.Identity, TotalBytes = body.Length, ExpectedSha256 = expected,
+            State = JobState.Queued, Category = category, NonResumable = true
+        };
+        job.Extents.Add(new ByteRange(0, body.Length));
+        lock (_lock)
+        {
+            if (_disposed) return new(AddStatus.Busy, Guid.Empty, "VESPER is closing.");
+            string submission = BrowserBodySubmission + transferId;
+            if (_store.TryGetSubmission(submission, out Guid prior) && _jobs.ContainsKey(prior))
+                return new(AddStatus.AlreadySubmitted, prior, "The browser copy was already accepted.");
+            if (_jobs.Count != 0 && _jobs.Values.Min(x => x.QueueOrder) == long.MinValue)
+                RebaseQueueOrdersLocked();
+            job.QueueOrder = _jobs.Count == 0 ? 0 : _jobs.Values.Min(x => x.QueueOrder) - 1;
+            try { SaveLocked(job, submission); }
+            catch
+            {
+                // The outcome is uncertain: durable state may own this partial, so it is never deleted.
+                body.Claimed = true;
+                throw;
+            }
+            body.Claimed = true;
+            body.File.MarkIdentitySaved();
+            WriteManifest(job, body.File.Handle);
+            // Do not expose a queued job while its transfer handle is still held.
+            body.File.Dispose();
+            _jobs[id] = job;
+            Changed(job);
         }
-        file.Dispose();
         FlushOutbox();
         ScheduleNext();
         return new(AddStatus.Added, id, "The browser copy was accepted for verification and publication.");

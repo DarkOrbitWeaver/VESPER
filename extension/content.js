@@ -275,8 +275,10 @@
   }
 
   function refreshHoveredPreview(player) {
-    if (!pointer) return false;
+    // Shadow-host hit testing must not search the feed's ancestors for another card.
+    if (!pointer || panelMedia || pointerTarget === host || pointerOnButterfly()) return false;
     const target = document.elementFromPoint(pointer.x, pointer.y) || pointerTarget;
+    if (target === host) return false;
     const preview = cardPreview(target);
     return preview?.player === player && activatePreview(preview);
   }
@@ -321,7 +323,13 @@
     if (!extensionPreferencesReady) return;
     if (butterflyHidden()) { detach(true); return; }
     if (drag && (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))) { place(true); return; }
-    if (panelMedia && video === panelMedia.player && !video.isConnected) { place(); return; }
+    // Opening the picker is an explicit selection. Do not switch to a
+    // larger or newly autoplaying neighbour until the picker closes.
+    // Source-generation and navigation handlers still invalidate stale media.
+    if (panelMedia && video === panelMedia.player) {
+      place();
+      if (panelMedia) return;
+    }
     if (holdMissingPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
     if (manualPlayer && !manualPlayer.isConnected) manualPlayer = null;
@@ -359,6 +367,56 @@
 
   // Lets the background briefly watch this tab for manifests named only by Content-Type.
   let announcedVideoAt = 0;
+  // Segment paths the page fetched for media, without query strings. The worker compares them with candidate
+  // manifests: a player's own segments live under its manifest's path, while ads and neighbours do not.
+  const fragmentLog = [];
+  function rememberFragment(url, entry) {
+    const parsed = VesperIntelligence.http(url);
+    if (!parsed) return;
+    const at = Number.isFinite(entry.startTime) ? performance.timeOrigin + entry.startTime : Date.now();
+    const path = parsed.origin + parsed.pathname;
+    const existing = fragmentLog.findIndex(item => item.path === path);
+    if (existing >= 0) fragmentLog.splice(existing, 1);
+    fragmentLog.push({ path, at });
+    const cutoff = Date.now() - 120_000;
+    while (fragmentLog.length > 64 || fragmentLog.length && fragmentLog[0].at < cutoff) fragmentLog.shift();
+  }
+  function recentFragments(since) {
+    const result = [], directories = new Set();
+    for (let i = fragmentLog.length - 1; i >= 0 && result.length < 8; i--) {
+      const item = fragmentLog[i];
+      if (item.at < since - 2000) continue;
+      const directory = item.path.slice(0, item.path.lastIndexOf('/') + 1);
+      if (directories.has(directory)) continue;
+      directories.add(directory);
+      result.push(item.path);
+    }
+    return result;
+  }
+  function playerFragmentWitness(player, binding) {
+    if (!player || !binding || !/^blob:https?:/i.test(playerSource(player))
+        || player.mediaKeys || protectedVideos.has(player)) return { paths: [], fingerprints: [] };
+    const attribute = 'data-vesper-media-provenance';
+    try {
+      player.removeAttribute(attribute);
+      player.dispatchEvent(new Event('vesper-media-provenance-request', { bubbles: true }));
+      const value = player.getAttribute(attribute);
+      player.removeAttribute(attribute);
+      if (!value || value.length > 32_768) return { paths: [], fingerprints: [] };
+      const data = JSON.parse(value);
+      if (!Array.isArray(data.paths)) return { paths: [], fingerprints: [] };
+      const now = Date.now();
+      // Page-world evidence is untrusted and can only reorder independent probes.
+      const witnesses = data.paths.slice(0, 12).filter(item => Number.isFinite(item?.seen)
+        && item.seen >= Math.max(now - 120_000, binding.changedAt - 2000)
+        && item.seen <= now + 1000)
+        .map(item => ({ url: VesperPlayerSource.http(item.path), fingerprint: item.fingerprint }))
+        .filter(item => item.url && !item.url.search);
+      return { paths: [...new Set(witnesses.map(item => item.url.href))],
+        fingerprints: [...new Set(witnesses.map(item => item.fingerprint)
+          .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))] };
+    } catch { return { paths: [], fingerprints: [] }; }
+  }
   function watchMediaResources() {
     if (resourceObserver || typeof PerformanceObserver === 'undefined') return;
     try {
@@ -371,6 +429,8 @@
           const url = VesperIntelligence.http(entry.name)?.href;
           const mime = typeof entry.contentType === 'string' ? entry.contentType : '';
           const kind = VesperIntelligence.sourceKind(url || '', mime);
+          if (url && (kind === 'fragment' || ['fetch', 'xmlhttprequest'].includes(entry.initiatorType)
+              && /^(?:video|audio)\/|mp2t/i.test(mime))) rememberFragment(url, entry);
           if (!url || kind === 'fragment'
               || kind === 'unknown' && !['video', 'audio'].includes(entry.initiatorType)) continue;
           const matchingPlayers = players.filter(el => VesperPlayerSource.http(playerSource(el))?.href === url);
@@ -386,9 +446,9 @@
       resourceObserver.observe({ type: 'resource', buffered: true });
     } catch { resourceObserver = null; }
   }
-  function announceVideoElement() {
+  function announceVideoElement(force = false) {
     const now = Date.now();
-    if (now - announcedVideoAt < 60_000) return;
+    if (!force && now - announcedVideoAt < 60_000) return;
     announcedVideoAt = now;
     watchMediaResources();
     send({ type: 'media-element', watching: true }).catch(() => {});   // a hint only; never surfaces errors
@@ -686,6 +746,7 @@
     receipt.setAttribute('role', 'status');
     root.append(style, button, panel, receipt);
     button.addEventListener('click', (e) => {
+      e.preventDefault();
       e.stopPropagation();
       if (suppressDragClick && e.detail !== 0) {
         suppressDragClick = false;
@@ -695,6 +756,10 @@
       }
       void togglePanel();
     }, { signal });
+    // Feed players often handle pointer/mouse events on a common ancestor.
+    // Do not let interaction with our overlay toggle their playback controls.
+    for (const type of ['pointerdown','pointerup','mousedown','mouseup','dblclick'])
+      root.addEventListener(type, e => e.stopPropagation(), { signal });
     button.draggable = false;
     button.addEventListener('pointerdown', startDrag, { signal });
     button.addEventListener('pointermove', moveDrag, { signal });
@@ -1034,7 +1099,11 @@
       if (!drag && !panel?.classList.contains('show') && button?.matches(':focus-visible')) button.blur();
     }
     pointer = { x: e.clientX, y: e.clientY };
-    if (drag) { updateFlyVisibility(); return; }
+    if (drag || panelMedia || host && (e.target === host || e.composedPath?.().includes(host))) {
+      pointerTarget = e.target;
+      updateFlyVisibility();
+      return;
+    }
     if (e.target !== pointerTarget) {
       pointerTarget = e.target;
       const preview = cardPreview(e.target);
@@ -1204,10 +1273,16 @@
   async function loadFormats(refresh = false) {
     syncPage();
     if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
+    // A new click also renews the bounded script-response watcher after MV3
+    // worker suspension. Existing evidence remains scoped to this document.
+    announceVideoElement(true);
     dismissReceipt();
     receipt.textContent = '';
-    const request = ++panelRequest;
     const player = video;
+    // The first click can arrive before the observer has bound a loaded player.
+    // Establish the current generation synchronously before opening the picker.
+    if (player?.isConnected && player.readyState >= 1 && !activeBrowserCopy) consider(player);
+    const request = ++panelRequest;
     // Reopening the butterfly must not start a second copy of the same Blob.
     if (activeBrowserCopy && activeBrowserCopy.player === player) {
       panelMedia = { ...activeBrowserCopy.panelMedia };
@@ -1237,7 +1312,9 @@
     updateFlyVisibility();
     const isPreview = !!preview;
     const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
-    const poster = current ? player.poster || (!isPreview && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
+    // A feed's page-wide Open Graph image often belongs to the site rather than this player.
+    const playerPageIsSpecific = identity && !/^https?:/.test(identity);
+    const poster = current ? player.poster || (!isPreview && playerPageIsSpecific && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
     const duration = current && Number.isFinite(player.duration) ? player.duration : null;
     const playerFacts = current ? {} : null;
     if (playerFacts) {
@@ -1252,6 +1329,7 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
+    const playerWitness = current ? playerFragmentWitness(player, binding) : null;
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
       title, playerPlaying: current && !player.paused && !player.ended,
       playerHasMedia: current && (player.readyState >= 1 || player.ended || ended), playerPageUrl: targetPage,
@@ -1261,6 +1339,9 @@
       playerFacts: playerFacts && Object.keys(playerFacts).length ? playerFacts : undefined,
       // Timing hints only reorder sources independently checked by the resolver.
       resourceUrls: current ? mediaLedger.matches(evidenceKey(player)).map(item => item.url).slice(0, 12) : undefined,
+      fragmentUrls: current ? recentFragments(binding.changedAt) : undefined,
+      playerFragmentUrls: playerWitness?.paths,
+      playerResourceFingerprints: playerWitness?.fingerprints,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
@@ -1275,34 +1356,36 @@
       return renderShell(result.data.title || title, poster, duration,
         element('div', 'msg', note), controls.status, footer);
     }
-    if (!result?.ok || (!result.data?.choices?.length && !result.data?.sourceChoices?.length)) {
+    let formats = result?.data;
+    const missingFormats = !result?.ok || (!formats?.choices?.length && !formats?.sourceChoices?.length);
+    // Acquisition is a delivery recipe, not a second download UI. Only fall
+    // back to the exact current player and never offer a speculative Blob URL.
+    if ((missingFormats || formats?.browserChoice)
+        && current && !activeBrowserCopy && !player.mediaKeys && !protectedVideos.has(player)
+        && playerFacts?.live !== true) {
+      let original = formats?.browserBodyAvailable === true ? formats.browserBodyFormat : null;
+      if (!original && missingFormats && ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
+          'site-refused', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported'].includes(result?.code)) {
+        original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
+      }
+      if (!isCurrentRequest(request)) return;
+      if (original && playerSource(player) === src && playback.get(player) === binding
+          && !player.mediaKeys && !protectedVideos.has(player)) {
+        const audio = original.mime.startsWith('audio/');
+        const height = !audio && player.videoHeight > 0 ? player.videoHeight + 'p' : '';
+        formats = { browserBody: true, title: formats?.title || title, choices: [{
+          index: 0, label: audio ? 'Original audio' : 'Original quality',
+          detail: height || (audio ? 'Audio' : 'Video'), container: original.container,
+          sizeBytes: original.sizeBytes, canClip: false
+        }] };
+      }
+    }
+    if (!formats?.browserBody && missingFormats) {
       const message = errorMessage(result);
       if (!['protected', 'blocked', 'chrome-format'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
-      // Explicitly selected, readable Blob or independently observed finite
-      // HTTPS representation. Never automatically retry a network request.
-      const local = globalThis.VesperBrowserBody?.localBlob(src, location.origin);
-      const conditional = result?.data?.browserBodyAvailable === true;
-      const eligible = ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
-        'site-refused', 'source-expired', 'sign-in', 'unsupported', 'chrome-format'].includes(result?.code)
-        && current && !activeBrowserCopy && !player.mediaKeys && !protectedVideos.has(player)
-        && (conditional || local && result?.code !== 'chrome-format');
-      if (eligible) {
-        const action = element('button', 'vesper-button', 'Save browser file');
-        action.onclick = () => {
-          if (action.isConnected && isCurrentRequest(request))
-            void startBrowserCopy({ player, src, title, poster, duration });
-        };
-        const footer = element('div', 'foot');
-        footer.append(action);
-        return renderShell(title, poster, duration, message,
-          element('div', 'msg', conditional
-            ? 'Save this verified file through your browser session.'
-            : 'Try the original file available inside this browser. Not all player streams are readable files.'), footer);
-      }
       return renderShell(title, poster, duration, message);
     }
-    const formats = result.data;
     formats.playerLive = playerFacts?.live === true || formats.isLive === true;
     const pickerDuration = formats.playerLive ? null : formats.duration ?? duration;
     if (formats.sourceChoices?.length) return renderSourceChoices(title, poster, pickerDuration, formats);
@@ -1318,11 +1401,11 @@
     copy.statusElement = status;
     copy.request = request;
     const footer = element('div', 'foot');
-    const cancel = element('button', 'vesper-button', 'Cancel copy');
+    const cancel = element('button', 'vesper-button', 'Cancel');
     cancel.onclick = () => {
       copy.controller.abort();
       cancel.disabled = true;
-      status.textContent = 'Stopping browser copy…';
+      status.textContent = 'Cancelling…';
     };
     footer.append(cancel);
     renderShell(copy.title, copy.poster, copy.duration, status, footer);
@@ -1333,7 +1416,7 @@
         || player.mediaKeys || protectedVideos.has(player) || playerSource(player) !== src) return;
     const controller = new AbortController();
     const copy = { player, src, title, poster, duration, controller,
-      panelMedia: { ...panelMedia }, status: 'Opening browser file…' };
+      panelMedia: { ...panelMedia }, status: 'Preparing download…' };
     activeBrowserCopy = copy;
     showBrowserCopy(copy, panelRequest);
     // Closing the picker is not cancellation. Navigation/extension retirement,
@@ -1359,19 +1442,19 @@
           const now = Date.now();
           if (received !== total && now - lastUpdate < 150) return;
           lastUpdate = now;
-          copy.status = received === total ? 'Checking and accepting browser file…'
-            : 'Copying browser file · ' + Math.floor(received * 100 / total) + '%';
+          copy.status = received === total ? 'Verifying download…'
+            : 'Downloading · ' + Math.floor(received * 100 / total) + '%';
           if (copy.statusElement?.isConnected) copy.statusElement.textContent = copy.status;
         } });
       if (copy.request === panelRequest && isCurrentRequest(copy.request))
-        await confirmSend('Browser file accepted by VESPER', copy.request);
+        await confirmSend('Sent to VESPER', copy.request);
     } catch (error) {
       if (copy.request === panelRequest && isCurrentRequest(copy.request)) {
         const uncertain = error?.code === 'uncertain-finish';
         const message = element('div', 'msg bad', uncertain
           ? 'Copy outcome is uncertain. Check the VESPER queue before attempting another copy.'
           : controller.signal.aborted ? 'Browser copy stopped. No completion was confirmed.'
-          : 'This browser file could not be copied. No completion was confirmed.');
+          : 'Could not download this format.');
         if (!uncertain) appendRetry(message, () => loadFormats(true));
         renderShell(title, poster, duration, message);
       }
@@ -1725,7 +1808,8 @@
       for (const action of downloadButtons)
         action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !canClip;
     }
-    const body = [output, list, clip];
+    const body = [output, list];
+    if (!formats.browserBody || draft.enabled) body.push(clip);
     if (noticeText()) {
       selectionNotice = element('div', 'msg', noticeText());
       body.unshift(selectionNotice);
@@ -1792,22 +1876,14 @@
       };
       body.push(more);
     }
-    if (formats.hasRelatedCollection && !formats.browserChoice) {
+    if (formats.hasRelatedCollection && !formats.browserChoice && !formats.browserBody) {
       collectionControls = collectionPickerControls(title, request, formats);
       body.push(collectionControls.status);
     }
     const footer = element('div', 'foot picker-foot');
     if (collectionControls) footer.append(collectionControls.browse);
-    if (formats.browserChoice && formats.browserBodyAvailable) {
-      const browserSave = element('button', 'vesper-button', 'Save with VESPER');
-      browserSave.onclick = () => {
-        if (!browserSave.isConnected || !isCurrentRequest(request)) return;
-        void startBrowserCopy({ player: panelMedia.player, src: panelMedia.src, title, poster, duration: seconds });
-      };
-      footer.append(browserSave);
-    }
-    for (const mode of formats.browserChoice ? ['download'] : ['queue', 'download']) {
-      const label = formats.browserChoice ? 'Download with Chrome' : mode === 'download' ? 'Download' : 'Queue';
+    for (const mode of formats.browserChoice || formats.browserBody ? ['download'] : ['queue', 'download']) {
+      const label = mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
       action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !clipAvailability(choice, seconds, formats.playerLive === true).available;
       downloadButtons.push(action);
@@ -1889,6 +1965,10 @@
 
   async function deliver(title, poster, seconds, formats, formatChoice, mode, request, intent = {}) {
     if (!isCurrentRequest(request)) return;
+    if (formats.browserBody) {
+      if (mode !== 'download' || intent.range || intent.audioTrack || intent.subtitles?.length) return;
+      return startBrowserCopy({ player: panelMedia.player, src: panelMedia.src, title, poster, duration: seconds });
+    }
     const sending = element('div', 'msg', formats.browserChoice ? 'Starting in Chrome…' : 'Sending to VESPER…');
     sending.setAttribute('role', 'status');
     const hadFocus = panel.contains(root.activeElement);
@@ -2024,8 +2104,13 @@
     if (still()) panelMotion?.cancel();
   }
 
+  // Clicking elsewhere dismisses the picker, but using the player it belongs to (play, seek, volume,
+  // its overlay controls) does not: those clicks land inside the player's rectangle.
   document.addEventListener('pointerdown', (e) => {
-    if (alive() && panel?.classList.contains('show') && !e.composedPath().includes(host)) closePanel();
+    if (!alive() || !panel?.classList.contains('show') || e.composedPath().includes(host)) return;
+    const rect = video?.isConnected ? video.getBoundingClientRect() : null;
+    if (rect && e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) return;
+    closePanel();
   }, { capture: true, passive: true, signal });
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender?.id !== chrome.runtime.id) return false;

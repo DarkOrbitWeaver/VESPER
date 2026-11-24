@@ -26,6 +26,14 @@ internal sealed class PageMetadata
 internal static class PageScanner
 {
     // NonBacktracking guarantees linear-time matching on hostile script text.
+    // A bounded fallback for inline player configuration; do not scan structured
+    // JSON feeds or treat an arbitrary URL key as a playable source.
+    private static readonly Regex ScriptMediaRegex = new(
+        @"https?://[^\s""'<>\\]+?\.(?:mp4|m4v|webm|mov|m4a|mp3|ogg|opus|flac|wav|m3u8|mpd)(?:\?[^\s""'<>\\]*)?",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+    private static readonly Regex PlayerMediaKeyRegex = new(
+        @"[""']?(?:file|video_url|videoUrl|hlsUrl|hls_url|dashUrl|dash_url|mp4Url|mp4_url|contentUrl|stream_url|streamUrl)[""']?\s*[:=]\s*[""']((?:https?:)?//[^""'\s<>]+)[""']",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
     private static readonly Regex ManifestRegex = new(
         @"https?://[^\s""'<>\\]+?\.(?:m3u8|mpd)(?:\?[^\s""'<>\\]*)?",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
@@ -42,6 +50,8 @@ internal static class PageScanner
         private string? _ldTitle;
         private readonly List<List<MediaCandidate>> _configGroups = new();
         private int _configBudget = 512;
+        private int _lazyBudget = 400;
+        private readonly List<string> _scriptFallbacks = new();
 
         public State(Uri page, int max)
         {
@@ -67,6 +77,8 @@ internal static class PageScanner
                     continue;
                 }
 
+                if (tag.Name is "div" or "a" or "span" && _lazyBudget-- > 0)
+                    ScanLazyMedia(tag);
                 switch (tag.Name)
                 {
                     case "base":
@@ -79,7 +91,16 @@ internal static class PageScanner
                     {
                         string? key = tag.Attr("property") ?? tag.Attr("name") ?? tag.Attr("itemprop");
                         string? content = tag.Attr("content");
-                        if (key is null || content is null) break;
+                        if (key is null) break;
+                        if (key.Equals("contentURL", StringComparison.OrdinalIgnoreCase))
+                            AddCandidate(content ?? tag.Attr("href"), tag.Attr("type"), null, null, null);
+                        else if (key.Equals("embedURL", StringComparison.OrdinalIgnoreCase))
+                            AddEmbed(content ?? tag.Attr("href"));
+                        else if (key.Equals("thumbnailUrl", StringComparison.OrdinalIgnoreCase))
+                            _meta.Thumbnail ??= UrlUtil.Resolve(_base, content);
+                        else if (key.Equals("duration", StringComparison.OrdinalIgnoreCase) && _meta.Duration is null && content is not null)
+                            _meta.Duration = DashParser.ParseIsoDuration(content);
+                        if (content is null) break;
                         key = key.ToLowerInvariant();
                         if (key is "og:video" or "og:video:url" or "og:video:secure_url" or "twitter:player:stream") ogVideos.Add(content);
                         else if (key is "og:audio" or "og:audio:url" or "og:audio:secure_url") ogAudios.Add(content);
@@ -120,6 +141,11 @@ internal static class PageScanner
                             _meta.Subtitles.Add(new SubtitleTrack(u, TextUtil.NormalizeLang(tag.Attr("srclang")), tag.Attr("label"), UrlUtil.Extension(u) ?? "vtt"));
                         break;
                     }
+                    case "link":
+                        if ((tag.Attr("rel") ?? "").Split(' ').Contains("preload", StringComparer.OrdinalIgnoreCase)
+                            && tag.Attr("as") is "video" or "audio")
+                            AddCandidate(tag.Attr("href"), tag.Attr("type"), null, null, null);
+                        break;
                     case "iframe":
                         AddEmbed(tag.Attr("src") ?? tag.Attr("data-src"));
                         break;
@@ -144,10 +170,25 @@ internal static class PageScanner
             if (_meta.Candidates.Count == 0 && _configGroups.Count == 1)
                 foreach (MediaCandidate candidate in _configGroups[0])
                     AddCandidate(candidate.Url.AbsoluteUri, candidate.MimeType, candidate.Width, candidate.Height, candidate.Label);
+            // Script fallbacks are weaker than explicit player markup and may
+            // be separate videos. Only use a unique candidate, not a feed's URLs.
+            if (_meta.Candidates.Count == 0 && _configGroups.Count == 0
+                && _scriptFallbacks.Distinct(StringComparer.Ordinal).Take(2).Count() == 1)
+                AddCandidate(_scriptFallbacks[0], null, null, null, null);
             _meta.Title = Clean(_ldTitle) ?? Clean(metas.GetValueOrDefault("og:title")) ?? Clean(metas.GetValueOrDefault("twitter:title")) ?? Clean(docTitle);
             _meta.Description ??= Clean(metas.GetValueOrDefault("og:description")) ?? Clean(metas.GetValueOrDefault("description"));
             _meta.Thumbnail ??= UrlUtil.Resolve(_base, metas.GetValueOrDefault("og:image") ?? metas.GetValueOrDefault("twitter:image"));
             return _meta;
+        }
+
+        private void ScanLazyMedia(HtmlTag tag)
+        {
+            foreach (string attribute in new[] { "data-video-src", "data-video", "data-mp4", "data-hls", "data-dash", "data-file" })
+            {
+                var uri = UrlUtil.Resolve(_base, tag.Attr(attribute));
+                if (uri is null || MediaCandidate.Classify(uri, tag.Attr("type")) == CandidateKind.Unknown) continue;
+                if (_scriptFallbacks.Count < 16) _scriptFallbacks.Add(uri.AbsoluteUri);
+            }
         }
 
         private void HandleScript(HtmlTag tag)
@@ -187,6 +228,20 @@ internal static class PageScanner
 
                 }
                 return;
+            }
+
+            if (_scriptFallbacks.Count < 16 && string.IsNullOrWhiteSpace(tag.Attr("src")))
+            {
+                string cleaned = WebUtility.HtmlDecode(body.Replace("\\/", "/", StringComparison.Ordinal)
+                    .Replace("\\u002F", "/", StringComparison.OrdinalIgnoreCase)
+                    .Replace("\\u0026", "&", StringComparison.OrdinalIgnoreCase));
+                foreach (var match in PlayerMediaKeyRegex.Matches(cleaned).Cast<Match>().Take(8))
+                {
+                    var uri = UrlUtil.Resolve(_base, match.Groups[1].Value);
+                    if (uri is not null && _scriptFallbacks.Count < 16) _scriptFallbacks.Add(uri.AbsoluteUri);
+                }
+                foreach (var match in ScriptMediaRegex.Matches(cleaned).Cast<Match>().Take(8))
+                    if (_scriptFallbacks.Count < 16) _scriptFallbacks.Add(match.Value);
             }
 
             if (body.Contains(".m3u8", StringComparison.OrdinalIgnoreCase) || body.Contains(".mpd", StringComparison.OrdinalIgnoreCase))

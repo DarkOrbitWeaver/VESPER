@@ -72,11 +72,14 @@ public sealed class BrowserBridgeTests
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
 
         var response = (BridgeResponse)createOptions.Invoke(bridge,
-            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None])!;
+            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None, new[] {
+                Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes("https://cdn.example.test/part.m4s")))
+            }])!;
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(response.Data, BridgeProtocol.Json));
         JsonElement best = json.RootElement.GetProperty("choices")[0];
 
         Assert.True(response.Ok, response.Message);
+        Assert.Equal(1, json.RootElement.GetProperty("playbackMatches").GetInt32());
         Assert.Equal("Best quality", best.GetProperty("label").GetString());
         Assert.Contains("1080p", best.GetProperty("detail").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.True(best.GetProperty("canClip").GetBoolean());
@@ -103,7 +106,7 @@ public sealed class BrowserBridgeTests
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
 
         var response = (BridgeResponse)createOptions.Invoke(bridge,
-            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None])!;
+            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None, null])!;
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(response.Data, BridgeProtocol.Json));
         JsonElement best = json.RootElement.GetProperty("choices")[0];
 
@@ -143,14 +146,22 @@ public sealed class BrowserBridgeTests
         Assert.Equal(@"Local\VESPER.Show-" + identityHash, Program.ShowEventName);
     }
 
-    [Fact]
-    public async Task NativeHelperCompletesAStagedDownloadThroughTheRealDesktopBridge()
+    [Theory]
+    [InlineData(false, 16 * 1024, false)]
+    [InlineData(true, 5 * 1024 * 1024, false)]
+    [InlineData(true, 200 * 1024 * 1024, false)]
+    [InlineData(true, 16 * 1024, true)]
+    public async Task NativeHelperCompletesAStagedDownloadThroughTheRealDesktopBridge(bool multiplexed, int length, bool mismatch)
     {
-        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_NATIVE_HOST");
+        string? isolatedHelper = Environment.GetEnvironmentVariable("VESPER_QA_ISOLATED_HOST");
+        bool isolated = !string.IsNullOrWhiteSpace(isolatedHelper);
+        string? helper = isolated ? isolatedHelper : Environment.GetEnvironmentVariable("VESPER_QA_NATIVE_HOST");
         if (string.IsNullOrWhiteSpace(helper)) return;
         Assert.True(File.Exists(helper));
-        string pipe = BridgePipe.NameForCurrentUser();
-        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+        if (isolated) Assert.Equal("vesper-qa-host.exe", Path.GetFileName(helper));
+        string pipe = isolated ? "vesper-qa-" + Guid.NewGuid().ToString("N") : BridgePipe.NameForCurrentUser();
+        string? qaPipe = isolated ? pipe : null;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         CancellationToken ct = deadline.Token;
         using (var occupancy = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
         {
@@ -173,10 +184,11 @@ public sealed class BrowserBridgeTests
                 File.Copy(file, Path.Combine(helperRoot, Path.GetFileName(file)));
             Assert.False(File.Exists(Path.Combine(helperRoot, "VESPER.exe")), "The isolated helper must not be able to start a desktop.");
             string executable = Path.Combine(helperRoot, Path.GetFileName(helper));
-            byte[] payload = Enumerable.Repeat((byte)0x5a, 16 * 1024).ToArray();
+            byte[] payload = new byte[Math.Min(length, 64 * 1024)];
+            new Random(4821).NextBytes(payload);
             using var server = new TcpListener(IPAddress.Loopback, 0);
             server.Start();
-            Task response = ServeNativeFixtureAsync(server, payload, ct);
+            Task response = ServeNativeFixtureAsync(server, payload, length, mismatch, ct);
             string url = $"http://127.0.0.1:{((IPEndPoint)server.LocalEndpoint).Port}/fixture";
             using var engine = DownloadEngine.Start(new EngineOptions
             {
@@ -186,40 +198,215 @@ public sealed class BrowserBridgeTests
             using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
             desktop.Start();
 
-            const string transferId = "native-fixture-0001";
-            BridgeResponse submit = await SendThroughHelperAsync(executable, new
+            using var session = multiplexed ? new NativeTestSession(executable, qaPipe) : null;
+            if (session is not null)
             {
-                v = 1, id = transferId, type = "browser-submit", mode = "download",
+                BridgeResponse opened = await session.SendAsync(new { v = 1, id = "native-session-0001", type = "session-open" }, ct);
+                Assert.True(opened.Ok, opened.Message);
+                Assert.True(Assert.IsType<JsonElement>(opened.Data).GetProperty("mux").GetBoolean());
+                // Multiple frames before any read: responses are correlated by id, not order.
+                await session.WriteAsync(new { v = 1, id = "native-invalid-0001", type = "unknown" }, ct);
+                await session.WriteAsync(new { v = 1, id = "native-invalid-0002", type = "unknown" }, ct);
+                var invalid = new[] { await session.ReadAsync(ct), await session.ReadAsync(ct) };
+                Assert.All(invalid, reply => Assert.False(reply.Ok));
+                Assert.Equal(new[] { "native-invalid-0001", "native-invalid-0002" }, invalid.Select(reply => reply.Id).Order().ToArray());
+            }
+            Task<BridgeResponse> Send(object request) => session is null
+                ? SendThroughHelperAsync(executable, request, ct, qaPipe) : session.SendAsync(request, ct);
+            const string transferId = "native-fixture-0001";
+            BridgeResponse submit = await Send(new
+            {
+                v = 1, id = transferId, type = multiplexed ? "browser-capture" : "browser-submit", mode = "download",
                 items = new[] { new { url, fileName = "native-fixture.bin", kind = "http" } },
-                browserProof = new { length = payload.Length, etag = "\"native-fixture\"", contentType = "application/octet-stream" }
-            }, ct);
+                browserProof = new { length, etag = "\"native-fixture\"", contentType = "application/octet-stream" }
+            });
             Assert.True(submit.Ok, submit.Message);
             BridgeResult result = Assert.Single(submit.Results!);
+            if (mismatch)
+            {
+                Assert.False(result.TransferReady ?? true);
+                Assert.Empty(Directory.GetFiles(downloads, "*.bin"));
+                Assert.All(engine.Snapshots(), entry => Assert.Equal(0, entry.CommittedBytes));
+                await Send(new { v = 1, id = "native-abandon-0001", type = "browser-transfer", transferId, operation = "abandon" });
+                await response;
+                if (session is not null) await session.CloseAsync(ct);
+                return;
+            }
             Assert.True(result.TransferReady, result.TransferReason);
             JobSnapshot staged = Assert.IsType<JobSnapshot>(engine.Snapshot(Guid.Parse(result.JobId!)));
             Assert.Equal(0, staged.CommittedBytes);
             Assert.Null(staged.FinalPath);
 
-            BridgeResponse accepted = await SendThroughHelperAsync(executable,
-                new { v = 1, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" }, ct);
+            BridgeResponse accepted = await Send(
+                new { v = 1, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" });
             Assert.True(accepted.Ok, accepted.Message);
-            BridgeResponse watched = await SendThroughHelperAsync(executable,
-                new { v = 1, id = "native-watch-0001", type = "browser-transfer", transferId, operation = "watch" }, ct);
+            BridgeResponse watched = await Send(
+                new { v = 1, id = "native-watch-0001", type = "browser-transfer", transferId, operation = "watch" });
             Assert.True(watched.Ok, watched.Message);
             Assert.Equal("complete", Assert.IsType<JsonElement>(watched.Data).GetProperty("state").GetString());
-            Assert.Equal(payload, await File.ReadAllBytesAsync(Assert.Single(Directory.GetFiles(downloads, "*.bin")), ct));
+            string final = Assert.Single(Directory.GetFiles(downloads, "*.bin"));
+            Assert.Equal(length, new FileInfo(final).Length);
+            using var expected = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            for (int offset = 0; offset < length; offset += payload.Length)
+                expected.AppendData(payload.AsSpan(0, Math.Min(payload.Length, length - offset)));
+            await using (var finished = File.OpenRead(final))
+                Assert.Equal(expected.GetHashAndReset(), await System.Security.Cryptography.SHA256.HashDataAsync(finished, ct));
             Assert.Single(engine.Snapshots());
             await response;
+            if (session is not null) await session.CloseAsync(ct);
         }
         finally { Directory.Delete(root, recursive: true); }
     }
 
-    private static async Task<BridgeResponse> SendThroughHelperAsync(string path, object request, CancellationToken ct)
+    [Fact]
+    public async Task NativeHelperMultiplexHandshakeAndInvalidRequestsNeedNoDesktop()
     {
-        using Process process = Process.Start(new ProcessStartInfo(path)
+        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_NATIVE_HOST");
+        if (string.IsNullOrWhiteSpace(helper)) return;
+        Assert.True(File.Exists(helper));
+        // The helper answers the handshake locally and rejects invalid messages
+        // before any pipe lookup. Never send a valid desktop command in this test.
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var session = new NativeTestSession(helper);
+        var opened = await session.SendAsync(new { v = 1, id = "native-session-0002", type = "session-open" }, deadline.Token);
+        Assert.True(opened.Ok, opened.Message);
+        Assert.True(Assert.IsType<JsonElement>(opened.Data).GetProperty("mux").GetBoolean());
+        for (int i = 0; i < 12; i++)
+            await session.WriteAsync(new { v = 1, id = $"native-invalid-{i:0000}", type = "unknown" }, deadline.Token);
+        var ids = new HashSet<string>();
+        for (int i = 0; i < 12; i++)
+        {
+            var reply = await session.ReadAsync(deadline.Token);
+            Assert.False(reply.Ok);
+            Assert.Equal("invalid", reply.Code);
+            Assert.True(ids.Add(reply.Id));
+        }
+        Assert.Equal(Enumerable.Range(0, 12).Select(i => $"native-invalid-{i:0000}").ToArray(), ids.Order().ToArray());
+        await session.CloseAsync(deadline.Token);
+    }
+
+    [Fact]
+    public async Task IsolatedNativeHelperPipelinesBrowserBodyAndDiscardsDisconnectedCopy()
+    {
+        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_ISOLATED_HOST");
+        if (string.IsNullOrWhiteSpace(helper)) return;
+        Assert.Equal("vesper-qa-host.exe", Path.GetFileName(helper));
+        Assert.True(File.Exists(helper));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(helper)!, "VESPER.exe")));
+        string pipe = "vesper-qa-" + Guid.NewGuid().ToString("N");
+        string root = Path.Combine(Path.GetTempPath(), "vesper-native-body-qa-" + Guid.NewGuid().ToString("N"));
+        string data = Path.Combine(root, "data"), downloads = Path.Combine(root, "downloads");
+        Directory.CreateDirectory(downloads);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        CancellationToken ct = deadline.Token;
+        try
+        {
+            using var engine = DownloadEngine.Start(new EngineOptions { DataDirectory = data, DefaultFolder = downloads });
+            var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
+            using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
+            desktop.Start();
+            const int length = 5 * 1024 * 1024, chunkSize = 512 * 1024;
+            object Begin(string id) => new { v = 1, id = "body-qa-begin", type = "browser-body", operation = "begin",
+                transferId = id, session = true, origin = "https://example.test/", fileName = "browser-qa.bin", length };
+            byte[] chunk = new byte[chunkSize];
+            new Random(731).NextBytes(chunk);
+            string digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(chunk));
+            string encoded = Convert.ToBase64String(chunk);
+            object Append(string id, int offset) => new { v = 1, id = $"body-qa-{offset}", type = "browser-body",
+                operation = "append", transferId = id, session = true, offset, chunk = encoded, digest };
+            const string abandoned = "body-qa-abandoned";
+            using (var copy = new NativeTestSession(helper, pipe))
+            {
+                Assert.True((await copy.SendAsync(Begin(abandoned), ct)).Ok);
+                Assert.True((await copy.SendAsync(Append(abandoned, 0), ct)).Ok);
+                await copy.CloseAsync(ct);
+            }
+            for (int i = 0; i < 100 && Directory.GetFiles(data, "browser-body-*.tmp").Length != 0; i++)
+                await Task.Delay(20, ct);
+            Assert.Empty(Directory.GetFiles(data, "browser-body-*.tmp"));
+            Assert.Empty(engine.Snapshots());
+            const string transferId = "body-qa-complete";
+            using var session = new NativeTestSession(helper, pipe);
+            Assert.True((await session.SendAsync(Begin(transferId), ct)).Ok);
+            for (int first = 0; first < length; first += 4 * chunkSize)
+            {
+                int end = Math.Min(first + 4 * chunkSize, length);
+                for (int offset = first; offset < end; offset += chunkSize)
+                    await session.WriteAsync(Append(transferId, offset), ct);
+                for (int offset = first; offset < end; offset += chunkSize)
+                {
+                    var reply = await session.ReadAsync(ct);
+                    Assert.True(reply.Ok, reply.Message);
+                    Assert.Equal($"body-qa-{offset}", reply.Id);
+                    Assert.Equal(offset + chunkSize, Assert.IsType<JsonElement>(reply.Data).GetProperty("offset").GetInt64());
+                }
+            }
+            Assert.Empty(engine.Snapshots());
+            var finished = await session.SendAsync(new { v = 1, id = "body-qa-finish", type = "browser-body",
+                operation = "finish", transferId, session = true }, ct);
+            Assert.True(finished.Ok, finished.Message);
+            Assert.True(Assert.IsType<JsonElement>(finished.Data).GetProperty("accepted").GetBoolean());
+            await session.CloseAsync(ct);
+            var jobId = Assert.IsType<JsonElement>(finished.Data).GetProperty("jobId").GetGuid();
+            while (engine.Snapshot(jobId)?.State != JobState.Completed) await Task.Delay(20, ct);
+            string final = Assert.Single(Directory.GetFiles(downloads, "*.bin"));
+            Assert.Equal(length, new FileInfo(final).Length);
+            using var expected = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            for (int offset = 0; offset < length; offset += chunkSize) expected.AppendData(chunk);
+            await using (var file = File.OpenRead(final))
+                Assert.Equal(expected.GetHashAndReset(), await System.Security.Cryptography.SHA256.HashDataAsync(file, ct));
+            Assert.Single(engine.Snapshots());
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static Process StartNativeTestProcess(string path, string? qaPipe)
+    {
+        var start = new ProcessStartInfo(path)
         {
             UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true
-        })!;
+        };
+        if (qaPipe is not null) start.Environment["VESPER_QA_PIPE"] = qaPipe;
+        return Process.Start(start)!;
+    }
+
+    private sealed class NativeTestSession(string path, string? qaPipe = null) : IDisposable
+    {
+        private readonly Process _process = StartNativeTestProcess(path, qaPipe);
+
+        public Task WriteAsync(object request, CancellationToken ct) =>
+            BridgeProtocol.WriteFrameAsync(_process.StandardInput.BaseStream, JsonSerializer.Serialize(request), ct);
+
+        public async Task<BridgeResponse> ReadAsync(CancellationToken ct)
+        {
+            string? json = await BridgeProtocol.ReadFrameAsync(_process.StandardOutput.BaseStream, ct);
+            Assert.NotNull(json);
+            return JsonSerializer.Deserialize<BridgeResponse>(json, BridgeProtocol.Json)!;
+        }
+
+        public async Task<BridgeResponse> SendAsync(object request, CancellationToken ct)
+        {
+            await WriteAsync(request, ct);
+            return await ReadAsync(ct);
+        }
+
+        public async Task CloseAsync(CancellationToken ct)
+        {
+            _process.StandardInput.Close();
+            await _process.WaitForExitAsync(ct);
+            Assert.Equal(0, _process.ExitCode);
+        }
+
+        public void Dispose()
+        {
+            if (!_process.HasExited) { _process.Kill(); _process.WaitForExit(2000); }
+            _process.Dispose();
+        }
+    }
+
+    private static async Task<BridgeResponse> SendThroughHelperAsync(string path, object request, CancellationToken ct, string? qaPipe = null)
+    {
+        using Process process = StartNativeTestProcess(path, qaPipe);
         try
         {
             await BridgeProtocol.WriteFrameAsync(process.StandardInput.BaseStream, JsonSerializer.Serialize(request), ct);
@@ -233,16 +420,22 @@ public sealed class BrowserBridgeTests
         finally { if (!process.HasExited) process.Kill(); }
     }
 
-    private static async Task ServeNativeFixtureAsync(TcpListener server, byte[] payload, CancellationToken ct)
+    private static async Task ServeNativeFixtureAsync(TcpListener server, byte[] payload, int length, bool mismatch, CancellationToken ct)
     {
         using TcpClient client = await server.AcceptTcpClientAsync(ct);
         using NetworkStream stream = client.GetStream();
         using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
         while (await reader.ReadLineAsync(ct) is { Length: > 0 }) { }
-        byte[] headers = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {payload.Length}\r\n"
-            + "Content-Type: application/octet-stream\r\nETag: \"native-fixture\"\r\nConnection: close\r\n\r\n");
-        await stream.WriteAsync(headers, ct);
-        await stream.WriteAsync(payload, ct);
+        string tag = mismatch ? "different-fixture" : "native-fixture";
+        byte[] headers = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n"
+            + $"Content-Type: application/octet-stream\r\nETag: \"{tag}\"\r\nConnection: close\r\n\r\n");
+        try
+        {
+            await stream.WriteAsync(headers, ct);
+            for (int offset = 0; offset < length; offset += payload.Length)
+                await stream.WriteAsync(payload.AsMemory(0, Math.Min(payload.Length, length - offset)), ct);
+        }
+        catch (IOException) when (mismatch) { /* The engine correctly refused the response. */ }
     }
 
     [Fact]

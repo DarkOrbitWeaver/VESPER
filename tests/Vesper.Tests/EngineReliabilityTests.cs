@@ -587,6 +587,28 @@ public sealed class MediaSourceRescueTests
     }
 
     [Fact]
+    public void Automatic_direct_refresh_requires_a_known_expired_media_identity()
+    {
+        var ready = new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Http, State = JobState.NeedsLink,
+            Reason = "forbidden", MediaProvider = "youtube", MediaId = "fixture", MediaFormatId = "18",
+            SourceUrl = "https://cdn.example.com/18?token=old", OriginalPageUrl = "https://www.youtube.com/watch?v=fixture" };
+        try
+        {
+            Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(ready));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(ready));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(new JobSnapshot {
+                Id = Guid.NewGuid(), Kind = JobKind.Http, State = JobState.NeedsLink, Reason = "expired",
+                MediaProvider = "generic", MediaId = ready.MediaId, MediaFormatId = ready.MediaFormatId,
+                OriginalPageUrl = ready.OriginalPageUrl }));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(new JobSnapshot {
+                Id = Guid.NewGuid(), Kind = JobKind.Http, State = JobState.Paused, Reason = "expired",
+                MediaProvider = ready.MediaProvider, MediaId = ready.MediaId, MediaFormatId = ready.MediaFormatId,
+                OriginalPageUrl = ready.OriginalPageUrl }));
+        }
+        finally { VESPER.MediaSourceRescue.ForgetAutomaticAttempt(ready.Id); }
+    }
+
+    [Fact]
     public async Task A_refreshed_merge_plan_continues_the_saved_tracks_when_the_formats_still_match()
     {
         using var h = new Harness(tweak: o => o.MaxConcurrentJobs = 0);

@@ -44,7 +44,7 @@ internal sealed partial class BrowserBridgeHandler
         Title = request.PageTitle, UserAgent = request.MediaAuth?.UserAgent,
         Authorization = MediaAuthorization(request, page),
         Candidates = (request.Candidates ?? []).Select(h => new BrowserMediaCandidate
-        { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network", MutedLoop = h.MutedLoop }).ToList()
+        { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network", MutedLoop = h.MutedLoop, ObservedLength = h.ObservedLength, ObservedETag = h.ObservedETag }).ToList()
     };
 
     private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page) =>
@@ -63,14 +63,14 @@ internal sealed partial class BrowserBridgeHandler
         using var timing = ProcessingTiming.Measure(Guid.TryParse(request.Id, out var id) ? id : Guid.Empty, ProcessingPhase.Discovery);
         using var discovery = CancellationTokenSource.CreateLinkedTokenSource(ct);
         discovery.CancelAfter(TimeSpan.FromSeconds(42)); // Leave time for the browser helper's cold start.
-        using var resolver = new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options));
+        var resolver = SharedResolver;
         MediaDiscoveryResult resolved = await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
             Url = page, Browser = MediaHints(request, page),
             Options = new DiscoveryOptions
             {
                 CollectionIntent = CollectionIntent.ItemOnly,
-                ExactBrowserSource = request.Type == "media-source-options",
+                ExactBrowserSource = request.Type is "media-source-options" or "media-range-options",
                 ExactBrowserAssetGroup = request.Type == "media-group-options"
             }
         }, discovery.Token);
@@ -88,17 +88,17 @@ internal sealed partial class BrowserBridgeHandler
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
-            if (request.Type is "media-source-options" or "media-group-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
+            if (request.Type is "media-source-options" or "media-range-options" or "media-group-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
                 return BridgeResponse.Fail(request.Id, "source-unavailable", "VESPER couldn't verify this source. Go back to try another source.");
             string code = MapResolverError(error?.Code);
             var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
             return error?.RetryAt is { } retryAt ? failure with { Data = new { retryAt } } : failure;
         }
 
-        return CreateBrowserOptions(request.Id, item, page.AbsoluteUri, discovery.Token);
+        return CreateBrowserOptions(request.Id, item, page.AbsoluteUri, discovery.Token, request.PlaybackFingerprints);
     }
 
-    private BridgeResponse CreateBrowserOptions(string requestId, MediaItem item, string pageUrl, CancellationToken ct)
+    private BridgeResponse CreateBrowserOptions(string requestId, MediaItem item, string pageUrl, CancellationToken ct, IReadOnlyList<string>? playbackFingerprints = null)
     {
         var playable = PlayableOnly(item);
         var jobs = new List<MediaDownloadChoice>();
@@ -274,8 +274,10 @@ internal sealed partial class BrowserBridgeHandler
             Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(recipe)))).ToArray();
         string deliveryTrackFingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
             System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { item.AudioTracks, item.Subtitles, item.Duration, item.IsLive, item.Related })));
+        int playbackMatches = ManifestPlaybackEvidence.CountMatches(playable.Representations, playbackFingerprints, ct);
         return BridgeResponse.Success(requestId, data: new
         {
+            playbackMatches,
             mediaSession = session.ToString("N"), deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             isLive = item.IsLive,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,

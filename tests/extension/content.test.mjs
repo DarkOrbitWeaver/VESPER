@@ -368,6 +368,41 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
   }
 });
 
+test('opening the picker pins the chosen feed player despite a larger autoplaying neighbour', () => {
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
+  const window = new EventTarget();
+  const context = vm.createContext({
+    window, document, URL, AbortController, location: { href: 'https://www.tiktok.com/' },
+    ResizeObserver: class {}, IntersectionObserver: class {},
+    VesperTheme: { available: () => true, watchPreference: () => () => {} },
+    chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
+  });
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.testPin = (selected, neighbour, overlay) => {
+    extensionPreferencesReady = true;
+    video = selected;
+    host = overlay;
+    panelMedia = { player: selected };
+    observed.add(selected); observed.add(neighbour);
+    const calls = [];
+    place = () => calls.push('place');
+    attach = player => calls.push(player);
+    visiblePlayer = player => player === selected ? {left:0,top:0,right:300,bottom:300} : {left:0,top:0,right:800,bottom:800};
+    cardPreview = () => { throw Error('Overlay interaction searched a different card'); };
+    updateFlyVisibility = () => {};
+    selectPlayer();
+    onPointer({target:overlay,clientX:10,clientY:10,composedPath:()=>[overlay]});
+    panelMedia = null;
+    selectPlayer();
+    return calls;
+  };\n})();`);
+  runContent(context, content);
+  const selected={isConnected:true,paused:true}, neighbour={isConnected:true,paused:false};
+  const calls=window.testPin(selected,neighbour,{});
+  assert.equal(calls.length,2);
+  assert.equal(calls[0],'place');
+  assert.equal(calls[1],neighbour);
+});
+
 test('Smart Select filters navigation links and reports direct file details', () => {
   const smartSelect = readFileSync(new URL('../../extension/smart-select.js', import.meta.url), 'utf8')
     .replace(/\}\)\(\);\s*$/, 'globalThis.__details = fileDetails;\n})();');

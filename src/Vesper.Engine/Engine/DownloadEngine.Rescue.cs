@@ -93,7 +93,7 @@ public sealed partial class DownloadEngine
         ReplaceLinkCoreAsync(id, newUrl, input, ct, null, null);
 
     private async Task<RescueResult> ReplaceLinkCoreAsync(Guid id, string newUrl, RescueInput? input, CancellationToken ct,
-        RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null)
+        RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null, string? expectedExpiredSource = null)
     {
         DownloadJob? job;
         DownloadJob snapshot;
@@ -102,6 +102,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out job)) return Rejected("That entry no longer exists.");
             if (_cancelling.Contains(id)) return Rejected("The download is being cancelled.");
+            if (expectedExpiredSource is not null && (job.State != JobState.NeedsLink || job.Reason is not ("expired" or "forbidden")
+                || job.SourceUrl != expectedExpiredSource || _sessions.ContainsKey(id)))
+                return Rejected("The download changed since automatic refresh was scheduled. Saved data was kept.");
             if (job.Reason == "restart-cleanup")
                 return Rejected("Restart from scratch must finish before this link can be replaced.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
@@ -128,6 +131,9 @@ public sealed partial class DownloadEngine
                 return Rejected("The download must finish its pending cleanup before its link can be replaced.");
             if (_sessions.ContainsKey(id)) return Rejected("The download is still stopping. Try again in a moment.");
             if (current.State == JobState.Completed) return Rejected("This download is already complete.");
+            if (expectedExpiredSource is not null && (current.State != JobState.NeedsLink
+                || current.Reason is not ("expired" or "forbidden") || current.SourceUrl != expectedExpiredSource))
+                return Rejected("The download changed since automatic refresh was scheduled. Saved data was kept.");
             snapshot = current.CopyForUiMutation();
         }
         ct.ThrowIfCancellationRequested();

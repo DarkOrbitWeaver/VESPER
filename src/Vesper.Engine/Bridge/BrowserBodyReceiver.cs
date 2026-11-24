@@ -1,37 +1,55 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace Vesper.Engine;
 
 /// <summary>
-/// Bounded browser-byte transport. Receives only a user-selected complete file, not
-/// an HTTP replay or a Chrome download record. Each chunk is verified before ack.
-/// An incomplete transfer never becomes a published file or an engine job.
+/// Bounded browser-byte transport. Receives only a user-selected complete file, not an HTTP replay or a Chrome
+/// download record. Each chunk is verified before its acknowledgement and written exactly once, straight into the
+/// destination's staging partial (preallocated, so a full disk fails at the start rather than at 90 %).
+/// <para>Crash consistency: a journal in the data directory names every partial before it is created. "receiving"
+/// entries can never be owned by a job and are deleted at the next start; "committing" entries may be owned, so
+/// their files are kept. An incomplete transfer never becomes a published file or an engine job.</para>
 /// </summary>
 internal sealed class BrowserBodyReceiver : IDisposable
 {
-    internal const int ChunkBytes = 256 * 1024;
+    internal const int ChunkBytes = 512 * 1024;
     internal const long MaxBytes = 16L * 1024 * 1024 * 1024;
-    private readonly string _folder;
+    internal const string JournalFileName = "browser-inbox.json";
+    private static readonly TimeSpan Idle = TimeSpan.FromMinutes(2);
+    private readonly string _journal;
+    private readonly Func<string, long, string?> _destination;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, Transfer> _active = new(StringComparer.Ordinal);
     private bool _disposed;
     private Timer? _expiry;
-    private static readonly TimeSpan Idle = TimeSpan.FromMinutes(2);
 
-    internal BrowserBodyReceiver(string folder) => _folder = Path.GetFullPath(folder);
+    /// <param name="destination">Resolves (file name, length) to a ready destination folder with enough free space, or null.</param>
+    internal BrowserBodyReceiver(string dataDirectory, Func<string, long, string?> destination)
+    {
+        _journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
+        _destination = destination;
+    }
 
     internal sealed record Reply(bool Ok, string Code, long Offset = 0, Guid? JobId = null);
-    private sealed class Transfer(string origin, string name, long length, FileStream file) : IDisposable
+
+    private sealed record JournalEntry(string Id, string Path, string State);
+
+    internal sealed class Transfer(string origin, string name, long length, string folder, PartialFile file, string? identity) : IDisposable
     {
         internal string Origin { get; } = origin;
         internal string Name { get; } = name;
         internal long Length { get; } = length;
-        internal FileStream File { get; } = file;
+        internal string Folder { get; } = folder;
+        internal PartialFile File { get; } = file;
+        internal string? Identity { get; } = identity;
         internal IncrementalHash Hash { get; } = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         internal long Offset { get; set; }
         internal int LastLength { get; set; }
         internal string? LastHash { get; set; }
         internal DateTimeOffset LastActivity { get; set; } = DateTimeOffset.UtcNow;
+        /// <summary>Set by the engine once durable state may own the partial. A claimed partial is never deleted here.</summary>
+        internal bool Claimed { get; set; }
         public void Dispose() { try { File.Dispose(); } finally { Hash.Dispose(); } }
     }
 
@@ -39,8 +57,17 @@ internal sealed class BrowserBodyReceiver : IDisposable
     {
         if (_active.Remove(id, out Transfer? transfer))
         {
-            try { transfer.Dispose(); }
-            catch (IOException) { /* Delete-on-close still owns the private temporary file. */ }
+            try
+            {
+                if (!transfer.Claimed) transfer.File.DeleteUnclaimedNewFile();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* The journal entry is kept below. */ }
+            finally
+            {
+                try { transfer.Dispose(); }
+                catch (IOException) { }
+            }
+            if (transfer.Claimed || !System.IO.File.Exists(transfer.File.Path)) ForgetJournal(id);
         }
         if (_active.Count == 0) _expiry?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
@@ -64,7 +91,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 Prune();
                 if (_active.Count != 0)
                 {
-                    TimeSpan remaining = _active.Values.First().LastActivity + Idle - DateTimeOffset.UtcNow;
+                    TimeSpan remaining = _active.Values.Min(entry => entry.LastActivity) + Idle - DateTimeOffset.UtcNow;
                     _expiry!.Change(remaining > TimeSpan.Zero ? remaining : TimeSpan.FromMilliseconds(1), Timeout.InfiniteTimeSpan);
                 }
             }
@@ -97,25 +124,36 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 Renew(existing);
                 return new(true, "ok", existing.Offset);
             }
-            // One stream is enough for the initial acquisition route. The cap limits
-            // memory, file handles and temporary disk usage even for hostile input.
+            // One stream at a time limits memory, handles and disk usage even for hostile input.
             if (_active.Count != 0) return new(false, "busy");
-            if (!PathSafety.TryCheckUnlinkedDirectory(_folder, out _)) return new(false, "storage");
-            string path = Path.Combine(_folder, "browser-body-" + Guid.NewGuid().ToString("N") + ".tmp");
-            // This file is private to the process; Windows deletes it on close, even
-            // if the browser disconnects or the desktop process terminates.
-            using var directory = OperatingSystem.IsWindows() ? PathSafety.OpenTemporaryDirectoryHandle(_folder) : null;
-            var handle = PathSafety.OpenTemporaryHandle(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
-                FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose, allowDelete: true);
-            FileStream file;
-            try { file = new FileStream(handle, FileAccess.ReadWrite, 64 * 1024, isAsync: true); }
-            catch { handle.Dispose(); throw; }
-            var transfer = new Transfer(origin, name, length, file);
+            if (_destination(name, length) is not { } folder) return new(false, "storage");
+            string staging = PartialFile.PrepareStagingFolder(folder);
+            string path = Path.Combine(staging, name + "." + Guid.NewGuid().ToString("N")[..8] + ".vpart");
+            // Journal first: a crash after the file exists still leaves a record that names it.
+            RememberJournal(new JournalEntry(id, path, "receiving"));
+            PartialFile file;
+            try { file = PartialFile.Open(path, FileMode.CreateNew, allowDelete: true); }
+            catch { ForgetJournal(id); throw; }
+            string? identity;
+            try
+            {
+                identity = file.CaptureIdentity();
+                if (OperatingSystem.IsWindows() && identity is null)
+                    throw new IOException("Cannot establish the browser file identity.");
+                file.EnsureLength(length);
+            }
+            catch
+            {
+                try { file.DeleteUnclaimedNewFile(); } finally { file.Dispose(); }
+                ForgetJournal(id);
+                throw;
+            }
+            var transfer = new Transfer(origin, name, length, folder, file, identity);
             _active.Add(id, transfer);
             Renew(transfer);
             return new(true, "ok");
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         { return new(false, "storage"); }
         finally { _gate.Release(); }
     }
@@ -142,7 +180,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 return new(false, "offset", transfer.Offset);
             try
             {
-                await transfer.File.WriteAsync(bytes, ct).ConfigureAwait(false);
+                await transfer.File.WriteAsync(bytes, offset, ct).ConfigureAwait(false);
                 transfer.Hash.AppendData(bytes);
                 transfer.Offset += bytes.Length;
                 transfer.LastLength = bytes.Length;
@@ -152,8 +190,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
             }
             catch
             {
-                // A write can be partial on cancellation or disk failure. Never
-                // guess its extent or resume this volatile inbox.
+                // A write can be partial on cancellation or disk failure. Never guess its extent or resume this inbox.
                 Remove(id);
                 throw;
             }
@@ -163,8 +200,8 @@ internal sealed class BrowserBodyReceiver : IDisposable
         finally { _gate.Release(); }
     }
 
-    internal async Task<Reply> FinishAsync(string id,
-        Func<string, string, long, string, Stream, CancellationToken, Task<AddResult>> accept,
+    /// <param name="accept">Creates the engine job over the finished partial and sets <see cref="Transfer.Claimed"/>.</param>
+    internal async Task<Reply> FinishAsync(string id, Func<Transfer, string, CancellationToken, Task<AddResult>> accept,
         CancellationToken ct)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -176,16 +213,15 @@ internal sealed class BrowserBodyReceiver : IDisposable
             if (transfer.Offset != transfer.Length) return new(false, "incomplete", transfer.Offset);
             try
             {
-                await transfer.File.FlushAsync(ct).ConfigureAwait(false);
-                transfer.File.Position = 0;
+                transfer.File.Flush();
                 string digest = Convert.ToHexString(transfer.Hash.GetHashAndReset());
-                AddResult result = await accept(transfer.Origin, transfer.Name, transfer.Length, digest, transfer.File, ct)
-                    .ConfigureAwait(false);
+                RememberJournal(new JournalEntry(id, transfer.File.Path, "committing"));
+                AddResult result = await accept(transfer, digest, ct).ConfigureAwait(false);
                 return result.Ok ? new(true, "accepted", transfer.Offset, result.JobId) : new(false, "rejected");
             }
             finally { Remove(id); }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         { return new(false, "storage"); }
         finally { _gate.Release(); }
     }
@@ -195,6 +231,71 @@ internal sealed class BrowserBodyReceiver : IDisposable
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try { Remove(id); }
         finally { _gate.Release(); }
+    }
+
+    // ---- journal -------------------------------------------------------------------------------------------------
+
+    private List<JournalEntry> ReadJournal() => ReadJournal(_journal);
+
+    private static List<JournalEntry> ReadJournal(string path)
+    {
+        if (!System.IO.File.Exists(path)) return [];
+        var entries = JsonSerializer.Deserialize<List<JournalEntry>>(System.IO.File.ReadAllText(path)) ?? [];
+        return entries.Where(entry => entry is { Id.Length: > 0, Path.Length: > 0, State: "receiving" or "committing" }).ToList();
+    }
+
+    private void WriteJournal(List<JournalEntry> entries)
+    {
+        if (entries.Count == 0)
+        {
+            System.IO.File.Delete(_journal);
+            return;
+        }
+        string temporary = _journal + ".tmp";
+        System.IO.File.WriteAllText(temporary, JsonSerializer.Serialize(entries));
+        System.IO.File.Move(temporary, _journal, overwrite: true);
+    }
+
+    private void RememberJournal(JournalEntry entry)
+    {
+        List<JournalEntry> entries = ReadJournal();
+        entries.RemoveAll(existing => existing.Id == entry.Id);
+        entries.Add(entry);
+        WriteJournal(entries);
+    }
+
+    private void ForgetJournal(string id)
+    {
+        try
+        {
+            List<JournalEntry> entries = ReadJournal();
+            if (entries.RemoveAll(existing => existing.Id == id) > 0) WriteJournal(entries);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { }
+    }
+
+    /// <summary>Startup cleanup. Runs before any browser copy can begin.</summary>
+    internal static void RecoverJournal(string dataDirectory)
+    {
+        string journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
+        try
+        {
+            foreach (JournalEntry entry in ReadJournal(journal))
+                if (entry.State == "receiving") DeleteOrphan(entry.Path);
+            System.IO.File.Delete(journal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { }
+    }
+
+    // Only a regular file named like a VESPER partial inside a VESPER staging folder can be an orphan of this receiver.
+    private static void DeleteOrphan(string path)
+    {
+        string full = Path.GetFullPath(path);
+        if (!full.EndsWith(".vpart", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(Path.GetFileName(Path.GetDirectoryName(full)), PartialFile.StagingFolderName, StringComparison.OrdinalIgnoreCase))
+            return;
+        var file = new FileInfo(full);
+        if (file.Exists && !file.Attributes.HasFlag(FileAttributes.ReparsePoint)) file.Delete();
     }
 
     public void Dispose()

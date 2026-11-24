@@ -14,6 +14,7 @@ namespace VESPER;
 internal static class MediaSourceRescue
 {
     private static readonly Dictionary<Guid, DateTime> LastAutomaticAttempt = [];
+    private const int MaxAutomaticAttempts = 1024;
 
     public static bool CanRefresh(JobSnapshot job) =>
         (job.Kind is JobKind.Http or JobKind.Merge || job.Kind == JobKind.Hls && job.IsLiveRecording)
@@ -22,7 +23,13 @@ internal static class MediaSourceRescue
     /// <summary>One automatic attempt per job per hour; the Rescue window can always try again by hand.</summary>
     public static bool ShouldTryAutomatically(JobSnapshot job)
     {
-        if (job.Kind != JobKind.Merge || job.Reason != "expired" || !CanRefresh(job)) return false;
+        if (!CanRefresh(job)) return false;
+        bool merge = job.Kind == JobKind.Merge && job.Reason == "expired";
+        bool direct = job.Kind == JobKind.Http && job.State == JobState.NeedsLink
+            && job.Reason is "expired" or "forbidden" && !job.IsUnacceptedBrowserCapture
+            && !string.IsNullOrWhiteSpace(job.MediaProvider) && job.MediaProvider != "generic"
+            && !string.IsNullOrWhiteSpace(job.MediaId) && !string.IsNullOrWhiteSpace(job.MediaFormatId);
+        if (!merge && !direct) return false;
         lock (LastAutomaticAttempt)
         {
             DateTime now = DateTime.UtcNow;
@@ -31,6 +38,7 @@ internal static class MediaSourceRescue
                 .Select(pair => pair.Key).ToArray())
                 LastAutomaticAttempt.Remove(stale);
             if (LastAutomaticAttempt.TryGetValue(job.Id, out DateTime last) && now - last < TimeSpan.FromHours(1)) return false;
+            if (LastAutomaticAttempt.Count >= MaxAutomaticAttempts) return false;
             LastAutomaticAttempt[job.Id] = now;
             return true;
         }
@@ -56,12 +64,14 @@ internal static class MediaSourceRescue
         if (item.MediaId is null)
             return new RescueResult(false, RescueMode.None, "The source does not expose a verifiable media identity. Saved data was kept.", 0);
 
-        if (job.Kind == JobKind.Http) return await RefreshDirectAsync(engine, job, item, ct);
+        if (job.Kind == JobKind.Http) return await RefreshDirectAsync(engine, job, item, ct,
+            automatic ? job.SourceUrl : null);
         if (job.Kind == JobKind.Hls) return await RefreshLiveHlsAsync(engine, job, item, ct);
         return await RefreshMergeAsync(engine, job, item, ct, automatic);
     }
 
-    internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)
+    internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct,
+        string? expectedExpiredSource = null)
     {
         MediaRepresentation? format = item.Representations.FirstOrDefault(r => r.Id == job.MediaFormatId);
         if (format is null || format.Protocol != StreamProtocol.Http)
@@ -70,7 +80,7 @@ internal static class MediaSourceRescue
         if (!TryRefreshCredentials(format, out IReadOnlyDictionary<string, string>? secrets, out string? error))
             return new RescueResult(false, RescueMode.None, error!, 0);
         return await engine.RefreshMediaSourceAsync(job.Id, new ResolvedMediaSource(item.Provider,
-            item.MediaId!, format.Id, format.Url.AbsoluteUri, format.ExpiresAt, secrets), ct);
+            item.MediaId!, format.Id, format.Url.AbsoluteUri, format.ExpiresAt, secrets), ct, expectedExpiredSource);
     }
 
     internal static async Task<RescueResult> RefreshLiveHlsAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct)

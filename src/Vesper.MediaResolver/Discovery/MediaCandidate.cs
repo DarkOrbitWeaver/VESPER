@@ -14,7 +14,9 @@ internal sealed record MediaCandidate(
     long? Bitrate = null,
     double? DurationSeconds = null,
     string? Label = null,
-    bool MutedLoop = false)
+    bool MutedLoop = false,
+    long? ObservedLength = null,
+    string? ObservedETag = null)
 {
     public static readonly IReadOnlySet<string> MediaExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {

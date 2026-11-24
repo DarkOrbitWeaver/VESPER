@@ -6,6 +6,9 @@ const RESPONSE_LIFETIME = 5 * 60_000;
 const NEW_DOWNLOAD_WINDOW = 15_000;
 const MAX_CAPTURE_ATTEMPTS = 3;
 const EARLY_CAPTURE_WINDOW = 5000;
+const PARKING_WINDOW = 12_000; // bound pre-accept parking, not the verified transfer itself
+const parkingRemaining = record => Number.isFinite(record.parkUntil)
+  ? Math.max(0, Math.min(PARKING_WINDOW, record.parkUntil - Date.now())) : 0;
 const CAPTURE_STATE_KEY = 'vesperDownloadCapture';
 const DECISIONS_KEY = 'vesperCaptureDecisions';
 const MAX_DECISIONS = 20;
@@ -281,6 +284,7 @@ async function observeDownloadResponse(details, generation, admissionGeneration 
   const range = header('content-range')?.match(/\/(\d+)$/);
   const rawLength = details.statusCode === 206 ? range?.[1] : header('content-length');
   const length = rawLength && /^\d+$/.test(rawLength) ? byteCount(Number(rawLength)) : undefined;
+  const acceptsRanges = (header('accept-ranges') || '').split(',').some(value => value.trim().toLowerCase() === 'bytes');
   const rawTag = header('etag')?.trim();
   const etag = rawTag && /^"[^"\x00-\x20\x7f]{0,254}"$/.test(rawTag) ? rawTag : undefined;
   const fileResponse = ['main_frame', 'sub_frame', 'other'].includes(details.type)
@@ -303,7 +307,7 @@ async function observeDownloadResponse(details, generation, admissionGeneration 
   else if (encoding && encoding !== 'identity') why = 'compressed';
   else if (conflicts) why = old.why || 'changed';
   responses.delete(url);
-  responses.set(url, { seen: Date.now(), replay: !why, why, length, etag, contentType: mime, attachment,
+  responses.set(url, { seen: Date.now(), replay: !why, why, length, etag, contentType: mime, attachment, acceptsRanges,
     originalUrl, scope, requestId: details.requestId });
   const waiting = chain ? [...awaitingResponses.values()].filter(entry =>
     entry.url === chain.originalUrl || entry.url === chain.currentUrl) : [];
@@ -413,7 +417,7 @@ function canPauseBeforeNative(item, proof) {
   const now = Date.now();
   return capturePreflightReadyAt > 0 && now >= capturePreflightReadyAt
     && now - capturePreflightReadyAt <= EARLY_CAPTURE_WINDOW
-    && response?.attachment === true && response.replay === true
+    && response?.attachment === true && response.replay === true && response.acceptsRanges === true
     && response.etag === proof?.etag && Number.isSafeInteger(response.length)
     && response.length === proof.length && now >= response.seen && now - response.seen <= EARLY_CAPTURE_WINDOW;
 }
@@ -565,8 +569,8 @@ function inBrowserOrder(id, work) {
   return next.finally(() => { if (browserOperations.get(id) === next) browserOperations.delete(id); });
 }
 
-const transferCommand = (transferId, operation) => nativeRequest(envelope('browser-transfer', { transferId, operation }),
-  operation === 'watch' ? 42000 : operation === 'abandon' ? 5000 : 16000);
+const transferCommand = (transferId, operation, timeout) => nativeRequest(envelope('browser-transfer', { transferId, operation }),
+  timeout ?? (operation === 'watch' ? 42000 : operation === 'abandon' ? 5000 : 16000));
 const unavailableTransferState = reply => !reply?.ok
   && ['host-missing', 'timeout', 'app-unavailable', 'host-error', 'error'].includes(reply?.code);
 const chromeKeeps = (message = 'Chrome is continuing this download.') => ({ ok: false, code: 'in-chrome', chromePaused: false, message });
@@ -656,6 +660,7 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     record.sourceHash = sourceHash;
     if (pauseFirst) {
       record.resumeChrome = true;
+      record.parkUntil = Date.now() + PARKING_WINDOW;
     }
     delete record.retryAt;
     record.attempts = captureAttemptCount(record) + 1;
@@ -723,6 +728,11 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     }];
     const { items, authorized } = signedIn ? await withSignIn(itemsToSend)
       : { items: itemsToSend, authorized: false };
+    if (earlyPaused && parkingRemaining(record) === 0) {
+      await resumeChromeBeforeNative(id, record);
+      await note('handoff-failed');
+      return chromeKeeps();
+    }
     if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
       if (earlyPaused) await resumeChromeBeforeNative(id, record);
       else if (!previous) await writeBrowserRecord(id, null);
@@ -731,7 +741,7 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     // The separate command keeps older helpers from accepting capture without checking current site rules.
     const command = signedIn ? 'browser-submit' : 'browser-capture';
     const reply = await nativeRequest(envelope(command, { id: record.transferId, mode, items, authorized, browserProof: proof }),
-      earlyPaused ? 8000 : 24000);
+      earlyPaused ? Math.max(1, Math.min(8000, parkingRemaining(record))) : 24000);
     // Chrome may finish while native verification is in flight. Its completed file is never ours.
     const latest = await getChromeDownload(id);
     if (!sameDownload(latest, record) || latest.state === 'complete' || !(await sameSource(latest, record))) {
@@ -781,12 +791,20 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       return chromeKeeps();
     }
     record.stage = 'parking';
+    if (!earlyPaused) record.parkUntil = Date.now() + PARKING_WINDOW;
     record.resumeChrome = earlyPaused || !current.paused;
     try {
-      await writeBrowserRecord(id, record);
+      if (!(await writeBrowserRecord(id, record))) {
+        await restoreChromeDownload(id, record);
+        return chromeKeeps();
+      }
       await armBrowserRecovery();
       if (automatic && !(await captureCanBegin(generation, admissionGeneration))) {
         await releaseChromeAfterOptOut(id, record);
+        return chromeKeeps();
+      }
+      if (parkingRemaining(record) === 0) {
+        await restoreChromeDownload(id, record);
         return chromeKeeps();
       }
       if (record.resumeChrome && !current.paused) await chrome.downloads.pause(id);
@@ -801,7 +819,8 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
       }
-      const accepted = canAccept ? await transferCommand(record.transferId, 'accept') : null;
+      const remaining = parkingRemaining(record);
+      const accepted = canAccept && remaining > 0 ? await transferCommand(record.transferId, 'accept', remaining) : null;
       // Pause only blocks a handoff until the helper accepts it. Parked VESPER jobs keep running.
       if (automatic && (capturePaused || admissionGeneration !== captureAdmissionGeneration)) {
         await releaseChromeAfterOptOut(id, record);
@@ -811,7 +830,7 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
         await releaseChromeAfterOptOut(id, record);
         return chromeKeeps();
       }
-      if (canAccept && accepted?.ok && ['active', 'complete'].includes(accepted.data?.state)) {
+      if (canAccept && accepted?.ok && parkingRemaining(record) > 0 && ['active', 'complete'].includes(accepted.data?.state)) {
         // Chrome can finish between the paused check and the native acceptance reply.
         const confirmed = await getChromeDownload(id);
         if (automatic && !(await captureIsEnabled(generation))) {
@@ -836,13 +855,14 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
           return chromeKeeps();
         }
         record.stage = 'parked';
+        delete record.parkUntil;
         await writeBrowserRecord(id, record);
         if (automatic && !(await captureIsEnabled(generation))) {
           await releaseChromeAfterOptOut(id, record);
           return chromeKeeps();
         }
         watchChromeDownload(id, record);
-        await noteDecision(item, 'moved');
+        await noteDecision(item, 'handoff-pending');
         return { ...reply, chromePaused: true };
       }
     } catch { /* The recovery record was written before changing Chrome. */ }
@@ -978,6 +998,7 @@ async function restoreChromeDownload(id, record) {
   if (sameDownload(item, record) && record.resumeChrome &&
       (item.state === 'in_progress' && item.paused || item.state === 'interrupted' && item.canResume && !item.error?.startsWith('USER_')))
     await chrome.downloads.resume(id);
+  if (sameDownload(item, record)) await noteDecision(item, 'handoff-failed');
   await writeBrowserRecord(id, { ...record, stage: 'stand-down' });
 }
 
@@ -1028,8 +1049,10 @@ async function finishBrowserHandoff(id, record) {
           // after our cancellation is confirmed for the exact zero-byte item.
           if (captureEnabled && !record.preserveChrome && sameDownload(cancelled, record)
               && cancelled.state === 'interrupted' && cancelled.bytesReceived === 0
-              && cancelled.error === 'USER_CANCELED')
+              && cancelled.error === 'USER_CANCELED') {
+            await noteDecision(cancelled, 'moved');
             await globalThis.VesperBatchEvents?.noteNativeCompletion(id, record.startTime).catch(() => {});
+          }
           if (sameDownload(cancelled, record) && cancelled.state === 'interrupted'
               && cancelled.error?.startsWith('USER_')) {
             await writeBrowserRecord(id, captureEnabled
@@ -1114,11 +1137,15 @@ async function reconcileChromeDownload(id, record, knownReply) {
   }
   if (item.state === 'in_progress' && !item.paused) { await restoreChromeDownload(id, record); return; }
   if (record.stage === 'parking') {
-    if (!canMove(item) || !item.paused) {
+    if (!canMove(item) || !item.paused || parkingRemaining(record) === 0) {
       await restoreChromeDownload(id, record);
       return;
     }
-    const accepted = await transferCommand(record.transferId, 'accept');
+    const accepted = await transferCommand(record.transferId, 'accept', parkingRemaining(record));
+    if (parkingRemaining(record) === 0) {
+      await restoreChromeDownload(id, record);
+      return;
+    }
     if (!accepted?.ok) {
       if (unavailableTransferState(accepted)) {
         await armBrowserRecovery();
@@ -1128,6 +1155,7 @@ async function reconcileChromeDownload(id, record, knownReply) {
       return;
     }
     record.stage = 'parked';
+    delete record.parkUntil;
     await writeBrowserRecord(id, record);
   }
   const reply = knownReply || await transferCommand(record.transferId, 'status');

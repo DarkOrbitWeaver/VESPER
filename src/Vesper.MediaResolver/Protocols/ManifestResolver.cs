@@ -64,19 +64,24 @@ public sealed class ManifestResolver
 
         // One extra request: look at a single media playlist to learn container, protection, liveness and duration.
         HlsMediaPlaylist? probe = null;
+        Uri? probedVariant = null;
         try
         {
             var variant = SelectProbeVariant(master);
             var pr = (await _http.GetStringAsync(variant.Url, ctx, ct, _o.MaxManifestBytes).ConfigureAwait(false)).EnsureSuccess();
             probe = HlsParser.Parse(pr.Content, pr.FinalUrl, _o.MaxSegmentsPerRepresentation * 2).Media;
-            if (probe is not null) GuardMedia(probe);
+            if (probe is not null)
+            {
+                GuardMedia(probe);
+                probedVariant = variant.Url;
+            }
         }
         catch (MediaResolverException ex) when (ex.Error.Code is MediaErrorCode.NetworkFailure or MediaErrorCode.VideoUnavailable)
         {
             _o.Diagnostics?.Invoke("HLS probe playlist unavailable; continuing without container/duration metadata");
         }
 
-        return HlsRepresentationBuilder.FromMaster(master, url, ctx, probe);
+        return HlsRepresentationBuilder.FromMaster(master, url, ctx, probe, probedVariant);
     }
 
     private static HlsVariant SelectProbeVariant(HlsMasterPlaylist master)

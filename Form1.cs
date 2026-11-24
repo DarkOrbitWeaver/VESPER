@@ -875,6 +875,7 @@ public partial class Form1 : Form
         CancelQueueCompletionPrompt();
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _bridge?.Dispose();
+        _browserHandler?.CloseResolver();
         _notice?.Dispose();
         VesperSounds.Stop();
         _tray?.ContextMenuStrip?.Dispose();

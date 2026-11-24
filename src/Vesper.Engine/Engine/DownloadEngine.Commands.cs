@@ -143,6 +143,9 @@ public sealed partial class DownloadEngine
         if (request.Kind == JobKind.Http && request.Output == MediaOutput.Wav && request.MediaPlanJson is not null
             && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "The requested WAV range is invalid.");
+        if (request.Kind == JobKind.Http && request.Output == MediaOutput.M4a && request.MediaPlanJson is not null
+            && !MediaTimeRange.TryParse(request.MediaPlanJson, out _))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "The requested M4A range is invalid.");
         if (request.Output == MediaOutput.Mp3 && request.Kind == JobKind.Http && request.MediaPlanJson is not null)
             return new AddResult(AddStatus.Invalid, Guid.Empty, "MP3 output does not support audio clips.");
         MediaMergeMetadata? mediaMetadata = null;
@@ -247,7 +250,7 @@ public sealed partial class DownloadEngine
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
-                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output == MediaOutput.Wav || audioIfPresentPlan
+                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output is MediaOutput.Wav or MediaOutput.M4a || audioIfPresentPlan
                     ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };

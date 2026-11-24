@@ -14,7 +14,8 @@ public sealed partial class DownloadEngine
     /// identities; direct files then delegate byte identity to Rescue, while live HLS checks the next sequence. Optional
     /// request credentials are memory-only and scoped to the replacement origin.
     /// </summary>
-    public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default)
+    public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default,
+        string? expectedExpiredSource = null)
     {
         ArgumentNullException.ThrowIfNull(replacement);
         string? liveState = null;
@@ -22,6 +23,9 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
+            if (expectedExpiredSource is not null && (job.Kind != JobKind.Http || job.State != JobState.NeedsLink
+                || job.Reason is not ("expired" or "forbidden") || job.SourceUrl != expectedExpiredSource || _sessions.ContainsKey(id)))
+                return Rejected("The download changed since automatic refresh was scheduled. Saved data was kept.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (job.Kind == JobKind.Hls && HlsTransfer.IsLiveState(job.MediaState))
@@ -49,7 +53,7 @@ public sealed partial class DownloadEngine
             return Rejected(credentialError);
         if (liveState is not null)
             return await RefreshLiveHlsSourceAsync(id, replacement, liveState, credentials, ct).ConfigureAwait(false);
-        return await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials, replacement.ExpiresAt)
+        return await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials, replacement.ExpiresAt, expectedExpiredSource)
             .ConfigureAwait(false);
     }
 

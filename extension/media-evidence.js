@@ -102,5 +102,59 @@ globalThis.VesperMediaEvidence = (() => {
     return '';
   }
 
-  return { mediaFacts, playerFacts, score, trackLabel };
+  // A graph is constructed for one picker request, never persisted across
+  // documents. Edges are evidence, not download authority.
+  function associate({ sources, player = {}, currentUrl = '', resources = [], exactResources = [], fragments = [] } = {}) {
+    const list = Array.isArray(sources) ? sources.slice(0, 32) : [];
+    const observed = new Set(Array.isArray(resources) ? resources.slice(0, 12) : []);
+    const bound = new Set(Array.isArray(exactResources) ? exactResources.slice(0, 32) : []);
+    const paths = new Set(Array.isArray(fragments) ? fragments.slice(0, 16) : []);
+    const parse = value => {
+      try {
+        const url = new URL(value);
+        if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return null;
+        url.hash = '';
+        return url;
+      } catch { return null; }
+    };
+    const exact = parse(currentUrl)?.href;
+    const mediaPath = value => {
+      const url = parse(value);
+      return url ? url.origin + url.pathname : null;
+    };
+    const fragmentPaths = [...paths].map(mediaPath).filter(Boolean);
+    const nodes = list.map((entry, index) => {
+      const url = parse(entry.source?.url);
+      const facts = entry.reply?.ok ? mediaFacts(entry.reply) : {};
+      const edges = [];
+      const direct = !!exact && url?.href === exact && !entry.source?.group;
+      if (direct) edges.push({ kind: 'current-source', weight: 20 });
+      if (bound.has(url?.href) || entry.source?.group?.some(member => bound.has(member.url)))
+        edges.push({ kind: 'player-resource', weight: 24 });
+      if (observed.has(url?.href)) edges.push({ kind: 'resource', weight: 4 });
+      // Shared directories are useful for ranking, but a CDN can host unrelated
+      // programs, ads and multiple encodings under the same path.
+      if (url) {
+        const dir = url.pathname.slice(0, url.pathname.lastIndexOf('/') + 1);
+        const distinctive = dir.split('/').some(part => part.length >= 6 && /\d/.test(part));
+        const hits = distinctive ? fragmentPaths.filter(path => path.startsWith(url.origin + dir)).length : 0;
+        if (hits) edges.push({ kind: 'segment-family', weight: Math.min(6, hits * 2) });
+      }
+      const memberships = entry.reply?.data?.playbackMatches;
+      if (entry.reply?.ok === true && Number.isInteger(memberships) && memberships > 0 && memberships <= 12)
+        edges.push({ kind: 'manifest-segment', weight: Math.min(30, 12 + 3 * memberships) });
+      const match = score(player, facts);
+      if (match) edges.push({ kind: 'media-facts', weight: match });
+      const verified = entry.reply?.ok === true && !!entry.reply.data?.choices?.length;
+      return { index, entry, edges, verified, direct,
+        rank: edges.reduce((sum, edge) => sum + edge.weight, 0) };
+    });
+    nodes.sort((a, b) => b.rank - a.rank || a.index - b.index);
+    // Duration, timing, CDN affinity and DOM hints can never prove the active
+    // asset. Only the exact current source with independently checked formats.
+    const direct = nodes.filter(node => node.direct && node.verified);
+    return { nodes, selected: direct.length === 1 ? direct[0].entry : null };
+  }
+
+  return { mediaFacts, playerFacts, score, trackLabel, associate };
 })();

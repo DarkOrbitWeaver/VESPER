@@ -5,6 +5,7 @@ import vm from 'node:vm';
 const intelCode = readFileSync(new URL('../../extension/vesper-intelligence.js', import.meta.url), 'utf8');
 function load() {
   const context = vm.createContext({ URL, Date, Math, Map, Set, Number, String, RegExp, Error });
+  vm.runInContext(readFileSync(new URL('../../extension/vesper-control-evidence.js', import.meta.url), 'utf8'), context);
   vm.runInContext(intelCode, context);
   return context.VesperIntelligence;
 }

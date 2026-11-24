@@ -96,8 +96,8 @@ public sealed class DiscoveryReliabilityTests
         }, CancellationToken.None);
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal("Observed playback", result.Item!.Title);
-        // One probe and one bounded read of the file's start. The watch page is never requested.
-        Assert.Equal(2, handler.Requests.Count);
+        // One bounded range probe serves both metadata and track inspection. The watch page is never requested.
+        Assert.Single(handler.Requests);
         Assert.All(handler.Requests, request => Assert.Equal("cdn.example.com", request.Url.Host));
     }
 

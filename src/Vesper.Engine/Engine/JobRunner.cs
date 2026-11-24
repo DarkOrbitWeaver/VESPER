@@ -179,19 +179,30 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         return await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
     }
 
+    // The validator ladder for a parked Chrome download (see BrowserTransferProof). A strong ETag must match exactly.
+    // Without one, every fact Chrome observed must be reproduced before a single body byte is read. Any
+    // difference stops this job with "browser-fallback" so the extension resumes Chrome's own copy.
     private void CheckBrowserResponse(FirstResult first)
     {
         if (Job.BrowserProof is not { } proof) return;
         HttpResponseMessage response = first.Response;
-        if (string.IsNullOrEmpty(proof.ETag)
-            || !string.Equals(HttpFacts.StrongEtag(response), proof.ETag, StringComparison.Ordinal))
-            throw Stop(DownloadEngine.BrowserFallbackOutcome);
-        if (first.Decoded
+        string? etag = HttpFacts.StrongEtag(response);
+        bool sameRepresentation = proof.UsesMetadata
+            ? proof.ETag is null || string.Equals(etag, proof.ETag, StringComparison.Ordinal)
+            : !string.IsNullOrEmpty(proof.ETag) && string.Equals(etag, proof.ETag, StringComparison.Ordinal);
+        if (!sameRepresentation || first.Decoded
             || proof.Length is long length && first.Total != length
+            || proof.UsesMetadata && first.Total is null
             || proof.ContentType is { } mime && !string.Equals(HttpFacts.ContentType(response), mime, StringComparison.OrdinalIgnoreCase)
+            || proof.Attachment is bool attachment && HttpFacts.IsAttachment(response) != attachment
+            || proof.FileName is { } name && !SameServedName(HttpFacts.SuggestedFileName(response), name)
+            || proof.LastModifiedValue is { } modified && HttpFacts.LastModified(response) != modified
             || response.RequestMessage?.RequestUri is { } final && UrlPolicy.Normalize(final) != UrlPolicy.Normalize(_url))
             throw Stop(DownloadEngine.BrowserFallbackOutcome);
     }
+
+    private static bool SameServedName(string? served, string observed) =>
+        served is not null && string.Equals(FileNames.Sanitize(served), FileNames.Sanitize(observed), StringComparison.OrdinalIgnoreCase);
 
     private async Task WaitForBrowserApprovalAsync(CancellationToken ct)
     {

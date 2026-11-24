@@ -43,6 +43,10 @@ public sealed partial class DownloadEngine
         bool preserveConversionStagesForAttention = false;
         bool remuxPermit = false;
         bool wavFeaturesRequested = WavFeaturesRequested(job);
+        MediaTimeRange? audioClip = job.Kind == JobKind.Http && job.Output == MediaOutput.M4a
+            && MediaTimeRange.TryParse(job.MediaPlanJson, out MediaTimeRange m4aRange) ? m4aRange : null;
+        if (job.Kind == JobKind.Http && job.Output == MediaOutput.M4a
+            && job.MediaPlanJson is not null && audioClip is null) return (null, null);
         try
         {
             if (job.Output == MediaOutput.Wav && FindPreviousWavRollback(job, stage) is { } previousBackup)
@@ -67,6 +71,9 @@ public sealed partial class DownloadEngine
                     : tracks.Count == 1 && video is null;
             if (!tracksMatch || audio is null)
                 return (file, notice);
+
+            if (audioClip is not null)
+                Mp4Clip.Apply(tracks, audioClip, ct);
 
             file = await TryReusePreparedConversionAsync(job, source, tracks, audio, video, stage, ct).ConfigureAwait(false);
             if (file is not null)
@@ -111,8 +118,10 @@ public sealed partial class DownloadEngine
                 remuxInputs.Add((audio, source));
             }
 
-            bool directRemux = Options.ConvertMedia is null && remuxContainer is not null
+            bool directRemux = (Options.ConvertMedia is null || audioClip is not null) && remuxContainer is not null
                 && MediaMerger.ChooseContainer(remuxInputs.Select(input => input.Track).ToArray(), remuxContainer) == remuxContainer;
+            if (audioClip is not null && !directRemux)
+                return (null, null); // Never encode or publish the entire untrimmed source.
             if (directRemux)
             {
                 MediaMergeMetadata? metadata;

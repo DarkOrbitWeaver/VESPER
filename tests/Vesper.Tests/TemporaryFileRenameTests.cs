@@ -28,6 +28,53 @@ public sealed class TemporaryFileRenameTests
     }
 
     [WindowsFact]
+    public void Reuses_a_recently_vacated_name_without_losing_file_identity()
+    {
+        string folder = NewFolder();
+        string source = Path.Combine(folder, "merge-output.tmp");
+        string target = Path.Combine(folder, "download.partial");
+        string backup = Path.Combine(folder, "download.tracks");
+        try
+        {
+            File.WriteAllText(target, "original tracks");
+            File.SetCreationTimeUtc(target, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            File.WriteAllText(source, "merged output");
+            File.SetCreationTimeUtc(source, new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            string identity = GetIdentity(source);
+            Assert.True(PathSafety.TryMoveTemporaryFile(target, backup, GetIdentity(target), out string error), error);
+            Assert.True(PathSafety.TryMoveTemporaryFile(source, target, identity, out error), error);
+            Assert.Equal(identity, GetIdentity(target));
+            Assert.Equal("merged output", File.ReadAllText(target));
+            Assert.Equal("original tracks", File.ReadAllText(backup));
+        }
+        finally { Directory.Delete(folder, recursive: true); }
+    }
+
+    [WindowsFact]
+    public void Restores_only_the_timestamp_of_the_same_file_id()
+    {
+        string folder = NewFolder();
+        string source = Path.Combine(folder, "source.tmp");
+        string other = Path.Combine(folder, "other.tmp");
+        try
+        {
+            File.WriteAllText(source, "output");
+            File.WriteAllText(other, "output");
+            string identity = GetIdentity(source);
+            File.SetCreationTimeUtc(source, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+            using (var file = PathSafety.OpenTemporaryHandle(source, FileMode.Open, FileAccess.Read, FileShare.Read, writeAttributes: true))
+            {
+                Assert.NotEqual(identity, PathSafety.TemporaryFileIdentity(file));
+                PathSafety.RestoreMovedTemporaryIdentity(file, identity);
+                Assert.Equal(identity, PathSafety.TemporaryFileIdentity(file));
+            }
+            using var different = PathSafety.OpenTemporaryHandle(other, FileMode.Open, FileAccess.Read, FileShare.Read, writeAttributes: true);
+            Assert.Throws<IOException>(() => PathSafety.RestoreMovedTemporaryIdentity(different, identity));
+        }
+        finally { Directory.Delete(folder, recursive: true); }
+    }
+
+    [WindowsFact]
     public void Pins_ancestor_directories_until_the_handle_bound_rename_finishes()
     {
         string folder = NewFolder();

@@ -179,7 +179,13 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       posted: [],
       onMessage: { addListener: fn => { port.reply = fn; } },
       onDisconnect: { addListener: fn => { port.close = fn; } },
-      postMessage: message => port.posted.push(message),
+      postMessage: message => {
+        // This fixture's activity connection is independent of the legacy request host.
+        if (message.type === 'session-open') {
+          ports.splice(ports.indexOf(port), 1);
+          queueMicrotask(() => port.reply({id: message.id, ok:false, code:'invalid', message:'Unknown request type.'}));
+        } else port.posted.push(message);
+      },
       disconnect: () => { port.disconnected = true; port.close(); }
     };
     ports.push(port);
@@ -293,8 +299,9 @@ const activeDownload = () => ({
 const started = { ok: true, results: [{ status: 'started', transferReady: true }] };
 const transfer = state => ({ ok: true, data: { state } });
 
-function observe(app, file, { method = 'GET', type = 'main_frame', contentType = 'application/zip', attachment = true, requestId = 'download-request' } = {}) {
+function observe(app, file, { method = 'GET', type = 'main_frame', contentType = 'application/zip', attachment = true, acceptsRanges = true, requestId = 'download-request' } = {}) {
   const headers = { 'Content-Length': String(file.fileSize), ETag: '"version-1"' };
+  if (acceptsRanges) headers['Accept-Ranges'] = 'bytes';
   if (contentType) headers['Content-Type'] = contentType;
   if (attachment) headers['Content-Disposition'] = 'attachment; filename="archive.zip"';
   return app.onHeaders({ url: file.finalUrl || file.url, requestId, method, type, statusCode: 200,
@@ -353,6 +360,33 @@ test('early capture resumes the Chrome stream when native staging fails', async 
   assert.equal(file.paused, false);
   assert.deepEqual(app.actions, ['pause', 'native', 'native', 'resume']);
   assert.equal(app.localData.browserDownloads[file.id].stage, 'stand-down');
+});
+
+test('warm helper does not park before staging when server has not advertised byte ranges', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, preflightReady: true });
+  await observe(app, file, { acceptsRanges: false });
+  await waitFor(() => app.preflights.length === 1);
+  await app.onCreated(file);
+  assert.equal(app.actions[0], 'native');
+  assert.equal(file.paused, true);
+});
+
+test('expired parking attempt is abandoned rather than accepted after worker restart', async () => {
+  const file = activeDownload();
+  const first = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file });
+  await observe(first, file);
+  await first.onCreated(file);
+  const parked = first.localData.browserDownloads[file.id];
+  first.stopWorker();
+  const app = load({ 'browser-transfer': transfer('failed') }, { download: file,
+    localData: { browserDownloads: { [file.id]: { ...parked, stage: 'parking', parkUntil: Date.now() - 1 } } } });
+  await app.recover();
+  assert.equal(app.sent.some(m => m.operation === 'accept'), false);
+  assert.equal(app.sent.some(m => m.operation === 'abandon'), true);
+  assert.equal(file.paused, false);
+  assert.equal(app.actions.includes('cancel'), false);
 });
 
 test('automatic handoff verifies the response before pausing Chrome and accepts before monitoring', async () => {
@@ -1519,10 +1553,12 @@ test('after VESPER completes, Chrome keeps its USER_CANCELED history entry visib
   await observe(app, file);
   await app.onCreated(file);
   await app.recover();
+  assert.equal(app.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'handoff-pending');
   assert.equal(app.actions.includes('cancel'), false);
   state = 'complete';
   await app.recover();
   assert.equal(app.actions.includes('cancel'), true);
+  assert.equal(app.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'moved');
   assert.equal(app.actions.includes('erase'), false);
   assert.equal(file.state, 'interrupted');
   assert.equal(file.error, 'USER_CANCELED');
@@ -2150,6 +2186,30 @@ test('a partial video range is not offered as a complete Instagram source', asyn
   const full = await completeApp.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
     playerUrl: 'blob:https://www.instagram.com/player', generation: 6, playerPlaying: true, mediaChangedAt: changedAt }, completeSender);
   assert.equal(full.data.sourceChoices.length, 1);
+});
+
+test('a strongly validated partial media response gets a separate full-file verification command', async () => {
+  const app = load({ 'media-options': {ok:false, code:'no-media'}, 'media-range-options': checkedSource(15) });
+  const page='https://www.instagram.com/reel/ranged/', url='https://cdn.example.com/opaque-video';
+  const sender={url:page,tab:{id:81},frameId:0,documentId:'ranged-document'};
+  const changedAt=Date.now();
+  const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
+    generation:5,playerPlaying:true,mediaChangedAt:changedAt};
+  try {
+    await app.onMedia({url,tabId:81,frameId:0,documentId:sender.documentId,method:'GET',statusCode:206,
+      type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:[
+        {name:'Content-Type',value:'video/mp4'},{name:'Content-Range',value:'bytes 0-999/700000'},
+        {name:'Content-Length',value:'1000'},{name:'ETag',value:'"original"'}]});
+    const result=await app.message(request,sender);
+    assert.equal(result.data.sourceChoices.length,1);
+    const check=app.sent.find(message=>message.type==='media-range-options');
+    assert.equal(check.candidates[0].observedLength,700000);
+    assert.equal(check.candidates[0].observedETag,'"original"');
+    assert.equal(check.candidates[0].url,url);
+    assert.equal(app.sent.some(message=>message.type==='media-source-options'),false);
+    const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
+    assert.equal(selected.ok,true);
+  } finally {app.stopWorker();}
 });
 
 test('signed media response URLs are removed from session storage after their TTL', async () => {
@@ -2917,7 +2977,7 @@ test('a link with a #fragment matches the response Chrome reported without it', 
   assert.equal(app.sent[0].type, 'browser-capture');
   assert.equal(app.sent[0].items[0].url, 'https://example.com/files/archive.zip');   // a fragment is never sent to a server
   assert.equal(file.paused, true);
-  assert.equal(outcomeOf(app), 'moved');
+  assert.equal(outcomeOf(app), 'handoff-pending');
 });
 
 test('a redirected download with a #fragment is matched when its response arrives late', async () => {
@@ -2929,7 +2989,7 @@ test('a redirected download with a #fragment is matched when its response arrive
   await app.onRedirect({ url: 'https://example.com/get/42', redirectUrl: 'https://cdn.example.net/files/archive.zip', requestId: 'r2', method: 'GET', type: 'main_frame' });
   await app.onHeaders({ url: 'https://cdn.example.net/files/archive.zip', requestId: 'r2', method: 'GET', type: 'main_frame',
     statusCode: 200, responseHeaders: responseHeaders(zipHeaders) });
-  await waitFor(() => outcomeOf(app) === 'moved', 'the late response should start the handoff');
+  await waitFor(() => outcomeOf(app) === 'handoff-pending', 'the late response should start the handoff');
   assert.equal(app.sent[0].items[0].url, 'https://cdn.example.net/files/archive.zip');
   assert.equal(file.paused, true);
 });
@@ -3414,6 +3474,100 @@ test('resource witnesses enter the five-source verification budget before weaker
   } finally { app.stopWorker(); }
 });
 
+test('exact current file can recover a refused page resolver without checking unrelated streams', async () => {
+  const page='https://video.example/feed',url='https://cdn.example/movie.mp4',changedAt=Date.now();
+  const sender={url:page,tab:{id:41},frameId:0,documentId:'exact-recovery-doc'};
+  for(const code of ['site-refused','protected','blocked','source-expired']) {
+    const app=load({'media-options':{ok:false,code},'media-source-options':checkedSource(60)});
+    try {
+      await app.onMedia({url,tabId:41,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'media',
+        timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Length':'700000',ETag:'"asset-v1"'})});
+      const result=await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:url,
+        generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
+      const checks=app.sent.filter(m=>m.type==='media-source-options');
+      assert.equal(checks.length,code==='site-refused'?1:0);
+      if(code==='site-refused') {
+        assert.equal(checks[0].candidates[0].url,url);
+        assert.equal(result.ok,true);
+      } else assert.equal(result.code,code);
+    } finally {app.stopWorker();}
+  }
+});
+
+test('same-origin browser proof obeys the current sign-in preference', async()=>{
+  const page='https://video.example/watch',url='https://video.example/movie.mp4',changedAt=Date.now();
+  const sender={url:page,tab:{id:42},frameId:0,documentId:'cookie-mode-doc'};
+  for(const useSignIn of [false,true]) {
+    const app=load({}, {prefs:{useSignIn}});
+    try {
+      await app.onMedia({url,tabId:42,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'media',
+        timeStamp:changedAt,responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Length':'700000',ETag:'"asset-v1"'})});
+      const result=await app.message({type:'browser-body-media-proof',pageUrl:page,playerPageUrl:page,playerUrl:url,
+        generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
+      assert.equal(result.ok,true);
+      assert.equal(result.data.credentials,useSignIn?'same-origin':'omit');
+    } finally {app.stopWorker();}
+  }
+});
+
+test('playback membership can recover a correct manifest beyond the first usable candidate wave', async () => {
+  const page = 'https://video.example/feed';
+  const sender = { url:page, tab:{id:40}, frameId:0, documentId:'manifest-membership-doc' };
+  const changedAt = Date.now();
+  const actual = 'https://elsewhere.example/program.m3u8';
+  const fingerprint = 'b'.repeat(64);
+  const app = load({'media-source-options': message => {
+    const reply = checkedSource(60);
+    reply.data.playbackMatches = message.candidates[0].url === actual && message.playbackFingerprints?.includes(fingerprint) ? 1 : 0;
+    return reply;
+  }});
+  try {
+    for (let i=0;i<7;i++) {
+      await app.onMedia({url:'https://cdn.video.example/noise-'+i+'.m3u8',tabId:40,frameId:0,documentId:sender.documentId,
+        method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:changedAt+i,
+        responseHeaders:[{name:'Content-Type',value:'application/vnd.apple.mpegurl'}]});
+    }
+    await app.onMedia({url:actual,tabId:40,frameId:0,documentId:sender.documentId,
+      method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:changedAt-12000,
+      responseHeaders:[{name:'Content-Type',value:'application/vnd.apple.mpegurl'}]});
+    const msg={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://video.example/player',
+      generation:1,playerPlaying:true,mediaChangedAt:changedAt};
+    await app.message(msg,sender);
+    assert.equal(app.sent.filter(m=>m.type==='media-source-options').length,5);
+    const result=await app.message({...msg,playerResourceFingerprints:[fingerprint]},sender);
+    const checks=app.sent.filter(m=>m.type==='media-source-options').slice(5);
+    assert.equal(checks.length,8,'bounded second wave, even though unrelated sources were usable');
+    assert.ok(checks.some(m=>m.candidates[0].url===actual));
+    assert.ok(checks.every(m=>m.playbackFingerprints?.[0]===fingerprint));
+    assert.ok(result.data.sourceChoices.length);
+    assert.equal(app.evaluate('sourceSelections.get(' + JSON.stringify(result.data.sourceChoices[0].token) + ').url'), actual);
+  } finally {app.stopWorker();}
+});
+test('exact player resource fingerprint prioritizes a signed source without authorizing automatic selection', async () => {
+  const page = 'https://video.example/feed';
+  const sender = { url: page, tab: { id: 39 }, frameId: 0, documentId: 'exact-resource-doc' };
+  const changedAt = Date.now(), base = 'https://cdn.video.example/movie-1234/video.mp4';
+  const actual = base + '?signature=actual', other = base + '?signature=other';
+  const app = load({ 'media-source-options': checkedSource(60) });
+  try {
+    for (const [url, at] of [[actual, changedAt-1000],[other, changedAt]]) {
+      await app.onMedia({url, tabId:39, frameId:0, documentId:sender.documentId,
+        method:'GET', statusCode:200, type:'xmlhttprequest', timeStamp:at,
+        responseHeaders:[{name:'Content-Type',value:'video/mp4'},{name:'Content-Length',value:'300000'}]});
+    }
+    const digest = await webcrypto.subtle.digest('SHA-256',new TextEncoder().encode(actual));
+    const fingerprint = Buffer.from(digest).toString('hex');
+    const result = await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,
+      playerUrl:'blob:https://video.example/player',generation:1,playerPlaying:true,
+      mediaChangedAt:changedAt,playerFragmentUrls:[base],playerResourceFingerprints:[fingerprint]},sender);
+    const checks=app.sent.filter(message=>message.type==='media-source-options');
+    assert.equal(checks.length,2);
+    assert.equal(checks[0].candidates[0].url,actual);
+    assert.equal(result.data.sourceChoices.length,2);
+    assert.equal(JSON.stringify(result.data.sourceChoices).includes('signature='),false);
+  } finally {app.stopWorker();}
+});
+
 test('watched video tabs discover extensionless complete media without accepting segments or unrelated data', async () => {
   const app = load({ 'media-source-options': checkedSource() });
   const page = 'https://video.example/watch/typed-media';
@@ -3509,7 +3663,8 @@ test('conflicting cross-document attachment responses with identical validators 
 test('browser-session acquisition requires the exact current media document and a strong range validator', async () => {
   const page='https://video.example/watch/1', url='https://video.example/media/movie.mp4';
   const sender={tab:{id:71},frameId:0,documentId:'media-document-71',url:page};
-  const app=load({'media-options':{ok:false,code:'sign-in',message:'Browser session required'}});
+  const failure={ok:false,code:'sign-in',message:'Browser session required'};
+  const app=load({'media-options':failure,'media-range-options':failure});
   const changedAt=Date.now();
   const selection={pageUrl:page,playerPageUrl:page,playerUrl:url,generation:1,mediaChangedAt:changedAt,playerHasMedia:true};
   const request={type:'browser-body-media-proof',...selection};

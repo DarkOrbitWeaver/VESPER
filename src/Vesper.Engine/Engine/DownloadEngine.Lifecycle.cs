@@ -79,6 +79,9 @@ public sealed partial class DownloadEngine
         if (job.Output == MediaOutput.Original)
             (prepared, completionNotice) = await PrepareAudioMetadataAsync(job, ct).ConfigureAwait(false);
         else (prepared, completionNotice) = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
+        if (prepared is null && job.Kind == JobKind.Http && job.Output == MediaOutput.M4a
+            && job.MediaPlanJson is not null)
+            return RunOutcome.NeedsAttention("trim-failed", "The requested audio clip could not be prepared. The full source was kept; nothing was published.");
         if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
         if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
         ct.ThrowIfCancellationRequested();
@@ -290,6 +293,8 @@ public sealed partial class DownloadEngine
 
     private void Recover()
     {
+        // Partials of browser copies that were still receiving when the process stopped belong to nobody.
+        BrowserBodyReceiver.RecoverJournal(Options.DataDirectory);
         string[] manifestFolders = RecoveryFolders();
         foreach (string folder in manifestFolders)
             RecoveryManifest.RecoverInterruptedReplacements(folder,

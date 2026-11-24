@@ -267,6 +267,13 @@ internal static class MediaTransferBridge
         && choice.Kind is JobKind.Http or JobKind.Merge
         && Path.GetExtension(choice.FileName).ToLowerInvariant() is ".webm" or ".mkv" or ".mp4" or ".m4a";
 
+    // A complete direct AAC file can be downloaded normally and cut locally.
+    // It does not need a pre-known exact size or a provider range identity.
+    private static bool CanClipDirectAac(MediaRepresentation? track) =>
+        track is { Protocol: StreamProtocol.Http, Content: StreamContent.AudioOnly,
+            Container: "mp4" or "m4a", AudioCodec: "aac", AudioUnverified: false, IsLive: false }
+        && !HasIncompatibleAacProfile(track);
+
     private static bool CanClipLocalMp4Tracks(IReadOnlyList<MediaRepresentation> tracks, string? outputContainer)
     {
         if (tracks.Count is < 1 or > 2
@@ -378,6 +385,14 @@ internal static class MediaTransferBridge
             return BuildMerge(item, selection, plan, [video, audio], container, clipStartSeconds, clipEndSeconds,
                 prefs.EmbedSubtitles, unsupportedSubtitleCount);
         }
+        if (selection.Video is { BrowserRangeVerified: true } ranged && selection.Audio is null)
+        {
+            if (ranged.ResourceETag is null || ranged.ResourceUrlSha256 is null || ranged.ContentIdentity is null
+                || MergeCapability.MuxedContainer(ranged, prefs.Container) is not { } rangedContainer)
+                return (null, "The observed file has no verified native delivery plan.");
+            return BuildMerge(item, selection, plan, [ranged], rangedContainer, clipStartSeconds, clipEndSeconds,
+                prefs.EmbedSubtitles, unsupportedSubtitleCount);
+        }
         if (prefs.EmbedSubtitles && clipStartSeconds is null && selection.Video is { } muxedVideo
             && selection.Audio is null && HasEmbeddableSubtitle(subtitles, muxedVideo)
             && muxedVideo.Protocol == StreamProtocol.Http && muxedVideo.ContentIdentity is { Length: > 0 }
@@ -386,10 +401,12 @@ internal static class MediaTransferBridge
             return BuildMerge(item, selection, plan, [muxedVideo], muxedContainer, null, null,
                 embedSubtitles: true, unsupportedSubtitleCount: unsupportedSubtitleCount);
 
+        bool directAacClip = selection.Video is null && CanClipDirectAac(selection.Audio);
         // Audio with provider byte identity goes through the native job: bounded range requests, container validation,
         // a clean non-fragmented M4A/WebM output and identity-checked continuation after a link refresh.
         if (selection.Video is null && selection.Audio is { ContentIdentity: not null } only
-            && MergeCapability.AudioContainer(only) is { } audioContainer)
+            && MergeCapability.AudioContainer(only) is { } audioContainer
+            && (!directAacClip || CanClipLocalMp4Tracks([only], audioContainer)))
             return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds,
                 unsupportedSubtitleCount: unsupportedSubtitleCount);
 
@@ -399,6 +416,15 @@ internal static class MediaTransferBridge
         TransferStep step = plan.Steps[0];
         if (step.Protocol is not (StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash) || !CanCarryContext(step.Context))
             return (null, "This source needs an unsupported transfer method or request context.");
+        if (clipStartSeconds is double audioStart && directAacClip && step.Protocol == StreamProtocol.Http)
+        {
+            if (selection.Subtitles.Count > 0) return (null, LocalMp4ClipSubtitleError);
+            return (new MediaDownloadChoice(step.Url.AbsoluteUri, Path.ChangeExtension(plan.SuggestedFileName, ".m4a"),
+                JobKind.Http, step.Context.Referer, step.Context.UserAgent, item.SourceUrl.AbsoluteUri,
+                item.Provider, item.MediaId, selection.Summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
+                JsonSerializer.Serialize(new MediaTimeRange(audioStart, clipEndSeconds!.Value)), selection.Audio!.Id,
+                Output: MediaOutput.M4a, Secrets: TransferSecrets(step.Context, step.Url)), null);
+        }
         if (clipStartSeconds is not null && step.Protocol == StreamProtocol.Http)
         {
             if (selection.Video is not { } localMuxedVideo || selection.Audio is not null
@@ -452,8 +478,8 @@ internal static class MediaTransferBridge
                 && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
                     ? SerializeAudioMetadata(item) : null,
             CanUseFullFileClip: clipStartSeconds is null && step.Protocol == StreamProtocol.Http
-                && selection.Video is { } localClipVideo && selection.Audio is null
-                && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer)), null);
+                && (directAacClip || selection.Video is { } localClipVideo && selection.Audio is null
+                    && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer))), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>

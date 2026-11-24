@@ -8,7 +8,8 @@ public sealed record BridgeItem(string Url, string? FileName, string Kind, strin
     string? Cookie, string? Authorization, string? OriginalUrl = null,
     string? ReviewLabel = null, string? ReviewType = null, double? ReviewDurationSeconds = null);
 
-public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false);
+public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false,
+    long? ObservedLength = null, string? ObservedETag = null);
 
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
     IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
@@ -16,7 +17,7 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
     IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
-    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null);
+    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null, IReadOnlyList<string>? PlaybackFingerprints = null);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -73,7 +74,7 @@ public static class BridgeProtocol
             { error = "Invalid request id."; return false; }
 
             string type = Str(root, "type") ?? "";
-            if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-group-options" or "media-select"
+            if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-range-options" or "media-group-options" or "media-select"
                 or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed" or "browser-body"))
             { error = "Unknown request type."; return false; }
 
@@ -96,7 +97,21 @@ public static class BridgeProtocol
             BrowserTransferProof? browserProof = null;
             BrowserActivity? activity = null;
             string? transferId = null, operation = null;
-            bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options" or "media-group-options";
+            bool mediaLookup = type is "media-picker" or "media-options" or "media-source-options" or "media-range-options" or "media-group-options";
+            List<string>? playbackFingerprints = null;
+            if (root.TryGetProperty("playbackFingerprints", out var playback))
+            {
+                if (!mediaLookup || playback.ValueKind != JsonValueKind.Array || playback.GetArrayLength() > 12)
+                { error = "Invalid playback evidence."; return false; }
+                playbackFingerprints = [];
+                foreach (var entry in playback.EnumerateArray())
+                {
+                    if (entry.ValueKind != JsonValueKind.String || entry.GetString() is not { Length: 64 } digest
+                        || !digest.All(char.IsAsciiHexDigit))
+                    { error = "Invalid playback fingerprint."; return false; }
+                    if (!playbackFingerprints.Contains(digest, StringComparer.OrdinalIgnoreCase)) playbackFingerprints.Add(digest);
+                }
+            }
             bool browserSubmit = type is "browser-submit" or "browser-capture";
             if (type == "probe" || mediaLookup)
             {
@@ -125,10 +140,24 @@ public static class BridgeProtocol
                         if (mime is { Length: > 100 } || mime is not null && mime.Any(char.IsControl))
                         { error = "Invalid media-hint MIME type."; return false; }
                         bool mutedLoop = hint.TryGetProperty("mutedLoop", out var muted) && muted.ValueKind == JsonValueKind.True;
-                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop));
+                        long? observedLength = null;
+                        string? observedTag = Str(hint, "observedETag");
+                        if (type == "media-range-options")
+                        {
+                            if (kind != "direct" || !hint.TryGetProperty("observedLength", out var size)
+                                || size.ValueKind != JsonValueKind.Number || !size.TryGetInt64(out long length)
+                                || length is <= 0 or > 17_179_869_184 || observedTag is not { Length: > 2 and <= 256 }
+                                || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
+                                || tag.IsWeak || tag.Tag == "*" || tag.ToString() != observedTag)
+                            { error = "A ranged media hint needs an exact size and strong ETag."; return false; }
+                            observedLength = length;
+                        }
+                        else if (observedTag is not null || hint.TryGetProperty("observedLength", out _))
+                        { error = "Ranged media evidence requires the exact range command."; return false; }
+                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop, observedLength, observedTag));
                     }
                 }
-                if (type == "media-source-options" && hints.Count != 1)
+                if (type is ("media-source-options" or "media-range-options") && hints.Count != 1)
                 { error = "Checking a media source requires exactly one hint."; return false; }
                 if (type == "media-group-options" && hints.Count is < 2 or > 5)
                 { error = "Checking a media group requires two to five hints."; return false; }
@@ -207,7 +236,11 @@ public static class BridgeProtocol
                         || proof.ValueKind != JsonValueKind.Object
                         || !TryLength(proof, "length", out long? length))
                     { error = "Invalid browser download proof."; return false; }
-                    browserProof = new BrowserTransferProof(length, Str(proof, "etag"), Str(proof, "contentType"));
+                    bool? attachment = proof.TryGetProperty("attachment", out JsonElement disposition)
+                        && disposition.ValueKind is JsonValueKind.True or JsonValueKind.False ? disposition.GetBoolean() : null;
+                    browserProof = new BrowserTransferProof(length, Str(proof, "etag"), Str(proof, "contentType"),
+                        LastModified: Str(proof, "lastModified"), FileName: Str(proof, "fileName"),
+                        Attachment: attachment, Basis: Str(proof, "basis"));
                     if (!browserProof.IsValid)
                     { error = "Invalid browser download proof."; return false; }
                 }
@@ -257,7 +290,7 @@ public static class BridgeProtocol
             string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
                 confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
-                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile, browserBody);
+                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile, browserBody, playbackFingerprints);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)

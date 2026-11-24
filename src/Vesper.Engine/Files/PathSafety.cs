@@ -127,7 +127,7 @@ public static class PathSafety
         (attributes & (RecallOnDataAccess | RecallOnOpen)) != 0;
 
     internal static SafeFileHandle OpenTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share,
-        FileOptions options = FileOptions.None, bool allowDelete = false)
+        FileOptions options = FileOptions.None, bool allowDelete = false, bool writeAttributes = false)
     {
         if (!Path.IsPathFullyQualified(path)) throw new IOException("The temporary file path is invalid.");
         path = Path.GetFullPath(path);
@@ -139,7 +139,7 @@ public static class PathSafety
         // Inspect the opened object before allowing a write or truncation.
         FileMode openMode = mode == FileMode.Create ? FileMode.OpenOrCreate : mode;
         SafeFileHandle handle = OperatingSystem.IsWindows()
-            ? OpenWindowsTemporaryHandle(path, openMode, access, share, options, allowDelete)
+            ? OpenWindowsTemporaryHandle(path, openMode, access, share, options, allowDelete, writeAttributes)
             : File.OpenHandle(path, openMode, access, share, options);
         try
         {
@@ -177,12 +177,13 @@ public static class PathSafety
         && !IsCloudPlaceholder(attributes);
 
     private static SafeFileHandle OpenWindowsTemporaryHandle(string path, FileMode mode, FileAccess access, FileShare share,
-        FileOptions options, bool allowDelete)
+        FileOptions options, bool allowDelete, bool writeAttributes)
     {
         const uint read = 0x80000000, write = 0x40000000;
         const uint openReparsePoint = 0x00200000, anonymousSecurity = 0x00100000;
         uint rights = access == FileAccess.Read ? read : read | write;
         if (allowDelete) rights |= 0x00010000; // DELETE
+        if (writeAttributes) rights |= 0x00000100; // FILE_WRITE_ATTRIBUTES (not data-write access)
         string nativePath = path.StartsWith(@"\\?\") ? path
             : path.StartsWith(@"\\") ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
         SafeFileHandle handle = CreateFileW(nativePath, rights, (uint)share, IntPtr.Zero, (uint)mode,
@@ -334,7 +335,7 @@ public static class PathSafety
             using SafeFileHandle directory = OpenTemporaryDirectoryHandle(sourceDirectory);
             using SafeFileHandle? publishDirectory = sameDirectory ? null : OpenTemporaryDirectoryHandle(targetDirectory);
             using SafeFileHandle sourceFile = OpenTemporaryHandle(source, FileMode.Open, FileAccess.Read,
-                FileShare.Read, allowDelete: true);
+                FileShare.Read, allowDelete: true, writeAttributes: true);
             if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(sourceFile), StringComparison.Ordinal))
             {
                 error = "The temporary source path now contains a different file.";
@@ -349,6 +350,8 @@ public static class PathSafety
                 return false;
             }
 
+            // Keep the full saved identity until the handle-bound rename begins.
+            RequireTemporaryIdentity(sourceFile, expectedSourceIdentity);
             string nativeTarget = target.StartsWith(@"\\?\") ? target
                 : target.StartsWith(@"\\") ? @"\\?\UNC\" + target[2..] : @"\\?\" + target;
             byte[] name = Encoding.Unicode.GetBytes(nativeTarget);
@@ -369,11 +372,10 @@ public static class PathSafety
             }
             finally { Marshal.FreeHGlobal(info); }
 
-            if (!string.Equals(expectedSourceIdentity, TemporaryFileIdentity(sourceFile), StringComparison.Ordinal))
-            {
-                error = "The moved temporary file no longer has its saved identity.";
-                return false;
-            }
+            // NTFS tunneling can inherit the vacated target name's creation time.
+            // The original, pinned handle proves which object was renamed. Restore
+            // only its saved timestamp, never accept a different volume/file ID.
+            RestoreMovedTemporaryIdentity(sourceFile, expectedSourceIdentity);
 
             using SafeFileHandle movedFile = OpenTemporaryHandle(target, FileMode.Open, FileAccess.Read,
                 FileShare.Read | FileShare.Delete);
@@ -473,6 +475,25 @@ public static class PathSafety
             throw new IOException("This drive did not provide a stable temporary file ID.");
         long created = File.GetCreationTimeUtc(handle).Ticks;
         return $"{id.Volume:X16}{id.IdHigh:X16}{id.IdLow:X16}{created:X16}";
+    }
+
+    internal static bool SameFileId(string? expected, string? actual) =>
+        expected is { Length: 64 } && actual is { Length: 64 }
+        && expected.AsSpan(0, 48).SequenceEqual(actual.AsSpan(0, 48));
+
+    // Only for a proven rename on a pinned handle, or crash recovery after
+    // independently verifying the recorded file ID, exact size and SHA-256.
+    internal static void RestoreMovedTemporaryIdentity(SafeFileHandle handle, string expected)
+    {
+        string? actual = TemporaryFileIdentity(handle);
+        if (string.Equals(expected, actual, StringComparison.Ordinal)) return;
+        if (!SameFileId(expected, actual)
+            || !long.TryParse(expected.AsSpan(48), System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out long ticks)
+            || ticks < DateTime.MinValue.Ticks || ticks > DateTime.MaxValue.Ticks)
+            throw new IOException("The moved temporary file no longer has its saved identity.");
+        File.SetCreationTimeUtc(handle, new DateTime(ticks, DateTimeKind.Utc));
+        RequireTemporaryIdentity(handle, expected);
     }
 
     internal static void RequireTemporaryIdentity(SafeFileHandle handle, string? expected)

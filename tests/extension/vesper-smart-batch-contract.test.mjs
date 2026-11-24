@@ -4,12 +4,15 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 const src = readFileSync(new URL('../../extension/vesper-smart-batch.js', import.meta.url), 'utf8');
 const brainSrc = readFileSync(new URL('../../extension/vesper-intelligence.js', import.meta.url), 'utf8');
+const evidenceSrc = readFileSync(new URL('../../extension/vesper-control-evidence.js', import.meta.url), 'utf8');
+const constants = src.split(/\r?\n/).filter(line => /^  const (ITEM_ATTRIBUTES|ITEM_QUERY|CONTROL_SELECTOR) =/.test(line)).join('\n');
 function subject(name, next, extras = {}) {
   const start = src.indexOf(`  function ${name}(`), end = src.indexOf(`  function ${next}(`, start + 10);
   assert.ok(start >= 0 && end > start, `${name} must remain a named, inspectable function`);
   const ctx = vm.createContext({ URL, location: { href: 'https://site.test/items', origin: 'https://site.test' }, ...extras });
   vm.runInContext(brainSrc, ctx);
-  vm.runInContext(`${src.slice(start, end)}\nthis.subject=${name};`, ctx);
+  vm.runInContext(evidenceSrc, ctx);
+  vm.runInContext(`${constants}\nconst evidence = VesperControlEvidence;\n${src.slice(start, end)}\nthis.subject=${name};`, ctx);
   return { fn: ctx.subject, ctx };
 }
 function el(attrs = {}) {
@@ -59,7 +62,7 @@ test('a button with an item-binding query parameter can be verified without CSS 
 test('manual control picking uses an extension-owned hit target rather than clicking the page button', () => {
   const start = src.indexOf('    function chooseControl() {');
   const end = src.indexOf('    async function refreshResults()', start);
-  const code = src.slice(start, end);
+  const code = src.slice(start, src.indexOf('    function outcomeText(', start));
   const listeners = new Map(), removed = [], pageButton = {
     disabled:false, getAttribute:()=>null, closest(){return this;}, click(){assert.fail('The page button must not be clicked while selecting');}
   };
@@ -70,9 +73,10 @@ test('manual control picking uses an extension-owned hit target rather than clic
   const hint={style:{},remove(){}};
   const ctx=vm.createContext({host,section,actionInfo,shadow:{append(){}},
     document:{createElement:()=>hint,elementsFromPoint:()=>[host,pageButton]},
-    shown:()=>true,labelFor:()=> 'Download',update(){},write(){},choose:{focus(){}},
+    shown:()=>true,labelFor:()=> 'Download',controlFacts:()=>({tagName:'BUTTON',label:'Download'}),update(){},write(){},choose:{focus(){}},
     setTimeout:()=>1,clearTimeout(){},selectionMode:false,picked:null,finishSelection:null});
-  vm.runInContext(code+'\nchooseControl();',ctx);
+  vm.runInContext(evidenceSrc, ctx);
+  vm.runInContext(constants+'\nconst evidence = VesperControlEvidence;\n'+code+'\nchooseControl();',ctx);
   assert.equal(section.hidden,true);
   assert.notEqual(host.style.pointerEvents,'none');
   let prevented=false, stopped=false;
@@ -108,7 +112,7 @@ test('readiness observes disabled changes and cancellation removes its timers im
     MutationObserver:class {constructor(fn){observerCallback=fn;}observe(el,opts){observed=opts;}disconnect(){disconnected=true;}},
     setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:i=>timers.delete(i)
   });
-  vm.runInContext(src.slice(start,end)+'\nthis.wait=waitForChange;',ctx);
+  vm.runInContext(constants+'\n'+src.slice(start,end)+'\nthis.wait=waitForChange;',ctx);
   const controller=new AbortController();
   const result=ctx.wait(()=>ready?{verified:true}:null,90000,controller.signal);
   assert.ok(observed.attributeFilter.includes('disabled'));

@@ -40,75 +40,123 @@ internal sealed class CandidateProcessor
     public async Task<CandidateOutcome> ProcessAsync(IEnumerable<MediaCandidate> candidates, MediaRequestContext ctx, CancellationToken ct,
         bool exactAssetGroup = false)
     {
-        var outcome = new CandidateOutcome();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var ordered = candidates.DistinctBy(c => c.Url.AbsoluteUri, StringComparer.Ordinal)
+            .Take(_o.MaxCandidatesPerPage).ToArray();
+        var direct = new DirectProbe?[ordered.Length];
         using var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        int manifestCount = 0, directIndex = 0, headerReads = 0;
+        headerDeadline.CancelAfter(TimeSpan.FromSeconds(6));
+        // Reserve header slots in input order; network completion order must not change the result.
+        var headerSlots = ordered.Select((c, i) => (c, i))
+            .Where(x => x.c.Kind is not (CandidateKind.Hls or CandidateKind.Dash)
+                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov"))
+            .Take(MaxHeaderReads).Select(x => x.i).ToHashSet();
+        await Parallel.ForEachAsync(Enumerable.Range(0, ordered.Length),
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _o.MaxConcurrentRequests), CancellationToken = ct },
+            async (i, token) =>
+            {
+                if (ordered[i].Kind is CandidateKind.Hls or CandidateKind.Dash) return;
+                direct[i] = await ProbeDirectAsync(ordered[i], ctx, exactAssetGroup,
+                    headerSlots.Contains(i), headerDeadline.Token, token).ConfigureAwait(false);
+            }).ConfigureAwait(false);
 
-        foreach (var c in candidates)
+        var outcome = new CandidateOutcome();
+        var manifestSlots = Enumerable.Range(0, ordered.Length)
+            .Where(i => ordered[i].Kind is CandidateKind.Hls or CandidateKind.Dash || direct[i]?.Manifest == true)
+            .Take(_o.MaxManifestsPerPage).ToArray();
+        var manifests = new CandidateOutcome?[ordered.Length];
+        await Parallel.ForEachAsync(Enumerable.Range(0, manifestSlots.Length),
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(2, _o.MaxConcurrentRequests)), CancellationToken = ct },
+            async (slot, token) =>
+            {
+                int i = manifestSlots[slot];
+                var result = new CandidateOutcome();
+                try { await AddManifestAsync(ordered[i].Url, ctx, result, slot, token).ConfigureAwait(false); }
+                catch (MediaResolverException ex) { result.Problems.Add(ex.Error); }
+                manifests[i] = result;
+            }).ConfigureAwait(false);
+
+        int directIndex = 0;
+        for (int i = 0; i < ordered.Length; i++)
         {
-            if (!seen.Add(c.Url.AbsoluteUri)) continue;
-            if (seen.Count > _o.MaxCandidatesPerPage) break;
             ct.ThrowIfCancellationRequested();
-
-            try
+            if (manifests[i] is { } manifest)
             {
-                if (c.Kind is CandidateKind.Hls or CandidateKind.Dash)
-                {
-                    if (manifestCount >= _o.MaxManifestsPerPage) continue;
-                    await AddManifestAsync(c.Url, ctx, outcome, manifestCount++, ct).ConfigureAwait(false);
-                    continue;
-                }
-
-                var probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false);
-                if (!probe.IsSuccess)
-                {
-                    outcome.Problems.Add(MediaErrors.FromHttpStatus(probe.StatusCode, c.Url));
-                    continue;
-                }
-
-                // The observed asset key must survive redirects before a direct
-                // representation is allowed to join a grouped picker.
-                if (exactAssetGroup && BrowserAssetIdentity.XVideo(c.Url) != BrowserAssetIdentity.XVideo(probe.FinalUrl))
-                {
-                    outcome.Problems.Add(MediaErrors.Invalid("A source redirected to a different media asset."));
-                    continue;
-                }
-
-                string ctype = probe.ContentType?.ToLowerInvariant() ?? "";
-                if (ctype.Contains("mpegurl") || ctype.Contains("dash+xml"))
-                {
-                    if (manifestCount < _o.MaxManifestsPerPage)
-                        await AddManifestAsync(c.Url, ctx, outcome, manifestCount++, ct).ConfigureAwait(false);
-                    continue;
-                }
-
-                if (!IsMedia(probe, c))
-                {
-                    outcome.Problems.Add(MediaErrors.NoMedia($"{UrlRedactor.Redact(c.Url)} is not media (content-type '{ctype}')", false));
-                    continue;
-                }
-                Mp4HeaderFacts? facts = null;
-                if (headerReads < MaxHeaderReads && !headerDeadline.IsCancellationRequested && IsMp4(probe, c))
-                {
-                    if (headerReads == 0) headerDeadline.CancelAfter(TimeSpan.FromSeconds(4));
-                    headerReads++;
-                    facts = await ReadHeaderAsync(c.Url, ctx, probe, headerDeadline.Token, ct).ConfigureAwait(false);
-                }
-                if (facts is { Encrypted: true })
-                {
-                    outcome.Problems.Add(MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
-                    continue;
-                }
-                outcome.Representations.Add(BuildDirect(c, probe, ctx, directIndex++, facts));
-                if (facts?.DurationSeconds is { } seconds) outcome.Duration ??= TimeSpan.FromSeconds(seconds);
+                outcome.Representations.AddRange(manifest.Representations);
+                outcome.AudioTracks.AddRange(manifest.AudioTracks);
+                outcome.Subtitles.AddRange(manifest.Subtitles);
+                outcome.Problems.AddRange(manifest.Problems);
+                outcome.Duration ??= manifest.Duration;
             }
-            catch (MediaResolverException ex)
+            else if (direct[i] is { } result)
             {
-                outcome.Problems.Add(ex.Error);
+                if (result.Problem is not null) outcome.Problems.Add(result.Problem);
+                else if (!result.Manifest && result.Probe is { } probe)
+                {
+                    outcome.Representations.Add(BuildDirect(ordered[i], probe, ctx, directIndex++, result.Facts));
+                    if (result.Facts?.DurationSeconds is { } seconds) outcome.Duration ??= TimeSpan.FromSeconds(seconds);
+                }
             }
         }
         return outcome;
+    }
+
+    private sealed record DirectProbe(ProbeResult? Probe, Mp4HeaderFacts? Facts, MediaError? Problem, bool Manifest = false);
+
+    private async Task<DirectProbe> ProbeDirectAsync(MediaCandidate c, MediaRequestContext ctx,
+        bool exactAssetGroup, bool headerSlot, CancellationToken headerToken, CancellationToken ct)
+    {
+        try
+        {
+            bool rangedWitness = c.ObservedLength is not null;
+            byte[]? start = null;
+            ProbeResult probe;
+            if (rangedWitness)
+                probe = await _http.ProbeGetAsync(c.Url, ctx, ct).ConfigureAwait(false);
+            else if (headerSlot && !headerToken.IsCancellationRequested)
+            {
+                try { (probe, start) = await _http.ProbeWithStartAsync(c.Url, ctx, HeaderBytes, headerToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                { probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false); }
+            }
+            else probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false);
+            if (rangedWitness && (probe.StatusCode != 206 || probe.InvalidExtent || probe.FinalUrl != c.Url
+                || !string.Equals(probe.ContentType, "video/mp4", StringComparison.OrdinalIgnoreCase)
+                || probe.ContentLength != c.ObservedLength || probe.StrongETag != c.ObservedETag))
+                return new(null, null, MediaErrors.NoMedia("The observed range no longer identifies the same complete file.", false));
+            if (probe.InvalidExtent)
+            {
+                if (rangedWitness) return new(null, null, MediaErrors.NoMedia("The server returned an invalid byte range.", false));
+                // Malformed range is not evidence of track structure. A separate
+                // whole-resource HEAD can still establish an unverified direct file.
+                probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false);
+                start = null;
+                if (probe.InvalidExtent) return new(null, null, MediaErrors.NoMedia("The server returned an invalid byte range.", false));
+            }
+            if (!probe.IsSuccess)
+                return new(null, null, MediaErrors.FromHttpStatus(probe.StatusCode, c.Url));
+            if (exactAssetGroup && BrowserAssetIdentity.XVideo(c.Url) != BrowserAssetIdentity.XVideo(probe.FinalUrl))
+                return new(null, null, MediaErrors.Invalid("A source redirected to a different media asset."));
+
+            string ctype = probe.ContentType?.ToLowerInvariant() ?? "";
+            if (ctype.Contains("mpegurl") || ctype.Contains("dash+xml"))
+                return new(null, null, null, true);
+            if (!IsMedia(probe, c))
+                return new(null, null, MediaErrors.NoMedia($"{UrlRedactor.Redact(c.Url)} is not media (content-type '{ctype}')", false));
+            Mp4HeaderFacts? facts = null;
+            if (IsMp4(probe, c))
+            {
+                if (start is not null) facts = Mp4HeaderFacts.Read(start);
+                else if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
+                    facts = await ReadHeaderAsync(c.Url, ctx, probe, headerToken, ct).ConfigureAwait(false);
+            }
+            if (facts is { Encrypted: true })
+                return new(null, null, MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
+            if (rangedWitness && (facts is not { HasVideo: true, HasAudio: true, DurationSeconds: > 0 }
+                || facts.VideoCodec is not ("h264" or "h265" or "av1") || facts.AudioCodec is not ("aac" or "mp3")))
+                return new(null, null, MediaErrors.NoMedia("The ranged source is not a verified complete audio/video file.", false));
+            return new(probe, facts, null);
+        }
+        catch (MediaResolverException ex) { return new(null, null, ex.Error); }
     }
 
     private async Task AddManifestAsync(Uri url, MediaRequestContext ctx, CandidateOutcome outcome, int index, CancellationToken ct)
@@ -182,6 +230,7 @@ internal sealed class CandidateProcessor
         {
             Id = $"direct-{index}",
             ResourceETag = resourceHash is not null ? p.StrongETag : null,
+            BrowserRangeVerified = c.ObservedLength is not null,
             ResourceUrlSha256 = resourceHash,
             ContentIdentity = contentIdentity,
             // An unreadable track table cannot establish equivalent quality.

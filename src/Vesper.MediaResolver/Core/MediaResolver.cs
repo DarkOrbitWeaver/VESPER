@@ -204,9 +204,10 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
 
     private static bool ShouldTryGeneric(MediaDiscoveryResult failed, MediaDiscoveryRequest request)
     {
+        if (failed.Error?.Code == MediaErrorCode.SourceChanged) return false;
         if (request.ValidatedBrowser is { Candidates.Count: > 0 }) return true;
         if (failed.Error is { Code: MediaErrorCode.NoDownloadableMedia, BrowserMayHelp: false }) return false;
-        return failed.Error?.Code is MediaErrorCode.NoDownloadableMedia or MediaErrorCode.SourceChanged or MediaErrorCode.UnsupportedSite;
+        return failed.Error?.Code is MediaErrorCode.NoDownloadableMedia or MediaErrorCode.UnsupportedSite;
     }
 
     /// <summary>Only players that a dedicated adapter understands are followed; arbitrary iframes (ads, widgets) are ignored.</summary>

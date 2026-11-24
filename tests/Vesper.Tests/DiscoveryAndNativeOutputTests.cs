@@ -267,6 +267,25 @@ public sealed class DiscoveryAndNativeOutputTests
     }
 
     [Fact]
+    public void Verified_browser_range_keeps_its_validator_in_the_native_plan()
+    {
+        const string tag = "\"media-v1\"";
+        var source = MuxedMp4("range-video", null);
+        string urlHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(source.Url.AbsoluteUri)));
+        string identity = "http-v1:" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(urlHash + "|" + tag + "|" + source.FileSize!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+        source = source with { BrowserRangeVerified = true, ResourceETag = tag, ResourceUrlSha256 = urlHash, ContentIdentity = identity };
+        var item = VideoItem(source);
+        var choice = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality).Choice);
+        Assert.Equal(JobKind.Merge, choice.Kind);
+        Assert.True(MediaMergePlan.TryParse(choice.MediaPlanJson, false, out var plan, out string error), error);
+        var track = Assert.Single(plan.Tracks);
+        Assert.Equal(tag, track.ResourceETag);
+        Assert.Equal(urlHash, track.ResourceUrlSha256);
+        Assert.Equal(identity, track.Identity);
+    }
+
+    [Fact]
     public void Audio_only_aac_m4a_can_use_the_native_clip_plan()
     {
         var audio = new MediaRepresentation
@@ -296,6 +315,32 @@ public sealed class DiscoveryAndNativeOutputTests
         Assert.True(plan.CanClipLocalMp4);
         Assert.True(MediaTransferBridge.SupportsTimeRange(full));
     }
+    [Fact]
+    public void Direct_aac_audio_without_provider_identity_can_be_trimmed_after_full_download()
+    {
+        var audio = new MediaRepresentation
+        {
+            Id = "direct-aac", Url = new Uri("https://cdn.example.test/song.m4a"),
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac", RawCodecs = "mp4a.40.2"
+        };
+        MediaItem item = new()
+        {
+            SourceUrl = new Uri("https://audio.example.test/song"), Provider = "fixture", MediaId = "song",
+            Title = "Song", Kind = MediaKind.Audio, Duration = TimeSpan.FromSeconds(60), Representations = [audio]
+        };
+        var full = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice);
+        Assert.Equal(JobKind.Http, full.Kind);
+        Assert.Equal(ClipMode.FullFile, ClipSelection.ModeFor(full));
+        var clip = Assert.IsType<MediaDownloadChoice>(MediaTransferBridge.Prepare(item,
+            FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a,
+            clipStartSeconds: 10, clipEndSeconds: 25).Choice);
+        Assert.Equal(JobKind.Http, clip.Kind);
+        Assert.Equal(MediaOutput.M4a, clip.Output);
+        Assert.Equal(full.FormatId, clip.FormatId);
+        Assert.Equal(new MediaTimeRange(10, 25), JsonSerializer.Deserialize<MediaTimeRange>(clip.MediaPlanJson!));
+    }
+
 
     [Fact]
     public void Audio_only_hls_range_uses_the_segment_transfer_plan()

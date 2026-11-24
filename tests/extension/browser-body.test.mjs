@@ -75,7 +75,7 @@ test('same-origin finite blob streams byte-exact chunks through both sides of th
   assert.deepEqual(Buffer.concat(b.chunks), Buffer.from(source));
   assert.equal(b.messages[0].origin, origin + '/');
   assert.equal(b.messages[0].fileName, 'Fixture clip.mp4');
-  assert.deepEqual(b.messages.map(message => message.operation), ['begin', 'append', 'append', 'append', 'finish']);
+  assert.deepEqual(b.messages.map(message => message.operation), ['begin', ...Array(Math.ceil(source.length / body.CHUNK)).fill('append'), 'finish']);
   assert.deepEqual(progress.at(-1), [source.length, source.length]);
   assert.equal(b.messages.some(message => 'cookie' in message || 'authorization' in message || 'path' in message), false);
 });
@@ -185,7 +185,7 @@ test('unknown finish receipt never restarts a copy', async () => {
 
 test('conditional same-origin media copy verifies the observed representation and keeps credentials in browser', async () => {
   const b=bridge(), url=origin+'/movie.mp4';
-  const proof={url,etag:'"movie-v1"',length:source.length,mime:'video/mp4'};
+  const proof={url,etag:'"movie-v1"',length:source.length,mime:'video/mp4',credentials:'same-origin'};
   const result=await copy(b,{url,mediaProof:proof,fetcher:async (actual,options)=>{
     assert.equal(actual,url);
     assert.equal(options.headers['If-Match'],proof.etag);
@@ -248,4 +248,32 @@ test('small stream reads are coalesced to the minimum native chunk count', async
   await copy(b,{fetcher:async()=>new Response(stream,{headers:{'Content-Type':'video/mp4','Content-Length':String(source.length)}})});
   assert.equal(b.chunks.length,Math.ceil(source.length/body.CHUNK));
   assert.deepEqual(Buffer.concat(b.chunks),Buffer.from(source));
+});
+
+test('local media inspection distinguishes readable finite files from MediaSource and other objects', async () => {
+  let cancelled = false;
+  const good = new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+    headers: { 'Content-Type': 'video/mp4', 'Content-Length': '700000' }
+  });
+  const facts = await body.inspectLocalMedia(blobUrl, origin, async () => good);
+  assert.equal(facts.container, 'MP4');
+  assert.equal(facts.sizeBytes, 700000);
+  assert.equal(cancelled, true);
+  assert.equal(await body.inspectLocalMedia(blobUrl, origin, async () => { throw new TypeError('MediaSource'); }), null);
+  assert.equal(await body.inspectLocalMedia(blobUrl, origin, async () => new Response(source)), null);
+  assert.equal(await body.inspectLocalMedia('https://media.test/file.mp4', origin, async () => assert.fail('No speculative HTTP request')), null);
+});
+
+ test('same-origin media replay omits cookies unless the proof explicitly allows sign-in', async () => {
+  const url=origin+'/movie.mp4';
+  for (const credentials of [undefined,'omit','same-origin']) {
+    const b=bridge();
+    const proof={url,etag:'"v1"',length:source.length,mime:'video/mp4',credentials};
+    await copy(b,{url,mediaProof:proof,fetcher:async(actual,options)=>{
+      assert.equal(actual,url);
+      assert.equal(options.credentials,credentials==='same-origin'?'same-origin':'omit');
+      return new Response(source,{headers:{'Content-Type':'video/mp4','Content-Length':String(source.length),'ETag':proof.etag}});
+    }});
+    assert.deepEqual(Buffer.concat(b.chunks),Buffer.from(source));
+  }
 });

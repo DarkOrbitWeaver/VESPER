@@ -287,6 +287,27 @@ public sealed class MediaRefreshTests
     }
 
     [Fact]
+    public async Task AutomaticRefreshRejectsStaleSourceAndThenResumesTheExactExpiredSource()
+    {
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"),
+            MediaProvider: "fixture", MediaId: "video", MediaFormatId: "muxed-720"));
+        var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        int hits = server.Hits("/expires-after-truncate");
+        var replacement = new ResolvedMediaSource("fixture", "video", "muxed-720",
+            server.Url("/expires-after-truncate?token=fresh"), DateTimeOffset.UtcNow.AddMinutes(5));
+        var stale = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement,
+            expectedExpiredSource: server.Url("/different"));
+        Assert.False(stale.Accepted);
+        Assert.Equal(hits, server.Hits("/expires-after-truncate"));
+        Assert.Equal(stopped.CommittedBytes, h.Engine.Snapshot(added.JobId)!.CommittedBytes);
+        var accepted = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement, expectedExpiredSource: stopped.SourceUrl);
+        Assert.True(accepted.Accepted, accepted.Message);
+        var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
     public async Task MediaRefreshDoesNotReuseAPartialAcrossAChangedSignedRedirectTarget()
     {
         await using var source = new FaultServer();

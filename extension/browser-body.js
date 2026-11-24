@@ -1,8 +1,14 @@
 // A finite, explicitly selected browser file can be copied to the native engine.
 // This is not interception of an existing Chrome download and does not replay HTTP requests.
+//
+// Transport: content script -> extension port -> service worker relay -> native port -> host -> desktop pipe.
+// Chunks are pipelined (WINDOW in flight) because every hop preserves order and the desktop
+// handles them strictly sequentially. Memory stays bounded by WINDOW * CHUNK per transfer.
 'use strict';
 globalThis.VesperBrowserBody = (() => {
-  const CHUNK = 256 * 1024;
+  // 512 KiB raw is 699,052 Base64 characters, which keeps every desktop pipe frame below its 1 MiB limit.
+  const CHUNK = 512 * 1024;
+  const WINDOW = 4;
   const MAX_BYTES = 16 * 1024 * 1024 * 1024;
   const PORT = 'vesper-browser-body-v1';
   // Only uncertain finish receipts, scoped to this document's isolated world.
@@ -65,7 +71,7 @@ globalThis.VesperBrowserBody = (() => {
 
   function validMediaProof(proof, url, origin) {
     return proof?.url === url && eligibleHttpMedia(url)
-      && (sameOriginMedia(url, origin) || proof.corsOrigin === origin
+      && (sameOriginMedia(url, origin) && [undefined, 'same-origin', 'omit'].includes(proof.credentials) || proof.corsOrigin === origin
         && ['omit', 'include'].includes(proof.credentials))
       && typeof proof.etag === 'string' && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(proof.etag)
       && Object.hasOwn(EXTENSIONS, proof.mime)
@@ -94,6 +100,27 @@ globalThis.VesperBrowserBody = (() => {
     return { length, fileName: stem + '.' + extension };
   }
 
+  // A MediaSource object URL has the same syntax as a file Blob, but cannot
+  // be fetched as a finite file. Only offer a format after inspecting the
+  // local object's response metadata; never consume or buffer the body here.
+  async function inspectLocalMedia(url, origin, fetcher = globalThis.fetch) {
+    if (!localBlob(url, origin)) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    let response;
+    try {
+      response = await fetcher(url, { signal: controller.signal, credentials: 'same-origin', redirect: 'error' });
+      if (response.url && response.url !== url) return null;
+      const facts = fileFacts(response, 'Media');
+      const mime = response.headers.get('content-type').split(';')[0].trim().toLowerCase();
+      return { mime, sizeBytes: facts.length, container: EXTENSIONS[mime].toUpperCase() };
+    } catch { return null; }
+    finally {
+      clearTimeout(timer);
+      if (response?.body) void response.body.cancel().catch(() => {});
+    }
+  }
+
   function encode(bytes) {
     let binary = '';
     for (let offset = 0; offset < bytes.length; offset += 8192)
@@ -101,19 +128,18 @@ globalThis.VesperBrowserBody = (() => {
     return btoa(binary);
   }
 
-  async function digest(bytes) {
-    const result = await crypto.subtle.digest('SHA-256', bytes);
-    return Array.from(new Uint8Array(result), value => value.toString(16).padStart(2, '0')).join('');
-  }
+  const hex = buffer => Array.from(new Uint8Array(buffer), value => value.toString(16).padStart(2, '0')).join('');
 
+  // Replies arrive in send order. Each call is matched to the oldest unanswered sequence.
   function openChannel(connect, signal) {
     const port = connect({ name: PORT });
-    let pending = null, closed = false;
+    const pending = [];
+    let closed = false, sequence = 0;
     const fail = message => {
       if (closed) return;
       closed = true;
-      if (pending) {
-        const call = pending; pending = null; clearTimeout(call.timer);
+      for (const call of pending.splice(0)) {
+        clearTimeout(call.timer);
         call.reject(new Error(message));
       }
       signal?.removeEventListener('abort', onAbort);
@@ -123,22 +149,27 @@ globalThis.VesperBrowserBody = (() => {
     signal?.addEventListener('abort', onAbort, { once: true });
     port.onDisconnect.addListener(() => fail('VESPER browser copy connection closed.'));
     port.onMessage.addListener(reply => {
-      if (!pending || reply?.sequence !== pending.sequence) {
+      const call = pending[0];
+      if (!call || reply?.sequence !== call.sequence) {
         fail('Unexpected browser copy response.');
         return;
       }
-      const call = pending; pending = null; clearTimeout(call.timer);
+      pending.shift();
+      clearTimeout(call.timer);
       if (reply.ok) call.resolve(reply.data || {});
-      else call.reject(new Error(reply.message || 'VESPER could not accept the browser copy.'));
+      else {
+        call.reject(new Error(reply.message || 'VESPER could not accept the browser copy.'));
+        fail(reply.message || 'VESPER could not accept the browser copy.');
+      }
     });
-    let sequence = 0;
     return {
       send(message) {
-        if (closed || signal?.aborted || pending) return Promise.reject(new Error('Browser copy connection unavailable.'));
+        if (closed || signal?.aborted || pending.length > WINDOW)
+          return Promise.reject(new Error('Browser copy connection unavailable.'));
         return new Promise((resolve, reject) => {
           const id = ++sequence;
           const timer = setTimeout(() => fail('VESPER browser copy timed out.'), message.operation === 'finish' ? 620_000 : 120_000);
-          pending = { sequence: id, timer, resolve, reject };
+          pending.push({ sequence: id, timer, resolve, reject });
           try { port.postMessage({ ...message, sequence: id }); }
           catch { fail('VESPER browser copy connection failed.'); }
         });
@@ -186,7 +217,7 @@ globalThis.VesperBrowserBody = (() => {
       options.mode = sameOrigin ? 'same-origin' : 'cors';
       // Browser-enforced CORS only. A cross-origin request cannot inherit
       // this page's credentials unless explicitly approved for that player.
-      options.credentials = sameOrigin ? 'same-origin' : mediaProof.credentials;
+      options.credentials = sameOrigin ? (mediaProof.credentials === 'same-origin' ? 'same-origin' : 'omit') : mediaProof.credentials;
       options.cache = 'no-store';
       options.headers = { 'If-Match': mediaProof.etag };
     }
@@ -201,7 +232,8 @@ globalThis.VesperBrowserBody = (() => {
         throw new Error('The media representation changed. No copy was accepted.');
     }
     catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
-    let channel, reader, offset = 0, transferId = null, finishing = false;
+    let channel, reader, transferId = null, finishing = false;
+    const unanswered = [];
     try {
       channel = openChannel(connect, signal);
       const begin = await channel.send({ operation: 'begin', ...facts });
@@ -209,27 +241,33 @@ globalThis.VesperBrowserBody = (() => {
       transferId = begin.transferId;
       reader = response.body.getReader();
       onProgress(0, facts.length);
-      // Aggregate small browser stream reads into a fixed-size buffer. This
-      // reduces native IPC and SHA calls without accumulating the whole body.
+      // Aggregate small stream reads into one fixed buffer. SubtleCrypto copies its input
+      // when digest() is called and Base64 encoding copies it too, so the buffer is reused at once.
       const buffer = new Uint8Array(CHUNK);
-      let used = 0;
+      let used = 0, sent = 0;
       async function flush() {
         if (!used) return;
         if (signal?.aborted) throw new Error('Browser copy cancelled.');
         const bytes = buffer.subarray(0, used);
-        const reply = await channel.send({ operation: 'append', offset, chunk: encode(bytes),
-          digest: await digest(bytes) });
-        if (reply.offset !== offset + used || reply.accepted)
-          throw new Error('VESPER returned an inconsistent browser copy offset.');
-        offset = reply.offset;
+        const digest = crypto.subtle.digest('SHA-256', bytes);
+        const chunk = encode(bytes);
+        const offset = sent, next = sent + used;
+        sent = next;
         used = 0;
-        onProgress(offset, facts.length);
+        const call = channel.send({ operation: 'append', offset, chunk, digest: hex(await digest) }).then(reply => {
+          if (reply.offset !== next || reply.accepted)
+            throw new Error('VESPER returned an inconsistent browser copy offset.');
+          onProgress(next, facts.length);
+        });
+        call.catch(() => {});            // Observed below; this only prevents an unhandled-rejection report.
+        unanswered.push(call);
+        while (unanswered.length >= WINDOW) await unanswered.shift();
       }
       while (true) {
         if (signal?.aborted) throw new Error('Browser copy cancelled.');
         const { done, value } = await reader.read();
         if (done) break;
-        if (!(value instanceof Uint8Array) || value.length > facts.length - offset - used)
+        if (!(value instanceof Uint8Array) || value.length > facts.length - sent - used)
           throw new Error('The browser returned more bytes than declared.');
         for (let start = 0; start < value.length;) {
           const count = Math.min(CHUNK - used, value.length - start);
@@ -239,9 +277,9 @@ globalThis.VesperBrowserBody = (() => {
           if (used === CHUNK) await flush();
         }
       }
-      if (offset + used !== facts.length) throw new Error('The browser file ended before its declared length.');
+      if (sent + used !== facts.length) throw new Error('The browser file ended before its declared length.');
       await flush();
-      if (offset !== facts.length) throw new Error('The browser file ended before its declared length.');
+      while (unanswered.length) await unanswered.shift();
       finishing = true;
       const done = await channel.send({ operation: 'finish' });
       if (!done.accepted || done.offset !== facts.length || typeof done.jobId !== 'string')
@@ -260,9 +298,10 @@ globalThis.VesperBrowserBody = (() => {
         }
         throw uncertainFinish();
       }
-      if (!finishing && channel && !signal?.aborted) await channel.send({ operation: 'abort' }).catch(() => {});
+      if (!finishing && channel && transferId && !signal?.aborted) await channel.send({ operation: 'abort' }).catch(() => {});
       throw error;
     } finally {
+      for (const call of unanswered) call.catch(() => {});
       if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); }
       else await response.body?.cancel().catch(() => {});
       channel?.close();
@@ -281,7 +320,8 @@ globalThis.VesperBrowserBody = (() => {
         || !/^https?:\/\//.test(origin || '')) return false;
 
     const transferId = makeId();
-    let native = null, pending = null, phase = 'new', sequence = 0, offset = 0, length = 0, closed = false;
+    const calls = [];                  // native calls awaiting their in-order reply
+    let native = null, phase = 'new', sequence = 0, forwarded = 0, length = 0, closed = false;
     const close = () => {
       if (closed) return;
       closed = true;
@@ -290,71 +330,77 @@ globalThis.VesperBrowserBody = (() => {
       try { native?.disconnect(); } catch {}
       try { port.disconnect(); } catch {}
     };
-    const refuse = (id, message) => {
-      try { port.postMessage({ sequence: id, ok: false, message }); } catch {}
+    const refuse = message => {
+      try { port.postMessage({ sequence: calls[0]?.sequence ?? sequence, ok: false, message }); } catch {}
       close();
     };
-    const nativeSend = async message => {
-      if (closed || pending || !Number.isSafeInteger(message?.sequence) || message.sequence !== sequence + 1)
-        return close();
+    const forward = (call, data) => {
+      calls.push(call);
+      try { native.postMessage({ v: 1, id: call.id, type: 'browser-body', transferId, operation: call.operation, session: true, ...data }); }
+      catch { refuse('The native VESPER helper could not receive the copy.'); }
+    };
+    const onNativeReply = reply => {
+      const call = calls[0];
+      if (closed || !call || reply?.id !== call.id) return close();
+      if (!reply.ok) return refuse(reply.message || 'The native VESPER receiver rejected the copy.');
+      calls.shift();
+      const result = reply.data || {};
+      if (call.operation === 'begin') {
+        if (result.offset !== 0 || result.accepted) return refuse('Invalid initial native copy state.');
+        phase = 'receiving';
+        result.transferId = transferId;
+      } else if (call.operation === 'append') {
+        if (result.offset !== call.next || result.accepted) return refuse('Native copy offset mismatch.');
+      } else if (call.operation === 'finish') {
+        if (!result.accepted || result.offset !== length || typeof result.jobId !== 'string')
+          return refuse('Native copy acceptance was not confirmed.');
+        phase = 'finished';
+      } else phase = 'finished';
+      try { port.postMessage({ sequence: call.sequence, ok: true, data: result }); }
+      catch { close(); }
+    };
+    const onPageMessage = async message => {
+      if (closed || !Number.isSafeInteger(message?.sequence) || message.sequence !== sequence + 1) return close();
       sequence = message.sequence;
       const operation = message.operation;
-      let data = {};
       if (operation === 'begin' && phase === 'new') {
         if (!Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES
             || typeof message.fileName !== 'string' || !message.fileName || message.fileName.length > 255
             || /[\\/:\u0000-\u001f]/.test(message.fileName))
-          return refuse(sequence, 'Invalid browser file metadata.');
+          return refuse('Invalid browser file metadata.');
         phase = 'opening';
-        if (!(await canBegin(sender)) || closed) return refuse(sequence, 'VESPER is not accepting browser copies.');
+        if (!(await canBegin(sender)) || closed) return refuse('VESPER is not accepting browser copies.');
         await rememberReceipt(transferId, sender);
         if (closed) return;
         length = message.length;
-        data = { origin: origin + '/', fileName: message.fileName, length };
         try {
           native = connectNative(nativeHost);
-          native.onDisconnect.addListener(() => refuse(sequence, 'The native VESPER connection closed.'));
-          native.onMessage.addListener(reply => {
-            if (closed || !pending || reply?.id !== pending.id) return close();
-            const call = pending; pending = null;
-            if (!reply.ok) return refuse(call.sequence, reply.message || 'The native VESPER receiver rejected the copy.');
-            const result = reply.data || {};
-            if (call.operation === 'begin') {
-              if (result.offset !== 0 || result.accepted) return refuse(call.sequence, 'Invalid initial native copy state.');
-              phase = 'receiving';
-              result.transferId = transferId;
-            } else if (call.operation === 'append') {
-              if (result.offset !== call.next || result.accepted) return refuse(call.sequence, 'Native copy offset mismatch.');
-              offset = call.next;
-            } else if (call.operation === 'finish') {
-              if (!result.accepted || result.offset !== length || typeof result.jobId !== 'string')
-                return refuse(call.sequence, 'Native copy acceptance was not confirmed.');
-              phase = 'finished';
-            } else phase = 'finished';
-            try { port.postMessage({ sequence: call.sequence, ok: true, data: result }); }
-            catch { close(); }
-          });
-        } catch { return refuse(sequence, 'The native VESPER helper is unavailable.'); }
+          native.onDisconnect.addListener(() => refuse('The native VESPER connection closed.'));
+          native.onMessage.addListener(onNativeReply);
+        } catch { return refuse('The native VESPER helper is unavailable.'); }
+        forward({ id: makeId(), sequence, operation }, { origin: origin + '/', fileName: message.fileName, length });
       } else if (operation === 'append' && phase === 'receiving') {
-        if (message.offset !== offset || typeof message.chunk !== 'string'
+        if (calls.length >= WINDOW) return refuse('Too many browser copy chunks are waiting.');
+        if (message.offset !== forwarded || typeof message.chunk !== 'string'
             || message.chunk.length > Math.ceil(CHUNK / 3) * 4
             || !/^[A-Za-z0-9+/]+={0,2}$/.test(message.chunk) || message.chunk.length % 4 !== 0
-            || !/^[a-f0-9]{64}$/i.test(message.digest || '')) return refuse(sequence, 'Invalid browser copy chunk.');
+            || !/^[a-f0-9]{64}$/i.test(message.digest || '')) return refuse('Invalid browser copy chunk.');
         const size = message.chunk.length / 4 * 3 - (message.chunk.endsWith('==') ? 2 : message.chunk.endsWith('=') ? 1 : 0);
-        if (size < 1 || size > CHUNK || size > length - offset) return refuse(sequence, 'Invalid browser copy length.');
-        data = { offset, chunk: message.chunk, digest: message.digest };
-        pending = { next: offset + size };
-      } else if (operation === 'finish' && phase === 'receiving' && offset === length) phase = 'finishing';
-      else if (operation === 'abort' && phase === 'receiving') phase = 'aborting';
-      else return refuse(sequence, 'Invalid browser copy sequence.');
-      const id = makeId();
-      pending = { ...pending, id, sequence, operation };
-      try { native.postMessage({ v: 1, id, type: 'browser-body', transferId, operation, session: true, ...data }); }
-      catch { refuse(sequence, 'The native VESPER helper could not receive the copy.'); }
+        if (size < 1 || size > CHUNK || size > length - forwarded) return refuse('Invalid browser copy length.');
+        const offset = forwarded;
+        forwarded += size;
+        forward({ id: makeId(), sequence, operation, next: forwarded }, { offset, chunk: message.chunk, digest: message.digest });
+      } else if (operation === 'finish' && phase === 'receiving' && forwarded === length && calls.length === 0) {
+        phase = 'finishing';
+        forward({ id: makeId(), sequence, operation }, {});
+      } else if (operation === 'abort' && phase === 'receiving') {
+        phase = 'aborting';
+        forward({ id: makeId(), sequence, operation }, {});
+      } else return refuse('Invalid browser copy sequence.');
     };
     port.onDisconnect.addListener(close);
-    port.onMessage.addListener(message => void nativeSend(message).catch(() => refuse(sequence, 'Browser copy failed.')));
+    port.onMessage.addListener(message => void onPageMessage(message).catch(() => refuse('Browser copy failed.')));
     return true;
   }
-  return Object.freeze({ PORT, CHUNK, MAX_BYTES, localBlob, eligibleHttpMedia, sameOriginMedia, validMediaProof, generatedLink, fileFacts, copyBlob, relay });
+  return Object.freeze({ PORT, CHUNK, WINDOW, MAX_BYTES, localBlob, eligibleHttpMedia, sameOriginMedia, validMediaProof, generatedLink, fileFacts, inspectLocalMedia, copyBlob, relay });
 })();

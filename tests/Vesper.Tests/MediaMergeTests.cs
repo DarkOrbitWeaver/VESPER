@@ -101,6 +101,40 @@ public sealed class MediaMergeTests
         });
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DirectM4aClipDownloadsCompleteSourceAndPublishesOnlyTheRange(bool outside)
+    {
+        await using var server = new FaultServer();
+        byte[] audio = AacFmp4();
+        using var source = new MemoryStream(audio);
+        DemuxedTrack full = Track(source, TrackKind.Audio);
+        server.Extra["/clip/direct-audio.m4a"] = audio;
+        await server.StartAsync();
+        using var h = new Harness();
+        var range = new MediaTimeRange(0.25, outside ? 2 : 0.7);
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/clip/direct-audio.m4a"), FileName: "clip.m4a",
+            Kind: JobKind.Http, MediaProvider: "fixture", MediaPlanJson: JsonSerializer.Serialize(range),
+            Output: MediaOutput.M4a));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        if (outside)
+        {
+            Assert.Equal(JobState.NeedsAttention, done.State);
+            Assert.Null(done.FinalPath);
+            Assert.Equal(audio, await File.ReadAllBytesAsync(done.PartialPath));
+            return;
+        }
+        Assert.True(done.State == JobState.Completed, $"{done.State} {done.Reason}: {done.Message}");
+        using var output = File.OpenRead(done.FinalPath!);
+        DemuxedTrack track = Assert.Single(MediaMerger.Demux(output, output.Length, default));
+        Assert.Equal("aac", track.Codec);
+        Assert.True(track.Samples.Count < full.Samples.Count);
+        Mp4EditListEntry edit = Assert.Single(track.EditList!);
+        Assert.Equal(0.45, edit.SegmentDuration / (double)track.EditMovieTimescale, 7);
+    }
+
     [Fact]
     public async Task LocalM4aAudioClip_PublishesOnlyTheSelectedAacPackets()
     {
@@ -1227,11 +1261,12 @@ public sealed class MediaMergeTests
     };
 
     [Theory]
-    [InlineData("http", "merge.beforeSwap")]
-    [InlineData("http", "merge.afterTracksMove")]
-    [InlineData("hls", "merge.afterOutputMove")]
-    [InlineData("dash", "merge.afterTracksMove")]
-    public async Task Merge_recovers_each_durable_swap_state_without_fetching_again(string protocol, string point)
+    [InlineData("http", "merge.beforeSwap", false)]
+    [InlineData("http", "merge.afterTracksMove", false)]
+    [InlineData("hls", "merge.afterOutputMove", false)]
+    [InlineData("http", "merge.afterOutputMove", true)]
+    [InlineData("dash", "merge.afterTracksMove", false)]
+    public async Task Merge_recovers_each_durable_swap_state_without_fetching_again(string protocol, string point, bool changedCreationTime)
     {
         await using var server = new FaultServer();
         await server.StartAsync();
@@ -1251,6 +1286,8 @@ public sealed class MediaMergeTests
         string partial = h.Engine.Snapshot(added.JobId)!.PartialPath;
         string muxed = point == "merge.afterOutputMove" ? partial : partial + ".merging";
         byte[] expected = await File.ReadAllBytesAsync(muxed);
+        if (changedCreationTime)
+            File.SetCreationTimeUtc(muxed, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
 
         h.Restart();
 

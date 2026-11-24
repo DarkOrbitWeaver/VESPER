@@ -33,44 +33,16 @@ globalThis.VesperIntelligence = (() => {
     if (DIRECT.test(url) || /^(?:audio|video)\//i.test(mime)) return 'direct';
     return 'unknown';
   }
-  const commonWords = new Map(Object.entries({
-    download: 5, save: 3, export: 4, get: 1, obtain: 2, herunterladen: 5, telecharger: 5, télécharger: 5,
-    descargar: 5, baixar: 5, scarica: 5, تحميل: 5, تنزيل: 5,
-    play: -6, preview: -5, view: -5, open: -3, read: -5, watch: -5, expand: -2,
-    next: -4, more: -2, details: -4, subscribe: -5, login: -6, sign: -4
-  }));
-  // Tiny on-device semantic ranker (a linear feature scorer, *not* a language model).
-  // Its score never authorizes a click. Class names are intentionally not required.
+  // Classification of one control, kept for existing callers. The evidence model owns the weights;
+  // its score never authorizes a click.
   function proposeControl(facts = {}) {
-    let score = 0;
-    const reasons = [];
-    const words = normText(`${facts.label || ''} ${facts.ariaLabel || ''} ${facts.title || ''}`)
-      .toLowerCase().split(/[\s\p{P}\p{S}]+/u).filter(Boolean).slice(0, 50);
-    for (const word of words) {
-      if (!commonWords.has(word)) continue;
-      const value = commonWords.get(word);
-      score += value;
-      reasons.push(`${word}:${value > 0 ? '+' : ''}${value}`);
-    }
-    if (facts.downloadAttribute) { score += 5; reasons.push('download attribute'); }
-    if (facts.role === 'button' || facts.tagName === 'BUTTON') { score += 1; reasons.push('button'); }
-    if (facts.isNavigation || facts.role === 'tab') { score -= 6; reasons.push('navigation'); }
-    if (facts.isInlinePdf) { score -= 8; reasons.push('inline PDF'); }
-    if (facts.isBackground) { score -= 12; reasons.push('background'); }
-    if (facts.isDisabled) { score -= 12; reasons.push('disabled'); }
-    const type = sourceKind(facts.href || '', facts.mime || '');
-    if (type === 'direct') { score += 2; reasons.push('file-like path'); }
-    if (type === 'fragment') { score -= 10; reasons.push('media segment'); }
-    const classification = score >= 5 ? 'download-likely' : score <= -3 ? 'navigation-likely' : 'uncertain';
-    return { classification, score, reasons, mayExecute: false };
-  }
-  function operationDecision({ approval, chromeCreated, model, navigates, inlinePdf, requestKind } = {}) {
-    // An explicit VESPER action or *actual* Chrome download is the authority, not a model score.
-    if (requestKind === 'drm' || requestKind === 'opaque') return 'unsupported';
-    if (approval?.explicit === true && approval?.scoped === true) return 'approved';
-    if (chromeCreated === true) return 'chrome-download';
-    if (navigates || inlinePdf) return 'navigation';
-    return model?.classification === 'download-likely' ? 'observe-only' : 'ignore';
+    const evidence = globalThis.VesperControlEvidence;
+    if (!evidence) return { classification: 'uncertain', score: 0, reasons: ['evidence model unavailable'], mayExecute: false };
+    const result = evidence.assess(facts);
+    const classification = result.verdict === 'download' ? 'download-likely'
+      : result.verdict === 'navigation' || result.verdict === 'blocked' ? 'navigation-likely' : 'uncertain';
+    const score = Number.isFinite(result.logOdds) ? Math.round(result.logOdds * 2) : -99;
+    return { classification, score, reasons: result.reasons, mayExecute: false };
   }
   // A local observation timeline: bounded memory, limited lifetime, epoch invalidation on source/identity changes.
   function createMediaLedger({ now = Date.now, maxPlayers = MAX_MEDIA, maxEvidence = MAX_EVIDENCE } = {}) {
@@ -254,6 +226,14 @@ globalThis.VesperIntelligence = (() => {
     }
     return { run, cancel: () => { stopped = true; }, snapshot: () => states.map(s => ({ ...s })) };
   }
+  function operationDecision({ approval, chromeCreated, model, navigates, inlinePdf, requestKind } = {}) {
+    // An explicit VESPER action or *actual* Chrome download is the authority, not a model score.
+    if (requestKind === 'drm' || requestKind === 'opaque') return 'unsupported';
+    if (approval?.explicit === true && approval?.scoped === true) return 'approved';
+    if (chromeCreated === true) return 'chrome-download';
+    if (navigates || inlinePdf) return 'navigation';
+    return model?.classification === 'download-likely' ? 'observe-only' : 'ignore';
+  }
   function chooseAcquisition({ approved, nativeReplayVerified, originalBytesProven,
       browserReadAllowed, isOneUse, isPost, isBlob, isDrm, chromeHasBytes } = {}) {
     if (isDrm) return { tier: 'unsupported', reason: 'Protected media' };
@@ -266,6 +246,6 @@ globalThis.VesperIntelligence = (() => {
       return { tier: 'browser-prototype', reason: 'Requires explicit browser streaming integration' };
     return { tier: 'chrome', reason: 'Cannot prove safe handoff' };
   }
-  return Object.freeze({ http, safeScope, sourceKind, proposeControl, operationDecision,
-    createMediaLedger, makeBatchPlan, createBatchExecutor, chooseAcquisition, MAX_ITEMS });
+  return Object.freeze({ http, safeScope, sourceKind, proposeControl,
+    operationDecision, createMediaLedger, makeBatchPlan, createBatchExecutor, chooseAcquisition, MAX_ITEMS });
 })();

@@ -1,3 +1,4 @@
+using Vesper.MediaResolver.Core;
 using Vesper.Engine;
 using Vesper.MediaResolver.Models;
 
@@ -9,6 +10,32 @@ namespace VESPER;
 /// </summary>
 internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine engine, Func<VesperPreferences> preferences)
 {
+    // Network settings are fixed for the engine lifetime. Share the resolver's
+    // bounded HTTP pool and metadata cache across concurrent picker requests.
+    private readonly object _resolverGate = new();
+    private DefaultMediaResolver? _sharedResolver;
+    private bool _resolverClosed;
+    private DefaultMediaResolver SharedResolver
+    {
+        get
+        {
+            lock (_resolverGate)
+            {
+                ObjectDisposedException.ThrowIf(_resolverClosed, this);
+                return _sharedResolver ??= new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options));
+            }
+        }
+    }
+    internal void CloseResolver()
+    {
+        lock (_resolverGate)
+        {
+            _resolverClosed = true;
+            _sharedResolver?.Dispose();
+            _sharedResolver = null;
+        }
+    }
+
     public async Task<BridgeResponse> HandleAsync(BridgeRequest request, CancellationToken ct)
     {
         switch (request.Type)
@@ -36,6 +63,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             case "media-options":
             case "media-source-options":
+            case "media-range-options":
             case "media-group-options":
                 return await MediaOptionsAsync(request, ct);
 

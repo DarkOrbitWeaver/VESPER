@@ -84,10 +84,13 @@ public sealed record MediaRepresentation
     // These fields never assert equivalence of two distinct delivery endpoints.
     public string? ResourceETag { get; init; }
     public string? ResourceUrlSha256 { get; init; }
-
+    // An observed partial response was verified as a complete file. Its delivery must retain the validator.
+    public bool BrowserRangeVerified { get; init; }
     public MediaRequestContext Context { get; init; } = MediaRequestContext.Empty;
     public Uri? ManifestUrl { get; init; }
     public SegmentPlan? Segments { get; init; }
+    // Bounded evidence from a parsed playlist, not a download plan or a byte-identity assertion.
+    [JsonIgnore] public IReadOnlyList<Uri> PlaybackEvidenceUrls { get; init; } = [];
     public ProcessingRequirement Requirements { get; init; } = ProcessingRequirement.None;
     public bool IsLive { get; init; }
 
