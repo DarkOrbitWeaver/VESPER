@@ -17,7 +17,7 @@ public sealed class Mp4HeaderFactsTests
         byte[] file = Join(Box("ftyp", Ascii("isom")), Box("moov", Mvhd(1000, 93_500),
             Track("vide", "avc1", 1280, 720), Track("soun", "mp4a", 0, 0)), Box("mdat", new byte[64]));
 
-        Mp4HeaderFacts? facts = Mp4HeaderFacts.Read(file);
+        DirectMediaFacts? facts = Mp4HeaderFacts.Read(file);
 
         Assert.NotNull(facts);
         Assert.True(facts.HasVideo);
@@ -34,7 +34,7 @@ public sealed class Mp4HeaderFactsTests
     {
         byte[] file = Join(Box("ftyp", Ascii("iso5")), Box("moov", Mvhd(1000, 0), Track("vide", "avc1", 720, 1280)));
 
-        Mp4HeaderFacts? facts = Mp4HeaderFacts.Read(file);
+        DirectMediaFacts? facts = Mp4HeaderFacts.Read(file);
 
         Assert.NotNull(facts);
         Assert.True(facts.HasVideo);

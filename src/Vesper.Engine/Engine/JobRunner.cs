@@ -180,16 +180,21 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     }
 
     // The validator ladder for a parked Chrome download (see BrowserTransferProof). A strong ETag must match exactly.
-    // Without one, every fact Chrome observed must be reproduced before a single body byte is read. Any
-    // difference stops this job with "browser-fallback" so the extension resumes Chrome's own copy.
+    // A Last-Modified proof needs a response with no ETag at all, the identical date, a Date that keeps that date
+    // strong, and the exact length. Every other fact Chrome observed must be reproduced before a single body byte
+    // is read. Any difference stops this job with "browser-fallback" so the extension resumes Chrome's own copy.
     private void CheckBrowserResponse(FirstResult first)
     {
-        if (Job.BrowserProof is not { } proof) return;
+        // An adopted download resumes saved bytes under its own validators, which the resume path checks itself.
+        if (Job.BrowserProof is not { Adopted: false } proof) return;
         HttpResponseMessage response = first.Response;
         string? etag = HttpFacts.StrongEtag(response);
-        bool sameRepresentation = proof.UsesMetadata
-            ? proof.ETag is null || string.Equals(etag, proof.ETag, StringComparison.Ordinal)
-            : !string.IsNullOrEmpty(proof.ETag) && string.Equals(etag, proof.ETag, StringComparison.Ordinal);
+        bool sameRepresentation = proof.UsesLastModified
+            ? response.Headers.ETag is null && proof.LastModifiedValue is { } stamp
+                && response.Headers.Date is { } served && served - stamp >= TimeSpan.FromSeconds(60)
+            : proof.UsesMetadata
+                ? proof.ETag is null || string.Equals(etag, proof.ETag, StringComparison.Ordinal)
+                : !string.IsNullOrEmpty(proof.ETag) && string.Equals(etag, proof.ETag, StringComparison.Ordinal);
         if (!sameRepresentation || first.Decoded
             || proof.Length is long length && first.Total != length
             || proof.UsesMetadata && first.Total is null
@@ -799,12 +804,15 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     {
         int code = (int)r.StatusCode;
         bool linkWorkedBefore = !Job.Extents.IsEmpty || Job.Identity != IdentityLevel.None;
+        bool refreshableMedia = Job.BrowserProof is null && Job.OriginalPageUrl is not null
+            && !string.IsNullOrWhiteSpace(Job.MediaProvider) && Job.MediaProvider != "generic"
+            && !string.IsNullOrWhiteSpace(Job.MediaId) && !string.IsNullOrWhiteSpace(Job.MediaFormatId);
         RunOutcome outcome = code switch
         {
             401 or 407 => RunOutcome.NeedsAttention("auth", $"The server asks for a sign-in (HTTP {code}). Send this download again from your signed-in browser."),
-            403 when linkWorkedBefore => RunOutcome.NeedsLink("forbidden", "The server refused the link (HTTP 403). Get a fresh link from the browser. Your download data was kept."),
+            403 when linkWorkedBefore || refreshableMedia => RunOutcome.NeedsLink("forbidden", "The server refused the link (HTTP 403). Get a fresh link from the browser. Your download data was kept."),
             403 => RunOutcome.NeedsAttention("forbidden", "The server refused the request (HTTP 403). Try again from the browser where the link works."),
-            404 or 410 when linkWorkedBefore => RunOutcome.NeedsLink("expired", $"The link no longer works (HTTP {code}). Saved data was kept."),
+            404 or 410 when linkWorkedBefore || refreshableMedia => RunOutcome.NeedsLink("expired", $"The link no longer works (HTTP {code}). Saved data was kept."),
             404 or 410 => RunOutcome.Failed("not-found", $"The file was not found (HTTP {code})."),
             408 or 429 or 503 => RunOutcome.Retry("throttled", $"The server asked VESPER to wait (HTTP {code}).", HttpFacts.RetryAfter(r, DateTimeOffset.UtcNow)),
             >= 500 => RunOutcome.Retry("server-error", $"The server had a problem (HTTP {code}).", HttpFacts.RetryAfter(r, DateTimeOffset.UtcNow)),

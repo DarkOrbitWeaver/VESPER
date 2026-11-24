@@ -515,6 +515,54 @@ public class HlsTests
     }
 
     [Fact]
+    public async Task RotatedVodRefreshReplaysAndVerifiesRewrittenTransportEpochs()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        const string oldRoot = "/hls/old-epochs", newRoot = "/hls/new-epochs";
+        byte[] first = FaultServer.HlsSegment(0), second = FaultServer.HlsSegment(0), third = FaultServer.HlsSegment(1);
+        string playlist = string.Join('\n', "#EXTM3U", "#EXT-X-TARGETDURATION:4", "#EXTINF:4,", "s0.ts",
+            "#EXT-X-DISCONTINUITY", "#EXTINF:4,", "s1.ts", "#EXTINF:4,", "final.ts", "#EXT-X-ENDLIST", "");
+        foreach (string root in new[] { oldRoot, newRoot })
+        {
+            server.HlsFiles[root + "/s0.ts"] = first;
+            server.HlsFiles[root + "/s1.ts"] = second;
+            server.HlsPlaylists[root + "/index.m3u8"] = playlist;
+        }
+        server.HlsFiles[newRoot + "/final.ts"] = third;
+        string oldUrl = server.Url(oldRoot + "/index.m3u8"), newUrl = server.Url(newRoot + "/index.m3u8");
+        using var h = new Harness();
+        AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "epoch.ts", Kind: JobKind.Hls,
+            MediaProvider: "fixture", MediaId: "epoch", MediaFormatId: "video", MediaQuality: "720p with audio"));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.Equal(first.Length + second.Length, stopped.CommittedBytes);
+        byte[] prefix = await File.ReadAllBytesAsync(stopped.PartialPath);
+        Assert.NotEqual(first.Concat(second).ToArray(), prefix); // epoch 2 has rewritten timestamps/counters
+        var source = new ResolvedMediaSource("fixture", "epoch", "video", newUrl);
+        server.HlsFiles[newRoot + "/s1.ts"] = third;
+        RescueResult refused = await h.Engine.RefreshMediaSourceAsync(added.JobId, source, default, oldUrl);
+        Assert.False(refused.Accepted);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(stopped.PartialPath));
+        server.HlsFiles[newRoot + "/s1.ts"] = second;
+        h.Engine.Options.MaxConcurrentJobs = 0;
+        h.Engine.SettingsChanged();
+        RescueResult accepted = await h.Engine.RefreshMediaSourceAsync(added.JobId, source, default, oldUrl);
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(stopped.CommittedBytes, accepted.RetainedBytes);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(stopped.PartialPath));
+        int firstHits = server.Hits(newRoot + "/s0.ts"), secondHits = server.Hits(newRoot + "/s1.ts");
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal(firstHits, server.Hits(newRoot + "/s0.ts"));
+        Assert.Equal(secondHits, server.Hits(newRoot + "/s1.ts"));
+        using var baseline = new Harness();
+        JobSnapshot full = await baseline.WaitForStateAsync(AddHls(baseline, server, newRoot + "/index.m3u8"), JobState.Completed);
+        Assert.Equal(await File.ReadAllBytesAsync(full.FinalPath!), await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
     public async Task Hls_resume_rejects_a_changed_discontinuity_sequence_before_appending()
     {
         await using var server = new FaultServer(); await server.StartAsync();
@@ -1017,6 +1065,49 @@ public class HlsTests
             && server.Hits("/hls/resume-tail/missing.ts") >= 2);
 
         Assert.Equal(waiting.CommittedBytes, new FileInfo(waiting.PartialPath).Length);
+    }
+
+    [Fact]
+    public async Task AutomaticVodRefreshRebasesOnlyAnIdenticalCommittedPrefix()
+    {
+        await using var server = new FaultServer(); await server.StartAsync();
+        using var h = new Harness();
+        string[] names = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
+        byte[] init = DashTransferTests.Fixture("av-init.mp4");
+        byte[][] fragments = names.Select(DashTransferTests.Fixture).ToArray();
+        string playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            + string.Concat(names.Select(name => $"#EXTINF:1,\n{name}\n")) + "#EXT-X-ENDLIST\n";
+        foreach (string root in new[] { "/hls/old-vod", "/hls/new-vod" })
+        {
+            server.HlsPlaylists[root + "/index.m3u8"] = playlist;
+            server.HlsFiles[root + "/init.mp4"] = init;
+            server.HlsFiles[root + "/" + names[0]] = fragments[0];
+        }
+        string oldUrl = server.Url("/hls/old-vod/index.m3u8");
+        string newUrl = server.Url("/hls/new-vod/index.m3u8");
+        AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "vod-refresh.mp4", Kind: JobKind.Hls,
+            MediaProvider: "fixture", MediaId: "vod", MediaFormatId: "video", OriginalPageUrl: server.Url("/page")));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot waiting = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.Equal(init.Length + fragments[0].Length, waiting.CommittedBytes);
+        var replacement = new ResolvedMediaSource("fixture", "vod", "video", newUrl);
+        RescueResult stale = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement, default, oldUrl + "?stale");
+        Assert.False(stale.Accepted);
+        byte[] altered = fragments[0].ToArray();
+        altered[^1] ^= 1;
+        server.HlsFiles["/hls/new-vod/" + names[0]] = altered;
+        RescueResult mismatch = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement, default, oldUrl);
+        Assert.False(mismatch.Accepted);
+        byte[] expectedPrefix = [.. init, .. fragments[0]];
+        Assert.Equal(expectedPrefix, await File.ReadAllBytesAsync(waiting.PartialPath));
+        for (int i = 0; i < names.Length; i++) server.HlsFiles["/hls/new-vod/" + names[i]] = fragments[i];
+        RescueResult accepted = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement, default, oldUrl);
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(waiting.CommittedBytes, accepted.RetainedBytes);
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        byte[] expected = [.. init, .. fragments[0], .. fragments[1], .. fragments[2]];
+        Assert.Equal(expected, await File.ReadAllBytesAsync(done.FinalPath!));
     }
 
     private static async Task AppendUncommittedTailAsync(string path)

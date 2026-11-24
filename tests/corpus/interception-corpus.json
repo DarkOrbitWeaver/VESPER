@@ -1,0 +1,45 @@
+{
+  "about": "Ordinary-download interception corpus. Eligibility is defined here, before anything is measured, and every case is reported whether eligible or not. Run it with: node scripts/replay-interception-corpus.mjs",
+  "eligibility": [
+    "E1  The download is a GET over http(s) with no request body.",
+    "E2  It is not from a private (Incognito) window and not a blob: or data: address built by the page.",
+    "E3  The response is 200 or 206 and is not content-encoded.",
+    "E4  The response carries a strong validator: a strong ETag, or (with no ETag at all) a Last-Modified that the server's own Date makes strong, together with an exact length.",
+    "E5  A second request to the same address returns the same representation: the address is not single-use, has not expired, and is not bound to a sign-in the user has not granted to VESPER.",
+    "E6  If Chrome already holds bytes when VESPER is able to park it, the response is one Chrome itself can resume (byte ranges, exact length, strong validator) and Chrome is not past the halfway mark.",
+    "E7  The site is not excluded by a site rule, and the desktop app answers within the handoff window."
+  ],
+  "scenarioEligibility": "A case is eligible in a scenario when case.eligible is true and either Chrome holds no bytes at the parking decision, or case.chromeResumable is true and Chrome holds at most half of the file.",
+  "scenarios": [
+    { "id": "warm-start", "helper": "warm", "atCreation": 0, "duringProof": 0,
+      "meaning": "The app is running and Chrome has received nothing yet when the download appears." },
+    { "id": "warm-headstart", "helper": "warm", "atCreation": 0.02, "duringProof": 0.02,
+      "meaning": "The app is running, but Chrome already received 2 % of the file before the extension could act." },
+    { "id": "cold-helper", "helper": "cold", "atCreation": 0, "duringProof": 0.3,
+      "meaning": "The helper is not warm, so Chrome keeps downloading and reaches 30 % while VESPER proves the file." },
+    { "id": "chrome-ahead", "helper": "cold", "atCreation": 0.1, "duringProof": 0.6,
+      "meaning": "Chrome is at 60 % by the time VESPER could park it: past halfway, so Chrome should keep it." }
+  ],
+  "cases": [
+    { "id": "etag-5m", "path": "/file/etag/5m", "eligible": true, "chromeResumable": true },
+    { "id": "etag-200m", "path": "/file/etag/200m", "eligible": true, "chromeResumable": true },
+    { "id": "etag-2g", "path": "/file/etag/2g", "eligible": true, "chromeResumable": true },
+    { "id": "last-modified-200m", "path": "/file/dated/200m", "eligible": true, "chromeResumable": true,
+      "note": "No ETag; strong Last-Modified with an exact length (E4)." },
+    { "id": "direct-link-200m", "path": "/file/inline/200m", "eligible": true, "chromeResumable": true,
+      "note": "No Content-Disposition, so nothing warms the helper before the download exists." },
+    { "id": "redirect-chain-200m", "path": "/redirect/3/file/etag/200m", "eligible": true, "chromeResumable": true },
+    { "id": "signed-valid-200m", "path": "/file/expiring/200m?ttl=60000", "eligible": true, "chromeResumable": true },
+    { "id": "no-range-200m", "path": "/file/norange/200m", "eligible": true, "chromeResumable": false,
+      "note": "Strong ETag but the server ignores Range: eligible only while Chrome holds no bytes (E6)." },
+    { "id": "weak-etag-200m", "path": "/file/weak/200m", "eligible": false, "why": "E4: weak ETag" },
+    { "id": "no-validator-200m", "path": "/file/bare/200m", "eligible": false, "why": "E4: no validator" },
+    { "id": "gzip-5m", "path": "/file/gzip/5m", "eligible": false, "why": "E3: content-encoded" },
+    { "id": "one-use-200m", "path": "/file/once/200m", "uniqueToken": true, "eligible": false, "why": "E5: single-use address" },
+    { "id": "cookie-only-200m", "path": "/file/cookie/200m", "cookie": true, "eligible": false,
+      "why": "E5: needs a sign-in the user has not granted to VESPER" },
+    { "id": "post-form-5m", "path": "/form/5m", "method": "POST", "eligible": false, "why": "E1: form submission" },
+    { "id": "page-made-blob", "blob": true, "eligible": false, "why": "E2: the bytes exist only in the page" },
+    { "id": "incognito-200m", "path": "/file/etag/200m", "incognito": true, "eligible": false, "why": "E2: private window" }
+  ]
+}

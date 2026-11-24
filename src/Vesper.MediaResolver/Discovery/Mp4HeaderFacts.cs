@@ -7,10 +7,12 @@ namespace Vesper.MediaResolver.Discovery;
 /// What the start of an MP4 file says about its tracks. Read from the <c>moov</c> box when it lies within the
 /// bytes fetched; a file that keeps <c>moov</c> at its end yields nothing, and its details stay unknown.
 /// </summary>
-internal sealed record Mp4HeaderFacts(bool HasVideo, bool HasAudio, int? Width, int? Height,
-    string? VideoCodec, string? AudioCodec, double? DurationSeconds, bool Encrypted)
+internal sealed record DirectMediaFacts(bool HasVideo, bool HasAudio, int? Width, int? Height,
+    string? VideoCodec, string? AudioCodec, double? DurationSeconds, bool Encrypted, bool CompleteFileCandidate = true);
+
+internal static class Mp4HeaderFacts
 {
-    public static Mp4HeaderFacts? Read(ReadOnlySpan<byte> data)
+    public static DirectMediaFacts? Read(ReadOnlySpan<byte> data)
     {
         if (!TryBox(data, out string first, out _, out _) || first is not ("ftyp" or "styp" or "moov")) return null;
         if (!TryFind(data, "moov", out ReadOnlySpan<byte> moov)) return null;

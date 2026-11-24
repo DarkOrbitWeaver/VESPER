@@ -231,21 +231,19 @@
       if (allVideos.length > 4) continue;
       const videos = includePlayer ? allVideos.filter(el => observed.has(el) && visiblePlayer(el)) : [];
       if (includePlayer && !videos.length) continue;
-      const pages = new Map();
-      for (const link of [...card.querySelectorAll('a[href]')].slice(0, 32)) {
-        try {
-          const url = new URL(link.href);
-          if (url.origin !== origin) continue;
-          const identity = VesperPlayerSource.identity(url.href);
-          if (/^(youtube|instagram|tiktok|facebook|x):/.test(identity || '')) pages.set(identity, url.href);
-        } catch { /* Ignore malformed page links. */ }
-      }
-      if (pages.size !== 1) continue;
+      const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
+        permalink: !!(link.querySelector?.('time[datetime]') || link.hasAttribute?.('data-permalink')) }));
+      try {
+        const own = card.getAttribute?.('data-permalink');
+        if (own) links.push({ href: new URL(own, origin).href, permalink: true });
+      } catch { /* A malformed permalink attribute names nothing. */ }
+      const page = VesperPlayerSource.cardPage(links, origin);
+      if (!page) continue;
       videos.sort((a, b) => {
         const area = el => { const r = el.getBoundingClientRect(); return r.width * r.height * (el.paused ? 1 : 1.15); };
         return area(b) - area(a);
       });
-      return { page: pages.values().next().value, player: videos[0] };
+      return { page, player: videos[0] };
     }
     return null;
   }
@@ -626,7 +624,8 @@
     if (option?.canClip !== true)
       return { available: false, reason: "This format can't be trimmed. Choose another format." };
     return { available: true, reason: option.clipUsesWholeFile
-      ? seconds > 1200 ? 'Downloads the full video, then trims it on your PC.' : ''
+      ? String(option.container || '').toLowerCase() === 'webm' ? 'Downloads the full video, then cuts at keyframe and frame boundaries; the range may shift.'
+        : seconds > 1200 ? 'Downloads the full video, then trims it on your PC.' : ''
       : 'The cut follows segment boundaries and may shift slightly.' };
   }
 

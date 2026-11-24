@@ -70,3 +70,28 @@ test('queued work expires without being sent and disconnect never replays active
     assert.equal(b.oneShots,0);
   }finally{b.stop();}
 });
+
+test('format discovery reserves slots for urgent transfer ownership and user actions', async () => {
+  const b = setup();
+  try {
+    const lookups = Array.from({length:12}, (_,i) => b.session.request('host',
+      {v:1,id:'lookup'+i,type:'media-source-options'}, 1000));
+    await b.tick();
+    assert.equal(b.requests.length,10);
+    const transfer = b.session.request('host',{v:1,id:'transfer',type:'browser-capture'},1000);
+    const selection = b.session.request('host',{v:1,id:'selection',type:'media-select'},1000);
+    await b.tick();
+    assert.equal(b.requests.length,12);
+    assert.deepEqual(b.requests.slice(-2).map(x=>x.message.id),['transfer','selection']);
+    for (const {port,message:m} of b.requests.slice(-2)) port.reply({id:m.id,ok:true});
+    assert.ok((await transfer).ok && (await selection).ok);
+    await b.tick();
+    assert.equal(b.requests.length,12); // still no more than ten active lookups
+    for (const {port,message:m} of b.requests.slice(0,2)) port.reply({id:m.id,ok:true});
+    await b.tick();
+    assert.deepEqual(b.requests.slice(-2).map(x=>x.message.id),['lookup10','lookup11']);
+    for (const {port,message:m} of b.requests.filter(x=>x.message.type==='media-source-options').slice(2))
+      port.reply({id:m.id,ok:true});
+    assert.ok((await Promise.all(lookups)).every(x=>x.ok));
+  } finally {b.stop();}
+});

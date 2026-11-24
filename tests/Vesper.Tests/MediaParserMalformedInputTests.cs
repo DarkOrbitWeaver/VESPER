@@ -58,6 +58,14 @@ public sealed class MediaParserMalformedInputTests
             mp4.Finish(requireAudio: false, requireVideo: false);
             return true;
         }),
+        ["fmp4-fragment-file"] = new(2004, () => AvFragment, bytes =>
+        {
+            FragmentedMp4 mp4 = FragmentedMp4.Open(AvInit, captureSamples: true);
+            using var source = new MemoryStream(bytes, writable: false);
+            mp4.ValidateFragment(source, 0, bytes.Length, CancellationToken.None);
+            mp4.Finish(requireAudio: false, requireVideo: false);
+            return true;
+        }),
         ["mp4-demux-audio"] = new(2005, () => Media("quiet-track-aac.m4a"), bytes =>
         {
             using var input = new MemoryStream(bytes, writable: false);

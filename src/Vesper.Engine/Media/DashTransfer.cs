@@ -5,7 +5,8 @@ using System.Text.Json;
 namespace Vesper.Engine;
 
 /// <summary>Bounded, ordered clear fMP4 transfer through the existing durable session, limiters and publish path.</summary>
-internal sealed class DashTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
+internal sealed class DashTransfer(DownloadEngine engine, JobSession session, HttpTransport http,
+    RequestCredentials? refreshCredentials = null, bool useStoredCredentials = true)
 {
     internal const long MaxObjectBytes = 64L * 1024 * 1024;
     private const int MaxInitBytes = 8 * 1024 * 1024;
@@ -145,6 +146,127 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
         return await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
     }
 
+    // A rotated fragment map may only replace the saved map after proving the exact committed prefix.
+    internal async Task<(bool Valid, string? CursorJson, string Error)> VerifyRefreshAsync(
+        DashDownloadPlan current, DashDownloadPlan replacement, CancellationToken ct)
+    {
+        long offset = Job.Extents.TotalBytes;
+        if (Job.MediaState is null)
+            return offset == 0 ? (true, null, "") : (false, null, "The saved DASH data has no verified cursor.");
+        Cursor? cursor;
+        try { cursor = JsonSerializer.Deserialize<Cursor>(Job.MediaState, new JsonSerializerOptions { MaxDepth = 12 }); }
+        catch (JsonException) { return (false, null, "The saved DASH cursor is invalid."); }
+        IReadOnlyList<DashFragment> fragments = replacement.Fragments;
+        if (replacement.ClipRange is { } range)
+        {
+            if (!range.TrySelect([.. fragments.Select(fragment => fragment.DurationSeconds ?? double.NaN)],
+                [.. fragments.Select(fragment => fragment.StartSeconds)], out int first, out int count, out _, out _))
+                return (false, null, "The refreshed DASH timeline cannot reproduce the selected clip.");
+            fragments = fragments.Skip(first).Take(count).ToArray();
+        }
+        if (cursor is null || cursor.Version != 1 || cursor.PlanFingerprint != current.Fingerprint
+            || cursor.Next < 1 || cursor.Next > fragments.Count || cursor.Offset != offset
+            || Job.Extents.ContiguousFromZero() != offset || cursor.InitLength is < 8 or > MaxInitBytes
+            || cursor.InitLength >= offset || cursor.Progress is null || cursor.PrefixHash is not { Length: 64 })
+            return (false, null, "The saved DASH cursor does not match the committed bytes.");
+        using (PartialFile file = session.OpenFile(create: false))
+        using (var saved = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+        {
+            if (file.Length < offset) return (false, null, "The saved DASH file is shorter than its cursor.");
+            MediaPartialIntegrity.HashPrefix(file, offset, saved, ct);
+            if (Convert.ToHexString(saved.GetCurrentHash()) != cursor.PrefixHash)
+                return (false, null, "The saved DASH prefix failed SHA-256 validation.");
+        }
+
+        using var fresh = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long fetchedBytes = 0;
+        async Task<bool> AppendAsync(DashFragment part, long limit, int? exactLength = null)
+        {
+            var fetched = await FetchBufferedAsync(part, limit, ct).ConfigureAwait(false);
+            using (fetched.Lease)
+            {
+                if (exactLength is int length && fetched.Data.Length != length
+                    || fetched.Data.Length > offset - fetchedBytes) return false;
+                fresh.AppendData(fetched.Data.Span);
+                fetchedBytes += fetched.Data.Length;
+                return true;
+            }
+        }
+
+        if (!await AppendAsync(replacement.Initialization, MaxInitBytes, cursor.InitLength).ConfigureAwait(false))
+            return (false, null, "The refreshed DASH initialization differs from the saved prefix.");
+        for (int i = 0; i < cursor.Next; i++)
+            if (!await AppendAsync(fragments[i], MaxObjectBytes).ConfigureAwait(false))
+                return (false, null, "The refreshed DASH fragments differ from the saved prefix.");
+        if (fetchedBytes != offset || Convert.ToHexString(fresh.GetCurrentHash()) != cursor.PrefixHash)
+            return (false, null, "The refreshed DASH prefix differs from the saved bytes.");
+        return (true, JsonSerializer.Serialize(cursor with { PlanFingerprint = replacement.Fingerprint }), "");
+    }
+
+    // Import a contiguous prefix from another acquisition route without rewriting any saved byte.
+    // Only a complete initialization and one or more complete fragments can form a DASH cursor.
+    internal async Task<(bool Valid, string? CursorJson, string Error)> ImportPrefixAsync(
+        DashDownloadPlan plan, CancellationToken ct)
+    {
+        long retained = Job.Extents.TotalBytes;
+        if (retained == 0) return (true, null, "");
+        if (plan.ClipRange is not null || Job.Extents.ContiguousFromZero() != retained)
+            return (false, null, "The existing data is not a complete contiguous DASH prefix.");
+        using PartialFile file = session.OpenFile(create: false);
+        if (file.Length < retained) return (false, null, "The saved partial file is shorter than its recorded progress.");
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long position = 0;
+        bool Match(ReadOnlyMemory<byte> data)
+        {
+            if (data.Length == 0 || data.Length > retained - position) return false;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                int done = 0;
+                while (done < data.Length)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    int n = file.Read(buffer.AsSpan(0, Math.Min(buffer.Length, data.Length - done)), position + done);
+                    if (n <= 0 || !buffer.AsSpan(0, n).SequenceEqual(data.Span.Slice(done, n))) return false;
+                    done += n;
+                }
+                hash.AppendData(data.Span);
+                position += data.Length;
+                return true;
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+        }
+
+        FragmentedMp4 mp4;
+        int initLength;
+        var init = await FetchBufferedAsync(plan.Initialization, MaxInitBytes, ct).ConfigureAwait(false);
+        using (init.Lease)
+        {
+            if (!Match(init.Data)) return (false, null, "The DASH initialization does not match the saved bytes.");
+            mp4 = FragmentedMp4.Open(init.Data.Span);
+            if (plan.RequireAudio && !mp4.HasAudio || plan.RequireVideo && !mp4.HasVideo)
+                return (false, null, "The DASH initialization lacks the selected tracks.");
+            initLength = init.Data.Length;
+        }
+        init = default;
+        int next = 0;
+        while (position < retained && next < plan.Fragments.Count)
+        {
+            var fragment = await FetchBufferedAsync(plan.Fragments[next], MaxObjectBytes, ct).ConfigureAwait(false);
+            using (fragment.Lease)
+            {
+                if (!Match(fragment.Data)) return (false, null, "The existing bytes differ or end inside a DASH fragment.");
+                mp4.ValidateFragment(fragment.Data.Span);
+            }
+            next++;
+        }
+        if (position != retained || next == 0)
+            return (false, null, "The existing bytes do not end on a complete DASH fragment.");
+        var cursor = new Cursor(1, plan.Fingerprint, next, retained, initLength,
+            Convert.ToHexString(hash.GetCurrentHash()), mp4.Snapshot());
+        return (true, JsonSerializer.Serialize(cursor), "");
+    }
+
     private async Task LimitedWriteAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken ct)
     {
         await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
@@ -168,7 +290,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
         session.AddConnection();
         try
         {
-            RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+            RequestCredentials? credentials = useStoredCredentials ? engine.CredentialsFor(Job.Id) : refreshCredentials;
             using var response = await http.SendAsync(uri, new RequestSpec(part.Offset, end, Referer: Job.Referer,
                 UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
                 CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl), ct).ConfigureAwait(false);

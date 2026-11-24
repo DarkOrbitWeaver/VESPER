@@ -13,7 +13,7 @@ namespace Vesper.Engine;
 /// renditions would need a muxer and are refused rather than faked.
 /// </summary>
 internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, HttpTransport http,
-    RequestCredentials? credentialOverride = null)
+    RequestCredentials? credentialOverride = null, bool useStoredCredentials = true)
 {
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
     private const int MaxInitializationBytes = 8 * 1024 * 1024;
@@ -26,7 +26,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         string? Container = null, string? MapIdentity = null, string? SourceIdentity = null, int TargetDuration = 0,
         double CapturedSeconds = 0, string[]? KeyFingerprints = null, bool StopRequested = false,
         bool HadGaps = false, string? GapMessage = null, long? EpochOffsetTicks = null,
-        long? TimelineOriginPts = null, string? TimelineCounters = null, string? CodecProfile = null);
+        long? TimelineOriginPts = null, string? TimelineCounters = null, string? CodecProfile = null, string? VodShape = null);
     private DownloadJob Job => session.Job;
 
     internal static bool IsLiveState(string? json)
@@ -104,26 +104,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             return RunOutcome.NeedsAttention("unsupported", "A playlist gap cannot be included in a complete file. Saved data was kept.");
         if (media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
             return RunOutcome.NeedsAttention("unsupported", "Initialization URI, byte range or encryption changes part-way. A remux is required; saved data was kept.");
-        bool hasDiscontinuityMetadata = media.Segments.Any(segment =>
-            segment.DiscontinuityBefore || segment.DiscontinuitySequence != 0);
-        byte[] planBytes;
-        if (hasDiscontinuityMetadata)
-        {
-            var plannedSegments = media.Segments.Select(segment => new
-            {
-                segment.Uri, segment.Duration, segment.RangeLength, segment.RangeOffset, segment.Key, segment.Map,
-                segment.Sequence, segment.DiscontinuityBefore, segment.DiscontinuitySequence, segment.IsGap
-            }).ToArray();
-            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(plannedSegments)
-                : JsonSerializer.SerializeToUtf8Bytes(new { Segments = plannedSegments, Clip = clipRange });
-        }
-        else
-        {
-            // Keep the existing plan identity for continuous playlists so saved progress remains resumable.
-            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(media.Segments)
-                : JsonSerializer.SerializeToUtf8Bytes(new { media.Segments, Clip = clipRange });
-        }
-        string planHash = Convert.ToHexString(SHA256.HashData(planBytes));
+        string planHash = VodPlanHash(media, clipRange);
+        string vodShape = VodShapeHash(media, clipRange);
         IReadOnlyList<HlsSegment> segments = media.Segments;
         double actualStart = 0, actualEnd = 0;
         if (clipRange is not null)
@@ -203,7 +185,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 {
                     HlsSegment ahead = segments[fetchNext];
                     prefetched.Enqueue((fetchNext, FetchBufferedSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength,
-                        ahead.Key is not null, prefetchLifetime.Token)));
+                        ahead.Key is not null, prefetchLifetime.Token, rewrite: hasSelectedDiscontinuity && !fragmented)));
                     fetchNext++;
                 }
             }
@@ -236,55 +218,14 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 {
                     data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
                 }
-                bool firstOutputSegment = offset == 0 && i == 0;
-                bool startEpoch = !firstOutputSegment && (segment.DiscontinuityBefore
-                    || lastDiscontinuitySequence is long previousSequence
-                        && segment.DiscontinuitySequence != previousSequence);
-                if (fragmented)
-                {
-                    mp4!.ValidateFragment(data.Span);
-                }
-                else if (startEpoch)
-                {
-                    TransportStreamLayout expectedLayout = transport!.SnapshotLayout()
-                        ?? throw new MediaContainerException("The preceding HLS epoch has no complete program layout.");
-                    var nextEpoch = new TransportStreamValidator(expectedLayout: expectedLayout);
-                    nextEpoch.Validate(data.Span);
-                    if (nextEpoch.SnapshotLayout() is null)
-                        throw new MediaContainerException("The new HLS epoch did not begin with complete program tables.");
-                    string? nextCodecProfile = HlsTransportCodecProfile.TryRead(data, ct);
-                    if (codecProfile is null || nextCodecProfile is null)
-                        throw new MediaContainerException("The HLS discontinuity has no verified H.264/AAC decoder configuration to compare.");
-                    if (!string.Equals(codecProfile, nextCodecProfile, StringComparison.Ordinal))
-                        throw new MediaContainerException("The HLS discontinuity changes decoder configuration; a remux is required.");
-                    long firstPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
-                        ?? throw new MediaContainerException("The new HLS epoch has no presentation timestamp to rebase.");
-                    if (timelineOriginPts is not long originPts)
-                        throw new MediaContainerException("The first HLS epoch has no verified presentation timestamp.");
-                    long elapsedTicks = TimelineTicks(segments, i);
-                    long targetPts = checked(originPts + elapsedTicks);
-                    epochOffset = checked(targetPts - firstPts);
-                    transport = nextEpoch;
-                    data = timeline.Rewrite(data, epochOffset, startEpoch: true, ct: ct);
-                }
+                if (fragmented) mp4!.ValidateFragment(data.Span);
                 else
                 {
-                    transport!.Validate(data.Span);
-                    if (firstOutputSegment && hasSelectedDiscontinuity)
-                    {
-                        timelineOriginPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
-                            ?? throw new MediaContainerException("The first HLS epoch has no presentation timestamp to anchor later epochs.");
-                        codecProfile = HlsTransportCodecProfile.TryRead(data, ct);
-                    }
-                    else if (!firstOutputSegment && hasSelectedDiscontinuity)
-                    {
-                        string? currentProfile = HlsTransportCodecProfile.TryRead(data, ct);
-                        if (currentProfile is not null && codecProfile is not null
-                            && !string.Equals(codecProfile, currentProfile, StringComparison.Ordinal))
-                            throw new MediaContainerException("An HLS epoch changes decoder configuration between segments.");
-                        codecProfile ??= currentProfile;
-                    }
-                    data = timeline.Rewrite(data, epochOffset, startEpoch: false, ct: ct);
+                    var validator = transport!;
+                    data = ProcessVodTransportSegment(data, segments, i, hasSelectedDiscontinuity,
+                        lastDiscontinuitySequence, timeline, ref validator, ref epochOffset,
+                        ref timelineOriginPts, ref codecProfile, ct);
+                    transport = validator;
                 }
                 await WritePartAsync(data, mediaOffset, hash, ct).ConfigureAwait(false);
                 long end = checked(mediaOffset + data.Length);
@@ -294,7 +235,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                     EpochOffsetTicks: hasSelectedDiscontinuity ? epochOffset : null,
                     TimelineOriginPts: hasSelectedDiscontinuity ? timelineOriginPts : null,
                     TimelineCounters: hasSelectedDiscontinuity ? timeline.SnapshotCounters() : null,
-                    CodecProfile: hasSelectedDiscontinuity ? codecProfile : null)));
+                    CodecProfile: hasSelectedDiscontinuity ? codecProfile : null, VodShape: vodShape)));
                 offset = end;
                 lastDiscontinuitySequence = segment.DiscontinuitySequence;
                 await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
@@ -592,6 +533,254 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         return updated;
     }
 
+    private static string VodPlanHash(HlsMedia media, MediaTimeRange? clipRange)
+    {
+        bool hasDiscontinuityMetadata = media.Segments.Any(segment =>
+            segment.DiscontinuityBefore || segment.DiscontinuitySequence != 0);
+        byte[] planBytes;
+        if (hasDiscontinuityMetadata)
+        {
+            var plannedSegments = media.Segments.Select(segment => new
+            {
+                segment.Uri, segment.Duration, segment.RangeLength, segment.RangeOffset, segment.Key, segment.Map,
+                segment.Sequence, segment.DiscontinuityBefore, segment.DiscontinuitySequence, segment.IsGap
+            }).ToArray();
+            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(plannedSegments)
+                : JsonSerializer.SerializeToUtf8Bytes(new { Segments = plannedSegments, Clip = clipRange });
+        }
+        else
+        {
+            // Keep the existing plan identity for continuous playlists so saved progress remains resumable.
+            planBytes = clipRange is null ? JsonSerializer.SerializeToUtf8Bytes(media.Segments)
+                : JsonSerializer.SerializeToUtf8Bytes(new { media.Segments, Clip = clipRange });
+        }
+        return Convert.ToHexString(SHA256.HashData(planBytes));
+    }
+
+    private static string VodShapeHash(HlsMedia media, MediaTimeRange? clipRange) =>
+        HashText(SegmentedMergeTransfer.HlsShapeFingerprint(media) + "|" + JsonSerializer.Serialize(clipRange));
+
+    // Download and recovery must use exactly the same transport timeline transformation.
+    private static ReadOnlyMemory<byte> ProcessVodTransportSegment(ReadOnlyMemory<byte> data,
+        IReadOnlyList<HlsSegment> segments, int i, bool hasSelectedDiscontinuity,
+        long? lastDiscontinuitySequence, HlsTransportTimeline timeline, ref TransportStreamValidator transport,
+        ref long epochOffset, ref long? timelineOriginPts, ref string? codecProfile, CancellationToken ct)
+    {
+        HlsSegment segment = segments[i];
+        bool firstOutputSegment = i == 0;
+        bool startEpoch = !firstOutputSegment && (segment.DiscontinuityBefore
+            || lastDiscontinuitySequence is long previousSequence && segment.DiscontinuitySequence != previousSequence);
+        if (startEpoch)
+        {
+            TransportStreamLayout expectedLayout = transport.SnapshotLayout()
+                ?? throw new MediaContainerException("The preceding HLS epoch has no complete program layout.");
+            var nextEpoch = new TransportStreamValidator(expectedLayout: expectedLayout);
+            nextEpoch.Validate(data.Span);
+            if (nextEpoch.SnapshotLayout() is null)
+                throw new MediaContainerException("The new HLS epoch did not begin with complete program tables.");
+            string? nextCodecProfile = HlsTransportCodecProfile.TryRead(data, ct);
+            if (codecProfile is null || nextCodecProfile is null)
+                throw new MediaContainerException("The HLS discontinuity has no verified H.264/AAC decoder configuration to compare.");
+            if (!string.Equals(codecProfile, nextCodecProfile, StringComparison.Ordinal))
+                throw new MediaContainerException("The HLS discontinuity changes decoder configuration; a remux is required.");
+            long firstPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
+                ?? throw new MediaContainerException("The new HLS epoch has no presentation timestamp to rebase.");
+            if (timelineOriginPts is not long originPts)
+                throw new MediaContainerException("The first HLS epoch has no verified presentation timestamp.");
+            long elapsedTicks = TimelineTicks(segments, i);
+            long targetPts = checked(originPts + elapsedTicks);
+            epochOffset = checked(targetPts - firstPts);
+            transport = nextEpoch;
+            data = timeline.Rewrite(data, epochOffset, startEpoch: true, ct: ct);
+        }
+        else
+        {
+            transport.Validate(data.Span);
+            if (firstOutputSegment && hasSelectedDiscontinuity)
+            {
+                timelineOriginPts = HlsTransportTimeline.FirstPresentationTimestamp(data.Span, ct)
+                    ?? throw new MediaContainerException("The first HLS epoch has no presentation timestamp to anchor later epochs.");
+                codecProfile = HlsTransportCodecProfile.TryRead(data, ct);
+            }
+            else if (!firstOutputSegment && hasSelectedDiscontinuity)
+            {
+                string? currentProfile = HlsTransportCodecProfile.TryRead(data, ct);
+                if (currentProfile is not null && codecProfile is not null
+                    && !string.Equals(codecProfile, currentProfile, StringComparison.Ordinal))
+                    throw new MediaContainerException("An HLS epoch changes decoder configuration between segments.");
+                codecProfile ??= currentProfile;
+            }
+            data = timeline.Rewrite(data, epochOffset, startEpoch: false, ct: ct);
+        }
+        return data;
+    }
+
+    internal async Task<(bool Valid, string? MediaState, string? Error)> VerifyVodRefreshAsync(
+        string replacementUrl, CancellationToken ct)
+    {
+        Cursor? cursor = ReadCursor();
+        long offset = Job.Extents.TotalBytes;
+        if (Job.MediaState is not null && cursor is null || cursor is { Mode: not null })
+            return (false, null, "The saved HLS cursor is invalid or is a live recording.");
+        if (Job.Extents.ContiguousFromZero() != offset || (cursor is null) != (offset == 0))
+            return (false, null, "The saved HLS cursor does not match the committed bytes.");
+        MediaTimeRange? clipRange = null;
+        if (Job.MediaPlanJson is not null)
+        {
+            if (!MediaTimeRange.TryParse(Job.MediaPlanJson, out MediaTimeRange range))
+                return (false, null, "The saved HLS time range is invalid.");
+            clipRange = range;
+        }
+        (string text, Uri baseUri) = await FetchTextAsync(replacementUrl, ct).ConfigureAwait(false);
+        if (!HlsParser.IsPlaylist(text) || HlsParser.IsMaster(text))
+            return (false, null, "The refreshed link must resolve to the selected HLS media playlist.");
+        HlsMedia media = HlsParser.ParseMedia(text, baseUri, allowTimelineChanges: true);
+        if (media.Unsupported is { } reason) return (false, null, reason);
+        if (!media.IsVod)
+            return cursor is null && clipRange is null ? (true, null, null)
+                : (false, null, "The refreshed HLS playlist is not a completed recording.");
+        if (media.Segments.Count == 0 || media.Segments.Any(segment => segment.IsGap)
+            || media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
+            return (false, null, "The refreshed HLS playlist has missing segments or changing initialization.");
+        string planHash = VodPlanHash(media, clipRange), shape = VodShapeHash(media, clipRange);
+        if (cursor is null) return (true, null, null);
+        bool samePlan = cursor.PlanHash == planHash;
+        if (!samePlan && cursor.VodShape != shape)
+            return (false, null, "The refreshed HLS timeline differs or the saved cursor has no verified timeline shape.");
+        IReadOnlyList<HlsSegment> segments = media.Segments;
+        if (clipRange is not null)
+        {
+            if (!clipRange.TrySelect([.. segments.Select(segment => segment.Duration)], out int first, out int count, out _, out _))
+                return (false, null, "The refreshed HLS timeline cannot reproduce the selected clip.");
+            segments = segments.Skip(first).Take(count).ToArray();
+        }
+        if (cursor.Next < 1 || cursor.Next > segments.Count || cursor.Offset != offset
+            || cursor.PrefixHash is not { Length: 64 } || !IsHash(cursor.PrefixHash))
+            return (false, null, "The saved HLS cursor does not match the committed prefix.");
+        bool fragmented = segments[0].Map is not null;
+        bool discontinuous = segments.Skip(1).Any(segment => segment.DiscontinuityBefore);
+        if (fragmented && discontinuous || fragmented && (cursor.InitLength is < 8 or > MaxInitializationBytes
+            || cursor.InitLength >= offset || cursor.Progress is null) || !fragmented && cursor.InitLength != 0)
+            return (false, null, "The refreshed HLS container differs from the committed cursor.");
+
+        return await ReplayVodPrefixAsync(media, baseUri.AbsoluteUri, segments, clipRange, cursor, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Build a VOD cursor from another delivery's complete, verified segment prefix.</summary>
+    internal async Task<(bool Valid, string? MediaState, string? Error)> ImportVodPrefixAsync(
+        string replacementUrl, string extension, CancellationToken ct)
+    {
+        long retained = Job.Extents.TotalBytes;
+        if (Job.Extents.ContiguousFromZero() != retained)
+            return (false, null, "The saved bytes are not a contiguous HLS prefix.");
+        (string text, Uri baseUri) = await FetchTextAsync(replacementUrl, ct).ConfigureAwait(false);
+        if (!HlsParser.IsPlaylist(text) || HlsParser.IsMaster(text))
+            return (false, null, "An alternate HLS delivery must identify the selected media playlist, not a master.");
+        HlsMedia media = HlsParser.ParseMedia(text, baseUri, allowTimelineChanges: true);
+        if (media.Unsupported is { } reason) return (false, null, reason);
+        if (!media.IsVod || media.Segments.Count == 0 || media.Segments.Any(segment => segment.IsGap)
+            || media.Segments.Skip(1).Any(segment => !SameInitialization(media.Segments[0].Map, segment.Map)))
+            return (false, null, "Only complete VOD playlists with unchanged initialization can import saved bytes.");
+        bool fragmented = media.Segments[0].Map is not null;
+        if (!extension.Equals(fragmented ? ".mp4" : ".ts", StringComparison.OrdinalIgnoreCase))
+            return (false, null, "The alternate playlist would change the selected output container.");
+        if (fragmented && media.Segments.Skip(1).Any(segment => segment.DiscontinuityBefore))
+            return (false, null, "Fragmented MP4 discontinuities cannot be safely rebased.");
+        if (retained == 0) return (true, null, null);
+        return await ReplayVodPrefixAsync(media, baseUri.AbsoluteUri, media.Segments, null, null, ct).ConfigureAwait(false);
+    }
+
+    private async Task<(bool Valid, string? MediaState, string? Error)> ReplayVodPrefixAsync(
+        HlsMedia media, string playlistUrl, IReadOnlyList<HlsSegment> segments, MediaTimeRange? clipRange,
+        Cursor? expected, CancellationToken ct)
+    {
+        long retained = Job.Extents.TotalBytes;
+        bool fragmented = segments[0].Map is not null;
+        bool discontinuous = segments.Skip(1).Any(segment => segment.DiscontinuityBefore);
+        if (fragmented && discontinuous)
+            return (false, null, "Fragmented MP4 discontinuities cannot be safely rebased.");
+        using PartialFile file = session.OpenFile(create: false);
+        if (file.Length < retained) return (false, null, "The saved file is shorter than its recorded progress.");
+        using var saved = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        MediaPartialIntegrity.HashPrefix(file, retained, saved, ct);
+        if (expected is not null && Convert.ToHexString(saved.GetCurrentHash()) != expected.PrefixHash)
+            return (false, null, "The saved HLS prefix failed SHA-256 validation.");
+        using var fresh = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        long position = 0;
+        bool Append(ReadOnlyMemory<byte> data)
+        {
+            if (data.Length == 0 || data.Length > retained - position) return false;
+            fresh.AppendData(data.Span);
+            position += data.Length;
+            return true;
+        }
+
+        int initLength = 0, next = 0;
+        FragmentedMp4? mp4 = null;
+        TransportStreamValidator? transport = fragmented ? null : new();
+        var timeline = new HlsTransportTimeline();
+        long epochOffset = 0;
+        long? timelineOriginPts = null, lastDiscontinuitySequence = null;
+        string? codecProfile = null;
+        var keys = new Dictionary<string, byte[]>();
+        try
+        {
+            if (segments[0].Map is { } map)
+            {
+                int copies = map.Key is null ? 1 : 2;
+                using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+                    SegmentBufferLimiter.Reservation(MaxInitializationBytes, map.Length, copies), ct).ConfigureAwait(false);
+                ReadOnlyMemory<byte> data = await FetchSegmentAsync(map.Uri, map.Offset, map.Length,
+                    MaxInitializationBytes, lease, copies, ct).ConfigureAwait(false);
+                if (map.Key is { } key)
+                {
+                    if (key.Iv is null) return (false, null, "Encrypted HLS initialization has no explicit IV.");
+                    data = await DecryptAsync(data, key, segments[0].Sequence, keys, ct).ConfigureAwait(false);
+                }
+                if (!Append(data)) return (false, null, "Saved data ends inside the HLS initialization.");
+                mp4 = FragmentedMp4.Open(data.Span);
+                if (Job.MediaProvider is not null && !mp4.HasAudio) return (false, null, "The HLS initialization lacks the required audio track.");
+                initLength = data.Length;
+            }
+            while (position < retained && next < segments.Count)
+            {
+                HlsSegment segment = segments[next];
+                var fetched = await FetchBufferedSegmentAsync(segment.Uri, segment.RangeOffset, segment.RangeLength,
+                    segment.Key is not null, ct, rewrite: discontinuous && !fragmented).ConfigureAwait(false);
+                using (fetched.Lease)
+                {
+                    ReadOnlyMemory<byte> data = fetched.Data;
+                    if (segment.Key is { } key) data = await DecryptAsync(data, key, segment.Sequence, keys, ct).ConfigureAwait(false);
+                    if (mp4 is not null) mp4.ValidateFragment(data.Span);
+                    else
+                    {
+                        var validator = transport!;
+                        data = ProcessVodTransportSegment(data, segments, next, discontinuous,
+                            lastDiscontinuitySequence, timeline, ref validator, ref epochOffset,
+                            ref timelineOriginPts, ref codecProfile, ct);
+                        transport = validator;
+                    }
+                    if (!Append(data)) return (false, null, "Saved data ends inside an HLS segment.");
+                }
+                lastDiscontinuitySequence = segment.DiscontinuitySequence;
+                next++;
+            }
+            if (next == 0 || position != retained || expected is not null && (next != expected.Next || initLength != expected.InitLength)
+                || !CryptographicOperations.FixedTimeEquals(fresh.GetCurrentHash(), saved.GetCurrentHash()))
+                return (false, null, "The alternate HLS segment prefix does not match the saved bytes.");
+            var cursor = new Cursor(playlistUrl, next, VodPlanHash(media, clipRange), retained,
+                Convert.ToHexString(fresh.GetCurrentHash()), initLength, mp4?.Snapshot(),
+                LastDiscontinuitySequence: lastDiscontinuitySequence,
+                EpochOffsetTicks: discontinuous ? epochOffset : null,
+                TimelineOriginPts: discontinuous ? timelineOriginPts : null,
+                TimelineCounters: discontinuous ? timeline.SnapshotCounters() : null,
+                CodecProfile: discontinuous ? codecProfile : null,
+                VodShape: VodShapeHash(media, clipRange));
+            return (true, JsonSerializer.Serialize(cursor), null);
+        }
+        finally { foreach (byte[] key in keys.Values) CryptographicOperations.ZeroMemory(key); }
+    }
+
     internal static async Task<(string? MediaState, string? Error)> PrepareLiveRefreshAsync(
         DownloadEngine engine, JobSession session, HttpTransport http, string savedState, string replacementUrl,
         RequestCredentials? credentials, CancellationToken ct)
@@ -839,9 +1028,9 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     }
 
     private async Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> FetchBufferedSegmentAsync(
-        string url, long? offset, long? length, bool encrypted, CancellationToken ct)
+        string url, long? offset, long? length, bool encrypted, CancellationToken ct, bool rewrite = false)
     {
-        int copies = encrypted ? 2 : 1;
+        int copies = (encrypted ? 2 : 1) + (rewrite ? 1 : 0);
         SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
             SegmentBufferLimiter.Reservation(MaxSegmentBytes, length, copies), ct).ConfigureAwait(false);
         try
@@ -950,7 +1139,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
 
     private RequestSpec Spec(long? start, long? end)
     {
-        RequestCredentials? credentials = credentialOverride ?? engine.CredentialsFor(Job.Id);
+        RequestCredentials? credentials = credentialOverride ?? (useStoredCredentials ? engine.CredentialsFor(Job.Id) : null);
         return new RequestSpec(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent,
             Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
     }

@@ -425,7 +425,12 @@ internal static class MediaTransferBridge
                 JsonSerializer.Serialize(new MediaTimeRange(audioStart, clipEndSeconds!.Value)), selection.Audio!.Id,
                 Output: MediaOutput.M4a, Secrets: TransferSecrets(step.Context, step.Url)), null);
         }
-        if (clipStartSeconds is not null && step.Protocol == StreamProtocol.Http)
+        bool silentWebm = item.Provider == "generic" && selection.Audio is null
+            && selection.Video is { Protocol: StreamProtocol.Http, Container: "webm", StandaloneVideo: true,
+                AudioUnverified: false, IsLive: false, VideoCodec: "vp8" or "vp9" }
+            && item.Duration is { TotalSeconds: > 0 }
+            && !UrlUtil.HostIs(item.SourceUrl, "instagram.com", "tiktok.com", "youtube.com", "youtube-nocookie.com", "youtu.be", "facebook.com", "fb.watch");
+        if (clipStartSeconds is not null && step.Protocol == StreamProtocol.Http && !silentWebm)
         {
             if (selection.Video is not { } localMuxedVideo || selection.Audio is not null
                 || !CanClipLocalMp4Tracks([localMuxedVideo], step.Container ?? selection.OutputContainer)
@@ -459,12 +464,18 @@ internal static class MediaTransferBridge
         string summary = selection.Summary;
         if (step.Protocol == StreamProtocol.Hls && clipStartSeconds is double clipStart)
             mediaPlan = JsonSerializer.Serialize(new MediaTimeRange(clipStart, clipEndSeconds!.Value));
-        if (item.Provider == "generic" && step.Protocol == StreamProtocol.Http && step.Container == "mp4"
-            && selection.Video is { AudioUnverified: true, MutedLoop: true } directVideo
+        if (item.Provider == "generic" && step.Protocol == StreamProtocol.Http && step.Container is ("mp4" or "webm")
+            && selection.Video is { } directVideo && (directVideo.StandaloneVideo || step.Container == "mp4" && directVideo is { AudioUnverified: true, MutedLoop: true })
             && !UrlUtil.HostIs(item.SourceUrl, "instagram.com", "tiktok.com", "youtube.com", "youtube-nocookie.com", "youtu.be", "facebook.com", "fb.watch"))
         {
             mediaPlan = DirectMediaPlan.AudioIfPresent;
-            summary = directVideo.Height is int height ? $"{height}p · may be silent" : "Video · may be silent";
+            string audioLabel = directVideo.StandaloneVideo ? "no audio" : "may be silent";
+            summary = directVideo.Height is int height ? $"{height}p · {audioLabel}" : $"Video · {audioLabel}";
+        }
+        if (silentWebm && clipStartSeconds is double webmStart)
+        {
+            if (selection.Subtitles.Count > 0) return (null, LocalMp4ClipSubtitleError);
+            mediaPlan = DirectMediaPlan.WebmClip(new MediaTimeRange(webmStart, clipEndSeconds!.Value));
         }
         return (new MediaDownloadChoice(step.Url.AbsoluteUri, name,
             step.Protocol == StreamProtocol.Hls ? JobKind.Hls : step.Protocol == StreamProtocol.Dash ? JobKind.Dash : JobKind.Http,
@@ -478,7 +489,7 @@ internal static class MediaTransferBridge
                 && step.Container is ("mp3" or "flac" or "ogg" or "vorbis" or "opus")
                     ? SerializeAudioMetadata(item) : null,
             CanUseFullFileClip: clipStartSeconds is null && step.Protocol == StreamProtocol.Http
-                && (directAacClip || selection.Video is { } localClipVideo && selection.Audio is null
+                && (silentWebm || directAacClip || selection.Video is { } localClipVideo && selection.Audio is null
                     && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer))), null);
     }
 

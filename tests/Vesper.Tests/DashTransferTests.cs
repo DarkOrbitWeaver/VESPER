@@ -74,6 +74,70 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public void FragmentMetadataReaderPreservesEverySampleWithoutReadingPayloads()
+    {
+        byte[] initialization = Fixture("av-init.mp4");
+        var original = FragmentedMp4.Open(initialization, captureSamples: true);
+        var optimized = FragmentedMp4.Open(initialization, captureSamples: true);
+        using var source = new CountingMediaStream();
+        source.Write(initialization);
+        long totalBytes = 0, inspectedBytes = 0;
+        for (int i = 1; i <= 3; i++)
+        {
+            byte[] fragment = Fixture($"av-{i}.m4s");
+            // Extended-size padding before the moof exercises non-zero box offsets.
+            byte[] padding = new byte[64];
+            BinaryPrimitives.WriteUInt32BigEndian(padding, 1);
+            "free"u8.CopyTo(padding.AsSpan(4));
+            BinaryPrimitives.WriteUInt64BigEndian(padding.AsSpan(8), (ulong)padding.Length);
+            byte[] part = [.. padding, .. fragment];
+            long offset = source.Length;
+            source.Position = offset;
+            source.Write(part);
+            original.ValidateFragment(part, offset);
+            long before = source.BytesRead;
+            optimized.ValidateFragment(source, offset, part.Length, default);
+            inspectedBytes += source.BytesRead - before;
+            totalBytes += part.Length;
+        }
+        original.Finish(true, true);
+        optimized.Finish(true, true);
+        var oldTracks = original.GetTracks();
+        var newTracks = optimized.GetTracks();
+        for (int i = 0; i < oldTracks.Count; i++)
+            Assert.Equal(oldTracks[i].Samples.ToArray(), newTracks[i].Samples.ToArray());
+        Assert.Equal(original.Snapshot().Sequence, optimized.Snapshot().Sequence);
+        Assert.Equal(original.Snapshot().Tracks.ToArray(), optimized.Snapshot().Tracks.ToArray());
+        Assert.True(inspectedBytes < totalBytes / 4, $"Read {inspectedBytes} of {totalBytes} bytes.");
+        Console.WriteLine($"fmp4 metadata reads: old={totalBytes}; new={inspectedBytes}; saved={totalBytes - inspectedBytes}");
+        using var output = new MemoryStream();
+        var inputs = newTracks.Select(track => (Track: track, Source: (Stream)source)).ToList();
+        MediaMerger.Merge(inputs, "mp4", output, default);
+        MediaMerger.ValidateRemux(output, output.Length, inputs, default);
+    }
+
+    [Fact]
+    public void FragmentMetadataReaderRejectsTruncationAndCancellation()
+    {
+        byte[] init = Fixture("av-init.mp4"), fragment = Fixture("av-1.m4s");
+        using var source = new MemoryStream(fragment);
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(init).ValidateFragment(source, 0, fragment.Length - 1, default));
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(init).ValidateFragment(source, 1, fragment.Length, default));
+        Assert.Throws<OperationCanceledException>(() => FragmentedMp4.Open(init).ValidateFragment(source, 0, fragment.Length, new CancellationToken(true)));
+    }
+
+    private sealed class CountingMediaStream : MemoryStream
+    {
+        public long BytesRead { get; private set; }
+        public override int Read(Span<byte> buffer)
+        {
+            int read = base.Read(buffer);
+            BytesRead += read;
+            return read;
+        }
+    }
+
+    [Fact]
     public void AudioOnly_IsSupported_ButCannotPretendToContainVideo()
     {
         var mp4 = FragmentedMp4.Open(Fixture("audio-init.mp4"));
@@ -258,6 +322,51 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public async Task SegmentedMerge_OverlapsClearRequestsAndCommitsInOrder()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.FragmentDelayMs = 100;
+        using var h = new Harness();
+        MediaMergePlan plan = SegmentedPlan(server);
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "pipelined.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        var done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
+        Assert.True(done.State == JobState.Completed, done.Message);
+        Assert.Equal(2, server.MaxActiveFragmentRequests);
+        foreach (string path in new[] { "/av-1.m4s", "/av-2.m4s", "/av-3.m4s" })
+            Assert.Equal(2, server.Hits(path));
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.Equal([TrackKind.Video, TrackKind.Audio], MediaMerger.Demux(output, output.Length, default).Select(track => track.Kind));
+    }
+
+    [Fact]
+    public async Task SegmentedMerge_PauseDrainsLookaheadAndResumesCommittedPrefix()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.SlowFirst = true;
+        using var h = new Harness();
+        MediaMergePlan plan = SegmentedPlan(server);
+        AddResult added = h.Engine.Add(new AddRequest(server.Url("/manifest.mpd"), FileName: "paused.mp4",
+            Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        await server.FirstFragmentStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await h.WaitAsync(added.JobId, _ => server.Hits("/av-2.m4s") == 1);
+        h.Engine.Pause(added.JobId);
+        var paused = await h.WaitForStateAsync(added.JobId, JobState.Paused);
+        Assert.Null(paused.FinalPath);
+        Assert.Equal(Fixture("av-init.mp4").LongLength, paused.CommittedBytes);
+        Assert.Equal(Fixture("av-init.mp4"), await File.ReadAllBytesAsync(paused.PartialPath));
+        server.SlowFirst = false;
+        h.Restart();
+        h.Engine.Resume(added.JobId);
+        var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.NotNull(done.FinalPath);
+        Assert.Equal(2, server.Hits("/av-init.mp4")); // once for each rendition
+        Assert.Equal(3, server.Hits("/av-2.m4s")); // uncommitted lookahead is fetched again
+    }
+
+    [Fact]
     public async Task SegmentedMerge_ResumesSeparateDashRenditionsAndRemuxesThem()
     {
         await using var server = await FixtureServer.StartAsync();
@@ -398,6 +507,252 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public async Task AcquisitionSwitchFromDashToHttpKeepsTheSameJobAndVerifiesEverySavedByte()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.ExpireSecond = true;
+        using var h = new Harness();
+        DashDownloadPlan plan = server.Plan(ranges: false);
+        string sourceUrl = server.Url("/manifest.mpd");
+        const string quality = "720p h264 with audio";
+        AddResult added = h.Engine.Add(new AddRequest(sourceUrl, FileName: "switch.mp4", Kind: JobKind.Dash,
+            MediaProvider: "fixture", MediaId: "av", MediaFormatId: plan.RepresentationId, MediaQuality: quality,
+            MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
+        Assert.True(stopped.CommittedBytes > 0);
+        byte[] prefix = await File.ReadAllBytesAsync(stopped.PartialPath);
+        var choice = new MediaAcquisitionReplacement(new ResolvedMediaSource("fixture", "av", plan.RepresentationId,
+            server.Url("/all.mp4")), JobKind.Http, "switch.mp4", quality, ExactSize: Expected.Length);
+        RescueResult wrongQuality = await h.Engine.SwitchMediaAcquisitionAsync(added.JobId, choice with { Quality = "360p" }, sourceUrl);
+        Assert.False(wrongQuality.Accepted);
+        RescueResult wrongSize = await h.Engine.SwitchMediaAcquisitionAsync(added.JobId, choice with { ExactSize = Expected.Length + 1 }, sourceUrl);
+        Assert.False(wrongSize.Accepted);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(stopped.PartialPath));
+        Assert.Equal(JobKind.Dash, h.Engine.Snapshot(added.JobId)!.Kind);
+        h.Engine.Options.MaxConcurrentJobs = 0;
+        h.Engine.SettingsChanged();
+        server.ExpireSecond = false;
+        RescueResult accepted = await h.Engine.SwitchMediaAcquisitionAsync(added.JobId, choice, sourceUrl);
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(stopped.CommittedBytes, accepted.RetainedBytes);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        Assert.Equal(JobKind.Http, h.Engine.Snapshot(added.JobId)!.Kind);
+        Assert.Equal(stopped.CommittedBytes, h.Engine.Snapshot(added.JobId)!.CommittedBytes);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(stopped.PartialPath));
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal(JobKind.Http, done.Kind);
+        Assert.Equal(added.JobId, done.Id);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Single(h.Engine.Snapshots());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcquisitionSwitchFromHttpToDashRequiresAnExactFragmentBoundary(bool misaligned)
+    {
+        await using var server = await FixtureServer.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        DashDownloadPlan plan = server.Plan(ranges: false);
+        const string quality = "720p h264 with audio";
+        string oldUrl = server.Url("/all.mp4");
+        AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "switch.mp4", Kind: JobKind.Http,
+            MediaProvider: "fixture", MediaId: "av", MediaFormatId: plan.RepresentationId, MediaQuality: quality));
+        Assert.True(added.Ok, added.Message);
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!;
+        DownloadJob job = jobs[added.JobId];
+        int count = Fixture("av-init.mp4").Length + Fixture("av-1.m4s").Length + (misaligned ? 1 : 0);
+        byte[] prefix = Expected[..count];
+        await File.WriteAllBytesAsync(job.PartialPath, prefix);
+        h.OwnFixturePartial(job.Id);
+        var extents = new ExtentSet();
+        extents.Add(new Vesper.Engine.ByteRange(0, count));
+        h.Engine.UpdateJob(job, current =>
+        {
+            current.Extents = extents;
+            current.State = JobState.NeedsLink;
+            current.Reason = "expired";
+        });
+        var choice = new MediaAcquisitionReplacement(new ResolvedMediaSource("fixture", "av", plan.RepresentationId,
+            server.Url("/manifest.mpd")), JobKind.Dash, "switch.mp4", quality, plan.ToJson());
+        RescueResult result = await h.Engine.SwitchMediaAcquisitionAsync(job.Id, choice, oldUrl);
+        Assert.Equal(!misaligned, result.Accepted);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(job.PartialPath));
+        if (misaligned)
+        {
+            Assert.Equal(JobKind.Http, h.Engine.Snapshot(job.Id)!.Kind);
+            return;
+        }
+        Assert.Equal(count, result.RetainedBytes);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        Assert.Equal(JobKind.Dash, h.Engine.Snapshot(job.Id)!.Kind);
+        Assert.Equal(count, h.Engine.Snapshot(job.Id)!.CommittedBytes);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(job.PartialPath));
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(job.Id, JobState.Completed);
+        Assert.Equal(JobKind.Dash, done.Kind);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Equal(1, server.Hits("/av-1.m4s"));
+    }
+
+    [Theory]
+    [InlineData(JobKind.Http)]
+    [InlineData(JobKind.Dash)]
+    public async Task AcquisitionSwitchImportsACompleteHlsPrefixAndSurvivesRestart(JobKind originalKind)
+    {
+        await using var server = await FixtureServer.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string quality = "720p h264 with audio";
+        var plan = server.Plan(ranges: false);
+        string oldUrl = server.Url(originalKind == JobKind.Http ? "/all.mp4" : "/manifest.mpd");
+        AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "switch.mp4", Kind: originalKind,
+            MediaProvider: "fixture", MediaId: "av", MediaFormatId: plan.RepresentationId, MediaQuality: quality,
+            MediaPlanJson: originalKind == JobKind.Dash ? plan.ToJson() : null));
+        Assert.True(added.Ok, added.Message);
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!;
+        DownloadJob job = jobs[added.JobId];
+        int count = Fixture("av-init.mp4").Length + Fixture("av-1.m4s").Length;
+        byte[] prefix = Expected[..count];
+        await File.WriteAllBytesAsync(job.PartialPath, prefix);
+        h.OwnFixturePartial(job.Id);
+        var extents = new ExtentSet();
+        extents.Add(new Vesper.Engine.ByteRange(0, count));
+        h.Engine.UpdateJob(job, current =>
+        {
+            current.Extents = extents;
+            current.State = JobState.NeedsLink;
+            current.Reason = "expired";
+        });
+        var choice = new MediaAcquisitionReplacement(new ResolvedMediaSource("fixture", "av", plan.RepresentationId,
+            server.Url("/hls.m3u8")), JobKind.Hls, "switch.mp4", quality);
+        RescueResult wrong = await h.Engine.SwitchMediaAcquisitionAsync(job.Id, choice with
+        {
+            Source = choice.Source with { Url = server.Url("/wrong.m3u8") }
+        }, oldUrl);
+        Assert.False(wrong.Accepted);
+        Assert.Equal(originalKind, h.Engine.Snapshot(job.Id)!.Kind);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(job.PartialPath));
+        RescueResult result = await h.Engine.SwitchMediaAcquisitionAsync(job.Id, choice, oldUrl);
+        Assert.True(result.Accepted, result.Message);
+        Assert.Equal(count, result.RetainedBytes);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        Assert.Equal(JobKind.Hls, h.Engine.Snapshot(job.Id)!.Kind);
+        Assert.Equal(count, h.Engine.Snapshot(job.Id)!.CommittedBytes);
+        Assert.Equal(prefix, await File.ReadAllBytesAsync(job.PartialPath));
+        int firstHits = server.Hits("/av-1.m4s");
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(job.Id, JobState.Completed);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Equal(firstHits, server.Hits("/av-1.m4s"));
+        Assert.Single(h.Engine.Snapshots());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HttpMirrorRetainsSparseRangesOnlyWhenEveryRangeMatches(bool changeValidator)
+    {
+        await using var server = await FixtureServer.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string quality = "720p h264 with audio";
+        string oldUrl = server.Url("/all.mp4");
+        AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "mirror.mp4", Kind: JobKind.Http,
+            MediaProvider: "fixture", MediaId: "av", MediaFormatId: "av-source-muxed", MediaQuality: quality));
+        Assert.True(added.Ok, added.Message);
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!;
+        DownloadJob job = jobs[added.JobId];
+        byte[] partial = new byte[Expected.Length];
+        int block = Expected.Length / 5;
+        Expected.AsSpan(0, block).CopyTo(partial);
+        Expected.AsSpan(block * 3, block).CopyTo(partial.AsSpan(block * 3));
+        await File.WriteAllBytesAsync(job.PartialPath, partial);
+        h.OwnFixturePartial(job.Id);
+        var extents = new ExtentSet();
+        extents.Add(new Vesper.Engine.ByteRange(0, block));
+        extents.Add(new Vesper.Engine.ByteRange(block * 3, block * 4));
+        h.Engine.UpdateJob(job, current =>
+        {
+            current.Extents = extents;
+            current.TotalBytes = Expected.Length;
+            current.State = JobState.NeedsLink;
+            current.Reason = "expired";
+        });
+        var choice = new MediaAcquisitionReplacement(new ResolvedMediaSource("fixture", "av", "av-source-muxed",
+            server.Url("/mirror.mp4")), JobKind.Http, "mirror.mp4", quality, ExactSize: Expected.Length);
+        RescueResult wrong = await h.Engine.SwitchMediaAcquisitionAsync(job.Id, choice with
+        {
+            Source = choice.Source with { Url = server.Url("/wrong.mp4") }
+        }, oldUrl);
+        Assert.False(wrong.Accepted);
+        Assert.Equal(partial, await File.ReadAllBytesAsync(job.PartialPath));
+        server.ChangeMirrorValidator = changeValidator;
+        RescueResult result = await h.Engine.SwitchMediaAcquisitionAsync(job.Id, choice, oldUrl);
+        Assert.Equal(!changeValidator, result.Accepted);
+        Assert.Equal(partial, await File.ReadAllBytesAsync(job.PartialPath));
+        if (changeValidator)
+        {
+            Assert.Equal(oldUrl, h.Engine.Snapshot(job.Id)!.SourceUrl);
+            return;
+        }
+        Assert.Equal(block * 2, result.RetainedBytes);
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+        Assert.Equal(block * 2, h.Engine.Snapshot(job.Id)!.CommittedBytes);
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(job.Id, JobState.Completed);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+        Assert.Single(h.Engine.Snapshots());
+    }
+
+    [Fact]
+    public async Task AutomaticDashRefreshRebasesOnlyAnIdenticalCommittedPrefix()
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.ExpireSecond = true;
+        using var h = new Harness();
+        Guid id = Add(h, server);
+        JobSnapshot stopped = await h.WaitForStateAsync(id, JobState.NeedsLink);
+        Assert.True(stopped.CommittedBytes > 0);
+        byte[] before = await File.ReadAllBytesAsync(stopped.PartialPath);
+        DashDownloadPlan original = server.Plan(ranges: false);
+        DashDownloadPlan fresh = original with
+        {
+            Initialization = original.Initialization with { Url = original.Initialization.Url + "?fresh=1" },
+            Fragments = original.Fragments.Select(part => part with { Url = part.Url + "?fresh=1" }).ToArray()
+        };
+        var source = new ResolvedMediaSource("fixture", "av", original.RepresentationId,
+            server.Url("/manifest.mpd?fresh=1"));
+        RescueResult stale = await h.Engine.RefreshDashPlanAsync(id, source, fresh.ToJson(),
+            expectedExpiredSource: stopped.SourceUrl + "?stale=1");
+        Assert.False(stale.Accepted);
+        var mismatched = fresh with { Fragments = fresh.Fragments.Select((part, index) =>
+            index == 0 ? part with { Url = server.Url("/audio-1.m4s") } : part).ToArray() };
+        RescueResult refused = await h.Engine.RefreshDashPlanAsync(id, source, mismatched.ToJson(),
+            expectedExpiredSource: stopped.SourceUrl);
+        Assert.False(refused.Accepted);
+        Assert.Equal(stopped.SourceUrl, h.Engine.Snapshot(id)!.SourceUrl);
+        Assert.Equal(before, await File.ReadAllBytesAsync(stopped.PartialPath));
+        server.ExpireSecond = false;
+        RescueResult accepted = await h.Engine.RefreshDashPlanAsync(id, source, fresh.ToJson(),
+            expectedExpiredSource: stopped.SourceUrl);
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(stopped.CommittedBytes, accepted.RetainedBytes);
+        var done = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
     public async Task FileLinkRescue_CannotReplaceAFragmentManifest()
     {
         await using var server = await FixtureServer.StartAsync(); server.ExpireSecond = true;
@@ -500,7 +855,7 @@ public sealed class DashTransferTests
         private int _activeFragmentRequests;
         private int _maxActiveFragmentRequests;
         private string _base = "";
-        internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst, OversizedRangeBody;
+        internal bool IgnoreRanges, InvalidFragment, ExpireSecond, SlowFirst, OversizedRangeBody, ChangeMirrorValidator;
         internal int FragmentDelayMs;
         internal string? RequiredCookie;
         internal bool RejectCredentials;
@@ -513,6 +868,15 @@ public sealed class DashTransferTests
         {
             foreach (string name in new[] { "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s", "audio-init.mp4", "audio-1.m4s" }) _objects["/" + name] = Fixture(name);
             _objects["/all.mp4"] = Expected;
+            _objects["/mirror.mp4"] = Expected;
+            byte[] wrong = Expected.ToArray(); wrong[wrong.Length * 3 / 5 + 1] ^= 0x5a;
+            _objects["/wrong.mp4"] = wrong;
+            byte[] wrongFragment = Fixture("av-1.m4s").ToArray(); wrongFragment[^1] ^= 0x5a;
+            _objects["/wrong-1.m4s"] = wrongFragment;
+            string playlist = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"av-init.mp4\"\n"
+                + "#EXTINF:1,\nav-1.m4s\n#EXTINF:1,\nav-2.m4s\n#EXTINF:1,\nav-3.m4s\n#EXT-X-ENDLIST\n";
+            _objects["/hls.m3u8"] = Encoding.UTF8.GetBytes(playlist);
+            _objects["/wrong.m3u8"] = Encoding.UTF8.GetBytes(playlist.Replace("av-1.m4s", "wrong-1.m4s"));
             var builder = WebApplication.CreateSlimBuilder(); builder.WebHost.UseUrls("http://127.0.0.1:0"); builder.Logging.ClearProviders();
             _app = builder.Build(); _app.Run(ServeAsync);
         }
@@ -577,7 +941,7 @@ public sealed class DashTransferTests
             int start = 0, end = data.Length - 1;
             if (!IgnoreRanges && context.Request.Headers.Range.ToString() is { Length: > 6 } range)
             {
-                var parts = range[6..].Split('-'); start = int.Parse(parts[0]); end = int.Parse(parts[1]);
+                var parts = range[6..].Split('-'); start = int.Parse(parts[0]); end = parts[1].Length == 0 ? data.Length - 1 : int.Parse(parts[1]);
                 context.Response.StatusCode = 206; context.Response.Headers.ContentRange = $"bytes {start}-{end}/{data.Length}";
                 if (OversizedRangeBody)
                 {
@@ -587,6 +951,7 @@ public sealed class DashTransferTests
                     return;
                 }
             }
+            context.Response.Headers.ETag = path == "/mirror.mp4" && ChangeMirrorValidator && start > 0 ? "\"changed\"" : "\"fixture-full-file\"";
             context.Response.ContentType = "video/mp4"; context.Response.ContentLength = end - start + 1;
             await context.Response.Body.WriteAsync(data.AsMemory(start, end - start + 1), context.RequestAborted);
         }

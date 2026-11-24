@@ -6,7 +6,8 @@ using System.Text.Json;
 namespace Vesper.Engine;
 
 /// <summary>Downloads separate static HLS or DASH renditions into the merge job, then remuxes validated samples.</summary>
-internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
+internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession session, HttpTransport http,
+    RequestCredentials? refreshCredentials = null, bool useStoredCredentials = true)
 {
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
     private const int MaxInitializationBytes = 8 * 1024 * 1024;
@@ -45,9 +46,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         PreparedTrack[] tracks;
         try
         {
-            tracks = new PreparedTrack[plan.Tracks.Count];
-            for (int i = 0; i < tracks.Length; i++)
-                tracks[i] = await PrepareTrackAsync(plan.Tracks[i], plan.ClipRange, ct).ConfigureAwait(false);
+            // A separate audio and video playlist can be resolved concurrently.
+            tracks = await Task.WhenAll(plan.Tracks.Select(track =>
+                PrepareTrackAsync(track, plan.ClipRange, ct))).ConfigureAwait(false);
         }
         catch (MediaContainerException ex) { return RunOutcome.NeedsAttention("invalid-container", ex.Message + " Saved data was kept."); }
 
@@ -81,6 +82,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
         using var keys = new HlsKeyCache(cursor?.KeyFingerprints);
         if (!keys.Valid) return Stop("The saved HLS key identities are invalid.");
+        using var fetchStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task<BufferedPart>? prefetched = null;
         try
         {
             session.SetPhase(JobState.Downloading);
@@ -93,12 +96,15 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 {
                     ct.ThrowIfCancellationRequested();
                     Part part = prepared.Parts[pi];
-                    long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
-                    int copies = part.Key is null ? 1 : 2;
-                    using SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
-                        SegmentBufferLimiter.Reservation(limit, part.Length, copies), ct).ConfigureAwait(false);
-                    ReadOnlyMemory<byte> data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct,
-                        lease, copies).ConfigureAwait(false);
+                    var current = prefetched ?? FetchBufferedPartAsync(part, fetchStop.Token);
+                    prefetched = null;
+                    // One lookahead, using the existing global memory/connection budget.
+                    // Initialize and decrypt in order; only independent clear media GETs
+                    // are eligible. Never advance the durable cursor until this part commits.
+                    if (pi + 1 < prepared.Parts.Count && CanPrefetch(part, prepared.Parts[pi + 1]))
+                        prefetched = FetchBufferedPartAsync(prepared.Parts[pi + 1], fetchStop.Token);
+                    using BufferedPart received = await current.ConfigureAwait(false);
+                    ReadOnlyMemory<byte> data = received.Data;
                     if (part.Key is { } key)
                     {
                         if (part.Initialization && key.Iv is null)
@@ -131,13 +137,50 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         {
             return RunOutcome.NeedsAttention("invalid-container", ex.Message + " Saved data was kept.");
         }
-        finally { keys.Clear(); }
+        finally
+        {
+            fetchStop.Cancel();
+            if (prefetched is not null)
+            {
+                try { (await prefetched.ConfigureAwait(false)).Dispose(); }
+                catch (Exception) { /* Observe speculative fetch failure; the ordered result owns the outcome. */ }
+            }
+            keys.Clear();
+        }
 
         if (completed.Where((count, i) => count != tracks[i].Parts.Count).Any())
             return RunOutcome.NeedsAttention("incomplete", "A rendition is incomplete. Saved segments were kept; resume to continue.");
         await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
         engine.UpdateJob(Job, job => job.Message = "Merging tracks");
         return await MergeAsync(plan, fingerprint, tracks, completed, lengths, ct).ConfigureAwait(false);
+    }
+
+    private sealed record BufferedPart(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease) : IDisposable
+    {
+        public void Dispose() => Lease.Dispose();
+    }
+
+    private static bool CanPrefetch(Part first, Part second)
+        => !first.Initialization && !second.Initialization && first.Key is null && second.Key is null
+           && (!string.Equals(first.Url, second.Url, StringComparison.Ordinal)
+               || first.Offset is long a && first.Length is long al && second.Offset is long b
+                   && second.Length is long bl && a >= 0 && b >= 0 && al > 0 && bl > 0
+                   && a <= long.MaxValue - al && b <= long.MaxValue - bl
+                   && (a + al <= b || b + bl <= a));
+
+    private async Task<BufferedPart> FetchBufferedPartAsync(Part part, CancellationToken ct)
+    {
+        long limit = part.Initialization ? MaxInitializationBytes : MaxPartBytes;
+        int copies = part.Key is null ? 1 : 2;
+        SegmentBufferLease lease = await engine.AcquireSegmentBufferAsync(
+            SegmentBufferLimiter.Reservation(limit, part.Length, copies), ct).ConfigureAwait(false);
+        try
+        {
+            var data = await FetchPartAsync(part.Url, part.Offset, part.Length, limit, ct,
+                lease, copies).ConfigureAwait(false);
+            return new BufferedPart(data, lease);
+        }
+        catch { lease.Dispose(); throw; }
     }
 
     private Cursor? ReadCursor()
@@ -202,9 +245,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         PreparedTrack[] tracks;
         try
         {
-            tracks = new PreparedTrack[replacementPlan.Tracks.Count];
-            for (int i = 0; i < tracks.Length; i++)
-                tracks[i] = await PrepareTrackAsync(replacementPlan.Tracks[i], replacementPlan.ClipRange, ct).ConfigureAwait(false);
+            tracks = await Task.WhenAll(replacementPlan.Tracks.Select(track =>
+                PrepareTrackAsync(track, replacementPlan.ClipRange, ct))).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (RunnerStop ex) { return (false, null, ex.Outcome.Message + " Saved data was kept."); }
@@ -416,7 +458,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         session.AddConnection();
         try
         {
-            RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
+            RequestCredentials? credentials = useStoredCredentials ? engine.CredentialsFor(Job.Id) : refreshCredentials;
             using HttpResponseMessage response = await http.SendAsync(uri, new RequestSpec(offset, end, Referer: Job.Referer,
                 UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
                 CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl), ct).ConfigureAwait(false);
@@ -511,8 +553,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 if (source.Length != partLengths.Sum()) return Stop("The committed rendition file length changed.");
                 tracksIdentity = PathSafety.TemporaryFileIdentity(source.SafeFileHandle)
                     ?? throw new IOException("Stable temporary file identity is not supported on this platform.");
-                using var samples = MergeTransfer.CreateNewSidecar(samplesPath, FileOptions.RandomAccess);
-                samplesIdentity = MergeTransfer.CaptureSidecarIdentity(samples);
+                using var samples = tracks.All(track => track.Fragmented) ? null
+                    : MergeTransfer.CreateNewSidecar(samplesPath, FileOptions.RandomAccess);
+                if (samples is not null) samplesIdentity = MergeTransfer.CaptureSidecarIdentity(samples);
                 var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
                 int partIndex = 0;
                 long trackOffset = 0;
@@ -536,14 +579,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                         && ReadAt(source, trackOffset, 3).AsSpan().SequenceEqual("ID3"u8))
                     {
                         using var region = new RegionStream(source, trackOffset, trackLength);
-                        demuxed = PackedAudioDemuxer.Read(region, sizes, samples, ct);
-                        sampleSource = samples;
+                        demuxed = PackedAudioDemuxer.Read(region, sizes, samples!, ct);
+                        sampleSource = samples!;
                     }
                     else
                     {
                         using var region = new RegionStream(source, trackOffset, trackLength);
-                        demuxed = MpegTsDemuxer.Read(region, trackLength, samples, ct);
-                        sampleSource = samples;
+                        demuxed = MpegTsDemuxer.Read(region, trackLength, samples!, ct);
+                        sampleSource = samples!;
                     }
                     DemuxedTrack[] selectedTracks = [.. demuxed.Where(track => track.Kind == kind)];
                     if (selectedTracks.Length == 0)
@@ -559,7 +602,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     inputs.Add((selected, sampleSource));
                     trackOffset += trackLength;
                 }
-                samples.Flush(flushToDisk: true);
+                samples?.Flush(flushToDisk: true);
                 if (inputs.Count == 2) ValidateTimeline(inputs);
                 if (plan.ClipRange is not null)
                 {
@@ -589,10 +632,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;
-                    using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Verify, output.Length))
-                        MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
-                    output.Position = 0;
-                    sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+                    sha = await MergeTransfer.ValidateAndHashOutputAsync(Job.Id, output, length, inputs, merged, ct)
+                        .ConfigureAwait(false);
                 }
                 engine.Failpoint("merge.afterStageWrite");
             }
@@ -639,14 +680,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
     private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
     {
-        string? identity = await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
+        using MergeTransfer.VerifiedOutput verified = await MergeTransfer.FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256,
             cursor.TracksLength, cursor.TracksSha256, cursor.MuxIdentity, cursor.TracksIdentity, ct).ConfigureAwait(false);
         var extents = new ExtentSet();
         extents.Add(new ByteRange(0, cursor.MuxLength));
         DownloadJob committed = engine.CommitCheckpoint(Job, extents, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
-            totalBytes: cursor.MuxLength, partialIdentity: identity);
-        engine.WriteManifest(committed);
-        return await PublishAsync(ct).ConfigureAwait(false);
+            totalBytes: cursor.MuxLength, partialIdentity: verified.Identity);
+        engine.WriteManifest(committed, verified.File.SafeFileHandle);
+        return await PublishAsync(ct, verified).ConfigureAwait(false);
     }
 
     private static List<DemuxedTrack> DemuxFragmented(Stream source, long trackOffset, long[] partLengths,
@@ -667,8 +708,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         {
             ct.ThrowIfCancellationRequested();
             if (partLengths[i] is <= 0 or > MaxPartBytes) throw new MediaContainerException("A fragmented media part exceeds its size limit.");
-            byte[] fragment = ReadAt(source, partOffset, checked((int)partLengths[i]));
-            mp4.ValidateFragment(fragment, partOffset);
+            mp4.ValidateFragment(source, partOffset, checked((int)partLengths[i]), ct);
             partOffset += partLengths[i];
         }
         mp4.Finish(requireAudio: requiredKind == TrackKind.Audio, requireVideo: requiredKind == TrackKind.Video);
@@ -762,14 +802,14 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 })
             return Stop("The merged output cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged output is missing.");
-        if (!await MergeTransfer.VerifyMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false))
-            return Stop("The merged output failed its saved validation.");
-        return await PublishAsync(ct).ConfigureAwait(false);
+        using MergeTransfer.VerifiedOutput? verified = await MergeTransfer.OpenVerifiedMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false);
+        if (verified is null) return Stop("The merged output failed its saved validation.");
+        return await PublishAsync(ct, verified).ConfigureAwait(false);
     }
 
-    private async Task<RunOutcome> PublishAsync(CancellationToken ct)
+    private async Task<RunOutcome> PublishAsync(CancellationToken ct, MergeTransfer.VerifiedOutput verified)
     {
-        RunOutcome result = await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
+        RunOutcome result = await engine.FinalizeVerifiedMergeAsync(session, verified, ct).ConfigureAwait(false);
         if (result.State == JobState.Completed && !MergeTransfer.DeleteSidecars(Job))
             engine.UpdateJob(Job, job => job.Message = "Saved. A temporary track file could not be removed: " + PathSafety.ForDisplay(MergeTransfer.TracksPath(job)));
         return result;

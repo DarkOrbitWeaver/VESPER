@@ -51,6 +51,18 @@ internal static class WebmDemuxer
             return (id, allOnes ? -1 : size, idLen + sizeLen);
         }
 
+        public void Read(long pos, Span<byte> destination) => MuxIo.ReadExact(s, pos, destination);
+
+        public ulong ReadUInt(long pos, int count)
+        {
+            if (count is < 1 or > 8) throw Bad("an integer has an invalid size");
+            Span<byte> bytes = stackalloc byte[8];
+            Read(pos, bytes[..count]);
+            ulong value = 0;
+            foreach (byte b in bytes[..count]) value = (value << 8) | b;
+            return value;
+        }
+
         public byte[] Read(long pos, int count)
         {
             var data = new byte[count];
@@ -97,7 +109,7 @@ internal static class WebmDemuxer
                 if (tracks.Count == 0) throw Bad("a cluster precedes the track list");
                 long end = e.Size < 0 ? segEnd : dataStart + e.Size;
                 if (end > segEnd) throw Bad("a cluster is truncated");
-                pos = ReadCluster(r, dataStart, end, e.Size < 0, tracks, ref total);
+                pos = ReadCluster(r, dataStart, end, e.Size < 0, tracks, ref total, ct);
                 if (total > MaxSamples) throw Bad("too many blocks");
                 continue;
             }
@@ -317,12 +329,13 @@ internal static class WebmDemuxer
         return value;
     }
 
-    private static long ReadCluster(Reader r, long start, long end, bool unknownSize, Dictionary<ulong, DemuxedTrack> tracks, ref int total)
+    private static long ReadCluster(Reader r, long start, long end, bool unknownSize, Dictionary<ulong, DemuxedTrack> tracks, ref int total, CancellationToken ct)
     {
         long clusterTime = 0;
         long pos = start;
         while (pos < end)
         {
+            ct.ThrowIfCancellationRequested();
             var e = r.Header(pos);
             if (unknownSize && e.Id is IdCluster or IdCues or IdTags or IdChapters or IdAttachments or IdSeekHead or IdInfo or IdTracks)
                 return pos; // a live-style cluster ends where the next top-level element begins
@@ -334,11 +347,13 @@ internal static class WebmDemuxer
             {
                 case 0xE7: // Timecode
                     if (e.Size > 8) throw Bad("a cluster timecode is malformed");
-                    clusterTime = (long)UInt(r.Read(dataStart, (int)e.Size), 0, (int)e.Size);
+                    ulong time = r.ReadUInt(dataStart, (int)e.Size);
+                    if (time > long.MaxValue) throw Bad("a cluster timecode is too large");
+                    clusterTime = (long)time;
                     break;
                 case 0xA3: // SimpleBlock
                     AddBlock(r, dataStart, e.Size, clusterTime, simple: true, keyHint: false, duration: 0, tracks);
-                    total++;
+                    if (++total > MaxSamples) throw Bad("too many blocks");
                     break;
                 case 0xA0: // BlockGroup
                 {
@@ -347,6 +362,7 @@ internal static class WebmDemuxer
                     long p = dataStart;
                     while (p < dataEnd)
                     {
+                        ct.ThrowIfCancellationRequested();
                         var c = r.Header(p);
                         if (c.Size < 0) throw Bad("a block group child has unknown size");
                         long cs = p + c.HeaderLength;
@@ -356,7 +372,7 @@ internal static class WebmDemuxer
                         else if (c.Id == 0x9B)
                         {
                             if (c.Size > 8) throw Bad("a block duration exceeds the supported range");
-                            ulong ticks = UInt(r.Read(cs, (int)c.Size), 0, (int)c.Size);
+                            ulong ticks = r.ReadUInt(cs, (int)c.Size);
                             if (ticks > int.MaxValue)
                                 throw Bad("a block duration exceeds the supported range");
                             duration = (long)ticks;
@@ -365,7 +381,7 @@ internal static class WebmDemuxer
                     }
                     if (blockPos < 0) throw Bad("a block group has no block");
                     AddBlock(r, blockPos, blockSize, clusterTime, simple: false, keyHint: !referenced, duration, tracks);
-                    total++;
+                    if (++total > MaxSamples) throw Bad("too many blocks");
                     break;
                 }
             }
@@ -378,12 +394,14 @@ internal static class WebmDemuxer
         Dictionary<ulong, DemuxedTrack> tracks)
     {
         if (size < 4) throw Bad("a block is truncated");
-        byte[] h = r.Read(start, (int)Math.Min(size, 12));
+        Span<byte> header = stackalloc byte[12];
+        Span<byte> h = header[..(int)Math.Min(size, header.Length)];
+        r.Read(start, h);
         int nLen = LeadingLength(h[0], 8) ?? throw Bad("a block track number is malformed");
         if (nLen + 3 > h.Length) throw Bad("a block header is truncated");
         ulong number = (ulong)(h[0] & (0xFF >> nLen));
         for (int i = 1; i < nLen; i++) number = (number << 8) | h[i];
-        short rel = BinaryPrimitives.ReadInt16BigEndian(h.AsSpan(nLen));
+        short rel = BinaryPrimitives.ReadInt16BigEndian(h[nLen..]);
         byte flags = h[nLen + 2];
         if (!tracks.TryGetValue(number, out var t)) return; // block for a track we do not merge (subtitles, etc.)
         int headerLen = nLen + 3;
@@ -393,7 +411,7 @@ internal static class WebmDemuxer
         {
             Offset = start + headerLen,
             Size = (int)payload,
-            Dts = clusterTime + rel,
+            Dts = checked(clusterTime + rel),
             Duration = (int)Math.Clamp(duration, 0, int.MaxValue),
             Key = t.Kind == TrackKind.Audio || (simple ? (flags & 0x80) != 0 : keyHint),
             Lacing = (byte)((flags >> 1) & 3)

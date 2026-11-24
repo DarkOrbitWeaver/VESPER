@@ -93,8 +93,11 @@ public sealed partial class DownloadEngine
         ReplaceLinkCoreAsync(id, newUrl, input, ct, null, null);
 
     private async Task<RescueResult> ReplaceLinkCoreAsync(Guid id, string newUrl, RescueInput? input, CancellationToken ct,
-        RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null, string? expectedExpiredSource = null)
+        RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null, string? expectedExpiredSource = null,
+        bool commit = true, BrowserAdoption? adoption = null)
     {
+        // commit: false answers "would this link be accepted?" and changes nothing. It is only used together with
+        // expectedExpiredSource, which refuses a download that is still running instead of stopping it.
         DownloadJob? job;
         DownloadJob snapshot;
         Task? stopping = null;
@@ -157,10 +160,11 @@ public sealed partial class DownloadEngine
         long retained = snapshot.Extents.TotalBytes;
         if (retained == 0)
         {
+            if (!commit) return new RescueResult(true, RescueMode.None, "", 0);
             try
             {
                 if (!ApplyRescue(job, snapshot, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null,
-                        replacementCredentials, mediaExpiresAt))
+                        replacementCredentials, mediaExpiresAt, adoption))
                     return Rejected("This download changed while checking its replacement link. Try again.");
             }
             catch (LocalStorageException ex)
@@ -200,6 +204,8 @@ public sealed partial class DownloadEngine
                 "The replacement resolves to a different file location. VESPER will verify the finished file against its trusted SHA-256 before publishing it.");
         }
 
+        if (!commit) return new RescueResult(true, decision.Mode, decision.Message, retained);
+
         ExtentSet? verified = null;
         int refetch = 0;
         if (decision.Mode == RescueMode.R1b)
@@ -219,7 +225,7 @@ public sealed partial class DownloadEngine
         Failpoint("rescue.beforeCommit");
         try
         {
-            if (!ApplyRescue(job, snapshot, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt))
+            if (!ApplyRescue(job, snapshot, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt, adoption))
                 return new RescueResult(false, RescueMode.R4,
                     "This download changed while checking its replacement link. No replacement was applied.", retained);
         }
@@ -251,7 +257,8 @@ public sealed partial class DownloadEngine
     }
 
     private bool ApplyRescue(DownloadJob job, DownloadJob snapshot, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
-        ExtentSet? verified, RequestCredentials? replacementCredentials = null, DateTimeOffset? mediaExpiresAt = null)
+        ExtentSet? verified, RequestCredentials? replacementCredentials = null, DateTimeOffset? mediaExpiresAt = null,
+        BrowserAdoption? adoption = null)
     {
         lock (_lock)
         {
@@ -261,7 +268,8 @@ public sealed partial class DownloadEngine
                 || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl
                 || job.FinalResourceIdentity != snapshot.FinalResourceIdentity
                 || !ReferenceEquals(job.Extents, snapshot.Extents) || job.ExpectedSha256 != snapshot.ExpectedSha256
-                || job.PieceMapJson != snapshot.PieceMapJson)
+                || job.PieceMapJson != snapshot.PieceMapJson
+                || adoption is not null && !AdoptionStillAcceptedLocked(adoption, job.Id))
                 return false;
 
             // The source and duplicate index become visible only AFTER SQLite accepts the new job.
@@ -301,7 +309,15 @@ public sealed partial class DownloadEngine
             updated.Message = "";
             updated.RetryCount = 0;
             updated.NextRetryUtc = null;
-            SaveLocked(updated); // The only possible durable mutation happens before any in-memory one.
+            if (adoption is not null)
+            {
+                // Chrome's parked transfer now follows this download. A receipt without the saved job below is inert.
+                _store.RecordSubmission(adoption.RequestId, job.Id);
+                updated.BrowserProof = adoption.Proof with { AwaitingConfirmation = false, Adopted = true,
+                    AdoptionTransferId = adoption.RequestId[..^2], AdoptionReleased = false };
+            }
+            SaveLocked(updated); // The durable job mutation happens before any in-memory one.
+            if (adoption is not null) _pendingAdoptions.Remove(adoption.RequestId[..^2]);
 
             RemoveDuplicateCandidateLocked(job, job.SourceUrl);
             _jobs[job.Id] = updated;

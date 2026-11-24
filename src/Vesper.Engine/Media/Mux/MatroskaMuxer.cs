@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Vesper.Engine;
@@ -119,12 +120,15 @@ internal static class MatroskaMuxer
                     rel = pts - clusterStartMs;
                 }
                 bool blockGroup = sampleDuration > 0;
-                long blockGroupSizePosition = -1;
                 if (blockGroup)
                 {
-                    Id(output, 0xA0); // BlockGroup carries an explicit per-sample duration.
-                    blockGroupSizePosition = output.Position;
-                    Size8(output, 0);
+                    // All children have known sizes. Preserve the existing eight-byte
+                    // encoding, but avoid two seeks and a buffer flush for every frame.
+                    long blockBytes = 4L + s.Size;
+                    long groupBytes = 1 + SizeLength(blockBytes) + blockBytes
+                        + (s.Key ? 0 : 3) + 2 + UIntLength((ulong)sampleDuration);
+                    Id(output, 0xA0);
+                    Size8(output, groupBytes);
                     Id(output, 0xA1);
                 }
                 else Id(output, 0xA3);
@@ -141,7 +145,6 @@ internal static class MatroskaMuxer
                     if (!s.Key)
                         WriteSignedInteger(output, 0xFB, 0); // The source gives no dependency graph; mark the frame non-RAP.
                     UInt(output, 0x9B, (ulong)sampleDuration);
-                    PatchSize8(output, blockGroupSizePosition);
                 }
                 clusterBytes += s.Size;
             }
@@ -469,18 +472,18 @@ internal static class MatroskaMuxer
         for (int i = IdLength(id) - 1; i >= 0; i--) s.WriteByte((byte)(id >> (8 * i)));
     }
 
-    private static void Size(Stream s, long size)
+    private static int SizeLength(long size)
     {
         for (int len = 1; len <= 8; len++)
-        {
-            if (size < (1L << (7 * len)) - 1)
-            {
-                ulong v = (ulong)size | (1UL << (7 * len));
-                for (int i = len - 1; i >= 0; i--) s.WriteByte((byte)(v >> (8 * i)));
-                return;
-            }
-        }
+            if (size >= 0 && size < (1L << (7 * len)) - 1) return len;
         throw new InvalidOperationException("EBML size too large.");
+    }
+
+    private static void Size(Stream s, long size)
+    {
+        int len = SizeLength(size);
+        ulong v = (ulong)size | (1UL << (7 * len));
+        for (int i = len - 1; i >= 0; i--) s.WriteByte((byte)(v >> (8 * i)));
     }
 
     private static void Size8(Stream s, long size)
@@ -497,10 +500,16 @@ internal static class MatroskaMuxer
         s.Position = end;
     }
 
-    private static void UInt(Stream s, uint id, ulong v)
+    private static int UIntLength(ulong v)
     {
         int n = 1;
         while (n < 8 && v >> (8 * n) != 0) n++;
+        return n;
+    }
+
+    private static void UInt(Stream s, uint id, ulong v)
+    {
+        int n = UIntLength(v);
         Id(s, id); Size(s, n);
         for (int i = n - 1; i >= 0; i--) s.WriteByte((byte)(v >> (8 * i)));
     }
@@ -614,9 +623,29 @@ internal static class MediaMerger
             ct, expectedMetadata, expectedThumbnailSha256);
     }
 
+    /// <summary>Checks all samples and computes the exact on-disk output digest in the same read pass.</summary>
+    public static string ValidateRemuxAndHash(Stream output, long length,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, CancellationToken ct,
+        MediaMergeMetadata? expectedMetadata = null, string? expectedThumbnailSha256 = null)
+    {
+        return ValidateRemuxAndHash(output, length, inputs, ct, out _, expectedMetadata, expectedThumbnailSha256);
+    }
+
+    internal static string ValidateRemuxAndHash(Stream output, long length,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, CancellationToken ct,
+        out List<DemuxedTrack> validatedTracks, MediaMergeMetadata? expectedMetadata = null,
+        string? expectedThumbnailSha256 = null)
+    {
+        if (inputs.Count == 0) throw new MediaContainerException("A remux needs at least one source track.");
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        validatedTracks = ValidateCore(output, length, inputs.Select(input => input.Track).ToArray(), inputs,
+            ct, expectedMetadata, expectedThumbnailSha256, hash);
+        return Convert.ToHexString(hash.GetHashAndReset());
+    }
+
     private static List<DemuxedTrack> ValidateCore(Stream output, long length, IReadOnlyList<DemuxedTrack> expected,
         IReadOnlyList<(DemuxedTrack Track, Stream Source)>? inputs, CancellationToken ct,
-        MediaMergeMetadata? expectedMetadata, string? expectedThumbnailSha256)
+        MediaMergeMetadata? expectedMetadata, string? expectedThumbnailSha256, IncrementalHash? hash = null)
     {
         List<DemuxedTrack> got = Demux(output, length, ct);
         bool matroska = WebmDemuxer.LooksLikeMatroska(output, length);
@@ -635,7 +664,7 @@ internal static class MediaMerger
         }
         if (inputs is not null)
         {
-            ValidateSamplePayloads(output, got, inputs, ct);
+            ValidateSamplePayloads(output, got, inputs, ct, hash);
             ValidateRemuxTimeline(output, length, got, inputs, matroska, ct);
         }
         if (expectedMetadata is not null)
@@ -660,7 +689,7 @@ internal static class MediaMerger
     }
 
     private static void ValidateSamplePayloads(Stream output, IReadOnlyList<DemuxedTrack> actual,
-        IReadOnlyList<(DemuxedTrack Track, Stream Source)> expected, CancellationToken ct)
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> expected, CancellationToken ct, IncrementalHash? hash = null)
     {
         if (!output.CanRead || !output.CanSeek)
             throw new MediaContainerException("The merged output cannot be checked for sample payload changes.");
@@ -682,51 +711,103 @@ internal static class MediaMerger
         long outputPosition = output.Position;
         try
         {
-            for (int trackIndex = 0; trackIndex < expected.Count; trackIndex++)
+            // Generated outputs are monotonic within each track. A different
+            // layout still gets the existing validation and a separate full hash.
+            bool ordered = hash is not null;
+            if (ordered)
             {
+                foreach (var track in actual)
+                {
+                    long previous = -1;
+                    foreach (var sample in track.Samples)
+                    {
+                        if (sample.Offset < previous) { ordered = false; break; }
+                        previous = sample.Offset;
+                    }
+                    if (!ordered) break;
+                }
+            }
+            long hashed = 0;
+            if (ordered) output.Position = 0;
+            var nextSample = new int[expected.Count];
+            for (int i = 0; i < expected.Count; i++)
+                if (expected[i].Track.Samples.Count != actual[i].Samples.Count)
+                    throw new MediaContainerException("The merged track changed its sample count.");
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                int trackIndex = -1;
+                long nextOffset = long.MaxValue, otherOffset = long.MaxValue;
+                for (int i = 0; i < expected.Count; i++)
+                {
+                    if (nextSample[i] == actual[i].Samples.Count) continue;
+                    if (!ordered) { trackIndex = i; break; }
+                    long offset = actual[i].Samples[nextSample[i]].Offset;
+                    if (trackIndex < 0 || offset < nextOffset)
+                    {
+                        otherOffset = nextOffset;
+                        nextOffset = offset;
+                        trackIndex = i;
+                    }
+                    else otherOffset = Math.Min(otherOffset, offset);
+                }
+                if (trackIndex < 0) break;
+
                 DemuxedTrack expectedTrack = expected[trackIndex].Track;
                 DemuxedTrack actualTrack = actual[trackIndex];
-                if (expectedTrack.Samples.Count != actualTrack.Samples.Count)
-                    throw new MediaContainerException($"The merged {expectedTrack.Kind.ToString().ToLowerInvariant()} track changed its sample count.");
-
                 Stream source = expected[trackIndex].Source;
-                for (int sampleIndex = 0; sampleIndex < expectedTrack.Samples.Count; sampleIndex++)
+                int sampleIndex = nextSample[trackIndex]++;
+                TrackSample sourceSample = expectedTrack.Samples[sampleIndex];
+                TrackSample outputSample = actualTrack.Samples[sampleIndex];
+                if (sourceSample.Size != outputSample.Size)
+                    throw new MediaContainerException($"The merged {expectedTrack.Kind.ToString().ToLowerInvariant()} track changed a sample size.");
+                if (sourceSample.Size < 0 || sourceSample.Offset < 0 || sourceSample.Offset > source.Length - sourceSample.Size
+                    || outputSample.Offset < 0 || outputSample.Offset > output.Length - outputSample.Size)
+                    throw new MediaContainerException("A sample lies outside its source or merged file.");
+
+                int remaining = sourceSample.Size;
+                while (sampleIndex + 1 < expectedTrack.Samples.Count && remaining < 1024 * 1024)
+                {
+                    var next = expectedTrack.Samples[sampleIndex + 1];
+                    var nextOutput = actualTrack.Samples[sampleIndex + 1];
+                    if (next.Size <= 0 || next.Size != nextOutput.Size || next.Size > 1024 * 1024 - remaining
+                        || next.Offset != sourceSample.Offset + remaining || nextOutput.Offset != outputSample.Offset + remaining
+                        || next.Offset > source.Length - next.Size || nextOutput.Offset > output.Length - next.Size
+                        || ordered && nextOutput.Offset >= otherOffset) break;
+                    remaining += next.Size;
+                    sampleIndex++;
+                    nextSample[trackIndex]++;
+                }
+                if (remaining == 0) continue;
+                if (ordered)
+                {
+                    if (outputSample.Offset < hashed || remaining > otherOffset - outputSample.Offset)
+                        throw new MediaContainerException("The merged output contains overlapping sample ranges.");
+                    HashUntil(output, outputBuffer, hash!, ref hashed, outputSample.Offset, ct);
+                }
+                if (source.Position != sourceSample.Offset) source.Position = sourceSample.Offset;
+                if (output.Position != outputSample.Offset) output.Position = outputSample.Offset;
+                while (remaining > 0)
                 {
                     ct.ThrowIfCancellationRequested();
-                    TrackSample sourceSample = expectedTrack.Samples[sampleIndex];
-                    TrackSample outputSample = actualTrack.Samples[sampleIndex];
-                    if (sourceSample.Size != outputSample.Size)
-                        throw new MediaContainerException($"The merged {expectedTrack.Kind.ToString().ToLowerInvariant()} track changed a sample size.");
-                    if (sourceSample.Size < 0 || sourceSample.Offset < 0 || sourceSample.Offset > source.Length - sourceSample.Size
-                        || outputSample.Offset < 0 || outputSample.Offset > output.Length - outputSample.Size)
-                        throw new MediaContainerException("A sample lies outside its source or merged file.");
-
-                    // Audio packets are often contiguous in both files. Compare a run at once,
-                    // but still check every packet size and boundary before joining it.
-                    int remaining = sourceSample.Size;
-                    while (sampleIndex + 1 < expectedTrack.Samples.Count && remaining < 1024 * 1024)
+                    int count = Math.Min(bufferSize, remaining);
+                    ReadSampleBytes(source, sourceBuffer, count, ct);
+                    ReadSampleBytes(output, outputBuffer, count, ct);
+                    if (!sourceBuffer.AsSpan(0, count).SequenceEqual(outputBuffer.AsSpan(0, count)))
+                        throw new MediaContainerException("The merged file contains a different encoded sample payload.");
+                    if (ordered)
                     {
-                        var next = expectedTrack.Samples[sampleIndex + 1];
-                        var nextOutput = actualTrack.Samples[sampleIndex + 1];
-                        if (next.Size <= 0 || next.Size != nextOutput.Size || next.Size > 1024 * 1024 - remaining
-                            || next.Offset != sourceSample.Offset + remaining || nextOutput.Offset != outputSample.Offset + remaining
-                            || next.Offset > source.Length - next.Size || nextOutput.Offset > output.Length - next.Size) break;
-                        remaining += next.Size;
-                        sampleIndex++;
+                        hash!.AppendData(outputBuffer, 0, count);
+                        hashed += count;
                     }
-                    if (source.Position != sourceSample.Offset) source.Position = sourceSample.Offset;
-                    if (output.Position != outputSample.Offset) output.Position = outputSample.Offset;
-                    while (remaining > 0)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        int count = Math.Min(bufferSize, remaining);
-                        ReadSampleBytes(source, sourceBuffer, count, ct);
-                        ReadSampleBytes(output, outputBuffer, count, ct);
-                        if (!sourceBuffer.AsSpan(0, count).SequenceEqual(outputBuffer.AsSpan(0, count)))
-                            throw new MediaContainerException("The merged file contains a different encoded sample payload.");
-                        remaining -= count;
-                    }
+                    remaining -= count;
                 }
+            }
+            if (hash is not null)
+            {
+                if (!ordered) output.Position = 0;
+                HashUntil(output, outputBuffer, hash, ref hashed, output.Length, ct);
             }
         }
         finally
@@ -741,6 +822,20 @@ internal static class MediaMerger
                 ArrayPool<byte>.Shared.Return(sourceBuffer);
                 ArrayPool<byte>.Shared.Return(outputBuffer);
             }
+        }
+    }
+
+    private static void HashUntil(Stream output, byte[] buffer, IncrementalHash hash, ref long position,
+        long end, CancellationToken ct)
+    {
+        if (output.Position != position) output.Position = position;
+        while (position < end)
+        {
+            ct.ThrowIfCancellationRequested();
+            int count = (int)Math.Min(end - position, buffer.Length);
+            ReadSampleBytes(output, buffer, count, ct);
+            hash.AppendData(buffer, 0, count);
+            position += count;
         }
     }
 

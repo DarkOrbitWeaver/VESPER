@@ -46,6 +46,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 return BridgeResponse.Success(request.Id, "VESPER is running.",
                     data: new { app = "VESPER", handoff = current.BrowserAction.ToString().ToLowerInvariant(),
                         siteRules = CurrentBrowserSiteRules(),
+                        proofs = BrowserTransferProof.AcceptedBases,
                         managedDownloads = true,
                         build = Vesper.Shared.BuildInfo.Version(typeof(BrowserBridgeHandler).Assembly) },
                     version: Vesper.Shared.BuildInfo.Number(typeof(BrowserBridgeHandler).Assembly));
@@ -53,7 +54,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             case "capture-preflight":
                 return BridgeResponse.Success(request.Id, "VESPER is ready for a browser download.",
-                    data: new { ready = true, siteRules = CurrentBrowserSiteRules() });
+                    data: new { ready = true, siteRules = CurrentBrowserSiteRules(), proofs = BrowserTransferProof.AcceptedBases });
 
             case "probe":
                 return BridgeResponse.Success(request.Id, data: await engine.ProbeMediaAsync(request.Url!, ct));
@@ -256,9 +257,19 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 if (item.Authorization is not null) secrets["Authorization"] = item.Authorization;
             }
 
-            AddResult added = engine.Add(new AddRequest(item.Url, folder, item.FileName, startNow, item.Referer, item.UserAgent,
+            var addRequest = new AddRequest(item.Url, folder, item.FileName, startNow, item.Referer, item.UserAgent,
                 RequestId: $"{request.Id}:{i}", ExpectedSha256: ConfirmedChecksum(item, i, trustedChecksums),
-                Kind: item.Kind == "hls" ? JobKind.Hls : JobKind.Http, Secrets: secrets, BrowserProof: request.BrowserProof));
+                Kind: item.Kind == "hls" ? JobKind.Hls : JobKind.Http, Secrets: secrets, BrowserProof: request.BrowserProof);
+
+            // A download waiting for a new link continues from this one instead of a second copy being started.
+            if (request.ConfirmTransfer && await engine.OfferFreshLinkAsync(addRequest, ct) is { } waiting)
+            {
+                results.Add(new BridgeResult(UrlPolicy.Redact(item.Url), "started", waiting.ToString("D"),
+                    "VESPER will continue its saved download from this link.", true, null));
+                continue;
+            }
+
+            AddResult added = engine.Add(addRequest);
 
             string status = added.Status switch
             {
@@ -373,7 +384,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
     private async Task<BridgeResponse> BrowserTransferAsync(BridgeRequest request, CancellationToken ct)
     {
         string id = request.TransferId!;
-        if (request.Operation == "accept" && !engine.AcceptBrowserTransfer(id))
+        if (request.Operation == "accept" && !await engine.AcceptBrowserTransferAsync(id, ct))
             return BridgeResponse.Fail(request.Id, "unavailable", "VESPER could not take over this download.");
         if (request.Operation == "abandon") engine.AbandonBrowserTransfer(id);
 

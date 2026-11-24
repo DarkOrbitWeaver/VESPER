@@ -24,6 +24,13 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         string? SubtitleNotice = null);
     private sealed class Progress { public long Offset; }
 
+    // The read handle denies external writes and remains open from verification
+    // through publication. The digest belongs to this object, not merely its path.
+    internal sealed record VerifiedOutput(FileStream File, string Digest, string? Identity) : IDisposable
+    {
+        public void Dispose() => File.Dispose();
+    }
+
     internal static string TracksPath(DownloadJob job) => job.PartialPath + ".tracks";
     internal static string MergingPath(DownloadJob job) => job.PartialPath + ".merging";
 
@@ -236,6 +243,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         string mergingPath = MergingPath(Job);
         string? mergingIdentity = null;
         string? tracksIdentity = null;
+        FileStream? source = null;
         bool swapCursorSaved = false;
         bool preserveStageForCrash = false;
         var subtitleLeases = new List<SegmentBufferLease>();
@@ -254,7 +262,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             session.CloseFile();
             try
             {
-                using (var source = PartialFile.OpenOwnedRead(Job, options: FileOptions.RandomAccess))
+                source = PartialFile.OpenOwnedRead(Job, FileShare.Read | FileShare.Delete, FileOptions.RandomAccess);
                 {
                     if (source.Length < plan.TotalBytes) return Stop("The partial file is shorter than its committed tracks.");
                     var inputs = new List<(DemuxedTrack Track, Stream Source)>();
@@ -343,13 +351,12 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;
-                    using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Verify, output.Length))
-                        MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
-                    output.Position = 0;
-                    sha = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+                    sha = await MergeTransfer.ValidateAndHashOutputAsync(Job.Id, output, length, inputs, merged, ct)
+                        .ConfigureAwait(false);
                     tracksLength = source.Length;
                     source.Position = 0;
-                    tracksSha = Convert.ToHexString(await SHA256.HashDataAsync(source, ct).ConfigureAwait(false));
+                    using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Hash, tracksLength))
+                        tracksSha = Convert.ToHexString(await SHA256.HashDataAsync(source, ct).ConfigureAwait(false));
                     tracksIdentity = PathSafety.TemporaryFileIdentity(source.SafeFileHandle)
                         ?? throw new IOException("Stable temporary file identity is not supported on this platform.");
                     foreach (MemoryStream stream in subtitleStreams) stream.Dispose();
@@ -387,7 +394,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                 throw;
             }
             engine.Failpoint("merge.beforeSwap");
-            return await FinishSwapAsync(swap, ct).ConfigureAwait(false);
+            using var verifiedTracks = new VerifiedOutput(source!, tracksSha, tracksIdentity);
+            return await FinishSwapAsync(swap, ct, verifiedTracks).ConfigureAwait(false);
         }
         catch (FailpointCrash)
         {
@@ -396,6 +404,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         }
         finally
         {
+            source?.Dispose();
             foreach (MemoryStream stream in subtitleStreams) stream.Dispose();
             foreach (SegmentBufferLease lease in subtitleLeases) lease.Dispose();
             if (!swapCursorSaved && !preserveStageForCrash && mergingIdentity is not null)
@@ -479,31 +488,32 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         finally { session.RemoveConnection(); }
     }
 
-    private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct)
+    private async Task<RunOutcome> FinishSwapAsync(Cursor cursor, CancellationToken ct, VerifiedOutput? verifiedTracks = null)
     {
-        string? identity = await FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, cursor.TracksLength,
-            cursor.TracksSha256, cursor.MuxIdentity, cursor.TracksIdentity, ct)
+        using VerifiedOutput verified = await FinishSwapAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, cursor.TracksLength,
+            cursor.TracksSha256, cursor.MuxIdentity, cursor.TracksIdentity, ct, verifiedTracks)
             .ConfigureAwait(false);
+        verifiedTracks?.Dispose(); // release the saved-track handle before sidecar cleanup
         var next = new ExtentSet();
         next.Add(new ByteRange(0, cursor.MuxLength));
         DownloadJob committed = engine.CommitCheckpoint(Job, next, JsonSerializer.Serialize(cursor with { Phase = "muxed" }),
-            totalBytes: cursor.MuxLength, partialIdentity: identity);
-        engine.WriteManifest(committed);
-        return await PublishAsync(ct, cursor.SubtitleNotice).ConfigureAwait(false);
+            totalBytes: cursor.MuxLength, partialIdentity: verified.Identity);
+        engine.WriteManifest(committed, verified.File.SafeFileHandle);
+        return await PublishAsync(ct, cursor.SubtitleNotice, verified).ConfigureAwait(false);
     }
 
     private async Task<RunOutcome> FinalizeMergedAsync(Cursor cursor, CancellationToken ct)
     {
         if (cursor.MuxLength <= 0 || cursor.MuxSha256 is not { Length: 64 }) return Stop("The merge cursor is incomplete.");
         if (!File.Exists(Job.PartialPath)) return Stop("The merged file is missing.");
-        if (!await VerifyMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false))
-            return Stop("The merged file failed its saved validation.");
-        return await PublishAsync(ct, cursor.SubtitleNotice).ConfigureAwait(false);
+        using VerifiedOutput? verified = await OpenVerifiedMergedOutputAsync(engine, Job, cursor.MuxLength, cursor.MuxSha256, ct).ConfigureAwait(false);
+        if (verified is null) return Stop("The merged file failed its saved validation.");
+        return await PublishAsync(ct, cursor.SubtitleNotice, verified).ConfigureAwait(false);
     }
 
-    private async Task<RunOutcome> PublishAsync(CancellationToken ct, string? subtitleNotice = null)
+    private async Task<RunOutcome> PublishAsync(CancellationToken ct, string? subtitleNotice, VerifiedOutput verified)
     {
-        RunOutcome outcome = await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
+        RunOutcome outcome = await engine.FinalizeVerifiedMergeAsync(session, verified, ct).ConfigureAwait(false);
         if (outcome.State == JobState.Completed)
         {
             string? cleanupNotice = DeleteSidecars(Job) ? null
@@ -531,8 +541,9 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             throw new RunnerStop(Stop("The saved tracks could not be restored safely: " + error));
     }
 
-    internal static async Task<string?> FinishSwapAsync(DownloadEngine engine, DownloadJob job, long muxLength, string? muxSha,
-        long tracksLength, string? tracksSha, string? muxIdentity, string? tracksIdentity, CancellationToken ct)
+    internal static async Task<VerifiedOutput> FinishSwapAsync(DownloadEngine engine, DownloadJob job, long muxLength, string? muxSha,
+        long tracksLength, string? tracksSha, string? muxIdentity, string? tracksIdentity, CancellationToken ct,
+        VerifiedOutput? verifiedTracks = null)
     {
         string partial = job.PartialPath;
         string tracks = TracksPath(job);
@@ -548,58 +559,116 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         bool hasStage = PathExists(stage);
         bool hasPartial = PathExists(partial);
         if ((!hasTracks && !(hasStage && hasPartial)) || (hasTracks && hasStage == hasPartial)
-            || tracksLength < job.Extents.End || muxLength <= 0 || muxSha is not { Length: 64 }
-            || !await MatchesAsync(hasTracks ? tracks : partial, tracksLength, tracksSha, ct, expectedTracksIdentity).ConfigureAwait(false))
+            || tracksLength < job.Extents.End || muxLength <= 0 || muxSha is not { Length: 64 })
             throw new RunnerStop(Stop("The files from the interrupted merge do not match the saved swap."));
 
-        using var outputHandle = PathSafety.OpenTemporaryHandle(hasStage ? stage : partial, FileMode.Open, FileAccess.Read,
-            FileShare.Read | FileShare.Delete, FileOptions.SequentialScan, writeAttributes: !hasStage);
-        using var output = new FileStream(outputHandle, FileAccess.Read, 1 << 16);
-        string? actualMuxIdentity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
-        bool movedWithChangedTimestamp = !hasStage && PathSafety.SameFileId(muxIdentity, actualMuxIdentity);
-        if (actualMuxIdentity != muxIdentity && !movedWithChangedTimestamp)
-            throw new RunnerStop(Stop("The merged output no longer has its saved file identity. Saved data was kept."));
-        if (output.Length != muxLength || !Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false))
-            .Equals(muxSha, StringComparison.OrdinalIgnoreCase))
-            throw new RunnerStop(Stop("The output from the interrupted merge does not match the saved swap."));
-        // Recovery of a rename completed before the timestamp could be restored.
-        // The durable cursor, same file ID and exact output hash must all agree.
-        if (actualMuxIdentity != muxIdentity)
-            PathSafety.RestoreMovedTemporaryIdentity(output.SafeFileHandle, muxIdentity);
+        string tracksLocation = hasTracks ? tracks : partial;
+        // On an uninterrupted merge the same read-only, write-denying handle
+        // has remained open since hashing the source. A recovered swap has no
+        // such proof and must rehash every saved byte as before.
+        bool tracksMatch;
+        if (verifiedTracks is not null && OperatingSystem.IsWindows())
+        {
+            tracksMatch = tracksSha is { Length: 64 } && verifiedTracks.Digest.Equals(tracksSha, StringComparison.OrdinalIgnoreCase)
+                && verifiedTracks.Identity == expectedTracksIdentity
+                && verifiedTracks.File.Length == tracksLength
+                && PathSafety.TemporaryFileIdentity(verifiedTracks.File.SafeFileHandle) == expectedTracksIdentity
+                && PathSafety.PathStillNamesFile(tracksLocation, verifiedTracks.File, tracksSha);
+        }
+        else
+        {
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, tracksLength))
+                tracksMatch = await MatchesAsync(tracksLocation, tracksLength, tracksSha, ct, expectedTracksIdentity).ConfigureAwait(false);
+        }
+        if (!tracksMatch)
+            throw new RunnerStop(Stop("The files from the interrupted merge do not match the saved swap."));
 
-        ct.ThrowIfCancellationRequested();
-        if (!hasTracks)
+        var outputHandle = PathSafety.OpenTemporaryHandle(hasStage ? stage : partial, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, FileOptions.SequentialScan, writeAttributes: !hasStage);
+        FileStream? output = null;
+        try
         {
-            engine.Failpoint("merge.beforeTracksMove");
-            if (!PathSafety.TryMoveTemporaryFile(partial, tracks, job.PartialIdentity, out string moveError))
-                throw new RunnerStop(Stop("The downloaded tracks could not be moved safely: " + moveError));
-            engine.Failpoint("merge.afterTracksMove");
+            output = new FileStream(outputHandle, FileAccess.Read, 1 << 16);
+            string? actualMuxIdentity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
+            bool movedWithChangedTimestamp = !hasStage && PathSafety.SameFileId(muxIdentity, actualMuxIdentity);
+            if (actualMuxIdentity != muxIdentity && !movedWithChangedTimestamp)
+                throw new RunnerStop(Stop("The merged output no longer has its saved file identity. Saved data was kept."));
+            string actualDigest;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, output.Length))
+                actualDigest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+            if (output.Length != muxLength || !actualDigest.Equals(muxSha, StringComparison.OrdinalIgnoreCase))
+                throw new RunnerStop(Stop("The output from the interrupted merge does not match the saved swap."));
+            // Recovery of a rename completed before the timestamp could be restored.
+            // The durable cursor, same file ID and exact output hash must all agree.
+            if (actualMuxIdentity != muxIdentity)
+                PathSafety.RestoreMovedTemporaryIdentity(output.SafeFileHandle, muxIdentity);
+
+            ct.ThrowIfCancellationRequested();
+            if (!hasTracks)
+            {
+                engine.Failpoint("merge.beforeTracksMove");
+                if (!PathSafety.TryMoveTemporaryFile(partial, tracks, job.PartialIdentity, out string moveError))
+                    throw new RunnerStop(Stop("The downloaded tracks could not be moved safely: " + moveError));
+                engine.Failpoint("merge.afterTracksMove");
+            }
+            if (hasStage)
+            {
+                if (!PathSafety.TryMoveTemporaryFile(stage, partial, muxIdentity, out string moveError))
+                    throw new RunnerStop(Stop("The merged output could not be moved safely: " + moveError));
+                engine.Failpoint("merge.afterOutputMove");
+            }
+            if (!PathSafety.PathStillNamesFile(partial, output, muxSha))
+                throw new RunnerStop(Stop("The merged output path changed during the swap."));
+            return new VerifiedOutput(output, actualDigest, PathSafety.TemporaryFileIdentity(output.SafeFileHandle));
         }
-        if (hasStage)
+        catch
         {
-            if (!PathSafety.TryMoveTemporaryFile(stage, partial, muxIdentity, out string moveError))
-                throw new RunnerStop(Stop("The merged output could not be moved safely: " + moveError));
-            engine.Failpoint("merge.afterOutputMove");
+            if (output is null) outputHandle.Dispose();
+            else output.Dispose();
+            throw;
         }
-        if (!PathSafety.PathStillNamesFile(partial, output, muxSha))
-            throw new RunnerStop(Stop("The merged output path changed during the swap."));
-        return PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
     }
 
-    // Older muxed rows have a saved output hash but no file ID. Bind the verified object before opening it for publication.
-    internal static async Task<bool> VerifyMergedOutputAsync(DownloadEngine engine, DownloadJob job,
+    // Older muxed rows have a saved output hash but no file ID. Bind the verified object
+    // and retain its read handle so publication cannot race an external writer.
+    internal static async Task<VerifiedOutput?> OpenVerifiedMergedOutputAsync(DownloadEngine engine, DownloadJob job,
         long length, string digest, CancellationToken ct)
     {
-        using var output = PathSafety.OpenTemporaryStream(job.PartialPath, FileMode.Open, FileAccess.Read,
-            FileShare.Read, 1 << 16, FileOptions.SequentialScan);
-        if (output.Length != length || !Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false))
-            .Equals(digest, StringComparison.OrdinalIgnoreCase))
-            return false;
-        string? identity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
-        if (job.PartialIdentity is not null && job.PartialIdentity != identity) return false;
-        if (job.PartialIdentity != identity || job.TotalBytes != length)
-            engine.UpdateJob(job, pending => { pending.PartialIdentity = identity; pending.TotalBytes = length; });
-        return true;
+        var output = PathSafety.OpenTemporaryStream(job.PartialPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, 1 << 16, FileOptions.SequentialScan);
+        bool accepted = false;
+        try
+        {
+            if (output.Length != length) return null;
+            string actual;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, length))
+                actual = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+            if (!actual.Equals(digest, StringComparison.OrdinalIgnoreCase)) return null;
+            string? identity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle);
+            if (job.PartialIdentity is not null && job.PartialIdentity != identity) return null;
+            if (job.PartialIdentity != identity || job.TotalBytes != length)
+                engine.UpdateJob(job, pending => { pending.PartialIdentity = identity; pending.TotalBytes = length; });
+            accepted = true;
+            return new VerifiedOutput(output, actual, identity);
+        }
+        finally { if (!accepted) output.Dispose(); }
+    }
+
+    internal static async Task<string> ValidateAndHashOutputAsync(Guid jobId, Stream output, long length,
+        IReadOnlyList<(DemuxedTrack Track, Stream Source)> inputs, MergeResult merged, CancellationToken ct)
+    {
+        // The fused pass benefits the MP4 layout. Keep Matroska's existing
+        // validation order, which measured equivalently on the same workload.
+        if (merged.Container is "mp4" or "m4a")
+        {
+            using var verify = ProcessingTiming.Measure(jobId, ProcessingPhase.Verify, length);
+            return MediaMerger.ValidateRemuxAndHash(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
+        }
+        using (ProcessingTiming.Measure(jobId, ProcessingPhase.Verify, length))
+            MediaMerger.ValidateRemux(output, length, inputs, ct, merged.Metadata, merged.ThumbnailSha256);
+        output.Position = 0;
+        using var hash = ProcessingTiming.Measure(jobId, ProcessingPhase.Hash, length);
+        return Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
     }
 
     internal static async Task<bool> MatchesAsync(string path, long length, string? digest, CancellationToken ct,

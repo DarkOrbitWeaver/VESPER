@@ -10,7 +10,7 @@ const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].inc
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }],
-  preflightReady = false, playerPicker = false } = {}) {
+  preflightReady = false, playerPicker = false, helperProofs } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -67,7 +67,8 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       sendNativeMessage: (host, message, cb) => {
         if (message.type === 'capture-preflight') {
           preflights.push(message);
-          cb({ ok: true, data: { ready: preflightReady, siteRules: { neverCaptureHosts: [] } } });
+          cb({ ok: true, data: { ready: preflightReady, siteRules: { neverCaptureHosts: [] },
+            ...(helperProofs ? { proofs: helperProofs } : {}) } });
           return;
         }
         if (message.type === 'hello') policyRequests.push(message);
@@ -216,7 +217,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       onFilename(item, suggestion => { suggested = suggestion; });
       return suggested;
     },
-    install: () => onInstalled(),
+    install: details => onInstalled(details),
     finishDownloadCancel: () => finishDownloadCancel?.(),
     deferDigestAt: callsAhead => { deferredDigestCall = digestCalls + callsAhead; },
     digestIsBlocked: () => typeof finishDigest === 'function',
@@ -1281,10 +1282,10 @@ test('preexisting Chrome downloads are never adopted by a worker restart or late
   assert.equal(app.actions.includes('cancel'), false);
 });
 
-test('Chrome keeps a file when it already downloaded bytes before the capture event', async () => {
+test('Chrome keeps a started download the server cannot resume', async () => {
   const file = { ...activeDownload(), bytesReceived: 1 };
   const app = load({ 'browser-submit': started }, { download: file });
-  await observe(app, file);
+  await observe(app, file, { acceptsRanges: false });
   await app.onCreated(file);
 
   assert.deepEqual(app.sent, []);
@@ -1293,19 +1294,257 @@ test('Chrome keeps a file when it already downloaded bytes before the capture ev
   assert.equal(decisions[0]?.outcome, 'chrome-started');
 });
 
-test('Chrome keeps the file if it receives bytes while native verification runs', async () => {
+test('bytes arriving while VESPER verifies keep a download Chrome cannot resume in Chrome', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': () => {
-    file.bytesReceived = 500;
+    file.bytesReceived = 400;
     return started;
   }, 'browser-transfer': transfer('failed') }, { download: file });
-  await observe(app, file);
+  await observe(app, file, { acceptsRanges: false });
   await app.onCreated(file);
 
   assert.equal(file.paused, false);
   assert.equal(file.state, 'in_progress');
+  assert.equal(app.actions.includes('pause'), false);
   assert.equal(app.actions.includes('cancel'), false);
   assert.ok(app.sent.some(message => message.type === 'browser-transfer' && message.operation === 'abandon'));
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'chrome-started');
+});
+
+test('bytes arriving while VESPER verifies do not lose a handoff Chrome could resume', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': () => {
+    file.bytesReceived = 400;
+    return started;
+  }, 'browser-transfer': transfer('active') }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(file.paused, true);
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+  assert.equal(app.localData.browserDownloads[file.id].parkedBytes, 400);
+});
+
+test('a resumable download that already received bytes is parked, and those bytes are discarded on completion', async () => {
+  const file = { ...activeDownload(), bytesReceived: 300 };
+  let state = 'active';
+  const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer(state) }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.equal(file.paused, true);
+  const record = app.localData.browserDownloads[file.id];
+  assert.equal(record.stage, 'parked');
+  assert.equal(record.chromeResumable, true);
+  assert.equal(record.parkedBytes, 300);
+  const pending = app.sessionData.vesperCaptureDecisions[0];
+  assert.equal(pending.outcome, 'handoff-pending');
+  assert.equal(pending.discarded, 300);
+  assert.ok(Number.isFinite(pending.parkMs) && pending.parkMs >= 0);
+  assert.equal(app.actions.includes('cancel'), false, 'Chrome is cancelled only after VESPER has the whole file');
+
+  state = 'complete';
+  await app.recover();
+  assert.equal(app.actions.includes('cancel'), true);
+  assert.equal(file.error, 'USER_CANCELED');
+  const moved = app.sessionData.vesperCaptureDecisions[0];
+  assert.equal(moved.outcome, 'moved');
+  assert.equal(moved.discarded, 300);
+});
+
+test('a parked download that holds bytes goes back to Chrome when VESPER fails', async () => {
+  const file = { ...activeDownload(), bytesReceived: 300 };
+  let state = 'active';
+  const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer(state) }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(file.paused, true);
+
+  state = 'failed';
+  await app.recover();
+  assert.equal(file.paused, false);
+  assert.equal(file.state, 'in_progress');
+  assert.equal(file.bytesReceived, 300, 'Chrome continues from the bytes it already had');
+  assert.equal(app.actions.includes('cancel'), false);
+  assert.ok(!app.sessionData.vesperCaptureDecisions.some(entry => entry.outcome === 'moved'));
+});
+
+test('Chrome keeps a download it is already more than halfway through', async () => {
+  const file = { ...activeDownload(), bytesReceived: 501 };
+  const app = load({ 'browser-submit': started }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+
+  assert.deepEqual(app.sent, []);
+  assert.equal(file.paused, false);
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'chrome-started');
+});
+
+test('after a worker restart a parked download with bytes stays parked only if its record says Chrome can resume it', async () => {
+  const file = { ...activeDownload(), bytesReceived: 300 };
+  const first = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file });
+  await observe(first, file);
+  await first.onCreated(file);
+  const parked = first.localData.browserDownloads[file.id];
+  first.stopWorker();
+
+  // The new worker has no response evidence left. The record's own fact keeps the handoff valid.
+  const resumed = load({ 'browser-transfer': transfer('active') }, { download: file,
+    localData: { browserDownloads: { [file.id]: { ...parked, stage: 'parking', parkUntil: Date.now() + 10_000 } } } });
+  await resumed.recover();
+  assert.equal(file.paused, true);
+  assert.equal(resumed.localData.browserDownloads[file.id].stage, 'parked');
+  resumed.stopWorker();
+
+  const unsafe = load({ 'browser-transfer': transfer('failed') }, { download: file,
+    localData: { browserDownloads: { [file.id]: { ...parked, chromeResumable: false, stage: 'parking', parkUntil: Date.now() + 10_000 } } } });
+  await unsafe.recover();
+  assert.equal(unsafe.sent.some(message => message.operation === 'accept'), false);
+  assert.equal(file.paused, false);
+  assert.equal(unsafe.actions.includes('cancel'), false);
+});
+
+// ---- Last-Modified as the strong validator (RFC 9110 8.8.2.2), for helpers that accept it
+
+const datedHeaders = (file, extra = {}) => Object.entries({ 'Content-Length': String(file.fileSize), 'Accept-Ranges': 'bytes',
+  'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="archive.zip"',
+  'Last-Modified': 'Tue, 03 Nov 2026 10:00:00 GMT', Date: 'Thu, 12 Nov 2026 01:00:00 GMT', ...extra })
+  .filter(([, value]) => value !== undefined).map(([name, value]) => ({ name, value }));
+const observeDated = (app, file, extra) => app.onHeaders({ url: file.url, requestId: 'dated-request', method: 'GET',
+  type: 'main_frame', statusCode: 200, responseHeaders: datedHeaders(file, extra) });
+const datedProofs = ['etag', 'last-modified'];
+
+test('a strong Last-Modified with an exact length proves the file to a helper that accepts it', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, helperProofs: datedProofs });
+  await observeDated(app, file);
+  await app.onCreated(file);
+
+  assert.deepEqual(app.localData.vesperCaptureProofs, datedProofs, 'the helper was asked once and its answer kept');
+  assert.deepEqual(structuredClone(app.sent[0].browserProof), { length: 1000,
+    lastModified: 'Tue, 03 Nov 2026 10:00:00 GMT', contentType: 'application/zip', basis: 'last-modified' });
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+  assert.equal(app.localData.browserDownloads[file.id].chromeResumable, true);
+});
+
+test('an older helper that knows only ETags leaves a Last-Modified download in Chrome', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started }, { download: file });
+  await observeDated(app, file);
+  await app.onCreated(file);
+
+  assert.deepEqual(app.sent, []);
+  assert.equal(file.paused, false);
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'no-validator');
+  assert.deepEqual(app.localData.vesperCaptureProofs, ['etag'], 'an older helper is not asked again for every download');
+});
+
+test('a helper that once accepted Last-Modified proofs loses that trust when an older helper answers', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started }, { download: file, localData: { vesperCaptureProofs: datedProofs } });
+  await observeDated(app, file);
+  await app.onCreated(file);
+
+  assert.deepEqual(app.sent, []);
+  assert.deepEqual(app.localData.vesperCaptureProofs, ['etag']);
+});
+
+test('a weak ETag, a date too close to the response, or a missing length never stands in for a strong validator', async () => {
+  for (const extra of [{ ETag: 'W/"weak"' }, { Date: 'Tue, 03 Nov 2026 10:00:00 GMT' }, { Date: 'Tue, 03 Nov 2026 10:00:01 GMT' }, { Date: undefined },
+    { 'Last-Modified': '2026-11-03T10:00:00Z' }, { 'Content-Length': undefined }]) {
+    const file = activeDownload();
+    const app = load({ 'browser-submit': started }, { download: file, helperProofs: datedProofs });
+    await observeDated(app, file, extra);
+    await app.onCreated(file);
+    assert.deepEqual(app.sent, [], JSON.stringify(extra));
+    assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'no-validator', JSON.stringify(extra));
+  }
+});
+
+test('the proofs a helper accepts are remembered, and withdrawn when an older helper answers', async () => {
+  const app = load();
+  await app.evaluate(`rememberCaptureProofs({ ok: true, data: { proofs: ['etag', 'last-modified'] } })`);
+  assert.deepEqual(app.localData.vesperCaptureProofs, ['etag', 'last-modified']);
+  await app.evaluate(`rememberCaptureProofs({ ok: false, data: { proofs: ['etag'] } })`);
+  assert.deepEqual(app.localData.vesperCaptureProofs, ['etag', 'last-modified'], 'a failed reply says nothing');
+  await app.evaluate(`rememberCaptureProofs({ ok: true, data: { proofs: ['etag'] } })`);
+  assert.deepEqual(app.localData.vesperCaptureProofs, ['etag']);
+});
+
+// ---- experience: a site that refuses VESPER's own request is not asked again for a while
+
+test('a site that refuses VESPER twice is not asked for a second copy again until that evidence fades', async () => {
+  const refused = { ok: true, results: [{ status: 'started', transferReady: false, transferReason: 'browser-fallback' }] };
+  const file = activeDownload();
+  const app = load({ 'browser-submit': refused, 'browser-transfer': transfer('failed') }, { download: file });
+  const click = async number => {
+    Object.assign(file, { id: 20 + number, startTime: `2026-11-12T01:0${number}:00.000Z`, bytesReceived: 0, paused: false });
+    await observe(app, file, { requestId: `click-${number}` });
+    await app.onCreated(file);
+  };
+
+  await click(1);
+  await click(2);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 2);
+
+  await click(3);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 2, 'the third click makes no second request');
+  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'site-declines');
+  assert.equal(file.paused, false);
+  assert.doesNotMatch(JSON.stringify(app.localData.vesperExperience), /example\.com|archive/);
+
+  app.advanceTime(4 * 24 * 60 * 60_000);
+  await click(4);
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 3, 'faded evidence lets VESPER ask again');
+});
+
+test('a signed address too long to name a site is still handed off, and still refused twice without an error', async () => {
+  const longUrl = 'https://example.com/files/archive.zip?signature=' + 'a'.repeat(5000);
+  const file = { ...activeDownload(), url: longUrl };
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file });
+  await observe(app, file);
+  await app.onCreated(file);
+  assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+
+  const refused = { ok: true, results: [{ status: 'started', transferReady: false, transferReason: 'browser-fallback' }] };
+  const other = { ...activeDownload(), url: longUrl };
+  const declined = load({ 'browser-submit': refused, 'browser-transfer': transfer('failed') }, { download: other });
+  for (const number of [1, 2, 3]) {
+    Object.assign(other, { id: 40 + number, startTime: `2026-11-12T03:0${number}:00.000Z`, bytesReceived: 0, paused: false });
+    await observe(declined, other, { requestId: `long-${number}` });
+    await declined.onCreated(other);
+  }
+  assert.equal(declined.sent.filter(isBrowserSubmission).length, 3, 'nothing is learned about a site that cannot be named');
+  assert.ok(!declined.sessionData.vesperCaptureDecisions.some(entry => entry.outcome === 'capture-error'));
+});
+
+test('an extension update forgets what the previous version learned about sites', async () => {
+  const app = load();
+  const promising = () => app.evaluate(`VesperExperience.promising('files.example', 'takeover')`);
+  for (let count = 0; count < 2; count++)
+    await app.evaluate(`VesperExperience.note('files.example', 'takeover', 'refused')`);
+  assert.equal(await promising(), false);
+
+  await app.install({ reason: 'chrome_update' });
+  assert.equal(await promising(), false, 'a browser update changes nothing VESPER learned');
+
+  await app.install({ reason: 'update' });
+  assert.equal(await promising(), true);
+  assert.equal(app.localData.vesperExperience, undefined);
+});
+
+test('a timeout or a busy helper teaches nothing about the site', async () => {
+  const slow = { ok: true, results: [{ status: 'started', transferReady: false, transferReason: 'slow' }] };
+  const file = activeDownload();
+  const app = load({ 'browser-submit': slow, 'browser-transfer': transfer('failed') }, { download: file });
+  for (const number of [1, 2, 3]) {
+    Object.assign(file, { id: 30 + number, startTime: `2026-11-12T02:0${number}:00.000Z`, bytesReceived: 0, paused: false });
+    await observe(app, file, { requestId: `slow-${number}` });
+    await app.onCreated(file);
+  }
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 3);
+  assert.equal(app.localData.vesperExperience, undefined);
 });
 
 test('Chrome completion during native acceptance never becomes a VESPER completion', async () => {
@@ -1325,13 +1564,13 @@ test('Chrome completion during native acceptance never becomes a VESPER completi
   assert.notEqual((await app.local.get('browserDownloads')).browserDownloads?.[file.id]?.stage, 'parked');
 });
 
-test('Chrome progress during native acceptance cannot be claimed by VESPER', async () => {
+test('bytes arriving during native acceptance return a download Chrome cannot resume to Chrome', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': started, 'browser-transfer': message => {
     if (message.operation === 'accept') file.bytesReceived = 4;
     return transfer(message.operation === 'abandon' ? 'failed' : 'active');
   } }, { download: file });
-  await observe(app, file);
+  await observe(app, file, { acceptsRanges: false });
   await app.onCreated(file);
 
   assert.equal(file.state, 'in_progress');
@@ -1818,6 +2057,97 @@ test('an Instagram blob player can choose a complete browser-observed video resp
   assert.equal(app.sent[1].candidates[0].url, mediaUrl);
   assert.equal(selected.ok, true);
   assert.equal(app.sent.length, 2);
+});
+
+// ---- experience: which of two capable routes is asked first for a single-video page
+
+function singleVideoPlayer(app, page) {
+  const sender = { url: page, tab: { id: 21 }, frameId: 0, documentId: 'video-document' };
+  return async generation => {
+    const changedAt = Date.now();
+    await app.onMedia({ url: 'https://cdn.example.com/video.mp4', tabId: 21, frameId: 0, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'media', timeStamp: changedAt,
+      responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+    const before = app.sent.length;
+    const reply = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: 'blob:player',
+      generation, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+    return { reply, asked: app.sent.slice(before).map(message => message.type) };
+  };
+}
+
+test('slow page refusal overlaps exact-source verification but retains the page policy verdict', async () => {
+  for (const code of ['no-media', 'protected']) {
+    let finishPage, observedStarted;
+    const started = new Promise(resolve => { observedStarted = resolve; });
+    const app = load({
+      'media-options': () => new Promise(resolve => { finishPage = resolve; }),
+      'media-source-options': () => { observedStarted(); return checkedSource(15); }
+    });
+    try {
+      const play = singleVideoPlayer(app, 'https://www.tiktok.com/@example/video/1234567');
+      const result = play(4);
+      let returned = false;
+      void result.then(() => { returned = true; });
+      await Promise.race([started, new Promise((_,reject) => {
+        const timer = setTimeout(() => reject(new Error('Traffic verification was not started while the page waited')), 1500);
+        void started.then(() => clearTimeout(timer));
+      })]);
+      assert.equal(returned, false);
+      assert.equal(app.sent[0].type, 'media-options');
+      assert.equal(app.sent[1].type, 'media-source-options');
+      finishPage({ok:false,code});
+      const { reply } = await result;
+      if (code === 'protected') assert.equal(reply.code, 'protected');
+      else assert.ok(reply.ok && reply.data.sourceChoices.length === 1);
+    } finally { app.stopWorker(); }
+  }
+});
+
+test('a page lookup that keeps being refused stops delaying what the player traffic can answer', async () => {
+  const verified = { ok: true, data: { choices: [{ index: 0, label: '720p', container: 'MP4' }], durationSeconds: 30 } };
+  const app = load({ 'media-options': { ok: false, code: 'no-media', message: 'Nothing found.' }, 'media-source-options': verified });
+  const play = singleVideoPlayer(app, 'https://www.tiktok.com/@example/video/1234567');
+
+  for (const generation of [4, 5]) {
+    const { asked } = await play(generation);
+    assert.equal(asked[0], 'media-options', 'the page lookup is asked first while it has not proven unhelpful');
+    assert.ok(asked.includes('media-source-options'));
+  }
+  const third = await play(6);
+  assert.equal(third.asked.includes('media-options'), false, 'two refusals: the page lookup no longer comes first');
+  assert.ok(third.asked.includes('media-source-options'));
+  assert.equal(third.reply.ok, true);
+  assert.doesNotMatch(JSON.stringify(app.localData.vesperExperience), /tiktok|example/);
+});
+
+test('the refused page lookup is still asked when the player traffic gives nothing, and success restores its place', async () => {
+  const resolved = { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } };
+  const app = load({ 'media-options': resolved, 'media-source-options': { ok: false, code: 'no-media', message: 'Not media.' } });
+  for (let count = 0; count < 2; count++)
+    await app.evaluate(`VesperExperience.note('www.tiktok.com', 'page-lookup', 'refused')`);
+  const play = singleVideoPlayer(app, 'https://www.tiktok.com/@example/video/1234567');
+
+  const first = await play(4);
+  assert.equal(first.asked[0], 'media-source-options');
+  assert.equal(first.asked.at(-1), 'media-options');
+  assert.equal(first.reply.data.choices[0].label, 'Best quality');
+  assert.equal(await app.evaluate(`VesperExperience.promising('www.tiktok.com', 'page-lookup')`), true);
+
+  const second = await play(5);
+  assert.deepEqual(second.asked, ['media-options']);
+});
+
+test('learned traffic-first route cannot bypass a protected or blocked source', async () => {
+  for (const code of ['protected','blocked','rate-limited','desktop-version-mismatch']) {
+    const app = load({'media-options': {ok:true,data:{choices:[{index:0,label:'Best'}]}},
+      'media-source-options':{ok:false,code}});
+    try {
+      for(let i=0;i<2;i++) await app.evaluate(`VesperExperience.note('www.tiktok.com','page-lookup','refused')`);
+      const {reply,asked}=await singleVideoPlayer(app,'https://www.tiktok.com/@example/video/1234567')(4);
+      assert.equal(reply.code,code);
+      assert.ok(!asked.includes('media-options'));
+    } finally {app.stopWorker();}
+  }
 });
 
 test('TikTok and reels show resolved formats before offering recently observed streams', async () => {
@@ -3664,7 +3994,9 @@ test('browser-session acquisition requires the exact current media document and 
   const page='https://video.example/watch/1', url='https://video.example/media/movie.mp4';
   const sender={tab:{id:71},frameId:0,documentId:'media-document-71',url:page};
   const failure={ok:false,code:'sign-in',message:'Browser session required'};
-  const app=load({'media-options':failure,'media-range-options':failure});
+  const app=load({'media-options':failure,'media-range-options':async () => {
+    await new Promise(resolve => setTimeout(resolve, 20)); return failure;
+  }});
   const changedAt=Date.now();
   const selection={pageUrl:page,playerPageUrl:page,playerUrl:url,generation:1,mediaChangedAt:changedAt,playerHasMedia:true};
   const request={type:'browser-body-media-proof',...selection};
@@ -3674,8 +4006,10 @@ test('browser-session acquisition requires the exact current media document and 
       responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Range':'bytes 0-999/700000',
         'Content-Length':'1000',ETag:tag}),...other});
     await report('"movie-v1"');
-    const options=await app.message({type:'media-options',...selection},sender);
+    const [options, concurrent]=await Promise.all([1,2].map(() => app.message({type:'media-options',...selection},sender)));
     assert.equal(options.data?.browserBodyAvailable,true);
+    assert.equal(concurrent.data?.browserBodyAvailable,true);
+    assert.equal(app.sent.filter(request => request.type === 'media-range-options').length,1);
     const proof=await app.message(request,sender);
     assert.equal(proof.ok,true);
     assert.equal(proof.data.etag,'"movie-v1"');

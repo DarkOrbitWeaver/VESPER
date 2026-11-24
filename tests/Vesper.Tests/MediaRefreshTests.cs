@@ -245,6 +245,14 @@ public sealed class MediaRefreshTests
         harness.Engine.UpdateJob(job, current => { current.Extents = extents; current.MediaState = JsonSerializer.Serialize(cursor); });
     }
 
+    private static void MarkMediaExpired(Harness harness, Guid id)
+    {
+        var jobs = (Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(harness.Engine)!;
+        harness.Engine.UpdateJob(jobs[id], current => { current.State = JobState.NeedsLink; current.Reason = "expired"; });
+    }
+
     private static byte[] EncryptHlsSegment(byte[] data)
     {
         using Aes aes = Aes.Create();
@@ -598,8 +606,10 @@ public sealed class MediaRefreshTests
         Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
     }
 
-    [Fact]
-    public async Task SegmentedRefreshRechecksCommittedPartsBeforeRebasingTheCursor()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SegmentedRefreshRechecksCommittedPartsBeforeRebasingTheCursor(bool automatic)
     {
         await using var server = new FaultServer();
         byte[] initialization = MediaFixture("av-init.mp4");
@@ -614,7 +624,17 @@ public sealed class MediaRefreshTests
         SeedSegmentedInitialization(h, added.JobId, oldPlan, initialization);
 
         MediaMergePlan refreshedPlan = StaticFmp4HlsPlan(server, "new", initialization, fragments);
-        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson());
+        if (automatic) MarkMediaExpired(h, added.JobId);
+        string? expected = automatic ? oldPlan.Tracks[0].Url : null;
+        if (automatic)
+        {
+            RescueResult stale = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson(),
+                expectedExpiredSource: expected + "&stale=1");
+            Assert.False(stale.Accepted);
+            Assert.Equal(expected, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+        }
+        RescueResult refreshed = await h.Engine.RefreshMergePlanAsync(added.JobId, refreshedPlan.ToJson(),
+            expectedExpiredSource: expected);
         Assert.True(refreshed.Accepted, refreshed.Message);
         Assert.Equal(refreshedPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
 
@@ -623,6 +643,54 @@ public sealed class MediaRefreshTests
         JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
         Assert.True(new FileInfo(done.FinalPath!).Length > 0);
         Assert.Equal(1, server.Hits("/hls/segmented-refresh-new/video/init.mp4"));
+    }
+
+    [Fact]
+    public async Task AuthenticatedSegmentedAutomaticRefreshChecksFreshCredentialsBeforeInstallingThem()
+    {
+        await using var server = new FaultServer();
+        byte[] initialization = MediaFixture("av-init.mp4");
+        byte[][] fragments = [MediaFixture("av-1.m4s"), MediaFixture("av-2.m4s"), MediaFixture("av-3.m4s")];
+        await server.StartAsync();
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string oldCookie = "session=old", newCookie = "session=new";
+        MediaMergePlan oldPlan = StaticFmp4HlsPlan(server, "old", initialization, fragments);
+        AddResult added = h.Engine.Add(new AddRequest(oldPlan.Tracks[0].Url, FileName: "private-segmented.mp4", StartNow: false,
+            Kind: JobKind.Merge, MediaProvider: oldPlan.Provider, MediaId: oldPlan.MediaId,
+            MediaFormatId: "video-format+audio-format", MediaPlanJson: oldPlan.ToJson(),
+            Secrets: new Dictionary<string, string> { ["Cookie"] = oldCookie }));
+        Assert.True(added.Ok, added.Message);
+        SeedSegmentedInitialization(h, added.JobId, oldPlan, initialization);
+        MarkMediaExpired(h, added.JobId);
+
+        MediaMergePlan fixture = StaticFmp4HlsPlan(server, "private", initialization, fragments);
+        MergeTrack[] privateTracks = fixture.Tracks.Select(track =>
+        {
+            Uri uri = new(track.Url);
+            string path = uri.AbsolutePath;
+            string root = path[..path.LastIndexOf('/')];
+            string freshPath = "/private" + path;
+            server.AuthenticatedFiles[freshPath] = (newCookie, Encoding.UTF8.GetBytes(server.HlsPlaylists[path]));
+            foreach (var file in server.HlsFiles.Where(file => file.Key.StartsWith(root + "/", StringComparison.Ordinal)))
+                server.AuthenticatedFiles["/private" + file.Key] = (newCookie, file.Value);
+            string freshUrl = server.Url(freshPath) + uri.Query;
+            return track with { Url = freshUrl, Source = new MergeMediaSource("hls", PlaylistUrl: freshUrl) };
+        }).ToArray();
+        MediaMergePlan fresh = fixture with { Tracks = privateTracks };
+        RescueResult refused = await h.Engine.RefreshMergePlanWithCredentialsAsync(added.JobId, fresh.ToJson(), null,
+            new Dictionary<string, string> { ["Cookie"] = oldCookie }, expectedExpiredSource: oldPlan.Tracks[0].Url);
+        Assert.False(refused.Accepted);
+        Assert.Equal(oldPlan.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+        Assert.Equal(initialization, await File.ReadAllBytesAsync(h.Engine.Snapshot(added.JobId)!.PartialPath));
+
+        RescueResult accepted = await h.Engine.RefreshMergePlanWithCredentialsAsync(added.JobId, fresh.ToJson(), null,
+            new Dictionary<string, string> { ["Cookie"] = newCookie }, expectedExpiredSource: oldPlan.Tracks[0].Url);
+        Assert.True(accepted.Accepted, accepted.Message);
+        Assert.Equal(fresh.Tracks[0].Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
+        h.Engine.Options.MaxConcurrentJobs = 3;
+        h.Engine.SettingsChanged();
+        JobSnapshot done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.True(new FileInfo(done.FinalPath!).Length > 0);
     }
 
     [Fact]

@@ -133,6 +133,17 @@ public sealed partial class DownloadEngine
                 return new AddResult(AddStatus.Invalid, Guid.Empty, credentialError);
         }
 
+        bool webmClipPlan = DirectMediaPlan.TryWebmClip(request.MediaPlanJson, out _);
+        if (webmClipPlan &&
+            (request.Kind != JobKind.Http || request.Output != MediaOutput.Original || request.MediaProvider != "generic"
+            || !string.Equals(Path.GetExtension(request.FileName ?? uri.AbsolutePath), ".webm", StringComparison.OrdinalIgnoreCase)
+            || request.ExpectedSha256 is not null || request.PieceMapJson is not null || request.BrowserProof is not null
+            || request.MediaMetadataJson is not null))
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "WebM trimming requires an original standalone WebM download.");
+        if (request.Kind == JobKind.Http && request.Output == MediaOutput.Original && request.MediaProvider == "generic"
+            && string.Equals(Path.GetExtension(request.FileName ?? uri.AbsolutePath), ".webm", StringComparison.OrdinalIgnoreCase)
+            && request.MediaPlanJson is not null && request.MediaPlanJson != DirectMediaPlan.AudioIfPresent && !webmClipPlan)
+            return new AddResult(AddStatus.Invalid, Guid.Empty, "Invalid standalone WebM media plan.");
         bool requestedAudioIfPresentPlan = string.Equals(request.MediaPlanJson,
             DirectMediaPlan.AudioIfPresent, StringComparison.Ordinal);
         bool audioIfPresentPlan = requestedAudioIfPresentPlan && request.Kind == JobKind.Http
@@ -250,7 +261,7 @@ public sealed partial class DownloadEngine
                 MediaExpiresAt = request.MediaExpiresAt,
                 Output = request.Output,
                 BrowserProof = request.BrowserProof,
-                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output is MediaOutput.Wav or MediaOutput.M4a || audioIfPresentPlan
+                MediaPlanJson = request.Kind is JobKind.Hls or JobKind.Dash or JobKind.Merge || request.Output is MediaOutput.Wav or MediaOutput.M4a || audioIfPresentPlan || webmClipPlan
                     ? request.MediaPlanJson : null,
                 TotalBytes = request.PieceMapJson is not null && PieceMap.TryParse(request.PieceMapJson, out PieceMap map, out _) ? map.TotalLength : null
             };
@@ -387,6 +398,7 @@ public sealed partial class DownloadEngine
                     pending.RetryCount = 0;
                     pending.Message = "";
                     pending.Reason = "";
+                    if (pending.BrowserProof is { AdoptionReleased: true }) pending.BrowserProof = null;
                     if (startNow) pending.QueueOrder = queueOrder;
                 });
                 AddDuplicateCandidateLocked(job);

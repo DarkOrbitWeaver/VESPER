@@ -10,8 +10,8 @@ public sealed record ResolvedMediaSource(string Provider, string MediaId, string
 public sealed partial class DownloadEngine
 {
     /// <summary>
-    /// Explicit source re-resolution for HTTP media and a saved live-HLS recording. Requires exact provider/media/format
-    /// identities; direct files then delegate byte identity to Rescue, while live HLS checks the next sequence. Optional
+    /// Explicit source re-resolution for HTTP media and HLS recordings. Requires exact provider/media/format
+    /// identities; direct files delegate byte identity to Rescue, while HLS checks the saved prefix or live sequence. Optional
     /// request credentials are memory-only and scoped to the replacement origin.
     /// </summary>
     public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default,
@@ -19,12 +19,12 @@ public sealed partial class DownloadEngine
     {
         ArgumentNullException.ThrowIfNull(replacement);
         string? liveState = null;
+        bool vodHls = false;
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
-            if (expectedExpiredSource is not null && (job.Kind != JobKind.Http || job.State != JobState.NeedsLink
-                || job.Reason is not ("expired" or "forbidden") || job.SourceUrl != expectedExpiredSource || _sessions.ContainsKey(id)))
+            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource))
                 return Rejected("The download changed since automatic refresh was scheduled. Saved data was kept.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
@@ -40,19 +40,22 @@ public sealed partial class DownloadEngine
                     return Rejected("This live recording can no longer be resumed.");
                 liveState = job.MediaState;
             }
-            else if (job.Kind != JobKind.Http)
+            else if (job.Kind is not (JobKind.Http or JobKind.Hls))
                 return Rejected("Streaming sources require a compatible fragment plan. Saved data was kept; resolve a separate copy.");
             else if (string.IsNullOrEmpty(job.MediaProvider) || string.IsNullOrEmpty(job.MediaId) || string.IsNullOrEmpty(job.MediaFormatId))
                 return Rejected("This older job does not have enough source identity for automatic re-resolution. Use ordinary Rescue with a trusted identity.");
             else if (job.MediaProvider != replacement.Provider || job.MediaId != replacement.MediaId || job.MediaFormatId != replacement.FormatId)
                 return Rejected("The newly resolved provider, media identity or selected format differs. Restart as a separate copy; no bytes were changed.");
             else if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+            else vodHls = job.Kind == JobKind.Hls;
         }
         ct.ThrowIfCancellationRequested();
         if (!TryCreateReplacementCredentials(replacement, out RequestCredentials? credentials, out string credentialError))
             return Rejected(credentialError);
         if (liveState is not null)
-            return await RefreshLiveHlsSourceAsync(id, replacement, liveState, credentials, ct).ConfigureAwait(false);
+            return await RefreshLiveHlsSourceAsync(id, replacement, liveState, credentials, ct, expectedExpiredSource).ConfigureAwait(false);
+        if (vodHls)
+            return await RefreshVodHlsSourceAsync(id, replacement, credentials, ct, expectedExpiredSource).ConfigureAwait(false);
         return await ReplaceLinkCoreAsync(id, replacement.Url, null, ct, credentials, replacement.ExpiresAt, expectedExpiredSource)
             .ConfigureAwait(false);
     }
@@ -126,13 +129,18 @@ public sealed partial class DownloadEngine
     }
 
     /// <summary>
-    /// Credentialed merge refresh is limited to direct same-origin tracks. Every fresh track is range-probed before
-    /// the engine replaces either its URLs or its in-memory credentials.
+    /// Credentialed merge refresh verifies direct same-origin tracks by range probe or segmented tracks by their
+    /// saved prefix before the engine replaces either its URLs or its in-memory credentials.
     /// </summary>
     public async Task<RescueResult> RefreshMergePlanWithCredentialsAsync(Guid id, string replacementPlanJson,
-        DateTimeOffset? expiresAt, IReadOnlyDictionary<string, string> secrets, CancellationToken ct = default)
+        DateTimeOffset? expiresAt, IReadOnlyDictionary<string, string> secrets, CancellationToken ct = default,
+        string? expectedExpiredSource = null)
     {
         ArgumentNullException.ThrowIfNull(secrets);
+        if (MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var parsed, out _)
+            && parsed.IsSegmented)
+            return await RefreshSegmentedMergePlanAsync(id, replacementPlanJson, expiresAt, ct,
+                expectedExpiredSource, secrets).ConfigureAwait(false);
         DownloadJob original;
         DownloadJob snapshot;
         ExtentSet savedExtents;
@@ -143,6 +151,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource)) return Rejected(AutomaticRefreshChanged);
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
@@ -177,8 +186,10 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, original)
                 || _cancelling.Contains(id)
                 || IsCleanupPending(job) || job.PendingFinalPath is not null
+                || !MatchesAutomaticRefreshLocked(job, expectedExpiredSource)
                 || _sessions.ContainsKey(id) || job.MediaPlanJson != snapshot.MediaPlanJson
                 || job.MediaState != snapshot.MediaState || !ReferenceEquals(job.Extents, savedExtents)
+                || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl
                 || job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
                     or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
                 return Rejected("The merge job changed while its refreshed tracks were being checked. Saved data was kept.");
@@ -240,7 +251,7 @@ public sealed partial class DownloadEngine
     }
 
     private async Task<RescueResult> RefreshLiveHlsSourceAsync(Guid id, ResolvedMediaSource replacement,
-        string savedState, RequestCredentials? credentials, CancellationToken ct)
+        string savedState, RequestCredentials? credentials, CancellationToken ct, string? expectedExpiredSource)
     {
         DownloadJob job;
         lock (_lock)
@@ -248,6 +259,7 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls
                 || _cancelling.Contains(id)
                 || IsCleanupPending(current) || current.PendingFinalPath is not null
+                || !MatchesAutomaticRefreshLocked(current, expectedExpiredSource)
                 || _sessions.ContainsKey(id) || current.MediaState != savedState)
                 return Rejected("The live recording changed before its replacement could be checked. Saved data was kept.");
             job = current;
@@ -273,6 +285,7 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? current) || current.Kind != JobKind.Hls
                 || _cancelling.Contains(id)
                 || IsCleanupPending(current) || current.PendingFinalPath is not null || _sessions.ContainsKey(id)
+                || !MatchesAutomaticRefreshLocked(current, expectedExpiredSource)
                 || current.MediaState != savedState || !HlsTransfer.IsLiveState(current.MediaState))
                 return Rejected("The live recording changed while its replacement was being checked. Saved data was kept.");
             if (replacement.ExpiresAt <= DateTimeOffset.UtcNow)
@@ -305,7 +318,7 @@ public sealed partial class DownloadEngine
 
     /// <summary>Refresh direct plans by identity and segmented plans by checking their saved parts.</summary>
     public async Task<RescueResult> RefreshMergePlanAsync(Guid id, string replacementPlanJson,
-        DateTimeOffset? expiresAt = null, CancellationToken ct = default)
+        DateTimeOffset? expiresAt = null, CancellationToken ct = default, string? expectedExpiredSource = null)
     {
         bool parsed = false;
         bool segmented = false;
@@ -313,6 +326,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource)) return Rejected(AutomaticRefreshChanged);
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
@@ -325,14 +339,19 @@ public sealed partial class DownloadEngine
         }
 
         ct.ThrowIfCancellationRequested();
-        if (!parsed || !segmented) return RefreshMergePlan(id, replacementPlanJson, expiresAt);
-        return await RefreshSegmentedMergePlanAsync(id, replacementPlanJson, expiresAt, ct).ConfigureAwait(false);
+        if (!parsed || !segmented) return RefreshMergePlan(id, replacementPlanJson, expiresAt, expectedExpiredSource);
+        return await RefreshSegmentedMergePlanAsync(id, replacementPlanJson, expiresAt, ct, expectedExpiredSource).ConfigureAwait(false);
     }
 
     private async Task<RescueResult> RefreshSegmentedMergePlanAsync(Guid id, string replacementPlanJson,
-        DateTimeOffset? expiresAt, CancellationToken ct)
+        DateTimeOffset? expiresAt, CancellationToken ct, string? expectedExpiredSource,
+        IReadOnlyDictionary<string, string>? secrets = null)
     {
+        RequestCredentials? credentials = null;
         DownloadJob snapshot;
+        DownloadJob original;
+        ExtentSet savedExtents;
+        string? savedMediaState;
         string savedPlanJson;
         MediaMergePlan current;
         MediaMergePlan next;
@@ -340,6 +359,7 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource)) return Rejected(AutomaticRefreshChanged);
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
@@ -354,15 +374,26 @@ public sealed partial class DownloadEngine
             next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
             if (!CanRebaseSegmentedPlan(current, next, out string shapeError)) return Rejected(shapeError);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
+            if (secrets is not null)
+            {
+                if (!UrlPolicy.TryParse(next.Tracks[0].Url, out Uri firstTrack, out _))
+                    return Rejected("The refreshed merge plan has no valid track address.");
+                if (!TryCreateMergeCredentials(next, firstTrack, secrets, out credentials, out string credentialError,
+                        allowSegmented: true) || credentials is null)
+                    return Rejected(credentialError.Length > 0 ? credentialError : "The refreshed merge credentials are unavailable.");
+            }
             savedPlanJson = job.MediaPlanJson!;
-            snapshot = job;
+            savedExtents = job.Extents;
+            savedMediaState = job.MediaState;
+            original = job;
+            snapshot = job.CopyForUpdate();
         }
 
         string? rebasedCursor;
         try
         {
             using var session = new JobSession(this, snapshot);
-            var transfer = new SegmentedMergeTransfer(this, session, _http);
+            var transfer = new SegmentedMergeTransfer(this, session, _http, credentials, useStoredCredentials: false);
             (bool valid, rebasedCursor, string message) = await transfer.VerifyCommittedPrefixAsync(current, next, ct)
                 .ConfigureAwait(false);
             if (!valid) return Rejected(message);
@@ -378,7 +409,10 @@ public sealed partial class DownloadEngine
         ct.ThrowIfCancellationRequested();
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, snapshot)
+            if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, original)
+                || !ReferenceEquals(job.Extents, savedExtents) || job.MediaState != savedMediaState
+                || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl
+                || !MatchesAutomaticRefreshLocked(job, expectedExpiredSource)
                 || _cancelling.Contains(id)
                 || IsCleanupPending(job) || job.PendingFinalPath is not null
                 || _sessions.ContainsKey(id) || job.MediaPlanJson != savedPlanJson
@@ -397,12 +431,13 @@ public sealed partial class DownloadEngine
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
             ct.ThrowIfCancellationRequested();
             SaveRefreshedJobLocked(job, updated);
-            _credentials.Remove(id);
+            if (credentials is not null) _credentials[id] = credentials;
+            else _credentials.Remove(id);
         }
         FlushOutbox();
         ScheduleNext();
         return new RescueResult(true, RescueMode.R0,
-            "The refreshed HLS/DASH source matches every saved part byte-for-byte. Download continues.", 0);
+            "The refreshed HLS/DASH source matches every saved part byte-for-byte. Download continues.", snapshot.Extents.TotalBytes);
     }
 
     private static bool CanRebaseSegmentedPlan(MediaMergePlan current, MediaMergePlan next, out string error)
@@ -446,17 +481,22 @@ public sealed partial class DownloadEngine
         && first.DurationSeconds == second.DurationSeconds && first.StartSeconds == second.StartSeconds;
 
     /// <summary>Synchronous direct-track refresh. Segmented plans must use RefreshMergePlanAsync to compare saved parts.</summary>
-    public RescueResult RefreshMergePlan(Guid id, string replacementPlanJson, DateTimeOffset? expiresAt = null)
+    public RescueResult RefreshMergePlan(Guid id, string replacementPlanJson, DateTimeOffset? expiresAt = null,
+        string? expectedExpiredSource = null)
     {
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out var job)) return Rejected("That entry no longer exists.");
             if (job.Kind != JobKind.Merge) return Rejected("Only merge jobs accept a replacement media plan.");
+            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource)) return Rejected(AutomaticRefreshChanged);
             if (_cancelling.Contains(id)) return Rejected("The download is already being cancelled.");
             if (IsCleanupPending(job) || job.PendingFinalPath is not null)
                 return Rejected("The download must finish its pending cleanup before its source can be refreshed.");
             if (_sessions.ContainsKey(id)) return Rejected("Pause the download before refreshing its source.");
             if (job.State == JobState.Completed) return Rejected("The download is already complete.");
+            if (job.State is not (JobState.Queued or JobState.Paused or JobState.WaitingForNetwork or JobState.WaitingForRetry
+                or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed))
+                return Rejected("This merge job is not in a resumable state.");
             if (!MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out var current, out _))
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var next, out var error))
@@ -478,6 +518,14 @@ public sealed partial class DownloadEngine
         ScheduleNext();
         return new RescueResult(true, RescueMode.R0, "The refreshed source matches the saved tracks byte-for-byte by provider identity. Download continues.", 0);
     }
+
+    private const string AutomaticRefreshChanged = "The download changed since automatic refresh was scheduled. Saved data was kept.";
+
+    // Automatic recovery must never resume a job that the user paused, replaced or restarted meanwhile.
+    private bool MatchesAutomaticRefreshLocked(DownloadJob job, string? expectedExpiredSource) =>
+        expectedExpiredSource is null || (job.State == JobState.NeedsLink && job.Reason is ("expired" or "forbidden")
+            && job.SourceUrl == expectedExpiredSource && !_sessions.ContainsKey(job.Id)
+            && job.BrowserProof is not { AwaitingConfirmation: true });
 
     private void SaveRefreshedJobLocked(DownloadJob job, DownloadJob updated)
     {

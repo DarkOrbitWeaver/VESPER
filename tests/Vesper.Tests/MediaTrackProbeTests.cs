@@ -167,4 +167,47 @@ public sealed class MediaTrackProbeTests
         var done = await h.WaitForStateAsync(h.Add(server.Url("/media/video-only.mp4"), "intentional.mp4"), JobState.Completed);
         Assert.Equal(DashTransferTests.Fixture("video-only.mp4"), await File.ReadAllBytesAsync(done.FinalPath!));
     }
+
+    [Fact]
+    public async Task CompleteSilentWebmDownloadsAndTrimsWithoutEncoding()
+    {
+        byte[] video = DashTransferTests.Fixture("video-only.webm");
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        server.Extra["/media/preview.webm"] = video;
+        var added = h.Engine.Add(new AddRequest(server.Url("/media/preview.webm"), FileName: "preview.webm",
+            MediaProvider: "generic", MediaPlanJson: DirectMediaPlan.AudioIfPresent));
+        Assert.True(added.Ok, added.Message);
+        var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
+        Assert.Equal(video, await File.ReadAllBytesAsync(done.FinalPath!));
+
+        var clipped = h.Engine.Add(new AddRequest(server.Url("/media/preview.webm"), FileName: "clip.webm",
+            MediaProvider: "generic", MediaPlanJson: DirectMediaPlan.WebmClip(new MediaTimeRange(0, .6)), InitiallyPaused: true));
+        Assert.True(clipped.Ok, clipped.Message);
+        h.Restart();
+        h.Engine.Resume(clipped.JobId);
+        var clip = await h.WaitForStateAsync(clipped.JobId, JobState.Completed);
+        using var source = new MemoryStream(video);
+        var original = Assert.Single(WebmDemuxer.Read(source, source.Length, CancellationToken.None));
+        using var result = File.OpenRead(clip.FinalPath!);
+        var track = Assert.Single(WebmDemuxer.Read(result, result.Length, CancellationToken.None));
+        Assert.True(track.Samples.Count < original.Samples.Count);
+        Assert.InRange(track.DurationSeconds, .59, .81);
+        Assert.True(track.Samples[0].Key);
+        Assert.Contains("Keyframe-aligned", clip.Message);
+    }
+
+    [Fact]
+    public async Task UnsupportedWebmCutNeverPublishesTheFullSource()
+    {
+        byte[] video = DashTransferTests.Fixture("video-only.webm");
+        await using var server = new FaultServer(); await server.StartAsync(); using var h = new Harness();
+        server.Extra["/media/preview.webm"] = video;
+        var added = h.Engine.Add(new AddRequest(server.Url("/media/preview.webm"), FileName: "preview.webm",
+            MediaProvider: "generic", MediaPlanJson: DirectMediaPlan.WebmClip(new MediaTimeRange(0, 10))));
+        Assert.True(added.Ok, added.Message);
+        var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+        Assert.Equal("trim-failed", stopped.Reason);
+        Assert.Null(stopped.FinalPath);
+        Assert.Equal(video, await File.ReadAllBytesAsync(stopped.PartialPath));
+    }
 }

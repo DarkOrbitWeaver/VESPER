@@ -37,6 +37,39 @@ public sealed class BrowserProofIdentityTests
         Assert.False(proof.IsValid);
     }
 
+    private const string Modified = "Tue, 03 Nov 2026 10:00:00 GMT";
+
+    [Fact]
+    public void A_strong_last_modified_with_an_exact_length_is_a_proof()
+    {
+        var proof = new BrowserTransferProof(4096, null, "application/zip", LastModified: Modified, Basis: "last-modified");
+
+        Assert.True(proof.IsValid);
+        Assert.Contains("last-modified", BrowserTransferProof.AcceptedBases);
+    }
+
+    [Theory]
+    [InlineData(null, null, Modified)]                       // no length
+    [InlineData(0L, null, Modified)]                         // an empty file proves nothing
+    [InlineData(4096L, null, null)]                          // no date
+    [InlineData(4096L, null, "2026-11-03T10:00:00Z")]        // not an HTTP date
+    [InlineData(4096L, "\"file-v1\"", Modified)]             // an ETag must be judged as an ETag
+    public void A_last_modified_proof_needs_an_exact_length_an_http_date_and_no_etag(long? length, string? etag, string? modified)
+    {
+        var proof = new BrowserTransferProof(length, etag, "application/zip", LastModified: modified, Basis: "last-modified");
+
+        Assert.False(proof.IsValid);
+    }
+
+    [Fact]
+    public void Matching_metadata_without_a_validator_is_still_never_a_proof()
+    {
+        var proof = new BrowserTransferProof(4096, null, "application/zip", LastModified: Modified, FileName: "archive.zip",
+            Attachment: true, Basis: "metadata");
+
+        Assert.False(proof.IsValid);
+    }
+
     [Fact]
     public void Negative_length_is_rejected_even_with_a_strong_etag()
     {

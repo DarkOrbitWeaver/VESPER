@@ -320,7 +320,9 @@ internal static class RecoveryManifest
                         FileAccess.Read, FileShare.Read, allowDelete: true);
                     if (TryRecover(backup, out DownloadJob previous, out _, publishedPath: null, publishedIdentity: null,
                         manifestHandle: previousHandle)
-                        && current.Id == previous.Id && current.Kind == previous.Kind
+                        && current.Id == previous.Id && (current.Kind == previous.Kind
+                            || current.Generation > previous.Generation && SwitchableKind(current.Kind) && SwitchableKind(previous.Kind)
+                                && current.PartialIdentity is { Length: 64 })
                         && SamePath(current.PartialPath, previous.PartialPath)
                         && current.Generation >= previous.Generation
                         && string.Equals(current.PartialIdentity, previous.PartialIdentity, StringComparison.Ordinal))
@@ -416,9 +418,14 @@ internal static class RecoveryManifest
         }
     }
 
+    private static bool SwitchableKind(JobKind kind) => kind is JobKind.Http or JobKind.Dash or JobKind.Hls;
+
     private static bool ManifestMatchesJob(Body body, string manifestPath, DownloadJob job)
     {
-        if (body.V != 1 || body.JobId != job.Id || body.Kind != (int)job.Kind
+        if (body.V != 1 || body.JobId != job.Id
+            || (body.Kind != (int)job.Kind && !(body.Generation < job.Generation
+                && SwitchableKind((JobKind)body.Kind) && SwitchableKind(job.Kind)
+                && job.PartialIdentity is { Length: 64 } && body.PartialIdentity == job.PartialIdentity))
             || body.Generation < 0 || body.Generation > job.Generation || body.Total is < 0
             || body.Url is not { Length: > 0 } || !UrlPolicy.TryParse(body.Url, out _, out _)
             || body.Extents is null || !ExtentSet.TryParse(body.Extents, out _)

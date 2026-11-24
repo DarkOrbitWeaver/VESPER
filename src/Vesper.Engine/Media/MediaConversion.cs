@@ -7,7 +7,25 @@ namespace Vesper.Engine;
 
 public sealed partial class DownloadEngine
 {
-    private sealed record PreparedMediaFile(long Bytes, string Digest, string Path, string FileName, string Identity);
+    private sealed record PreparedMediaFile(long Bytes, string Digest, string Path, string FileName, string Identity,
+        FileStream? VerifiedFile = null) : IDisposable
+    {
+        public void Dispose() => VerifiedFile?.Dispose();
+    }
+
+    // Only an actual read handle that denies writers can carry a digest into
+    // publication without a second full-file read. Crash recovery rechecks it.
+    private static FileStream OpenPreparedRead(string path, string identity)
+    {
+        var file = PathSafety.OpenTemporaryStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, 1 << 16, FileOptions.SequentialScan);
+        try
+        {
+            PathSafety.RequireTemporaryIdentity(file.SafeFileHandle, identity);
+            return file;
+        }
+        catch { file.Dispose(); throw; }
+    }
     private enum AudioMetadataWriteStatus { Written, NoChanges, ExistingTags, UnsupportedAudio }
     // Only encoders need a single slot. Lossless, file-local MP4/M4A remuxes must not wait behind transcoding.
     private readonly SemaphoreSlim _conversionSlot = new(1);
@@ -16,7 +34,8 @@ public sealed partial class DownloadEngine
     private static string OutputExtension(MediaOutput output) => output switch
     { MediaOutput.M4a => ".m4a", MediaOutput.Opus => ".opus", MediaOutput.Wav => ".wav", MediaOutput.Mp3 => ".mp3", _ => ".mp4" };
     private static string ConversionPath(DownloadJob job) => job.PartialPath + ".convert"
-        + (job.Output is MediaOutput.Opus or MediaOutput.Wav or MediaOutput.Mp3 ? OutputExtension(job.Output) : ".mp4");
+        + (DirectMediaPlan.TryWebmClip(job.MediaPlanJson, out _) ? ".webm"
+            : job.Output is MediaOutput.Opus or MediaOutput.Wav or MediaOutput.Mp3 ? OutputExtension(job.Output) : ".mp4");
     private static string ConversionAudioPath(DownloadJob job) => job.PartialPath + ".convert-audio.mp4";
     private static string ConversionTaggedPath(DownloadJob job) => job.PartialPath + ".convert-tagged.mp4";
     private static string ConversionMp3TaggedPath(DownloadJob job) => job.PartialPath + ".convert-tagged.mp3";
@@ -140,12 +159,28 @@ public sealed partial class DownloadEngine
                 MergeResult merged;
                 using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Remux, source.Length))
                     merged = MediaMerger.Merge(remuxInputs, remuxContainer!, remuxed, ct, metadata, cover);
-                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Verify, remuxed.Length))
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) remuxed.Flush(flushToDisk: true);
+                long length = remuxed.Length;
+                remuxed.Dispose();
+                FileStream verifiedFile = OpenPreparedRead(stage, stageIdentity);
+                try
                 {
-                    var verified = MediaMerger.ValidateRemux(remuxed, remuxed.Length, remuxInputs, ct, merged.Metadata, merged.ThumbnailSha256);
-                    ValidateConvertedMp4(remuxed, tracks, audio, video, stageIdentity, ct, verified);
+                    if (verifiedFile.Length != length) throw new IOException("The converted stage changed size.");
+                    string remuxDigest;
+                    using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Verify, length))
+                    {
+                        remuxDigest = MediaMerger.ValidateRemuxAndHash(verifiedFile, length, remuxInputs, ct,
+                            out var verified, merged.Metadata, merged.ThumbnailSha256);
+                        ValidateConvertedMp4(verifiedFile, tracks, audio, video, stageIdentity, ct, verified);
+                    }
+                    file = new PreparedMediaFile(length, remuxDigest, stage,
+                        Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), stageIdentity, verifiedFile);
+                    PersistPreparedMedia(job, file);
+                    ready = true;
+                    if (cover is null && !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl)) notice = "Saved without unavailable source artwork.";
+                    return (file, notice);
                 }
-                if (cover is null && !string.IsNullOrWhiteSpace(job.MediaThumbnailUrl)) notice = "Saved without unavailable source artwork.";
+                finally { if (!ready) verifiedFile.Dispose(); }
             }
             else
             {
@@ -254,17 +289,15 @@ public sealed partial class DownloadEngine
                     stageIdentity ?? throw new IOException("The converted file has no saved identity."), ct).ConfigureAwait(false);
             }
 
-            using var output = new FileStream(stage, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
-            PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
-            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) output.Flush(flushToDisk: true);
-            string digest;
-            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, output.Length))
-                digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
-            PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
-            file = new PreparedMediaFile(output.Length, digest, stage,
-                Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), stageIdentity
-                    ?? throw new IOException("The converted file has no saved identity."));
-            PersistPreparedMedia(job, file);
+            if (stageIdentity is null) throw new IOException("The converted file has no saved identity.");
+            using (var output = PathSafety.OpenTemporaryStream(stage, FileMode.Open, FileAccess.ReadWrite,
+                FileShare.Read, 1 << 16, FileOptions.SequentialScan))
+            {
+                PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) output.Flush(flushToDisk: true);
+            }
+            file = await HashPreparedStageAsync(job, stage, stageIdentity,
+                Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), ct).ConfigureAwait(false);
             ready = true;
             return (file, notice);
         }
@@ -297,6 +330,25 @@ public sealed partial class DownloadEngine
         }
     }
 
+    private async Task<PreparedMediaFile> HashPreparedStageAsync(DownloadJob job, string stage,
+        string identity, string name, CancellationToken ct)
+    {
+        FileStream output = OpenPreparedRead(stage, identity);
+        bool accepted = false;
+        try
+        {
+            string digest;
+            using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, output.Length))
+                digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
+            PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, identity);
+            var prepared = new PreparedMediaFile(output.Length, digest, stage, name, identity, output);
+            PersistPreparedMedia(job, prepared);
+            accepted = true;
+            return prepared;
+        }
+        finally { if (!accepted) output.Dispose(); }
+    }
+
     private async Task<PreparedMediaFile?> TryReusePreparedConversionAsync(DownloadJob job, Stream source,
         List<DemuxedTrack> tracks, DemuxedTrack audio, DemuxedTrack? video, string stage, CancellationToken ct)
     {
@@ -307,13 +359,12 @@ public sealed partial class DownloadEngine
         if (PathSafety.Inspect(stage) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
             return null;
 
+        FileStream? output = null;
+        bool accepted = false;
         try
         {
-            using var output = PathSafety.OpenTemporaryStream(stage, FileMode.Open, FileAccess.ReadWrite,
-                FileShare.Read, 1 << 16, FileOptions.RandomAccess);
-            string identity = PathSafety.TemporaryFileIdentity(output.SafeFileHandle)
-                ?? throw new IOException("The prepared conversion has no saved identity.");
-            if (!string.Equals(identity, expectedIdentity, StringComparison.Ordinal)) return null;
+            output = OpenPreparedRead(stage, expectedIdentity);
+            string identity = expectedIdentity;
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, identity);
             if (output.Length != expectedBytes) return null;
 
@@ -339,20 +390,23 @@ public sealed partial class DownloadEngine
                 ValidateConvertedMp4(output, tracks, audio, video, identity, ct);
             }
 
-            output.Flush(flushToDisk: true);
+            // The prepared record is written only after the stage was flushed.
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, identity);
             output.Position = 0;
             string digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, identity);
             if (!digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase)) return null;
-            return new PreparedMediaFile(output.Length, digest, stage,
-                Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), identity);
+            var prepared = new PreparedMediaFile(output.Length, digest, stage,
+                Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), identity, output);
+            accepted = true;
+            return prepared;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or MediaContainerException
             or NotSupportedException or ArgumentException or OverflowException)
         {
             return null;
         }
+        finally { if (!accepted) output?.Dispose(); }
     }
 
     private PreparedMediaFile? TryReusePreparedAudioMetadata(DownloadJob job, string stage)
@@ -363,22 +417,26 @@ public sealed partial class DownloadEngine
             || PathSafety.Inspect(stage) is not { Exists: true, IsDirectory: false, IsReparsePoint: false, IsCloudPlaceholder: false })
             return null;
 
+        FileStream? output = null;
+        bool accepted = false;
         try
         {
-            using var output = PathSafety.OpenTemporaryStream(stage, FileMode.Open, FileAccess.Read,
-                FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+            output = OpenPreparedRead(stage, expectedIdentity);
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, expectedIdentity);
             if (output.Length != expectedBytes) return null;
             string digest = Convert.ToHexString(SHA256.HashData(output));
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, expectedIdentity);
             if (!digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase)) return null;
-            return new PreparedMediaFile(expectedBytes, digest, stage, job.FileName, expectedIdentity);
+            var prepared = new PreparedMediaFile(expectedBytes, digest, stage, job.FileName, expectedIdentity, output);
+            accepted = true;
+            return prepared;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
             or ArgumentException or OverflowException)
         {
             return null;
         }
+        finally { if (!accepted) output?.Dispose(); }
     }
 
     private void PersistPreparedMedia(DownloadJob job, PreparedMediaFile prepared)
@@ -770,12 +828,8 @@ public sealed partial class DownloadEngine
 
             output.Flush(flushToDisk: true);
             PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
-            output.Position = 0;
-            string digest = Convert.ToHexString(await SHA256.HashDataAsync(output, ct).ConfigureAwait(false));
-            PathSafety.RequireTemporaryIdentity(output.SafeFileHandle, stageIdentity);
-            var prepared = new PreparedMediaFile(output.Length, digest, stage, job.FileName,
-                stageIdentity ?? throw new IOException("The metadata file has no saved identity."));
-            PersistPreparedMedia(job, prepared);
+            output.Dispose();
+            var prepared = await HashPreparedStageAsync(job, stage, stageIdentity, job.FileName, ct).ConfigureAwait(false);
             ready = true;
             return (prepared, artworkNotice);
         }

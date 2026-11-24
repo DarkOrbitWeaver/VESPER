@@ -280,7 +280,27 @@ public sealed class SecureHttpClient : IDisposable
                 { return (probe, null); }
             }
             if (get.StatusCode == HttpStatusCode.OK && !headers.Contains("Content-Range"))
+            {
+                // A finite WebM can reveal its track table even if the host
+                // ignored Range. Read only the bounded prefix, not the whole file.
+                if (identity && headers.ContentLength is > 0
+                    && (probe.ContentType?.Equals("video/webm", StringComparison.OrdinalIgnoreCase) == true
+                        || probe.ContentType?.Equals("audio/webm", StringComparison.OrdinalIgnoreCase) == true))
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(_o.RequestTimeout);
+                    try
+                    {
+                        await using Stream body = await get.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+                        byte[] bytes = new byte[(int)Math.Min(maxBytes, headers.ContentLength.Value)];
+                        await body.ReadExactlyAsync(bytes, timeout.Token).ConfigureAwait(false);
+                        return (probe with { AcceptsRanges = false }, bytes);
+                    }
+                    catch (Exception ex) when (ex is IOException or HttpRequestException
+                        || ex is OperationCanceledException && !ct.IsCancellationRequested) { }
+                }
                 return (probe with { AcceptsRanges = false }, null);
+            }
             if (get.StatusCode is HttpStatusCode.OK or HttpStatusCode.PartialContent)
                 return (probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false }, null);
             if (get.StatusCode is not (HttpStatusCode.MethodNotAllowed or HttpStatusCode.NotImplemented or HttpStatusCode.RequestedRangeNotSatisfiable))

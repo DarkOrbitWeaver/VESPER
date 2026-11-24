@@ -15,6 +15,11 @@ globalThis.VesperNativeSession = (() => {
   const HANDSHAKE_MS = 4000;
   const MAX_IN_FLIGHT = 12;
   const MAX_WAITING = 48;
+  // Read-only discovery must never occupy every connection slot. A parked browser
+  // download, cancellation or approved selection needs to reach the helper promptly.
+  const MAX_LOOKUPS = MAX_IN_FLIGHT - 2;
+  const LOOKUP_TYPES = new Set(['media-options','media-source-options','media-range-options','media-group-options']);
+  const LOOKUP_WAIT_LIMIT = MAX_WAITING - 8;
   const timedOut = () => ({ ok: false, code: 'timeout', message: 'VESPER did not answer in time.' });
   const MISSING = /not found|forbidden|access to the specified native messaging host/i;
   let port = null;
@@ -22,6 +27,7 @@ globalThis.VesperNativeSession = (() => {
   let multiplexed = null;          // null: unknown, true: host supports sessions, false: use one-shot messages
   let idleTimer = 0;
   let active = 0;
+  let activeLookups = 0;
   const inFlight = new Map();      // request id -> settle(reply)
   const waiting = [];
 
@@ -172,20 +178,28 @@ globalThis.VesperNativeSession = (() => {
     clearTimeout(idleTimer);
     idleTimer = 0;
     while (waiting.length && active < MAX_IN_FLIGHT) {
-      const job = waiting.shift();
+      // Preserve FIFO within each class, but dispatch actual user actions and
+      // ownership controls ahead of queued, read-only format discovery.
+      let index = waiting.findIndex(job => !job.lookup);
+      if (index < 0 && activeLookups < MAX_LOOKUPS) index = 0;
+      if (index < 0) break;
+      const [job] = waiting.splice(index, 1);
       clearTimeout(job.timer);
       active++;
+      if (job.lookup) activeLookups++;
       dispatch(job).then(job.resolve, error => job.resolve({ ok: false, code: 'host-error', message: String(error) }))
-        .finally(() => { active--; pump(); });
+        .finally(() => { active--; if (job.lookup) activeLookups--; pump(); });
     }
     scheduleIdle();
   }
 
   function request(host, message, timeoutMs = 330_000) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return Promise.resolve(timedOut());
-    if (waiting.length >= MAX_WAITING) return Promise.resolve({ ok: false, code: 'busy', message: 'VESPER has too many pending requests.' });
+    const lookup = LOOKUP_TYPES.has(message?.type);
+    if (waiting.length >= MAX_WAITING || lookup && waiting.length >= LOOKUP_WAIT_LIMIT)
+      return Promise.resolve({ ok: false, code: 'busy', message: 'VESPER has too many pending requests.' });
     return new Promise(resolve => {
-      const job = { host, message, resolve, deadline: Date.now() + timeoutMs, timer: 0 };
+      const job = { host, message, lookup, resolve, deadline: Date.now() + timeoutMs, timer: 0 };
       job.timer = setTimeout(() => {
         const index = waiting.indexOf(job);
         if (index < 0) return;

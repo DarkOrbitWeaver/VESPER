@@ -557,24 +557,19 @@ public sealed class MediaSourceRescueTests
         Assert.True(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot
         { Kind = JobKind.Merge, OriginalPageUrl = "https://www.youtube.com/watch?v=a", MediaId = "a", MediaFormatId = "137+140" }));
         Assert.False(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Merge, OriginalPageUrl = "https://x/", MediaId = "a" }));
-        Assert.False(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Hls, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
+        Assert.True(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Hls, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
+        Assert.True(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Dash, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
+        Assert.False(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot { Kind = JobKind.Hls, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "subtitle:en" }));
         Assert.True(VESPER.MediaSourceRescue.CanRefresh(new JobSnapshot
         { Kind = JobKind.Hls, IsLiveRecording = true, OriginalPageUrl = "https://x/", MediaId = "a", MediaFormatId = "1" }));
     }
 
     [Fact]
-    public void An_automatic_attempt_happens_once_per_hour_and_only_for_expired_merge_jobs()
+    public void An_automatic_merge_attempt_never_repeats_the_same_delivery_and_only_runs_for_stopped_media()
     {
-        var expired = new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Merge, Reason = "expired",
-            OriginalPageUrl = "https://www.youtube.com/watch?v=b", MediaId = "b", MediaFormatId = "251" };
-        var attempts = (Dictionary<Guid, DateTime>)typeof(VESPER.MediaSourceRescue)
-            .GetField("LastAutomaticAttempt", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
-            .GetValue(null)!;
-        Guid staleId = Guid.NewGuid();
-        lock (attempts) attempts[staleId] = DateTime.UtcNow.AddHours(-2);
-
+        var expired = new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Merge, State = JobState.NeedsLink,
+            MediaProvider = "youtube", Reason = "expired", OriginalPageUrl = "https://www.youtube.com/watch?v=b", MediaId = "b", MediaFormatId = "251" };
         Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(expired));
-        lock (attempts) Assert.False(attempts.ContainsKey(staleId));
         Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(expired));                       // within the hour
         Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(new JobSnapshot { Id = Guid.NewGuid(), Kind = JobKind.Merge, Reason = "auth",
             OriginalPageUrl = expired.OriginalPageUrl, MediaId = "b", MediaFormatId = "251" }));
@@ -606,6 +601,27 @@ public sealed class MediaSourceRescueTests
                 OriginalPageUrl = ready.OriginalPageUrl }));
         }
         finally { VESPER.MediaSourceRescue.ForgetAutomaticAttempt(ready.Id); }
+    }
+
+    [Fact]
+    public void Automatic_recovery_allows_three_distinct_deliveries_but_does_not_loop()
+    {
+        Guid id = Guid.NewGuid();
+        JobSnapshot Source(string suffix, JobKind kind = JobKind.Http) => new()
+        {
+            Id = id, Kind = kind, State = JobState.NeedsLink, Reason = "expired",
+            MediaProvider = "youtube", MediaId = "fixture", MediaFormatId = "18",
+            OriginalPageUrl = "https://www.youtube.com/watch?v=fixture", SourceUrl = "https://cdn.example.com/18?token=" + suffix
+        };
+        try
+        {
+            Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(Source("a")));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(Source("a")));
+            Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(Source("b")));
+            Assert.True(VESPER.MediaSourceRescue.ShouldTryAutomatically(Source("c", JobKind.Dash)));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(Source("d")));
+        }
+        finally { VESPER.MediaSourceRescue.ForgetAutomaticAttempt(id); }
     }
 
     [Fact]
@@ -642,7 +658,7 @@ public sealed class MediaSourceRescueTests
     }
 
     [Fact]
-    public async Task Automatic_refresh_skips_segmented_merges_that_need_saved_part_verification()
+    public async Task Automatic_refresh_does_not_replace_a_queued_direct_merge_with_a_segmented_plan()
     {
         using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
         var video = Rep("137", true, "mp4", "h264");
@@ -660,7 +676,7 @@ public sealed class MediaSourceRescueTests
         RescueResult result = await InvokeRefreshMerge(h.Engine, h.Engine.Snapshot(added.JobId)!, segmentedItem, automatic: true);
 
         Assert.False(result.Accepted);
-        Assert.Contains("Automatic refresh was skipped", result.Message);
+        Assert.Equal(JobState.Queued, h.Engine.Snapshot(added.JobId)!.State);
         Assert.Equal(choice.Url, h.Engine.Snapshot(added.JobId)!.SourceUrl);
     }
 

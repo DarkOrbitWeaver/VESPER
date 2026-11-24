@@ -8,7 +8,8 @@ internal enum ClipMode
 {
     None,       // this format cannot be cut
     Segments,   // HLS/DASH: only the needed segments are downloaded, so the cut lands on segment edges
-    FullFile    // the full source is downloaded, then trimmed locally
+    FullFile,   // the full source is downloaded, then trimmed locally
+    Keyframes   // standalone WebM: lossless frame/keyframe-aligned cut
 }
 
 internal static class ClipSelection
@@ -19,6 +20,8 @@ internal static class ClipSelection
     internal static ClipMode ModeFor(MediaDownloadChoice choice)
     {
         if (!MediaTransferBridge.SupportsTimeRange(choice)) return ClipMode.None;
+        if (choice.Kind == JobKind.Http && choice.CanUseFullFileClip && choice.Output == MediaOutput.Original
+            && Path.GetExtension(choice.FileName).Equals(".webm", StringComparison.OrdinalIgnoreCase)) return ClipMode.Keyframes;
         if (choice.Output == MediaOutput.Wav || choice.CanUseFullFileClip) return ClipMode.FullFile;
         return ModeFor(choice.Output, choice.Kind);
     }
@@ -29,6 +32,7 @@ internal static class ClipSelection
     internal static string Notice(ClipMode mode) => mode switch
     {
         ClipMode.Segments => SegmentNotice,
+        ClipMode.Keyframes => "Downloads the full source, then cuts at keyframe and frame boundaries. The range may shift.",
         _ => ""
     };
 

@@ -90,11 +90,29 @@ globalThis.VesperPlayerSource = (() => {
     return url.href;
   }
 
+  // The page of the one post a feed card shows, from the card's own same-origin links. A site identity
+  // (a watch page, a status, a reel) names it directly. On other sites a card names its post through a
+  // timestamp link or an explicit permalink attribute. Two different posts in one card name neither.
+  function cardPage(links, origin) {
+    const known = new Map();
+    const permalinks = new Map();
+    for (const link of Array.isArray(links) ? links.slice(0, 32) : []) {
+      const url = http(link?.href);
+      if (!url || url.origin !== origin) continue;
+      const name = identity(url.href);
+      if (name && !/^https?:/.test(name)) known.set(name, url.href);
+      else if (link.permalink === true && url.pathname.length > 1) permalinks.set(url.href, url.href);
+    }
+    if (known.size === 1) return known.values().next().value;
+    if (known.size === 0 && permalinks.size === 1) return permalinks.values().next().value;
+    return null;
+  }
+
   function kind(url, mime = '') {
     if (/\.mpd(?:[?#]|$)/i.test(url) || /dash\+xml/i.test(mime)) return 'dash';
     if (/\.m3u8(?:[?#]|$)/i.test(url) || /mpegurl/i.test(mime)) return 'hls';
     return 'direct';
   }
 
-  return { http, identity, kind };
+  return { http, identity, cardPage, kind };
 })();

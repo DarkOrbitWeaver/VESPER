@@ -39,25 +39,38 @@ public sealed partial class DownloadEngine
         });
         Failpoint("finalize.afterFlush");
 
+        bool webmClip = DirectMediaPlan.TryWebmClip(job.MediaPlanJson, out var webmRange);
         if (job.Kind == JobKind.Http && job.MediaProvider is not null)
         {
             string extension = Path.GetExtension(job.FileName).ToLowerInvariant();
             string type = job.ContentType?.ToLowerInvariant() ?? "";
             string? format = extension == ".webm" || type.Contains("webm") ? "webm"
                 : extension is ".mp4" or ".m4a" or ".m4v" or ".mov" || type.Contains("mp4") ? "mp4" : null;
+            if (format == "webm" && job.Output == MediaOutput.Original && job.MediaProvider == "generic"
+                && job.MediaPlanJson is not null && job.MediaPlanJson != DirectMediaPlan.AudioIfPresent && !webmClip)
+                return RunOutcome.NeedsAttention("trim-failed", "Invalid WebM media plan. The original source was kept; nothing was published.");
+            if (webmClip && format != "webm")
+                return RunOutcome.NeedsAttention("trim-failed", "The selected WebM is not available. The source was kept; nothing was published.");
             if (format is not null)
             {
                 using var probe = ProcessingTiming.Measure(job.Id, ProcessingPhase.Probe, total);
-                bool allowSilentProgressiveMp4 = format == "mp4" && job.Output == MediaOutput.Original
+                bool allowSilentStandalone = job.Output == MediaOutput.Original
                     && string.Equals(job.MediaProvider, "generic", StringComparison.Ordinal)
-                    && string.Equals(job.MediaPlanJson, DirectMediaPlan.AudioIfPresent, StringComparison.Ordinal);
-                try { MediaTrackProbe.RequireAudio(file, format, ct, allowSilentProgressiveMp4, job.PartialIdentity); }
+                    && (string.Equals(job.MediaPlanJson, DirectMediaPlan.AudioIfPresent, StringComparison.Ordinal)
+                        || webmClip);
+                try
+                {
+                    if (webmClip) MediaTrackProbe.RequireSilentWebmHeader(file, ct);
+                    else MediaTrackProbe.RequireAudio(file, format, ct, allowSilentStandalone, job.PartialIdentity);
+                }
                 catch (MediaContainerException ex)
                 { return RunOutcome.NeedsAttention("media-validation", ex.Message + " Saved data was kept."); }
             }
         }
 
-        if (job.ExpectedSha256 is { } expected)
+        bool verifyAtPublication = job.ExpectedSha256 is not null && job.Output == MediaOutput.Original
+            && job.MediaMetadataJson is null;
+        if (!verifyAtPublication && job.ExpectedSha256 is { } expected)
         {
             SetPhase(job, JobState.Verifying);
             string actual;
@@ -76,19 +89,64 @@ public sealed partial class DownloadEngine
         session.CloseFile();                                  // release the handle before renaming
         PreparedMediaFile? prepared;
         string? completionNotice = null;
-        if (job.Output == MediaOutput.Original)
+        if (webmClip && job.Kind == JobKind.Http
+            && job.Output == MediaOutput.Original && job.MediaProvider == "generic")
+        {
+            try { (prepared, completionNotice) = await PrepareWebmClipAsync(job, webmRange, ct).ConfigureAwait(false); }
+            catch (MediaContainerException ex)
+            { return RunOutcome.NeedsAttention("trim-failed", ex.Message + " The original source was kept; nothing was published."); }
+            if (prepared is null) return RunOutcome.NeedsAttention("trim-failed", "The WebM clip could not be prepared. The original source was kept; nothing was published.");
+        }
+        else if (job.Output == MediaOutput.Original)
             (prepared, completionNotice) = await PrepareAudioMetadataAsync(job, ct).ConfigureAwait(false);
         else (prepared, completionNotice) = await ConvertMediaAsync(job, ct).ConfigureAwait(false);
         if (prepared is null && job.Kind == JobKind.Http && job.Output == MediaOutput.M4a
             && job.MediaPlanJson is not null)
             return RunOutcome.NeedsAttention("trim-failed", "The requested audio clip could not be prepared. The full source was kept; nothing was published.");
-        if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
-        if (ct.IsCancellationRequested && prepared is not null) DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
-        ct.ThrowIfCancellationRequested();
-        RunOutcome outcome = await PublishAsync(job, prepared, completionNotice, ct).ConfigureAwait(false);
+        RunOutcome outcome;
+        try
+        {
+            if (prepared is not null) Failpoint("finalize.afterMediaPrepare");
+            if (ct.IsCancellationRequested && prepared is not null)
+            {
+                prepared.Dispose();
+                DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
+            }
+            ct.ThrowIfCancellationRequested();
+            outcome = await PublishAsync(job, prepared, completionNotice, ct, verifyAtPublication).ConfigureAwait(false);
+        }
+        finally { prepared?.Dispose(); }
         if (prepared is not null && job.PendingFinalPath is null && outcome.State != JobState.Completed)
             DeleteTemporaryFile(job, prepared.Path, prepared.Identity);
         return outcome;
+    }
+
+    internal async Task<RunOutcome> FinalizeVerifiedMergeAsync(JobSession session, MergeTransfer.VerifiedOutput verified, CancellationToken ct)
+    {
+        DownloadJob job = session.Job;
+        // Conversion must reopen its source using the normal path. Only a finished
+        // original merge can publish without a second full read of the same object.
+        if (!OperatingSystem.IsWindows() || job.Kind != JobKind.Merge || job.Output != MediaOutput.Original
+            || job.MediaMetadataJson is not null || job.ExpectedSha256 is not null)
+        {
+            verified.Dispose();
+            return await FinalizeAsync(session, ct).ConfigureAwait(false);
+        }
+
+        ct.ThrowIfCancellationRequested();
+        session.CloseFile();
+        if (job.TotalBytes is not long total || total <= 0 || !job.Extents.Covers(0, total)
+            || verified.File.Length != total || verified.Identity != job.PartialIdentity
+            || verified.Identity is not { Length: 64 } || verified.Digest is not { Length: 64 })
+            return RunOutcome.NeedsAttention("publication-file", "The verified merge output does not match its committed identity. Saved data was kept.");
+        UpdateJob(job, j =>
+        {
+            j.State = JobState.Finalizing;
+            j.Message = "";
+            ClearPendingPublication(j);
+        });
+        Failpoint("finalize.afterFlush");
+        return await PublishAsync(job, null, null, ct, verifiedMerge: verified).ConfigureAwait(false);
     }
 
     private static string HashFile(PartialFile file, long length, CancellationToken ct)
@@ -119,7 +177,7 @@ public sealed partial class DownloadEngine
     /// Publishes with "create or fail" semantics: File.Move never overwrites. The chosen name is persisted BEFORE
     /// the rename so a crash between the rename and the database update can be reconciled on restart.
     /// </summary>
-    private async Task<RunOutcome> PublishAsync(DownloadJob job, PreparedMediaFile? prepared, string? completionNotice, CancellationToken ct)
+    private async Task<RunOutcome> PublishAsync(DownloadJob job, PreparedMediaFile? prepared, string? completionNotice, CancellationToken ct, bool verifyAtPublication = false, MergeTransfer.VerifiedOutput? verifiedMerge = null)
     {
         if (!PathSafety.TryResolveFolder(job.DestinationFolder, create: true, out _, out string problem))
             return RunOutcome.NeedsAttention("destination", problem + " The finished file is waiting at " + PathSafety.ForDisplay(job.PartialPath));
@@ -132,9 +190,10 @@ public sealed partial class DownloadEngine
 
         const FileShare share = FileShare.Read | FileShare.Delete;
         const FileOptions options = FileOptions.Asynchronous | FileOptions.SequentialScan;
-        FileStream file = prepared is null
+        FileStream? preparedProof = OperatingSystem.IsWindows() ? prepared?.VerifiedFile : null;
+        FileStream file = verifiedMerge?.File ?? preparedProof ?? (prepared is null
             ? PartialFile.OpenOwnedRead(job, share, options)
-            : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options);
+            : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options));
         try
         {
             if (file.Length != expectedLength)
@@ -147,9 +206,27 @@ public sealed partial class DownloadEngine
                     return RunOutcome.NeedsAttention("publication-file", "The prepared file changed before it could be published.");
                 }
             }
-            string digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
+            if (verifyAtPublication) SetPhase(job, JobState.Verifying);
+            string digest;
+            if (verifiedMerge is not null) digest = verifiedMerge.Digest;
+            else if (preparedProof is not null && !verifyAtPublication) digest = prepared!.Digest;
+            else
+            {
+                using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Hash, file.Length))
+                    digest = Convert.ToHexString(await SHA256.HashDataAsync(file, ct).ConfigureAwait(false));
+            }
             Debug.Assert(expectedLength is >= 0 && file.Length == expectedLength.Value,
                 "The publication handle must retain the validated file length.");
+            if (verifyAtPublication)
+            {
+                if (prepared is not null || !digest.Equals(job.ExpectedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    string how = job.RescueCandidate ? " The replacement link may serve different content." : "";
+                    return new RunOutcome(JobState.Suspect, "hash-mismatch",
+                        $"The file does not match the expected SHA-256, so it was not published.{how} The downloaded data was kept at {PathSafety.ForDisplay(job.PartialPath)}.");
+                }
+                UpdateJob(job, j => { j.Sha256Verified = true; j.State = JobState.Finalizing; });
+            }
             string? expectedDigest = prepared?.Digest ?? (job.Sha256Verified ? job.ExpectedSha256 : null);
             if (expectedDigest is not null && !digest.Equals(expectedDigest, StringComparison.OrdinalIgnoreCase))
                 return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published failed its saved validation.");
@@ -320,6 +397,14 @@ public sealed partial class DownloadEngine
 
                 bool wasCandidate = IsDuplicateCandidate(job);
                 string previousSourceUrl = job.SourceUrl;
+                if (job.BrowserProof is { AdoptionReleased: true } && (job.State == JobState.Queued || JobStates.IsActive(job.State)))
+                {
+                    job.State = JobState.Paused;
+                    job.NextRetryUtc = null;
+                    job.Message = "";
+                    SaveLocked(job);
+                    continue;
+                }
                 if (job.BrowserProof is { AwaitingConfirmation: true } && (job.State == JobState.Queued || JobStates.IsActive(job.State)))
                 {
                     job.State = JobState.Cancelled;

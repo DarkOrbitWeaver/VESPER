@@ -157,95 +157,162 @@ internal sealed class FragmentedMp4
             if (moof.Type != "moof" || ++i >= boxes.Count || boxes[i].Type != "mdat")
                 throw Bad("A media fragment must contain moof immediately followed by mdat.");
             var mdat = boxes[i];
-            var children = Boxes(data, moof.Payload, moof.End);
-            if (children.Any(b => b.Type is not ("mfhd" or "traf"))) throw Bad("Unsupported movie-fragment box.");
-            var mfhd = One(children, "mfhd"); Need(mfhd, 8);
-            uint sequence = U32(data, mfhd.Payload + 4);
-            if (U32(data, mfhd.Payload) != 0 || sequence <= _sequence) throw Bad("Duplicate or unordered fragment sequence.");
-            var ranges = new List<(long Start, long End)>();
-            var seen = new HashSet<uint>();
-            foreach (var traf in children.Where(b => b.Type == "traf"))
-            {
-                var tb = Boxes(data, traf.Payload, traf.End);
-                if (tb.Any(b => b.Type is not ("tfhd" or "tfdt" or "trun")))
-                    throw Bad("Encrypted or unsupported track-fragment metadata.");
-                var tfhd = One(tb, "tfhd"); Need(tfhd, 8);
-                uint flags = U32(data, tfhd.Payload);
-                if ((flags & 0x020000) == 0 || (flags & ~0x02003au) != 0)
-                    throw Bad("Only moof-relative track fragments are supported; absolute offsets require remuxing.");
-                uint id = U32(data, tfhd.Payload + 4);
-                if (!_tracks.TryGetValue(id, out var track) || !seen.Add(id)) throw Bad("Unknown or duplicate fragment track.");
-                int p = tfhd.Payload + 8;
-                uint duration = track.DefaultDuration, size = track.DefaultSize, sampleFlags = track.DefaultSampleFlags;
-                if ((flags & 2) != 0 && Read(data, ref p, tfhd.End) != 1) throw Bad("Sample description changed.");
-                if ((flags & 8) != 0) duration = Read(data, ref p, tfhd.End);
-                if ((flags & 16) != 0) size = Read(data, ref p, tfhd.End);
-                if ((flags & 32) != 0) sampleFlags = Read(data, ref p, tfhd.End);
-                if (p != tfhd.End) throw Bad("Invalid tfhd length.");
-                var tfdt = One(tb, "tfdt"); Need(tfdt, 8);
-                uint tv = U32(data, tfdt.Payload);
-                if (tv is not (0 or 0x01000000)) throw Bad("Unsupported tfdt version/flags.");
-                if (tv != 0) Need(tfdt, 12);
-                ulong decode = tv == 0 ? U32(data, tfdt.Payload + 4) : BinaryPrimitives.ReadUInt64BigEndian(data.Slice(tfdt.Payload + 4, 8));
-                if (track.Next is { } expected && decode != expected) throw Bad("Track timeline has a gap, overlap or discontinuity.");
-                var runs = tb.Where(b => b.Type == "trun").ToList();
-                if (runs.Count is < 1 or > 4096) throw Bad("Missing or excessive sample runs.");
-                foreach (var run in runs)
-                {
-                    Need(run, 12);
-                    uint rf = U32(data, run.Payload);
-                    if ((rf & 1) == 0 || (rf & ~0x01000f05u) != 0) throw Bad("Unsupported trun flags or missing data offset.");
-                    if ((rf & 0x00000400) != 0 && (rf & 0x00000004) != 0)
-                        throw Bad("A track run has conflicting sample-flag fields.");
-                    uint count = U32(data, run.Payload + 4);
-                    if (count is 0 or > 100_000 || track.Samples > MaxSamples - count)
-                        throw Bad("Invalid or excessive sample count.");
-                    int q = run.Payload + 8;
-                    long start = checked((long)moof.Start + unchecked((int)Read(data, ref q, run.End)));
-                    uint firstFlags = (rf & 4) != 0 ? Read(data, ref q, run.End) : sampleFlags;
-                    long bytes = 0;
-                    long sampleOffset = start;
-                    for (int sample = 0; sample < count; sample++)
-                    {
-                        uint d = (rf & 0x100) != 0 ? Read(data, ref q, run.End) : duration;
-                        uint n = (rf & 0x200) != 0 ? Read(data, ref q, run.End) : size;
-                        uint sf = (rf & 0x400) != 0 ? Read(data, ref q, run.End) : sample == 0 ? firstFlags : sampleFlags;
-                        uint rawCts = (rf & 0x800) != 0 ? Read(data, ref q, run.End) : 0;
-                        long cts = (rf & 0x800) == 0 ? 0 : (rf >> 24) == 1 ? unchecked((int)rawCts) : rawCts;
-                        if (d == 0 || d > int.MaxValue || n == 0 || n > int.MaxValue || decode > long.MaxValue
-                            || decode > ulong.MaxValue - d || cts is < int.MinValue or > int.MaxValue)
-                            throw Bad("Invalid sample duration, size, composition offset or decode timestamp.");
-                        if (_captureSamples)
-                            track.Media.Samples.Add(new TrackSample
-                            {
-                                Offset = checked(sourceOffset + sampleOffset),
-                                Size = (int)n,
-                                Dts = (long)decode,
-                                CtsOffset = (int)cts,
-                                Duration = (int)d,
-                                Key = (sf & 0x00010000) == 0
-                            });
-                        decode += d;
-                        bytes = checked(bytes + n);
-                        sampleOffset = checked(sampleOffset + n);
-                    }
-                    if (q != run.End || start < mdat.Payload || start > mdat.End || bytes > mdat.End - start)
-                        throw Bad("A sample run points outside its mdat payload.");
-                    ranges.Add((start, start + bytes));
-                    track.Samples = checked(track.Samples + count);
-                }
-                track.Next = decode;
-            }
-            long covered = mdat.Payload;
-            foreach (var range in ranges.OrderBy(r => r.Start))
-            {
-                if (range.Start != covered) throw Bad("Overlapping samples or unreferenced mdat bytes.");
-                covered = range.End;
-            }
-            if (covered != mdat.End || ranges.Count == 0) throw Bad("Fragment has incomplete or unreferenced media data.");
-            _sequence = sequence; sawMedia = true;
+            ValidateMoof(data, moof, mdat, sourceOffset);
+            sawMedia = true;
         }
         if (!sawMedia) throw Bad("No media fragment was present.");
+    }
+
+    // The saved file is already bounded to one committed part. Read box headers
+    // and moof metadata, never allocate or reread the mdat payload here.
+    internal void ValidateFragment(Stream source, long offset, int length, CancellationToken ct)
+    {
+        if (offset < 0 || length <= 0 || offset > source.Length - length)
+            throw Bad("Invalid saved fragment extent.");
+        Span<byte> header = stackalloc byte[16];
+        int pos = 0, count = 0;
+        bool sawMedia = false;
+        while (pos < length)
+        {
+            ct.ThrowIfCancellationRequested();
+            Box moof = ReadTopBox(source, offset, length, ref pos, ref count, header);
+            if (moof.Type is "styp" or "sidx" or "emsg" or "prft" or "free") continue;
+            if (moof.Type != "moof" || pos == length)
+                throw Bad("A media fragment must contain moof immediately followed by mdat.");
+            Box mdat = ReadTopBox(source, offset, length, ref pos, ref count, header);
+            if (mdat.Type != "mdat")
+                throw Bad("A media fragment must contain moof immediately followed by mdat.");
+            int size = moof.End - moof.Start;
+            // Same bounded part limit as acquisition. Only metadata is rented.
+            bool pooled = size <= 1024 * 1024;
+            byte[] rented = pooled ? System.Buffers.ArrayPool<byte>.Shared.Rent(size) : new byte[size];
+            try
+            {
+                Span<byte> metadata = rented.AsSpan(0, size);
+                MuxIo.ReadExact(source, offset + moof.Start, metadata);
+                int origin = moof.Start;
+                ValidateMoof(metadata, new Box("moof", 0, moof.Payload - origin, size),
+                    new Box("mdat", mdat.Start - origin, mdat.Payload - origin, mdat.End - origin),
+                    checked(offset + origin), ct);
+            }
+            finally { if (pooled) System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
+            sawMedia = true;
+        }
+        if (!sawMedia) throw Bad("No media fragment was present.");
+    }
+
+    private static Box ReadTopBox(Stream source, long offset, int length, ref int pos, ref int count, Span<byte> header)
+    {
+        if (length - pos < 8 || ++count > 100_000)
+            throw Bad("Truncated box header or excessive box count.");
+        MuxIo.ReadExact(source, offset + pos, header[..8]);
+        ulong size = U32(header, 0);
+        int headerSize = 8;
+        if (size == 1)
+        {
+            if (length - pos < 16) throw Bad("Truncated extended-size box.");
+            MuxIo.ReadExact(source, offset + pos + 8, header[8..]);
+            size = BinaryPrimitives.ReadUInt64BigEndian(header[8..]);
+            headerSize = 16;
+        }
+        if (size < (ulong)headerSize || size > (ulong)(length - pos))
+            throw Bad("Invalid or out-of-bounds box size.");
+        var box = new Box(Encoding.ASCII.GetString(header.Slice(4, 4)), pos, pos + headerSize, pos + (int)size);
+        pos = box.End;
+        return box;
+    }
+
+    private void ValidateMoof(ReadOnlySpan<byte> data, Box moof, Box mdat, long sourceOffset, CancellationToken ct = default)
+    {
+        var children = Boxes(data, moof.Payload, moof.End);
+        if (children.Any(b => b.Type is not ("mfhd" or "traf"))) throw Bad("Unsupported movie-fragment box.");
+        var mfhd = One(children, "mfhd"); Need(mfhd, 8);
+        uint sequence = U32(data, mfhd.Payload + 4);
+        if (U32(data, mfhd.Payload) != 0 || sequence <= _sequence) throw Bad("Duplicate or unordered fragment sequence.");
+        var ranges = new List<(long Start, long End)>();
+        var seen = new HashSet<uint>();
+        foreach (var traf in children.Where(b => b.Type == "traf"))
+        {
+            ct.ThrowIfCancellationRequested();
+            var tb = Boxes(data, traf.Payload, traf.End);
+            if (tb.Any(b => b.Type is not ("tfhd" or "tfdt" or "trun")))
+                throw Bad("Encrypted or unsupported track-fragment metadata.");
+            var tfhd = One(tb, "tfhd"); Need(tfhd, 8);
+            uint flags = U32(data, tfhd.Payload);
+            if ((flags & 0x020000) == 0 || (flags & ~0x02003au) != 0)
+                throw Bad("Only moof-relative track fragments are supported; absolute offsets require remuxing.");
+            uint id = U32(data, tfhd.Payload + 4);
+            if (!_tracks.TryGetValue(id, out var track) || !seen.Add(id)) throw Bad("Unknown or duplicate fragment track.");
+            int p = tfhd.Payload + 8;
+            uint duration = track.DefaultDuration, size = track.DefaultSize, sampleFlags = track.DefaultSampleFlags;
+            if ((flags & 2) != 0 && Read(data, ref p, tfhd.End) != 1) throw Bad("Sample description changed.");
+            if ((flags & 8) != 0) duration = Read(data, ref p, tfhd.End);
+            if ((flags & 16) != 0) size = Read(data, ref p, tfhd.End);
+            if ((flags & 32) != 0) sampleFlags = Read(data, ref p, tfhd.End);
+            if (p != tfhd.End) throw Bad("Invalid tfhd length.");
+            var tfdt = One(tb, "tfdt"); Need(tfdt, 8);
+            uint tv = U32(data, tfdt.Payload);
+            if (tv is not (0 or 0x01000000)) throw Bad("Unsupported tfdt version/flags.");
+            if (tv != 0) Need(tfdt, 12);
+            ulong decode = tv == 0 ? U32(data, tfdt.Payload + 4) : BinaryPrimitives.ReadUInt64BigEndian(data.Slice(tfdt.Payload + 4, 8));
+            if (track.Next is { } expected && decode != expected) throw Bad("Track timeline has a gap, overlap or discontinuity.");
+            var runs = tb.Where(b => b.Type == "trun").ToList();
+            if (runs.Count is < 1 or > 4096) throw Bad("Missing or excessive sample runs.");
+            foreach (var run in runs)
+            {
+                Need(run, 12);
+                uint rf = U32(data, run.Payload);
+                if ((rf & 1) == 0 || (rf & ~0x01000f05u) != 0) throw Bad("Unsupported trun flags or missing data offset.");
+                if ((rf & 0x00000400) != 0 && (rf & 0x00000004) != 0)
+                    throw Bad("A track run has conflicting sample-flag fields.");
+                uint count = U32(data, run.Payload + 4);
+                if (count is 0 or > 100_000 || track.Samples > MaxSamples - count)
+                    throw Bad("Invalid or excessive sample count.");
+                int q = run.Payload + 8;
+                long start = checked((long)moof.Start + unchecked((int)Read(data, ref q, run.End)));
+                uint firstFlags = (rf & 4) != 0 ? Read(data, ref q, run.End) : sampleFlags;
+                long bytes = 0;
+                long sampleOffset = start;
+                for (int sample = 0; sample < count; sample++)
+                {
+                    if ((sample & 1023) == 0) ct.ThrowIfCancellationRequested();
+                    uint d = (rf & 0x100) != 0 ? Read(data, ref q, run.End) : duration;
+                    uint n = (rf & 0x200) != 0 ? Read(data, ref q, run.End) : size;
+                    uint sf = (rf & 0x400) != 0 ? Read(data, ref q, run.End) : sample == 0 ? firstFlags : sampleFlags;
+                    uint rawCts = (rf & 0x800) != 0 ? Read(data, ref q, run.End) : 0;
+                    long cts = (rf & 0x800) == 0 ? 0 : (rf >> 24) == 1 ? unchecked((int)rawCts) : rawCts;
+                    if (d == 0 || d > int.MaxValue || n == 0 || n > int.MaxValue || decode > long.MaxValue
+                        || decode > ulong.MaxValue - d || cts is < int.MinValue or > int.MaxValue)
+                        throw Bad("Invalid sample duration, size, composition offset or decode timestamp.");
+                    if (_captureSamples)
+                        track.Media.Samples.Add(new TrackSample
+                        {
+                            Offset = checked(sourceOffset + sampleOffset),
+                            Size = (int)n,
+                            Dts = (long)decode,
+                            CtsOffset = (int)cts,
+                            Duration = (int)d,
+                            Key = (sf & 0x00010000) == 0
+                        });
+                    decode += d;
+                    bytes = checked(bytes + n);
+                    sampleOffset = checked(sampleOffset + n);
+                }
+                if (q != run.End || start < mdat.Payload || start > mdat.End || bytes > mdat.End - start)
+                    throw Bad("A sample run points outside its mdat payload.");
+                ranges.Add((start, start + bytes));
+                track.Samples = checked(track.Samples + count);
+            }
+            track.Next = decode;
+        }
+        long covered = mdat.Payload;
+        foreach (var range in ranges.OrderBy(r => r.Start))
+        {
+            if (range.Start != covered) throw Bad("Overlapping samples or unreferenced mdat bytes.");
+            covered = range.End;
+        }
+        if (covered != mdat.End || ranges.Count == 0) throw Bad("Fragment has incomplete or unreferenced media data.");
+        _sequence = sequence;
     }
 
     internal void Finish(bool requireAudio, bool requireVideo)

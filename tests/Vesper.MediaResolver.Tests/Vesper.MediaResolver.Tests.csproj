@@ -22,6 +22,8 @@
 
   <ItemGroup>
     <None Update="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Vesper.Tests\Fixtures\Media\video-only.webm" Link="Fixtures\video-only.webm" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Vesper.Tests\Fixtures\Media\muxed.webm" Link="Fixtures\muxed.webm" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

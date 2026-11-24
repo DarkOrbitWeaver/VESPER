@@ -58,6 +58,33 @@ public sealed class MediaConversionTests
         }
     }
 
+    [WindowsFact]
+    public async Task PreparedLosslessConversionRemainsWriteProtectedUntilPublication()
+    {
+        await using var server = new FaultServer();
+        server.Extra["/audio.mp4"] = Audio();
+        await server.StartAsync();
+        Harness? harness = null;
+        int checkedStage = 0;
+        using var h = harness = new Harness(failpoint: point =>
+        {
+            if (point != "finalize.afterMediaPrepare") return;
+            string stage = Assert.Single(Directory.GetFiles(harness!.Downloads, "*.convert.mp4", SearchOption.AllDirectories));
+            Assert.ThrowsAny<IOException>(() =>
+            {
+                using var writer = File.Open(stage, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            });
+            Interlocked.Increment(ref checkedStage);
+        });
+        Guid id = AddAudio(h, server);
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(1, checkedStage);
+        Assert.Equal("audio.m4a", done.FileName);
+        Assert.Single(h.Files());
+        using var output = File.OpenRead(done.FinalPath!);
+        Assert.Equal("aac", Assert.Single(MediaMerger.Demux(output, output.Length, default)).Codec);
+    }
+
     [Fact]
     public async Task CompatibleFragmentedAacIsRemuxedToTaggedM4aWithoutReencoding()
     {

@@ -26,6 +26,23 @@ public enum MediaOutput { Original = 0, Mp4 = 1, M4a = 2, Opus = 3, Wav = 4, Mp3
 public static class DirectMediaPlan
 {
     public const string AudioIfPresent = """{"audio":"if-present"}""";
+
+    public static string WebmClip(MediaTimeRange range) =>
+        System.Text.Json.JsonSerializer.Serialize(new { webmClip = range });
+
+    internal static bool TryWebmClip(string? json, out MediaTimeRange range)
+    {
+        range = null!;
+        if (json is null || json.Length > 1024) return false;
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(json);
+            return document.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && document.RootElement.TryGetProperty("webmClip", out var clip)
+                && MediaTimeRange.TryParse(clip.GetRawText(), out range);
+        }
+        catch (System.Text.Json.JsonException) { return false; }
+    }
 }
 
 /// <summary>How strongly the remote representation can be identified across requests.</summary>

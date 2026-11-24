@@ -6,6 +6,27 @@ namespace Vesper.Tests;
 
 public sealed class MediaMergerPayloadValidationTests
 {
+    [Theory]
+    [InlineData("mp4")]
+    [InlineData("webm")]
+    [InlineData("mkv")]
+    public void FusedValidationProducesExactWholeFileDigestAndRejectsCorruption(string container)
+    {
+        using var source = new MemoryStream(Fixture(container == "mp4" ? "video-only.mp4" : "muxed.webm"));
+        var inputs = MediaMerger.Demux(source, source.Length, default).Select(track => (track, (Stream)source)).ToArray();
+        using var output = new MemoryStream();
+        var merged = MediaMerger.Merge(inputs, container, output, default);
+        string expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(output.ToArray()));
+        Assert.Equal(expected, MediaMerger.ValidateRemuxAndHash(output, output.Length, inputs, default,
+            merged.Metadata, merged.ThumbnailSha256));
+        var first = MediaMerger.Demux(output, output.Length, default)[0].Samples[0];
+        output.Position = first.Offset;
+        int original = output.ReadByte();
+        output.Position = first.Offset;
+        output.WriteByte((byte)(original ^ 1));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(output, output.Length, inputs, default));
+    }
+
     [Fact]
     public void Mp4_remux_validation_rejects_intermediate_timestamp_changes_with_unchanged_payload_and_duration()
     {
@@ -40,6 +61,8 @@ public sealed class MediaMergerPayloadValidationTests
         MediaMerger.Validate(output, output.Length, [expected], CancellationToken.None);
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
             output, output.Length, expectedInputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
+            output, output.Length, expectedInputs, CancellationToken.None));
     }
 
     [Fact]
@@ -67,6 +90,8 @@ public sealed class MediaMergerPayloadValidationTests
         AssertSamePayloads(expected, expectedSource, actual, output);
         MediaMerger.Validate(output, output.Length, [expected], CancellationToken.None);
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
+            output, output.Length, expectedInputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
             output, output.Length, expectedInputs, CancellationToken.None));
     }
 
@@ -165,6 +190,8 @@ public sealed class MediaMergerPayloadValidationTests
         output.Write(bytes);
 
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
+            output, output.Length, inputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
             output, output.Length, inputs, CancellationToken.None));
     }
 
@@ -266,6 +293,8 @@ public sealed class MediaMergerPayloadValidationTests
         MediaMerger.Validate(output, output.Length, [expected], CancellationToken.None);
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
             output, output.Length, expectedInputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
+            output, output.Length, expectedInputs, CancellationToken.None));
     }
 
     [Fact]
@@ -311,6 +340,8 @@ public sealed class MediaMergerPayloadValidationTests
         MediaMerger.Validate(output, output.Length, [expected], CancellationToken.None);
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
             output, output.Length, expectedInputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
+            output, output.Length, expectedInputs, CancellationToken.None));
     }
 
     [Fact]
@@ -341,6 +372,8 @@ public sealed class MediaMergerPayloadValidationTests
 
         MediaMerger.Validate(output, outputLength, [inputs[0].Track], CancellationToken.None);
         Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemux(
+            output, outputLength, inputs, CancellationToken.None));
+        Assert.Throws<MediaContainerException>(() => MediaMerger.ValidateRemuxAndHash(
             output, outputLength, inputs, CancellationToken.None));
     }
 

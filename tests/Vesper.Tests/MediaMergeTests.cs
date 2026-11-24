@@ -18,7 +18,10 @@ namespace Vesper.Tests;
 [Collection("Process handle checks")]
 public sealed class MediaMergeTests
 {
-    private const int BenchmarkDurationSeconds = 600;
+    // Opt-in scale for the same fixture workload; keep normal regressions small.
+    private static readonly int BenchmarkDurationSeconds =
+        int.TryParse(Environment.GetEnvironmentVariable("VESPER_BENCHMARK_DURATION_SECONDS"), out int seconds)
+            && seconds is >= 600 and <= 15000 ? seconds : 600;
     private readonly ITestOutputHelper _output;
 
     public MediaMergeTests(ITestOutputHelper output) => _output = output;
@@ -234,6 +237,7 @@ public sealed class MediaMergeTests
         try
         {
             var disk = new DriveInfo(Path.GetPathRoot(outputFolder)!);
+            _output.WriteLine($"fixture-duration-seconds={BenchmarkDurationSeconds}; repeated encoded packets; warm-cache benchmark, no transcoding");
             _output.WriteLine($"environment: os={RuntimeInformation.OSDescription}; runtime={Environment.Version}; processors={Environment.ProcessorCount}; available-memory={GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024)} MiB; disk-free={disk.AvailableFreeSpace / (1024 * 1024)} MiB");
 
             string fixtureFolder = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
@@ -445,6 +449,9 @@ public sealed class MediaMergeTests
         var mergeAllocations = new List<double>();
         var validationAllocations = new List<double>();
         var peakGrowth = new List<double>();
+        var separateTimes = new List<double>();
+        var fusedTimes = new List<double>();
+        bool compareDigest = Environment.GetEnvironmentVariable("VESPER_BENCHMARK_FUSED") == "1";
         long outputBytes = 0;
         double outputDuration = 0;
         int packetCount = inputs.Sum(input => input.Track.Samples.Count);
@@ -479,6 +486,18 @@ public sealed class MediaMergeTests
                 validationMs = validationWatch.Elapsed.TotalMilliseconds;
                 validationAllocations.Add(validationAllocatedMiB);
                 validationTimes.Add(validationMs);
+                if (compareDigest)
+                {
+                    // Separate validation just ran; time its full-file digest too.
+                    output.Position = 0;
+                    var hashWatch = Stopwatch.StartNew();
+                    string separate = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(output));
+                    separateTimes.Add(validationMs + hashWatch.Elapsed.TotalMilliseconds);
+                    var fusedWatch = Stopwatch.StartNew();
+                    string fused = MediaMerger.ValidateRemuxAndHash(output, output.Length, inputs, default);
+                    fusedTimes.Add(fusedWatch.Elapsed.TotalMilliseconds);
+                    Assert.Equal(separate, fused);
+                }
             });
             double mergeMs = mergeWatch.Elapsed.TotalMilliseconds;
             double mergeAllocatedMiB = mergeAllocatedBytes / (1024.0 * 1024.0);
@@ -492,6 +511,8 @@ public sealed class MediaMergeTests
             File.Delete(outputPath);
         }
 
+        if (compareDigest)
+            _output.WriteLine($"digest-comparison: container={container}; separate-ms={Median(separateTimes.Skip(1).ToArray()):0.###}; fused-ms={Median(fusedTimes.Skip(1).ToArray()):0.###}");
         double medianMerge = Median(mergeTimes.Skip(1).ToArray());
         double medianValidation = Median(validationTimes.Skip(1).ToArray());
         double medianMergeAllocated = Median(mergeAllocations.Skip(1).ToArray());

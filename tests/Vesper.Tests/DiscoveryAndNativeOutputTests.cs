@@ -40,6 +40,32 @@ public sealed class DiscoveryAndNativeOutputTests
         }
     }
 
+    [Fact]
+    public void StandaloneWebmOffersLosslessKeyframeClipWithoutAudio()
+    {
+        var video = new MediaRepresentation
+        {
+            Id = "direct-webm", Url = new("https://video.example/preview.webm"), Container = "webm",
+            Content = StreamContent.VideoOnly, StandaloneVideo = true, VideoCodec = "vp9", Height = 720, FileSize = 600000
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new("https://video.example/watch"), Provider = "generic", Title = "Preview",
+            Duration = TimeSpan.FromSeconds(7), Representations = [video]
+        };
+        var full = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality).Choice!;
+        Assert.NotNull(full);
+        Assert.Equal(DirectMediaPlan.AudioIfPresent, full.MediaPlanJson);
+        Assert.Equal(ClipMode.Keyframes, ClipSelection.ModeFor(full));
+        Assert.Contains("keyframe", ClipSelection.Notice(ClipMode.Keyframes));
+        var clipped = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality, clipStartSeconds: 0, clipEndSeconds: 3).Choice!;
+        Assert.NotNull(clipped);
+        Assert.Equal(JobKind.Http, clipped.Kind);
+        Assert.Equal(MediaOutput.Original, clipped.Output);
+        Assert.True(DirectMediaPlan.TryWebmClip(clipped.MediaPlanJson, out var range));
+        Assert.Equal(3, range.EndSeconds);
+    }
+
     private sealed class PlaybackProbe : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

@@ -48,7 +48,7 @@ internal sealed class CandidateProcessor
         // Reserve header slots in input order; network completion order must not change the result.
         var headerSlots = ordered.Select((c, i) => (c, i))
             .Where(x => x.c.Kind is not (CandidateKind.Hls or CandidateKind.Dash)
-                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov"))
+                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov" or "webm"))
             .Take(MaxHeaderReads).Select(x => x.i).ToHashSet();
         await Parallel.ForEachAsync(Enumerable.Range(0, ordered.Length),
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _o.MaxConcurrentRequests), CancellationToken = ct },
@@ -100,7 +100,7 @@ internal sealed class CandidateProcessor
         return outcome;
     }
 
-    private sealed record DirectProbe(ProbeResult? Probe, Mp4HeaderFacts? Facts, MediaError? Problem, bool Manifest = false);
+    private sealed record DirectProbe(ProbeResult? Probe, DirectMediaFacts? Facts, MediaError? Problem, bool Manifest = false);
 
     private async Task<DirectProbe> ProbeDirectAsync(MediaCandidate c, MediaRequestContext ctx,
         bool exactAssetGroup, bool headerSlot, CancellationToken headerToken, CancellationToken ct)
@@ -142,13 +142,15 @@ internal sealed class CandidateProcessor
                 return new(null, null, null, true);
             if (!IsMedia(probe, c))
                 return new(null, null, MediaErrors.NoMedia($"{UrlRedactor.Redact(c.Url)} is not media (content-type '{ctype}')", false));
-            Mp4HeaderFacts? facts = null;
+            DirectMediaFacts? facts = null;
             if (IsMp4(probe, c))
             {
                 if (start is not null) facts = Mp4HeaderFacts.Read(start);
                 else if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
                     facts = await ReadHeaderAsync(c.Url, ctx, probe, headerToken, ct).ConfigureAwait(false);
             }
+            else if (start is not null && (CodecInfo.ContainerFromMime(ctype) ?? ExtensionOf(probe, c)) == "webm")
+                facts = WebmHeaderFacts.Read(start, probe.ContentLength);
             if (facts is { Encrypted: true })
                 return new(null, null, MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
             if (rangedWitness && (facts is not { HasVideo: true, HasAudio: true, DurationSeconds: > 0 }
@@ -173,7 +175,7 @@ internal sealed class CandidateProcessor
         (CodecInfo.ContainerFromMime(p.ContentType?.ToLowerInvariant()) ?? ExtensionOf(p, c)) is "mp4" or "m4v" or "m4a" or "mov";
 
     // The header is extra detail. A server that will not serve it leaves the file's details unknown, nothing more.
-    private async Task<Mp4HeaderFacts?> ReadHeaderAsync(Uri url, MediaRequestContext ctx, ProbeResult probe,
+    private async Task<DirectMediaFacts?> ReadHeaderAsync(Uri url, MediaRequestContext ctx, ProbeResult probe,
         CancellationToken headerToken, CancellationToken ct)
     {
         try
@@ -204,7 +206,7 @@ internal sealed class CandidateProcessor
         return UrlUtil.Extension(p.FinalUrl) ?? UrlUtil.Extension(c.Url) ?? (string.IsNullOrEmpty(fromName) ? null : fromName);
     }
 
-    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index, Mp4HeaderFacts? facts = null)
+    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index, DirectMediaFacts? facts = null)
     {
         string ctype = p.ContentType?.ToLowerInvariant() ?? "";
         string? ext = ExtensionOf(p, c);
@@ -243,7 +245,7 @@ internal sealed class CandidateProcessor
                 : facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
             // Without a readable track table, whether a video file has sound stays honestly unverified.
             AudioUnverified = !audio && facts is null,
-            StandaloneVideo = facts is { HasVideo: true, HasAudio: false },
+            StandaloneVideo = facts is { HasVideo: true, HasAudio: false, CompleteFileCandidate: true },
             MutedLoop = !audio && c.MutedLoop,
             Container = container,
             Width = facts?.Width ?? c.Width,

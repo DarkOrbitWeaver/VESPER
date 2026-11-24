@@ -666,9 +666,12 @@ public partial class Form1 : Form
     {
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            RescueResult result = await MediaSourceRescue.RefreshAsync(engine, job,
-                EngineHost.MediaNetwork(options: engine.Options), timeout.Token, automatic: true);
+            // A retained prefix may require a full byte-for-byte recheck. Give larger partials
+            // a bounded longer budget; the recovery coordinator limits concurrent network work.
+            double seconds = Math.Clamp(60 + job.CommittedBytes / (4d * 1024 * 1024), 60, 600);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
+            RescueResult result = await MediaSourceRescue.RefreshAutomaticallyAsync(engine, job,
+                EngineHost.MediaNetwork(options: engine.Options), timeout.Token);
             if (!result.Accepted) System.Diagnostics.Trace.WriteLine(result.Message, "Automatic link refresh");
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)

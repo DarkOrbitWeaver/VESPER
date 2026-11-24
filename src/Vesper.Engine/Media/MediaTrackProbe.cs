@@ -23,7 +23,10 @@ internal static class MediaTrackProbe
     {
         if (format == "webm")
         {
-            if (!WebmHasAudio(file, ct)) throw MissingAudio();
+            if (WebmHasAudio(file, ct, out bool finiteSegment)) return;
+            if (!allowSilentProgressiveMp4) throw MissingAudio();
+            if (!finiteSegment) throw Bad("The WebM has no complete finite segment extent.");
+            RequireSilentWebmSamples(file, expectedIdentity, ct);
             return;
         }
 
@@ -116,14 +119,36 @@ internal static class MediaTrackProbe
             throw Bad("The MP4 does not contain complete video-only samples.");
     }
 
-    private static bool WebmHasAudio(PartialFile file, CancellationToken ct)
+    internal static void RequireSilentWebmHeader(PartialFile file, CancellationToken ct)
     {
+        if (WebmHasAudio(file, ct, out bool finite) || !finite)
+            throw Bad("The selected clip is not a finite silent WebM.");
+    }
+
+    private static void RequireSilentWebmSamples(PartialFile file, string? expectedIdentity, CancellationToken ct)
+    {
+        PathSafety.RequireTemporaryIdentity(file.Handle, expectedIdentity);
+        using var source = PathSafety.OpenTemporaryStream(file.Path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite, 1 << 16, FileOptions.RandomAccess);
+        PathSafety.RequireTemporaryIdentity(source.SafeFileHandle, expectedIdentity);
+        if (source.Length != file.Length) throw Bad("The WebM changed during validation.");
+        List<DemuxedTrack> tracks = WebmDemuxer.Read(source, source.Length, ct);
+        PathSafety.RequireTemporaryIdentity(source.SafeFileHandle, expectedIdentity);
+        if (tracks.Count != 1 || tracks[0] is not { Kind: TrackKind.Video, Codec: "vp8" or "vp9" or "av1" }
+            || tracks[0].Samples.Count == 0 || !tracks[0].Samples[0].Key)
+            throw Bad("The WebM does not contain a supported standalone video.");
+    }
+
+    private static bool WebmHasAudio(PartialFile file, CancellationToken ct, out bool finiteSegment)
+    {
+        finiteSegment = false;
         long position = 0;
         var ebml = FileElement(file, ref position, file.Length);
         if (ebml.Id != 0x1a45dfa3) throw Bad("Missing EBML header.");
         position = ebml.End;
         var segment = FileElement(file, ref position, file.Length);
         if (segment.Id != 0x18538067) throw Bad("Missing WebM segment.");
+        finiteSegment = !segment.UnknownSize && segment.End == file.Length;
         for (int count = 0; position < segment.End && count < 100_000; count++)
         {
             ct.ThrowIfCancellationRequested();
@@ -151,7 +176,12 @@ internal static class MediaTrackProbe
                             if (property.Id == 0x86 && property.End - q <= 128) codec = Encoding.ASCII.GetString(tracks, q, (int)property.End - q);
                             q = (int)property.End;
                         }
-                        if (kind == 2 && codec is "A_OPUS" or "A_VORBIS" or "A_AAC" or "A_MPEG/L3" or "A_FLAC") audio = true;
+                        if (kind == 2)
+                        {
+                            if (codec is not ("A_OPUS" or "A_VORBIS" or "A_AAC" or "A_MPEG/L3" or "A_FLAC"))
+                                throw Bad("The WebM declares an unsupported audio track.");
+                            audio = true;
+                        }
                     }
                     p = (int)track.End;
                 }
@@ -162,7 +192,7 @@ internal static class MediaTrackProbe
         throw Bad("No bounded WebM track table was found.");
     }
 
-    private readonly record struct Element(ulong Id, long End);
+    private readonly record struct Element(ulong Id, long End, bool UnknownSize = false);
     private static Element FileElement(PartialFile file, ref long position, long parentEnd)
     {
         if (parentEnd - position < 2) throw Bad("Truncated EBML element.");
@@ -170,7 +200,7 @@ internal static class MediaTrackProbe
         int p = 0; ulong id = Vint(header, ref p, true, out _); ulong length = Vint(header, ref p, false, out bool unknown);
         position += p;
         if (!unknown && length > (ulong)(parentEnd - position)) throw Bad("EBML element exceeds its container.");
-        return new(id, unknown ? parentEnd : position + (long)length);
+        return new(id, unknown ? parentEnd : position + (long)length, unknown);
     }
     private static Element MemoryElement(byte[] bytes, ref int p, int end)
     {

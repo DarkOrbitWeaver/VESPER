@@ -160,7 +160,7 @@ internal sealed partial class BrowserBridgeHandler
             string container = job.Kind == JobKind.Hls && job.Output == MediaOutput.Original
                 ? (tracks.FirstOrDefault()?.Container ?? "Video").ToUpperInvariant() : job.DisplayContainer;
             return new BrowserOption(index, label, job.DisplayDetail, container,
-                clipMode != ClipMode.None, clipMode == ClipMode.FullFile,
+                clipMode != ClipMode.None, clipMode is ClipMode.FullFile or ClipMode.Keyframes,
                 video?.Height, hasVideo, hasAudio, size, estimate);
         }
         void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
