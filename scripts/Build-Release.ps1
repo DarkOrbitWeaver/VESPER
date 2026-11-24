@@ -105,10 +105,11 @@ $manifestFile = Join-Path $out 'extension/manifest.json'
 $extensionManifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
 $extensionManifest.version = ($Version -split '-')[0]
 $extensionManifest | Add-Member -NotePropertyName version_name -NotePropertyValue $Version -Force
-$extensionManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+[IO.File]::WriteAllText($manifestFile, ($extensionManifest | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
 
 if (-not $PortableOnly) {
     Write-Host "==> Build offline First Flight setup"
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $package = Join-Path $root ("release\.setup-" + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($package) | Out-Null
@@ -126,13 +127,17 @@ if (-not $PortableOnly) {
             }
         )
         $payload.Dispose(); $payload = $null
-        @{ Version = $Version; Files = $files } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+        [IO.File]::WriteAllText($manifestPath, (@{ Version = $Version; Files = $files } | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
         Run "Publish First Flight" {
             dotnet publish src/Vesper.Setup/Vesper.Setup.csproj -c Release -r win-x64 --self-contained -o $setupOut `
                 -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
                 -p:EnableCompressionInSingleFile=true "-p:SetupPayload=$payloadPath" "-p:SetupManifest=$manifestPath" @buildArgs
         }
         $setupExe = Join-Path $setupOut 'VESPER-Setup.exe'
+        Run 'Verify embedded setup payload' {
+            $verification = Start-Process -FilePath $setupExe -ArgumentList '--verify-package' -Wait -PassThru
+            $global:LASTEXITCODE = $verification.ExitCode
+        }
         Sign-ReleaseFile $setupExe
         "$((Get-FileHash -LiteralPath $setupExe).Hash)  VESPER-Setup.exe" | Set-Content -LiteralPath (Join-Path $setupOut 'SHA256SUMS.txt')
         Write-Host "Setup: $setupExe"

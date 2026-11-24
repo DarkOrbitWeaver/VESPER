@@ -13,6 +13,19 @@ public sealed class InstallTests : IDisposable
     private readonly Registration _registration = new();
     private InstallPaths Paths => new(Path.Combine(_root, "Programs"), Path.Combine(_root, "VESPER"), Path.Combine(_root, "StartMenu"));
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ManifestReaderAcceptsUtf8WithOrWithoutBom(bool bom)
+    {
+        var expected = new PayloadManifest("1.2.3", [new PayloadFile("extension/manifest.json", 42, new string('A', 64))]);
+        byte[] json = JsonSerializer.SerializeToUtf8Bytes(expected);
+        using var stream = new MemoryStream(bom ? [0xEF, 0xBB, 0xBF, .. json] : json);
+        var actual = InstallPayload.ReadManifest(stream);
+        Assert.Equal(expected.Version, actual.Version);
+        Assert.Equal(expected.Files, actual.Files);
+    }
+
     [Fact]
     public void InstallRepairAndUninstallKeepUserFiles()
     {

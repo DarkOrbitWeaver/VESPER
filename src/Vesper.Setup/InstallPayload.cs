@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using VESPER;
 
@@ -22,7 +23,13 @@ internal sealed class InstallPayload(Stream archive, PayloadManifest manifest)
     internal static PayloadManifest ReadManifest()
     {
         using var stream = Resource("Vesper.Setup.Payload.json");
-        return JsonSerializer.Deserialize<PayloadManifest>(stream)
+        return ReadManifest(stream);
+    }
+
+    internal static PayloadManifest ReadManifest(Stream stream)
+    {
+        using var reader = new StreamReader(stream, new UTF8Encoding(false, true), detectEncodingFromByteOrderMarks: true, leaveOpen: true);
+        return JsonSerializer.Deserialize<PayloadManifest>(reader.ReadToEnd())
             ?? throw new InvalidDataException("The package manifest is missing.");
     }
 
@@ -103,7 +110,7 @@ internal sealed class InstallPayload(Stream archive, PayloadManifest manifest)
 
     private static void VerifyExtension(string stage)
     {
-        using var json = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(stage, "extension", "manifest.json")));
+        using var json = JsonDocument.Parse(File.ReadAllText(Path.Combine(stage, "extension", "manifest.json"), new UTF8Encoding(false, true)));
         if (!json.RootElement.TryGetProperty("key", out var key) || key.ValueKind != JsonValueKind.String)
             throw new InvalidDataException("The extension manifest has no pinned key.");
         var digest = SHA256.HashData(Convert.FromBase64String(key.GetString()!));

@@ -17,6 +17,11 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args is ["--verify-package"])
+        {
+            Environment.ExitCode = VerifyPackage();
+            return;
+        }
         ApplicationConfiguration.Initialize();
         var mode = args.Contains("--uninstall") ? SetupMode.Uninstall : args.Contains("--repair") ? SetupMode.Repair : SetupMode.Install;
         try
@@ -48,6 +53,25 @@ internal static class Program
         {
             MessageBox.Show(ex.Message, "VESPER Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    // Build-time smoke check: exercise the actual embedded resources without
+    // opening the UI, registering the host, or touching an installed copy.
+    private static int VerifyPackage()
+    {
+        string stage = Directory.CreateTempSubdirectory("vesper-package-check-").FullName;
+        try
+        {
+            using var archive = InstallPayload.Resource("Vesper.Setup.Payload.zip");
+            new InstallPayload(archive, InstallPayload.ReadManifest()).Extract(stage, null, CancellationToken.None);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            return 1;
+        }
+        finally { Directory.Delete(stage, recursive: true); }
     }
 
     internal static IDisposable AcquireAppLock(CancellationToken ct) => AcquireAppLock(InstanceMutexName,
