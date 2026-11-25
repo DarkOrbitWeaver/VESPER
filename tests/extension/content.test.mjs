@@ -421,7 +421,7 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
     chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
   });
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.testPlayer = {
-    startDrag, moveDrag, finishDrag, onPointer, place, moved: () => suppressDragClick,
+    startDrag, moveDrag, finishDrag, onPointer, place, fillsFullscreen, moved: () => suppressDragClick,
     setup: (player, action, picker, sprite) => {
       video = player; button = action; panel = picker; companion = sprite;
       perch = { x: 20, y: 30, faceLeft: false };
@@ -455,6 +455,10 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
     }
   }
   const fullBox = () => ({ left: 0, top: 0, right: 800, bottom: 600 });
+  player.parentElement = { position: 'fixed', getBoundingClientRect: fullBox };
+  assert.equal(window.testPlayer.fillsFullscreen({ left: 200, top: 0, right: 800, bottom: 600 }), false,
+    'a feed with a sidebar is not fullscreen even inside a fixed app shell');
+  delete player.parentElement;
   for (const mode of ['native', 'fullscreen frame', 'expanded player']) {
     document.fullscreenElement = mode === 'native' ? { contains: () => true } : null;
     window.screen = mode === 'fullscreen frame' ? { width: 800, height: 600 } : { width: 1200, height: 900 };
@@ -502,14 +506,20 @@ test('opening the picker pins the chosen feed player despite a larger autoplayin
     onPointer({target:overlay,clientX:10,clientY:10,composedPath:()=>[overlay]});
     panelMedia = null;
     selectPlayer();
+    manualPlayer = selected;
+    movedPerch = { x: 0.2, y: 0.2 };
+    visiblePlayer = player => player === selected ? null : {left:0,top:0,right:800,bottom:800};
+    selectPlayer();
+    if (manualPlayer || movedPerch) throw Error('Off-screen pin survived feed transition');
     return calls;
   };\n})();`);
   runContent(context, content);
   const selected={isConnected:true,paused:true}, neighbour={isConnected:true,paused:false};
   const calls=window.testPin(selected,neighbour,{});
-  assert.equal(calls.length,2);
+  assert.equal(calls.length,3);
   assert.equal(calls[0],'place');
   assert.equal(calls[1],neighbour);
+  assert.equal(calls[2],neighbour);
 });
 
 test('Smart Select filters navigation links and reports direct file details', () => {

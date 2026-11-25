@@ -1237,15 +1237,28 @@ async function playerOptions(message, sender) {
       .map(url => ({ host: url.host, origin: url.origin, parts: url.pathname.split('/').filter(Boolean) })) : [];
     const rankingFragments = playerFragments.length ? playerFragments : fragments;
     const possibleSources = [];
+    const exactResources = new Set();
+    const fingerprints = new Set(playbackFingerprints);
     const playerActiveOrLoaded = playerActiveForWatch(message);
     if (!matchedManifest && source === null && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
-      for (const evidence of state.sources) {
+      const scoped = state.sources.filter(currentEvidence);
+      // Preloaded media can precede loadedmetadata by many seconds. Only a
+      // current object's exact URL fingerprint may widen the timing window.
+      // It admits a candidate for independent verification, not auto-selection.
+      if (fingerprints.size && !prefetch) {
+        await Promise.all(scoped.filter(item => item.seen >= now - 120_000).slice(0, MAX_SOURCES).map(async item => {
+          try {
+            if (fingerprints.has(await sourceIdentity(item.url))) exactResources.add(item.url);
+          } catch { /* Missing crypto leaves the ordinary timing window intact. */ }
+        }));
+      }
+      for (const evidence of scoped) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
-        const recent = evidence.seen >= sourceCutoff;
+        const witnessed = exactResources.has(evidence.url);
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
-        if (currentEvidence(evidence) && recent
-            && (isManifest || evidence.seen >= directCutoff
+        if ((witnessed || evidence.seen >= sourceCutoff)
+            && (isManifest || (witnessed || evidence.seen >= directCutoff)
               && (isWholeDirectSource(evidence) || isRangedMediaCandidate(evidence)))
             && !possibleSources.some(item => item.url === evidence.url))
           possibleSources.push(evidence);
@@ -1333,13 +1346,12 @@ async function playerOptions(message, sender) {
             const pickerTitle = binding ? message.title : undefined;
             const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
               generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl, title: pickerTitle };
-            const fingerprints = new Set(playbackFingerprints);
-            const exactResources = new Set();
-            if (fingerprints.size && !prefetch) {
+            // Include exact witnesses for recently observed direct/range candidates
+            // too; the earlier scoped pass already covered blob-backed players.
+            if (fingerprints.size && !prefetch && source !== null) {
               await Promise.all(possibleSources.slice(0, MAX_SOURCES).map(async item => {
                 try {
-                  const url = VesperPlayerSource.http(item.url);
-                  if (url && fingerprints.has(await sourceIdentity(url.href))) exactResources.add(item.url);
+                  if (fingerprints.has(await sourceIdentity(item.url))) exactResources.add(item.url);
                 } catch { /* Missing crypto is a ranking miss, not a download failure. */ }
               }));
             }

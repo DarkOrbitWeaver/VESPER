@@ -4380,3 +4380,29 @@ test('out-of-order media callbacks cannot restore an obsolete ETag or CORS polic
   assert.equal(state.sources[0].corsOrigin,null);
   assert.equal(state.sources[0].conflictingValidator,true);
 });
+
+test('preloaded blob media is admitted only by a recent exact witness in the same document', async () => {
+  const page = 'https://video.example/feed';
+  const sender = { url: page, tab: { id: 81 }, frameId: 0, documentId: 'preloaded-doc' };
+  const now = Date.now();
+  const actual = 'https://cdn.example.com/actual.mp4?signature=one';
+  const other = 'https://cdn.example.com/other.mp4?signature=two';
+  const app = load({ 'media-options': { ok: false, code: 'site-refused' }, 'media-source-options': checkedSource(60) });
+  try {
+    for (const [url, documentId] of [[actual, sender.documentId], [other, sender.documentId], ['https://cdn.example.com/wrong.mp4', 'other-doc']]) {
+      await app.onMedia({ url, tabId: 81, frameId: 0, documentId, method: 'GET', statusCode: 200, type: 'media',
+        timeStamp: now - 30_000, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }, { name: 'Content-Length', value: '300000' }] });
+    }
+    const hash = async url => Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(url))).toString('hex');
+    const message = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: 'blob:https://video.example/active',
+      generation: 1, playerPlaying: true, mediaChangedAt: now };
+    const noWitness = await app.message(message, sender);
+    assert.equal(noWitness.ok, false);
+    assert.equal(app.sent.filter(m => m.type === 'media-source-options').length, 0);
+    const result = await app.message({ ...message, playerResourceFingerprints: [await hash(actual), await hash('https://cdn.example.com/wrong.mp4')] }, sender);
+    const checks = app.sent.filter(m => m.type === 'media-source-options');
+    assert.equal(checks.length, 1);
+    assert.equal(checks[0].candidates[0].url, actual);
+    assert.equal(result.data.sourceChoices.length, 1, 'witness ranks verified media but does not auto-select');
+  } finally { app.stopWorker(); }
+});

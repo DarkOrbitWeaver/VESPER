@@ -389,7 +389,11 @@
     }
     if (holdMissingPreview()) { place(); return; }
     const fullscreen = document.fullscreenElement;
-    if (manualPlayer && !manualPlayer.isConnected) manualPlayer = null;
+    if (manualPlayer && (!manualPlayer.isConnected || !visiblePlayer(manualPlayer, 110, 70)
+        && [...observed].some(el => el !== manualPlayer && visiblePlayer(el)))) {
+      manualPlayer = null;
+      movedPerch = null;
+    }
     if (manualPlayer && (!fullscreen || fullscreen.contains(manualPlayer))) {
       setIntentCertainty(true);
       if (video !== manualPlayer) attach(manualPlayer);
@@ -497,9 +501,10 @@
       const data = JSON.parse(value);
       if (!Array.isArray(data.paths)) return { paths: [], fingerprints: [] };
       const now = Date.now();
-      // Page-world evidence is untrusted and can only reorder independent probes.
+      // The witness belongs to the current Blob/MSE object, which may have been
+      // populated before loadedmetadata. It remains untrusted ranking evidence.
       const witnesses = data.paths.slice(0, 12).filter(item => Number.isFinite(item?.seen)
-        && item.seen >= Math.max(now - 120_000, binding.changedAt - 2000)
+        && item.seen >= now - 120_000
         && item.seen <= now + 1000)
         .map(item => ({ url: VesperPlayerSource.http(item.path), fingerprint: item.fingerprint }))
         .filter(item => item.url && !item.url.search);
@@ -948,6 +953,7 @@
 
   function attach(el) {
     if (video === el && host) {
+      if (host.isConnected === false) mount();
       clearTimeout(previewExitTimer);
       previewExitTimer = previewRemovedAt = 0;
       place();
@@ -1082,7 +1088,9 @@
     // The parent can fullscreen a cross-origin iframe without setting fullscreenElement inside it.
     if (fillsWidth && fillsHeight && display && Math.abs(display.width - innerWidth) <= 8
         && Math.abs(display.height - innerHeight) <= 8) return true;
-    if (!fillsWidth && !fillsHeight) return false;
+    // A feed may fill one axis inside a fixed, viewport-sized app shell.
+    // That is not fullscreen playback: keep the butterfly visible there.
+    if (!fillsWidth || !fillsHeight) return false;
     // Some players expand a fixed container over the whole tab instead of using the Fullscreen API.
     for (let parent = video, depth = 0; parent && depth < 6; parent = parent.parentElement, depth++) {
       if (getComputedStyle(parent).position !== 'fixed') continue;
