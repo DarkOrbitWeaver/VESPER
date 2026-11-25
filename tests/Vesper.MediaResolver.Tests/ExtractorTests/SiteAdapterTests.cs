@@ -884,6 +884,28 @@ public class SiteAdapterTests
             Assert.Equal(MediaErrorCode.NoDownloadableMedia, result.Error!.Code);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TikTok_ExpiredEmbedRefreshesOnlyTheSameCanonicalPost(bool sameIdentity)
+    {
+        const string embed = "https://www.tiktok.com/embed/v2/7234567890123456789";
+        string fresh = Fixture.Load("tiktok_page.html");
+        string expired = fresh.Replace("expire=4000000000", "expire=1500000000")
+            .Replace("play.mp4", "play.mp4?expire=1500000000");
+        var handler = AddTikTokMedia(new FakeHttpHandler()
+            .Add(embed, expired, "text/html")
+            .Add(TikTokUrl, sameIdentity ? fresh : fresh.Replace("7234567890123456789", "7234567890123456780"), "text/html"));
+        var result = await Resolve(handler, embed);
+        Assert.Equal(sameIdentity, result.IsSuccess);
+        Assert.Equal(1, handler.Count("/embed/v2/"));
+        Assert.Equal(1, handler.Count("/@fixtureuser/video/"));
+        if (sameIdentity)
+            Assert.Equal("7234567890123456789", result.Item!.MediaId);
+        else
+            Assert.Equal(MediaErrorCode.NoDownloadableMedia, result.Error!.Code);
+    }
+
     [Fact]
     public async Task TikTok_ReturnsQualitiesWithoutLeakingHostOnlyCookiesToCdn()
     {

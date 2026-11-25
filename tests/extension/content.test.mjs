@@ -973,3 +973,77 @@ test('a pointer still heading for the butterfly gets extra time, with a limit', 
   assert.match(source('content'), /const approaching = distance < previewPointerDistance - 6;/);
   assert.match(source('content'), /\(previewLatched\(\) \|\| approaching\) && Date\.now\(\) - previewRemovedAt < PREVIEW_MAX_LATCH/);
 });
+
+test('feed DOM discovery coalesces inserted players and recovers a removed overlay', () => {
+  const content = source('content');
+  const start = content.indexOf('  function mediaTreeChanged(');
+  const end = content.indexOf('  function refreshPlayers(', start);
+  let passes = 0;
+  const frames = [];
+  const context = vm.createContext({ alive: () => true, host: null, observed: new Set(), discoveryFrame: 0,
+    requestAnimationFrame: callback => (frames.push(callback), frames.length),
+    refreshPlayers: () => passes++ });
+  const changed = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
+  const unrelated = {nodeType: 1, matches: () => false, querySelector: () => null};
+  const media = {nodeType: 1, matches: () => true};
+  changed([{type:'childList', addedNodes:[unrelated]}]);
+  assert.equal(frames.length, 0);
+  changed([{type:'childList', addedNodes:[media]}]);
+  changed([{type:'attributes', target:media}]);
+  assert.equal(frames.length, 1);
+  frames[0]();
+  assert.equal(passes, 1);
+  context.host = {isConnected:false};
+  changed([{type:'childList', addedNodes:[]}]);
+  assert.equal(frames.length, 2);
+  frames[1]();
+  assert.equal(passes, 2);
+  context.host = null;
+  context.observed.add({isConnected:false});
+  changed([{type:'childList', addedNodes:[]}]);
+  assert.equal(frames.length, 3);
+});
+
+test('scroll re-ranks a competing visible feed player instead of merely moving the old overlay', () => {
+  const content = source('content');
+  const start = content.indexOf('  function schedule()');
+  const end = content.indexOf('  function stopFullscreenIdle(', start);
+  let ranked = 0, placed = 0, callback;
+  const player = {};
+  const context = vm.createContext({ alive: () => true, frame:0, manualPlayer:null, video:player,
+    observed: new Set([player, {}]), visiblePlayer: () => ({}),
+    place: () => placed++, selectPlayer: () => ranked++, requestAnimationFrame: fn => (callback=fn,1) });
+  const schedule = vm.runInContext(content.slice(start,end)+'\nschedule;', context);
+  schedule(); callback();
+  assert.equal(ranked,1); assert.equal(placed,0);
+  context.observed = new Set([player]);
+  schedule(); callback();
+  assert.equal(placed,1);
+});
+
+test('TikTok feed identity comes from the exact live player wrapper, not the home page or adjacent card', () => {
+  const content = source('content');
+  const start = content.indexOf('  function activeTikTokPage(');
+  const end = content.indexOf('  function setIntentCertainty(', start);
+  const location = { hostname:'www.tiktok.com', origin:'https://www.tiktok.com' };
+  const context = vm.createContext({location, URL});
+  vm.runInContext(source('player-source'),context);
+  const identify = vm.runInContext(content.slice(start,end)+'\nactiveTikTokPage;',context);
+  const player = {tagName:'VIDEO'};
+  const wrapper = {id:'xgwrapper-0-7608248907960814879', querySelectorAll:()=>[player]};
+  player.parentElement = wrapper;
+  const root = location.origin+'/';
+  assert.equal(identify(player,root),location.origin+'/embed/v2/7608248907960814879');
+  const permalink = location.origin+'/@creator/video/7608248907960814879';
+  assert.equal(identify(player,permalink),permalink);
+  wrapper.id = 'xgwrapper-0-7608248907960814880';
+  assert.equal(identify(player,permalink),location.origin+'/embed/v2/7608248907960814880');
+  wrapper.querySelectorAll = ()=>[player,{}];
+  assert.equal(identify(player,root),null);
+  wrapper.querySelectorAll = ()=>[player];
+  wrapper.id = 'xgwrapper-0-invalid';
+  assert.equal(identify(player,root),null);
+  location.hostname='not-tiktok.com';
+  wrapper.id='xgwrapper-0-7608248907960814879';
+  assert.equal(identify(player,root),null);
+});

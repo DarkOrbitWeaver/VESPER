@@ -30,16 +30,19 @@ internal sealed class TikTokAdapter : AdapterBase
 
     public override bool CanHandle(Uri url) => Matches(url);
 
-    public override async Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct)
+    public override Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct) =>
+        ResolvePageAsync(request, request.Url, ct);
+
+    private async Task<MediaDiscoveryResult> ResolvePageAsync(MediaDiscoveryRequest request, Uri pageUrl, CancellationToken ct)
     {
-        var page = await GetPageAsync(request.Url, request.AuthContext, ct).ConfigureAwait(false);
+        var page = await GetPageAsync(pageUrl, request.AuthContext, ct).ConfigureAwait(false);
         request.PageResponse = page;
         JsonDocument? state = null;
         JsonElement? item = null;
         try
         {
-            string? embedId = EmbedVideoId(request.Url);
-            string? videoId = embedId ?? VideoId(request.Url) ?? VideoId(page.FinalUrl) ?? EmbedVideoId(page.FinalUrl);
+            string? embedId = EmbedVideoId(pageUrl);
+            string? videoId = embedId ?? VideoId(pageUrl) ?? VideoId(page.FinalUrl) ?? EmbedVideoId(page.FinalUrl);
             var found = FindPlayerState(page.Content, videoId);
             state = found.Document;
             item = found.Item;
@@ -159,11 +162,24 @@ internal sealed class TikTokAdapter : AdapterBase
             await AddAddressesAsync(video.P("playAddr"), "tiktok-play").ConfigureAwait(false);
             await AddAddressesAsync(video.P("downloadAddr"), "tiktok-download").ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
+            string? author = s.P("author").P("uniqueId").Str() ?? s.P("author").Str();
             if (reps.Count == 0)
+            {
+                // The embed may be cached with expired signed URLs. Retry once
+                // through the public canonical post named by its verified item.
+                // Do not retry refusals, protection, or rate limits.
+                if (embedId is not null && problems.Count > 0
+                    && problems.All(problem => problem.Code == MediaErrorCode.SourceExpired)
+                    && author is { Length: > 0 and <= 64 }
+                    && author.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.'))
+                {
+                    var canonical = new Uri(pageUrl.GetLeftPart(UriPartial.Authority) + "/@" + author + "/video/" + embedId);
+                    return await ResolvePageAsync(request, canonical, ct).ConfigureAwait(false);
+                }
                 return Fail(problems.FirstOrDefault(problem => problem.Code is not (MediaErrorCode.VideoUnavailable or MediaErrorCode.NoDownloadableMedia))
                     ?? problems.FirstOrDefault()
                     ?? MediaErrors.NoMedia("TikTok supplied title and artwork but no verified media URL.", browserMayHelp: true));
-            string? author = s.P("author").P("uniqueId").Str() ?? s.P("author").Str();
+            }
             string desc = s.P("desc").Str() ?? "";
             return MediaDiscoveryResult.FromItem(new MediaItem
             {

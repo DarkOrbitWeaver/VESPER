@@ -88,6 +88,7 @@
   const prefetchRetried = new WeakMap();
   let generation = 0;
   const observed = new Set();
+  let discoveryObserver = null, discoveryFrame = 0;
   const intersecting = new WeakMap();
   const resize = new ResizeObserver(schedule);
   const visibility = new IntersectionObserver((entries) => {
@@ -107,6 +108,9 @@
     activeBrowserCopy?.controller.abort();
     generatedCopy?.controller.abort();
     visibility.disconnect();
+    discoveryObserver?.disconnect();
+    if (discoveryFrame) cancelAnimationFrame(discoveryFrame);
+    discoveryFrame = 0;
     resourceObserver?.disconnect();
     resourceObserver = null;
     observed.clear();
@@ -281,7 +285,8 @@
     const origin = new URL(pageAddress()).origin;
     for (let card = node, depth = 0; card && depth < 9 && card !== document.body; card = card.parentElement, depth++) {
       const allVideos = [...card.querySelectorAll('video')];
-      if (allVideos.length > 4) continue;
+      // Never derive one video's post from a shared multi-player feed container.
+      if (allVideos.length > 1) break;
       const videos = includePlayer ? allVideos.filter(el => observed.has(el) && visiblePlayer(el)) : [];
       if (includePlayer && !videos.length) continue;
       const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
@@ -366,7 +371,25 @@
 
   function pageForPlayer(el) {
     const contextPage = cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
-    return activeYouTubePage(el, contextPage) || contextPage;
+    return activeYouTubePage(el, contextPage) || activeTikTokPage(el, contextPage) || contextPage;
+  }
+
+  function activeTikTokPage(el, contextPage) {
+    if (!/(?:^|\.)tiktok\.com$/i.test(location.hostname || '') || el?.tagName !== 'VIDEO') return null;
+    // The feed keeps its address at /, but its player wrapper carries the
+    // actual post ID. Only use the nearest wrapper enclosing this exact video.
+    for (let node = el.parentElement, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+      const match = /^xgwrapper-\d+-(\d{10,24})$/.exec(node.id || '');
+      if (!match) continue;
+      const videos = node.querySelectorAll('video');
+      if (videos.length !== 1 || videos[0] !== el) return null;
+      const id = 'tiktok:' + match[1];
+      if (VesperPlayerSource.identity(contextPage) === id) return contextPage;
+      // A DOM hint is not permission or proof of bytes. The native adapter
+      // requires its returned item ID to match this explicit ID.
+      return new URL('/embed/v2/' + match[1], location.origin).href;
+    }
+    return null;
   }
 
   function setIntentCertainty(certain) {
@@ -606,11 +629,30 @@
     }
   }
 
+  function mediaTreeChanged(records) {
+    if (!alive() || discoveryFrame) return;
+    const selector = 'video,audio[controls],source';
+    const relevant = (node) => node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector));
+    // Feed virtualization can insert a ready, paused player without firing a
+    // new media event. Batch DOM changes into a single discovery pass.
+    if (host && !host.isConnected || [...observed].some(el => !el.isConnected)
+        || records.some(record => record.type === 'attributes' ? relevant(record.target)
+          : [...record.addedNodes].some(relevant))) {
+      discoveryFrame = requestAnimationFrame(() => {
+        discoveryFrame = 0;
+        refreshPlayers();
+      });
+    }
+  }
+
   function refreshPlayers() {
     if (!alive()) return;
     syncPage();
     if (!extensionPreferencesReady) return;
     if (butterflyHidden()) { detach(true); return; }
+    for (const el of observed) {
+      if (!el.isConnected) { visibility.unobserve(el); observed.delete(el); }
+    }
     document.querySelectorAll('video,audio[controls]').forEach(consider);
     selectPlayer();
   }
@@ -977,8 +1019,7 @@
       listening = true;
       document.addEventListener('pointermove', onPointer, { passive: true, capture: true, signal });
       document.addEventListener('pointerleave', clearPointer, { passive: true, signal });
-      window.addEventListener('scroll', schedule, { passive: true, capture: true, signal });
-      window.addEventListener('resize', schedule, { passive: true, signal });
+
     }
     place();
     schedulePrefetch(el);
@@ -1002,8 +1043,7 @@
     unwatchTheme = null;
     document.removeEventListener('pointermove', onPointer, true);
     document.removeEventListener('pointerleave', clearPointer);
-    window.removeEventListener('scroll', schedule, true);
-    window.removeEventListener('resize', schedule);
+
     cancelAnimationFrame(frame);
     frame = 0;
     perch = null;
@@ -1229,7 +1269,9 @@
   function schedule() {
     if (alive() && !frame) frame = requestAnimationFrame(() => {
       frame = 0;
-      if (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video)) place(true);
+      // Geometry and focus can change before IntersectionObserver reports
+      // a new threshold. Re-rank competing players even if the old one remains visible.
+      if (observed.size <= 1 && (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))) place(true);
       else selectPlayer();
     });
   }
@@ -2345,7 +2387,7 @@
   });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) cancelPrefetch();
-    else schedulePrefetch(video);
+    else { refreshPlayers(); schedulePrefetch(video); }
   }, { signal });
   window.addEventListener('pagehide', e => {
     cancelPrefetch();
@@ -2354,6 +2396,15 @@
     if (e.persisted) companion?.setVisible(false); else retire();
   }, { signal });
   window.addEventListener('pageshow', refreshPlayers, { signal });
+  // These remain installed when the overlay is temporarily absent. No polling.
+  const geometryChanged = () => { if (observed.size) schedule(); };
+  window.addEventListener('scroll', geometryChanged, { passive: true, capture: true, signal });
+  window.addEventListener('resize', geometryChanged, { passive: true, signal });
+  if (typeof MutationObserver !== 'undefined' && document.documentElement) {
+    discoveryObserver = new MutationObserver(mediaTreeChanged);
+    discoveryObserver.observe(document.documentElement, { childList: true, subtree: true,
+      attributes: true, attributeFilter: ['src', 'controls', 'id', 'data-permalink'] });
+  }
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;
     applyMotion();
