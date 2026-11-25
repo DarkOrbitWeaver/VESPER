@@ -27,9 +27,10 @@ function setup() {
       this.promise = Promise.resolve(buffer);
     }
     arrayBuffer() { return this.promise; }
+    blob() { return this.promise; }
   }
   const context = vm.createContext({ URL: WitnessURL, MediaSource: Source, SourceBuffer: Buffer,
-    HTMLMediaElement: Player, Response: FetchResponse, WeakRef, ArrayBuffer,
+    HTMLMediaElement: Player, Response: FetchResponse, WeakRef, ArrayBuffer, Blob,
     Date: class extends Date { static now() { return time; } },
     document: { addEventListener: (type, fn) => listeners.set(type, fn) } });
   vm.runInContext(script('media-source-witness'), context);
@@ -43,7 +44,7 @@ function setup() {
     listeners.get('vesper-media-provenance-request')({target:el});
     return JSON.parse(el.attributes.get('data-vesper-media-provenance') || '{"paths":[]}').paths;
   };
-  return {player, request, FetchResponse, advance: ms => time += ms};
+  return {player, request, FetchResponse, WitnessURL, Player, advance: ms => time += ms};
 }
 
 test('exact response buffer is associated with only the SourceBuffer that receives it', async () => {
@@ -59,6 +60,28 @@ test('exact response buffer is associated with only the SourceBuffer that receiv
   assert.deepEqual(b.request(neighbour.el), []);
   b.advance(120001);
   assert.deepEqual(b.request(a.el), []);
+});
+
+test('a media response fetched before MediaSource creation retains exact object provenance', async () => {
+  const b = setup(), bytes = new ArrayBuffer(16);
+  await new b.FetchResponse('https://cdn.test/early.mp4?session=private', 'video/mp4', bytes).arrayBuffer();
+  const a = b.player(), neighbour = b.player();
+  a.buffer.appendBuffer(bytes);
+  assert.deepEqual(b.request(a.el), [{path:'https://cdn.test/early.mp4',seen:100000}]);
+  assert.deepEqual(b.request(neighbour.el), []);
+});
+
+test('direct media Blob URL retains only its own response provenance', async () => {
+  const b = setup(), blob = new Blob(['media'], {type:'video/mp4'});
+  const response = new b.FetchResponse('https://cdn.test/clip.mp4?session=private', 'video/mp4', blob);
+  assert.equal(response.blob(),response.promise);
+  assert.equal(await response.promise,blob);
+  const player = new b.Player(b.WitnessURL.createObjectURL(blob));
+  const unrelated = new b.Player(b.WitnessURL.createObjectURL(new Blob(['media'],{type:'video/mp4'})));
+  assert.deepEqual(b.request(player), [{path:'https://cdn.test/clip.mp4',seen:100000}]);
+  assert.deepEqual(b.request(unrelated),[]);
+  b.advance(120001);
+  assert.deepEqual(b.request(player),[]);
 });
 
 test('equal-length unrelated buffers and non-media responses do not create provenance', async () => {

@@ -1,3 +1,4 @@
+using Vesper.Intelligence;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Utilities;
@@ -87,7 +88,12 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
             ?? (meta is not null ? new MediaRequestContext { Referer = UrlUtil.WithoutFragment(pageUrl).AbsoluteUri } : MediaRequestContext.Empty);
         if (additionalCandidates is not null) candidates.AddRange(additionalCandidates);
 
-        var outcome = await _svc.Candidates.ProcessAsync(candidates, ctx, ct, request.Options.ExactBrowserAssetGroup).ConfigureAwait(false);
+        // Negative evidence (muted loops, isolated fragments) must not consume the bounded probe and manifest
+        // budget. An exact browser asset group is one verified program and keeps its order.
+        HashSet<MediaCandidate> observed = includeBrowserCandidates && browser is not null ? new(browser.Candidates) : [];
+        IReadOnlyList<MediaCandidate> ordered = request.Options.ExactBrowserAssetGroup ? candidates
+            : SourcePrioritizer.Order(candidates, candidate => Describe(candidate, observed.Contains(candidate)));
+        var outcome = await _svc.Candidates.ProcessAsync(ordered, ctx, ct, request.Options.ExactBrowserAssetGroup).ConfigureAwait(false);
         if (request.Options.ExactBrowserAssetGroup
             && outcome.Problems.FirstOrDefault(problem => problem.Code == MediaErrorCode.InvalidInput) is { } invalid)
             return MediaDiscoveryResult.Failure(invalid);
@@ -147,6 +153,18 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
         }
         return null;
     }
+
+    private static SourceEvidence Describe(MediaCandidate candidate, bool observed) => new(
+        candidate.Url.AbsoluteUri,
+        observed ? SourceProvenance.PlayerGeneration : SourceProvenance.PageStructure,
+        UrlUtil.Extension(candidate.Url) is "m4s" or "cmfv" or "cmfa" ? SourceShape.Fragment : candidate.Kind switch
+        {
+            CandidateKind.Direct => SourceShape.Direct,
+            CandidateKind.Hls => SourceShape.Hls,
+            CandidateKind.Dash => SourceShape.Dash,
+            _ => SourceShape.Unknown,
+        },
+        IncidentalLoop: candidate.MutedLoop);
 
     private static MediaError PickError(CandidateOutcome outcome, int candidateCount, bool browserMode)
     {

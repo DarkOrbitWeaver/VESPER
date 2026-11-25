@@ -2,7 +2,8 @@
 // user opted to hand off, a media request, or recovery of an unfinished handoff. It holds no native connection.
 'use strict';
 
-importScripts('native-session.js', 'vesper-experience.js', 'player-source.js', 'media-evidence.js', 'vesper-intelligence.js', 'vesper-batch-events.js', 'browser-body.js');
+importScripts('native-session.js', 'vesper-experience.js', 'player-source.js', 'media-evidence.js', 'vesper-intelligence.js',
+  'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js', 'browser-body.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
@@ -308,32 +309,24 @@ async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = 
   });
 }
 
-async function signInApproval() {
+async function signInEnabled() {
   const prefs = await settings();
-  if (!prefs.useSignIn || !(await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false)))
-    return null;
-  const { signInHosts = [] } = await chrome.storage.local.get('signInHosts').catch(() => ({}));
-  return new Set(Array.isArray(signInHosts)
-    ? signInHosts.filter(host => typeof host === 'string' && host.length <= 253).slice(0, 50).map(host => host.toLowerCase()) : []);
+  return prefs.useSignIn === true && await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false);
 }
 
 async function withSignIn(items, context = {}) {
   const safe = items.map(stripSecrets);
-  const approvedHosts = await signInApproval();
-  if (!approvedHosts) return { items: safe, authorized: false };
+  if (context.incognito || !await signInEnabled()) return { items: safe, authorized: false };
   const enriched = [];
   for (const item of safe) {
-    let targetHost;
-    let allowVideoSignIn = false;
+    let allowed = false;
     try {
       const target = new URL(item.url);
-      if (target.protocol === 'https:' && !target.username && !target.password) {
-        targetHost = target.hostname.toLowerCase();
-        allowVideoSignIn = context.mediaPicker && context.userGesture && context.frame && supportsMediaPrefetch(target)
-          && target.origin === new URL(item.referer).origin;
-      }
-    } catch { /* invalid URLs receive no browser credentials */ }
-    if (!targetHost || (!allowVideoSignIn && !approvedHosts.has(targetHost))) {
+      allowed = target.protocol === 'https:' && !target.username && !target.password
+        && (!context.mediaPicker || context.userGesture && context.frame
+          && target.origin === new URL(item.referer).origin);
+    } catch { /* Invalid URLs receive no browser credentials. */ }
+    if (!allowed) {
       enriched.push(item);
       continue;
     }
@@ -357,6 +350,69 @@ const DIRECT = /\.(mp4|webm|m4v|mov|mkv|mp3|m4a|flac|wav|ogg|opus)(\?|$)/i;
 const sourceWrites = new Map();
 const mediaLookups = new Map();
 const sourceSelections = new Map();
+const formatSessions = new Map();
+const formatSessionsKey = 'vesperFormatSessions';
+let formatSessionWrites = Promise.resolve();
+const formatSessionsReady = chrome.storage.session.get(formatSessionsKey).then(({ [formatSessionsKey]: saved }) => {
+  for (const [token, entry] of (Array.isArray(saved) ? saved : []).slice(-64))
+    if (/^[a-f0-9]{32}$/i.test(token) && /^[a-f0-9]{64}$/.test(entry?.scope || '')
+        && Number.isSafeInteger(entry.tab) && Number.isFinite(entry.expires) && entry.expires > Date.now())
+      formatSessions.set(token, entry);
+}).catch(() => {});
+
+async function formatScope(message, sender) {
+  const page = mediaPage(message, sender);
+  if (!page || !Number.isSafeInteger(sender.tab?.id) || typeof sender.documentId !== 'string'
+      || !sender.documentId || sender.documentId.length > 128
+      || typeof message.playerKey !== 'string' || !/^player-\d{1,12}$/.test(message.playerKey)
+      || !Number.isSafeInteger(message.generation) || message.generation < 0
+      || typeof message.playerUrl !== 'string' || message.playerUrl.length > 4096) return null;
+  const bytes = new TextEncoder().encode(JSON.stringify([sender.tab.id, sender.frameId ?? 0,
+    sender.documentId, page.href, message.playerKey, message.generation, message.playerUrl]));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function persistFormatSessions() {
+  const now = Date.now();
+  for (const [token, entry] of formatSessions) if (entry.expires <= now) formatSessions.delete(token);
+  while (formatSessions.size > 64) formatSessions.delete(formatSessions.keys().next().value);
+  const write = formatSessionWrites.then(() => chrome.storage.session.set({ [formatSessionsKey]: [...formatSessions] }));
+  formatSessionWrites = write.catch(() => {});
+  return write;
+}
+
+const expiredFormats = () => ({ ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' });
+
+async function bindFormatSession(reply, message, sender) {
+  const token = reply?.data?.mediaSession;
+  if (!reply?.ok || !reply.data?.choices?.length || !/^[a-f0-9]{32}$/i.test(token || '')
+      || message.prefetch === true || !sender.tab) return reply;
+  const scope = await formatScope(message, sender);
+  // A result from an older content script can still be displayed, but must
+  // not authorize a native submission without a scoped selection.
+  if (!scope) return reply;
+  await formatSessionsReady;
+  const old = formatSessions.get(token);
+  if (old && old.expires > Date.now() && old.scope !== scope) return expiredFormats();
+  // Keep the binding long enough to resolve a lost acknowledgement after the
+  // desktop session expires. The desktop still decides whether it can submit.
+  formatSessions.set(token, { scope, tab: sender.tab.id, expires: Date.now() + 600_000 });
+  await persistFormatSessions();
+  return reply;
+}
+
+async function matchesFormatSession(token, message, sender) {
+  await formatSessionsReady;
+  const entry = formatSessions.get(token);
+  return !!entry && entry.expires > Date.now() && entry.scope === await formatScope(message, sender);
+}
+
+async function clearFormatSessions(tabId) {
+  await formatSessionsReady;
+  for (const [token, entry] of formatSessions) if (entry.tab === tabId) formatSessions.delete(token);
+  await persistFormatSessions();
+}
 const browserChoices = new Map();
 const browserChoiceStarts = new Map();
 const browserChoicesKey = 'vesperBrowserChoices';
@@ -429,16 +485,12 @@ function inTabOrder(tabId, work) {
 const tabStates = new Map();
 const tabStateWrites = new Map();
 const tabFlushTimers = new Map();
-const tabBadgeCounts = new Map();
 const mediaPrefetchCache = new Map();
-const mediaPrefetchAt = new Map();
 const MEDIA_PREFETCH_TTL = 120_000;
-const MEDIA_PREFETCH_COOLDOWN = 5_000;
-const MEDIA_PREFETCH_SITE_COOLDOWN = 15_000;
 const MEDIA_PREFETCH_LIMIT = 12;
-const prefetchSiteAt = new Map();
+// Early format lookups: per-tab and per-site cooldowns, two concurrent lookups, Retry-After and refusal backoff.
+const prefetchGovernor = VesperPlanner.createPrefetchGovernor();
 const pageLookups = new Map();
-let activePrefetches = 0;
 let sourceExpiryScheduled = false;
 let sourceStorageReady = null;
 let sourceBudgetWrites = Promise.resolve();
@@ -448,11 +500,10 @@ function forgetTab(tabId) {
   tabFlushTimers.delete(tabId);
   tabStates.delete(tabId);
   tabStateWrites.delete(tabId);
-  tabBadgeCounts.delete(tabId);
 }
 
 function clearMediaPrefetch(tabId) {
-  mediaPrefetchAt.delete(tabId);
+  prefetchGovernor.forgetTab(tabId);
   for (const [key, entry] of mediaPrefetchCache)
     if (entry.tab === tabId) mediaPrefetchCache.delete(key);
   for (const key of mediaLookups.keys())
@@ -856,12 +907,6 @@ async function saveTabState(tabId, state, { force = false } = {}) {
   }            // the in-memory copy is current; storage catches up later
   tabStateWrites.set(tabId, now);
   await chrome.storage.session.set({ [`tab:${tabId}`]: state });
-  const count = state.sources.length;
-  if (count && tabBadgeCounts.get(tabId) !== count) {      // the badge only changes when the count does
-    tabBadgeCounts.set(tabId, count);
-    await chrome.action.setBadgeBackgroundColor({ tabId, color: '#3D694B' });
-    await chrome.action.setBadgeText({ tabId, text: String(Math.min(count, 9)) });
-  }
 }
 
 function mediaPage(message, sender) {
@@ -1026,6 +1071,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
       clearMediaPrefetch(tabId);
       await chrome.storage.session.remove(`tab:${tabId}`);
       await clearBrowserChoicesForTab(tabId);
+      await clearFormatSessions(tabId);
       await chrome.action.setBadgeText({ tabId, text: '' });
     }).catch(() => {});
   }
@@ -1036,10 +1082,11 @@ chrome.tabs.onRemoved.addListener(tabId => inTabOrder(tabId, async () => {
   clearMediaPrefetch(tabId);
   await chrome.storage.session.remove(`tab:${tabId}`);
   await clearBrowserChoicesForTab(tabId);
+  await clearFormatSessions(tabId);
 }).catch(() => {}));
 
 async function mediaAuthorization(pageUrl, sender, { userGesture = false } = {}) {
-  if (!userGesture) return {};
+  if (!userGesture || sender?.tab?.incognito) return {};
   const frame = Number.isInteger(sender?.tab?.id) ? {
     tabId: sender.tab.id, frameId: sender.frameId ?? 0,
     ...(sender.documentId ? { documentId: sender.documentId } : {})
@@ -1098,6 +1145,29 @@ async function browserBodyMediaProof(message, sender) {
   return { ok:true, data:proof };
 }
 
+// Which evidence route is asked first for a single-video page with observed player traffic. The evidence
+// graph binds the observed sources to the player's current generation; if they compete without a clear
+// association, the site's own identity lookup goes first. Both routes remain fallbacks for each other.
+function lookupPlan({ scope, message, source, possibleSources, changedAt, adapterPromising }) {
+  const graph = VesperEvidenceGraph.create({ limits: { nodes: 96, edges: 192 } });
+  const playerKey = 'player';
+  const generation = Number.isSafeInteger(message.generation) && message.generation > 0 ? message.generation : 1;
+  // Matches the observed-source window used by playerOptions: manifests often precede loadstart.
+  graph.observePlayer({ scope, playerKey, generation, sourceUrl: source?.href || '', at: changedAt ? changedAt - 15_000 : 0 });
+  for (const item of possibleSources.slice(0, 16))
+    graph.observeRequest({ scope, url: item.url, kind: item.kind || 'unknown', playerKey, generation,
+      at: Number.isFinite(item.seen) ? item.seen : 0 });
+  const { candidates } = graph.associate({ scope, playerKey });
+  const ranked = VesperInference.rankSources(candidates);
+  return VesperPlanner.createRun({
+    intent: { explicit: true, scoped: true, wants: 'media' },
+    selection: { decisive: ranked.decisive, ambiguous: false },
+    sources: candidates.map(candidate => ({ key: candidate.url, kind: candidate.kind, provenance: candidate.provenance, verified: false })),
+    capabilities: { adapter: true, generic: false },
+    experience: { adapterPromising: adapterPromising || !ranked.decisive && candidates.length > 1 }
+  });
+}
+
 function playerActiveForWatch(message) {
   return message.playerPlaying === true || message.playerHasMedia === true;
 }
@@ -1125,7 +1195,7 @@ async function playerOptions(message, sender) {
     && sender.documentId && Array.isArray(message.playerResourceFingerprints)
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
-  const lookupKey = [tab, frame, sender.documentId, identity, page.href, message.generation, source?.href, manifest?.href,
+  const lookupKey = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
     route, mutedLoop, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
@@ -1219,34 +1289,21 @@ async function playerOptions(message, sender) {
         const existing = pageLookups.get(pageKey);
         // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
         if (existing) return existing;
+        let prefetchTicket;
         if (prefetch) {
-          const last = mediaPrefetchAt.get(tab) ?? -Infinity;
-          const site = page.hostname.toLowerCase();
-          const siteUntil = prefetchSiteAt.get(site) ?? 0;
-          const retryAfterMs = Math.max(0, last + MEDIA_PREFETCH_COOLDOWN - now, siteUntil - now);
-          if (activePrefetches >= 2 || retryAfterMs > 0)
-            return { ok: true, data: { prefetchSkipped: true, retryAfterMs: retryAfterMs || 5000 } };
-          for (const [host, until] of prefetchSiteAt) if (until <= now) prefetchSiteAt.delete(host);
-          if (prefetchSiteAt.size >= 64) return { ok: true, data: { prefetchSkipped: true } };
-          mediaPrefetchAt.set(tab, now);
-          prefetchSiteAt.set(site, now + MEDIA_PREFETCH_SITE_COOLDOWN);
-          activePrefetches++;
+          const admission = prefetchGovernor.admit({ tab, site: page.hostname });
+          if (!admission.allow) return { ok: true, data: { prefetchSkipped: true,
+            ...(admission.retryAfterMs ? { retryAfterMs: admission.retryAfterMs } : {}) } };
+          prefetchTicket = admission.ticket;
         }
         const work = (async () => {
+          let reply;
           try {
-            const reply = await nativeRequest(envelope('media-options', pageInput), 60000);
-            if (prefetch) {
-              const retryAt = Date.parse(reply?.data?.retryAt || '');
-              if (reply?.code === 'rate-limited' || reply?.code === 'site-refused') {
-                const site = page.hostname.toLowerCase();
-                if (prefetchSiteAt.has(site))
-                  prefetchSiteAt.set(site, Math.max(prefetchSiteAt.get(site), Date.now() + 60_000,
-                    Number.isFinite(retryAt) ? retryAt : 0));
-              }
-            }
+            reply = await nativeRequest(envelope('media-options', pageInput), 60000);
             return reply;
           } finally {
-            if (prefetch) activePrefetches--;
+            if (prefetch) prefetchGovernor.settle({ ticket: prefetchTicket, code: reply?.ok ? 'ok' : reply?.code,
+              retryAt: Date.parse(reply?.data?.retryAt || '') });
           }
         })();
         pageLookups.set(pageKey, work);
@@ -1258,8 +1315,11 @@ async function playerOptions(message, sender) {
       const lookupStrategy = auth.authorized ? 'page-lookup-signed' : 'page-lookup';
       if (prefetch) return pageLookup();
       const bothRoutes = !!singleVideo && possibleSources.length > 0;
-      const trafficFirst = bothRoutes && !(await VesperExperience.promising(page.hostname, lookupStrategy));
+      const lookupRun = bothRoutes ? lookupPlan({ scope: [tab, frame, sender.documentId].join(':'), message, source,
+        possibleSources, changedAt, adapterPromising: await VesperExperience.promising(page.hostname, lookupStrategy) }) : null;
+      const trafficFirst = lookupRun?.next().next?.route === 'verify-observed';
       const learnLookup = reply => {
+        lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
         const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
           : LOOKUP_REFUSALS.includes(reply.code) ? 'refused' : null;
         return bothRoutes && outcome ? VesperExperience.note(page.hostname, lookupStrategy, outcome).catch(() => {}) : undefined;
@@ -1270,7 +1330,7 @@ async function playerOptions(message, sender) {
           trafficWork = (async () => {
             const pickerTitle = binding ? message.title : undefined;
             const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
-              generation: message.generation, playerUrl: message.playerUrl, title: pickerTitle };
+              generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl, title: pickerTitle };
             const fingerprints = new Set(playbackFingerprints);
             const exactResources = new Set();
             if (fingerprints.size && !prefetch) {
@@ -1367,8 +1427,10 @@ async function playerOptions(message, sender) {
           return { ok: true, data: { title: pickerTitle, sourceChoices, verifiedSources: true } };
         }
         const refusal = bestRefusal(ordered);
+        lookupRun?.report({ route: 'verify-observed', outcome: 'failed' });
         // Learning changes route order, not the protection or security policy.
-        if (trafficFirst && !['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(refusal?.code)) {
+        if (trafficFirst && lookupRun?.next().next?.route === 'adapter-lookup'
+            && !['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(refusal?.code)) {
           const reply = await pageLookup();
           await learnLookup(reply);
           if (reply.ok || ['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(reply.code)) return reply;
@@ -1441,7 +1503,7 @@ async function selectMediaSource(message, sender) {
   const page = mediaPage(message, sender);
   if (!page || selection.tab !== sender.tab?.id || selection.frame !== (sender.frameId ?? 0)
       || selection.documentId !== sender.documentId || selection.identity !== VesperPlayerSource.identity(page.href)
-      || selection.generation !== message.generation || selection.playerUrl !== (message.playerUrl || '')) {
+      || selection.generation !== message.generation || selection.playerKey !== message.playerKey || selection.playerUrl !== (message.playerUrl || '')) {
     sourceSelections.delete(token);
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   }
@@ -1585,7 +1647,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         if (!safe.length) return { ok: false, code: 'invalid', message: 'No reusable file addresses were selected.' };
         // Untrusted content can propose links, never skip the native confirmation or choose a disk path.
-        const signed = await withSignIn(safe, { frame: { tabId: sender.tab.id, frameId: sender.frameId ?? 0 }, userGesture: true });
+        const signed = await withSignIn(safe, { frame: { tabId: sender.tab.id, frameId: sender.frameId ?? 0 }, userGesture: true, incognito: sender.tab.incognito });
         return submit(signed.items, 'ask', { authorized: signed.authorized, review: true });
       }
       case 'media-element': {
@@ -1605,8 +1667,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'managed-downloads': return { ok: true, files: await listManagedCandidates() };
       case 'continue-managed': return continueManagedDownload(message.id, message.startTime);
-      case 'media-options': return playerOptions(message, sender);
-      case 'media-source-select': return selectMediaSource(message, sender);
+      case 'media-options': return bindFormatSession(await playerOptions(message, sender), message, sender);
+      case 'media-source-select': return bindFormatSession(await selectMediaSource(message, sender), message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
       case 'media-select': {
         const { mediaSession, formatChoice, mode } = message;
@@ -1626,6 +1688,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return { ok: false, code: 'invalid', message: 'Enter a start time before the end time.' };
           range = { start, end };
         }
+        if (!sender.url.startsWith(EXTENSION_PAGES) && !await matchesFormatSession(mediaSession, message, sender))
+          return expiredFormats();
         const suffix = range ? `-${Math.round(range.start * 1000).toString(36)}-${Math.round(range.end * 1000).toString(36)}` : '';
         let intentSuffix = '';
         if (audioTrack || subtitles?.length || includeAutoSubtitles || embedSubtitles) {
@@ -1798,7 +1862,7 @@ async function runContextAction(info, tab) {
   }
   // The frame that holds the link is the real initiator; an embedded frame can be another site than the tab.
   const { items, authorized } = await withSignIn([{ url, referer: info.frameUrl || info.pageUrl || tab?.url, userAgent: navigator.userAgent }],
-    { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined });
+    { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined, incognito: tab?.incognito });
   const reply = await submit(items, prefs.handoff, { authorized });
   await flash(tab?.id, reply, info.frameId);
 }

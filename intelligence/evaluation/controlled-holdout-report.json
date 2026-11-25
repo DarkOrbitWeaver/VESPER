@@ -1,0 +1,306 @@
+{
+ "corpus": {
+  "schema": "vesper.intelligence-corpus/1",
+  "seed": 20260705,
+  "holdoutArchetypes": {
+   "player": [
+    "outstream-ad-in-article",
+    "background-loop-and-mini",
+    "lecture-with-previews",
+    "live-stream-with-ad",
+    "split-screen-equal-programs",
+    "muted-loop-pair"
+   ],
+   "source": [
+    "exact-with-stale-and-ad",
+    "witnessed-beside-bound-ad",
+    "declared-beside-stale"
+   ]
+  }
+ },
+ "player": {
+  "schema": "vesper.player-intent/2",
+  "model": {
+   "format": "vesper.model/1",
+   "schema": "vesper.player-intent/2",
+   "kind": "calibrated-linear",
+   "version": "2.1.0-candidate",
+   "weights": {
+    "area": 4.5169,
+    "visible": 1.3445,
+    "central": 1.0419,
+    "playing": 0.5857,
+    "ready": 0.5858,
+    "progressed": 0,
+    "controls": 1.7644,
+    "audiblePlayback": 0.3301,
+    "incidentalLoop": -5.0296,
+    "interaction": 6.7339,
+    "incumbent": 0.9291,
+    "networkBound": 1.4298,
+    "declaredSource": 1,
+    "longForm": 1.623,
+    "adContext": -4.38
+   },
+   "temperature": 0.25,
+   "margin": 4.75,
+   "minConfidence": 0.95,
+   "checksum": "a6dda8bb",
+   "provenance": {
+    "labels": "synthetic-fixture-and-adapter-weak",
+    "independentRealLabels": 0
+   }
+  },
+  "calibratedBaseline": {
+   "format": "vesper.model/1",
+   "schema": "vesper.player-intent/2",
+   "kind": "calibrated-linear",
+   "version": "2.0.1-baseline",
+   "weights": {
+    "area": 5,
+    "visible": 1.25,
+    "central": 0.75,
+    "playing": 2,
+    "ready": 0.5,
+    "progressed": 0.6,
+    "controls": 1,
+    "audiblePlayback": 1.25,
+    "incidentalLoop": -5,
+    "interaction": 6,
+    "incumbent": 0.75,
+    "networkBound": 1.5,
+    "declaredSource": 1,
+    "longForm": 1,
+    "adContext": -4
+   },
+   "temperature": 1.25,
+   "margin": 3.75,
+   "minConfidence": 0.95,
+   "checksum": "375a5a81",
+   "provenance": {
+    "labels": "authored-weights-validation-thresholds",
+    "independentRealLabels": 0
+   }
+  },
+  "calibratedBaselineGuards": [],
+  "calibration": {
+   "temperature": 0.25,
+   "margin": 4.75,
+   "minConfidence": 0.95,
+   "validation": {
+    "cases": 120,
+    "unambiguous": 84,
+    "ambiguous": 36,
+    "decisive": 68,
+    "correctDecisive": 68,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.8095238095238095,
+    "top1Accuracy": 1,
+    "expectedCalibrationError": 0.0037509743270786045
+   }
+  },
+  "holdout": {
+   "candidate": {
+    "cases": 288,
+    "unambiguous": 192,
+    "ambiguous": 96,
+    "decisive": 158,
+    "correctDecisive": 158,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.8229166666666666,
+    "top1Accuracy": 0.984375,
+    "expectedCalibrationError": 0.014280706800317186
+   },
+   "baseline": {
+    "cases": 288,
+    "unambiguous": 192,
+    "ambiguous": 96,
+    "decisive": 193,
+    "correctDecisive": 182,
+    "wrongDecisive": 3,
+    "ambiguousDecisive": 8,
+    "decisivePrecision": 0.9430051813471503,
+    "unambiguousRecall": 0.9479166666666666,
+    "top1Accuracy": 0.96875,
+    "expectedCalibrationError": 0.02253625957030551
+   },
+   "calibratedBaseline": {
+    "cases": 288,
+    "unambiguous": 192,
+    "ambiguous": 96,
+    "decisive": 158,
+    "correctDecisive": 157,
+    "wrongDecisive": 1,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 0.9936708860759493,
+    "unambiguousRecall": 0.8177083333333334,
+    "top1Accuracy": 0.96875,
+    "expectedCalibrationError": 0.013637728275190492
+   },
+   "legacyV1": {
+    "cases": 288,
+    "unambiguous": 192,
+    "ambiguous": 96,
+    "decisive": 153,
+    "correctDecisive": 134,
+    "wrongDecisive": 19,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 0.8758169934640523,
+    "unambiguousRecall": 0.6979166666666666,
+    "top1Accuracy": 0.8125,
+    "expectedCalibrationError": 0
+   }
+  },
+  "guards": [],
+  "gates": {
+   "precision": true,
+   "noRegression": true,
+   "guards": true,
+   "independentRealData": false
+  },
+  "promotable": false,
+  "deployed": false,
+  "sizes": {
+   "train": 420,
+   "validation": 120,
+   "holdout": 288
+  }
+ },
+ "source": {
+  "schema": "vesper.source-association/1",
+  "model": {
+   "format": "vesper.model/1",
+   "schema": "vesper.source-association/1",
+   "kind": "calibrated-linear",
+   "version": "1.1.0-candidate",
+   "weights": {
+    "exactPlayerUrl": 8,
+    "playerBound": 4.004,
+    "currentGeneration": 3.0036,
+    "manifestParent": 3.3308,
+    "resourceWitness": 8.0001,
+    "wholeFile": 1,
+    "declared": 1.5,
+    "durationAgreement": 2,
+    "adContext": -6.015,
+    "hypothesized": -3,
+    "stale": -8.0036,
+    "fragmentOnly": -6.0001
+   },
+   "temperature": 0.25,
+   "margin": 6,
+   "minConfidence": 0.95,
+   "checksum": "dd740847",
+   "provenance": {
+    "labels": "synthetic-fixture-and-adapter-weak",
+    "independentRealLabels": 0
+   }
+  },
+  "calibratedBaseline": {
+   "format": "vesper.model/1",
+   "schema": "vesper.source-association/1",
+   "kind": "calibrated-linear",
+   "version": "1.0.1-baseline",
+   "weights": {
+    "exactPlayerUrl": 8,
+    "playerBound": 4,
+    "currentGeneration": 3,
+    "manifestParent": 3,
+    "resourceWitness": 8,
+    "wholeFile": 1,
+    "declared": 1.5,
+    "durationAgreement": 2,
+    "adContext": -6,
+    "hypothesized": -3,
+    "stale": -8,
+    "fragmentOnly": -6
+   },
+   "temperature": 0.25,
+   "margin": 6,
+   "minConfidence": 0.95,
+   "checksum": "4b1acb41",
+   "provenance": {
+    "labels": "authored-weights-validation-thresholds",
+    "independentRealLabels": 0
+   }
+  },
+  "calibratedBaselineGuards": [],
+  "calibration": {
+   "temperature": 0.25,
+   "margin": 6,
+   "minConfidence": 0.95,
+   "validation": {
+    "cases": 84,
+    "unambiguous": 48,
+    "ambiguous": 36,
+    "decisive": 46,
+    "correctDecisive": 46,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.9583333333333334,
+    "top1Accuracy": 0.9791666666666666,
+    "expectedCalibrationError": 0.010416700752606407
+   }
+  },
+  "holdout": {
+   "candidate": {
+    "cases": 144,
+    "unambiguous": 96,
+    "ambiguous": 48,
+    "decisive": 89,
+    "correctDecisive": 89,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.9270833333333334,
+    "top1Accuracy": 1,
+    "expectedCalibrationError": 2.477017480018162e-10
+   },
+   "baseline": {
+    "cases": 144,
+    "unambiguous": 96,
+    "ambiguous": 48,
+    "decisive": 89,
+    "correctDecisive": 89,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.9270833333333334,
+    "top1Accuracy": 1,
+    "expectedCalibrationError": 0.008035137695232675
+   },
+   "calibratedBaseline": {
+    "cases": 144,
+    "unambiguous": 96,
+    "ambiguous": 48,
+    "decisive": 89,
+    "correctDecisive": 89,
+    "wrongDecisive": 0,
+    "ambiguousDecisive": 0,
+    "decisivePrecision": 1,
+    "unambiguousRecall": 0.9270833333333334,
+    "top1Accuracy": 1,
+    "expectedCalibrationError": 6.598488422326909e-11
+   }
+  },
+  "guards": [],
+  "gates": {
+   "precision": true,
+   "noRegression": true,
+   "guards": true,
+   "independentRealData": false
+  },
+  "promotable": false,
+  "deployed": false,
+  "sizes": {
+   "train": 252,
+   "validation": 84,
+   "holdout": 144
+  }
+ }
+}

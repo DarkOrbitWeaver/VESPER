@@ -19,6 +19,18 @@ The new player model has versioned feature names, independent weights and a deci
 
 The configuration discovery component tolerates common structural changes but still understands a bounded vocabulary of player and source concepts. It does not evaluate arbitrary JavaScript, crawl every URL, or combine unrelated source groups.
 
+## Implemented subsystem (v2)
+
+| Module | Responsibility |
+|---|---|
+| extension/vesper-inference.js, src/Vesper.Intelligence/RankingModel.cs | Versioned feature schemas (`vesper.player-intent/2`, `vesper.source-association/1`), validated `vesper.model/1` artifacts with checksums, sign constraints, safety vetoes, missing-evidence robustness, calibrated confidence, abstention and baseline fallback |
+| extension/vesper-evidence-graph.js | Bounded program-identity graph scoped by document, player and source generation; signed-URL expiry; strong-validator interchangeability |
+| extension/vesper-planner.js | Bounded acquisition route planner, ownership route contract and prefetch governor |
+| extension/vesper-model.js, intelligence/models | Shipped model artifacts, history for rollback, unpromoted candidates |
+| src/Vesper.Intelligence/SourceEvidence.cs | Source evidence, verification-budget ordering used by GenericAdapter, resource compatibility |
+
+Train, evaluate, promote and roll back with `scripts/train-intelligence.mjs` (`fit`, `promote`, `rollback`, `verify`); the controlled corpus and adapter-knowledge distillation live in `tools/intelligence`. The shipped models are conservative baselines (authored weights, validation-chosen thresholds) because no independent real labels exist yet; `promote` refuses synthetic-only candidates. See VESPER_INTELLIGENCE_COMPLETE_IMPLEMENTATION.md.
+
 ## Offline learning, not production self-modification
 
 `scripts/train-player-intent.mjs` fits a small pairwise logistic ranking model to labeled pages. Separate train, validation and untouched holdout partitions must have disjoint site-family identifiers. Validation selects the margin; the holdout compares the candidate with the baseline. The script produces a candidate report, never overwrites a bundled model and never deploys it.

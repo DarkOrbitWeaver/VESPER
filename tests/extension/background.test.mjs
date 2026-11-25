@@ -1757,8 +1757,9 @@ test('a browser watch that reaches its timeout is rearmed', async () => {
   app = load(replies, { download: file });
   await observe(app, file);
   await app.onCreated(file);
-  for (let attempt = 0; attempt < 20 && !app.actions.includes('cancel'); attempt++)
-    await new Promise(resolve => setImmediate(resolve));
+  const deadline = Date.now() + 2000;
+  while (!app.actions.includes('cancel') && Date.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 5));
 
   assert.equal(watches, 2);
   assert.equal(app.actions.includes('cancel'), true);
@@ -2965,26 +2966,26 @@ test('unsafe downloads remain exclusively Chrome-owned and are not exposed for m
   assert.equal(file.paused, false);
 });
 
-test('file download cookies still require host approval when sign-in is on by default', async () => {
+test('file download sign-in defaults on without requiring a host list', async () => {
   const app = load({ submit: { ok: true } }, { signInPermission: true });
 
   await app.message({ type: 'submit', pageUrl: 'https://public.example/',
     items: [{ url: 'https://public.example/file.zip' }] });
 
-  assert.equal(app.cookieLookups.length, 0);
-  assert.equal(app.sent[0].items[0].cookie, undefined);
-  assert.equal(app.sent[0].authorized, false);
+  assert.deepEqual(app.cookieLookups, ['https://public.example/file.zip']);
+  assert.equal(app.sent[0].items[0].cookie, 'session=test-value');
+  assert.equal(app.sent[0].authorized, true);
 });
 
-test('site sign-in requires exact HTTPS host approval', async () => {
+test('global sign-in works for HTTPS destinations without a host list', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, {
     download: file, signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: [] }
   });
   await observe(app, file);
   await app.onCreated(file);
-  assert.equal(app.cookieLookups.length, 0);
-  assert.equal(app.sent[0].authorized, false);
+  assert.equal(app.cookieLookups.length, 1);
+  assert.equal(app.sent[0].authorized, true);
 
   const approved = load({ submit: { ok: true } }, {
     signInPermission: true, prefs: { useSignIn: true }, localData: { signInHosts: ['example.com'] }
@@ -2996,9 +2997,9 @@ test('site sign-in requires exact HTTPS host approval', async () => {
   ] });
   assert.equal(result.ok, true);
   assert.equal(approved.sent[0].items[0].cookie, 'session=test-value');
-  assert.equal(approved.sent[0].items[1].cookie, undefined);
+  assert.equal(approved.sent[0].items[1].cookie, 'session=test-value');
   assert.equal(approved.sent[0].items[2].cookie, undefined);
-  assert.deepEqual(approved.cookieLookups, ['https://example.com/file.zip']);
+  assert.deepEqual(approved.cookieLookups, ['https://example.com/file.zip', 'https://cdn.example.com/file.zip']);
 });
 
 test('sign-in context is used only during a fresh capture and a failed attempt does not retry', async () => {
@@ -3101,7 +3102,7 @@ const videoOptionsMessage = (pageUrl, extra = {}) => ({
   mediaChangedAt: 0, playerPlaying: false, ...extra
 });
 
-test('opening a supported video picker uses sign-in after Chrome approves it', async () => {
+test('opening any HTTPS video picker uses sign-in after Chrome approves it', async () => {
   const pageUrl = 'https://www.tiktok.com/@author/video/1234567';
   const sender = { ...videoSender, tab: { id: 17, url: pageUrl }, url: pageUrl };
   const app = load({ 'media-options': mediaOptionsReply }, { signInPermission: true });
@@ -3111,11 +3112,17 @@ test('opening a supported video picker uses sign-in after Chrome approves it', a
   assert.equal(app.sent[0].mediaAuth.cookie, 'session=test-value');
   assert.equal(app.sent[0].authorized, true);
 
+  const unfamiliar = 'https://example.com/video';
+  const generic = load({ 'media-options': mediaOptionsReply }, { signInPermission: true });
+  await generic.message(videoOptionsMessage(unfamiliar), { ...sender, url: unfamiliar, tab: { id: 17, url: unfamiliar } });
+  assert.deepEqual(generic.cookieLookups, [unfamiliar]);
+  assert.equal(generic.sent[0].mediaAuth.cookie, 'session=test-value');
+
   for (const [address, opts, extra] of [
     [pageUrl, { signInPermission: false }, {}],
     [pageUrl, { signInPermission: true, prefs: { useSignIn: false } }, {}],
     [pageUrl, { signInPermission: true, localData: { prefetchFormats: true } }, { prefetch: true }],
-    ['https://example.com/video', { signInPermission: true }, {}]
+    ['http://example.com/video', { signInPermission: true }, {}]
   ]) {
     const blocked = load({ 'media-options': mediaOptionsReply }, opts);
     await blocked.message(videoOptionsMessage(address, extra), { ...sender, url: address, tab: { id: 17, url: address } });
@@ -3355,7 +3362,7 @@ test('an automatic handoff sends only the cookies Chrome would send for that dow
 
 test('with sign-in off no cookie is read or sent', async () => {
   const file = activeDownload();
-  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file, signInPermission: true, cookies: cookieJar });
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') }, { download: file, signInPermission: true, prefs: { useSignIn: false }, cookies: cookieJar });
   await observe(app, file);
   await app.onCreated(file);
   assert.equal(app.cookieLookups.length, 0);
@@ -3788,17 +3795,73 @@ test('media responses no longer wake the download-capture listeners', async () =
 // ---------------------------------------------------------------- "Download part" from the extension (VES-023)
 
 test('a media selection carries its time range to VESPER and refuses an impossible one', async () => {
-  const app = load({ 'media-select': { ok: true } });
   const session = 'a'.repeat(32);
-  const ok = await app.message({ type: 'media-select', mediaSession: session, formatChoice: 1, mode: 'download', range: { start: 72, end: 102 } }, contentScript);
+  const app = load({ 'media-select': { ok: true }, 'media-options': { ok: true,
+    data: { mediaSession: session, choices: [{ index: 1, label: '720p' }] } } });
+  const scope = { pageUrl: contentScript.url, playerPageUrl: contentScript.url, playerUrl: '', playerKey: 'player-1', generation: 1 };
+  assert.equal((await app.message({ type: 'media-options', ...scope }, contentScript)).ok, true);
+  const base = { type: 'media-select', mediaSession: session, formatChoice: 1, mode: 'download', ...scope };
+  const ok = await app.message({ ...base, range: { start: 72, end: 102 } }, contentScript);
   assert.equal(ok.ok, true);
   assert.deepEqual(structuredClone(app.sent.at(-1).range), { start: 72, end: 102 });
   assert.notEqual(app.sent.at(-1).id, `${session}-1-download`, 'a clipped request has its own id');
   for (const range of [{ start: 10, end: 5 }, { start: -1, end: 5 }, { start: 0, end: Infinity }, { start: 'a', end: 5 }])
-    assert.equal((await app.message({ type: 'media-select', mediaSession: session, formatChoice: 1, mode: 'download', range }, contentScript)).code, 'invalid');
-  const plain = await app.message({ type: 'media-select', mediaSession: session, formatChoice: 1, mode: 'download' }, contentScript);
+    assert.equal((await app.message({ ...base, range }, contentScript)).code, 'invalid');
+  const plain = await app.message(base, contentScript);
   assert.equal(plain.ok, true);
   assert.equal(app.sent.at(-1).range, undefined);
+});
+
+test('native format sessions are bound to the requesting document, player and generation', async () => {
+  const token = 'b'.repeat(32);
+  const app = load({ 'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
+    'media-select': { ok: true } });
+  const scope = { pageUrl: videoPage, playerPageUrl: videoPage, playerKey: 'player-1', generation: 1, playerUrl: '' };
+  const select = { type: 'media-select', mediaSession: token, formatChoice: 0, mode: 'download', ...scope };
+  assert.equal((await app.message(select, videoSender)).code, 'expired-selection');
+  assert.equal((await app.message({ type: 'media-options', ...scope }, videoSender)).ok, true);
+  for (const [changes, sender] of [
+    [{ playerKey: 'player-2' }, videoSender],
+    [{ generation: 2 }, videoSender],
+    [{ playerUrl: 'https://example.com/other.mp4' }, videoSender],
+    [{ pageUrl: 'https://www.youtube.com/watch?v=abcdefghijk' }, videoSender],
+    [{}, { ...videoSender, documentId: 'other-document' }],
+    [{}, { ...videoSender, frameId: 1 }],
+    [{}, { ...videoSender, tab: { ...videoSender.tab, id: 99 } }]
+  ]) assert.equal((await app.message({ ...select, ...changes }, sender)).code, 'expired-selection');
+  assert.equal(app.sent.filter(r => r.type === 'media-select').length, 0);
+  assert.equal((await app.message(select, videoSender)).ok, true);
+  assert.equal((await app.message(select, videoSender)).ok, true);
+  assert.equal(app.sent.at(-1).id, app.sent.at(-2).id);
+});
+
+test('prefetch alone cannot establish a native download selection', async () => {
+  const token = 'c'.repeat(32);
+  const app = load({ 'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
+    'media-select': { ok: true } });
+  const scope = { pageUrl: videoPage, playerPageUrl: videoPage, playerKey: 'player-1', generation: 1, playerUrl: '' };
+  const select = { type: 'media-select', mediaSession: token, formatChoice: 0, mode: 'download', ...scope };
+  assert.equal((await app.message({ type: 'media-options', prefetch: true, ...scope }, videoSender)).ok, true);
+  assert.equal((await app.message(select, videoSender)).code, 'expired-selection');
+  assert.equal((await app.message({ type: 'media-options', ...scope }, videoSender)).ok, true);
+  assert.equal((await app.message(select, videoSender)).ok, true);
+});
+
+test('scoped format sessions survive worker restart without retaining raw player URLs', async () => {
+  const sessionData = {};
+  const token = 'd'.repeat(32);
+  const replies = { 'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
+    'media-select': { ok: true } };
+  const app = load(replies, { sessionData });
+  const scope = { pageUrl: videoPage, playerPageUrl: videoPage, playerKey: 'player-1', generation: 1, playerUrl: 'blob:https://www.youtube.com/secret-test-source' };
+  assert.equal((await app.message({ type: 'media-options', ...scope }, videoSender)).ok, true);
+  assert.ok(sessionData.vesperFormatSessions.length === 1);
+  assert.equal(JSON.stringify(sessionData.vesperFormatSessions).includes('secret-test-source'), false);
+  const restarted = load(replies, { sessionData });
+  const select = { type: 'media-select', mediaSession: token, formatChoice: 0, mode: 'download', ...scope };
+  assert.equal((await restarted.message(select, videoSender)).ok, true);
+  restarted.advanceTime(601_000);
+  assert.equal((await restarted.message(select, videoSender)).code, 'expired-selection');
 });
 
 

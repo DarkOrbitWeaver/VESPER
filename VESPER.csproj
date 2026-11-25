@@ -19,9 +19,9 @@
 
   <!-- The engine, native host, tests and extension live in subfolders and have their own projects. -->
   <ItemGroup>
-    <Compile Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
-    <EmbeddedResource Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
-    <None Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**" />
+    <Compile Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**;samples\**;intelligence\**" />
+    <EmbeddedResource Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**;samples\**;intelligence\**" />
+    <None Remove="src\**;tests\**;extension\**;scripts\**;release\**;tools\**;samples\**;intelligence\**" />
   </ItemGroup>
 
   <ItemGroup>

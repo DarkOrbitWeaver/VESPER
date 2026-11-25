@@ -1,0 +1,31 @@
+{
+ "format": "vesper.model/1",
+ "schema": "vesper.player-intent/2",
+ "kind": "calibrated-linear",
+ "version": "2.0.0-baseline",
+ "temperature": 1.5,
+ "margin": 1.25,
+ "minConfidence": 0.6,
+ "weights": {
+  "area": 5,
+  "visible": 1.25,
+  "central": 0.75,
+  "playing": 2,
+  "ready": 0.5,
+  "progressed": 0.6,
+  "controls": 1,
+  "audiblePlayback": 1.25,
+  "incidentalLoop": -5,
+  "interaction": 6,
+  "incumbent": 0.75,
+  "networkBound": 1.5,
+  "declaredSource": 1,
+  "longForm": 1,
+  "adContext": -4
+ },
+ "checksum": "fff43f9f",
+ "provenance": {
+  "labels": "authored-baseline",
+  "independentRealLabels": 0
+ }
+}

@@ -149,6 +149,33 @@ public class SecureHttpTests
         Assert.Equal(status is 429 or 503, e.IsRetryable);
     }
 
+    [Theory]
+    [InlineData(401, MediaErrorCode.LoginRequired)]
+    [InlineData(403, MediaErrorCode.AuthorizationRequired)]
+    [InlineData(404, MediaErrorCode.VideoUnavailable)]
+    [InlineData(429, MediaErrorCode.RateLimited)]
+    [InlineData(451, MediaErrorCode.RegionRestricted)]
+    [InlineData(503, MediaErrorCode.NetworkFailure)]
+    public async Task OversizedErrorBody_DoesNotHideHttpStatus(int status, MediaErrorCode expected)
+    {
+        var url = new Uri("https://a.example.com/error");
+        foreach (bool post in new[] { false, true })
+        {
+            var h = new FakeHttpHandler().Add(url.AbsoluteUri, new string('x', 5000), "text/html", status);
+            using var client = Client(h, new ResolverOptions { MaxErrorBodyBytes = 1000 });
+            var error = await Error(async () =>
+            {
+                var response = post
+                    ? await client.PostJsonAsync(url, "{}", null, null, default)
+                    : await client.GetStringAsync(url, null, default);
+                Assert.Equal(status, response.StatusCode);
+                Assert.Empty(response.Content);
+                response.EnsureSuccess();
+            });
+            Assert.Equal(expected, error.Code);
+        }
+    }
+
     [Fact]
     public async Task Timeout_BecomesRetryableNetworkError_NotRawCancellation()
     {

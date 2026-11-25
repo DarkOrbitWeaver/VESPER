@@ -86,64 +86,16 @@ async function init() {
   const signIn = $('signin');
   const access = $('signin-access');
   const permit = $('signin-permission');
-  const fileSignIn = $('file-sign-in');
-  const siteSignIn = $('signin-site');
-  const siteHostLabel = $('signin-host');
-  const siteHint = $('signin-site-hint');
   const cookies = { permissions: ['cookies'] };
   const hasAccess = () => chrome.permissions.contains(cookies).catch(() => false);
   let cookiePermission = false;
-  function httpsHost(value) {
-    try {
-      const url = new URL(value);
-      return url.protocol === 'https:' && !url.username && !url.password ? url.hostname.toLowerCase() : null;
-    } catch { return null; }
-  }
-  const siteHost = httpsHost(siteTab?.url);
-  siteHostLabel.textContent = siteHost || 'this site';
-  if (siteHost) {
-    try {
-      const { signInHosts = [] } = await chrome.storage.local.get('signInHosts');
-      siteSignIn.checked = Array.isArray(signInHosts) && signInHosts.includes(siteHost);
-    } catch {
-      siteHint.textContent = 'Couldn’t read this site’s sign-in setting.';
-    }
-  } else {
-    siteHint.textContent = 'Site sign-in is available on HTTPS pages.';
-  }
-  siteSignIn.onchange = async () => {
-    if (!siteHost) return;
-    siteSignIn.disabled = true;
-    try {
-      const { signInHosts = [] } = await chrome.storage.local.get('signInHosts');
-      const hosts = new Set(Array.isArray(signInHosts)
-        ? signInHosts.filter(host => typeof host === 'string' && host.length <= 253).slice(0, 50) : []);
-      if (siteSignIn.checked && !hosts.has(siteHost) && hosts.size >= 50) {
-        siteSignIn.checked = false;
-        siteHint.textContent = 'Remove an approved host before adding another.';
-        return;
-      }
-      if (siteSignIn.checked) hosts.add(siteHost);
-      else hosts.delete(siteHost);
-      await chrome.storage.local.set({ signInHosts: [...hosts].slice(0, 50) });
-      siteHint.textContent = siteSignIn.checked ? 'VESPER can use your sign-in for files from this site.'
-        : 'Turn this on if the file requires your account.';
-    } catch {
-      siteSignIn.checked = !siteSignIn.checked;
-      siteHint.textContent = 'Couldn’t save this site’s sign-in setting.';
-    } finally {
-      siteSignIn.disabled = fileSignIn.hidden;
-    }
-  };
   function showAccess(allowed) {
     cookiePermission = allowed;
     signIn.checked = prefs.useSignIn;
     permit.hidden = allowed || !signIn.checked;
     access.textContent = !signIn.checked ? '' : allowed
-      ? 'Used automatically when you choose a video on a supported site.'
+      ? 'Used automatically for downloads and videos when needed.'
       : 'Chrome needs your permission to use your sign-in.';
-    fileSignIn.hidden = !allowed || !signIn.checked || !siteHost;
-    siteSignIn.disabled = fileSignIn.hidden;
   }
   chrome.permissions.onRemoved.addListener(removed => {
     if (removed.permissions?.includes('cookies')) showAccess(false);

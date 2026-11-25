@@ -308,18 +308,6 @@ globalThis.VesperIntelligence = (() => {
     if (navigates || inlinePdf) return 'navigation';
     return model?.classification === 'download-likely' ? 'observe-only' : 'ignore';
   }
-  function chooseAcquisition({ approved, nativeReplayVerified, originalBytesProven,
-      browserReadAllowed, isOneUse, isPost, isBlob, isDrm, chromeHasBytes } = {}) {
-    if (isDrm) return { tier: 'unsupported', reason: 'Protected media' };
-    if (!approved) return { tier: 'chrome', reason: 'No download authority' };
-    if (chromeHasBytes && !originalBytesProven) return { tier: 'chrome', reason: 'Original Chrome bytes are already owned' };
-    if (originalBytesProven) return { tier: 'original-stream', reason: 'Original stream ownership proven' };
-    if (!isOneUse && !isPost && !isBlob && nativeReplayVerified)
-      return { tier: 'native', reason: 'Independent GET verified replayable' };
-    if (!isOneUse && !isPost && browserReadAllowed)
-      return { tier: 'browser-prototype', reason: 'Requires explicit browser streaming integration' };
-    return { tier: 'chrome', reason: 'Cannot prove safe handoff' };
-  }
   return Object.freeze({ http, safeScope, sourceKind, proposeControl,
-    operationDecision, rankPlayers, createPlayerRanker, playerFeatures, PLAYER_FEATURES, PLAYER_POLICY, createMediaLedger, makeBatchPlan, createBatchExecutor, chooseAcquisition, MAX_ITEMS });
+    operationDecision, rankPlayers, createPlayerRanker, playerFeatures, PLAYER_FEATURES, PLAYER_POLICY, createMediaLedger, makeBatchPlan, createBatchExecutor, MAX_ITEMS });
 })();

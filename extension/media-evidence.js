@@ -149,7 +149,22 @@ globalThis.VesperMediaEvidence = (() => {
       return { index, entry, edges, verified, direct,
         rank: edges.reduce((sum, edge) => sum + edge.weight, 0) };
     });
-    nodes.sort((a, b) => b.rank - a.rank || a.index - b.index);
+    // The portable model ranks already-verified candidates. It cannot select a
+    // source without the independent exact-player check below.
+    const learned = globalThis.VesperInference?.rankSources(nodes.filter(node => node.verified).map(node => {
+      const facts = mediaFacts(node.entry.reply);
+      const durationAgreement = player.durationSeconds && facts.durationSeconds
+        ? Number(Math.abs(player.durationSeconds - facts.durationSeconds) <= Math.max(1, player.durationSeconds * 0.03)) : null;
+      return { id: 'source-' + node.index, exactPlayerUrl: node.direct,
+        playerBound: node.edges.some(edge => edge.kind === 'player-resource' || edge.kind === 'current-source'),
+        resourceWitness: node.edges.some(edge => edge.kind === 'player-resource'),
+        manifestParent: node.edges.some(edge => edge.kind === 'manifest-segment'),
+        durationAgreement, currentGeneration: true,
+        hypothesized: false, fragmentOnly: node.entry.source?.kind === 'fragment' };
+    }));
+    const preferred = learned?.decisive ? learned.selected : null;
+    nodes.sort((a, b) => Number('source-' + b.index === preferred) - Number('source-' + a.index === preferred)
+      || b.rank - a.rank || a.index - b.index);
     // Duration, timing, CDN affinity and DOM hints can never prove the active
     // asset. Only the exact current source with independently checked formats.
     const direct = nodes.filter(node => node.direct && node.verified);

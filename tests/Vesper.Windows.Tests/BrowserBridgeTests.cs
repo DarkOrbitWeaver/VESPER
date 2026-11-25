@@ -360,6 +360,200 @@ public sealed class BrowserBridgeTests
         finally { Directory.Delete(root, recursive: true); }
     }
 
+    [Fact]
+    public async Task IsolatedNativeHelperSubmitsARealMediaSessionExactlyOnce()
+    {
+        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_ISOLATED_HOST");
+        if (string.IsNullOrWhiteSpace(helper) || Environment.GetEnvironmentVariable("VESPER_QA_LIVE_MEDIA") != "1") return;
+        Assert.Equal("vesper-qa-host.exe", Path.GetFileName(helper));
+        Assert.True(File.Exists(helper));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(helper)!, "VESPER.exe")));
+        string pipe = "vesper-qa-" + Guid.NewGuid().ToString("N");
+        string root = Path.Combine(Path.GetTempPath(), "vesper-native-media-qa-" + Guid.NewGuid().ToString("N"));
+        string downloads = Path.Combine(root, "downloads");
+        Directory.CreateDirectory(downloads);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        CancellationToken ct = deadline.Token;
+        const string url = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm";
+        try
+        {
+            // Independent bounded reference; never substitute a successful discovery for correct bytes.
+            using var http = new HttpClient { MaxResponseContentBufferSize = 4 * 1024 * 1024 };
+            byte[] payload = await http.GetByteArrayAsync(url, ct);
+            Assert.InRange(payload.Length, 1, 4 * 1024 * 1024);
+            using var engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads
+            });
+            var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
+            using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
+            desktop.Start();
+            try
+            {
+                using var session = new NativeTestSession(helper, pipe);
+                Assert.True((await session.SendAsync(new { v = 1, id = "native-session-0003", type = "session-open" }, ct)).Ok);
+                BridgeResponse options = await session.SendAsync(new { v = 1, id = "native-options-0001", type = "media-options", url }, ct);
+                Assert.True(options.Ok, options.Message);
+                JsonElement data = Assert.IsType<JsonElement>(options.Data);
+                string token = data.GetProperty("mediaSession").GetString()!;
+                int index = data.GetProperty("choices").EnumerateArray()
+                    .Concat(data.GetProperty("originalChoices").EnumerateArray())
+                    .Concat(data.GetProperty("more").EnumerateArray())
+                    .First(option => option.GetProperty("container").GetString() == "WEBM").GetProperty("index").GetInt32();
+
+                var invalid = await session.SendAsync(new { v = 1, id = "native-media-invalid", type = "media-select",
+                    mediaSession = Guid.NewGuid().ToString("N"), formatChoice = index, mode = "download" }, ct);
+                Assert.False(invalid.Ok);
+                Assert.Equal("expired-selection", invalid.Code);
+                Assert.Empty(engine.Snapshots());
+
+                var request = new { v = 1, id = "native-media-select", type = "media-select", mediaSession = token,
+                    formatChoice = index, mode = "download" };
+                BridgeResponse accepted = await session.SendAsync(request, ct);
+                Assert.True(accepted.Ok, accepted.Message);
+                Guid job = Guid.Parse(Assert.Single(accepted.Results!).JobId!);
+                JobSnapshot? snapshot;
+                while ((snapshot = engine.Snapshot(job))?.State is not (JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink))
+                    await Task.Delay(50, ct);
+                Assert.True(snapshot.State == JobState.Completed, snapshot.Message);
+                Assert.EndsWith(".webm", snapshot.FinalPath!);
+                Assert.Equal(payload, await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
+
+                BridgeResponse replay = await session.SendAsync(request, ct);
+                Assert.True(replay.Ok, replay.Message);
+                Assert.Equal(job, Guid.Parse(Assert.Single(replay.Results!).JobId!));
+                Assert.Single(engine.Snapshots());
+                Assert.Single(Directory.GetFiles(downloads, "*.webm"));
+                await session.CloseAsync(ct);
+            }
+            finally { bridge.CloseResolver(); }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+    [Fact]
+    public async Task IsolatedChromePickerUsesRealNativeHelperAndEngine()
+    {
+        string? script = Environment.GetEnvironmentVariable("VESPER_QA_CHROME_RELAY_SCRIPT");
+        string? helper = Environment.GetEnvironmentVariable("VESPER_QA_ISOLATED_HOST");
+        if (string.IsNullOrWhiteSpace(script) || string.IsNullOrWhiteSpace(helper)) return;
+        Assert.Equal("vesper-qa-host.exe", Path.GetFileName(helper));
+        Assert.True(File.Exists(helper));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(helper)!, "VESPER.exe")));
+        Assert.True(File.Exists(script));
+        string pipe = "vesper-qa-" + Guid.NewGuid().ToString("N");
+        string root = Path.Combine(Path.GetTempPath(), "vesper-chrome-media-qa-" + Guid.NewGuid().ToString("N"));
+        string downloads = Path.Combine(root, "downloads");
+        Directory.CreateDirectory(downloads);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(4));
+        CancellationToken ct = deadline.Token;
+        bool socialReference = Environment.GetEnvironmentVariable("VESPER_QA_SOCIAL_REFERENCE") == "1";
+        string url = socialReference ? "https://www.tiktok.com/@nasa/video/7665075736742530317"
+            : "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm";
+        try
+        {
+            using var engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads
+            });
+            var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
+            using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
+            desktop.Start();
+            try
+            {
+                var start = new ProcessStartInfo("node")
+                {
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                start.ArgumentList.Add(script);
+                start.Environment["VESPER_QA_PIPE"] = pipe;
+                start.Environment["VESPER_QA_HOST"] = helper;
+                start.Environment["VESPER_QA_RESULT"] = Path.Combine(root, "result.json");
+                start.Environment["VESPER_QA_REFERENCE_URL"] = url;
+                using Process process = Process.Start(start)!;
+                Task<string> stdout = process.StandardOutput.ReadToEndAsync(ct);
+                Task<string> stderr = process.StandardError.ReadToEndAsync(ct);
+                try { await process.WaitForExitAsync(ct); }
+                finally { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+                Assert.True(process.ExitCode == 0, (await stdout) + "\n" + (await stderr));
+                using var result = JsonDocument.Parse(await File.ReadAllTextAsync(start.Environment["VESPER_QA_RESULT"]!, ct));
+                Assert.True(result.RootElement.GetProperty("submitted").GetBoolean(), result.RootElement.ToString());
+                var job = Guid.Parse(result.RootElement.GetProperty("jobId").GetString()!);
+                JobSnapshot? snapshot;
+                while ((snapshot = engine.Snapshot(job))?.State is not (JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink))
+                    await Task.Delay(50, ct);
+                Assert.True(snapshot.State == JobState.Completed, snapshot.Message);
+                if (socialReference)
+                {
+                    // This is a specific public NASA clip, previously acquired and
+                    // independently decoded by the standalone QA campaign.
+                    // A different representation is NOT counted as byte identity.
+                    const string previouslyDecodedSha = "A88A8631DE898AAD0CB8AEC4FC2D004BCFE91C227268EAE3D1A885A75049A3E8";
+                    await using var file = File.OpenRead(snapshot.FinalPath!);
+                    string actual = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(file, ct));
+                    Console.WriteLine($"Social reference SHA256: {actual}; bytes: {file.Length}");
+                    Assert.Equal(previouslyDecodedSha, actual);
+                }
+                else
+                {
+                    using var http = new HttpClient { MaxResponseContentBufferSize = 4 * 1024 * 1024 };
+                    byte[] expected = await http.GetByteArrayAsync(url, ct);
+                    Assert.InRange(expected.Length, 1, 4 * 1024 * 1024);
+                    Assert.Equal(expected, await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
+                }
+                if (Environment.GetEnvironmentVariable("VESPER_QA_ZAI_ACQUISITION") == "1")
+                {
+                    JsonElement[] blogJobs = result.RootElement.GetProperty("blogJobs").EnumerateArray().ToArray();
+                    int expectedBlogJobs = int.TryParse(Environment.GetEnvironmentVariable("VESPER_QA_ZAI_INDEX"), out _) ? 1 : 4;
+                    Assert.Equal(expectedBlogJobs, blogJobs.Length);
+                    foreach (JsonElement entry in blogJobs)
+                    {
+                        int index = entry.GetProperty("index").GetInt32();
+                        Guid mediaJob = entry.GetProperty("jobId").GetGuid();
+                        JobSnapshot? acquired;
+                        while ((acquired = engine.Snapshot(mediaJob))?.State is not
+                            (JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink))
+                            await Task.Delay(100, ct);
+                        Console.WriteLine($"Blog player {index}: {acquired.State}; {acquired.TotalBytes} bytes; {acquired.Kind}; {acquired.Reason} {acquired.Message}");
+                        Assert.True(acquired.State == JobState.Completed, $"Blog {index}: {acquired.Message}");
+                        Assert.NotNull(acquired.FinalPath);
+                        Assert.True(File.Exists(acquired.FinalPath));
+                        var inspect = new ProcessStartInfo("ffprobe")
+                        {
+                            UseShellExecute = false, CreateNoWindow = true,
+                            RedirectStandardOutput = true, RedirectStandardError = true
+                        };
+                        foreach (string arg in new[] { "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height:format=duration,size", "-of", "json", acquired.FinalPath! })
+                            inspect.ArgumentList.Add(arg);
+                        using Process ffprobe = Process.Start(inspect)!;
+                        Task<string> probeOut = ffprobe.StandardOutput.ReadToEndAsync(ct);
+                        Task<string> probeErr = ffprobe.StandardError.ReadToEndAsync(ct);
+                        try { await ffprobe.WaitForExitAsync(ct); }
+                        finally { if (!ffprobe.HasExited) ffprobe.Kill(entireProcessTree: true); }
+                        Assert.True(ffprobe.ExitCode == 0, await probeErr);
+                        using var facts = JsonDocument.Parse(await probeOut);
+                        var streams = facts.RootElement.GetProperty("streams").EnumerateArray().ToArray();
+                        Assert.Contains(streams, track => track.GetProperty("codec_type").GetString() == "video");
+                        Assert.Equal(index != 2, streams.Any(track => track.GetProperty("codec_type").GetString() == "audio"));
+                        double duration = double.Parse(facts.RootElement.GetProperty("format").GetProperty("duration").GetString()!, System.Globalization.CultureInfo.InvariantCulture);
+                        Assert.InRange(duration, entry.GetProperty("duration").GetDouble() - 1, entry.GetProperty("duration").GetDouble() + 1);
+                        Console.WriteLine($"Blog player {index}: independent FFprobe verification {facts.RootElement.GetRawText()}");
+                    }
+                    Assert.Equal(expectedBlogJobs + 1, engine.Snapshots().Count);
+                    Assert.Equal(expectedBlogJobs + 1, Directory.GetFiles(downloads).Length);
+                }
+                else
+                {
+                    Assert.Single(engine.Snapshots());
+                    Assert.Single(Directory.GetFiles(downloads));
+                }
+                Console.WriteLine("Real Chrome picker, QA relay, actual native helper, desktop handler and engine: exact bytes verified.");
+            }
+            finally { bridge.CloseResolver(); }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     private static Process StartNativeTestProcess(string path, string? qaPipe)
     {
         var start = new ProcessStartInfo(path)

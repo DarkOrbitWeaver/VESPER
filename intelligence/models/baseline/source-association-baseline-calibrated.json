@@ -1,0 +1,28 @@
+{
+ "format": "vesper.model/1",
+ "schema": "vesper.source-association/1",
+ "kind": "calibrated-linear",
+ "version": "1.0.1-baseline",
+ "weights": {
+  "exactPlayerUrl": 8,
+  "playerBound": 4,
+  "currentGeneration": 3,
+  "manifestParent": 3,
+  "resourceWitness": 8,
+  "wholeFile": 1,
+  "declared": 1.5,
+  "durationAgreement": 2,
+  "adContext": -6,
+  "hypothesized": -3,
+  "stale": -8,
+  "fragmentOnly": -6
+ },
+ "temperature": 0.25,
+ "margin": 6,
+ "minConfidence": 0.95,
+ "checksum": "4b1acb41",
+ "provenance": {
+  "labels": "authored-weights-validation-thresholds",
+  "independentRealLabels": 0
+ }
+}

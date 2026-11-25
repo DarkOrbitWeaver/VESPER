@@ -5,10 +5,121 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 function runContent(context, content = source('content')) {
+  vm.runInContext(source('player-source'), context);
   vm.runInContext(source('vesper-intelligence'), context);
+  vm.runInContext(source('vesper-model'), context);
+  vm.runInContext(source('vesper-inference'), context);
   vm.runInContext(source('browser-body'), context);
   vm.runInContext(content, context);
 }
+
+test('player visibility checks rendered containers and falls back safely on older browsers', () => {
+  const content = source('content');
+  const start = content.indexOf('  function renderedPlayerBox(');
+  const end = content.indexOf('  function visiblePlayer(', start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({ getComputedStyle: el => el.style || {} });
+  const rendered = vm.runInContext(content.slice(start, end) + '\nrenderedPlayerBox;', context);
+  let options;
+  assert.equal(rendered({ checkVisibility(value) { options = value; return false; } }), false);
+  assert.equal(options.checkOpacity, true);
+  assert.equal(options.checkVisibilityCSS, true);
+  assert.equal(options.contentVisibilityAuto, true);
+  const visible = { style: { visibility: 'visible', opacity: '1' } };
+  for (const style of [{ opacity: '0' }, { display: 'none' }, { contentVisibility: 'hidden' }]) {
+    const player = { ...visible, parentElement: { ...visible, parentElement: { style } } };
+    assert.equal(rendered(player), false);
+  }
+  assert.equal(rendered({ ...visible, parentElement: visible }), true);
+  assert.equal(rendered({ style: { visibility: 'hidden' } }), false);
+});
+
+test('only an explicit current picker survives a video opacity transition', () => {
+  const content = source('content');
+  const start = content.indexOf('  function pickerTransitionRect(');
+  const end = content.indexOf('  function place(', start);
+  assert.ok(start >= 0 && end > start);
+  const rect = { left: 10, top: 10, right: 310, bottom: 210 };
+  const player = { readyState: 4, src: 'blob:https://example.test/one', style: { opacity: '0', visibility: 'visible', display: 'block' }, getBoundingClientRect: () => rect };
+  const panelMedia = { player, generation: 7, src: player.src, documentIdentity: 'page-a', targetKey: 'target-a' };
+  const document = { fullscreenElement: null };
+  const context = vm.createContext({
+    perch: {}, panelMedia, panel: { classList: { contains: () => true } }, document,
+    intersecting: new Map([[player, true]]), playback: new Map([[player, { generation: 7 }]]),
+    VesperPlayerSource: { identity: value => value }, pageAddress: () => 'page-a',
+    playerSource: p => p.src, activePreview: null, getComputedStyle: p => p.style,
+    hiddenPlayerContainer: p => Boolean(p.hiddenAncestor), clippedPlayerRect: r => r
+  });
+  const transition = vm.runInContext(content.slice(start, end) + '\npickerTransitionRect;', context);
+  assert.equal(transition(player), rect);
+  for (const [key, value] of [['generation', 8], ['src', 'blob:https://example.test/two'], ['documentIdentity', 'page-b'], ['player', {}]]) {
+    const original = panelMedia[key];
+    panelMedia[key] = value;
+    assert.equal(transition(player), null, key);
+    panelMedia[key] = original;
+  }
+  player.hiddenAncestor = true;
+  assert.equal(transition(player), null);
+  player.hiddenAncestor = false;
+  document.fullscreenElement = {};
+  assert.equal(transition(player), null);
+  document.fullscreenElement = null;
+  context.intersecting.set(player, false);
+  assert.equal(transition(player), null);
+  context.intersecting.set(player, true);
+  context.panelMedia = null;
+  assert.equal(transition(player), null);
+});
+
+test('initial metadata refreshes a provisional picker once but a replacement invalidates it', async () => {
+  const content = source('content');
+  const start = content.indexOf('  function canAdoptInitialBinding(');
+  const end = content.indexOf('  function refreshPlayers(', start);
+  assert.ok(start >= 0 && end > start);
+  class Media {
+    isConnected = true;
+    readyState = 1;
+    src = 'https://example.test/a.mp4';
+    duration = 10;
+  }
+  const player = new Media(), page = 'https://example.test/watch/a';
+  const context = vm.createContext({
+    HTMLMediaElement: Media, HTMLVideoElement: Media, video: player,
+    alive: () => true, observed: new Set([player]), nativeAudioPlayer: () => false,
+    mediaLedger: { playback() {} }, evidenceKey: () => 'player-1',
+    location: { origin: 'https://example.test' }, VesperPlayerSource: { identity: v => v },
+    pageForPlayer: () => page, pageAddress: () => page, playback: new Map(),
+    isCurrentEndedPlayer: () => false, endedPlayer: null, activePreview: null,
+    generation: 0, mediaChangedAt: 0, retainedPickerDraft: null, panelRequest: 3,
+    panel: { classList: { contains: () => true } },
+    panelMedia: { player, generation: 0, src: player.src, pageUrl: page, documentIdentity: page },
+    isCurrentRequest: n => n === context.panelRequest && !!context.panelMedia,
+    closePanel: () => { context.panelMedia = null; context.panelRequest++; context.closed++; },
+    loadFormats: refresh => { assert.equal(refresh, true); context.reloaded++; },
+    closed: 0, reloaded: 0
+  });
+  const consider = vm.runInContext(content.slice(start, end) + '\nconsider;', context);
+  consider(player);
+  consider(player);
+  await Promise.resolve();
+  assert.equal(context.closed, 0);
+  assert.equal(context.reloaded, 1);
+  assert.equal(context.panelRequest, 4);
+  assert.equal(context.panelMedia.generation, 1);
+  player.src = 'https://example.test/b.mp4';
+  consider(player);
+  await Promise.resolve();
+  assert.equal(context.closed, 1);
+  assert.equal(context.reloaded, 1);
+
+  // A contradictory initial source must not be adopted.
+  context.playback.clear();
+  context.panelMedia = { player, generation: 0, src: 'https://example.test/other.mp4', pageUrl: page, documentIdentity: page };
+  consider(player);
+  await Promise.resolve();
+  assert.equal(context.closed, 2);
+  assert.equal(context.reloaded, 1);
+});
 
 test('the butterfly motion picker has Animate and Off', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
@@ -22,11 +133,10 @@ test('the butterfly motion picker has Animate and Off', () => {
   ]);
 });
 
-test('browser sign-in settings require approval for the current HTTPS host', () => {
+test('browser sign-in is global, with only the browser permission gate', () => {
   const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
   assert.match(popup, /Use my Chrome sign-in/);
-  assert.match(popup, /id="signin-site" disabled/);
-  assert.match(popup, /id="signin-host"/);
+  assert.doesNotMatch(popup, /id="signin-site"|id="signin-host"|id="file-sign-in"/);
 });
 
 test('opening the popup shows the installed extension version without checking the app', async () => {
@@ -85,8 +195,7 @@ test('opening the popup shows the installed extension version without checking t
     await allow.onclick();
     assert.deepEqual(permissionRequests, [{ permissions: ['cookies'] }]);
     assert.equal(allow.hidden, true);
-    assert.equal(getElementById('signin-site').checked, false);
-    assert.equal(getElementById('signin-host').textContent, 'example.com');
+    assert.match(getElementById('signin-access').textContent, /Used automatically for downloads and videos/);
     assert.deepEqual(preferences, [
       { route: 'auto', intercept: false }, { route: 'auto', intercept: true }, { useSignIn: true }
     ]);

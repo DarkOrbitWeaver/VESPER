@@ -77,12 +77,21 @@ public sealed class Mp4HeaderFactsTests
     [InlineData("wrong-size", false)]
     [InlineData("ignored-range", false)]
     [InlineData("init-only", false)]
+    [InlineData("tail-muxed", true)]
+    [InlineData("tail-silent", true)]
+    [InlineData("tail-changed", false)]
+    [InlineData("tail-fragmented", false)]
     public async Task Observed_partial_response_requires_the_same_complete_muxed_representation(string mode, bool success)
     {
         const string url = "https://cdn.example.com/opaque";
         const string page = "https://video.example.com/watch";
-        byte[] file = Join(Box("ftyp", Ascii("isom")), Box("moov", Mvhd(1000, mode == "init-only" ? 0u : 15_000u),
-            Track("vide", "avc1", 1280, 720), Track("soun", "mp4a", 0, 0)), Box("mdat", new byte[64]));
+        bool tail = mode.StartsWith("tail-", StringComparison.Ordinal);
+        byte[] moov = Box("moov", Mvhd(1000, mode == "init-only" ? 0u : 15_000u),
+            Track("vide", mode == "tail-muxed" ? "hvc1" : "avc1", 1280, 720),
+            mode == "tail-silent" ? [] : Track("soun", "mp4a", 0, 0),
+            mode == "tail-fragmented" ? Box("mvex") : []);
+        byte[] file = tail ? Join(Box("ftyp", Ascii("isom")), Box("mdat", new byte[300_000]), moov)
+            : Join(Box("ftyp", Ascii("isom")), moov, Box("mdat", new byte[64]));
         using var resolver = new DefaultMediaResolver(handler: new RangeFixture(file, mode));
         var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
@@ -100,7 +109,36 @@ public sealed class Mp4HeaderFactsTests
         Assert.True(rep.BrowserRangeVerified);
         Assert.Equal("\"original\"", rep.ResourceETag);
         Assert.Equal(file.Length, rep.FileSize);
-        Assert.True(rep.HasAudio && rep.HasVideo);
+        Assert.True(rep.HasVideo);
+        Assert.Equal(mode != "tail-silent", rep.HasAudio);
+        Assert.Equal(mode == "tail-silent", rep.StandaloneVideo);
+    }
+
+    [Fact]
+    public async Task OptInPublicBlogRangeDiagnostic()
+    {
+        string? path = Environment.GetEnvironmentVariable("VESPER_QA_ZAI_PROBE");
+        if (string.IsNullOrWhiteSpace(path)) return;
+        foreach (string line in File.ReadLines(path))
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(line);
+            var root = json.RootElement;
+            var url = new Uri(root.GetProperty("url").GetString()!);
+            var length = root.GetProperty("total").GetInt64();
+            string tag = root.GetProperty("etag").GetString()!;
+            var options = new ResolverOptions();
+            using var http = new SecureHttpClient(options);
+            var context = new MediaRequestContext { Referer = "https://z.ai/blog/glm-5.4" };
+            var probe = await http.ProbeGetAsync(url, context, CancellationToken.None);
+            byte[]? prefix = await http.ReadStartAsync(url, context, probe, 256 * 1024, CancellationToken.None);
+            long? offset = prefix is null ? null : Mp4HeaderFacts.TailOffset(prefix, length, 256 * 1024);
+            byte[]? suffix = offset is long at ? await http.ReadBoundedRangeAsync(url, context, probe, at, 256 * 1024, CancellationToken.None) : null;
+            var facts = prefix is null ? null : Mp4HeaderFacts.Read(prefix);
+            facts ??= suffix is null ? null : Mp4HeaderFacts.ReadTail(suffix);
+            var processor = new CandidateProcessor(http, new Vesper.MediaResolver.Protocols.ManifestResolver(http, options), options);
+            var outcome = await processor.ProcessAsync([new MediaCandidate(url, CandidateKind.Direct, "video/mp4", ObservedLength: length, ObservedETag: tag)], context, CancellationToken.None);
+            Console.WriteLine($"QA {root.GetProperty("index")}: {probe.StatusCode}, length={probe.ContentLength == length}, tag={probe.StrongETag == tag}, prefix={prefix?.Length}, tailOffset={offset}, tail={suffix?.Length}, facts={facts}, reps={outcome.Representations.Count}, problems={string.Join("; ", outcome.Problems.Select(p => p.ToString()))}");
+        }
     }
 
     private sealed class RangeFixture(byte[] bytes, string mode) : HttpMessageHandler
@@ -118,7 +156,7 @@ public sealed class Mp4HeaderFactsTests
             };
             result.Content.Headers.ContentType = new MediaTypeHeaderValue("video/mp4");
             if (partial) result.Content.Headers.ContentRange = new ContentRangeHeaderValue(start, end, bytes.Length);
-            result.Headers.ETag = new EntityTagHeaderValue(mode == "wrong-tag" ? "\"changed\"" : "\"original\"");
+            result.Headers.ETag = new EntityTagHeaderValue(mode == "wrong-tag" || mode == "tail-changed" && start > 0 ? "\"changed\"" : "\"original\"");
             return Task.FromResult(result);
         }
     }

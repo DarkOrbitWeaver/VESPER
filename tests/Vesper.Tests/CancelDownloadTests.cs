@@ -338,7 +338,8 @@ public sealed class CancelDownloadTests
     public async Task Resume_and_cleanup_refuse_a_different_file_even_with_identical_bytes_after_reopen()
     {
         if (!OperatingSystem.IsWindows()) return;
-        await using var server = new FaultServer(64 * 1024);
+        // Ensure the truncated response supplies more than one durable checkpoint.
+        await using var server = new FaultServer();
         await server.StartAsync();
         using var h = new Harness();
         Guid id = h.Add(server.Url("/expires-after-truncate"), "owned-partial.bin");

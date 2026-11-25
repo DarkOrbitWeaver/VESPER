@@ -4,20 +4,58 @@ using Vesper.MediaResolver.Formats;
 namespace Vesper.MediaResolver.Discovery;
 
 /// <summary>
-/// What the start of an MP4 file says about its tracks. Read from the <c>moov</c> box when it lies within the
-/// bytes fetched; a file that keeps <c>moov</c> at its end yields nothing, and its details stay unknown.
+/// Facts from an MP4's bounded track table, at the start or a verified top-level tail boundary.
 /// </summary>
 internal sealed record DirectMediaFacts(bool HasVideo, bool HasAudio, int? Width, int? Height,
     string? VideoCodec, string? AudioCodec, double? DurationSeconds, bool Encrypted, bool CompleteFileCandidate = true);
 
 internal static class Mp4HeaderFacts
 {
+
+    // Follow declared top-level sizes, never search sample bytes for a fake moov signature.
+    internal static long? TailOffset(ReadOnlySpan<byte> prefix, long total, int budget)
+    {
+        if (prefix.Length < 8 || Name(prefix.Slice(4, 4)) != "ftyp") return null;
+        long offset = 0;
+        while (offset <= prefix.Length - 8)
+        {
+            var box = prefix[(int)offset..];
+            ulong length = BinaryPrimitives.ReadUInt32BigEndian(box);
+            int header = 8;
+            if (length == 1)
+            {
+                if (box.Length < 16) return null;
+                length = BinaryPrimitives.ReadUInt64BigEndian(box[8..]);
+                header = 16;
+            }
+            if (length < (ulong)header || length > (ulong)(total - offset)) return null;
+            string type = Name(box.Slice(4, 4));
+            long end = offset + (long)length;
+            if (end > prefix.Length)
+                return type == "mdat" && end < total && total - end <= budget ? end : null;
+            if (type is "moov" or "moof" or "styp") return null;
+            offset = end;
+        }
+        return null;
+    }
+
+    internal static DirectMediaFacts? ReadTail(ReadOnlySpan<byte> tail)
+    {
+        while (TryBox(tail, out string type, out _, out int size))
+        {
+            if (type == "moov") return Read(tail[..size]);
+            if (type is not ("free" or "skip" or "wide")) return null;
+            tail = tail[size..];
+        }
+        return null;
+    }
+
     public static DirectMediaFacts? Read(ReadOnlySpan<byte> data)
     {
         if (!TryBox(data, out string first, out _, out _) || first is not ("ftyp" or "styp" or "moov")) return null;
         if (!TryFind(data, "moov", out ReadOnlySpan<byte> moov)) return null;
 
-        bool video = false, audio = false, encrypted = false;
+        bool video = false, audio = false, encrypted = false, fragmented = false;
         int? width = null, height = null;
         string? videoCodec = null, audioCodec = null;
         double? duration = null;
@@ -42,6 +80,7 @@ internal static class Mp4HeaderFacts
                     if (scale > 0 && ticks is > 0 and < uint.MaxValue) duration = ticks / (double)scale;
                 }
             }
+            else if (type == "mvex") fragmented = true;
             else if (type == "trak")
             {
                 if (!ReadTrack(body, out string? handler, out string? format, out int? w, out int? h, out bool protectedTrack))
@@ -63,7 +102,7 @@ internal static class Mp4HeaderFacts
             rest = rest[size..];
         }
         if (duration is > 31_536_000) duration = null;
-        return video || audio ? new(video, audio, width, height, videoCodec, audioCodec, duration, encrypted) : null;
+        return video || audio ? new(video, audio, width, height, videoCodec, audioCodec, duration, encrypted, CompleteFileCandidate: !fragmented) : null;
     }
 
     private static bool ReadTrack(ReadOnlySpan<byte> trak, out string? handler, out string? format,

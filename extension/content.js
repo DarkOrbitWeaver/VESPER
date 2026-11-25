@@ -61,6 +61,25 @@
   const playerInteractions = new WeakMap();
   let intentCertain = true;
   let evidenceSerial = 0, resourceObserver = null;
+  function viewportCenterDistance(rect) {
+    const width = globalThis.innerWidth || 1, height = globalThis.innerHeight || 1;
+    const dx = (rect.left + rect.right) / 2 - width / 2, dy = (rect.top + rect.bottom) / 2 - height / 2;
+    return Math.min(1, Math.hypot(dx, dy) / Math.hypot(width / 2, height / 2));
+  }
+  // Structural advertisement context: ad-slot tokens on the element or its nearest containers, or an
+  // ad-skip control inside the same container. A weak negative feature; never a reason to act.
+  const AD_TOKEN = /^(?:ad|ads|advert|adverts|advertisement|adslot|adunit|sponsor|sponsored|promoted|preroll|midroll|postroll|ima)$/;
+  function advertisementContext(el) {
+    let node = el;
+    for (let depth = 0; node && node.nodeType === 1 && depth < 5; depth++, node = node.parentElement) {
+      const text = [node.id, typeof node.className === 'string' ? node.className : '', node.getAttribute?.('aria-label') || '',
+        node.getAttribute?.('aria-roledescription') || ''].join(' ').slice(0, 400);
+      const tokens = text.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z0-9]+/);
+      if (tokens.some(token => AD_TOKEN.test(token))) return true;
+      if (node.dataset && Object.keys(node.dataset).slice(0, 24).some(name => /^(?:ad|ads|adSlot|adUnit|sponsored)$/.test(name))) return true;
+    }
+    return false;
+  }
   function evidenceKey(el) {
     if (!playerEvidenceKeys.has(el)) playerEvidenceKeys.set(el, 'player-' + ++evidenceSerial);
     return playerEvidenceKeys.get(el);
@@ -165,21 +184,45 @@
 
   // noticing media
 
+  function nativeAudioPlayer(el) {
+    return el?.tagName === 'AUDIO' && el.controls === true;
+  }
+
+  function renderedPlayerBox(el) {
+    // Unlike getBoundingClientRect, this detects opacity and content visibility
+    // inherited through containers (including virtualized feed cards).
+    if (typeof el.checkVisibility === 'function')
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true });
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
+    return !hiddenPlayerContainer(el);
+  }
+
+  function hiddenPlayerContainer(el) {
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.opacity === '0' || style.display === 'none' || style.contentVisibility === 'hidden') return true;
+    }
+    return false;
+  }
+
   function visiblePlayer(el, minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT) {
+    if (el?.tagName === 'AUDIO') {
+      if (!nativeAudioPlayer(el)) return null;
+      minWidth = 160;
+      minHeight = 24;
+    }
     const ended = isCurrentEndedPlayer(el);
     if (!el?.isConnected || intersecting.get(el) === false && !ended) return null;
     const r = el.getBoundingClientRect();
-    const style = getComputedStyle(el);
-    const hidden = style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0';
-    if (!hidden) {
+    if (renderedPlayerBox(el)) {
       const rect = clippedPlayerRect(r, minWidth, minHeight);
       if (rect) return rect;
     }
-    if (!ended) return null;
+    if (!ended || hiddenPlayerContainer(el)) return null;
 
     for (let parent = el.parentElement, depth = 0; parent && parent !== document.body && depth < 5; parent = parent.parentElement, depth++) {
-      const parentStyle = getComputedStyle(parent);
-      if (parentStyle.visibility === 'hidden' || parentStyle.visibility === 'collapse' || parentStyle.opacity === '0') continue;
+      if (!renderedPlayerBox(parent)) continue;
       const parentBox = parent.getBoundingClientRect();
       const original = endedPlayer.frame;
       const left = parentBox.left + scrollX, top = parentBox.top + scrollY;
@@ -360,7 +403,9 @@
         && (!fullscreen || fullscreen.contains(endedPlayer.player))) {
       const newPlayerPlaying = [...observed].some(el => el !== endedPlayer.player && !el.paused && !el.ended
         && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el));
-      if (!newPlayerPlaying && visiblePlayer(endedPlayer.player)) best = endedPlayer.player;
+      const videoAvailable = nativeAudioPlayer(endedPlayer.player) && [...observed].some(el =>
+        !nativeAudioPlayer(el) && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el));
+      if (!newPlayerPlaying && !videoAvailable && visiblePlayer(endedPlayer.player)) best = endedPlayer.player;
     }
     const previouslyCertain = intentCertain;
     if (best) setIntentCertainty(true);
@@ -383,11 +428,22 @@
           incidentalLoop: !!(el.defaultMuted && el.autoplay && el.loop && !el.controls),
           interacted: !!(interaction && binding && interaction.generation === binding.generation
             && now - interaction.at <= 30_000),
-          incumbent: el === video });
+          incumbent: el === video,
+          centerDistance: viewportCenterDistance(r),
+          duration: Number.isNaN(el.duration) ? null : el.duration,
+          networkBound: !!binding && mediaLedger.matches(id).some(entry => entry.bound),
+          declaredSource: !!VesperPlayerSource.http(el.getAttribute?.('src') || el.querySelector?.('source[src]')?.getAttribute?.('src') || ''),
+          adContext: advertisementContext(el) });
         players.set(id, el);
         if (candidates.length > VesperIntelligence.PLAYER_POLICY.limit) break;
       }
-      const intent = VesperIntelligence.rankPlayers(candidates);
+      // The v2 model abstains on ads, incidental loops, conflicting interaction and missing evidence;
+      // VesperIntelligence keeps the v1 ranker as the fallback if the inference runtime is absent.
+      // Native audio controls can anchor the picker when no visible video is
+      // competing. Hidden audio and separately playing sound must not steal
+      // the butterfly from a video; an explicit manual perch still works.
+      const videos = candidates.filter(candidate => !nativeAudioPlayer(players.get(candidate.id)));
+      const intent = (globalThis.VesperInference || VesperIntelligence).rankPlayers(videos.length ? videos : candidates);
       setIntentCertainty(intent.decisive);
       best = players.get(intent.selected);
     }
@@ -489,10 +545,19 @@
     send({ type: 'media-element', watching: true }).catch(() => {});   // a hint only; never surfaces errors
   }
 
+  function canAdoptInitialBinding(player, previous, src, page) {
+    if (previous || !panelMedia || panelMedia.player !== player || panelMedia.generation !== 0
+        || !panel?.classList.contains('show') || !player.isConnected
+        || panelMedia.documentIdentity !== VesperPlayerSource.identity(pageAddress())) return false;
+    const identity = VesperPlayerSource.identity(page);
+    return !!identity && identity === VesperPlayerSource.identity(panelMedia.pageUrl)
+      && (!panelMedia.src || panelMedia.src === src);
+  }
+
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
-    if (el instanceof HTMLVideoElement && !observed.has(el) &&
+    if ((el instanceof HTMLVideoElement || nativeAudioPlayer(el)) && !observed.has(el) &&
         (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]'))) {
       observed.add(el);
       visibility.observe(el);
@@ -504,6 +569,7 @@
     const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
     if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)
         && !(isCurrentEndedPlayer(el) && !src)) {
+      const adoptInitial = canAdoptInitialBinding(el, previous, src, page);
       const changedAt = Date.now();
       const binding = { src, page, generation: ++generation, changedAt };
       playback.set(el, binding);
@@ -514,12 +580,22 @@
       if (activePreview?.player === el) {
         activePreview = { ...activePreview, page, src,
           key: `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}`, binding };
-        if (panelMedia && panelMedia.targetKey !== activePreview.key) closePanel();
+        if (!adoptInitial && panelMedia && panelMedia.targetKey !== activePreview.key) closePanel();
       }
       if (el === video) mediaChangedAt = changedAt;
       if (el === video && panelMedia?.player === el) {
         retainedPickerDraft = null;
-        closePanel();
+        if (adoptInitial) {
+          // Invalidate the provisional lookup immediately; the first metadata
+          // event is not a replacement of an already bound media source.
+          const request = ++panelRequest;
+          panelMedia = { ...panelMedia, pageUrl: page, src, formatSrc: src, generation: binding.generation,
+            targetKey: activePreview?.player === el ? activePreview.key
+              : `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}` };
+          Promise.resolve().then(() => {
+            if (isCurrentRequest(request) && video === el) void loadFormats(true);
+          });
+        } else closePanel();
       }
       if (el === video && retainedPickerDraft) retainedPickerDraft = null;
     }
@@ -530,7 +606,7 @@
     syncPage();
     if (!extensionPreferencesReady) return;
     if (butterflyHidden()) { detach(true); return; }
-    document.querySelectorAll('video').forEach(consider);
+    document.querySelectorAll('video,audio[controls]').forEach(consider);
     selectPlayer();
   }
 
@@ -571,7 +647,7 @@
     void send({ type: 'media-options', prefetch: true, pageUrl: targetPage,
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
       playerPlaying: !el.paused && !el.ended, playerHasMedia: current && (el.readyState >= 1 || el.ended || ended), playerPageUrl: targetPage,
-      playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      playerUrl: current ? src : '', playerKey: evidenceKey(el), generation: current ? binding.generation : 0,
       mutedLoop: current && activePreview?.player !== el && isMutedLoop(el, src),
       playerResourceFingerprints: witness?.fingerprints,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
@@ -930,6 +1006,23 @@
     host?.remove(); host = root = button = panel = receipt = null; video = null;
   }
 
+  function pickerTransitionRect(player) {
+    // Some players briefly hide their video element when the pointer leaves the
+    // controls. An explicit picker is already bound to a concrete source.
+    // Never use this exception to select an invisible player automatically.
+    if (!perch || !panelMedia || panelMedia.player !== player || !panelMedia.generation
+        || !panel?.classList.contains('show') || player.readyState < 1
+        || intersecting.get(player) === false || document.fullscreenElement
+        || panelMedia.documentIdentity !== VesperPlayerSource.identity(pageAddress())
+        || playback.get(player)?.generation !== panelMedia.generation
+        || playerSource(player) !== panelMedia.src || !panelMedia.src
+        || activePreview && activePreview.key !== panelMedia.targetKey) return null;
+    const style = getComputedStyle(player);
+    if (style.opacity !== '0' || style.visibility !== 'visible' || style.display === 'none'
+        || hiddenPlayerContainer(player)) return null;
+    return clippedPlayerRect(player.getBoundingClientRect());
+  }
+
   function place(continuous = false) {
     if (!alive()) return;
     if (!video) return detach();
@@ -941,7 +1034,8 @@
       if (!perch || !panelMedia || !panel?.classList.contains('show')) return detach();
       button.hidden = true;
     } else {
-      const rect = manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video);
+      const rect = (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))
+        || pickerTransitionRect(video);
       button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
       if (button.hidden) {
         fullscreenPlayer = false;
@@ -957,6 +1051,12 @@
         else stopFullscreenIdle();
       }
       perch = playerPerch(rect, fullscreenPlayer);
+      if (!perch) {
+        button.hidden = true;
+        updateFlyVisibility();
+        closePanel();
+        return;
+      }
       companion.setPerch(perch.x, perch.y, perch.faceLeft, fullscreenPlayer, { continuous, immediate: !!drag?.moved });
     }
     if (!perch) return detach();
@@ -1017,6 +1117,18 @@
           if (!control || control === host || control.contains?.(video)) return false;
           return true;
         }));
+    if (nativeAudioPlayer(video)) {
+      // Native audio controls occupy the entire element. Only use a clear
+      // position outside the control's rectangle, or leave it unobstructed.
+      const candidates = [
+        ...corners.map(corner => ({ ...corner, y: rect.top - FLY_SIZE - 4 })),
+        ...corners.map(corner => ({ ...corner, y: rect.bottom + 4 })),
+        { x: rect.right + 4, y: rect.top, faceLeft: true },
+        { x: rect.left - FLY_SIZE - 4, y: rect.top, faceLeft: false }
+      ];
+      return candidates.find(({ x, y }) => x >= 4 && y >= 4 && x + FLY_SIZE <= innerWidth - 4
+        && y + FLY_SIZE <= innerHeight - 4 && clear(x, y)) || null;
+    }
     const positions = fullscreen || !border ? [rect.top + 8] : [rect.top - VesperCompanion.footY, rect.top + 8];
     if (rect.bottom - rect.top >= 180) positions.push(rect.top + 56);
     for (const y of positions) {
@@ -1311,6 +1423,7 @@
   }
 
   function closePanel(acknowledged = false) {
+    const invisibleTransition = video?.isConnected && pickerTransitionRect(video);
     panelRequest++;
     panelMedia = null;
     panelMotion?.cancel();
@@ -1325,6 +1438,7 @@
     }
     button?.setAttribute('aria-expanded', 'false');
     companion?.setPickerOpen(false, acknowledged);
+    if (invisibleTransition && button) button.hidden = true;
     updateFlyVisibility();
     holdMissingPreview();
   }
@@ -1372,13 +1486,14 @@
     if (retainedPickerDraft && !savedDraft) retainedPickerDraft = null;
     refresh = refresh || savedDraft;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), documentPage: pageAddress(), targetKey,
-      player, pageUrl: targetPage, src, generation: current ? binding.generation : 0 };
+      player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player), generation: current ? binding.generation : 0 };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
     companion.setPickerOpen(true, false, true);
     updateFlyVisibility();
     const isPreview = !!preview;
-    const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
+    const fallbackTitle = nativeAudioPlayer(player) ? 'This audio' : 'This video';
+    const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || fallbackTitle : fallbackTitle;
     // A feed's page-wide Open Graph image often belongs to the site rather than this player.
     const playerPageIsSpecific = identity && !/^https?:/.test(identity);
     const poster = current ? player.poster || (!isPreview && playerPageIsSpecific && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
@@ -1400,7 +1515,7 @@
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
       title, playerPlaying: current && !player.paused && !player.ended,
       playerHasMedia: current && (player.readyState >= 1 || player.ended || ended), playerPageUrl: targetPage,
-      playerUrl: current ? src : '', generation: current ? binding.generation : 0,
+      playerUrl: current ? src : '', playerKey: evidenceKey(player), generation: current ? binding.generation : 0,
       mutedLoop: current && !isPreview && isMutedLoop(player, src),
       playerCrossOrigin: current ? player.crossOrigin : undefined,
       playerFacts: playerFacts && Object.keys(playerFacts).length ? playerFacts : undefined,
@@ -2014,7 +2129,7 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, seconds, loading);
     const result = await send({ type: 'media-source-select', sourceChoice: token,
-      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src });
+      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.choices?.length) {
       const formats = result.data;
@@ -2043,7 +2158,8 @@
     if (hadFocus) close.focus({ preventScroll: true });
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src }
-      : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent });
+      : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent,
+        pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
     if (!isCurrentRequest(request)) return;
     if (reply?.ok) {
       const status = reply.results?.[0]?.status;

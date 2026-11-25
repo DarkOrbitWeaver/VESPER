@@ -130,7 +130,7 @@ public sealed class SecureHttpClient : IDisposable
             return new HttpTextResponse(final, status, "", ctype, cookies, IsText: false) { SessionCookies = sessionCookies };
 
         int limit = status >= 400 ? _o.MaxErrorBodyBytes : maxBytes ?? _o.MaxPageBytes;
-        string body = await ReadLimitedAsync(resp, limit, ct).ConfigureAwait(false);
+        string body = await ReadResponseTextAsync(resp, limit, ct).ConfigureAwait(false);
         return new HttpTextResponse(final, status, body, ctype, cookies) { SessionCookies = sessionCookies };
     }
 
@@ -179,7 +179,7 @@ public sealed class SecureHttpClient : IDisposable
         }).ConfigureAwait(false);
         int status = (int)resp.StatusCode;
         int limit = status >= 400 ? _o.MaxErrorBodyBytes : maxBytes ?? _o.MaxJsonBytes;
-        string body = await ReadLimitedAsync(resp, limit, ct).ConfigureAwait(false);
+        string body = await ReadResponseTextAsync(resp, limit, ct).ConfigureAwait(false);
         return new HttpTextResponse(resp.RequestMessage?.RequestUri ?? url, status, body, resp.Content.Headers.ContentType?.MediaType, []);
     }
 
@@ -312,15 +312,23 @@ public sealed class SecureHttpClient : IDisposable
 
     internal async Task<byte[]?> ReadStartAsync(Uri url, MediaRequestContext? ctx, ProbeResult probe, int maxBytes,
         CancellationToken ct)
+        => await ReadBoundedRangeAsync(url, ctx, probe, 0, maxBytes, ct).ConfigureAwait(false);
+
+    internal async Task<byte[]?> ReadBoundedRangeAsync(Uri url, MediaRequestContext? ctx, ProbeResult probe,
+        long offset, int maxBytes, CancellationToken ct)
     {
+        if (offset < 0 || maxBytes <= 0 || maxBytes > 1024 * 1024
+            || probe.ContentLength is not long length || offset >= length
+            || offset > 0 && probe.StrongETag is null) return null;
+        long end = offset + Math.Min(maxBytes, length - offset) - 1;
         using var get = await SendAsync(HttpMethod.Get, url, ctx, ct,
-            req => req.Headers.Range = new RangeHeaderValue(0, maxBytes - 1)).ConfigureAwait(false);
+            req => req.Headers.Range = new RangeHeaderValue(offset, end)).ConfigureAwait(false);
         var headers = get.Content.Headers;
         if (get.StatusCode != HttpStatusCode.PartialContent
-            || headers.ContentRange is not { From: 0, To: long last, Length: long total } range
+            || headers.ContentRange is not { From: long first, To: long last, Length: long total } range
             || !range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
-            || last != Math.Min(maxBytes, total) - 1 || last < 0
-            || headers.ContentLength is long declared && declared != last + 1
+            || first != offset || last != end || last < first
+            || headers.ContentLength is long declared && declared != last - first + 1
             || (get.RequestMessage?.RequestUri ?? url) != probe.FinalUrl
             || probe.ContentLength is long expected && expected != total
             || probe.StrongETag is { } expectedTag && get.Headers.ETag?.ToString() != expectedTag
@@ -331,7 +339,7 @@ public sealed class SecureHttpClient : IDisposable
         try
         {
             await using Stream body = await get.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
-            byte[] buffer = new byte[(int)(last + 1)];
+            byte[] buffer = new byte[(int)(last - first + 1)];
             int read = 0;
             while (read < buffer.Length)
             {
@@ -507,6 +515,21 @@ public sealed class SecureHttpClient : IDisposable
             throw new MediaResolverException(MediaErrors.Blocked("The proxy destination must resolve to public addresses."));
 
         return addresses.FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork) ?? addresses[0];
+    }
+
+    private async Task<string> ReadResponseTextAsync(HttpResponseMessage resp, int maxBytes, CancellationToken ct)
+    {
+        try
+        {
+            return await ReadLimitedAsync(resp, maxBytes, ct).ConfigureAwait(false);
+        }
+        catch (MediaResolverException ex) when ((int)resp.StatusCode >= 400
+            && ex.Error.Code == MediaErrorCode.ResponseTooLarge)
+        {
+            // The server's refusal is authoritative. Oversized error pages
+            // need not be retained, and must not hide rate limits or login requirements.
+            return "";
+        }
     }
 
     private async Task<string> ReadLimitedAsync(HttpResponseMessage resp, int maxBytes, CancellationToken ct)

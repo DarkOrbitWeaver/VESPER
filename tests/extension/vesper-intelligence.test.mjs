@@ -10,6 +10,9 @@ function load() {
   return context.VesperIntelligence;
 }
 const brain = load();
+const plannerContext = vm.createContext({ URL, Date, Math, Map, Set, Number, String, RegExp, Error });
+vm.runInContext(readFileSync(new URL('../../extension/vesper-planner.js', import.meta.url), 'utf8'), plannerContext);
+const planner = plannerContext.VesperPlanner;
 const eq = (actual, expected) => assert.equal(actual, expected);
 const item = i => ({ key: `ep-${i}`, label: `Episode ${i}` });
 const action = { label: 'Download', key: 'BUTTON|||download' };
@@ -236,15 +239,15 @@ test('native completion requires independent verification', async () => {
   eq(result[0].state, 'indeterminate');
 });
 test('never replay one-use GET or POST because ETag/size happens to exist', () => {
-  eq(brain.chooseAcquisition({ approved: true, isOneUse: true, nativeReplayVerified: true }).tier, 'chrome');
-  eq(brain.chooseAcquisition({ approved: true, isPost: true, nativeReplayVerified: true }).tier, 'chrome');
-  eq(brain.chooseAcquisition({ approved: true, isBlob: true, nativeReplayVerified: true }).tier, 'chrome');
-  eq(brain.chooseAcquisition({ approved: true, nativeReplayVerified: true }).tier, 'native');
+  eq(planner.ownershipRoute({ approved: true, isOneUse: true, nativeReplayVerified: true }).tier, 'chrome');
+  eq(planner.ownershipRoute({ approved: true, isPost: true, nativeReplayVerified: true }).tier, 'chrome');
+  eq(planner.ownershipRoute({ approved: true, isBlob: true, nativeReplayVerified: true }).tier, 'chrome');
+  eq(planner.ownershipRoute({ approved: true, nativeReplayVerified: true }).tier, 'native');
 });
 test('browser already receiving bytes prevents unproven takeover', () => {
-  eq(brain.chooseAcquisition({ approved: true, nativeReplayVerified: true, chromeHasBytes: true }).tier, 'chrome');
-  eq(brain.chooseAcquisition({ approved: true, isDrm: true, originalBytesProven: true }).tier, 'unsupported');
-  eq(brain.chooseAcquisition({ approved: true, originalBytesProven: true }).tier, 'original-stream');
+  eq(planner.ownershipRoute({ approved: true, nativeReplayVerified: true, chromeHasBytes: true }).tier, 'chrome');
+  eq(planner.ownershipRoute({ approved: true, isDrm: true, originalBytesProven: true }).tier, 'unsupported');
+  eq(planner.ownershipRoute({ approved: true, originalBytesProven: true }).tier, 'original-stream');
 });
 
 test('same-URL loadstart invalidates previous bound resource evidence', () => {

@@ -18,6 +18,7 @@
     <Compile Include="..\Shared\OriginAwareProxy.cs" Link="Core\OriginAwareProxy.cs" />
     <Compile Include="..\Shared\NetworkAddressPolicy.cs" Link="Security\NetworkAddressPolicy.cs" />
     <Compile Include="..\Shared\FileNameRules.cs" Link="Security\FileNameRules.cs" />
+    <ProjectReference Include="..\Vesper.Intelligence\Vesper.Intelligence.csproj" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Tests" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />
   </ItemGroup>

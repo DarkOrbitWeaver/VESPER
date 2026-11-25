@@ -11,7 +11,7 @@
 #>
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
-    [string]$Version = "1.0.2",
+    [string]$Version = "1.0.3-preview.1",
     [switch]$SkipTests,
     [string]$SigningCertificateThumbprint = $env:VESPER_SIGN_CERT_SHA1,
     [uri]$TimestampServer = 'https://timestamp.digicert.com',

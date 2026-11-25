@@ -683,10 +683,9 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     }
 
     const source = VesperPlayerSource.http(browserUrl(item));
-    const [approvedHosts, sourceHash] = await Promise.all([
-      source?.protocol === 'https:' ? signInApproval() : null, sourceIdentity(browserUrl(item))
+    const [signedIn, sourceHash] = await Promise.all([
+      source?.protocol === 'https:' && !item.incognito ? signInEnabled() : false, sourceIdentity(browserUrl(item))
     ]);
-    const signedIn = approvedHosts?.has(source?.hostname) === true;
     const siteDecision = await captureSiteDecision(item, signedIn);
     if (siteDecision === 'policy-unavailable') {
       await note('policy-unavailable');
@@ -804,7 +803,7 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       return chromeKeeps();
     }
     // The separate command keeps older helpers from accepting capture without checking current site rules.
-    const command = signedIn ? 'browser-submit' : 'browser-capture';
+    const command = authorized ? 'browser-submit' : 'browser-capture';
     const reply = await nativeRequest(envelope(command, { id: record.transferId, mode, items, authorized, browserProof: proof }),
       earlyPaused ? Math.max(1, Math.min(8000, parkingRemaining(record))) : 24000);
     // Chrome may finish while native verification is in flight. Its completed file is never ours.
@@ -846,7 +845,11 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     }
 
     const current = await getChromeDownload(id);
-    if (!sameDownload(current, record) || !canPark(current, response) || !(await sameSource(current, record))
+    const ownership = VesperPlanner.ownershipRoute({ approved: true,
+      nativeReplayVerified: reply.ok === true && result?.transferReady === true,
+      chromeHasBytes: current?.bytesReceived > 0,
+      chromeReplaySafe: chromeCanResume(response) && canPark(current, response) });
+    if (ownership.route !== 'native-http' || !sameDownload(current, record) || !canPark(current, response) || !(await sameSource(current, record))
         || earlyPaused && !current.paused || automatic && current.paused && !earlyPaused) {
       if (earlyPaused) await restoreChromeDownload(id, record);
       else await releaseChromeDownload(current, { ...record, id });

@@ -1,0 +1,238 @@
+{
+ "schema": "vesper.adapter-knowledge/1",
+ "adapters": [
+  {
+   "adapter": "bandcamp",
+   "hosts": [
+    "bandcamp.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": false,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": false,
+    "signedExpiry": false,
+    "authentication": false,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "bilibili",
+   "hosts": [
+    "b23.tv",
+    "bilibili.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": false,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": false,
+    "signedExpiry": true,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": true,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "dailymotion",
+   "hosts": [
+    "dai.ly",
+    "dailymotion.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": true,
+    "dashManifests": false,
+    "directFiles": true,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": true,
+    "signedExpiry": true,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "instagram",
+   "hosts": [
+    "cdninstagram.com",
+    "fbcdn.net",
+    "instagram.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": false,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": false,
+    "signedExpiry": false,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "internetarchive",
+   "hosts": [
+    "archive.org"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": false,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": true,
+    "signedExpiry": false,
+    "authentication": false,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "peertube",
+   "hosts": [],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": true,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": true,
+    "signedExpiry": false,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": true,
+    "liveStreams": true
+   }
+  },
+  {
+   "adapter": "reddit",
+   "hosts": [
+    "redd.it",
+    "reddit.com",
+    "v.redd.it"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": true,
+    "dashManifests": true,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": false,
+    "signedExpiry": false,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "tiktok",
+   "hosts": [
+    "tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": false,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": false,
+    "signedExpiry": true,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": true,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "vimeo",
+   "hosts": [
+    "player.vimeo.com",
+    "vimeo.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": true,
+    "dashManifests": false,
+    "directFiles": true,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": false,
+    "subtitles": true,
+    "signedExpiry": true,
+    "authentication": true,
+    "drmDetection": false,
+    "refusalHandling": false,
+    "liveStreams": false
+   }
+  },
+  {
+   "adapter": "youtube",
+   "hosts": [
+    "music.youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "youtube.com"
+   ],
+   "concepts": {
+    "programIdentity": true,
+    "hlsManifests": true,
+    "dashManifests": false,
+    "directFiles": false,
+    "separateAudioVideo": true,
+    "multipleAudioLanguages": true,
+    "subtitles": true,
+    "signedExpiry": true,
+    "authentication": true,
+    "drmDetection": true,
+    "refusalHandling": true,
+    "liveStreams": true
+   }
+  }
+ ],
+ "expiryParams": [
+  "deadline",
+  "exp",
+  "expire",
+  "expires",
+  "x-amz-expires"
+ ],
+ "prevalence": {
+  "programIdentity": 10,
+  "hlsManifests": 5,
+  "dashManifests": 1,
+  "directFiles": 2,
+  "separateAudioVideo": 10,
+  "multipleAudioLanguages": 1,
+  "subtitles": 5,
+  "signedExpiry": 5,
+  "authentication": 8,
+  "drmDetection": 1,
+  "refusalHandling": 4,
+  "liveStreams": 2
+ },
+ "adapterCount": 10
+}

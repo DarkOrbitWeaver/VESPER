@@ -44,7 +44,7 @@ internal sealed class CandidateProcessor
             .Take(_o.MaxCandidatesPerPage).ToArray();
         var direct = new DirectProbe?[ordered.Length];
         using var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        headerDeadline.CancelAfter(TimeSpan.FromSeconds(6));
+        headerDeadline.CancelAfter(TimeSpan.FromSeconds(ordered.Any(c => c.ObservedLength is not null) ? 12 : 6));
         // Reserve header slots in input order; network completion order must not change the result.
         var headerSlots = ordered.Select((c, i) => (c, i))
             .Where(x => x.c.Kind is not (CandidateKind.Hls or CandidateKind.Dash)
@@ -110,8 +110,16 @@ internal sealed class CandidateProcessor
             bool rangedWitness = c.ObservedLength is not null;
             byte[]? start = null;
             ProbeResult probe;
-            if (rangedWitness)
-                probe = await _http.ProbeGetAsync(c.Url, ctx, ct).ConfigureAwait(false);
+            if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
+            {
+                // The bounded prefix range proves the same extent and validator while
+                // supplying track metadata, avoiding a redundant one-byte request.
+                try { (probe, start) = await _http.ProbeWithStartAsync(c.Url, ctx, HeaderBytes, headerToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                { return new(null, null, MediaErrors.NoMedia("The observed file metadata did not arrive in time.", false)); }
+            }
+            else if (rangedWitness)
+                return new(null, null, MediaErrors.NoMedia("The observed file metadata could not be verified within the lookup budget.", false));
             else if (headerSlot && !headerToken.IsCancellationRequested)
             {
                 try { (probe, start) = await _http.ProbeWithStartAsync(c.Url, ctx, HeaderBytes, headerToken).ConfigureAwait(false); }
@@ -145,9 +153,8 @@ internal sealed class CandidateProcessor
             DirectMediaFacts? facts = null;
             if (IsMp4(probe, c))
             {
-                if (start is not null) facts = Mp4HeaderFacts.Read(start);
-                else if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
-                    facts = await ReadHeaderAsync(c.Url, ctx, probe, headerToken, ct).ConfigureAwait(false);
+                if (start is not null) facts = await ReadMp4FactsAsync(c.Url, ctx, probe, start, headerToken, ct).ConfigureAwait(false);
+
             }
             else if (start is not null && (CodecInfo.ContainerFromMime(ctype) ?? ExtensionOf(probe, c)) == "webm")
                 facts = WebmHeaderFacts.Read(start, probe.ContentLength);
@@ -155,8 +162,9 @@ internal sealed class CandidateProcessor
                 facts = ReadOggAudioFacts(start);
             if (facts is { Encrypted: true })
                 return new(null, null, MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
-            if (rangedWitness && (facts is not { HasVideo: true, HasAudio: true, DurationSeconds: > 0 }
-                || facts.VideoCodec is not ("h264" or "h265" or "av1") || facts.AudioCodec is not ("aac" or "mp3")))
+            if (rangedWitness && (facts is not { HasVideo: true, DurationSeconds: > 0, CompleteFileCandidate: true }
+                || facts.VideoCodec is not ("h264" or "h265" or "av1")
+                || facts.HasAudio && facts.AudioCodec is not ("aac" or "mp3")))
                 return new(null, null, MediaErrors.NoMedia("The ranged source is not a verified complete audio/video file.", false));
             return new(probe, facts, null);
         }
@@ -205,13 +213,16 @@ internal sealed class CandidateProcessor
         (CodecInfo.ContainerFromMime(p.ContentType?.ToLowerInvariant()) ?? ExtensionOf(p, c)) is "mp4" or "m4v" or "m4a" or "mov";
 
     // The header is extra detail. A server that will not serve it leaves the file's details unknown, nothing more.
-    private async Task<DirectMediaFacts?> ReadHeaderAsync(Uri url, MediaRequestContext ctx, ProbeResult probe,
-        CancellationToken headerToken, CancellationToken ct)
+    private async Task<DirectMediaFacts?> ReadMp4FactsAsync(Uri url, MediaRequestContext ctx, ProbeResult probe,
+        byte[] start, CancellationToken headerToken, CancellationToken ct)
     {
+        if (Mp4HeaderFacts.Read(start) is { } facts) return facts;
+        if (probe.StrongETag is null || probe.ContentLength is not long total
+            || Mp4HeaderFacts.TailOffset(start, total, HeaderBytes) is not long offset) return null;
         try
         {
-            byte[]? start = await _http.ReadStartAsync(url, ctx, probe, HeaderBytes, headerToken).ConfigureAwait(false);
-            return start is null ? null : Mp4HeaderFacts.Read(start);
+            byte[]? tail = await _http.ReadBoundedRangeAsync(url, ctx, probe, offset, HeaderBytes, headerToken).ConfigureAwait(false);
+            return tail is null ? null : Mp4HeaderFacts.ReadTail(tail);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return null; }
         catch (MediaResolverException) { return null; }

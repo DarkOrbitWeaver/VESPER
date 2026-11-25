@@ -1,0 +1,31 @@
+{
+ "format": "vesper.model/1",
+ "schema": "vesper.player-intent/2",
+ "kind": "calibrated-linear",
+ "version": "2.1.0-candidate",
+ "weights": {
+  "area": 4.5169,
+  "visible": 1.3445,
+  "central": 1.0419,
+  "playing": 0.5857,
+  "ready": 0.5858,
+  "progressed": 0,
+  "controls": 1.7644,
+  "audiblePlayback": 0.3301,
+  "incidentalLoop": -5.0296,
+  "interaction": 6.7339,
+  "incumbent": 0.9291,
+  "networkBound": 1.4298,
+  "declaredSource": 1,
+  "longForm": 1.623,
+  "adContext": -4.38
+ },
+ "temperature": 0.25,
+ "margin": 4.75,
+ "minConfidence": 0.95,
+ "checksum": "a6dda8bb",
+ "provenance": {
+  "labels": "synthetic-fixture-and-adapter-weak",
+  "independentRealLabels": 0
+ }
+}

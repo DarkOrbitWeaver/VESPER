@@ -1,6 +1,6 @@
 // Page-world media provenance. No body is copied, intercepted or retained.
-// A response's ArrayBuffer can sometimes be recognized when the same object
-// is appended to an MSE SourceBuffer. A player-scoped path hint is useful for
+// A response body object can sometimes be recognized when it becomes an object
+// URL or is appended to an MSE SourceBuffer. A player-scoped path hint is useful for
 // ranking, but is never authority to download or proof of the complete asset.
 (() => {
   'use strict';
@@ -36,7 +36,7 @@
     } catch { return null; }
   }
   function rememberBuffer(buffer, source) {
-    if (!source || !(buffer instanceof ArrayBuffer)) return;
+    if (!source || !(buffer instanceof ArrayBuffer || typeof Blob === 'function' && buffer instanceof Blob)) return;
     const { path, address } = source;
     const previous = buffers.get(buffer);
     if (previous?.path === path && now() - previous.at < TTL) return;
@@ -71,7 +71,7 @@
           // The page itself reads the response. No duplicate read or request.
           const value = apply(descriptor.get, this, []);
           try {
-            if (this.readyState === 4 && this.responseType === 'arraybuffer'
+            if (this.readyState === 4 && (this.responseType === 'arraybuffer' || this.responseType === 'blob')
                 && this.status >= 200 && this.status < 300)
               rememberBuffer(value, pathOf(this.responseURL, this.getResponseHeader('content-type')));
           } catch { /* Do not change the result of the native getter. */ }
@@ -85,7 +85,7 @@
     if (observingResponses) return;
     observingResponses = true;
     watchXhr();
-    replace(Response.prototype, 'arrayBuffer', original => function (...args) {
+    for (const method of ['arrayBuffer', 'blob']) replace(Response.prototype, method, original => function (...args) {
       // Preserve the original promise and its result. Only metadata survives.
       const promise = apply(original, this, args);
       try {
@@ -102,6 +102,12 @@
         urls.set(url, { ref: new WeakRef(args[0]), paths: new Map() });
         while (urls.size > MAX_SOURCES) urls.delete(urls.keys().next().value);
         watchResponses();
+      } else if (typeof Blob === 'function' && args[0] instanceof Blob) {
+        const evidence = buffers.get(args[0]);
+        if (evidence && now() - evidence.at <= TTL) {
+          urls.set(url, { ref: new WeakRef(args[0]), paths: new Map([[evidence, now()]]) });
+          while (urls.size > MAX_SOURCES) urls.delete(urls.keys().next().value);
+        }
       }
     } catch { /* Do not affect page playback. */ }
     return url;
@@ -130,6 +136,9 @@
     } catch { /* Observation is optional and never blocks append. */ }
     return result;
   });
+  // Players may fetch media before creating the MediaSource or Blob URL.
+  // Observe the original promise only; never read a response a second time.
+  watchResponses();
   document.addEventListener('vesper-media-provenance-request', event => {
     const player = event.target;
     if (!(player instanceof HTMLMediaElement)) return;
