@@ -42,7 +42,7 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["media-source-witness.js"],
+      "js": ["media-source-witness.js", "generated-download-witness.js"],
       "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true

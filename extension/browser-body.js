@@ -47,6 +47,18 @@ globalThis.VesperBrowserBody = (() => {
     return names.size === 1 ? { url, fileName: [...names][0] } : null;
   }
 
+  // Automatic interception is limited to explicit data-file download names.
+  // Executable, script, HTML and PDF downloads remain under Chrome's policy.
+  function automaticGeneratedFile(proposal, origin) {
+    const { url, fileName, size, mime } = proposal || {};
+    if (!localBlob(url, origin) || !Number.isSafeInteger(size) || size <= 0 || size > MAX_BYTES
+        || typeof fileName !== 'string' || safeName(fileName) !== fileName || fileName.length > 180
+        || !/\.(?:zip|7z|rar|tar|gz|tgz|png|jpe?g|webp|gif|txt|md|csv|json|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|m4a|flac|mkv)$/i.test(fileName)
+        || typeof mime !== 'string' || /(?:html|javascript|executable|x-msdownload|x-sh|pdf)/i.test(mime))
+      return null;
+    return { url, fileName, expectedLength: size, automatic: true };
+  }
+
   function localBlob(url, origin) {
     try {
       const value = new URL(url);
@@ -226,6 +238,8 @@ globalThis.VesperBrowserBody = (() => {
     try {
       if (response.url && response.url !== url) throw new Error('Browser file identity changed.');
       facts = fileFacts(response, title, generated);
+      if (generated?.automatic && facts.length !== generated.expectedLength)
+        throw new Error('The generated file length changed.');
       if (httpMedia && (response.headers.get('etag') !== mediaProof.etag
           || facts.length !== mediaProof.length
           || (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== mediaProof.mime))
@@ -236,7 +250,7 @@ globalThis.VesperBrowserBody = (() => {
     const unanswered = [];
     try {
       channel = openChannel(connect, signal);
-      const begin = await channel.send({ operation: 'begin', ...facts });
+      const begin = await channel.send({ operation: 'begin', ...facts, ...(generated?.automatic ? { automatic: true } : {}) });
       if (begin.offset !== 0 || begin.accepted) throw new Error('Unexpected initial browser copy state.');
       transferId = begin.transferId;
       reader = response.body.getReader();
@@ -369,7 +383,7 @@ globalThis.VesperBrowserBody = (() => {
             || /[\\/:\u0000-\u001f]/.test(message.fileName))
           return refuse('Invalid browser file metadata.');
         phase = 'opening';
-        if (!(await canBegin(sender)) || closed) return refuse('VESPER is not accepting browser copies.');
+        if (!(await canBegin(sender, message.automatic === true)) || closed) return refuse('VESPER is not accepting browser copies.');
         await rememberReceipt(transferId, sender);
         if (closed) return;
         length = message.length;
@@ -402,5 +416,5 @@ globalThis.VesperBrowserBody = (() => {
     port.onMessage.addListener(message => void onPageMessage(message).catch(() => refuse('Browser copy failed.')));
     return true;
   }
-  return Object.freeze({ PORT, CHUNK, WINDOW, MAX_BYTES, localBlob, eligibleHttpMedia, sameOriginMedia, validMediaProof, generatedLink, fileFacts, inspectLocalMedia, copyBlob, relay });
+  return Object.freeze({ PORT, CHUNK, WINDOW, MAX_BYTES, localBlob, eligibleHttpMedia, sameOriginMedia, validMediaProof, generatedLink, automaticGeneratedFile, fileFacts, inspectLocalMedia, copyBlob, relay });
 })();

@@ -472,9 +472,13 @@ function downloadProof(item, manual) {
 function canPauseBeforeNative(item, proof) {
   const response = responseForDownload(item);
   const now = Date.now();
-  return capturePreflightReadyAt > 0 && now >= capturePreflightReadyAt
-    && now - capturePreflightReadyAt <= EARLY_CAPTURE_WINDOW
-    && response?.attachment === true && chromeCanResume(response)
+  const warm = capturePreflightReadyAt > 0 && now >= capturePreflightReadyAt
+    && now - capturePreflightReadyAt <= 15_000;
+  const warming = capturePreflightPromise && now >= capturePreflightAt
+    && now - capturePreflightAt <= EARLY_CAPTURE_WINDOW;
+  // A known resumable, fresh attachment need not race a cold native handshake.
+  // The durable parking deadline and Chrome recovery still apply.
+  return (warm || warming) && response?.attachment === true && chromeCanResume(response)
     && response.length === proof?.length && now >= response.seen && now - response.seen <= EARLY_CAPTURE_WINDOW;
 }
 
@@ -696,9 +700,10 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
       return chromeKeeps('This site is set to keep automatic downloads in Chrome.');
     }
     if (!sourceHash) return chromeKeeps('The download source cannot be verified.');
-    // A site that already refused VESPER's separate request would only be asked for a second copy in vain.
+    // A fresh attachment with matching response proof deserves its own attempt.
+    // Host-wide refusal history is advisory for less explicit downloads.
     const strategy = takeoverStrategy(signedIn);
-    if (!previous && !(await VesperExperience.promising(siteOf(item), strategy))) {
+    if (!previous && !response?.attachment && !(await VesperExperience.promising(siteOf(item), strategy))) {
       await note('site-declines');
       return chromeKeeps('This site declined VESPER\'s own request before. Chrome is continuing this download.');
     }

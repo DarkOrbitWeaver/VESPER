@@ -10,7 +10,7 @@ const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].inc
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }],
-  preflightReady = false, playerPicker = false, helperProofs } = {}) {
+  preflightReady = false, preflightDelay = 0, playerPicker = false, helperProofs } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -67,8 +67,9 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       sendNativeMessage: (host, message, cb) => {
         if (message.type === 'capture-preflight') {
           preflights.push(message);
-          cb({ ok: true, data: { ready: preflightReady, siteRules: { neverCaptureHosts: [] },
+          const respond = () => cb({ ok: true, data: { ready: preflightReady, siteRules: { neverCaptureHosts: [] },
             ...(helperProofs ? { proofs: helperProofs } : {}) } });
+          if (preflightDelay) testSetTimeout(respond, preflightDelay); else respond();
           return;
         }
         if (message.type === 'hello') policyRequests.push(message);
@@ -349,6 +350,19 @@ test('a warm preflight pauses a validated attachment before starting native stag
   assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
 });
 
+test('an in-flight cold preflight does not leave a verified attachment racing Chrome', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, preflightReady: true, preflightDelay: 3000 });
+  try {
+    await observe(app, file);
+    await waitFor(() => app.preflights.length === 1);
+    await app.onCreated(file);
+    assert.equal(app.actions[0], 'pause');
+    assert.equal(file.paused, true);
+    assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+  } finally { app.stopWorker(); }
+});
 test('early capture resumes the Chrome stream when native staging fails', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': { ok: false, code: 'network', message: 'The server refused VESPER.' },
@@ -1474,7 +1488,7 @@ test('the proofs a helper accepts are remembered, and withdrawn when an older he
 
 // ---- experience: a site that refuses VESPER's own request is not asked again for a while
 
-test('a site that refuses VESPER twice is not asked for a second copy again until that evidence fades', async () => {
+test('a fresh verified attachment is attempted even after earlier site refusals', async () => {
   const refused = { ok: true, results: [{ status: 'started', transferReady: false, transferReason: 'browser-fallback' }] };
   const file = activeDownload();
   const app = load({ 'browser-submit': refused, 'browser-transfer': transfer('failed') }, { download: file });
@@ -1489,14 +1503,14 @@ test('a site that refuses VESPER twice is not asked for a second copy again unti
   assert.equal(app.sent.filter(isBrowserSubmission).length, 2);
 
   await click(3);
-  assert.equal(app.sent.filter(isBrowserSubmission).length, 2, 'the third click makes no second request');
-  assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'site-declines');
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 3, 'a new verified attachment gets a fresh attempt');
+  assert.notEqual(app.sessionData.vesperCaptureDecisions[0].outcome, 'site-declines');
   assert.equal(file.paused, false);
   assert.doesNotMatch(JSON.stringify(app.localData.vesperExperience), /example\.com|archive/);
 
   app.advanceTime(4 * 24 * 60 * 60_000);
   await click(4);
-  assert.equal(app.sent.filter(isBrowserSubmission).length, 3, 'faded evidence lets VESPER ask again');
+  assert.equal(app.sent.filter(isBrowserSubmission).length, 4);
 });
 
 test('a signed address too long to name a site is still handed off, and still refused twice without an error', async () => {

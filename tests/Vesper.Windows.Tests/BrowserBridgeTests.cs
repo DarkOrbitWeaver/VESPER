@@ -468,11 +468,22 @@ public sealed class BrowserBridgeTests
         Directory.CreateDirectory(downloads);
         using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(4));
         CancellationToken ct = deadline.Token;
+        bool generatedReference = Environment.GetEnvironmentVariable("VESPER_QA_GENERATED_REFERENCE") == "1";
+        string? generatedPath = generatedReference ? Path.Combine(root, "generated-source.zip") : null;
         bool socialReference = Environment.GetEnvironmentVariable("VESPER_QA_SOCIAL_REFERENCE") == "1";
         string url = socialReference ? "https://www.tiktok.com/@nasa/video/7665075736742530317"
             : "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm";
         try
         {
+            if (generatedPath is not null)
+            {
+                byte[] payload = new byte[5_300_000];
+                new Random(42).NextBytes(payload);
+                using var stream = File.Create(generatedPath);
+                using var archive = new System.IO.Compression.ZipArchive(stream, System.IO.Compression.ZipArchiveMode.Create);
+                using var entry = archive.CreateEntry("fixture.bin", System.IO.Compression.CompressionLevel.NoCompression).Open();
+                entry.Write(payload);
+            }
             using var engine = DownloadEngine.Start(new EngineOptions
             {
                 DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads
@@ -492,6 +503,7 @@ public sealed class BrowserBridgeTests
                 start.Environment["VESPER_QA_HOST"] = helper;
                 start.Environment["VESPER_QA_RESULT"] = Path.Combine(root, "result.json");
                 start.Environment["VESPER_QA_REFERENCE_URL"] = url;
+                if (generatedPath is not null) start.Environment["VESPER_QA_GENERATED_FILE"] = generatedPath;
                 using Process process = Process.Start(start)!;
                 Task<string> stdout = process.StandardOutput.ReadToEndAsync(ct);
                 Task<string> stderr = process.StandardError.ReadToEndAsync(ct);
@@ -505,7 +517,14 @@ public sealed class BrowserBridgeTests
                 while ((snapshot = engine.Snapshot(job))?.State is not (JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink))
                     await Task.Delay(50, ct);
                 Assert.True(snapshot.State == JobState.Completed, snapshot.Message);
-                if (socialReference)
+                if (generatedPath is not null)
+                {
+                    byte[] expected = await File.ReadAllBytesAsync(generatedPath, ct);
+                    Assert.Equal(expected, await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
+                    Assert.Equal("generated-native.zip", Path.GetFileName(snapshot.FinalPath));
+                    Console.WriteLine($"Generated ZIP: {expected.Length} exact bytes published by VESPER.");
+                }
+                else if (socialReference)
                 {
                     // This is a specific public NASA clip, previously acquired and
                     // independently decoded by the standalone QA campaign.
@@ -569,7 +588,7 @@ public sealed class BrowserBridgeTests
                     Assert.Single(engine.Snapshots());
                     Assert.Single(Directory.GetFiles(downloads));
                 }
-                Console.WriteLine("Real Chrome picker, QA relay, actual native helper, desktop handler and engine: exact bytes verified.");
+                Console.WriteLine("Real Chrome, QA relay, actual native helper, desktop handler and engine: exact bytes verified.");
             }
             finally { bridge.CloseResolver(); }
         }

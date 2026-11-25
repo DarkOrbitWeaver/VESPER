@@ -93,7 +93,14 @@ chrome.runtime.onConnect?.addListener(port => {
     nativeHost: HOST, makeId: () => crypto.randomUUID(),
     connectNative: host => chrome.runtime.connectNative(host),
     rememberReceipt: rememberBodyReceipt,
-    canBegin: async () => !(await extensionPaused()) && (await settings()).route !== 'chrome'
+    canBegin: async (sender, automatic) => {
+      const prefs = await settings();
+      if (await extensionPaused() || prefs.route === 'chrome') return false;
+      if (!automatic) return true;
+      if (!prefs.intercept || !(await refreshNeverCaptureHosts())) return false;
+      return !(await extensionPaused()) && (await settings()).intercept !== false
+        && (await settings()).route !== 'chrome' && !matchesNeverCaptureHost({ url: sender.url });
+    }
   })) port.disconnect();
 });
 
