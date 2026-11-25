@@ -1,4 +1,8 @@
 using System.Buffers.Binary;
+using Vesper.MediaResolver.Core;
+using Vesper.MediaResolver.Models;
+using Vesper.MediaResolver.Security;
+using Vesper.Shared;
 using Vesper.MediaResolver.Formats;
 
 namespace Vesper.MediaResolver.Discovery;
@@ -11,6 +15,34 @@ internal sealed record DirectMediaFacts(bool HasVideo, bool HasAudio, int? Width
 
 internal static class Mp4HeaderFacts
 {
+
+    // Unresolved prefixes are not positive evidence. Veto only contradictory
+    // structure, an empty resource, or an identifiable non-media response.
+    internal static MediaError? DirectFileProblem(Uri url, ProbeResult probe, ReadOnlySpan<byte> prefix,
+        out bool layoutUnverified)
+    {
+        var layout = probe.ContentLength is long total ? Mp4TopLevelExtent.Inspect(prefix, total) : Mp4Layout.Unresolved;
+        layoutUnverified = layout == Mp4Layout.Unresolved;
+        string? reason = probe.InvalidExtent ? "the server returned an invalid media extent"
+            : probe.ContentLength == 0 ? "the response is empty" : layout switch
+        {
+            Mp4Layout.Invalid => "the MP4 box structure contradicts the HTTP resource extent",
+            Mp4Layout.Initialization => "this is an MP4 initialization segment without samples",
+            Mp4Layout.Fragment => "this is an MP4 media fragment without movie metadata",
+            _ => LooksLikeHtml(prefix) ? "the response contains HTML, not an MP4" : null,
+        };
+        return reason is null ? null : MediaErrors.NoMedia($"{UrlRedactor.Redact(url)}: {reason}.", browserMayHelp: true);
+    }
+
+    private static bool LooksLikeHtml(ReadOnlySpan<byte> prefix)
+    {
+        prefix = prefix[..Math.Min(prefix.Length, 256)];
+        if (prefix.StartsWith("\uFEFF"u8)) prefix = prefix[3..];
+        while (!prefix.IsEmpty && prefix[0] is (byte)' ' or (byte)'\r' or (byte)'\n' or (byte)'\t') prefix = prefix[1..];
+        return prefix.Length >= 14 && System.Text.Ascii.EqualsIgnoreCase(prefix[..14], "<!doctype html"u8)
+            || prefix.Length >= 6 && System.Text.Ascii.EqualsIgnoreCase(prefix[..5], "<html"u8)
+                && prefix[5] is (byte)'>' or (byte)' ' or (byte)'\r' or (byte)'\n' or (byte)'\t';
+    }
 
     // Follow declared top-level sizes, never search sample bytes for a fake moov signature.
     internal static long? TailOffset(ReadOnlySpan<byte> prefix, long total, int budget)

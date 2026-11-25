@@ -238,6 +238,7 @@ public static class FormatSelector
         string audioNote = c.A is not null ? "+ separate audio (merge required)"
             : c.V.AudioUnverified ? "· audio not confirmed"
             : c.HasAudio ? "with audio" : c.V.StandaloneVideo ? "· no audio" : "VIDEO ONLY (no audio stream available)";
+        string verificationNote = c.V.Mp4LayoutUnverified || c.A?.Mp4LayoutUnverified == true ? " · file layout not confirmed" : "";
         return new FormatSelection
         {
             Video = c.V,
@@ -248,7 +249,7 @@ public static class FormatSelector
             EstimatedSizeIsEstimate = c.IsEstimate,
             IsFallback = fallback,
             FallbackReason = reason,
-            Summary = $"{res} {fps}{c.VCodec ?? ""} {audioNote}".Replace("  ", " ").Trim()
+            Summary = $"{res} {fps}{c.VCodec ?? ""} {audioNote}{verificationNote}".Replace("  ", " ").Trim()
         };
     }
 

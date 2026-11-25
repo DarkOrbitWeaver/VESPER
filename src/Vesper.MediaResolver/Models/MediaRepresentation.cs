@@ -63,6 +63,8 @@ public sealed record MediaRepresentation
 
     /// <summary>True when the audio presence could not be verified (e.g. direct file with no codec metadata).</summary>
     public bool AudioUnverified { get; init; }
+    // A bounded MP4 probe could not establish the complete top-level layout.
+    internal bool Mp4LayoutUnverified { get; init; }
     // The track table belongs to a standalone file with no audio, rather than to an adaptive video track.
     public bool StandaloneVideo { get; init; }
     public bool MutedLoop { get; init; }

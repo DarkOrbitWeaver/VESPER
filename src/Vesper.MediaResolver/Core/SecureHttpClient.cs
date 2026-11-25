@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
+using Vesper.MediaResolver.Formats;
+using Vesper.MediaResolver.Utilities;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Security;
 using Vesper.Shared;
@@ -241,7 +243,7 @@ public sealed class SecureHttpClient : IDisposable
 
     /// <summary>
     /// Reads at most <paramref name="maxBytes"/> from the start of a file with one ranged GET.
-    /// Null when the server does not honour the range or encodes the body, so nothing larger is ever pulled.
+    /// A finite identity response that ignores Range gets the same bounded prefix read.
     /// </summary>
     internal async Task<(ProbeResult Probe, byte[]? Start)> ProbeWithStartAsync(Uri url, MediaRequestContext? ctx, int maxBytes, CancellationToken ct)
     {
@@ -263,7 +265,7 @@ public sealed class SecureHttpClient : IDisposable
             if (get.StatusCode == HttpStatusCode.PartialContent && identity
                 && headers.ContentRange is { From: 0, To: long last, Length: > 0 } range
                 && range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase)
-                && last >= 0 && last == Math.Min(maxBytes, range.Length!.Value) - 1
+                && last >= 0 && last < Math.Min(maxBytes, range.Length!.Value)
                 && (headers.ContentLength is not long declared || declared == last + 1))
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -277,15 +279,14 @@ public sealed class SecureHttpClient : IDisposable
                 }
                 catch (Exception ex) when (ex is IOException or HttpRequestException
                     || ex is OperationCanceledException && !ct.IsCancellationRequested)
-                { return (probe, null); }
+                { return (probe with { InvalidExtent = true, ContentLength = null }, null); }
             }
             if (get.StatusCode == HttpStatusCode.OK && !headers.Contains("Content-Range"))
             {
-                // A finite WebM can reveal its track table even if the host
-                // ignored Range. Read only the bounded prefix, not the whole file.
-                if (identity && headers.ContentLength is > 0
-                    && (probe.ContentType?.Equals("video/webm", StringComparison.OrdinalIgnoreCase) == true
-                        || probe.ContentType?.Equals("audio/webm", StringComparison.OrdinalIgnoreCase) == true))
+                // Keep the same cap even when the origin ignores Range.
+                string? container = CodecInfo.ContainerFromMime(probe.ContentType?.ToLowerInvariant())
+                    ?? UrlUtil.Extension(probe.FinalUrl) ?? UrlUtil.Extension(url);
+                if (identity && headers.ContentLength is > 0 && container is ("mp4" or "m4a" or "m4v" or "mov" or "webm"))
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                     timeout.CancelAfter(_o.RequestTimeout);
@@ -297,9 +298,10 @@ public sealed class SecureHttpClient : IDisposable
                         return (probe with { AcceptsRanges = false }, bytes);
                     }
                     catch (Exception ex) when (ex is IOException or HttpRequestException
-                        || ex is OperationCanceledException && !ct.IsCancellationRequested) { }
+                        || ex is OperationCanceledException && !ct.IsCancellationRequested)
+                    { return (probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false }, null); }
                 }
-                return (probe with { AcceptsRanges = false }, null);
+                return (probe with { AcceptsRanges = false, ContentLength = identity ? probe.ContentLength : null }, null);
             }
             if (get.StatusCode is HttpStatusCode.OK or HttpStatusCode.PartialContent)
                 return (probe with { InvalidExtent = true, ContentLength = null, AcceptsRanges = false }, null);

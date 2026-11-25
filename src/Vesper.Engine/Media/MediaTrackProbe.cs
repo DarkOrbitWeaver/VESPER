@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using Vesper.Shared;
 
 namespace Vesper.Engine;
 
@@ -50,24 +51,18 @@ internal static class MediaTrackProbe
             ct.ThrowIfCancellationRequested();
             if (count >= 100_000 || file.Length - offset < 8) throw Bad("Invalid MP4 top-level structure.");
             var header = Read(file, offset, (int)Math.Min(16, file.Length - offset));
-            ulong size = BinaryPrimitives.ReadUInt32BigEndian(header); int prefix = 8;
-            if (size == 1)
-            {
-                if (header.Length < 16) throw Bad("Truncated extended MP4 size.");
-                size = BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8)); prefix = 16;
-            }
-            else if (size == 0) size = (ulong)(file.Length - offset);
-            if (size < (ulong)prefix || size > (ulong)(file.Length - offset)) throw Bad("An MP4 box exceeds the downloaded file.");
+            if (Mp4TopLevelExtent.ReadBox(header, file.Length - offset, out int prefix, out long size)
+                != Mp4TopLevelExtent.BoxStatus.Known) throw Bad("An MP4 box exceeds the downloaded file.");
             string type = Encoding.ASCII.GetString(header, 4, 4);
             if (type == "moov")
             {
                 if (moov is not null) throw Bad("The MP4 has more than one set of movie metadata.");
-                moov = new FileBox(type, offset + prefix, offset + (long)size);
+                moov = new FileBox(type, offset + prefix, offset + size);
             }
-            if (type == "mdat" && size > (ulong)prefix) media = true;
+            if (type == "mdat" && size > prefix) media = true;
             if (type == "moof") fragment = true;
             if (type == "pssh") throw Bad("Protected MP4 initialization is unsupported.");
-            offset += (long)size;
+            offset += size;
         }
         if (moov is null && media && fragment)
             throw Bad("The site sent only part of the video. Open the original page and choose another format.");

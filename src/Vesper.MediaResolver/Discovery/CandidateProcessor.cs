@@ -92,7 +92,7 @@ internal sealed class CandidateProcessor
                 if (result.Problem is not null) outcome.Problems.Add(result.Problem);
                 else if (!result.Manifest && result.Probe is { } probe)
                 {
-                    outcome.Representations.Add(BuildDirect(ordered[i], probe, ctx, directIndex++, result.Facts));
+                    outcome.Representations.Add(BuildDirect(ordered[i], probe, ctx, directIndex++, result.Facts, result.Mp4LayoutUnverified));
                     if (result.Facts?.DurationSeconds is { } seconds) outcome.Duration ??= TimeSpan.FromSeconds(seconds);
                 }
             }
@@ -100,7 +100,8 @@ internal sealed class CandidateProcessor
         return outcome;
     }
 
-    private sealed record DirectProbe(ProbeResult? Probe, DirectMediaFacts? Facts, MediaError? Problem, bool Manifest = false);
+    private sealed record DirectProbe(ProbeResult? Probe, DirectMediaFacts? Facts, MediaError? Problem, bool Manifest = false,
+        bool Mp4LayoutUnverified = false);
 
     private async Task<DirectProbe> ProbeDirectAsync(MediaCandidate c, MediaRequestContext ctx,
         bool exactAssetGroup, bool headerSlot, CancellationToken headerToken, CancellationToken ct)
@@ -133,7 +134,8 @@ internal sealed class CandidateProcessor
                 return new(null, null, MediaErrors.NoMedia("The observed range no longer identifies the same complete file.", false));
             if (probe.InvalidExtent)
             {
-                if (rangedWitness) return new(null, null, MediaErrors.NoMedia("The server returned an invalid byte range.", false));
+                if (rangedWitness || IsMp4(probe, c))
+                    return new(null, null, MediaErrors.NoMedia("The server returned an invalid media extent.", false));
                 // Malformed range is not evidence of track structure. A separate
                 // whole-resource HEAD can still establish an unverified direct file.
                 probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false);
@@ -151,8 +153,11 @@ internal sealed class CandidateProcessor
             if (!IsMedia(probe, c))
                 return new(null, null, MediaErrors.NoMedia($"{UrlRedactor.Redact(c.Url)} is not media (content-type '{ctype}')", false));
             DirectMediaFacts? facts = null;
+            bool layoutUnverified = false;
             if (IsMp4(probe, c))
             {
+                if (Mp4HeaderFacts.DirectFileProblem(c.Url, probe, start, out layoutUnverified) is { } problem)
+                    return new(null, null, problem);
                 if (start is not null) facts = await ReadMp4FactsAsync(c.Url, ctx, probe, start, headerToken, ct).ConfigureAwait(false);
 
             }
@@ -166,7 +171,7 @@ internal sealed class CandidateProcessor
                 || facts.VideoCodec is not ("h264" or "h265" or "av1")
                 || facts.HasAudio && facts.AudioCodec is not ("aac" or "mp3")))
                 return new(null, null, MediaErrors.NoMedia("The ranged source is not a verified complete audio/video file.", false));
-            return new(probe, facts, null);
+            return new(probe, facts, null, Mp4LayoutUnverified: layoutUnverified);
         }
         catch (MediaResolverException ex) { return new(null, null, ex.Error); }
     }
@@ -247,7 +252,7 @@ internal sealed class CandidateProcessor
         return UrlUtil.Extension(p.FinalUrl) ?? UrlUtil.Extension(c.Url) ?? (string.IsNullOrEmpty(fromName) ? null : fromName);
     }
 
-    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index, DirectMediaFacts? facts = null)
+    private static MediaRepresentation BuildDirect(MediaCandidate c, ProbeResult p, MediaRequestContext ctx, int index, DirectMediaFacts? facts, bool layoutUnverified)
     {
         string ctype = p.ContentType?.ToLowerInvariant() ?? "";
         string? ext = ExtensionOf(p, c);
@@ -286,6 +291,7 @@ internal sealed class CandidateProcessor
                 : facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
             // Without a readable track table, whether a video file has sound stays honestly unverified.
             AudioUnverified = !audio && facts is null,
+            Mp4LayoutUnverified = layoutUnverified,
             StandaloneVideo = facts is { HasVideo: true, HasAudio: false, CompleteFileCandidate: true },
             MutedLoop = !audio && c.MutedLoop,
             Container = container,
@@ -295,7 +301,7 @@ internal sealed class CandidateProcessor
             AudioCodec = facts is { HasAudio: true } ? facts.AudioCodec : audio && ctype is "audio/mpeg" or "audio/mp3" ? "mp3" : null,
             BitrateKbps = c.Bitrate is { } b ? (int)Math.Min(int.MaxValue, b / 1000) : null,
             FileSize = p.ContentLength,
-            ExpiresAt = ExpiryParser.FromUrl(c.Url),
+            ExpiresAt = ExpiryParser.Earliest(c.Url, p.FinalUrl),
             Label = c.Label,
             Context = ctx
         };

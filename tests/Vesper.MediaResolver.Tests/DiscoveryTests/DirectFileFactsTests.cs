@@ -88,16 +88,13 @@ public sealed class DirectFileFactsTests
     }
 
     [Fact]
-    public async Task An_inconsistent_range_does_not_change_the_files_track_metadata()
+    public async Task An_inconsistent_range_is_not_published()
     {
         var handler = new FakeHttpHandler().Add(VideoUrl, Mp4(("vide", "avc1", 1024, 576)), "video/mp4",
-            contentHeaders: new() { ["Content-Range"] = "bytes 0-80/81" });
+            contentHeaders: new() { ["Content-Range"] = "bytes 0-80/81" }, ignoreRange: true);
 
-        MediaRepresentation file = Assert.Single((await ResolveAsync(handler, VideoUrl)).Representations);
-
-        Assert.True(file.AudioUnverified);
-        Assert.False(file.StandaloneVideo);
-        Assert.Null(file.Height);
+        var result = await ResolveResultAsync(handler, VideoUrl);
+        Assert.False(result.IsSuccess);
     }
 
     [Fact]
@@ -196,8 +193,15 @@ public sealed class DirectFileFactsTests
 
     private static async Task<MediaItem> ResolveAsync(FakeHttpHandler handler, params string[] urls)
     {
+        var result = await ResolveResultAsync(handler, urls);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        return result.Item!;
+    }
+
+    private static async Task<MediaDiscoveryResult> ResolveResultAsync(FakeHttpHandler handler, params string[] urls)
+    {
         using var resolver = T.Resolver(handler);
-        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        return await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
             Url = new(Page), Browser = new BrowserDiscoveryMessage
             {
@@ -205,12 +209,32 @@ public sealed class DirectFileFactsTests
                 Candidates = urls.Select(url => new BrowserMediaCandidate { Url = url, Kind = "direct", Source = "network" }).ToList()
             }
         }, CancellationToken.None);
-        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
-        return result.Item!;
     }
 
     // The fake server stores bodies as text, so every byte of this file stays below 0x80.
-    private static string Mp4(params (string Handler, string Format, uint Width, uint Height)[] tracks)
+    internal static string Mp4(params (string Handler, string Format, uint Width, uint Height)[] tracks)
+        => InitSegment(tracks) + "\u0000\u0000\u0000\u0018mdat" + new string('x', 16);
+
+    [Theory]
+    [InlineData("init")]
+    [InlineData("truncated")]
+    [InlineData("fragment")]
+    [InlineData("html")]
+    public async Task Invalid_direct_mp4_is_not_published(string kind)
+    {
+        string init = InitSegment(("vide", "avc1", 1024, 576));
+        string body = kind switch
+        {
+            "init" => init,
+            "truncated" => init + "\u0000\u0010\u0000\u0000mdat" + new string('x', 1000),
+            "fragment" => "\u0000\u0000\u0000\u0008moof\u0000\u0000\u0000\u0018mdat" + new string('x', 16),
+            _ => "<!doctype html><html>Access denied</html>"
+        };
+        var result = await ResolveResultAsync(new FakeHttpHandler().Add(VideoUrl, body, "video/mp4"), VideoUrl);
+        Assert.False(result.IsSuccess);
+    }
+
+    private static string InitSegment(params (string Handler, string Format, uint Width, uint Height)[] tracks)
     {
         byte[] mvhd = new byte[100];
         BinaryPrimitives.WriteUInt32BigEndian(mvhd.AsSpan(12), 600);

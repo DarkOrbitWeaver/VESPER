@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Vesper.MediaResolver.Core;
+using Vesper.MediaResolver.Discovery;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Utilities;
@@ -96,6 +97,7 @@ internal sealed class TikTokAdapter : AdapterBase
                     budget--;
                     var ctx = ContextFor(url);
                     ProbeResult probe;
+                    byte[]? start;
                     try
                     {
                         if (ExpiryParser.FromUrl(url) is { } expires && expires <= Svc.Now)
@@ -103,7 +105,7 @@ internal sealed class TikTokAdapter : AdapterBase
                             problems.Add(MediaErrors.Expired("TikTok supplied an already expired media URL"));
                             continue;
                         }
-                        probe = await Http.ProbeGetAsync(url, ctx, probeDeadline.Token).ConfigureAwait(false);
+                        (probe, start) = await Http.ProbeWithStartAsync(url, ctx, 16 * 1024, probeDeadline.Token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested && probeDeadline.IsCancellationRequested)
                     {
@@ -133,6 +135,18 @@ internal sealed class TikTokAdapter : AdapterBase
                         problems.Add(MediaErrors.Expired("TikTok redirected to an expired media URL"));
                         continue;
                     }
+                    if (Mp4HeaderFacts.DirectFileProblem(url, probe, start, out bool layoutUnverified) is { } problem)
+                    {
+                        problems.Add(problem);
+                        continue;
+                    }
+                    var facts = start is null ? null : Mp4HeaderFacts.Read(start);
+                    if (facts is { Encrypted: true })
+                    {
+                        problems.Add(MediaErrors.Drm("TikTok states that this MP4 has encrypted tracks"));
+                        continue;
+                    }
+                    if (facts is { HasVideo: false }) continue;
                     string? codec = bitrate.P("CodecType").Str() ?? video.P("codecType").Str();
                     string? normalized = codec?.StartsWith("h265", StringComparison.OrdinalIgnoreCase) == true
                         || codec?.StartsWith("bytevc1", StringComparison.OrdinalIgnoreCase) == true ? "h265"
@@ -140,11 +154,14 @@ internal sealed class TikTokAdapter : AdapterBase
                     reps.Add(new MediaRepresentation
                     {
                         Id = id, Url = url,
-                        Protocol = StreamProtocol.Http, Content = StreamContent.VideoAndAudio,
-                        AudioUnverified = true,
-                        Container = "mp4", VideoCodec = normalized, DeliveryId = url.GetLeftPart(UriPartial.Authority),
-                        Width = (address.P("Width") ?? address.P("width")).Int() ?? (bitrate is null ? video.P("width").Int() : null),
-                        Height = (address.P("Height") ?? address.P("height")).Int() ?? (bitrate is null ? video.P("height").Int() : null),
+                        Protocol = StreamProtocol.Http, Content = facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
+                        AudioUnverified = facts is null,
+                        Mp4LayoutUnverified = layoutUnverified,
+                        StandaloneVideo = facts is { HasVideo: true, HasAudio: false, CompleteFileCandidate: true } && !layoutUnverified,
+                        Container = "mp4", VideoCodec = facts?.VideoCodec ?? normalized, AudioCodec = facts?.AudioCodec,
+                        DeliveryId = url.GetLeftPart(UriPartial.Authority),
+                        Width = facts?.Width ?? (address.P("Width") ?? address.P("width")).Int() ?? (bitrate is null ? video.P("width").Int() : null),
+                        Height = facts?.Height ?? (address.P("Height") ?? address.P("height")).Int() ?? (bitrate is null ? video.P("height").Int() : null),
                         FrameRate = bitrate.P("BitrateFPS").Int(),
                         BitrateKbps = (bitrate.P("Bitrate").Int() ?? video.P("bitrate").Int()) is { } bps ? bps / 1000 : null,
                         FileSize = probe.ContentLength ?? address.P("DataSize").Long(), FileSizeIsEstimate = probe.ContentLength is null,
