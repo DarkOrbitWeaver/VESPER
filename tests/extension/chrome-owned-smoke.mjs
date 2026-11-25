@@ -20,6 +20,7 @@ const extension = join(root, 'extension');
 const chromeExe = process.env.CHROME_PATH;
 const nativeHostTest = process.env.VESPER_NATIVE_HOST_TEST === '1';
 const captureRaceTest = process.env.VESPER_CAPTURE_RACE_TEST === '1';
+const playerRaceTest = process.env.VESPER_PLAYER_RACE_TEST === '1';
 const nativeDownloadFolder = process.env.VESPER_TEST_DOWNLOAD_FOLDER
   ? resolve(process.env.VESPER_TEST_DOWNLOAD_FOLDER) : null;
 const nativeDataDirectory = process.env.VESPER_TEST_DATA_DIRECTORY
@@ -146,7 +147,7 @@ async function waitFor(fn, timeoutMs, reason) {
 }
 
 async function main() {
-  assert.ok(!(nativeHostTest && captureRaceTest), 'Run the simulated race and registered helper separately.');
+  assert.ok(!(nativeHostTest && (captureRaceTest || playerRaceTest)), 'Run the simulated race and registered helper separately.');
   if (nativeHostTest) {
     assert.equal(process.platform, 'win32', 'Native host acceptance requires Windows.');
     assert.ok(nativeDownloadFolder, 'VESPER_TEST_DOWNLOAD_FOLDER must point to the disposable output folder.');
@@ -233,6 +234,12 @@ async function main() {
     if (/^\/asset-(?:100001|200002)\/clip\.mp4\?session=fixture-(?:one|two)$/.test(request.url)) {
       response.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': mseClip.length, 'Cache-Control': 'no-store' });
       response.end(mseClip);
+      return;
+    }
+    if (playerRaceTest && request.url === '/recycled-player') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>Recycled player fixture</title><article id="card" data-permalink="/posts/first">'
+        + '<video width="640" height="360" src="/player.webm" muted controls preload="auto"></video></article>');
       return;
     }
     if (request.url === '/player') {
@@ -453,6 +460,8 @@ async function main() {
     }
 
 
+    await waitFor(() => evaluate('Wait for extension APIs', 'typeof chrome !== "undefined" && !!chrome.storage?.sync && typeof playerOptions === "function"'),
+      8000, 'The extension worker did not initialize its Chrome APIs.');
     const messagingHook = captureRaceTest ? '(' + installRaceBridge.toString() + ')();' : nativeHostTest
       ? "const sendNative = chrome.runtime.sendNativeMessage.bind(chrome.runtime);"
         + "const wrapped = (host, message, callback) => { __ownershipSmoke.nativeCalls++;"
@@ -789,6 +798,66 @@ async function main() {
       await waitFor(() => butterflyInside('main-media'), 5000, 'A reused player retained stale intent, case ' + variant);
       intentScenarios.at(-1).generationReset = true;
     }
+    let recycledPlayer = null;
+    if (playerRaceTest) {
+      await evaluate('Stub only the picker lookup and native enqueue', `(() => {
+        globalThis.__recycled = { lookedUp: [], submitted: [] };
+        playerOptions = async message => {
+          if (message.prefetch) return { ok: true, data: { prefetchSkipped: true } };
+          const token = crypto.randomUUID().replaceAll('-', '');
+          __recycled.lookedUp.push({ page: new URL(message.pageUrl).pathname, token });
+          return { ok: true, data: { mediaSession: token, title: 'Reused player',
+            choices: [{ index: 0, label: 'Original quality', detail: 'Fixture', container: 'WEBM' }] } };
+        };
+        const originalRequest = nativeRequest;
+        nativeRequest = async (...args) => {
+          if (args[0]?.type !== 'media-select') return originalRequest(...args);
+          __recycled.submitted.push(args[0].mediaSession);
+          return { ok: true, results: [{ status: 'queued' }] };
+        };
+        return true;
+      })()`);
+      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/recycled-player' }, tab);
+      await waitFor(() => flyShown(), 5000, 'Recycled player did not get a butterfly.');
+      async function clickWith(className, before = '') {
+        const target = await waitFor(async () => {
+          const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+          const nodes = [root];
+          for (const node of nodes) {
+            nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+            const classes = node.attributes?.[node.attributes.indexOf('class') + 1]?.split(' ') || [];
+            if (node.nodeName === 'BUTTON' && classes.includes(className)) return node;
+          }
+        }, 5000, 'Could not find fixture button: ' + className);
+        const { object } = await browser.send('DOM.resolveNode', { nodeId: target.nodeId }, tab);
+        const result = await browser.send('Runtime.callFunctionOn', {
+          objectId: object.objectId, functionDeclaration: `function () { ${before}; this.click(); }`, userGesture: true
+        }, tab);
+        assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
+      }
+      const identity = () => browser.send('Runtime.evaluate', {
+        expression: '[location.href, document.querySelector("video").currentSrc]', returnByValue: true
+      }, tab).then(reply => reply.result.value);
+      const beforeRecycle = await identity();
+      assert.ok(beforeRecycle[1].endsWith('/player.webm'));
+      await clickWith('fly');
+      await clickWith('primary', "this.ownerDocument.getElementById('card').dataset.permalink = '/posts/second'");
+      await delay(250);
+      assert.deepEqual(await identity(), beforeRecycle);
+      const stale = await evaluate('Check stale submission', '__recycled');
+      assert.equal(stale.lookedUp[0]?.page, '/posts/first');
+      assert.equal(stale.submitted.length, 0);
+      await waitFor(() => flyShown(), 5000, 'Butterfly did not recover after the post changed.');
+      await clickWith('fly');
+      await clickWith('primary');
+      const fresh = await waitFor(async () => {
+        const status = await evaluate('Read positive control', '__recycled');
+        return status.submitted.length ? status : null;
+      }, 5000, 'The current picker could not submit.');
+      assert.equal(fresh.lookedUp[1]?.page, '/posts/second');
+      assert.deepEqual(fresh.submitted, [fresh.lookedUp[1].token]);
+      recycledPlayer = { unchangedDocumentUrl: true, unchangedCurrentSrc: true, staleSubmissions: 0, currentSubmissions: 1 };
+    }
     const finalObservations = await evaluate('Read final Chrome events', 'globalThis.__ownershipSmoke');
     process.stdout.write(JSON.stringify({
       ok: true,
@@ -802,7 +871,7 @@ async function main() {
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
-      nativeCapture, captureRace, managedDownloads
+      nativeCapture, captureRace, managedDownloads, recycledPlayer
     }) + '\n');
   }
   finally {

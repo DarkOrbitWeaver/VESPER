@@ -1118,7 +1118,8 @@ function observedBrowserBodyProof(state, message, sender, useSignIn = false) {
   const observed = state.sources.find(source => source.url === url.href
     && source.documentId === sender.documentId && (source.frameId ?? 0) === (sender.frameId ?? 0)
     && source.kind === 'direct' && !source.conflictingValidator
-    && (source.requestType === 'media' || ['xmlhttprequest','other'].includes(source.requestType) && source.wholeRepresentation)
+    && (source.wholeRepresentation && ['media', 'xmlhttprequest', 'other'].includes(source.requestType)
+      || source.requestType === 'media' && source.rangeResource === true)
     && source.seen >= Math.max(now - SOURCE_TTL, message.mediaChangedAt - 15000) && source.seen <= now + 1000);
   if (!observed) return null;
   const proof = { url: url.href, etag: observed.validator, length: observed.bytes, mime: observed.mime };
@@ -1167,13 +1168,19 @@ function lookupPlan({ scope, message, source, possibleSources, changedAt, adapte
     graph.observeRequest({ scope, url: item.url, kind: item.kind || 'unknown', playerKey, generation,
       at: Number.isFinite(item.seen) ? item.seen : 0 });
   const { candidates } = graph.associate({ scope, playerKey });
-  const ranked = VesperInference.rankSources(candidates);
+  // This short-lived graph has only player and request edges. Ranking cannot
+  // manufacture stronger provenance here; exact current evidence decides the
+  // lookup order, never permission to download or source identity on its own.
+  const decisive = candidates.filter(candidate => candidate.exactPlayerUrl
+    && candidate.currentGeneration && !candidate.fragmentOnly && !candidate.stale
+    && (candidate.expiresAt == null || candidate.expiresAt > Date.now())
+    && possibleSources.some(item => item.url === candidate.url)).length === 1;
   return VesperPlanner.createRun({
     intent: { explicit: true, scoped: true, wants: 'media' },
-    selection: { decisive: ranked.decisive, ambiguous: false },
+    selection: { decisive, ambiguous: false },
     sources: candidates.map(candidate => ({ key: candidate.url, kind: candidate.kind, provenance: candidate.provenance, verified: false })),
     capabilities: { adapter: true, generic: false },
-    experience: { adapterPromising: adapterPromising || !ranked.decisive && candidates.length > 1 }
+    experience: { adapterPromising: adapterPromising || !decisive && candidates.length > 1 }
   });
 }
 
@@ -1389,7 +1396,7 @@ async function playerOptions(message, sender) {
           // An exact observed player resource can be checked without the page
           // adapter. Do not retry policy/protection or uncertain identity failures.
           const exact = wholeRepresentation ? matching : matchedManifest;
-          if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-unavailable'].includes(reply.code)) {
+          if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
             const checked = explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
             if (checked.ok && checked.data?.choices?.length) return checked;
             if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;

@@ -4005,8 +4005,9 @@ test('exact current file can recover a refused page resolver without checking un
       const result=await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:url,
         generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
       const checks=app.sent.filter(m=>m.type==='media-source-options');
-      assert.equal(checks.length,code==='site-refused'?1:0);
-      if(code==='site-refused') {
+      const recoverable = ['site-refused', 'source-expired'].includes(code);
+      assert.equal(checks.length,recoverable?1:0);
+      if(recoverable) {
         assert.equal(checks[0].candidates[0].url,url);
         assert.equal(result.ok,true);
       } else assert.equal(result.code,code);

@@ -94,6 +94,7 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
     panel: { classList: { contains: () => true } },
     panelMedia: { player, generation: 0, src: player.src, pageUrl: page, documentIdentity: page },
     isCurrentRequest: n => n === context.panelRequest && !!context.panelMedia,
+    pickerPlayerState: el => ({ current: el.src }),
     closePanel: () => { context.panelMedia = null; context.panelRequest++; context.closed++; },
     loadFormats: refresh => { assert.equal(refresh, true); context.reloaded++; },
     closed: 0, reloaded: 0
@@ -276,7 +277,7 @@ test('collection controls render an icon and a hidden status and forward the res
   const window = new EventTarget();
   const location = { href: 'https://www.youtube.com/', hostname: 'www.youtube.com', origin: 'https://www.youtube.com' };
   const context = vm.createContext({
-    window, document, location, AbortController, URL, Event,
+    window, document, location, AbortController, URL, Event, Element: class {},
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} disconnect() {} },
     VesperTheme: { available: () => true, watchPreference: () => () => {} },
@@ -286,7 +287,9 @@ test('collection controls render an icon and a hidden status and forward the res
   });
   vm.runInContext(source('player-source'), context);
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.testControls = (formats, selected = location.href, documentPage = location.href) => {
-    panelMedia = { pageUrl: selected, documentPage, documentIdentity: VesperPlayerSource.identity(pageAddress()) };
+    const player = { isConnected: true, querySelectorAll: () => [], dispatchEvent() {}, getAttribute() { return null; } };
+    panelMedia = { pageUrl: selected, documentPage, documentIdentity: VesperPlayerSource.identity(pageAddress()), player, playerState: pickerPlayerState(player) };
+    closePanel = () => { panelMedia = null; };
     place = () => {};
     return collectionPickerControls('Example', panelRequest, formats);
   };

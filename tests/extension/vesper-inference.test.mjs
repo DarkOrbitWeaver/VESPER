@@ -159,3 +159,19 @@ test('fallback models and timing alone cannot authorize a decisive association',
   assert.equal(missing.rankPlayers([player('x')]).decisive, false);
   assert.equal(I.rankSources([{ id: 'x', playerBound: true, currentGeneration: true }]).reason, 'unproven-association');
 });
+
+test('a unique explicit interaction resolves a narrow ranking margin without overriding vetoes', () => {
+  const feed = { area:230400, visibleFraction:1, centerDistance:0, playing:true, ready:true, progressed:true,
+    controls:false, muted:false, incidentalLoop:false, incumbent:true, duration:40, adContext:false };
+  const chosen = {...feed, id:'chosen', area:92160, visibleFraction:0.4, centerDistance:0.6,
+    progressed:false, incumbent:false, interacted:true};
+  const result = I.rankPlayers([{...feed,id:'big',interacted:false}, chosen]);
+  assert.equal(result.selected,'chosen');
+  assert.equal(result.reason,'explicit-interaction');
+  assert.equal(result.decisive,true);
+  const both=I.rankPlayers([{...feed,id:'big',interacted:true},chosen]);
+  assert.notEqual(both.reason,'explicit-interaction');
+  const duplicate=I.rankPlayers([chosen,chosen]);
+  assert.equal(duplicate.decisive,false);
+  assert.equal(duplicate.reason,'duplicate-identity');
+});

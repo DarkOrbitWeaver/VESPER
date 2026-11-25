@@ -183,13 +183,35 @@
       || [...player.querySelectorAll(':scope > source[src]')].some(child => VesperPlayerSource.http(child.src)?.href === selected));
   }
 
+  // Revalidate live identity before acting on a cached picker. Media events
+  // and mutation observers may not yet have observed a recycled feed card.
+  function pickerPlayerState(player) {
+    return {
+      identity: VesperPlayerSource.identity(pageForPlayer(player)),
+      current: playerSource(player),
+      srcObject: player.srcObject || null,
+      assigned: player.src || '',
+      alternatives: [...player.querySelectorAll(':scope > source[src]')].slice(0, 12).map(el => el.src)
+    };
+  }
+
+  function matchesPickerPlayer(media) {
+    const { player, playerState: before } = media;
+    if (!player?.isConnected || !before || player.mediaKeys || protectedVideos.has(player)) return false;
+    const now = pickerPlayerState(player);
+    return before.identity === now.identity && before.current === now.current
+      && before.srcObject === now.srcObject && before.assigned === now.assigned
+      && before.alternatives.length === now.alternatives.length
+      && before.alternatives.every((src, i) => src === now.alternatives[i]);
+  }
+
   function isCurrentRequest(request) {
     if (!alive() || request !== panelRequest || !panelMedia) return false;
     const pageMatches = panelMedia.documentIdentity === VesperPlayerSource.identity(pageAddress());
     const previewMatches = !activePreview || activePreview.key === panelMedia.targetKey;
     const binding = panelMedia.player && playback.get(panelMedia.player);
     const sourceMatches = !panelMedia.generation || binding?.generation === panelMedia.generation;
-    if (pageMatches && previewMatches && sourceMatches) return true;
+    if (pageMatches && previewMatches && sourceMatches && matchesPickerPlayer(panelMedia)) return true;
     retainedPickerDraft = null;
     closePanel();
     return false;
@@ -627,6 +649,7 @@
           // event is not a replacement of an already bound media source.
           const request = ++panelRequest;
           panelMedia = { ...panelMedia, pageUrl: page, src, formatSrc: src, generation: binding.generation,
+            playerState: pickerPlayerState(el),
             targetKey: activePreview?.player === el ? activePreview.key
               : `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}` };
           Promise.resolve().then(() => {
@@ -1545,17 +1568,19 @@
     if (retainedPickerDraft && !savedDraft) retainedPickerDraft = null;
     refresh = refresh || savedDraft;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), documentPage: pageAddress(), targetKey,
-      player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player), generation: current ? binding.generation : 0 };
+      player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player), playerState: pickerPlayerState(player), generation: current ? binding.generation : 0 };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
     companion.setPickerOpen(true, false, true);
     updateFlyVisibility();
     const isPreview = !!preview;
     const fallbackTitle = nativeAudioPlayer(player) ? 'This audio' : 'This video';
-    const title = current && !isPreview ? document.title.replace(/\s+- YouTube$/, '') || fallbackTitle : fallbackTitle;
+    const onPlayerPage = current && !isPreview && identity === panelMedia.documentIdentity;
+    const title = (onPlayerPage && document.title.replace(/\s+- YouTube$/, ''))
+      || (current && player.getAttribute?.('aria-label')?.trim().slice(0, 300)) || fallbackTitle;
     // A feed's page-wide Open Graph image often belongs to the site rather than this player.
     const playerPageIsSpecific = identity && !/^https?:/.test(identity);
-    const poster = current ? player.poster || (!isPreview && playerPageIsSpecific && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
+    const poster = current ? player.poster || (onPlayerPage && playerPageIsSpecific && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
     const duration = current && Number.isFinite(player.duration) ? player.duration : null;
     const playerFacts = current ? {} : null;
     if (playerFacts) {
@@ -1673,7 +1698,7 @@
           pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
           generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
         if (!reply?.ok || controller.signal.aborted || playback.get(player) !== binding
-            || playerSource(player) !== src || player.mediaKeys || protectedVideos.has(player))
+            || !matchesPickerPlayer(copy.panelMedia))
           throw new Error('No verified browser file is available.');
         mediaProof = reply.data;
       }

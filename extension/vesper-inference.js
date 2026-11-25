@@ -57,7 +57,9 @@ globalThis.VesperInference = (() => {
         if (best.facts.interaction !== 1 && rows.some(row => row !== best && row.facts.interaction === 1))
           return 'conflicting-interaction';
         return null;
-      }
+      },
+      // A unique explicit gesture can resolve a narrow ranking margin, but never a veto.
+      explicit: (best, rows) => best.facts.interaction === 1 && rows.filter(row => row.facts.interaction === 1).length === 1
     }),
     'vesper.source-association/1': Object.freeze({
       features: Object.freeze(['exactPlayerUrl', 'playerBound', 'currentGeneration', 'manifestParent',
@@ -192,9 +194,9 @@ globalThis.VesperInference = (() => {
       const margin = second ? best.score - second.score : Infinity;
       const robust = scored.slice(1).every(row => best.score + best.downside >= row.score + row.upside);
       const veto = truncated ? 'candidate-limit' : duplicate ? 'duplicate-identity' : schema.veto(best, scored);
-      const reason = veto || (!robust ? 'missing-evidence'
+      const reason = veto || (schema.explicit?.(best, scored) ? 'explicit-interaction' : !robust ? 'missing-evidence'
         : margin < model.margin || confidence < model.minConfidence ? 'competing-candidates' : 'leading-evidence');
-      const decisive = reason === 'leading-evidence';
+      const decisive = reason === 'leading-evidence' || reason === 'explicit-interaction';
       const conflicts = second && margin < model.margin
         ? Object.keys(best.terms).filter(name => (second.terms[name] ?? 0) > best.terms[name]) : [];
       return { ...base, selected: best.id, decisive, abstained: !decisive, confidence, margin: Number.isFinite(margin) ? margin : null,
