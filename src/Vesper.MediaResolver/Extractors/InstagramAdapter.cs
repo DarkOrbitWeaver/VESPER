@@ -58,7 +58,9 @@ internal sealed class InstagramAdapter : AdapterBase
             return Fail(MediaErrors.NoMedia("Instagram returned a non-text page without a verified media URL. Open the post in Chrome and use the VESPER picker.", true));
 
         request.PageResponse = page;
-        EmbeddedPageMedia? embedded = ExtractEmbeddedMedia(page.Content, target, Options.MaxCandidatesPerPage);
+        EmbeddedPageMedia? embedded = ExtractEmbeddedMedia(page.Content, target, Options.MaxCandidatesPerPage, out bool ambiguous);
+        if (ambiguous)
+            return Fail(MediaErrors.BrowserContext("Instagram exposed competing media without a verified match for the requested post. Select the intended player in Chrome."));
         if (embedded is { IsCarousel: true })
             return await ResolveCarouselAsync(request, target, page, embedded, ct).ConfigureAwait(false);
 
@@ -156,15 +158,21 @@ internal sealed class InstagramAdapter : AdapterBase
         return MediaDiscoveryResult.FromItem(first, warnings);
     }
 
-    private static EmbeddedPageMedia? ExtractEmbeddedMedia(string html, InstagramTarget target, int maxCandidates)
+    private static EmbeddedPageMedia? ExtractEmbeddedMedia(string html, InstagramTarget target, int maxCandidates, out bool ambiguous)
     {
+        ambiguous = false;
         maxCandidates = Math.Max(1, maxCandidates);
         int scripts = 0;
         EmbeddedPageMedia? unlabelled = null;
+        bool competing = false;
         foreach (HtmlTag tag in HtmlScanner.Scan(html))
         {
             if (tag.Name != "script" || tag.Attr("data-sjs") is null) continue;
-            if (++scripts > MaxSjsScripts) break;
+            if (++scripts > MaxSjsScripts)
+            {
+                if (unlabelled is not null) competing = true;
+                break;
+            }
             if (tag.Body is not { Length: > 0 and <= MaxEmbeddedJsonChars } body) continue;
             using JsonDocument? document = JsonExt.TryParse(body);
             if (document is null) continue;
@@ -174,7 +182,11 @@ internal sealed class InstagramAdapter : AdapterBase
                 string? code = target.Shortcode is null ? null : media.P("code").Str() ?? media.P("shortcode").Str();
                 bool hasShortcode = !string.IsNullOrWhiteSpace(code);
                 if (hasShortcode && !string.Equals(code, target.Shortcode, StringComparison.Ordinal))
+                {
+                    if (HasVideoSource(media) || media.P("carousel_media") is { ValueKind: JsonValueKind.Array })
+                        competing = true;
                     continue;
+                }
                 bool useImmediately = hasShortcode || target.Shortcode is null;
                 string? caption = media.P("caption").P("text").Str();
                 string? uploader = media.P("owner").P("username").Str() ?? media.P("user").P("username").Str();
@@ -205,7 +217,8 @@ internal sealed class InstagramAdapter : AdapterBase
                     {
                         var candidate = new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader);
                         if (useImmediately) return candidate;
-                        unlabelled ??= candidate;
+                        if (unlabelled is null) unlabelled = candidate;
+                        else if (!SameSources(unlabelled, candidate)) competing = true;
                         continue;
                     }
                 }
@@ -215,12 +228,21 @@ internal sealed class InstagramAdapter : AdapterBase
                 {
                     var candidate = new EmbeddedPageMedia([single], false, 1, false, caption, uploader);
                     if (useImmediately) return candidate;
-                    unlabelled ??= candidate;
+                    if (unlabelled is null) unlabelled = candidate;
+                    else if (!SameSources(unlabelled, candidate)) competing = true;
                 }
             }
         }
-        return unlabelled;
+        ambiguous = competing;
+        return competing ? null : unlabelled;
     }
+
+    private static bool SameSources(EmbeddedPageMedia first, EmbeddedPageMedia second) =>
+        first.IsCarousel == second.IsCarousel && first.SlideCount == second.SlideCount
+        && first.Videos.Count == second.Videos.Count
+        && first.Videos.Zip(second.Videos).All(pair => pair.First.Index == pair.Second.Index
+            && pair.First.Candidates.Select(c => c.Url.AbsoluteUri).ToHashSet(StringComparer.Ordinal)
+                .SetEquals(pair.Second.Candidates.Select(c => c.Url.AbsoluteUri)));
 
     private static bool HasVideoSource(JsonElement media) =>
         media.P("video_versions") is { ValueKind: JsonValueKind.Array }

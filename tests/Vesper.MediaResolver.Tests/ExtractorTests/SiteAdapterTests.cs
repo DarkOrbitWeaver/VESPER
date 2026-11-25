@@ -141,6 +141,36 @@ public class SiteAdapterTests
         Assert.DoesNotContain(h.Requests, request => request.Url.AbsoluteUri == unrelated || request.Url.AbsoluteUri == unlabelled);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task Instagram_RefusesCompetingMediaWithoutARequestedShortcode(bool labelled, bool duplicate)
+    {
+        const string first = "https://scontent.cdninstagram.com/unlabelled-one.mp4";
+        const string second = "https://scontent.cdninstagram.com/unlabelled-two.mp4";
+        string Script(string url, string? code) => "<script data-sjs>"
+            + JsonSerializer.Serialize(new { if_not_gated_logged_out = new { code, video_url = url } })
+            + "</script>";
+        string page = Script(first, null) + Script(duplicate ? first : second, labelled ? "OtherReel" : null);
+        var h = new FakeHttpHandler().Add(InstagramPage, page)
+            .AddMedia(first, "video/mp4", 1000)
+            .AddMedia(second, "video/mp4", 1000);
+
+        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+
+        if (duplicate)
+        {
+            Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+            Assert.Equal(first, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        }
+        else
+        {
+            Assert.Equal(MediaErrorCode.BrowserContextRequired, result.Error!.Code);
+            Assert.Single(h.Requests);
+        }
+    }
+
     [Fact]
     public async Task Instagram_LoginRedirectIsExplainedWithoutTryingPrivateEndpoints()
     {
