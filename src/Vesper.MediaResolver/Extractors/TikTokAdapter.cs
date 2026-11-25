@@ -151,6 +151,15 @@ internal sealed class TikTokAdapter : AdapterBase
                         problems.Add(MediaErrors.Drm("TikTok states that this MP4 has encrypted tracks"));
                         continue;
                     }
+                    // A matching representation's declared size is corroboration, not proof.
+                    // Do not reject a structurally verified file because a site estimate is stale.
+                    long? declaredSize = address.P("DataSize").Long();
+                    if ((facts is null || layoutUnverified) && declaredSize is > 0
+                        && probe.ContentLength is > 0 && probe.ContentLength.Value < declaredSize.Value / 2)
+                    {
+                        problems.Add(MediaErrors.NoMedia("TikTok returned substantially fewer bytes than the advertised representation.", true));
+                        continue;
+                    }
                     if (facts is { HasVideo: false }) continue;
                     string? codec = bitrate.P("CodecType").Str() ?? video.P("codecType").Str();
                     string? normalized = codec?.StartsWith("h265", StringComparison.OrdinalIgnoreCase) == true
@@ -169,7 +178,7 @@ internal sealed class TikTokAdapter : AdapterBase
                         Height = facts?.Height ?? (address.P("Height") ?? address.P("height")).Int() ?? (bitrate is null ? video.P("height").Int() : null),
                         FrameRate = bitrate.P("BitrateFPS").Int(),
                         BitrateKbps = (bitrate.P("Bitrate").Int() ?? video.P("bitrate").Int()) is { } bps ? bps / 1000 : null,
-                        FileSize = probe.ContentLength ?? address.P("DataSize").Long(), FileSizeIsEstimate = probe.ContentLength is null,
+                        FileSize = probe.ContentLength ?? declaredSize, FileSizeIsEstimate = probe.ContentLength is null,
                         ExpiresAt = expiry, Context = ctx
                     });
                     break; // These addresses are mirrors of the same advertised representation, not qualities.
