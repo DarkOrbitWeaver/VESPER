@@ -37,6 +37,17 @@ public class FormatSelectorTests
     }
 
     [Fact]
+    public void SameQualityPrefersConfirmedLayoutWithoutOverridingExplicitResolution()
+    {
+        var unknown = T.Video("unverified", 1080, kbps: 6000) with { Mp4LayoutVerified = false };
+        var verified = T.Video("verified", 1080, kbps: 4000) with { Mp4LayoutVerified = true };
+        var lower = T.Video("lower", 720, kbps: 2000) with { Mp4LayoutVerified = true };
+        Assert.Equal("verified", Pick(T.Item(unknown, verified), FormatPreferences.BestQuality).Video!.Id);
+        Assert.Equal("unverified", Pick(T.Item(unknown, lower), FormatPreferences.Height(1080)).Video!.Id);
+        Assert.Contains("file layout not confirmed", Pick(T.Item(unknown), FormatPreferences.BestQuality).Summary);
+    }
+
+    [Fact]
     public void Best_RespectsMaxHeightWithoutCallingItAFallback()
     {
         var s = Pick(Ladder(), new FormatPreferences { Mode = QualityMode.Best, MaxHeight = 1080 });

@@ -68,6 +68,8 @@ public static class FormatDeduplicator
 
     private static bool IsBetter(MediaRepresentation candidate, MediaRepresentation current)
     {
+        if (candidate.Mp4LayoutVerified == true && current.NeedsMp4Verification) return true;
+        if (current.Mp4LayoutVerified == true && candidate.NeedsMp4Verification) return false;
         int p = ((int)candidate.Protocol).CompareTo((int)current.Protocol);
         if (p != 0) return p < 0;
         int b = (candidate.BitrateKbps ?? 0).CompareTo(current.BitrateKbps ?? 0);

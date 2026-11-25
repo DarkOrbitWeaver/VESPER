@@ -293,7 +293,7 @@ internal sealed class CandidateProcessor
                 : facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
             // Without a readable track table, whether a video file has sound stays honestly unverified.
             AudioUnverified = !audio && facts is null,
-            Mp4LayoutUnverified = layoutUnverified,
+            Mp4LayoutVerified = container is "mp4" or "m4v" or "m4a" or "mov" ? facts is not null && !layoutUnverified : null,
             StandaloneVideo = facts is { HasVideo: true, HasAudio: false, CompleteFileCandidate: true },
             MutedLoop = !audio && c.MutedLoop,
             Container = container,

@@ -53,6 +53,8 @@ public static class FormatSelector
         public int Kbps => (V.BitrateKbps ?? 0) + (A?.BitrateKbps ?? 0);
         public long? Size => V.FileSize is { } s && (A is null || A.FileSize is not null) ? s + (A?.FileSize ?? 0) : null;
         public bool IsEstimate => V.FileSizeIsEstimate || (A?.FileSizeIsEstimate ?? false);
+        public bool LayoutUnconfirmed => V.NeedsMp4Verification || A?.NeedsMp4Verification == true;
+        public bool LayoutConfirmed => V.Mp4LayoutVerified == true && !LayoutUnconfirmed;
     }
 
     private static SelectionResult SelectVideo(MediaItem item, List<MediaRepresentation> reps, List<MediaRepresentation> audios, FormatPreferences p)
@@ -212,6 +214,7 @@ public static class FormatSelector
             .ThenBy(c => CodecIndex(p.VideoCodecs, c.VCodec))
             .ThenBy(c => p.TargetFrameRate is { } tf ? Math.Abs((c.Fps ?? 0) - tf) : -(c.Fps ?? 0))
             .ThenBy(c => p.Hdr is HdrPreference.PreferHdr or HdrPreference.HdrOnly ? (c.V.Hdr == HdrKind.Sdr ? 1 : 0) : (c.V.Hdr == HdrKind.Sdr ? 0 : 1))
+            .ThenByDescending(c => c.LayoutConfirmed)
             .ThenBy(c => preferLowBitrate ? c.Kbps : -c.Kbps)
             .ThenByDescending(c => CodecInfo.CompatibilityRank(c.VCodec))
             .ThenBy(c => c.A is null ? 0 : 1)
@@ -238,7 +241,7 @@ public static class FormatSelector
         string audioNote = c.A is not null ? "+ separate audio (merge required)"
             : c.V.AudioUnverified ? "· audio not confirmed"
             : c.HasAudio ? "with audio" : c.V.StandaloneVideo ? "· no audio" : "VIDEO ONLY (no audio stream available)";
-        string verificationNote = c.V.Mp4LayoutUnverified || c.A?.Mp4LayoutUnverified == true ? " · file layout not confirmed" : "";
+        string verificationNote = c.LayoutUnconfirmed ? " · file layout not confirmed" : "";
         return new FormatSelection
         {
             Video = c.V,

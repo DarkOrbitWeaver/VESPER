@@ -161,7 +161,7 @@ internal sealed class TikTokAdapter : AdapterBase
                         Id = id, Url = url,
                         Protocol = StreamProtocol.Http, Content = facts is { HasAudio: false } ? StreamContent.VideoOnly : StreamContent.VideoAndAudio,
                         AudioUnverified = facts is null,
-                        Mp4LayoutUnverified = layoutUnverified,
+                        Mp4LayoutVerified = facts is not null && !layoutUnverified,
                         StandaloneVideo = facts is { HasVideo: true, HasAudio: false, CompleteFileCandidate: true } && !layoutUnverified,
                         Container = "mp4", VideoCodec = facts?.VideoCodec ?? normalized, AudioCodec = facts?.AudioCodec,
                         DeliveryId = url.GetLeftPart(UriPartial.Authority),
