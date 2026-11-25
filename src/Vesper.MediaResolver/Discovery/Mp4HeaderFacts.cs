@@ -11,7 +11,7 @@ namespace Vesper.MediaResolver.Discovery;
 /// Facts from an MP4's bounded track table, at the start or a verified top-level tail boundary.
 /// </summary>
 internal sealed record DirectMediaFacts(bool HasVideo, bool HasAudio, int? Width, int? Height,
-    string? VideoCodec, string? AudioCodec, double? DurationSeconds, bool Encrypted, bool CompleteFileCandidate = true);
+    string? VideoCodec, string? AudioCodec, double? DurationSeconds, bool Encrypted, bool CompleteFileCandidate = true, long? MaxChunkOffset = null);
 
 internal static class Mp4HeaderFacts
 {
@@ -91,6 +91,7 @@ internal static class Mp4HeaderFacts
         int? width = null, height = null;
         string? videoCodec = null, audioCodec = null;
         double? duration = null;
+        long? maxChunk = null;
 
         ReadOnlySpan<byte> rest = moov;
         while (!rest.IsEmpty)
@@ -115,9 +116,10 @@ internal static class Mp4HeaderFacts
             else if (type == "mvex") fragmented = true;
             else if (type == "trak")
             {
-                if (!ReadTrack(body, out string? handler, out string? format, out int? w, out int? h, out bool protectedTrack))
+                if (!ReadTrack(body, out string? handler, out string? format, out int? w, out int? h, out bool protectedTrack, out long? trackChunk))
                     return null;
                 encrypted |= protectedTrack;
+                if (trackChunk is long chunk && (maxChunk is null || chunk > maxChunk)) maxChunk = chunk;
                 if (handler == "vide" && !video)
                 {
                     video = true;
@@ -134,15 +136,16 @@ internal static class Mp4HeaderFacts
             rest = rest[size..];
         }
         if (duration is > 31_536_000) duration = null;
-        return video || audio ? new(video, audio, width, height, videoCodec, audioCodec, duration, encrypted, CompleteFileCandidate: !fragmented) : null;
+        return video || audio ? new(video, audio, width, height, videoCodec, audioCodec, duration, encrypted, CompleteFileCandidate: !fragmented, MaxChunkOffset: maxChunk) : null;
     }
 
     private static bool ReadTrack(ReadOnlySpan<byte> trak, out string? handler, out string? format,
-        out int? width, out int? height, out bool encrypted)
+        out int? width, out int? height, out bool encrypted, out long? maxChunkOffset)
     {
         handler = format = null;
         width = height = null;
         encrypted = false;
+        maxChunkOffset = null;
         if (TryFind(trak, "tkhd", out ReadOnlySpan<byte> tkhd) && tkhd.Length >= 8)
         {
             // Width and height close the box as 16.16 fixed-point numbers.
@@ -168,7 +171,36 @@ internal static class Mp4HeaderFacts
             encrypted |= entry is "encv" or "enca";
             descriptions = descriptions[size..];
         }
+        maxChunkOffset = MaxChunkOffset(stbl);
         return true;
+    }
+
+    // Chunk offsets are absolute file positions. An offset at or beyond the
+    // declared resource end is positive evidence that this is not a whole file.
+    internal static bool SamplesOutsideExtent(DirectMediaFacts? facts, long? extent) =>
+        facts is { MaxChunkOffset: long offset } && extent is long length && offset >= length;
+
+    private static long? MaxChunkOffset(ReadOnlySpan<byte> stbl)
+    {
+        bool wide = false;
+        if (!TryFind(stbl, "stco", out var table))
+        {
+            if (!TryFind(stbl, "co64", out table)) return null;
+            wide = true;
+        }
+        if (table.Length < 8) return null;
+        uint count = BinaryPrimitives.ReadUInt32BigEndian(table[4..]);
+        int width = wide ? 8 : 4;
+        if (count == 0 || count > (table.Length - 8) / width) return null;
+        long max = 0;
+        for (int i = 0; i < (int)count; i++)
+        {
+            var entry = table[(8 + i * width)..];
+            long offset = wide ? (long)Math.Min(BinaryPrimitives.ReadUInt64BigEndian(entry), (ulong)long.MaxValue)
+                : BinaryPrimitives.ReadUInt32BigEndian(entry);
+            max = Math.Max(max, offset);
+        }
+        return max;
     }
 
     private static bool TryFind(ReadOnlySpan<byte> boxes, string wanted, out ReadOnlySpan<byte> body)

@@ -159,6 +159,8 @@ internal sealed class CandidateProcessor
                 if (Mp4HeaderFacts.DirectFileProblem(c.Url, probe, start, out layoutUnverified) is { } problem)
                     return new(null, null, problem);
                 if (start is not null) facts = await ReadMp4FactsAsync(c.Url, ctx, probe, start, headerToken, ct).ConfigureAwait(false);
+                if (Mp4HeaderFacts.SamplesOutsideExtent(facts, probe.ContentLength))
+                    return new(null, null, MediaErrors.NoMedia("MP4 sample offsets refer to bytes outside the resource.", true));
 
             }
             else if (start is not null && (CodecInfo.ContainerFromMime(ctype) ?? ExtensionOf(probe, c)) == "webm")

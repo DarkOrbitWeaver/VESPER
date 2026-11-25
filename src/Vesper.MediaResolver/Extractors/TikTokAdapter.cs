@@ -141,6 +141,11 @@ internal sealed class TikTokAdapter : AdapterBase
                         continue;
                     }
                     var facts = start is null ? null : Mp4HeaderFacts.Read(start);
+                    if (Mp4HeaderFacts.SamplesOutsideExtent(facts, probe.ContentLength))
+                    {
+                        problems.Add(MediaErrors.NoMedia("TikTok returned a byte slice rather than the complete MP4.", true));
+                        continue;
+                    }
                     if (facts is { Encrypted: true })
                     {
                         problems.Add(MediaErrors.Drm("TikTok states that this MP4 has encrypted tracks"));

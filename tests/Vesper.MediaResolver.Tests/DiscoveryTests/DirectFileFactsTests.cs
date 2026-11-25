@@ -234,6 +234,29 @@ public sealed class DirectFileFactsTests
         Assert.False(result.IsSuccess);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ChunkOffsetsMustPointInsideTheWholeResource(bool wide, bool outside)
+    {
+        byte[] entries = new byte[8 + (wide ? 8 : 4)];
+        BinaryPrimitives.WriteUInt32BigEndian(entries.AsSpan(4), 1);
+        byte[] Make(uint offset)
+        {
+            if (wide) BinaryPrimitives.WriteUInt64BigEndian(entries.AsSpan(8), offset);
+            else BinaryPrimitives.WriteUInt32BigEndian(entries.AsSpan(8), offset);
+            return [.. Box("ftyp", Encoding.ASCII.GetBytes("isom")),
+                .. Box("moov", Track("vide", "avc1", 1024, 576, Box(wide ? "co64" : "stco", entries))),
+                .. Box("mdat", new byte[64])];
+        }
+        byte[] file = Make(0);
+        file = Make(outside ? 0x6000u : (uint)(file.Length - 64));
+        var result = await ResolveResultAsync(new FakeHttpHandler().AddBinary(VideoUrl, file), VideoUrl);
+        Assert.Equal(!outside, result.IsSuccess);
+    }
+
     private static string InitSegment(params (string Handler, string Format, uint Width, uint Height)[] tracks)
     {
         byte[] mvhd = new byte[100];
@@ -246,7 +269,7 @@ public sealed class DirectFileFactsTests
         return Encoding.ASCII.GetString(file);
     }
 
-    private static byte[] Track(string handler, string format, uint width, uint height)
+    private static byte[] Track(string handler, string format, uint width, uint height, byte[]? chunks = null)
     {
         byte[] tkhd = new byte[84];
         BinaryPrimitives.WriteUInt32BigEndian(tkhd.AsSpan(76), width << 16);
@@ -258,7 +281,7 @@ public sealed class DirectFileFactsTests
         BinaryPrimitives.WriteUInt32BigEndian(stsd.AsSpan(8), 86);
         Encoding.ASCII.GetBytes(format).CopyTo(stsd, 12);
         return Box("trak", Box("tkhd", tkhd), Box("mdia", Box("hdlr", hdlr), Box("free", new byte[92]),
-            Box("minf", Box("stbl", Box("stsd", stsd)))));
+            Box("minf", Box("stbl", Box("stsd", stsd), chunks ?? []))));
     }
 
     private static byte[] Box(string type, params byte[][] body)

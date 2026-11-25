@@ -8,7 +8,7 @@ namespace Vesper.MediaResolver.Tests.TestSupport;
 public sealed class FakeHttpHandler : HttpMessageHandler
 {
     public sealed record Route(int Status, string Body, string ContentType, IReadOnlyDictionary<string, string>? Headers = null,
-        string? Redirect = null, IReadOnlyDictionary<string, string>? ContentHeaders = null, bool IgnoreRange = false);
+        string? Redirect = null, IReadOnlyDictionary<string, string>? ContentHeaders = null, bool IgnoreRange = false, byte[]? Binary = null);
 
     public sealed record Recorded(HttpMethod Method, Uri Url, IReadOnlyDictionary<string, string> Headers, string? Body);
 
@@ -24,6 +24,12 @@ public sealed class FakeHttpHandler : HttpMessageHandler
         Dictionary<string, string>? headers = null, Dictionary<string, string>? contentHeaders = null, bool ignoreRange = false)
     {
         _routes[new Uri(url).AbsoluteUri] = new Route(status, body, contentType, headers, ContentHeaders: contentHeaders, IgnoreRange: ignoreRange);
+        return this;
+    }
+
+    public FakeHttpHandler AddBinary(string url, byte[] body, string contentType = "video/mp4")
+    {
+        _routes[new Uri(url).AbsoluteUri] = new Route(200, "", contentType, Binary: body.ToArray());
         return this;
     }
 
@@ -63,7 +69,7 @@ public sealed class FakeHttpHandler : HttpMessageHandler
             return resp;
         }
 
-        byte[] bytes = Encoding.UTF8.GetBytes(r.Body);
+        byte[] bytes = r.Binary ?? Encoding.UTF8.GetBytes(r.Body);
         if (request.Method == HttpMethod.Head)
         {
             resp.Content = new ByteArrayContent([]);
