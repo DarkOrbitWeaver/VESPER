@@ -79,6 +79,7 @@ internal sealed class InstallPayload(Stream archive, PayloadManifest manifest)
             }
             if (remaining != 0 || !Convert.ToHexString(hash.GetHashAndReset()).Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"The package failed verification for {file.Path}.");
+            output.Flush(flushToDisk: true);
             verified += file.Size;
             if (verified == total || Stopwatch.GetElapsedTime(lastUpdate).TotalMilliseconds >= 50)
             {

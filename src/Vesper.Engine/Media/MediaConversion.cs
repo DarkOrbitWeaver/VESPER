@@ -77,9 +77,15 @@ public sealed partial class DownloadEngine
                 return (file, notice);
 
             using var source = PartialFile.OpenOwnedRead(job);
-            List<DemuxedTrack> tracks;
+            List<DemuxedTrack> tracks = [];
+            RawAudioTimeline? rawAudio = null;
             using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Probe, source.Length))
-                tracks = MediaMerger.Demux(source, source.Length, ct);
+            {
+                if (job.Output == MediaOutput.Wav && job.Kind == JobKind.Http && RawAudioTimeline.IsRawFile(job.FileName))
+                    rawAudio = RawAudioTimeline.Read(source, job.FileName, ct);
+                else
+                    tracks = MediaMerger.Demux(source, source.Length, ct);
+            }
             DemuxedTrack? audio = tracks.Find(t => t.Kind == TrackKind.Audio);
             DemuxedTrack? video = tracks.Find(t => t.Kind == TrackKind.Video);
             bool wantVideo = job.Output == MediaOutput.Mp4;
@@ -88,13 +94,16 @@ public sealed partial class DownloadEngine
                 : job.Output == MediaOutput.Mp3
                     ? tracks.Count == (video is null ? 1 : 2)
                     : tracks.Count == 1 && video is null;
-            if (!tracksMatch || audio is null)
+            if (rawAudio is null && (!tracksMatch || audio is null))
                 return (file, notice);
+            int audioChannels = rawAudio?.Channels ?? audio!.Channels;
+            int audioRate = rawAudio?.SampleRate ?? audio!.SampleRate;
+            double audioDuration = rawAudio?.DurationSeconds ?? audio!.DurationSeconds;
 
             if (audioClip is not null)
                 Mp4Clip.Apply(tracks, audioClip, ct);
 
-            file = await TryReusePreparedConversionAsync(job, source, tracks, audio, video, stage, ct).ConfigureAwait(false);
+            file = await TryReusePreparedConversionAsync(job, source, tracks, audio, video, stage, ct, rawAudio).ConfigureAwait(false);
             if (file is not null)
             {
                 ready = true;
@@ -112,7 +121,7 @@ public sealed partial class DownloadEngine
                 using var opus = CreateOwnedStage(stage, FileShare.None, out stageIdentity);
                 string hash;
                 using (ProcessingTiming.Measure(job.Id, ProcessingPhase.Remux, source.Length))
-                    hash = await OpusMuxer.WriteAsync(audio, source, opus, tags, cover, ct).ConfigureAwait(false);
+                    hash = await OpusMuxer.WriteAsync(audio!, source, opus, tags, cover, ct).ConfigureAwait(false);
                 using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush)) opus.Flush(flushToDisk: true);
                 file = new PreparedMediaFile(opus.Length, hash, stage, Path.ChangeExtension(job.FileName, ".opus"),
                     stageIdentity ?? throw new IOException("The Opus stage has no saved identity."));
@@ -171,7 +180,7 @@ public sealed partial class DownloadEngine
                     {
                         remuxDigest = MediaMerger.ValidateRemuxAndHash(verifiedFile, length, remuxInputs, ct,
                             out var verified, merged.Metadata, merged.ThumbnailSha256);
-                        ValidateConvertedMp4(verifiedFile, tracks, audio, video, stageIdentity, ct, verified);
+                        ValidateConvertedMp4(verifiedFile, tracks, audio!, video, stageIdentity, ct, verified);
                     }
                     file = new PreparedMediaFile(length, remuxDigest, stage,
                         Path.ChangeExtension(job.FileName, OutputExtension(job.Output)), stageIdentity, verifiedFile);
@@ -184,12 +193,12 @@ public sealed partial class DownloadEngine
             }
             else
             {
-                if (!SupportsConversionAudioFormat(job.Output, audio.Channels, audio.SampleRate)
+                if (!SupportsConversionAudioFormat(job.Output, audioChannels, audioRate)
                     || video is { Width: < 16 or > 4096 } or { Height: < 16 or > 2304 } or { BitDepth: > 8 })
                     return (file, notice);
 
-                string extension = audio.SourceContainer == "webm" ? ".mkv" : ".mp4";
-                double totalSeconds = Math.Max(audio.DurationSeconds, video?.DurationSeconds ?? 0);
+                string extension = rawAudio?.Extension ?? (audio!.SourceContainer == "webm" ? ".mkv" : ".mp4");
+                double totalSeconds = Math.Max(audioDuration, video?.DurationSeconds ?? 0);
                 int lastPercent = -1;
                 Action<double> progress = seconds =>
                 {
@@ -237,8 +246,8 @@ public sealed partial class DownloadEngine
                 {
                     PathSafety.RequireTemporaryIdentity(decoded.SafeFileHandle, stageIdentity);
                     var info = WaveAudio.Read(decoded);
-                    if (info.Channels != audio.Channels || info.SampleRate != audio.SampleRate
-                        || Math.Abs(info.Duration - audio.DurationSeconds) > Math.Max(.25, audio.DurationSeconds * .01))
+                    if (info.Channels != audioChannels || info.SampleRate != audioRate
+                        || Math.Abs(info.Duration - audioDuration) > Math.Max(.25, audioDuration * .01))
                         throw new MediaContainerException("The decoded WAV differs from the source timeline.");
                     if (rewrite)
                     {
@@ -280,7 +289,7 @@ public sealed partial class DownloadEngine
                 using (var converted = new FileStream(stage, FileMode.Open, FileAccess.Read, FileShare.Read,
                     1 << 16, FileOptions.SequentialScan))
                 {
-                    ValidateConvertedMp4(converted, tracks, audio, video, stageIdentity, ct);
+                    ValidateConvertedMp4(converted, tracks, audio!, video, stageIdentity, ct);
                 }
 
                 // The converter only writes audio and video. Title, artist and cover go in now, before the file is hashed.
@@ -350,7 +359,8 @@ public sealed partial class DownloadEngine
     }
 
     private async Task<PreparedMediaFile?> TryReusePreparedConversionAsync(DownloadJob job, Stream source,
-        List<DemuxedTrack> tracks, DemuxedTrack audio, DemuxedTrack? video, string stage, CancellationToken ct)
+        List<DemuxedTrack> tracks, DemuxedTrack? audio, DemuxedTrack? video, string stage, CancellationToken ct,
+        RawAudioTimeline? rawAudio = null)
     {
         if (job.PendingConversionBytes is not long expectedBytes
             || job.PendingConversionDigest is not { Length: 64 } expectedDigest
@@ -372,14 +382,14 @@ public sealed partial class DownloadEngine
             {
                 WaveAudio.Info info = WaveAudio.Read(output);
                 MediaTimeRange? range = RequestedWaveRange(job);
-                double duration = range is null ? audio.DurationSeconds : range.EndSeconds - range.StartSeconds;
-                if (info.Channels != audio.Channels || info.SampleRate != audio.SampleRate
+                double duration = range is null ? rawAudio?.DurationSeconds ?? audio!.DurationSeconds : range.EndSeconds - range.StartSeconds;
+                if (info.Channels != (rawAudio?.Channels ?? audio!.Channels) || info.SampleRate != (rawAudio?.SampleRate ?? audio!.SampleRate)
                     || Math.Abs(info.Duration - duration) > Math.Max(.25, duration * .01))
                     return null;
             }
             else if (job.Output == MediaOutput.Opus)
             {
-                ValidatePreparedOpus(output, source, audio, ct);
+                ValidatePreparedOpus(output, source, audio!, ct);
             }
             else if (job.Output == MediaOutput.Mp3)
             {
@@ -387,7 +397,7 @@ public sealed partial class DownloadEngine
             }
             else
             {
-                ValidateConvertedMp4(output, tracks, audio, video, identity, ct);
+                ValidateConvertedMp4(output, tracks, audio!, video, identity, ct);
             }
 
             // The prepared record is written only after the stage was flushed.

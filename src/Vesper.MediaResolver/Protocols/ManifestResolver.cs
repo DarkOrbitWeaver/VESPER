@@ -23,7 +23,7 @@ public sealed class ManifestResolver
     public async Task<ManifestResult> ResolveAsync(Uri url, MediaRequestContext ctx, CancellationToken ct)
     {
         var r = (await _http.GetStringAsync(url, ctx, ct, _o.MaxManifestBytes,
-            "application/vnd.apple.mpegurl, application/x-mpegURL, application/dash+xml, */*").ConfigureAwait(false)).EnsureSuccess();
+            "application/vnd.apple.mpegurl, application/x-mpegURL, application/dash+xml, */*", allowBinaryManifest: true).ConfigureAwait(false)).EnsureSuccess();
         if (!r.IsText)
             throw new MediaResolverException(MediaErrors.UnsupportedManifest($"Manifest URL returned non-text content ({r.ContentType})"));
         return await ResolveTextAsync(r.Content, r.FinalUrl, ctx, ct).ConfigureAwait(false);
@@ -68,7 +68,7 @@ public sealed class ManifestResolver
         try
         {
             var variant = SelectProbeVariant(master);
-            var pr = (await _http.GetStringAsync(variant.Url, ctx, ct, _o.MaxManifestBytes).ConfigureAwait(false)).EnsureSuccess();
+            var pr = (await _http.GetStringAsync(variant.Url, ctx, ct, _o.MaxManifestBytes, allowBinaryManifest: true).ConfigureAwait(false)).EnsureSuccess();
             probe = HlsParser.Parse(pr.Content, pr.FinalUrl, _o.MaxSegmentsPerRepresentation * 2).Media;
             if (probe is not null)
             {

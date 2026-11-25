@@ -37,6 +37,7 @@ public sealed partial class DownloadEngine
 
     public async Task<CancelDownloadResult> CancelDownloadAsync(Guid id)
     {
+        using var operation = EnterOperation();
         bool cancelling = false;
         try
         {
@@ -350,7 +351,7 @@ public sealed partial class DownloadEngine
                 return false;
 
             RecoveryManifestBody? body = JsonSerializer.Deserialize<RecoveryManifestBody>(bodyJson);
-            if (body is null || body.V != 1 || body.JobId != job.Id || body.Kind != (int)job.Kind
+            if (body is null || body.V is not (1 or 2) || body.JobId != job.Id || body.Kind != (int)job.Kind
                 || body.Generation < 0 || body.Generation > job.Generation || body.Total is < 0
                 || body.FileName is not { Length: > 0 } || body.Url is not { Length: > 0 }
                 || !UrlPolicy.TryParse(body.Url, out _, out _) || body.Extents is null

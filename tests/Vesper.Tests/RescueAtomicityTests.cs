@@ -28,7 +28,7 @@ public sealed class RescueAtomicityTests
         h.Engine.Options.Schedule = ClosedWindow();
         restart = () => Assert.True(h.Engine.RestartFromScratch(id));
 
-        RescueResult result = await h.Engine.ReplaceLinkAsync(id, server.Url("/expires-after-truncate?token=fresh"));
+        RescueResult result = await h.Engine.ReplaceLinkAsync(id, server.ReopenExpired("/expires-after-truncate", "/fresh-entry"));
 
         Assert.False(result.Accepted);
         JobSnapshot after = h.Engine.Snapshot(id)!;
@@ -120,7 +120,7 @@ public sealed class RescueAtomicityTests
             command.ExecuteNonQuery();
         }
 
-        string fresh = server.Url("/expires-after-truncate?token=fresh");
+        string fresh = server.ReopenExpired("/expires-after-truncate", "/fresh-entry");
         RescueResult refused = await harness.Engine.ReplaceLinkAsync(id, fresh);
         Assert.False(refused.Accepted);
         Assert.Equal(RescueMode.R4, refused.Mode);

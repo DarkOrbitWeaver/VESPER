@@ -251,9 +251,31 @@ internal static class MediaSourceRescue
             return new RescueResult(false, RescueMode.None,
                 "The source no longer offers the same formats. Saved data was kept; restart as a separate copy.", 0);
 
+        MediaMergePlan? saved = engine.GetSavedMergePlan(job.Id);
+        if (saved is null)
+            return new RescueResult(false, RescueMode.None, "The saved media plan is unavailable. Saved data was kept.", 0);
+        var subtitles = new List<SubtitleTrack>();
+        foreach (MergeSubtitle selected in saved.Subtitles)
+        {
+            // The engine fingerprints subtitle URLs, including their query. Do not substitute a different track.
+            var matches = item.Subtitles.Where(track =>
+                track.Url.AbsoluteUri == selected.Url
+                && track.Format.Equals(selected.Format, StringComparison.OrdinalIgnoreCase)
+                && Vesper.MediaResolver.Utilities.TextUtil.NormalizeLang(track.Language) == selected.Language).ToArray();
+            if (matches.Length != 1)
+                return new RescueResult(false, RescueMode.None, "A selected subtitle is no longer available at its verified address. Saved data was kept.", 0);
+            subtitles.Add(matches[0]);
+        }
         bool audioOnly = same.All(r => !r.HasVideo);
-        var prefs = audioOnly ? FormatPreferences.AudioOnly with { AudioCodecs = [] } : FormatPreferences.BestQuality;
-        (MediaDownloadChoice? choice, string? error) = MediaTransferBridge.Prepare(item with { Representations = same }, prefs);
+        var prefs = (audioOnly ? FormatPreferences.AudioOnly with { AudioCodecs = [] } : FormatPreferences.BestQuality) with
+        {
+            Container = saved.OutputContainer, ContainerStrict = true,
+            EmbedSubtitles = subtitles.Count > 0, IncludeAutoSubtitles = true,
+            SubtitleLanguages = subtitles.Select(track => track.Language).ToArray()
+        };
+        (MediaDownloadChoice? choice, string? error) = MediaTransferBridge.Prepare(
+            item with { Representations = same, Subtitles = subtitles }, prefs,
+            clipStartSeconds: saved.ClipRange?.StartSeconds, clipEndSeconds: saved.ClipRange?.EndSeconds);
         if (choice is not { Kind: JobKind.Merge, MediaPlanJson: { } plan })
             return new RescueResult(false, RescueMode.None,
                 error ?? "The refreshed source cannot be planned the same way. Saved data was kept.", 0);

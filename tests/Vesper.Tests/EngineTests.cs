@@ -478,7 +478,7 @@ public class RescueTests
         using (h)
         {
             long saved = stalled.CommittedBytes;
-            RescueResult result = await h.Engine.ReplaceLinkAsync(id, server.Url("/expires-after-truncate?token=fresh"));
+            RescueResult result = await h.Engine.ReplaceLinkAsync(id, server.ReopenExpired("/expires-after-truncate", "/fresh-entry"));
             Assert.True(result.Accepted, result.Message);
             Assert.Equal(RescueMode.R0, result.Mode);
 

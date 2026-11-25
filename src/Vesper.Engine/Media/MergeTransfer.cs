@@ -6,9 +6,9 @@ using System.Text.Json;
 namespace Vesper.Engine;
 
 /// <summary>
-/// Native merge job. Phase 1 downloads every track into its own region of the job's partial file using bounded
+/// Downloads each track into its own region of the job's partial file using bounded
 /// (8 MiB) range requests through the normal durable checkpoint pipeline, so progress, pause, crash recovery and
-/// per-chunk retry all reuse the engine's guarantees. Phase 2 demuxes the committed regions, remuxes them into one
+/// per-chunk retry reuse the engine's existing transfer logic. Then demuxes and remuxes the committed regions into one
 /// container (no transcoding), validates the output and records the swap before moving files. The downloaded tracks are kept
 /// until the merged file is published, so a failed merge never destroys completed work.
 /// </summary>
@@ -81,6 +81,12 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         if (cursor?.Phase == "swapping") return await FinishSwapAsync(cursor, ct).ConfigureAwait(false);
         if (cursor?.Phase == "muxed") return await FinalizeMergedAsync(cursor, ct).ConfigureAwait(false);
         if (cursor is not null && cursor.Phase != "download") return Stop("The saved merge cursor has an unknown phase.");
+        // A staging identity is saved before writing the output. Only that exact object can be discarded.
+        if (PathExists(MergingPath(Job)) && cursor?.MuxIdentity is { } stageIdentity)
+        {
+            if (!TryDeleteSidecar(MergingPath(Job), stageIdentity, out _))
+                return Stop("The unfinished merge output no longer belongs to this job.");
+        }
 
         RestoreLegacyTracks(Job);
         long total = plan.TotalBytes;
@@ -112,7 +118,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         return await MergeAsync(plan, fingerprint, ct).ConfigureAwait(false);
     }
 
-    // ------------------------------------------------------------------------------------------------ download
+    // download
 
     private async Task RunWorkersAsync(MediaMergePlan plan, Queue<(int Track, long Start, long End)> work, string state, CancellationToken ct)
     {
@@ -235,7 +241,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
         finally { session.RemoveConnection(); }
     }
 
-    // ------------------------------------------------------------------------------------------------ merge
+    // merge
 
     private async Task<RunOutcome> MergeAsync(MediaMergePlan plan, string fingerprint, CancellationToken ct)
     {
@@ -348,6 +354,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                             $"The downloaded codecs ({string.Join(", ", expected.Select(t => t.Codec))}) cannot be stored in {plan.OutputContainer} without conversion. Nothing was published; saved data was kept.");
                     using var output = CreateNewSidecar(mergingPath);
                     mergingIdentity = CaptureSidecarIdentity(output);
+                    string staging = JsonSerializer.Serialize(new Cursor(1, fingerprint, "download", MuxIdentity: mergingIdentity));
+                    engine.UpdateJob(Job, job => job.MediaState = staging);
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;

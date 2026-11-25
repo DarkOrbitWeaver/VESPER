@@ -13,14 +13,15 @@ namespace Vesper.Tests;
 public sealed class HttpResourceIdentityTests
 {
     [Fact]
-    public void Resource_identity_keeps_origin_and_path_but_ignores_signed_query_values()
+    public void Resource_identity_keeps_full_query_but_ignores_fragment()
     {
         Uri signed = new("https://CDN.example:443/folder/file.bin?token=first#part");
         Uri refreshed = new("https://cdn.example/folder/file.bin?token=second");
 
         string identity = HttpTransport.ResourceIdentity(signed);
 
-        Assert.Equal(identity, HttpTransport.ResourceIdentity(refreshed));
+        Assert.NotEqual(identity, HttpTransport.ResourceIdentity(refreshed));
+        Assert.Equal(identity, HttpTransport.ResourceIdentity(new Uri("https://cdn.example/folder/file.bin?token=first")));
         Assert.NotEqual(identity, HttpTransport.ResourceIdentity(new Uri("https://other.example/folder/file.bin")));
         Assert.NotEqual(identity, HttpTransport.ResourceIdentity(new Uri("https://cdn.example:444/folder/file.bin")));
         Assert.NotEqual(identity, HttpTransport.ResourceIdentity(new Uri("https://cdn.example/folder/other.bin")));
@@ -248,7 +249,7 @@ public sealed class HttpResourceIdentityTests
         await newSource.StartAsync();
         await cdn.StartAsync();
         oldSource.RedirectTarget = cdn.Url("/file?signature=old");
-        newSource.RedirectTarget = cdn.Url("/file?signature=new");
+        newSource.RedirectTarget = cdn.Url("/file?signature=old");
 
         using var harness = new Harness(tweak: options => options.MaxConnectionsPerJob = 1);
         Guid id = harness.Add(oldSource.Url("/entry?ticket=old"), "same-final-resource.bin");

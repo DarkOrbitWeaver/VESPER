@@ -276,7 +276,7 @@ public sealed class MediaRefreshTests
         var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"), MediaProvider: "fixture", MediaId: "video", MediaFormatId: "muxed-720"));
         var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
         int requests = server.Hits("/expires-after-truncate");
-        var result = await h.Engine.RefreshMediaSourceAsync(added.JobId, new(provider, mediaId, format, server.Url("/expires-after-truncate?token=fresh")));
+        var result = await h.Engine.RefreshMediaSourceAsync(added.JobId, new(provider, mediaId, format, server.ReopenExpired("/expires-after-truncate", "/fresh-entry")));
         Assert.False(result.Accepted); Assert.Equal(requests, server.Hits("/expires-after-truncate"));
         Assert.Equal(stopped.CommittedBytes, h.Engine.Snapshot(added.JobId)!.CommittedBytes);
     }
@@ -288,7 +288,7 @@ public sealed class MediaRefreshTests
         var added = h.Engine.Add(new AddRequest(server.Url("/expires-after-truncate"), MediaProvider: "fixture", MediaId: "video", MediaFormatId: "muxed-720"));
         await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
         var result = await h.Engine.RefreshMediaSourceAsync(added.JobId,
-            new("fixture", "video", "muxed-720", server.Url("/expires-after-truncate?token=fresh"), DateTimeOffset.UtcNow.AddMinutes(5)));
+            new("fixture", "video", "muxed-720", server.ReopenExpired("/expires-after-truncate", "/fresh-entry"), DateTimeOffset.UtcNow.AddMinutes(5)));
         Assert.True(result.Accepted, result.Message); Assert.Equal(RescueMode.R0, result.Mode);
         var done = await h.WaitForStateAsync(added.JobId, JobState.Completed);
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!)); Assert.Equal("muxed-720", done.MediaFormatId);
@@ -303,7 +303,7 @@ public sealed class MediaRefreshTests
         var stopped = await h.WaitForStateAsync(added.JobId, JobState.NeedsLink);
         int hits = server.Hits("/expires-after-truncate");
         var replacement = new ResolvedMediaSource("fixture", "video", "muxed-720",
-            server.Url("/expires-after-truncate?token=fresh"), DateTimeOffset.UtcNow.AddMinutes(5));
+            server.ReopenExpired("/expires-after-truncate", "/fresh-entry"), DateTimeOffset.UtcNow.AddMinutes(5));
         var stale = await h.Engine.RefreshMediaSourceAsync(added.JobId, replacement,
             expectedExpiredSource: server.Url("/different"));
         Assert.False(stale.Accepted);
@@ -340,7 +340,7 @@ public sealed class MediaRefreshTests
 
         JobSnapshot after = harness.Engine.Snapshot(added.JobId)!;
         Assert.False(result.Accepted);
-        Assert.Contains("different file location", result.Message);
+        Assert.Contains("cannot prove", result.Message);
         Assert.Equal(stalled.SourceUrl, after.SourceUrl);
         Assert.Equal(stalled.CommittedBytes, after.CommittedBytes);
         Assert.Equal(saved, await File.ReadAllBytesAsync(stalled.PartialPath));
@@ -364,8 +364,8 @@ public sealed class MediaRefreshTests
         JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
         h.Engine.Options.MaxConcurrentJobs = 0;
         byte[] savedBytes = await File.ReadAllBytesAsync(stalled.PartialPath);
-        string firstUrl = server.Url("/expires-after-truncate?token=fresh&candidate=first");
-        string secondUrl = server.Url("/expires-after-truncate?token=fresh&candidate=second");
+        string firstUrl = server.ReopenExpired("/expires-after-truncate", "/fresh-first");
+        string secondUrl = server.ReopenExpired("/expires-after-truncate", "/fresh-second");
 
         RescueResult[] results = await Task.WhenAll(
             h.Engine.ReplaceLinkAsync(id, firstUrl),

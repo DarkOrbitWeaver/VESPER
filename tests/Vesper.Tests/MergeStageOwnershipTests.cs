@@ -43,8 +43,10 @@ public sealed class MergeStageOwnershipTests
         }
     }
 
-    [Fact]
-    public async Task Restart_does_not_replace_an_unclaimed_merge_stage()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Restart_rebuilds_only_the_owned_merge_stage(bool replaceStage)
     {
         await using var server = new FaultServer();
         await server.StartAsync();
@@ -85,13 +87,28 @@ public sealed class MergeStageOwnershipTests
         byte[] stagedOutput = await File.ReadAllBytesAsync(stage);
         Assert.NotEmpty(stagedOutput);
 
+        if (replaceStage)
+        {
+            File.Move(stage, stage + ".original");
+            File.WriteAllBytes(stage, stagedOutput);
+        }
+
         harness.Restart();
 
-        JobSnapshot stopped = await harness.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
-        Assert.Equal("merge-integrity", stopped.Reason);
-        Assert.Contains("no saved swap proof", stopped.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(stagedOutput, await File.ReadAllBytesAsync(stage));
-        Assert.Null(stopped.FinalPath);
+        if (replaceStage)
+        {
+            JobSnapshot stopped = await harness.WaitForStateAsync(added.JobId, JobState.NeedsAttention);
+            Assert.Equal("merge-integrity", stopped.Reason);
+            Assert.Contains("no longer belongs", stopped.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(stagedOutput, await File.ReadAllBytesAsync(stage));
+            Assert.Null(stopped.FinalPath);
+        }
+        else
+        {
+            JobSnapshot completed = await harness.WaitForStateAsync(added.JobId, JobState.Completed);
+            Assert.Equal(stagedOutput, await File.ReadAllBytesAsync(completed.FinalPath!));
+            Assert.False(File.Exists(stage));
+        }
     }
 
     [Fact]

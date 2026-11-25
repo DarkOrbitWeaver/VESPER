@@ -17,6 +17,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     private readonly ToolTip _tips = new();
     private readonly VesperButton _close;
     private readonly Dictionary<string, Label> _live = [];
+    private readonly Dictionary<(float Size, bool Bold), Font> _fonts = [];
     private Panel? _progressFill;
     private int _progressWidth;
     private JobSnapshot _job;
@@ -33,7 +34,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         _colors = UiKit.Palette(preferences);
         VesperWindowChrome.Brand(this);
         Text = "Download details — VESPER";
-        Font = new Font("Segoe UI", 9F);
+        Font = DetailFont(9F, false);
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(516, 345);
@@ -82,7 +83,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         Build();
     }
 
-    // ---- live updates ---------------------------------------------------------------------------------------------
+    // live updates
 
     private void OnJobChanged(JobSnapshot s)
     {
@@ -98,7 +99,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     private void Post(Action action)
     {
         if (IsDisposed || !IsHandleCreated) return;
-        try { BeginInvoke(action); }
+        try { BeginInvoke(() => { if (!IsDisposed && !Disposing) action(); }); }
         catch (InvalidOperationException) { /* closing */ }
     }
 
@@ -112,16 +113,13 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
 
     private void UpdateLive()
     {
-        foreach ((string key, Label label) in _live)
-        {
-            string value = Fields().FirstOrDefault(f => f.Key == key).Value ?? label.Text;
-            if (label.Text != value) label.Text = value;
-        }
+        foreach ((string key, string value) in Fields())
+            if (_live.TryGetValue(key, out Label? label) && label.Text != value) label.Text = value;
         if (_progressFill is not null)
             _progressFill.Width = (int)(_progressWidth * Math.Clamp(_job.Fraction ?? 0, 0, 1));
     }
 
-    // ---- layout ---------------------------------------------------------------------------------------------------
+    // layout
 
     private VesperButton NewButton(string text, int width, bool primary)
     {
@@ -130,11 +128,19 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         return button;
     }
 
+    private Font DetailFont(float size, bool bold)
+    {
+        var key = (size, bold);
+        if (!_fonts.TryGetValue(key, out Font? font))
+            _fonts[key] = font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular);
+        return font;
+    }
+
     private Label Text_(string text, int x, int y, int width, int height, float size = 9, bool bold = false, bool muted = false) => new()
     {
         Text = text, AutoSize = false, AutoEllipsis = true, Location = new Point(x, y), Size = new Size(width, height),
         ForeColor = muted ? _colors.Muted : _colors.Text, TextAlign = ContentAlignment.MiddleLeft,
-        Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular)
+        Font = DetailFont(size, bold), UseMnemonic = false
     };
 
     private void Build()
@@ -296,7 +302,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         finally { _building = false; }
     }
 
-    // ---- content by state -----------------------------------------------------------------------------------------
+    // content by state
 
     private (string Text, VesperIcon Icon, Color Color) StatusLine()
     {
@@ -463,11 +469,18 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
     {
         if (disposing && !IsDisposed)
         {
+            _engine.JobChanged -= OnJobChanged;
+            _engine.Progress -= OnProgress;
             _posterLifetime.Cancel();
             _posterLifetime.Dispose();
             _poster?.Dispose();
             _tips.Dispose();
         }
         base.Dispose(disposing);
+        if (disposing)
+        {
+            foreach (Font font in _fonts.Values) font.Dispose();
+            _fonts.Clear();
+        }
     }
 }

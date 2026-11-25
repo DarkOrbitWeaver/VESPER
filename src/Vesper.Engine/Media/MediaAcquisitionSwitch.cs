@@ -15,6 +15,8 @@ public sealed partial class DownloadEngine
     public async Task<RescueResult> SwitchMediaAcquisitionAsync(Guid id, MediaAcquisitionReplacement replacement,
         string expectedExpiredSource, CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         ArgumentNullException.ThrowIfNull(replacement);
         var source = replacement.Source;
         if (string.IsNullOrWhiteSpace(expectedExpiredSource) || !UrlPolicy.TryParse(source.Url, out Uri url, out _))
@@ -133,10 +135,6 @@ public sealed partial class DownloadEngine
                 || !ReferenceEquals(job.Extents, savedExtents) || job.FileName != snapshot.FileName
                 || source.ExpiresAt <= DateTimeOffset.UtcNow)
                 return Rejected("The download changed while its alternate delivery was being checked.");
-            var duplicateKey = new DuplicateKey(UrlPolicy.Normalize(url), job.Output);
-            if (_duplicateCandidates.TryGetValue(duplicateKey, out var candidates)
-                && candidates.Any(candidate => candidate.Id != id && IsDuplicateCandidate(candidate)))
-                return Rejected("The alternate delivery is already owned by another download.");
             // Never create a second job or write the old file during a switch. Only the durable cursor changes.
             DownloadJob updated = job.CopyForUpdate();
             updated.PreviousUrls = AppendPreviousUrl(updated.PreviousUrls, job.SourceUrl);
@@ -164,7 +162,8 @@ public sealed partial class DownloadEngine
                 (JobState.Queued, "", "Alternate delivery selected; saved data preserved.", 0);
             updated.NextRetryUtc = null;
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             if (credentials is not null) _credentials[id] = credentials;
             else _credentials.Remove(id);
             // The manifest is auxiliary; the SQLite transaction is authoritative.

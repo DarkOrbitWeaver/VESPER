@@ -79,6 +79,15 @@ internal sealed class FaultServer : IAsyncDisposable
 
     public string Url(string path) => BaseUrl + path;
 
+    private readonly ConcurrentDictionary<string, bool> _reopened = new();
+    public string ReopenExpired(string path, string? alias = null)
+    {
+        _reopened[path] = true;
+        if (alias is null) return Url(path);
+        Redirects[alias] = Url(path);
+        return Url(alias);
+    }
+
     private async Task Handle(HttpContext ctx)
     {
         string path = ctx.Request.Path.Value ?? "/";
@@ -119,13 +128,13 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, truncate: hit == 1 ? 0.6 : null); break;
             case "/norange-truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, ranges: false, truncate: hit == 1 ? 0.6 : null); break;
             case "/expires-after-truncate":
-                if (ctx.Request.Query["token"] == "fresh") await Serve(ctx, V1, "\"p1\"", Modified);
+                if (_reopened.ContainsKey(path) || ctx.Request.Query["token"] == "fresh") await Serve(ctx, V1, "\"p1\"", Modified);
                 else if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
                 else res.StatusCode = 403;
                 break;
             case "/expires-without-etag":
                 // A same-size, same-time replacement is not strong-ETag identical if its ETag disappears.
-                if (ctx.Request.Query["token"] == "fresh") await Serve(ctx, V1, null, Modified);
+                if (_reopened.ContainsKey(path) || ctx.Request.Query["token"] == "fresh") await Serve(ctx, V1, null, Modified);
                 else if (hit == 1) await Serve(ctx, V1, "\"p1\"", Modified, truncate: 0.6);
                 else res.StatusCode = 403;
                 break;

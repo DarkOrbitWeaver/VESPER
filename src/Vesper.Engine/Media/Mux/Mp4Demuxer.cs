@@ -473,7 +473,7 @@ internal static class Mp4Demuxer
         return chapters;
     }
 
-    // ------------------------------------------------------------------------------------------------ boxes
+    // boxes
 
     private static MediaContainerException Bad(string why) => new($"Invalid MP4: {why}.");
 

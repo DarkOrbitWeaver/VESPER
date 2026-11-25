@@ -35,7 +35,8 @@ internal sealed class InternetArchiveAdapter : AdapterBase
         return (id, segs.Length > 2 ? string.Join('/', segs.Skip(2)) : null);
     }
 
-    private sealed record IaFile(string Name, string Stem, string Ext, string? Title, long? Size, TimeSpan? Length, int? Height, int? Width, int? Bitrate);
+    private sealed record IaFile(string Name, string Stem, string Ext, string? Title, long? Size, TimeSpan? Length, int? Height, int? Width, int? Bitrate,
+        string? Original, string? Source);
 
     public override async Task<MediaDiscoveryResult> ResolveAsync(MediaDiscoveryRequest request, CancellationToken ct)
     {
@@ -65,12 +66,13 @@ internal sealed class InternetArchiveAdapter : AdapterBase
             string? name = f.P("name").Str();
             if (string.IsNullOrEmpty(name) || f.P("source").Str() == "metadata") continue;
             string ext = Path.GetExtension(name).TrimStart('.');
-            string groupName = f.P("original").Str() is { } original && AudioExt.Contains(Path.GetExtension(original).TrimStart('.'))
-                ? original : name;
-            string groupExt = Path.GetExtension(groupName);
-            string stem = groupName[..^(groupExt.Length)];
+            string stem = name[..^(Path.GetExtension(name).Length)];
+            string? original = f.P("original").Str();
+            if (original is not null && !(VideoExt.Contains(ext) && VideoExt.Contains(Path.GetExtension(original).TrimStart('.'))
+                || AudioExt.Contains(ext) && AudioExt.Contains(Path.GetExtension(original).TrimStart('.'))))
+                original = null;
             var file = new IaFile(name, stem, ext, f.P("title").Str(), f.P("size").Long(), TextUtil.ParseDuration(f.P("length").Str()),
-                f.P("height").Int(), f.P("width").Int(), f.P("bitrate").Int());
+                f.P("height").Int(), f.P("width").Int(), f.P("bitrate").Int(), original, f.P("source").Str());
 
             if (VideoExt.Contains(ext)) video.Add(file);
             else if (AudioExt.Contains(ext)) audio.Add(file);
@@ -82,73 +84,100 @@ internal sealed class InternetArchiveAdapter : AdapterBase
             }
         }
 
-        bool preferVideo = video.Count > 0 && (mediaType is "movies" or "video" || audio.Count == 0);
-        if (preferVideo)
-        {
-            var reps = video.Select((f, i) => ToRep(id, f, i, audio: false)).ToList();
-            return MediaDiscoveryResult.FromItem(new MediaItem
-            {
-                SourceUrl = request.Url, Provider = "internet-archive", MediaId = id, Title = title, Description = description,
-                Uploader = creator, Duration = video.Select(v => v.Length).FirstOrDefault(l => l is not null), Thumbnail = thumb,
-                Representations = reps, Subtitles = subs
-            });
-        }
-        if (audio.Count == 0)
-            return Fail(MediaErrors.NoMedia("Item contains no playable video or audio files", browserMayHelp: false));
-
-        // Group the same track delivered in several formats.
-        var groups = audio.GroupBy(a => a.Stem, StringComparer.Ordinal).ToList();
+        var videoGroups = GroupFiles(video);
+        var audioGroups = GroupFiles(audio);
+        var groups = video.Count > 0 && (mediaType is "movies" or "video" || audio.Count == 0)
+            ? videoGroups : audioGroups;
         if (wantedFile is not null)
         {
-            string wantedStem = wantedFile.Contains('.') ? wantedFile[..wantedFile.LastIndexOf('.')] : wantedFile;
-            var match = groups.Where(g => g.Key == wantedStem || g.Any(f => f.Name == wantedFile)).ToList();
-            if (match.Count > 0) groups = match;
+            // An explicit file takes precedence over the item's declared media type.
+            var all = videoGroups.Concat(audioGroups).ToList();
+            var matches = all.Where(g => g.Any(f => f.Name == wantedFile)).ToList();
+            if (matches.Count == 0)
+            {
+                string wantedStem = wantedFile;
+                matches = all.Where(g => g.Key == wantedStem || g.Any(f => f.Stem == wantedStem)).ToList();
+            }
+            if (matches.Count != 1)
+                return Fail(MediaErrors.NoMedia("The requested Archive file is missing or ambiguous.", browserMayHelp: false));
+            groups = matches;
         }
-
-        if (groups.Count == 1 || request.Options.CollectionIntent == CollectionIntent.ItemOnly && wantedFile is not null)
+        if (groups.Count == 0)
+            return Fail(MediaErrors.NoMedia("Item contains no playable video or audio files", browserMayHelp: false));
+        if (groups.Count == 1)
         {
-            var g = groups[0];
-            return MediaDiscoveryResult.FromItem(TrackItem(id, g.Key, g.ToList(), title, creator, thumb, request.Url));
+            var group = groups[0];
+            return MediaDiscoveryResult.FromItem(FileItem(id, group, title, description, creator, thumb, request.Url, subs));
         }
+        if (request.Options.CollectionIntent == CollectionIntent.ItemOnly)
+            return Fail(MediaErrors.NoMedia("This Archive item contains several different files. Select an individual file.", browserMayHelp: false));
 
-        var entries = groups.Take(Options.MaxCollectionItems).Select((g, i) =>
+        var entries = groups.Take(Options.MaxCollectionItems).Select((group, i) =>
         {
-            var first = g.First();
+            IaFile first = group.First();
             var url = new Uri($"https://archive.org/details/{Uri.EscapeDataString(id)}/{string.Join('/', first.Name.Split('/').Select(Uri.EscapeDataString))}");
-            var item = TrackItem(id, g.Key, g.ToList(), first.Title ?? g.Key, creator, thumb, url);
+            var item = FileItem(id, group, first.Title ?? first.Stem, description, creator, thumb, url, subs);
             return new CollectionEntry
             {
-                MediaId = $"{id}/{g.Key}", Url = url, Title = item.Title, Duration = first.Length, Thumbnail = thumb, Index = i, Resolved = item
+                MediaId = item.MediaId!, Url = url, Title = item.Title, Duration = item.Duration, Thumbnail = thumb, Index = i, Resolved = item
             };
         }).ToList();
 
         return MediaDiscoveryResult.FromCollection(new MediaCollection
         {
             SourceUrl = request.Url, Provider = "internet-archive", CollectionId = id, Title = title,
-            Kind = mediaType == "etree" || mediaType == "audio" ? CollectionKind.Album : CollectionKind.Playlist,
+            Kind = mediaType is "etree" or "audio" ? CollectionKind.Album : CollectionKind.Playlist,
             TotalCount = groups.Count, Entries = entries, IsComplete = entries.Count == groups.Count
         });
     }
 
-    private static MediaItem TrackItem(string id, string stem, List<IaFile> formats, string title, string? creator, Uri thumb, Uri url) => new()
+    private static List<IGrouping<string, IaFile>> GroupFiles(List<IaFile> files)
     {
-        SourceUrl = url,
-        Provider = "internet-archive",
-        MediaId = $"{id}/{stem}",
-        Title = title,
-        Uploader = creator,
-        Duration = formats.Select(f => f.Length).FirstOrDefault(l => l is not null),
-        Thumbnail = thumb,
-        Kind = MediaKind.Audio,
-        Representations = formats.Select((f, i) => ToRep(id, f, i, audio: true)).ToList()
-    };
+        var originals = files.Where(f => f.Source != "derivative" && f.Original is null)
+            .ToLookup(f => f.Stem, StringComparer.Ordinal);
+        return files.GroupBy(file =>
+        {
+            if (file.Original is not null) return file.Original;
+            var sameStem = originals[file.Stem].ToArray();
+            if (sameStem.Length == 1) return sameStem[0].Name;
+            if (sameStem.Length == 0 && file.Source == "derivative") return file.Stem;
+            return file.Name;
+        }, StringComparer.Ordinal).ToList();
+    }
+
+    private static MediaItem FileItem(string id, IGrouping<string, IaFile> group, string title, string? description,
+        string? creator, Uri thumb, Uri url, List<SubtitleTrack> subtitles)
+    {
+        bool audio = AudioExt.Contains(group.First().Ext);
+        string[] stems = group.Select(f => f.Stem).Distinct(StringComparer.Ordinal).ToArray();
+        return new MediaItem
+        {
+            SourceUrl = url, Provider = "internet-archive", MediaId = $"{id}/{group.Key}",
+            Title = title, Description = description, Uploader = creator, Thumbnail = thumb,
+            Duration = group.Select(f => f.Length).FirstOrDefault(l => l is not null),
+            Kind = audio ? MediaKind.Audio : MediaKind.Video,
+            Representations = group.Select(f => ToRep(id, f, audio)).ToList(),
+            Subtitles = audio ? [] : subtitles.Where(subtitle =>
+            {
+                string name = Uri.UnescapeDataString(subtitle.Url.AbsolutePath);
+                string prefix = "/download/" + id + "/";
+                if (!name.StartsWith(prefix, StringComparison.Ordinal)) return false;
+                string relative = name[prefix.Length..];
+                string captionStem = relative[..^Path.GetExtension(relative).Length];
+                if (stems.Contains(captionStem, StringComparer.Ordinal)) return true;
+                int dot = captionStem.LastIndexOf('.');
+                return dot > 0 && captionStem.Length - dot - 1 is 2 or 3
+                    && stems.Contains(captionStem[..dot], StringComparer.Ordinal);
+            }).ToList()
+        };
+    }
 
     private static Uri DownloadUrl(string id, string name) =>
         new($"https://archive.org/download/{Uri.EscapeDataString(id)}/{string.Join('/', name.Split('/').Select(Uri.EscapeDataString))}");
 
-    private static MediaRepresentation ToRep(string id, IaFile f, int index, bool audio) => new()
+    private static MediaRepresentation ToRep(string id, IaFile f, bool audio) => new()
     {
-        Id = $"ia-{f.Ext.ToLowerInvariant()}-{index}",
+        Id = "ia-" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(f.Name))),
         Url = DownloadUrl(id, f.Name),
         Protocol = StreamProtocol.Http,
         Content = audio ? StreamContent.AudioOnly : StreamContent.VideoAndAudio,

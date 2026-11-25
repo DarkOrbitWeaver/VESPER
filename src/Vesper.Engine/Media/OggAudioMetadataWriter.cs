@@ -111,6 +111,47 @@ internal static class OggAudioMetadataWriter
             throw new MediaContainerException("The Opus output lost packets or its final granule position.");
     }
 
+    internal static RawAudioTimeline ReadTimeline(Stream source, CancellationToken ct)
+    {
+        if (!TryReadHeaders(source, out Header header))
+            throw new MediaContainerException("The Ogg audio headers are incomplete or unsupported.");
+        bool opus = header.Codec == Codec.Opus;
+        int channels = header.Identification[opus ? 9 : 11];
+        uint rate = opus ? 48_000u : BinaryPrimitives.ReadUInt32LittleEndian(header.Identification.AsSpan(12, 4));
+        long preSkip = opus ? BinaryPrimitives.ReadUInt16LittleEndian(header.Identification.AsSpan(10, 2)) : 0;
+        if (rate == 0 || rate > 192_000 || channels <= 0)
+            throw new MediaContainerException("The Ogg audio format is unsupported.");
+        uint sequence = unchecked(header.LastSequence + 1);
+        long granule = 0;
+        bool continued = false, ended = false, sawPacket = false;
+        Page? page;
+        while ((page = ReadPage(source)) is not null)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (ended || page.Serial != header.Serial || page.Sequence != sequence
+                || (page.Flags & 2) != 0 || ((page.Flags & 1) != 0) != continued
+                || page.Lacing.Length == 0 || page.Granule < -1)
+                throw new MediaContainerException("The Ogg audio page sequence is incomplete or contains another stream.");
+            sequence = unchecked(sequence + 1);
+            bool completedPacket = page.Lacing.Any(lace => lace < 255);
+            if (completedPacket)
+            {
+                if (page.Granule < granule)
+                    throw new MediaContainerException("The Ogg audio timeline moves backward.");
+                granule = page.Granule;
+                sawPacket = true;
+            }
+            else if (page.Granule != -1)
+                throw new MediaContainerException("An incomplete Ogg packet has a granule position.");
+            continued = page.Lacing[^1] == 255;
+            ended = (page.Flags & 4) != 0;
+        }
+        if (!ended || continued || !sawPacket || granule <= preSkip)
+            throw new MediaContainerException("The Ogg audio stream has no complete ending.");
+        return new RawAudioTimeline(opus ? ".opus" : ".ogg", opus ? "opus" : "vorbis",
+            channels, (int)rate, (granule - preSkip) / (double)rate);
+    }
+
     private static bool TryReadHeaders(Stream source, out Header header)
     {
         header = null!;

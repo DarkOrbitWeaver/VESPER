@@ -4,9 +4,6 @@
 // and to one of three verdicts, with explicit abstention in between. Destructive or commercial
 // labels are hard vetoes, never weights that a strong label could outvote.
 //
-// This replaces the hashed n-gram logistic model (350 synthetic samples) and the 12-weight relationship
-// model (60 synthetic pairs). Those learned the generator's own rules back and could not be audited;
-// these weights are the same knowledge stated directly, with multilingual coverage they never had.
 // A score here never authorizes a click: execution still requires explicit user approval.
 'use strict';
 globalThis.VesperControlEvidence = (() => {

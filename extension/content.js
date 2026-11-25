@@ -1,4 +1,4 @@
-// Player discovery is local to the page. The desktop app checks formats after a click.
+// Observe the current player and prepare formats without starting a download.
 (() => {
   'use strict';
   if (window.__vesperContent) return;          // never inject twice
@@ -23,7 +23,8 @@
   const pageAddress = () => location.href.split('#', 1)[0];
   let pageUrl = pageAddress(), mediaChangedAt = 0, panelMedia = null;
   let motionMode = 'animate', unwatchMotion = null;
-  let extensionPaused = false, extensionPreferencesReady = false;
+  let extensionPaused = false, extensionPreferencesReady = false, prefetchEnabled = true;
+  let prefetchTimer = 0, prefetchTarget = null;
   let hiddenButterflyHosts = new Set();
   let retainedPickerDraft = null;
   let activeBrowserCopy = null;
@@ -33,6 +34,12 @@
   function onExtensionPreferencesChanged(changes, areaName) {
     if (areaName !== 'local') return;
     if (changes.vesperPaused) extensionPaused = changes.vesperPaused.newValue === true;
+    if (changes.prefetchFormats) {
+      prefetchEnabled = changes.prefetchFormats.newValue !== false;
+      if (video) { prefetchedPlayers.delete(video); prefetchRetried.delete(video); }
+      cancelPrefetch();
+      if (prefetchEnabled) schedulePrefetch(video);
+    }
     if (extensionPaused) {
       activeBrowserCopy?.controller.abort();
       generatedCopy?.controller.abort();
@@ -51,12 +58,15 @@
   const playback = new WeakMap();
   const mediaLedger = VesperIntelligence.createMediaLedger();
   const playerEvidenceKeys = new WeakMap();
+  const playerInteractions = new WeakMap();
+  let intentCertain = true;
   let evidenceSerial = 0, resourceObserver = null;
   function evidenceKey(el) {
     if (!playerEvidenceKeys.has(el)) playerEvidenceKeys.set(el, 'player-' + ++evidenceSerial);
     return playerEvidenceKeys.get(el);
   }
   const prefetchedPlayers = new WeakMap();
+  const prefetchRetried = new WeakMap();
   let generation = 0;
   const observed = new Set();
   const intersecting = new WeakMap();
@@ -153,7 +163,7 @@
     return false;
   }
 
-  // ------------------------------------------------------------ noticing media
+  // noticing media
 
   function visiblePlayer(el, minWidth = MIN_WIDTH, minHeight = MIN_HEIGHT) {
     const ended = isCurrentEndedPlayer(el);
@@ -316,6 +326,12 @@
     return activeYouTubePage(el, contextPage) || contextPage;
   }
 
+  function setIntentCertainty(certain) {
+    if (intentCertain === certain) return;
+    intentCertain = certain;
+    if (!certain) cancelPrefetch();
+  }
+
   function selectPlayer() {
     if (!alive()) return;
     if (!extensionPreferencesReady) return;
@@ -332,33 +348,54 @@
     const fullscreen = document.fullscreenElement;
     if (manualPlayer && !manualPlayer.isConnected) manualPlayer = null;
     if (manualPlayer && (!fullscreen || fullscreen.contains(manualPlayer))) {
+      setIntentCertainty(true);
       if (video !== manualPlayer) attach(manualPlayer);
       else place();
       return;
     }
-    let best = null, bestArea = 0;
-    if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))) {
-      const rect = visiblePlayer(activePreview.player);
-      if (rect) { best = activePreview.player; bestArea = Infinity; }
-    }
-    if (bestArea !== Infinity && isCurrentEndedPlayer(endedPlayer?.player)
+    let best = null;
+    if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))
+        && visiblePlayer(activePreview.player)) best = activePreview.player;
+    if (!best && isCurrentEndedPlayer(endedPlayer?.player)
         && (!fullscreen || fullscreen.contains(endedPlayer.player))) {
       const newPlayerPlaying = [...observed].some(el => el !== endedPlayer.player && !el.paused && !el.ended
         && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el));
-      if (!newPlayerPlaying && visiblePlayer(endedPlayer.player)) {
-        best = endedPlayer.player;
-        bestArea = Infinity;
+      if (!newPlayerPlaying && visiblePlayer(endedPlayer.player)) best = endedPlayer.player;
+    }
+    const previouslyCertain = intentCertain;
+    if (best) setIntentCertainty(true);
+    else {
+      const candidates = [], players = new Map();
+      const now = Date.now();
+      for (const el of observed) {
+        if (fullscreen && !fullscreen.contains(el)) continue;
+        const r = visiblePlayer(el);
+        if (!r) continue;
+        const area = (r.right - r.left) * (r.bottom - r.top);
+        const bounds = el.getBoundingClientRect?.();
+        const fullArea = bounds ? bounds.width * bounds.height : area;
+        const id = evidenceKey(el);
+        const interaction = playerInteractions.get(el);
+        const binding = playback.get(el);
+        candidates.push({ id, area, visibleFraction: fullArea > 0 ? area / fullArea : 0,
+          playing: !el.paused && !el.ended, ready: el.readyState >= 1,
+          progressed: el.currentTime > 1, controls: el.controls, muted: el.muted,
+          incidentalLoop: !!(el.defaultMuted && el.autoplay && el.loop && !el.controls),
+          interacted: !!(interaction && binding && interaction.generation === binding.generation
+            && now - interaction.at <= 30_000),
+          incumbent: el === video });
+        players.set(id, el);
+        if (candidates.length > VesperIntelligence.PLAYER_POLICY.limit) break;
       }
+      const intent = VesperIntelligence.rankPlayers(candidates);
+      setIntentCertainty(intent.decisive);
+      best = players.get(intent.selected);
     }
-    for (const el of observed) {
-      if (bestArea === Infinity) break;
-      if (fullscreen && !fullscreen.contains(el)) continue;
-      const r = visiblePlayer(el);
-      if (!r) continue;
-      const area = (r.right - r.left) * (r.bottom - r.top) * (el.paused ? 1 : 1.15);
-      if (area > bestArea) { best = el; bestArea = area; }
+    if (best) {
+      const same = best === video;
+      attach(best);
+      if (same && !previouslyCertain && intentCertain) schedulePrefetch(best);
     }
-    if (best) attach(best);
     else if (video && !video.isConnected) detach();
     else if (video) place();
   }
@@ -497,8 +534,26 @@
     selectPlayer();
   }
 
+  function cancelPrefetch() {
+    if (prefetchTimer) clearTimeout(prefetchTimer);
+    prefetchTimer = 0;
+    prefetchTarget = null;
+  }
+
+  function schedulePrefetch(el, delay = 800) {
+    if (!intentCertain || !prefetchEnabled || !el || butterflyHidden() || document.hidden || panelMedia || el !== video) return;
+    if (prefetchTimer && prefetchTarget === el) return;
+    cancelPrefetch();
+    prefetchTarget = el;
+    prefetchTimer = setTimeout(() => {
+      prefetchTimer = 0;
+      prefetchTarget = null;
+      prefetchPlayer(el);
+    }, delay);
+  }
+
   function prefetchPlayer(el) {
-    if (!alive() || butterflyHidden() || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
+    if (!alive() || !intentCertain || !prefetchEnabled || document.hidden || butterflyHidden() || panelMedia || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
         || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
     const ended = isCurrentEndedPlayer(el);
     const src = playerSource(el) || (ended ? endedPlayer.binding.src : '');
@@ -507,18 +562,27 @@
     if (!identity) return;
     const binding = playback.get(el) || (ended ? endedPlayer.binding : null);
     const current = binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
-    const key = `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
+    if (!current || el.readyState < 1 || !src || el.duration === Infinity) return;
+    const key = `${identity}|${targetPage}|${src}|${binding.generation}`;
     if (prefetchedPlayers.get(el) === key) return;
     prefetchedPlayers.set(el, key);
+    const witness = playerFragmentWitness(el, binding);
     const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
     void send({ type: 'media-options', prefetch: true, pageUrl: targetPage,
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
       playerPlaying: !el.paused && !el.ended, playerHasMedia: current && (el.readyState >= 1 || el.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', generation: current ? binding.generation : 0,
-      mutedLoop: current && isMutedLoop(el, src),
+      mutedLoop: current && activePreview?.player !== el && isMutedLoop(el, src),
+      playerResourceFingerprints: witness?.fingerprints,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
     }).then(reply => {
-      if (reply?.data?.prefetchSkipped && prefetchedPlayers.get(el) === key) prefetchedPlayers.delete(el);
+      if (!reply?.data?.prefetchSkipped || prefetchedPlayers.get(el) !== key) return;
+      const retry = reply.data.retryAfterMs;
+      if (Number.isFinite(retry) && retry > 0 && retry <= 15_000 && prefetchRetried.get(el) !== key) {
+        prefetchRetried.set(el, key);
+        prefetchedPlayers.delete(el);
+        schedulePrefetch(el, retry + 100);
+      }
     });
   }
 
@@ -532,7 +596,7 @@
     refreshPlayer(e.target);
     if (e.target === video) {
       announceVideoElement();
-      prefetchPlayer(e.target);
+      schedulePrefetch(e.target);
     }
   }, { capture: true, passive: true, signal });
   // Renew on deliberate playback transitions, not a background timer or timeupdate loop.
@@ -597,7 +661,7 @@
     consider(e.target);
   }, { capture: true, passive: true, signal });
 
-  // ------------------------------------------------------------ the butterfly
+  // the butterfly
 
   // "1:23", "01:23:45" or plain seconds -> seconds. Empty or nonsense -> null (the field's default applies).
   function parseClock(text) {
@@ -813,6 +877,7 @@
       place();
       return;
     }
+    cancelPrefetch();
     if (video && video !== el) retainedPickerDraft = null;
     clearTimeout(previewExitTimer);
     previewExitTimer = previewRemovedAt = 0;
@@ -834,9 +899,11 @@
       window.addEventListener('resize', schedule, { passive: true, signal });
     }
     place();
+    schedulePrefetch(el);
   }
 
   function detach(preservePickerDraft = false) {
+    cancelPrefetch();
     if (!preservePickerDraft) retainedPickerDraft = null;
     manualPlayer = null;
     listening = false;
@@ -1179,7 +1246,7 @@
     return true;
   }
 
-  // ------------------------------------------------------------ the quality picker
+  // the quality picker
 
   let choice = null;
   function pickerOptionKey(option) {
@@ -1278,6 +1345,7 @@
     dismissReceipt();
     receipt.textContent = '';
     const player = video;
+    cancelPrefetch();
     // The first click can arrive before the observer has bound a loaded player.
     // Establish the current generation synchronously before opening the picker.
     if (player?.isConnected && player.readyState >= 1 && !activeBrowserCopy) consider(player);
@@ -2106,7 +2174,15 @@
   // Clicking elsewhere dismisses the picker, but using the player it belongs to (play, seek, volume,
   // its overlay controls) does not: those clicks land inside the player's rectangle.
   document.addEventListener('pointerdown', (e) => {
-    if (!alive() || !panel?.classList.contains('show') || e.composedPath().includes(host)) return;
+    if (!alive()) return;
+    if (e.isTrusted && observed.has(e.target)) {
+      const binding = playback.get(e.target);
+      if (binding) {
+        playerInteractions.set(e.target, { generation: binding.generation, at: Date.now() });
+        if (!panelMedia) selectPlayer();
+      }
+    }
+    if (!panel?.classList.contains('show') || e.composedPath().includes(host)) return;
     const rect = video?.isConnected ? video.getBoundingClientRect() : null;
     if (rect && e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) return;
     closePanel();
@@ -2139,11 +2215,16 @@
     syncPage();
     if (video) {
       prefetchedPlayers.delete(video);
-      prefetchPlayer(video);
+      schedulePrefetch(video);
     }
     return false;
   });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelPrefetch();
+    else schedulePrefetch(video);
+  }, { signal });
   window.addEventListener('pagehide', e => {
+    cancelPrefetch();
     activeBrowserCopy?.controller.abort();
     generatedCopy?.controller.abort();
     if (e.persisted) companion?.setVisible(false); else retire();
@@ -2154,7 +2235,8 @@
     applyMotion();
   });
   if (chrome.storage?.local?.get) {
-    void chrome.storage.local.get(['vesperPaused', 'vesperHiddenButterflyHosts']).then(prefs => {
+    void chrome.storage.local.get(['vesperPaused', 'vesperHiddenButterflyHosts', 'prefetchFormats']).then(prefs => {
+      prefetchEnabled = prefs.prefetchFormats !== false;
       extensionPaused = prefs.vesperPaused === true;
       hiddenButterflyHosts = new Set(Array.isArray(prefs.vesperHiddenButterflyHosts)
         ? prefs.vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()) : []);

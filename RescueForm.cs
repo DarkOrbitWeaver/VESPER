@@ -189,11 +189,13 @@ internal sealed class RescueForm : VesperPopupForm
             return;
         }
 
+        CancellationToken token = _lifetime.Token;
         SetBusy(true);
         Show("Checking the new link…", error: false);
         try
         {
-            RescueResult result = await _engine.ReplaceLinkAsync(_job.Id, link, new RescueInput(_sha.Text.Trim(), _pieceJson), _lifetime.Token);
+            RescueResult result = await _engine.ReplaceLinkAsync(_job.Id, link, new RescueInput(_sha.Text.Trim(), _pieceJson), token);
+            if (IsDisposed || token.IsCancellationRequested) return;
             if (result.Accepted)
             {
                 string message = result.RetainedBytes == 0
@@ -209,14 +211,15 @@ internal sealed class RescueForm : VesperPopupForm
             }
             else
             {
-                Show("This link can't safely continue the saved file. Your existing data was not changed. Try another link or download a new copy.", error: true);
+                Show(result.Message, error: true);
                 _result.AccessibleDescription = result.Message;
                 _separateCopy.Visible = true;
             }
         }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            Show("Something went wrong while checking the link: " + ex.Message + "\nYour saved data was not changed.", error: true);
+            if (!IsDisposed && !token.IsCancellationRequested) Show("Could not replace the link: " + ex.Message, error: true);
         }
         finally { if (!IsDisposed) SetBusy(false); }
     }
@@ -249,7 +252,7 @@ internal sealed class RescueForm : VesperPopupForm
 
     private void SetBusy(bool busy)
     {
-        _replace.Enabled = _refreshSource.Enabled = !busy;
+        _replace.Enabled = _refreshSource.Enabled = _separateCopy.Enabled = !busy;
         _url.Enabled = _sha.Enabled = _pieceButton.Enabled = _advanced.Enabled = !busy;
         UseWaitCursor = busy;
     }

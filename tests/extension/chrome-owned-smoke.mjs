@@ -243,7 +243,19 @@ async function main() {
         + '#player.expanded{position:fixed;inset:0}</style>');
       return;
     }
-    if (request.url === '/player.webm') {
+    if (request.url.startsWith('/intent-feed?')) {
+      const variant = Number(new URL(request.url, 'http://fixture.invalid').searchParams.get('case')) || 0;
+      const reversed = variant % 2 === 1;
+      const small = variant < 4 ? 260 : 300;
+      const big = variant < 4 ? 360 : 340;
+      const main = '<video id="main-media" width="' + small + '" height="160" src="/player.webm" autoplay muted controls></video>';
+      const loop = '<video id="incidental-media" width="' + big + '" height="210" src="/player.webm" autoplay muted loop></video>';
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>Intent fixture</title><style>body{margin:12px;display:flex;align-items:flex-start;gap:16px}video{object-fit:contain}</style>'
+        + (reversed ? loop + main : main + loop));
+      return;
+    }
+    if (request.url === '/player.webm' || request.url.startsWith('/player.webm?')) {
       response.writeHead(200, { 'Content-Type': 'video/webm', 'Content-Length': playerClip.length });
       response.end(playerClip);
       return;
@@ -733,6 +745,50 @@ async function main() {
     assert.deepEqual(mse.map(x => x.fingerprints), ['one','two'].map((session,index) => [createHash('sha256')
       .update('http://127.0.0.1:' + port + '/asset-' + (index ? '200002' : '100001') + '/clip.mp4?session=fixture-' + session).digest('hex')]),
       'Exact source fingerprints did not match the observed requests.');
+    // Test placement through the real closed shadow DOM, without modifying the
+    // content script or asking its private ranking function which player won.
+    const intentScenarios = [];
+    async function playerBounds(id) {
+      const result = await browser.send('Runtime.evaluate', { expression: `(() => {
+        const el = document.getElementById(${JSON.stringify(id)});
+        if (!el || el.readyState < 1) return null;
+        const r = el.getBoundingClientRect();
+        return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};
+      })()`, returnByValue: true }, tab);
+      return result.result.value;
+    }
+    async function butterflyInside(id) {
+      const rect = await playerBounds(id);
+      if (!rect) return false;
+      const { root: dom } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+      const nodes = [dom];
+      for (const node of nodes) {
+        nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+        if (node.nodeName !== 'BUTTON') continue;
+        const index = node.attributes?.indexOf('class') ?? -1;
+        if (index < 0 || !node.attributes[index + 1].split(' ').includes('fly')) continue;
+        try {
+          const { model } = await browser.send('DOM.getBoxModel', { nodeId: node.nodeId }, tab);
+          const x = (model.border[0] + model.border[4]) / 2;
+          return x >= rect.left && x <= rect.right;
+        } catch { return false; }
+      }
+      return false;
+    }
+    for (const variant of [0, 1, 4, 5]) {
+      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/intent-feed?case=' + variant }, tab);
+      await waitFor(() => butterflyInside('main-media'), 8000, 'A larger incidental loop displaced the primary player, case ' + variant);
+      intentScenarios.push({ variant, primarySelected: true });
+      const target = await waitFor(() => playerBounds('incidental-media'), 5000, 'The secondary player never loaded.');
+      const x = (target.left + target.right) / 2, y = (target.top + target.bottom) / 2;
+      await browser.send('Input.dispatchMouseEvent', { type:'mousePressed', x, y, button:'left', clickCount:1 }, tab);
+      await browser.send('Input.dispatchMouseEvent', { type:'mouseReleased', x, y, button:'left', clickCount:1 }, tab);
+      await waitFor(() => butterflyInside('incidental-media'), 5000, 'A deliberate interaction did not select the secondary player, case ' + variant);
+      intentScenarios.at(-1).interactionSelected = true;
+      await browser.send('Runtime.evaluate', { expression: "document.getElementById('incidental-media').src='/player.webm?next=1'" }, tab);
+      await waitFor(() => butterflyInside('main-media'), 5000, 'A reused player retained stale intent, case ' + variant);
+      intentScenarios.at(-1).generationReset = true;
+    }
     const finalObservations = await evaluate('Read final Chrome events', 'globalThis.__ownershipSmoke');
     process.stdout.write(JSON.stringify({
       ok: true,
@@ -743,6 +799,7 @@ async function main() {
       keptInChrome: true,
       pageMadeKeptInChrome: true,
       fullscreenButterfly: true,
+      intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
       nativeCapture, captureRace, managedDownloads

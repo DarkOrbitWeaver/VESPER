@@ -103,10 +103,9 @@ public sealed class SecureHttpClient : IDisposable
         return await NetworkConnector.ConnectAsync(allowed, ctx.DnsEndPoint.Port, ct).ConfigureAwait(false);
     }
 
-    // ---- public API -------------------------------------------------------------------------------------------
-
+    // public API
     public async Task<HttpTextResponse> GetStringAsync(
-        Uri url, MediaRequestContext? ctx, CancellationToken ct, int? maxBytes = null, string? accept = null)
+        Uri url, MediaRequestContext? ctx, CancellationToken ct, int? maxBytes = null, string? accept = null, bool allowBinaryManifest = false)
     {
         using var resp = await SendAsync(HttpMethod.Get, url, ctx, ct, req =>
         {
@@ -126,7 +125,8 @@ public sealed class SecureHttpClient : IDisposable
             foreach (string header in raw)
                 try { sessionCookies.SetCookies(final, header); } catch (CookieException) { }
 
-        if (status < 400 && ctype is not null && !IsTextual(ctype))
+        if (status < 400 && ctype is not null && !IsTextual(ctype)
+            && !(allowBinaryManifest && maxBytes.HasValue && ctype is "application/octet-stream" or "binary/octet-stream"))
             return new HttpTextResponse(final, status, "", ctype, cookies, IsText: false) { SessionCookies = sessionCookies };
 
         int limit = status >= 400 ? _o.MaxErrorBodyBytes : maxBytes ?? _o.MaxPageBytes;
@@ -383,8 +383,7 @@ public sealed class SecureHttpClient : IDisposable
         };
     }
 
-    // ---- internals --------------------------------------------------------------------------------------------
-
+    // internals
     private async Task<HttpResponseMessage> SendAsync(
         HttpMethod method, Uri url, MediaRequestContext? ctx, CancellationToken ct, Action<HttpRequestMessage>? configure)
     {
@@ -455,7 +454,7 @@ public sealed class SecureHttpClient : IDisposable
                 {
                     DateTimeOffset now = _o.TimeProvider.GetUtcNow();
                     TimeSpan delay = resp.Headers.RetryAfter?.Delta ?? (resp.Headers.RetryAfter?.Date - now) ?? TimeSpan.FromSeconds(30);
-                    DateTimeOffset until = now.AddTicks(Math.Clamp(delay.Ticks, 0, TimeSpan.TicksPerHour));
+                    DateTimeOffset until = now.AddTicks(Math.Clamp(delay.Ticks, 0, DateTimeOffset.MaxValue.UtcTicks - now.UtcTicks));
                     _o.OriginThrottled?.Invoke(url, until);
                     string origin = url.GetLeftPart(UriPartial.Authority);
                     _o.Diagnostics?.Invoke($"HTTP {(int)status} from {origin}. Retry at {until:O}.");

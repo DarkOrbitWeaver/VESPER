@@ -15,6 +15,10 @@ public static class HttpFacts
 
     public static DateTimeOffset? LastModified(HttpResponseMessage response) => response.Content.Headers.LastModified;
 
+    public static bool HasStrongLastModified(HttpResponseMessage response) =>
+        response.Headers.ETag is null && LastModified(response) is { } modified
+        && response.Headers.Date is { } date && date - modified >= TimeSpan.FromSeconds(60);
+
     /// <summary>True if the body is the stored representation. Anything else makes byte ranges ambiguous.</summary>
     public static bool IsIdentityEncoded(HttpResponseMessage response) =>
         response.Content.Headers.ContentEncoding.All(e => e.Equals("identity", StringComparison.OrdinalIgnoreCase));

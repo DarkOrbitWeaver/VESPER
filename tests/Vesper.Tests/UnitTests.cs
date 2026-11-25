@@ -374,22 +374,24 @@ public class RescueEvaluatorTests
     private static DownloadJob Job(IdentityLevel level = IdentityLevel.StrongEtag, string? etag = "\"p1\"") => new()
     {
         SourceUrl = "https://cdn.example.com/f/file.iso?token=old", TotalBytes = 1000, Identity = level, ETag = etag,
-        LastModified = new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero)
+        LastModified = new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero),
+        FinalResourceIdentity = HttpTransport.ResourceIdentity(new Uri("https://cdn.example.com/f/file.iso?token=old"))
     };
-    private static readonly Uri New = new("https://cdn.example.com/f/file.iso?token=new");
-    private static ProbeFacts Probe(string? etag = "\"p1\"", long total = 1000, bool rangeOk = true, DateTimeOffset? lm = null) =>
-        new(rangeOk ? 206 : 200, rangeOk, total, etag, lm, true);
+    private static readonly Uri New = new("https://cdn.example.com/f/file.iso?token=old");
+    private static ProbeFacts Probe(string? etag = "\"p1\"", long total = 1000, bool rangeOk = true, DateTimeOffset? lm = null, Uri? resource = null, bool strongDate = true) =>
+        new(rangeOk ? 206 : 200, rangeOk, total, etag, lm, true, HttpTransport.ResourceIdentity(resource ?? New), strongDate);
 
     [Fact] public void R0_matching_strong_etag_is_accepted() =>
         Assert.Equal(RescueMode.R0, RescueEvaluator.Evaluate(Job(), New, Probe(), null, null).Mode);
 
     [Theory]
+    [InlineData("https://cdn.example.com/f/file.iso?token=new")]
     [InlineData("https://mirror.example.net/f/file.iso?token=new")]
     [InlineData("https://cdn.example.com/f/other.iso?token=new")]
     [InlineData("http://cdn.example.com/f/file.iso?token=new")]
     public void Matching_etag_does_not_authorize_reuse_from_another_resource(string url)
     {
-        RescueDecision result = RescueEvaluator.Evaluate(Job(), new Uri(url), Probe(), null, null);
+        RescueDecision result = RescueEvaluator.Evaluate(Job(), new Uri(url), Probe(resource: new Uri(url)), null, null);
         Assert.False(result.Accepted);
         Assert.Equal(RescueMode.R4, result.Mode);
     }
@@ -413,7 +415,7 @@ public class RescueEvaluatorTests
         var lm = new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero);
         DownloadJob job = Job(IdentityLevel.LastModified, null);
         Assert.Equal(RescueMode.R0, RescueEvaluator.Evaluate(job, New, Probe(null, lm: lm), null, null).Mode);
-        Assert.False(RescueEvaluator.Evaluate(job, new Uri("https://mirror.example.net/other.iso"), Probe(null, lm: lm), null, null).Accepted);
+        Assert.False(RescueEvaluator.Evaluate(job, new Uri("https://mirror.example.net/other.iso"), Probe(null, lm: lm, resource: new Uri("https://mirror.example.net/other.iso")), null, null).Accepted);
         Assert.False(RescueEvaluator.Evaluate(job, New, Probe(null, lm: lm.AddHours(1)), null, null).Accepted);
     }
 

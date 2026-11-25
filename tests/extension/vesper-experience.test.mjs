@@ -8,7 +8,7 @@ import { webcrypto } from 'node:crypto';
 const DAY = 24 * 60 * 60_000;
 const source = readFileSync(new URL('../../extension/vesper-experience.js', import.meta.url), 'utf8');
 
-function load(saved = {}) {
+function load(saved = {}, cryptoProvider = webcrypto) {
   const data = structuredClone(saved);
   let writes = 0;
   const chrome = { storage: { local: {
@@ -16,7 +16,7 @@ function load(saved = {}) {
     set: async values => { writes++; Object.assign(data, structuredClone(values)); },
     remove: async key => { delete data[key]; }
   } } };
-  const context = { chrome, crypto: webcrypto, TextEncoder, Uint8Array, Date };
+  const context = { chrome, crypto: cryptoProvider, TextEncoder, Uint8Array, Date };
   vm.createContext(context);
   vm.runInContext(source + '\n;globalThis.experience = VesperExperience;', context);
   return { experience: context.experience, data, writes: () => writes };
@@ -117,6 +117,27 @@ test('clearing forgets everything', async () => {
   await experience.note('files.example', 'takeover', 'refused');
   await experience.note('files.example', 'takeover', 'refused');
   await experience.clear();
+  assert.equal(data.vesperExperience, undefined);
+  assert.equal(await experience.promising('files.example', 'takeover'), true);
+});
+
+test('clearing during a hash cannot restore old experience', async () => {
+  let startHash, releaseHash;
+  const started = new Promise(resolve => { startHash = resolve; });
+  const released = new Promise(resolve => { releaseHash = resolve; });
+  const { experience, data } = load({}, {
+    randomUUID: () => webcrypto.randomUUID(),
+    subtle: { async digest(...args) {
+      startHash();
+      await released;
+      return webcrypto.subtle.digest(...args);
+    } }
+  });
+  const note = experience.note('files.example', 'takeover', 'refused');
+  await started;
+  await experience.clear();
+  releaseHash();
+  await note;
   assert.equal(data.vesperExperience, undefined);
   assert.equal(await experience.promising('files.example', 'takeover'), true);
 });

@@ -40,7 +40,7 @@ public sealed class PieceMap
 
             if (pieceLength < 16 * 1024 || pieceLength > 1L << 30) { error = "Piece length must be between 16 KiB and 1 GiB."; return false; }
             if (total <= 0) { error = "Total length must be positive."; return false; }
-            long expected = (total + pieceLength - 1) / pieceLength;
+            long expected = 1 + (total - 1) / pieceLength;
             if (hashes.Count != expected) { error = $"Expected {expected} piece hashes, found {hashes.Count}."; return false; }
             if (hashes.Any(h => h.Length != 64 || !h.All(Uri.IsHexDigit))) { error = "Piece hashes must be 64-character SHA-256 hex values."; return false; }
 

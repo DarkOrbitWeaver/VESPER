@@ -476,6 +476,7 @@ internal sealed class InstallTransaction(InstallPaths paths, IInstallRegistratio
         to.Position = 0;
         if (!hash.GetHashAndReset().AsSpan().SequenceEqual(SHA256.HashData(to)))
             throw new InvalidDataException("The repair and uninstall program failed verification.");
+        to.Flush(flushToDisk: true);
     }
 
     internal static void CheckPath(string path)

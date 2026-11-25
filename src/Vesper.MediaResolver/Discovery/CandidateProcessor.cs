@@ -48,7 +48,7 @@ internal sealed class CandidateProcessor
         // Reserve header slots in input order; network completion order must not change the result.
         var headerSlots = ordered.Select((c, i) => (c, i))
             .Where(x => x.c.Kind is not (CandidateKind.Hls or CandidateKind.Dash)
-                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov" or "webm"))
+                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov" or "webm" or "ogg" or "oga" or "ogv" or "opus"))
             .Take(MaxHeaderReads).Select(x => x.i).ToHashSet();
         await Parallel.ForEachAsync(Enumerable.Range(0, ordered.Length),
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _o.MaxConcurrentRequests), CancellationToken = ct },
@@ -151,6 +151,8 @@ internal sealed class CandidateProcessor
             }
             else if (start is not null && (CodecInfo.ContainerFromMime(ctype) ?? ExtensionOf(probe, c)) == "webm")
                 facts = WebmHeaderFacts.Read(start, probe.ContentLength);
+            else if (start is not null && (CodecInfo.ContainerFromMime(ctype) ?? ExtensionOf(probe, c)) is "ogg" or "oga" or "ogv" or "opus")
+                facts = ReadOggAudioFacts(start);
             if (facts is { Encrypted: true })
                 return new(null, null, MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
             if (rangedWitness && (facts is not { HasVideo: true, HasAudio: true, DurationSeconds: > 0 }
@@ -169,6 +171,34 @@ internal sealed class CandidateProcessor
         outcome.AudioTracks.AddRange(m.AudioTracks);
         outcome.Subtitles.AddRange(m.Subtitles);
         outcome.Duration ??= m.Duration;
+    }
+
+    // Some servers label audio-only Ogg as video/ogg. Identify the actual logical streams
+    // from the bounded beginning-of-stream pages, never from the extension alone.
+    private static DirectMediaFacts? ReadOggAudioFacts(ReadOnlySpan<byte> bytes)
+    {
+        string? codec = null;
+        int streams = 0;
+        while (bytes.Length >= 27)
+        {
+            if (!bytes[..4].SequenceEqual("OggS"u8) || bytes[4] != 0) return null;
+            int segments = bytes[26];
+            if (bytes.Length < 27 + segments || segments == 0) return null;
+            int size = 0;
+            foreach (byte length in bytes.Slice(27, segments)) size += length;
+            int offset = 27 + segments;
+            if (bytes.Length < offset + size) return null;
+            if ((bytes[5] & 2) == 0)
+                return streams == 1 && codec is not null
+                    ? new DirectMediaFacts(false, true, null, null, null, codec, null, false) : null;
+            if ((bytes[5] & 1) != 0 || ++streams > 1) return null;
+            var body = bytes.Slice(offset, size);
+            codec = body.StartsWith("OpusHead"u8) ? "opus"
+                : body.Length >= 7 && body[0] == 1 && body[1..].StartsWith("vorbis"u8) ? "vorbis" : null;
+            if (codec is null) return null;
+            bytes = bytes[(offset + size)..];
+        }
+        return null;
     }
 
     private static bool IsMp4(ProbeResult p, MediaCandidate c) =>
@@ -251,7 +281,7 @@ internal sealed class CandidateProcessor
             Width = facts?.Width ?? c.Width,
             Height = facts?.Height ?? c.Height,
             VideoCodec = audio ? null : facts?.VideoCodec,
-            AudioCodec = facts is { HasAudio: true } ? facts.AudioCodec : null,
+            AudioCodec = facts is { HasAudio: true } ? facts.AudioCodec : audio && ctype is "audio/mpeg" or "audio/mp3" ? "mp3" : null,
             BitrateKbps = c.Bitrate is { } b ? (int)Math.Min(int.MaxValue, b / 1000) : null,
             FileSize = p.ContentLength,
             ExpiresAt = ExpiryParser.FromUrl(c.Url),

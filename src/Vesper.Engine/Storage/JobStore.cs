@@ -287,8 +287,7 @@ public sealed class JobStore : IDisposable
         }
     }
 
-    // ---- jobs -------------------------------------------------------------------------------------------------
-
+    // jobs
     private static readonly string[] Columns =
     [
         "id", "kind", "source_url", "previous_urls", "file_name", "name_locked", "destination", "partial_path", "final_path",
@@ -525,8 +524,7 @@ public sealed class JobStore : IDisposable
         };
     }
 
-    // ---- idempotent browser submissions -------------------------------------------------------------------------
-
+    // idempotent browser submissions
     public bool TryGetSubmission(string requestId, out Guid jobId)
     {
         lock (_gate)
@@ -540,14 +538,15 @@ public sealed class JobStore : IDisposable
         }
     }
 
-    // Separate registration is retained for import/test utilities; new browser jobs
-    // always use Save(job, submissionId) so both rows commit in one transaction.
-    public void RecordSubmission(string requestId, Guid jobId) =>
-        Execute("INSERT OR IGNORE INTO submissions(request_id, job_id, created_utc) VALUES($r,$j,$t);",
-            ("$r", requestId), ("$j", jobId.ToString("D")), ("$t", Iso(DateTime.UtcNow)));
+    // New jobs use Save(job, submissionId); adoption can claim an existing job separately.
+    public void RecordSubmission(string requestId, Guid jobId)
+    {
+        lock (_gate)
+            Execute("INSERT OR IGNORE INTO submissions(request_id, job_id, created_utc) VALUES($r,$j,$t);",
+                ("$r", requestId), ("$j", jobId.ToString("D")), ("$t", Iso(DateTime.UtcNow)));
+    }
 
-    // ---- bounded event log (privacy: callers pass redacted text) --------------------------------------------------
-
+    // bounded event log (privacy: callers pass redacted text)
     public void LogEvent(Guid? jobId, string kind, string detail)
     {
         lock (_gate)
@@ -578,8 +577,7 @@ public sealed class JobStore : IDisposable
         }
     }
 
-    // ---- helpers ----------------------------------------------------------------------------------------------
-
+    // helpers
     private static string Iso(DateTime utc) => utc.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
     private void Execute(string sql, params (string, object?)[] args)

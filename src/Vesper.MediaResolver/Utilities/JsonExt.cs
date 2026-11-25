@@ -93,7 +93,12 @@ public static class JsonExt
             {
                 foreach (var p in cur.EnumerateObject())
                 {
-                    if (p.Name == propertyName && p.Value.ValueKind == JsonValueKind.Object) { found++; yield return p.Value; }
+                    if (p.Name == propertyName && p.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        found++;
+                        yield return p.Value;
+                        if (found >= maxResults) yield break;
+                    }
                     if (p.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array) stack.Push(p.Value);
                 }
             }

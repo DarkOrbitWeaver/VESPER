@@ -113,7 +113,8 @@ public sealed record MediaMergePlan
             foreach (MergeSubtitle subtitle in Subtitles)
             {
                 if (!Uri.TryCreate(subtitle.Url, UriKind.Absolute, out Uri? uri)) continue;
-                sb.Append("|S:").Append(HttpTransport.ResourceIdentity(uri)).Append(',')
+                // Preserve the existing subtitle fingerprint; the query is hashed separately below.
+                sb.Append("|S:").Append(HttpTransport.LegacyResourceIdentity(uri)).Append(',')
                     .Append(JsonSerializer.Serialize(new[] { subtitle.Format, subtitle.Language, subtitle.Name ?? "" }))
                     .Append(',').Append(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(uri.Query))));
             }

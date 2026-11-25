@@ -685,7 +685,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             MediaDiscoveryResult result = await Task.Run(() => _resolver.ResolveAsync(new MediaDiscoveryRequest
             { Url = _url, Browser = _browserContext, Progress = updates,
                 Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.ItemOnly } }, attempt), attempt);
-            if (_lifetime.IsCancellationRequested || IsDisposed) return;
+            if (attempt.IsCancellationRequested || IsDisposed) return;
             if (result.Item is { } item)
                 DisplayItem(item);
             else if (result.Collection is { } collection)
@@ -701,12 +701,12 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception) when (!_lifetime.IsCancellationRequested)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            if (!IsDisposed) ShowUnavailable("This media source could not be inspected.",
+            if (!IsDisposed && !attempt.IsCancellationRequested) ShowUnavailable("This media source could not be inspected.",
                 "Check your connection, then check again or use the VESPER browser picker.");
         }
-        finally { if (!IsDisposed) SetBusy(false); }
+        finally { if (!IsDisposed && !attempt.IsCancellationRequested) SetBusy(false); }
     }
 
     private void DisplayItem(MediaItem item)
@@ -799,7 +799,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
             if (!_posterCache.TryGetValue(url, out byte[]? imageBytes))
             {
                 imageBytes = await _thumbnails.GetThumbnailAsync(url, token);
-                if (imageBytes is null) { if (_posterUrl == url) _posterUrl = null; return; }
+                if (imageBytes is null) { if (!token.IsCancellationRequested && _posterUrl == url) _posterUrl = null; return; }
                 if (token.IsCancellationRequested || IsDisposed) return;
                 if (_posterCache.Count >= 8) _posterCache.Remove(_posterCache.Keys.First());
                 _posterCache[url] = imageBytes;
@@ -813,14 +813,18 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 if (decoded.Width > 4096 || decoded.Height > 4096 || (long)decoded.Width * decoded.Height > 4_000_000) return null;
                 return new Bitmap(decoded);
             }, token);
-            if (image is null) return;
+            if (image is null)
+            {
+                if (!token.IsCancellationRequested && _posterUrl == url) _posterUrl = null;
+                return;
+            }
             if (token.IsCancellationRequested || IsDisposed) { image.Dispose(); return; }
             ReplacePoster(image);
         }
         catch (Exception ex) when (ex is IOException or ArgumentException or OutOfMemoryException
             or System.Net.Http.HttpRequestException or Vesper.MediaResolver.Models.MediaResolverException
             or OperationCanceledException or ObjectDisposedException or System.Runtime.InteropServices.ExternalException)
-        { if (_posterUrl == url) _posterUrl = null; /* optional artwork; placeholder remains */ }
+        { if (!token.IsCancellationRequested && _posterUrl == url) _posterUrl = null; }
     }
 
     private void UpdatePlayableFormats(MediaItem item)
@@ -996,7 +1000,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 _notice.Text = "This video will be saved with audio if the source includes it.";
             else if (_playableFormats.Any(r => r.Id == choice.FormatId && r.AudioUnverified))
                 _notice.Text = "Audio is unconfirmed and will be checked before publication.";
-            if (choice.SubtitleTracks is { Count: > 0 })
+            if (choice.SubtitleNotice is not null || choice.SubtitleTracks is { Count: > 0 })
             {
                 string subtitleNotice = choice.SubtitleNotice ?? "Selected subtitles are saved as separate files.";
                 _notice.Text = (_notice.Text.Length > 0 ? _notice.Text + " " : "") + subtitleNotice;

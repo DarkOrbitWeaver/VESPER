@@ -4,7 +4,7 @@ namespace Vesper.Engine;
 
 /// <summary>What one request to the replacement link revealed. Built from a single ranged GET; the body is never read.</summary>
 public sealed record ProbeFacts(int Status, bool RangeOk, long? TotalBytes, string? StrongEtag, DateTimeOffset? LastModified,
-    bool IdentityEncoding, string? FinalResourceIdentity = null);
+    bool IdentityEncoding, string? FinalResourceIdentity = null, bool StrongLastModified = false);
 
 public sealed record RescueDecision(RescueMode Mode, bool Accepted, string Message);
 
@@ -49,15 +49,10 @@ public static class RescueEvaluator
                 : Reject("The piece-checksum list describes a different file size than the new link serves.");
         }
 
-        Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? old);
-        // An ETag only identifies a representation within the scope of its resource.
-        // A different host or path may reuse the same ETag for unrelated bytes.
-        bool sameStartingResource = old is not null && UrlPolicy.IsSameOrigin(old, newUrl)
-            && UrlPolicy.IsSameResource(old, newUrl);
-        bool sameFinalResource = HttpTransport.IsResourceIdentity(job.FinalResourceIdentity)
-            && HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity)
+        // Validators are scoped to the final resource, not merely its host and path.
+        bool sameResource = HttpTransport.IsCurrentResourceIdentity(job.FinalResourceIdentity)
+            && HttpTransport.IsCurrentResourceIdentity(probe.FinalResourceIdentity)
             && string.Equals(job.FinalResourceIdentity, probe.FinalResourceIdentity, StringComparison.Ordinal);
-        bool sameResource = sameStartingResource || sameFinalResource;
         string differs = "";
         if (job.Identity == IdentityLevel.StrongEtag)
         {
@@ -69,7 +64,7 @@ public static class RescueEvaluator
 
         bool sameTime = job.LastModified is not null && probe.LastModified is not null
             && job.LastModified.Value.ToUnixTimeSeconds() == probe.LastModified.Value.ToUnixTimeSeconds();
-        if (job.Identity == IdentityLevel.LastModified && sameResource && sameTime)
+        if (job.Identity == IdentityLevel.LastModified && sameResource && sameTime && probe.StrongLastModified)
             return Accept(RescueMode.R0, "Same address, size and modification time. Saved data will be reused.");
 
         if (trustedSha256 is not null)
@@ -96,6 +91,8 @@ public sealed partial class DownloadEngine
         RequestCredentials? replacementCredentials, DateTimeOffset? mediaExpiresAt = null, string? expectedExpiredSource = null,
         bool commit = true, BrowserAdoption? adoption = null)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         // commit: false answers "would this link be accepted?" and changes nothing. It is only used together with
         // expectedExpiredSource, which refuses a download that is still running instead of stopping it.
         DownloadJob? job;
@@ -156,6 +153,11 @@ public sealed partial class DownloadEngine
         PieceMap? pieces = null;
         string? pieceJson = input?.PieceMapJson ?? snapshot.PieceMapJson;
         if (pieceJson is not null && !PieceMap.TryParse(pieceJson, out pieces, out string pieceError)) return Rejected(pieceError);
+        if (snapshot.Reason == "recovery-integrity-missing" && input?.PieceMapJson is null)
+            return Rejected("Provide the original trusted piece-checksum map before continuing this recovered download.");
+        if ((sha is not null || pieces is not null) && (snapshot.Output != MediaOutput.Original
+            || snapshot.MediaMetadataJson is not null || DirectMediaPlan.TryWebmClip(snapshot.MediaPlanJson, out _)))
+            return Rejected("This download changes the source file. A source checksum cannot verify its processed output. Saved data was kept.");
 
         long retained = snapshot.Extents.TotalBytes;
         if (retained == 0)
@@ -163,7 +165,7 @@ public sealed partial class DownloadEngine
             if (!commit) return new RescueResult(true, RescueMode.None, "", 0);
             try
             {
-                if (!ApplyRescue(job, snapshot, uri, new RescueDecision(RescueMode.None, true, ""), null, null, null, null,
+                if (!ApplyRescue(job, snapshot, uri, new RescueDecision(RescueMode.None, true, ""), null, sha, pieces, null,
                         replacementCredentials, mediaExpiresAt, adoption))
                     return Rejected("This download changed while checking its replacement link. Try again.");
             }
@@ -189,11 +191,11 @@ public sealed partial class DownloadEngine
             return new RescueResult(false, decision.Mode, decision.Message, retained);
         }
 
-        if (!HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity))
+        if (!HttpTransport.IsCurrentResourceIdentity(probe.FinalResourceIdentity))
             return Rejected("The replacement did not provide a verifiable final file location. Saved data was kept.");
 
-        bool sameFinalResource = HttpTransport.IsResourceIdentity(snapshot.FinalResourceIdentity)
-            && HttpTransport.IsResourceIdentity(probe.FinalResourceIdentity)
+        bool sameFinalResource = HttpTransport.IsCurrentResourceIdentity(snapshot.FinalResourceIdentity)
+            && HttpTransport.IsCurrentResourceIdentity(probe.FinalResourceIdentity)
             && string.Equals(snapshot.FinalResourceIdentity, probe.FinalResourceIdentity, StringComparison.Ordinal);
         if (!sameFinalResource && decision.Mode != RescueMode.R1b)
         {
@@ -253,7 +255,7 @@ public sealed partial class DownloadEngine
         string? finalIdentity = response.RequestMessage?.RequestUri is { } finalUri
             ? HttpTransport.ResourceIdentity(finalUri) : null;
         return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response),
-            HttpFacts.IsIdentityEncoded(response), finalIdentity);
+            HttpFacts.IsIdentityEncoded(response), finalIdentity, HttpFacts.HasStrongLastModified(response));
     }
 
     private bool ApplyRescue(DownloadJob job, DownloadJob snapshot, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,
@@ -280,6 +282,8 @@ public sealed partial class DownloadEngine
             updated.SourceUrl = uri.AbsoluteUri;
             updated.FinalResourceIdentity = probe?.FinalResourceIdentity;
             updated.RescueMode = decision.Mode;
+            updated.ExpectedSha256 = sha ?? job.ExpectedSha256;
+            updated.Sha256Verified = false;
             if (mediaExpiresAt is not null) updated.MediaExpiresAt = mediaExpiresAt;
 
             if (decision.Mode is RescueMode.R1 or RescueMode.R1b && probe is not null)
@@ -287,12 +291,10 @@ public sealed partial class DownloadEngine
                 updated.ETag = probe.StrongEtag;
                 updated.LastModified = probe.LastModified;
                 updated.Identity = probe.StrongEtag is not null ? IdentityLevel.StrongEtag
-                    : probe.LastModified is not null ? IdentityLevel.LastModified : IdentityLevel.None;
+                    : probe.StrongLastModified ? IdentityLevel.LastModified : IdentityLevel.None;
                 updated.UnverifiedResumeApproved = true;
                 updated.AcceptsRanges = true;
-                updated.ExpectedSha256 = sha ?? job.ExpectedSha256;
                 updated.RescueCandidate = decision.Mode == RescueMode.R1;
-                updated.Sha256Verified = false;
             }
             if (decision.Mode == RescueMode.R1b && pieces is not null && verified is not null)
             {
@@ -301,14 +303,19 @@ public sealed partial class DownloadEngine
                 updated.Extents = verified;
             }
             if (decision.Mode == RescueMode.None)
+            {
                 (updated.ETag, updated.LastModified, updated.Identity, updated.AcceptsRanges) =
                     (null, null, IdentityLevel.None, false);
+                updated.PieceMapJson = pieces?.ToJson();
+                if (pieces is not null) updated.TotalBytes = pieces.TotalLength;
+            }
 
             updated.State = JobState.Queued;
             updated.Reason = "";
             updated.Message = "";
             updated.RetryCount = 0;
             updated.NextRetryUtc = null;
+            if (HasConflictingDownloadLocked(updated)) return false;
             if (adoption is not null)
             {
                 // Chrome's parked transfer now follows this download. A receipt without the saved job below is inert.
@@ -317,6 +324,8 @@ public sealed partial class DownloadEngine
                     AdoptionTransferId = adoption.RequestId[..^2], AdoptionReleased = false };
             }
             SaveLocked(updated); // The durable job mutation happens before any in-memory one.
+            if (updated.Extents.TotalBytes > 0 && updated.PartialIdentity is not null)
+                WriteManifest(updated);
             if (adoption is not null) _pendingAdoptions.Remove(adoption.RequestId[..^2]);
 
             RemoveDuplicateCandidateLocked(job, job.SourceUrl);

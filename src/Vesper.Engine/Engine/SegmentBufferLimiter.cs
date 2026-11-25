@@ -24,7 +24,8 @@ internal sealed class SegmentBufferLimiter
 
     internal static long Reservation(long maxCapacity, long? knownCapacity, int copies = 1)
     {
-        if (maxCapacity <= 0 || copies <= 0) throw new ArgumentOutOfRangeException();
+        if (maxCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(maxCapacity));
+        if (copies <= 0) throw new ArgumentOutOfRangeException(nameof(copies));
         if (knownCapacity is < 0) throw new ArgumentOutOfRangeException(nameof(knownCapacity));
         if (knownCapacity is null) return CapacityReservation(maxCapacity, copies);
         long wanted = Math.Max(knownCapacity.Value, Math.Min(maxCapacity, DefaultBufferCapacity));
@@ -36,14 +37,16 @@ internal sealed class SegmentBufferLimiter
 
     internal static long ContentLengthReservation(long maxCapacity, long contentLength, int copies = 1)
     {
-        if (maxCapacity <= 0 || contentLength < 0 || contentLength > maxCapacity || copies <= 0)
-            throw new ArgumentOutOfRangeException();
+        if (maxCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(maxCapacity));
+        if (contentLength < 0 || contentLength > maxCapacity) throw new ArgumentOutOfRangeException(nameof(contentLength));
+        if (copies <= 0) throw new ArgumentOutOfRangeException(nameof(copies));
         return CapacityReservation(contentLength > 0 ? contentLength : Math.Min(maxCapacity, DefaultBufferCapacity), copies);
     }
 
     internal static long CapacityReservation(long capacity, int copies = 1)
     {
-        if (capacity < 0 || copies <= 0) throw new ArgumentOutOfRangeException();
+        if (capacity < 0) throw new ArgumentOutOfRangeException(nameof(capacity));
+        if (copies <= 0) throw new ArgumentOutOfRangeException(nameof(copies));
         return checked(capacity * copies);
     }
 
@@ -73,7 +76,7 @@ internal sealed class SegmentBufferLimiter
         return new ValueTask<SegmentBufferLease>(WaitAsync(waiter));
     }
 
-    private async Task<SegmentBufferLease> WaitAsync(Waiter waiter)
+    private static async Task<SegmentBufferLease> WaitAsync(Waiter waiter)
     {
         try { return await waiter.Completion.Task.ConfigureAwait(false); }
         finally { waiter.Registration.Dispose(); }

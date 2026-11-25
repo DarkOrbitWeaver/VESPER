@@ -8,7 +8,7 @@ namespace Vesper.Engine;
 /// download record. Each chunk is verified before its acknowledgement and written exactly once, straight into the
 /// destination's staging partial (preallocated, so a full disk fails at the start rather than at 90 %).
 /// <para>Crash consistency: a journal in the data directory names every partial before it is created. "receiving"
-/// entries can never be owned by a job and are deleted at the next start; "committing" entries may be owned, so
+/// entries are removed at startup only with proof that no job owns the same file; "committing" entries may be owned, so
 /// their files are kept. An incomplete transfer never becomes a published file or an engine job.</para>
 /// </summary>
 internal sealed class BrowserBodyReceiver : IDisposable
@@ -33,7 +33,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
 
     internal sealed record Reply(bool Ok, string Code, long Offset = 0, Guid? JobId = null);
 
-    private sealed record JournalEntry(string Id, string Path, string State);
+    private sealed record JournalEntry(string Id, string Path, string State, string? Identity = null);
 
     internal sealed class Transfer(string origin, string name, long length, string folder, PartialFile file, string? identity) : IDisposable
     {
@@ -140,6 +140,8 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 identity = file.CaptureIdentity();
                 if (OperatingSystem.IsWindows() && identity is null)
                     throw new IOException("Cannot establish the browser file identity.");
+                // Record the actual file identity before its path becomes eligible for crash cleanup.
+                RememberJournal(new JournalEntry(id, path, "receiving", identity));
                 file.EnsureLength(length);
             }
             catch
@@ -215,7 +217,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
             {
                 transfer.File.Flush();
                 string digest = Convert.ToHexString(transfer.Hash.GetHashAndReset());
-                RememberJournal(new JournalEntry(id, transfer.File.Path, "committing"));
+                RememberJournal(new JournalEntry(id, transfer.File.Path, "committing", transfer.Identity));
                 AddResult result = await accept(transfer, digest, ct).ConfigureAwait(false);
                 return result.Ok ? new(true, "accepted", transfer.Offset, result.JobId) : new(false, "rejected");
             }
@@ -233,7 +235,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
         finally { _gate.Release(); }
     }
 
-    // ---- journal -------------------------------------------------------------------------------------------------
+    // journal
 
     private List<JournalEntry> ReadJournal() => ReadJournal(_journal);
 
@@ -252,7 +254,11 @@ internal sealed class BrowserBodyReceiver : IDisposable
             return;
         }
         string temporary = _journal + ".tmp";
-        System.IO.File.WriteAllText(temporary, JsonSerializer.Serialize(entries));
+        using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            JsonSerializer.Serialize(stream, entries);
+            stream.Flush(flushToDisk: true);
+        }
         System.IO.File.Move(temporary, _journal, overwrite: true);
     }
 
@@ -275,27 +281,29 @@ internal sealed class BrowserBodyReceiver : IDisposable
     }
 
     /// <summary>Startup cleanup. Runs before any browser copy can begin.</summary>
-    internal static void RecoverJournal(string dataDirectory)
+    internal static void RecoverJournal(string dataDirectory, IReadOnlySet<string> ownedPaths, bool databaseRecovered)
     {
         string journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
         try
         {
             foreach (JournalEntry entry in ReadJournal(journal))
-                if (entry.State == "receiving") DeleteOrphan(entry.Path);
+                if (!databaseRecovered && entry.State == "receiving") DeleteOrphan(entry, ownedPaths);
             System.IO.File.Delete(journal);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { }
     }
 
-    // Only a regular file named like a VESPER partial inside a VESPER staging folder can be an orphan of this receiver.
-    private static void DeleteOrphan(string path)
+    // Never delete a file based on its name alone, or if a job or recovery manifest may own it.
+    private static void DeleteOrphan(JournalEntry entry, IReadOnlySet<string> ownedPaths)
     {
-        string full = Path.GetFullPath(path);
+        string full = Path.GetFullPath(entry.Path);
         if (!full.EndsWith(".vpart", StringComparison.OrdinalIgnoreCase)
             || !string.Equals(Path.GetFileName(Path.GetDirectoryName(full)), PartialFile.StagingFolderName, StringComparison.OrdinalIgnoreCase))
             return;
-        var file = new FileInfo(full);
-        if (file.Exists && !file.Attributes.HasFlag(FileAttributes.ReparsePoint)) file.Delete();
+        string manifest = RecoveryManifest.PathFor(full);
+        if (ownedPaths.Contains(full) || System.IO.File.Exists(manifest)
+            || System.IO.File.Exists(manifest + ".previous") || System.IO.File.Exists(manifest + ".tmp")) return;
+        _ = PathSafety.TryDeleteTemporaryFile(full, entry.Identity, out _);
     }
 
     public void Dispose()

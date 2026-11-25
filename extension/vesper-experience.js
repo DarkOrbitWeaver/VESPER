@@ -1,12 +1,7 @@
 'use strict';
 
-// What VESPER has learned from how its own acquisition attempts ended, per site and per strategy.
-// It stays on this device. Sites are stored as salted hashes: no addresses, file names, cookies or headers.
-// Only definite outcomes are recorded (a verified file, or the site's own refusal). Timeouts, a busy helper
-// and anything VESPER merely guessed teach nothing, so the memory cannot reinforce its own guesses.
-// Evidence fades with a one-week half-life and the table is capped: one bad afternoon never becomes a
-// permanent rule, and a stand-down is tried again once its evidence has faded.
-// Experience can only make VESPER more cautious. It never unlocks a transfer the safety checks refuse.
+// Local, bounded history of verified transfers and explicit server refusals, keyed by salted site hashes.
+// Evidence decays over time and can only restrict acquisition, never override its safety checks.
 const VesperExperience = (() => {
   const KEY = 'vesperExperience';
   const MAX_ENTRIES = 256;
@@ -59,11 +54,12 @@ const VesperExperience = (() => {
   }
 
   async function standing(site, strategy, now = Date.now()) {
-    const memory = await load();
-    // Nothing learned yet: answer without hashing, so a cold start costs nothing on the download path.
+    const loaded = load();
+    const memory = await loaded;
+    // Skip hashing when there is no saved evidence.
     if (Object.keys(memory.entries).length === 0) return { verified: 0, refused: 0 };
     const key = await keyFor(memory, site, strategy);
-    const entry = key && memory.entries[key];
+    const entry = state === loaded && key && memory.entries[key];
     if (!entry) return { verified: 0, refused: 0 };
     const [verified, refused] = faded(entry, now);
     return { verified, refused };
@@ -77,9 +73,10 @@ const VesperExperience = (() => {
 
   async function note(site, strategy, outcome, now = Date.now()) {
     if (outcome !== 'verified' && outcome !== 'refused') return;
-    const memory = await load();
+    const loaded = load();
+    const memory = await loaded;
     const key = await keyFor(memory, site, strategy);
-    if (!key) return;
+    if (!key || state !== loaded) return;
     const [verified, refused] = memory.entries[key] ? faded(memory.entries[key], now) : [0, 0];
     // A verified file proves the site serves the same file twice, which is what earlier refusals put in doubt.
     memory.entries[key] = outcome === 'verified'

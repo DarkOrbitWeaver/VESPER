@@ -2,7 +2,7 @@ namespace Vesper.MediaResolver.Models;
 
 /// <summary>
 /// Stable browser-to-native interchange format, schema "vesper.discovery/1".
-/// JSON property names are camelCase. See docs/BROWSER_MESSAGE.md.
+/// JSON property names are camelCase.
 /// The message is untrusted input: it is parsed and validated by <c>BrowserMessageParser</c> / <c>BrowserMessageValidator</c>.
 /// </summary>
 public sealed class BrowserDiscoveryMessage

@@ -165,6 +165,25 @@ internal sealed class BilibiliAdapter : AdapterBase
         if (reps.Count == 0)
             return Fail(MediaErrors.NoMedia("Bilibili playurl returned no streams for guest access", browserMayHelp: true));
 
+        if (dash is not null)
+        {
+            // Probe the best audio choices and video qualities with bounded 0-0 range requests.
+            int budget = Math.Clamp(Options.MaxCandidatesPerPage, 0, 12);
+            int[] candidates = reps.Select((representation, index) => (representation, index))
+                .Where(pair => pair.representation.Content == StreamContent.AudioOnly)
+                .OrderByDescending(pair => pair.representation.BitrateKbps).Take(Math.Min(3, budget))
+                .Concat(reps.Select((representation, index) => (representation, index))
+                    .Where(pair => pair.representation.Content == StreamContent.VideoOnly)
+                    .OrderByDescending(pair => pair.representation.Height)
+                    .ThenByDescending(pair => pair.representation.BitrateKbps))
+                .Take(budget).Select(pair => pair.index).ToArray();
+
+            var checkedTracks = await Task.WhenAll(candidates.Select(async index =>
+                (Index: index, Track: await VerifyTrackAsync(reps[index], ct).ConfigureAwait(false)))).ConfigureAwait(false);
+            foreach (var track in checkedTracks)
+                reps[track.Index] = track.Track;
+        }
+
         var item = new MediaItem
         {
             SourceUrl = request.Url,
@@ -182,6 +201,37 @@ internal sealed class BilibiliAdapter : AdapterBase
         };
         return MediaDiscoveryResult.FromItem(item);
     }
+
+    private async Task<MediaRepresentation> VerifyTrackAsync(MediaRepresentation track, CancellationToken ct)
+    {
+        try
+        {
+            ProbeResult probe = await Http.ProbeGetAsync(track.Url, track.Context, ct).ConfigureAwait(false);
+            if (!probe.IsSuccess || probe.StatusCode != 206 || probe.ContentLength is not > 0
+                || probe.StrongETag is not { } tag
+                || probe.ContentType?.StartsWith("text/", StringComparison.OrdinalIgnoreCase) == true)
+                return track;
+
+            string resourceHash = Hash(probe.FinalUrl.AbsoluteUri);
+            string identity = "http-v1:" + Hash(resourceHash + "|" + tag + "|" +
+                probe.ContentLength.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return track with
+            {
+                FileSize = probe.ContentLength,
+                ResourceETag = tag,
+                ResourceUrlSha256 = resourceHash,
+                ContentIdentity = identity
+            };
+        }
+        catch (MediaResolverException)
+        {
+            // A refused probe must not turn an estimated size into a usable merge plan.
+            return track;
+        }
+    }
+
+    private static string Hash(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes(value)));
 
     private static MediaError MapCode(int code, string? message, string stage)
     {

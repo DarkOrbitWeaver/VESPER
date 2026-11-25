@@ -29,7 +29,7 @@ const DEFAULTS = {
   useSignIn: true              // Chrome must grant cookie access before VESPER can use it.
 };
 
-// ---------------------------------------------------------------- native messaging
+// native messaging
 
 // Requests share one multiplexed native connection (native-session.js). Older hosts that do not
 // understand sessions are detected by the handshake and get one process per message, as before.
@@ -173,7 +173,7 @@ async function captureSiteDecision(item, signedIn) {
   return matchesNeverCaptureHost(item) ? 'site-rule' : 'allowed';
 }
 
-// ---------------------------------------------------------------- submission (durable and idempotent)
+// submission (durable and idempotent)
 
 // Pending signed URLs are short-lived and kept in session storage only.
 const PENDING_TTL_MS = 30 * 60_000;
@@ -350,7 +350,7 @@ async function withSignIn(items, context = {}) {
   return { items: enriched, authorized: enriched.some(item => item.cookie !== undefined) };
 }
 
-// ---------------------------------------------------------------- media sources per tab (kept in session storage)
+// media sources per tab (kept in session storage)
 
 const SEGMENT = /\.(ts|m4s|aac|vtt|webvtt|cmfv|cmfa|key)(\?|$)/i;
 const DIRECT = /\.(mp4|webm|m4v|mov|mkv|mp3|m4a|flac|wav|ogg|opus)(\?|$)/i;
@@ -432,9 +432,13 @@ const tabFlushTimers = new Map();
 const tabBadgeCounts = new Map();
 const mediaPrefetchCache = new Map();
 const mediaPrefetchAt = new Map();
-const MEDIA_PREFETCH_TTL = 30_000;
-const MEDIA_PREFETCH_COOLDOWN = 15_000;
-const MEDIA_PREFETCH_LIMIT = 32;
+const MEDIA_PREFETCH_TTL = 120_000;
+const MEDIA_PREFETCH_COOLDOWN = 5_000;
+const MEDIA_PREFETCH_SITE_COOLDOWN = 15_000;
+const MEDIA_PREFETCH_LIMIT = 12;
+const prefetchSiteAt = new Map();
+const pageLookups = new Map();
+let activePrefetches = 0;
 let sourceExpiryScheduled = false;
 let sourceStorageReady = null;
 let sourceBudgetWrites = Promise.resolve();
@@ -453,6 +457,8 @@ function clearMediaPrefetch(tabId) {
     if (entry.tab === tabId) mediaPrefetchCache.delete(key);
   for (const key of mediaLookups.keys())
     if (key.startsWith(String(tabId) + '|')) mediaLookups.delete(key);
+  for (const key of pageLookups.keys())
+    if (key.startsWith(String(tabId) + '|')) pageLookups.delete(key);
 }
 
 function cachedMediaOptions(key) {
@@ -780,10 +786,15 @@ async function pruneObservedSources() {
 
 function rememberMediaOptions(key, tab, reply) {
   // Source choices are single-use. A new picker request needs fresh tokens.
-  if (!reply?.ok || !reply.data?.choices?.length) return;
+  if (!reply?.ok || !reply.data?.choices?.length || reply.data.browserChoice || reply.data.sourceChoices) return;
+  const now = Date.now();
+  const deadline = Date.parse(reply.data.formatsExpireAt || '');
+  const expires = Math.min(now + MEDIA_PREFETCH_TTL, Number.isFinite(deadline) ? deadline - 5000 : now + 30_000);
+  if (expires <= now) return;
+  mediaPrefetchCache.delete(key);
   while (mediaPrefetchCache.size >= MEDIA_PREFETCH_LIMIT)
     mediaPrefetchCache.delete(mediaPrefetchCache.keys().next().value);
-  mediaPrefetchCache.set(key, { tab, reply, expires: Date.now() + MEDIA_PREFETCH_TTL });
+  mediaPrefetchCache.set(key, { tab, reply, expires });
 }
 
 function supportsMediaPrefetch(page) {
@@ -1105,9 +1116,12 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
+  if (prefetch && (route === 'chrome' || message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
+      || !sender.documentId || !binding || !Number.isInteger(message.generation) || message.generation < 1))
+    return { ok: true, data: { prefetchSkipped: true } };
   const auth = route !== 'chrome' && !prefetch
     ? await mediaAuthorization(page.href, sender, { userGesture: true }) : {};
-  const playbackFingerprints = binding && !prefetch && Number.isInteger(message.generation) && message.generation > 0
+  const playbackFingerprints = binding && Number.isInteger(message.generation) && message.generation > 0
     && sender.documentId && Array.isArray(message.playerResourceFingerprints)
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
@@ -1121,7 +1135,7 @@ async function playerOptions(message, sender) {
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   const task = (async () => {
     if (prefetch) {
-      const { prefetchFormats = false } = await chrome.storage.local.get('prefetchFormats');
+      const { prefetchFormats = true } = await chrome.storage.local.get('prefetchFormats');
       if (!prefetchFormats) return { ok: true, data: { prefetchSkipped: true } };
     }
     const state = await tabState(tab);
@@ -1165,16 +1179,14 @@ async function playerOptions(message, sender) {
           possibleSources.push(evidence);
       }
     }
-    if (prefetch && possibleSources.length > 0 && !matching && !matchedManifest)
-      return { ok: true, data: { prefetchSkipped: true } };   // opening the picker verifies; idle pages stay cheap
-    if (prefetch) {
-      if (!supportsMediaPrefetch(page) && !matching && !matchedManifest && possibleSources.length === 0)
-        return { ok: true, data: { prefetchSkipped: true } };
-      const lastPrefetch = mediaPrefetchAt.get(tab);
-      if (lastPrefetch !== undefined && now - lastPrefetch < MEDIA_PREFETCH_COOLDOWN)
-        return { ok: true, data: { prefetchSkipped: true } };
-      mediaPrefetchAt.set(tab, now);
-    }
+    // A page-specific adapter may identify a single video without guessing among feed resources.
+    const singleVideo = binding && identity && (identity.startsWith('tiktok:')
+      || identity.startsWith('dailymotion:')
+      || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
+    if (prefetch && possibleSources.length > 0 && !singleVideo)
+      return { ok: true, data: { prefetchSkipped: true } };
+    if (prefetch && !(supportsMediaPrefetch(page) && identity && !/^https?:/.test(identity)) && !matching && !matchedManifest)
+      return { ok: true, data: { prefetchSkipped: true } };
     // A direct current player also benefits from the verified range route.
     // Do not downgrade a known partial representation into an unchecked URL.
     if (matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching)
@@ -1196,18 +1208,56 @@ async function playerOptions(message, sender) {
 
     if (route !== 'chrome') {
       // A single-video page can give the resolver a better identity than nearby network traffic.
-      const singleVideo = binding && identity && (identity.startsWith('tiktok:')
-        || identity.startsWith('dailymotion:')
-        || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
-      const pageLookup = () => nativeRequest(envelope('media-options', {
-        ...auth,
-        url: page.href, pageTitle: title, candidates: !youTube || candidates.length ? candidates : undefined,
-        ...(playbackFingerprints.length ? { playbackFingerprints } : {})
-      }), 60000);
+      const pageInput = { ...auth, url: page.href, pageTitle: title,
+        candidates: !youTube || candidates.length ? candidates : undefined,
+        ...(playbackFingerprints.length ? { playbackFingerprints } : {}) };
+      // Only anonymous, exact-input requests share a flight. Signed-in clicks retain their own authorization.
+      const pageKey = lookupKey + '|' + JSON.stringify([pageInput.candidates, pageInput.pageTitle]);
+      const pageLookup = async () => {
+        if (auth.authorized || message.refresh === true)
+          return nativeRequest(envelope('media-options', pageInput), 60000);
+        const existing = pageLookups.get(pageKey);
+        // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
+        if (existing) return existing;
+        if (prefetch) {
+          const last = mediaPrefetchAt.get(tab) ?? -Infinity;
+          const site = page.hostname.toLowerCase();
+          const siteUntil = prefetchSiteAt.get(site) ?? 0;
+          const retryAfterMs = Math.max(0, last + MEDIA_PREFETCH_COOLDOWN - now, siteUntil - now);
+          if (activePrefetches >= 2 || retryAfterMs > 0)
+            return { ok: true, data: { prefetchSkipped: true, retryAfterMs: retryAfterMs || 5000 } };
+          for (const [host, until] of prefetchSiteAt) if (until <= now) prefetchSiteAt.delete(host);
+          if (prefetchSiteAt.size >= 64) return { ok: true, data: { prefetchSkipped: true } };
+          mediaPrefetchAt.set(tab, now);
+          prefetchSiteAt.set(site, now + MEDIA_PREFETCH_SITE_COOLDOWN);
+          activePrefetches++;
+        }
+        const work = (async () => {
+          try {
+            const reply = await nativeRequest(envelope('media-options', pageInput), 60000);
+            if (prefetch) {
+              const retryAt = Date.parse(reply?.data?.retryAt || '');
+              if (reply?.code === 'rate-limited' || reply?.code === 'site-refused') {
+                const site = page.hostname.toLowerCase();
+                if (prefetchSiteAt.has(site))
+                  prefetchSiteAt.set(site, Math.max(prefetchSiteAt.get(site), Date.now() + 60_000,
+                    Number.isFinite(retryAt) ? retryAt : 0));
+              }
+            }
+            return reply;
+          } finally {
+            if (prefetch) activePrefetches--;
+          }
+        })();
+        pageLookups.set(pageKey, work);
+        try { return await work; }
+        finally { if (pageLookups.get(pageKey) === work) pageLookups.delete(pageKey); }
+      };
       // Both routes can answer for this player. Where the page lookup keeps being refused, the player's own
       // traffic is asked first and the page lookup becomes the fallback, instead of failing slowly on every click.
       const lookupStrategy = auth.authorized ? 'page-lookup-signed' : 'page-lookup';
-      const bothRoutes = !!singleVideo && possibleSources.length > 0 && !prefetch;
+      if (prefetch) return pageLookup();
+      const bothRoutes = !!singleVideo && possibleSources.length > 0;
       const trafficFirst = bothRoutes && !(await VesperExperience.promising(page.hostname, lookupStrategy));
       const learnLookup = reply => {
         const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
@@ -1248,7 +1298,7 @@ async function playerOptions(message, sender) {
       if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
         // Preserve the page's policy/identity verdict. If it is slow, overlap a
         // bounded exact-source check so a refusal does not cost two serial waits.
-        const hedge = bothRoutes ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+        const hedge = bothRoutes && !pageLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
         let reply;
         try { reply = await pageLookup(); }
         finally { if (hedge !== null) clearTimeout(hedge); }
@@ -1434,7 +1484,7 @@ async function confirmOrStartBrowserChoice(choice) {
     : { ok: false, code: 'chrome-download-failed', message: 'Chrome could not start this download.' };
 }
 
-// ---------------------------------------------------------------- describing a source: honest quality choices
+// describing a source: honest quality choices
 
 const mb = n => n < 1024 ? `${n} B` : n < 104858 ? `${(n / 1024).toFixed(1)} KB`
   : n >= 1073741824 ? `${(n / 1073741824).toFixed(2)} GB` : `${(n / 1048576).toFixed(n >= 104857600 ? 0 : 1)} MB`;
@@ -1480,7 +1530,7 @@ async function describe(url, durationSeconds) {
   return choices.length ? { ok: true, choices, more } : { ok: false, code: 'unsupported', message: 'No downloadable quality was found.' };
 }
 
-// ---------------------------------------------------------------- messages from the popup and content scripts
+// messages from the popup and content scripts
 
 // Content scripts run inside web pages, and a page that breaks out of its sandbox can forge their messages.
 // They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
@@ -1620,7 +1670,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;   // async response
 });
 
-// ---------------------------------------------------------------- context menus (links, video, audio)
+// context menus (links, video, audio)
 
 function contextPageUrl(info, tab) {
   if (Number.isInteger(info?.frameId) && info.frameId > 0 && /^https?:\/\//i.test(info.frameUrl || ''))
@@ -1657,8 +1707,13 @@ async function updateVesperContextMenus(paused) {
 }
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'local' || !changes.vesperPaused) return;
-  return updateVesperContextMenus(changes.vesperPaused.newValue === true);
+  if (areaName !== 'local') return;
+  if (changes.prefetchFormats?.newValue === false || changes.vesperPaused?.newValue === true) {
+    mediaPrefetchCache.clear();
+    // Forget pending cache ownership, but retain the in-flight budget until the requests settle.
+    for (const key of mediaLookups.keys()) if (key.includes('|prefetch|')) mediaLookups.delete(key);
+  }
+  if (changes.vesperPaused) return updateVesperContextMenus(changes.vesperPaused.newValue === true);
 });
 
 chrome.runtime.onInstalled.addListener(async details => {
@@ -1767,7 +1822,7 @@ async function flash(tabId, reply, frameId = 0) {
   }, reply.ok ? 2500 : 5000));
 }
 
-// ---------------------------------------------------------------- Chrome downloads
+// Chrome downloads
 
 importScripts('browser-downloads.js');
 importScripts('browser-managed.js');

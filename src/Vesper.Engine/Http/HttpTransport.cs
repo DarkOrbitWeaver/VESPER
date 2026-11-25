@@ -161,7 +161,7 @@ internal sealed class HttpTransport : IDisposable
             if (!IsRedirect(response.StatusCode))
             {
                 if (spec.ExpectedResourceIdentity is { Length: > 0 } expected
-                    && (!IsResourceIdentity(expected)
+                    && (!IsCurrentResourceIdentity(expected)
                         || !string.Equals(expected, ResourceIdentity(current), StringComparison.Ordinal)))
                 {
                     response.Dispose();
@@ -236,14 +236,23 @@ internal sealed class HttpTransport : IDisposable
 
     internal static string ResourceIdentity(Uri uri)
     {
-        // Signed query values can rotate, so a query-only change is treated as the same resource.
+        // Query parameters can select different files. Hash the full address without storing tokens.
+        string normalized = UrlPolicy.Normalize(uri);
+        return "v2:" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+    }
+
+    internal static string LegacyResourceIdentity(Uri uri)
+    {
         var resource = new UriBuilder(uri) { Query = "", Fragment = "" }.Uri;
-        string normalized = UrlPolicy.Normalize(resource);
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(UrlPolicy.Normalize(resource))));
     }
 
     internal static bool IsResourceIdentity(string? identity) =>
-        identity is { Length: 64 } && identity.All(Uri.IsHexDigit);
+        identity is { Length: 64 } && identity.All(Uri.IsHexDigit) || IsCurrentResourceIdentity(identity);
+
+    internal static bool IsCurrentResourceIdentity(string? identity) =>
+        identity is { Length: 67 } && identity.StartsWith("v2:", StringComparison.Ordinal)
+        && identity.AsSpan(3).ToString().All(Uri.IsHexDigit);
 
     private async Task<IPAddress> ResolveProxyDestinationAsync(Uri uri, CancellationToken ct)
     {

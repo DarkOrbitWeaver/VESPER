@@ -44,6 +44,80 @@ globalThis.VesperIntelligence = (() => {
     const score = Number.isFinite(result.logOdds) ? Math.round(result.logOdds * 2) : -99;
     return { classification, score, reasons: result.reasons, mayExecute: false };
   }
+  // Player intent policy v1. These are ranking weights, not calibrated probabilities.
+  // No DOM, site names, I/O, identity verification or permission to acquire bytes.
+  const PLAYER_POLICY = Object.freeze({
+    area: 5, visible: 1.25, playing: 2, ready: 0.5, progressed: 0.6,
+    controls: 1, audiblePlayback: 1.25, incidentalLoop: -5,
+    interaction: 6, incumbent: 0.75, margin: 1.25, limit: 256
+  });
+  const PLAYER_FEATURES = Object.freeze(['area', 'visible', 'playing', 'ready', 'progressed',
+    'controls', 'audiblePlayback', 'incidentalLoop', 'interaction', 'incumbent']);
+  function playerFeatures(candidates) {
+    if (!Array.isArray(candidates)) return { rows: [], truncated: false, duplicate: false };
+    const truncated = candidates.length > PLAYER_POLICY.limit;
+    const seen = new Set(), usable = [];
+    let largest = 0, duplicate = false;
+    for (const candidate of candidates.slice(0, PLAYER_POLICY.limit)) {
+      if (!candidate || typeof candidate.id !== 'string' || !candidate.id || candidate.id.length > 128
+          || !Number.isFinite(candidate.area) || candidate.area <= 0) continue;
+      if (seen.has(candidate.id)) { duplicate = true; continue; }
+      seen.add(candidate.id);
+      usable.push(candidate);
+      largest = Math.max(largest, candidate.area);
+    }
+    const unit = value => Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+    const flag = value => value === true ? 1 : 0;
+    const rows = usable.map(candidate => {
+      const incidental = candidate.incidentalLoop === true && candidate.interacted !== true;
+      return { id: candidate.id, incidental, features: {
+        area: Math.sqrt(candidate.area / largest),
+        visible: unit(candidate.visibleFraction),
+        playing: flag(candidate.playing),
+        ready: flag(candidate.ready),
+        progressed: flag(candidate.progressed),
+        controls: flag(candidate.controls),
+        audiblePlayback: flag(candidate.playing === true && candidate.muted === false),
+        incidentalLoop: flag(incidental),
+        interaction: flag(candidate.interacted),
+        incumbent: flag(candidate.incumbent)
+      } };
+    });
+    return { rows, truncated, duplicate };
+  }
+  function createPlayerRanker(model) {
+    if (model?.version !== 1 || !model.weights || !Number.isFinite(model.margin)
+        || model.margin < 0.25 || model.margin > 16
+        || Object.keys(model.weights).length !== PLAYER_FEATURES.length)
+      throw new Error('Invalid player model');
+    const weights = {};
+    for (const name of PLAYER_FEATURES) {
+      const weight = model.weights[name];
+      if (!Number.isFinite(weight) || weight < -16 || weight > 16
+          || (name === 'incidentalLoop' ? weight > 0 : weight < 0))
+        throw new Error('Invalid player weight: ' + name);
+      weights[name] = weight;
+    }
+    const margin = model.margin;
+    return candidates => {
+      const { rows, truncated, duplicate } = playerFeatures(candidates);
+      if (!rows.length) return { selected: null, decisive: false, reason: 'no-visible-player' };
+      const ranked = rows.map(row => {
+        const terms = Object.fromEntries(PLAYER_FEATURES.map(name => [name, row.features[name] * weights[name]]));
+        return { id: row.id, score: Object.values(terms).reduce((a, b) => a + b, 0), terms, incidental: row.incidental };
+      }).sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const [best, second] = ranked;
+      const decisive = !truncated && !duplicate && !best.incidental && (!second || best.score - second.score >= margin);
+      // Presentation may choose an anchor when intent is ambiguous. That
+      // cannot promote an unproven source or trigger speculative lookup.
+      return { selected: best.id, decisive, reason: truncated ? 'candidate-limit'
+        : duplicate ? 'duplicate-identity' : best.incidental ? 'incidental-loop'
+        : decisive ? 'leading-evidence' : 'competing-players', ranked };
+    };
+  }
+  const rankPlayers = createPlayerRanker({ version: 1, margin: PLAYER_POLICY.margin,
+    weights: Object.fromEntries(PLAYER_FEATURES.map(name => [name, PLAYER_POLICY[name]])) });
+
   // A local observation timeline: bounded memory, limited lifetime, epoch invalidation on source/identity changes.
   function createMediaLedger({ now = Date.now, maxPlayers = MAX_MEDIA, maxEvidence = MAX_EVIDENCE } = {}) {
     const players = new Map();
@@ -247,5 +321,5 @@ globalThis.VesperIntelligence = (() => {
     return { tier: 'chrome', reason: 'Cannot prove safe handoff' };
   }
   return Object.freeze({ http, safeScope, sourceKind, proposeControl,
-    operationDecision, createMediaLedger, makeBatchPlan, createBatchExecutor, chooseAcquisition, MAX_ITEMS });
+    operationDecision, rankPlayers, createPlayerRanker, playerFeatures, PLAYER_FEATURES, PLAYER_POLICY, createMediaLedger, makeBatchPlan, createBatchExecutor, chooseAcquisition, MAX_ITEMS });
 })();

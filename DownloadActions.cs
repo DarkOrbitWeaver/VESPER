@@ -20,15 +20,18 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
 
     private VesperPalette Colors => UiKit.Palette(preferences());
 
-    private void Info(string text, string title = "VESPER", MessageBoxIcon icon = MessageBoxIcon.Information) =>
+    private void Info(string text, string title = "VESPER", MessageBoxIcon icon = MessageBoxIcon.Information)
+    {
+        if (owner is Control { IsDisposed: true }) return;
         VesperMessageBox.Show(owner, text, title, MessageBoxButtons.OK, icon);
+    }
 
     private bool Confirm(string text, string title, MessageBoxIcon icon = MessageBoxIcon.Question,
         string? action = null, VesperIcon? symbol = null) =>
         VesperMessageBox.Show(owner, text, title, MessageBoxButtons.YesNo, icon, MessageBoxDefaultButton.Button2,
             action, symbol) == DialogResult.Yes;
 
-    // ---- opening --------------------------------------------------------------------------------------------------
+    // opening
 
     /// <summary>Revalidates the path, asks before launching anything runnable, and never runs anything unprompted.</summary>
     public async void Open(JobSnapshot s)
@@ -41,6 +44,11 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         if (owner is Control control) control.UseWaitCursor = true;
         OpenCompletedFileResult result;
         try { result = await engine.OpenCompletedFileAsync(s.Id, path); }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Info("Could not open this file: " + ex.Message, "Open file", MessageBoxIcon.Warning);
+            return;
+        }
         finally
         {
             if (owner is Control { IsDisposed: false } current) current.UseWaitCursor = false;
@@ -54,6 +62,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
 
         using (result.Lease)
         {
+            if (owner is Control { IsDisposed: true }) return;
             try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
             catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
             { Info("The file could not be opened: " + ex.Message, "Open file", MessageBoxIcon.Warning); }
@@ -105,10 +114,12 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
             if (owner is not Control { IsDisposed: true } && !result.Deleted)
                 Info(result.Message, "Locate file", MessageBoxIcon.Warning);
         }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        { Info("Could not locate this file: " + ex.Message, "Locate file", MessageBoxIcon.Warning); }
         finally { owner.Cursor(Cursors.Default); }
     }
 
-    // ---- recovery -------------------------------------------------------------------------------------------------
+    // recovery
 
     public void ReplaceLink(JobSnapshot s)
     {
@@ -143,7 +154,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         }
     }
 
-    // ---- cancel / remove / delete -----------------------------------------------------------------------------------
+    // cancel / remove / delete
 
     public async Task CancelAsync(JobSnapshot snapshot)
     {
@@ -160,7 +171,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         }
     }
 
-    // ---- remove / delete --------------------------------------------------------------------------------------------
+    // remove / delete
 
     public void Remove(IReadOnlyList<JobSnapshot> items)
     {
@@ -192,10 +203,12 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
                 Info(result.Deleted ? $"Moved to the Recycle Bin:\n{result.Path}" : result.Message, "Delete downloaded file",
                     result.Deleted ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        { Info("Could not delete this file: " + ex.Message, "Delete downloaded file", MessageBoxIcon.Warning); }
         finally { owner.Cursor(Cursors.Default); }
     }
 
-    // ---- information -----------------------------------------------------------------------------------------------
+    // information
 
     public async void Verify(JobSnapshot s)
     {
@@ -247,7 +260,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         engine.SetSpeedLimit(s.Id, kb * 1000L);
     }
 
-    // ---- small input dialog in the shared popup style ----------------------------------------------------------------
+    // small input dialog in the shared popup style
 
     public string? AskForText(string title, string caption, string initial, string hintText)
     {

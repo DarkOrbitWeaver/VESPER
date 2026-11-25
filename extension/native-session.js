@@ -1,14 +1,6 @@
-// One multiplexed native-messaging connection for VESPER's request/reply commands.
-//
-// chrome.runtime.sendNativeMessage starts a new host process for every message, and the
-// media picker alone can verify up to nine sources at once. This module opens a single
-// connectNative port on demand, sends every request over it with its own id, and closes
-// the port after a short idle period. A connected native port keeps the service worker
-// alive (Chrome 105+), so the idle close is what keeps VESPER at zero cost when unused.
-//
-// Nothing is retried here. A reply that is lost because the port closed is reported to
-// the caller exactly like a crashed one-shot host, so callers keep their existing
-// duplicate-safe recovery logic.
+// Share one connectNative process across request/reply commands, identified by request ID.
+// Close the idle port so it does not keep the MV3 worker alive.
+// Lost replies are not retried here; callers own duplicate-safe recovery.
 'use strict';
 globalThis.VesperNativeSession = (() => {
   const IDLE_MS = 15_000;

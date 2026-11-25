@@ -382,6 +382,26 @@ public class SiteAdapterTests
     }
 
     [Fact]
+    public async Task InternetArchive_ExplicitFileDoesNotSelectAnotherMovie()
+    {
+        var h = new FakeHttpHandler().Add("https://archive.org/metadata/movies", """
+            {"metadata":{"title":"Two movies","mediatype":"movies"},"files":[
+              {"name":"first.mp4","source":"original","height":720},
+              {"name":"second.mp4","source":"original","height":720},
+              {"name":"second.webm","source":"derivative","original":"second.mp4","height":720}]}
+            """, "application/json");
+        var second = await Resolve(h, "https://archive.org/details/movies/second.mp4");
+        Assert.True(second.IsSuccess, second.Error?.Diagnostic);
+        Assert.Equal(2, second.Item!.Representations.Count);
+        Assert.All(second.Item.Representations, representation => Assert.Contains("/second.", representation.Url.AbsoluteUri));
+        var collection = await Resolve(h, "https://archive.org/details/movies");
+        Assert.Equal(2, collection.Collection!.Entries.Count);
+        Assert.NotEqual(collection.Collection.Entries[0].MediaId, collection.Collection.Entries[1].MediaId);
+        var missing = await Resolve(h, "https://archive.org/details/movies/missing.mp4");
+        Assert.False(missing.IsSuccess);
+    }
+
+    [Fact]
     public async Task InternetArchive_MissingItem_IsUnavailable()
     {
         var h = new FakeHttpHandler().Add("https://archive.org/metadata/nothing_here", "{}", "application/json");
@@ -520,6 +540,29 @@ public class SiteAdapterTests
         Assert.Equal(2160, best.Video!.Height);
         Assert.Equal(192, best.Audio!.BitrateKbps);
         Assert.True(best.NeedsMuxing);
+    }
+
+    [Fact]
+    public async Task Bilibili_VerifiedRangeFacts_EnableNativeTrackPlanning()
+    {
+        var h = BiliServer();
+        string[] paths = ["v80.m4s?deadline=4000000000", "v64.m4s?deadline=4000000000",
+            "v125.m4s", "a192.m4s", "a64.m4s"];
+        foreach (string path in paths)
+            h.Add("https://upos.bilivideo-fixture.example/" + path, new string('x', 4096), "video/mp4",
+                headers: new Dictionary<string, string> { ["ETag"] = "\"fixture\"" });
+        var result = await Resolve(h, "https://www.bilibili.com/video/BV1xx411c7mD");
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.All(result.Item!.Representations, representation =>
+        {
+            Assert.Equal(4096, representation.FileSize);
+            Assert.False(representation.FileSizeIsEstimate);
+            Assert.NotNull(representation.ResourceETag);
+            Assert.NotNull(representation.ContentIdentity);
+            Assert.NotNull(representation.ResourceUrlSha256);
+        });
+        Assert.All(h.Requests.Where(request => request.Url.Host == "upos.bilivideo-fixture.example"),
+            request => Assert.Equal("https://www.bilibili.com/", request.Headers["Referer"]));
     }
 
     [Fact]

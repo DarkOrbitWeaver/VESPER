@@ -10,6 +10,7 @@ public static class JsonBalanced
 {
     public static JsonDocument? ExtractAfter(string text, string marker, int maxChars = 4_000_000)
     {
+        if (string.IsNullOrEmpty(marker) || maxChars <= 0) return null;
         int m = text.IndexOf(marker, StringComparison.Ordinal);
         while (m >= 0)
         {
@@ -33,7 +34,8 @@ public static class JsonBalanced
     {
         int depth = 0;
         bool inString = false, escaped = false;
-        int end = Math.Min(t.Length, start + maxChars);
+        if (start < 0 || start >= t.Length || maxChars <= 0 || t[start] != '{') return null;
+        int end = start + Math.Min(t.Length - start, maxChars);
         for (int i = start; i < end; i++)
         {
             char c = t[i];

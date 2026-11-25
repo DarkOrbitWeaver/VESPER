@@ -10,8 +10,7 @@ public sealed partial class DownloadEngine
 {
     public IReadOnlyList<string> ReadLog() => _store.ReadEvents();
 
-    // ---- finalization: verify (only against a TRUSTED digest) and publish ------------------------------------------------
-
+    // finalization: verify (only against a TRUSTED digest) and publish
     internal async Task<RunOutcome> FinalizeAsync(JobSession session, CancellationToken ct)
     {
         DownloadJob job = session.Job;
@@ -366,12 +365,13 @@ public sealed partial class DownloadEngine
         }
     }
 
-    // ---- restart recovery ---------------------------------------------------------------------------------------------
-
+    // restart recovery
     private void Recover()
     {
-        // Partials of browser copies that were still receiving when the process stopped belong to nobody.
-        BrowserBodyReceiver.RecoverJournal(Options.DataDirectory);
+        var ownedPaths = _jobs.Values.Select(job => job.PartialPath)
+            .Where(path => PathSafety.TryGetFullPath(path, out _, out _))
+            .Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        BrowserBodyReceiver.RecoverJournal(Options.DataDirectory, ownedPaths, _store.RecoveredFromCorruption);
         string[] manifestFolders = RecoveryFolders();
         foreach (string folder in manifestFolders)
             RecoveryManifest.RecoverInterruptedReplacements(folder,
@@ -742,6 +742,14 @@ public sealed partial class DownloadEngine
                     continue;
                 }
                 if (_jobs.ContainsKey(job.Id)) continue;
+                // The database may have held a newer checksum obligation than this sidecar.
+                // Require trusted evidence for manifest-only HTTP recovery when none was recorded.
+                if (job.Kind == JobKind.Http && job.ExpectedSha256 is null && job.PieceMapJson is null)
+                {
+                    job.FinalResourceIdentity = null;
+                    job.Identity = IdentityLevel.None;
+                    job.UnverifiedResumeApproved = false;
+                }
                 job.QueueOrder = order++;
                 SaveLocked(job);
                 _jobs[job.Id] = job;
@@ -751,12 +759,12 @@ public sealed partial class DownloadEngine
         }
     }
 
-    // ---- availability and verification -----------------------------------------------------------------------------------
-
+    // availability and verification
     public Task RefreshAvailabilityAsync() => Task.Run(RefreshAvailability);
 
     private void RefreshAvailability()
     {
+        using var operation = EnterOperation();
         List<(Guid Id, string Path)> targets;
         lock (_lock)
             targets = [.. _jobs.Values.Where(j => j.State == JobState.Completed && !string.IsNullOrEmpty(j.FinalPath)).Select(j => (j.Id, j.FinalPath!))];
@@ -781,6 +789,8 @@ public sealed partial class DownloadEngine
     /// </summary>
     public async Task<VerifyResult> VerifyIntegrityAsync(Guid id, CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         DownloadJob? job;
         lock (_lock) _jobs.TryGetValue(id, out job);
         if (job is null || job.State != JobState.Completed || string.IsNullOrEmpty(job.FinalPath))
@@ -822,10 +832,15 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return false;
             if (job.PendingFinalPath is not null || job.State is JobState.Converting or JobState.Finalizing or JobState.Verifying)
                 return false;
+            if (job.FinalPath is null && (job.Kind == JobKind.Merge || job.Output != MediaOutput.Original
+                || job.MediaMetadataJson is not null || DirectMediaPlan.TryWebmClip(job.MediaPlanJson, out _)))
+                return false;
             DownloadJob saved = job.CopyForUpdate();
             saved.ExpectedSha256 = normalized;
             saved.Sha256Verified = false;
             SaveRecoveredJob(job, saved);
+            if (job.FinalPath is null && !_sessions.ContainsKey(id) && job.Extents.TotalBytes > 0 && job.PartialIdentity is not null)
+                WriteManifest(job);
             Changed(job);
         }
         FlushOutbox();

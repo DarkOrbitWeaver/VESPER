@@ -467,26 +467,6 @@ internal sealed class AddDownloadForm : VesperPopupForm
         Close();
     }
 
-    private void OpenVideoPage()
-    {
-        string[] links = SplitLinks();
-        if (links.Length != 1 || !Vesper.Engine.UrlPolicy.TryParse(links[0], out Uri uri, out _)
-            || !Vesper.Engine.MediaPageLinks.TryGetSite(uri, out _)) return;
-        try
-        {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri)
-                { UseShellExecute = true });
-        }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
-        {
-            VesperMessageBox.Show(this, "The browser couldn't open this page: " + ex.Message,
-                "Open video page", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-        DialogResult = DialogResult.Cancel;
-        Close();
-    }
-
     private void Accept(bool queueOnly)
     {
         string[] links = SplitLinks();

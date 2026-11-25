@@ -102,7 +102,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
     private MediaRequestContext PageContext(MediaDiscoveryRequest request) =>
         request.AuthContext is { HasCredentials: true } auth ? auth with { UserAgent = auth.UserAgent ?? DesktopUserAgent } : ConsentContext;
 
-    // ------------------------------------------------------------------------------------------------ video
+    // video
 
     internal sealed class FormatStats
     {
@@ -563,7 +563,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             .Select(g => new AudioTrack(g.Key, g.First().AudioLanguage, null, g.Any(r => r.IsDefaultAudio), g.First().AudioChannels, g.First().AudioCodec))
             .ToList();
 
-    // ------------------------------------------------------------------------------------------------ collections
+    // collections
 
     private async Task<MediaDiscoveryResult> ResolveCollectionAsync(MediaDiscoveryRequest request, YtTarget t, CancellationToken ct)
     {
@@ -682,7 +682,7 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         }
 
         if (entries.Count == 0 && dynamicMix)
-            return Fail(MediaErrors.SourceChanged("The watch page no longer embeds the Mix panel (page structure change). Mix enumeration needs the InnerTube 'next' endpoint, which is not implemented yet; the current video itself still resolves."));
+            return Fail(MediaErrors.SourceChanged("The watch page did not provide a readable Mix panel. Try the current video on its own."));
         if (entries.Count == 0)
             return Fail(MediaErrors.Unavailable("The playlist is empty, private or unavailable"));
 

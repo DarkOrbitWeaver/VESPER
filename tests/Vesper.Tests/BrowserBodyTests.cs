@@ -253,4 +253,42 @@ public sealed class BrowserBodyTests
         Assert.Empty(Directory.GetFiles(h.Data, "browser-body-*.tmp"));
         Assert.Empty(h.Engine.Snapshots());
     }
+
+    [Theory]
+    [InlineData("owned", true)]
+    [InlineData("replaced", true)]
+    [InlineData("legacy", true)]
+    [InlineData("database-lost", true)]
+    [InlineData("manifest", true)]
+    [InlineData("unclaimed", false)]
+    public void JournalRecoveryRequiresProvenUnownedFile(string scenario, bool retained)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string root = Path.Combine(Path.GetTempPath(), "vesper-body-recovery-" + Guid.NewGuid().ToString("N"));
+        string staging = Path.Combine(root, PartialFile.StagingFolderName);
+        Directory.CreateDirectory(staging);
+        try
+        {
+            string path = Path.Combine(staging, "body.12345678.vpart");
+            File.WriteAllBytes(path, [1, 2, 3]);
+            string? identity;
+            using (var file = PathSafety.OpenTemporaryHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                identity = PathSafety.TemporaryFileIdentity(file);
+            Assert.NotNull(identity);
+            if (scenario == "replaced")
+            {
+                File.Move(path, path + ".original");
+                File.WriteAllBytes(path, [4, 5, 6]);
+            }
+            if (scenario == "manifest") File.WriteAllText(RecoveryManifest.PathFor(path) + ".previous", "{}");
+            var owned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (scenario == "owned") owned.Add(path);
+            File.WriteAllText(Path.Combine(root, BrowserBodyReceiver.JournalFileName),
+                JsonSerializer.Serialize(new[] { new { Id = Transfer, Path = path, State = "receiving",
+                    Identity = scenario == "legacy" ? null : identity } }));
+            BrowserBodyReceiver.RecoverJournal(root, owned, scenario == "database-lost");
+            Assert.Equal(retained, File.Exists(path));
+        }
+        finally { Directory.Delete(root, true); }
+    }
 }

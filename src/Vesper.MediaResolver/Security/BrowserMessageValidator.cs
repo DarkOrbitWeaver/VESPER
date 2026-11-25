@@ -26,11 +26,14 @@ internal static class BrowserMessageValidator
 
     public static ValidatedBrowserContext Validate(BrowserDiscoveryMessage m, DateTimeOffset now, ResolverOptions options)
     {
-        if (m.Schema is null || !m.Schema.StartsWith("vesper.discovery/1", StringComparison.Ordinal))
+        if (!string.Equals(m.Schema, BrowserDiscoveryMessage.CurrentSchema, StringComparison.Ordinal))
             throw new MediaResolverException(MediaErrors.Invalid($"Unsupported browser message schema '{TextUtil.Clip(m.Schema, 40)}'"));
         if (!UrlValidator.TryParse(m.PageUrl, out var page, out var why))
             throw new MediaResolverException(MediaErrors.Invalid($"Invalid pageUrl: {why}"));
         UrlValidator.EnsureAllowed(page, options);
+
+        if (m.Candidates is null || m.Subtitles is null || m.AudioTracks is null)
+            throw new MediaResolverException(MediaErrors.Invalid("Browser media lists must not be null"));
 
         var warnings = new List<string>();
         MediaRequestContext ctx = BuildContext(m, page, now, warnings);
@@ -45,7 +48,8 @@ internal static class BrowserMessageValidator
 
         foreach (var c in m.Candidates.Take(MaxCandidates))
         {
-            if (!UrlValidator.TryParse(c.Url, out var u, out _) || !UrlValidator.IsAllowed(u, options, out var reason))
+            if (c is null) continue;
+            if (!UrlValidator.TryParse(c.Url, out var u, out _) || !UrlValidator.IsAllowed(u, options, out _))
             {
                 v.Warnings.Add($"Dropped candidate with invalid or blocked URL ({UrlRedactor.Redact(c.Url)})");
                 continue;
@@ -75,12 +79,12 @@ internal static class BrowserMessageValidator
 
         foreach (var s in m.Subtitles.Take(MaxSubtitles))
         {
-            if (UrlValidator.TryParse(s.Url, out var su, out _) && UrlValidator.IsAllowed(su, options, out _))
+            if (s is not null && UrlValidator.TryParse(s.Url, out var su, out _) && UrlValidator.IsAllowed(su, options, out _))
                 v.Subtitles.Add(new SubtitleTrack(su, TextUtil.NormalizeLang(s.Language), Short(s.Label, 80),
                     Short(s.Format, 12) ?? UrlUtil.Extension(su) ?? "vtt"));
         }
         foreach (var a in m.AudioTracks.Take(MaxAudioTracks))
-            v.AudioTracks.Add(new AudioTrack($"browser:{v.AudioTracks.Count}", a.Language is null ? null : TextUtil.NormalizeLang(a.Language), Short(a.Label, 80)));
+            if (a is not null) v.AudioTracks.Add(new AudioTrack($"browser:{v.AudioTracks.Count}", a.Language is null ? null : TextUtil.NormalizeLang(a.Language), Short(a.Label, 80)));
 
         return v;
     }
@@ -119,7 +123,7 @@ internal static class BrowserMessageValidator
         string? acceptLanguage = null;
         foreach (var kv in auth.Headers ?? new())
         {
-            if (kv.Value.Length > MaxHeaderChars || HasControl(kv.Value) || HasControl(kv.Key))
+            if (kv.Value is null || kv.Value.Length > MaxHeaderChars || HasControl(kv.Value) || HasControl(kv.Key))
                 throw new MediaResolverException(MediaErrors.Invalid("Forwarded header contains control characters or is too long"));
             if (kv.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)) sensitive["Authorization"] = kv.Value;
             else if (kv.Key.Equals("Accept-Language", StringComparison.OrdinalIgnoreCase)) acceptLanguage = kv.Value;
@@ -129,6 +133,7 @@ internal static class BrowserMessageValidator
         var hosts = new List<string> { page.Host };
         foreach (var h in (auth.AllowedHosts ?? new()).Take(MaxExtraHosts))
         {
+            if (string.IsNullOrWhiteSpace(h)) continue;
             string host = h.Trim().ToLowerInvariant();
             bool ok = Uri.CheckHostName(host) == UriHostNameType.Dns &&
                       (host == page.Host.ToLowerInvariant() || host.EndsWith("." + page.Host.ToLowerInvariant(), StringComparison.Ordinal));

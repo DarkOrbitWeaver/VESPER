@@ -169,6 +169,10 @@ public partial class Form1 : Form
     private readonly HashSet<string> _recentBrowserCompletions = new(StringComparer.Ordinal);
     private readonly VesperPreferences _prefs;
     private readonly DownloadEngine? _engine;
+    private readonly object _refreshGate = new();
+    private readonly CancellationTokenSource _refreshStop = new();
+    private readonly HashSet<Task> _refreshTasks = [];
+    private bool _refreshClosing;
     private readonly DownloadActions? _actions;
     private readonly Func<bool> _requestSleep;
     private readonly Func<bool> _requestShutdown;
@@ -280,7 +284,7 @@ public partial class Form1 : Form
 
     protected override void SetVisibleCore(bool value) => base.SetVisibleCore(_allowVisible && value);
 
-    // ---- engine wiring --------------------------------------------------------------------------------------------
+    // engine wiring
 
     private void AttachEngine(DownloadEngine engine)
     {
@@ -289,7 +293,7 @@ public partial class Form1 : Form
 
         CodecCapabilities.Prime();
         engine.JobChanged += Enqueue;
-        engine.JobChanged += snapshot => { if (MediaSourceRescue.ShouldTryAutomatically(snapshot)) _ = AutoRefreshAsync(engine, snapshot); };
+        engine.JobChanged += snapshot => QueueAutomaticRefresh(engine, snapshot);
         engine.Progress += batch => { foreach (JobSnapshot s in batch) Enqueue(s); };
         engine.JobRemoved += id =>
         {
@@ -660,16 +664,28 @@ public partial class Form1 : Form
 
     private Rectangle NoticeArea => _noticeWorkArea.IsEmpty ? Screen.FromPoint(Cursor.Position).WorkingArea : _noticeWorkArea;
 
-    // "Pause tonight, resume tomorrow": an expired YouTube merge job gets fresh links by itself. The engine only
-    // accepts a plan that continues the saved bytes byte-for-byte, so this is safe to do without asking.
-    private static async Task AutoRefreshAsync(DownloadEngine engine, JobSnapshot job)
+    // Re-resolve expired media links; the engine checks whether the saved data can continue.
+    private void QueueAutomaticRefresh(DownloadEngine engine, JobSnapshot job)
+    {
+        lock (_refreshGate)
+        {
+            if (_refreshClosing || !MediaSourceRescue.ShouldTryAutomatically(job)) return;
+            Task refresh = Task.Run(() => AutoRefreshAsync(engine, job, _refreshStop.Token));
+            _refreshTasks.Add(refresh);
+            _ = refresh.ContinueWith(task => { lock (_refreshGate) _refreshTasks.Remove(task); },
+                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
+    }
+
+    private static async Task AutoRefreshAsync(DownloadEngine engine, JobSnapshot job, CancellationToken stop)
     {
         try
         {
             // A retained prefix may require a full byte-for-byte recheck. Give larger partials
             // a bounded longer budget; the recovery coordinator limits concurrent network work.
             double seconds = Math.Clamp(60 + job.CommittedBytes / (4d * 1024 * 1024), 60, 600);
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(seconds));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stop);
+            timeout.CancelAfter(TimeSpan.FromSeconds(seconds));
             RescueResult result = await MediaSourceRescue.RefreshAutomaticallyAsync(engine, job,
                 EngineHost.MediaNetwork(options: engine.Options), timeout.Token);
             if (!result.Accepted) System.Diagnostics.Trace.WriteLine(result.Message, "Automatic link refresh");
@@ -745,7 +761,7 @@ public partial class Form1 : Form
         if (Visible && WindowState != FormWindowState.Minimized) _noticeWorkArea = Screen.FromControl(this).WorkingArea;
     }
 
-    // ---- window, tray and lifecycle -------------------------------------------------------------------------------
+    // window, tray and lifecycle
 
     private void BuildTray()
     {
@@ -877,14 +893,28 @@ public partial class Form1 : Form
     {
         CancelQueueCompletionPrompt();
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
-        _bridge?.Dispose();
-        _browserHandler?.CloseResolver();
+        Task[] refreshes;
+        lock (_refreshGate)
+        {
+            _refreshClosing = true;
+            refreshes = [.. _refreshTasks];
+        }
+        _refreshStop.Cancel();
+        Task drained = Task.WhenAll([.. refreshes, _bridge?.StopAsync() ?? Task.CompletedTask]);
+        Task release = drained.ContinueWith(task =>
+        {
+            _ = task.Exception;
+            _browserHandler?.CloseResolver();
+            _refreshStop.Dispose();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try { release.Wait(TimeSpan.FromSeconds(2)); }
+        catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex.Message, "VESPER shutdown"); }
         _notice?.Dispose();
         VesperSounds.Stop();
         _tray?.ContextMenuStrip?.Dispose();
         _tray?.Dispose();
         EngineHost.HoldAwake(false);
-        _engine?.Dispose();                       // stops transfers and makes their progress durable
+        _engine?.Dispose();
         base.OnFormClosed(e);
     }
 
@@ -932,7 +962,7 @@ public partial class Form1 : Form
         catch (System.Runtime.InteropServices.ExternalException) { /* another program holds the clipboard; try again next time */ }
     }
 
-    // ---- drag and drop --------------------------------------------------------------------------------------------
+    // drag and drop
 
     protected override void OnDragEnter(DragEventArgs drgevent)
     {
@@ -1017,7 +1047,7 @@ public partial class Form1 : Form
         return null;
     }
 
-    // ---- layout (unchanged structure) -------------------------------------------------------------------------------
+    // layout (unchanged structure)
 
     private void WireEvents()
     {
@@ -1247,7 +1277,7 @@ public partial class Form1 : Form
         UpdateFooter();
     }
 
-    // ---- list -----------------------------------------------------------------------------------------------------
+    // list
 
     internal event Action? PreviewAddRequested;
     internal event Action? PreviewSettingsRequested;
@@ -1407,7 +1437,7 @@ public partial class Form1 : Form
         LayoutSelectionToolbar();
     }
 
-    // ---- commands -------------------------------------------------------------------------------------------------
+    // commands
 
     private void ShowDetails(DownloadItem record)
     {
@@ -1743,7 +1773,7 @@ public partial class Form1 : Form
         to.ScheduleStart = from.ScheduleStart; to.ScheduleEnd = from.ScheduleEnd; to.BrowserAction = from.BrowserAction;
     }
 
-    // ---- row context menu: built once, reused, only availability changes per right-click -------------------------------------
+    // row context menu: built once, reused, only availability changes per right-click
 
     private void BuildMenuOnce()
     {

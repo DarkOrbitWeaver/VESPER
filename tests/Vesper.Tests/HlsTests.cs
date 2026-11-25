@@ -17,13 +17,13 @@ public class HlsTests
     private static Guid AddHls(Harness h, FaultServer s, string path) =>
         h.Engine.Add(new AddRequest(s.Url(path), FileName: "video", Kind: JobKind.Hls)).JobId;
 
-    private static byte[] Id3TimestampTag(ulong timestamp)
+    private static byte[] Id3TimestampTag(ulong timestamp, byte version = 3)
     {
         byte[] owner = "com.apple.streaming.transportStreamTimestamp"u8.ToArray();
         int bodyLength = owner.Length + 1 + 8;
         byte[] tag = new byte[10 + 10 + bodyLength];
         "ID3"u8.CopyTo(tag);
-        tag[3] = 3;
+        tag[3] = version;
         int tagBodyLength = tag.Length - 10;
         tag[6] = (byte)((tagBodyLength >> 21) & 0x7f);
         tag[7] = (byte)((tagBodyLength >> 14) & 0x7f);
@@ -1208,8 +1208,10 @@ public class HlsTests
         Assert.False(File.Exists(done.PartialPath + ".tracks"));
     }
 
-    [Fact]
-    public async Task SegmentedMergeJob_MergesId3TimestampedPackedAacHlsAudio()
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task SegmentedMergeJob_MergesId3TimestampedPackedAacHlsAudio(byte version)
     {
         await using var server = new FaultServer(); await server.StartAsync();
         string[] fragmentNames = ["av-1.m4s", "av-2.m4s", "av-3.m4s"];
@@ -1237,7 +1239,7 @@ public class HlsTests
             Assert.NotEmpty(samples);
             ulong timestamp = checked((ulong)((Int128)samples[0].Dts * 90_000 / sourceAudio.Timescale));
             using var segment = new MemoryStream();
-            segment.Write(Id3TimestampTag(timestamp));
+            segment.Write(Id3TimestampTag(timestamp, version));
             foreach (TrackSample sample in samples)
                 segment.Write(AdtsFrame(sourceBytes.AsSpan(checked((int)sample.Offset), sample.Size), sourceAudio));
             packedSegments[i] = segment.ToArray();

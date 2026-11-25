@@ -57,7 +57,7 @@ public sealed record CodecCapabilities(bool Known, bool Opus, bool Vorbis, bool 
         { return Unknown; }
     }
 
-    // ---- Media Foundation interop (same GUID conventions as WindowsMediaConverter) ---------------------------
+    // Media Foundation interop (same GUID conventions as WindowsMediaConverter)
 
     private static Guid MediaGuid(int format) => new(format, 0, 0x0010, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71);
     private static readonly Guid MajorAudio = MediaGuid(0x73647561), MajorVideo = MediaGuid(0x73646976);

@@ -46,6 +46,35 @@ public class GenericAdapterTests
         Assert.Equal(StreamContent.AudioOnly, res.Item.Representations[0].Content);
     }
 
+    [Theory]
+    [InlineData("application/octet-stream")]
+    [InlineData("binary/octet-stream")]
+    public async Task GenericBinaryMimeDoesNotHideAClearDashManifest(string mime)
+    {
+        string url = $"{Media}/sample.mpd";
+        var h = new FakeHttpHandler().Add(url, """
+            <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT4S">
+              <Period><AdaptationSet mimeType="video/mp4" codecs="avc1.64001f">
+                <Representation id="v" bandwidth="100000" width="320" height="180">
+                  <SegmentTemplate timescale="1" duration="2" initialization="init.mp4" media="seg-$Number$.m4s" startNumber="1"/>
+                </Representation>
+              </AdaptationSet></Period>
+            </MPD>
+            """, mime);
+        var result = await Resolve(h, url);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(StreamProtocol.Dash, Assert.Single(result.Item!.Representations).Protocol);
+    }
+
+    [Fact]
+    public async Task BinaryMimeDoesNotAuthorizeAnInvalidManifest()
+    {
+        var h = new FakeHttpHandler().Add($"{Media}/sample.mpd", "Not a manifest", "application/octet-stream");
+        var result = await Resolve(h, $"{Media}/sample.mpd");
+        Assert.False(result.IsSuccess);
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, result.Error!.Code);
+    }
+
     [Fact]
     public async Task MutedAutoplayLoopIsRecordedOnlyForItsOwnVideoSource()
     {

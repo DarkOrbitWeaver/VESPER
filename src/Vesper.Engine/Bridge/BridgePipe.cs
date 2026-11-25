@@ -68,7 +68,10 @@ public sealed class BridgeServer : IDisposable
     private readonly Func<string, CancellationToken, Task<string?>>? _setupExitHandler;
     private readonly Action? _setupExitResponseWritten;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _gate = new();
+    private readonly HashSet<Task> _connections = [];
     private Task? _loop;
+    private Task? _stopping;
 
     public BridgeServer(string pipeName, Func<BridgeRequest, CancellationToken, Task<BridgeResponse>> handler,
         Func<string, CancellationToken, Task<string?>>? setupExitHandler = null,
@@ -80,7 +83,14 @@ public sealed class BridgeServer : IDisposable
         _setupExitResponseWritten = setupExitResponseWritten;
     }
 
-    public void Start() => _loop ??= Task.Run(AcceptLoopAsync);
+    public void Start()
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_stopping is not null, this);
+            _loop ??= Task.Run(AcceptLoopAsync);
+        }
+    }
 
     private async Task AcceptLoopAsync()
     {
@@ -111,7 +121,16 @@ public sealed class BridgeServer : IDisposable
                 await pipe.DisposeAsync().ConfigureAwait(false);
                 continue;
             }
-            _ = Task.Run(() => ServeAsync(pipe));
+            lock (_gate)
+            {
+                Task connection = Task.Run(() => ServeAsync(pipe));
+                _connections.Add(connection);
+                _ = connection.ContinueWith(task =>
+                {
+                    _ = task.Exception;
+                    lock (_gate) _connections.Remove(task);
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
         }
     }
 
@@ -253,11 +272,30 @@ public sealed class BridgeServer : IDisposable
         }
     }
 
-    public void Dispose()
+    public Task StopAsync()
+    {
+        lock (_gate) return _stopping ??= Task.Run(DrainAsync);
+    }
+
+    private async Task DrainAsync()
     {
         _stop.Cancel();
-        try { _loop?.Wait(TimeSpan.FromSeconds(2)); }
-        catch (AggregateException) { /* loop ended by cancellation */ }
-        _stop.Dispose();
+        try
+        {
+            if (_loop is not null) await _loop.ConfigureAwait(false);
+        }
+        finally
+        {
+            Task[] connections;
+            lock (_gate) connections = [.. _connections];
+            try { await Task.WhenAll(connections).ConfigureAwait(false); }
+            finally { _stop.Dispose(); }
+        }
+    }
+
+    public void Dispose()
+    {
+        try { StopAsync().Wait(TimeSpan.FromSeconds(2)); }
+        catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex.Message, "Browser bridge shutdown"); }
     }
 }

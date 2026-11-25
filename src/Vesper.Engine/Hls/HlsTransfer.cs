@@ -963,8 +963,6 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (root is not null && new DriveInfo(root) is { IsReady: true } drive
             && drive.AvailableFreeSpace < bytes.Length + engine.Options.FreeSpaceReserve)
             throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "Not enough free disk space. Saved data was kept."));
-        await session.Limiter.AcquireAsync(bytes.Length, ct).ConfigureAwait(false);
-        await engine.GlobalLimiter.AcquireAsync(bytes.Length, ct).ConfigureAwait(false);
         await session.WriteAsync(bytes, offset, report: false, ct).ConfigureAwait(false);
         hash.AppendData(bytes.Span);
     }
@@ -1020,7 +1018,7 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         }
         else if (code == 206)
             throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
-        if (HlsLooksLikeHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
+        if (HttpFacts.IsHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
         ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies).ConfigureAwait(false);
         if (length is long expected && bytes.Length != expected)
             throw new TransientNetworkException("The HLS byte-range response was incomplete.");
@@ -1045,8 +1043,6 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         }
     }
 
-    private static bool HlsLooksLikeHtml(HttpResponseMessage r) => HttpFacts.IsHtml(r);
-
     private async Task<ReadOnlyMemory<byte>> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct,
         SegmentBufferLease? lease = null, int copies = 1)
     {
@@ -1067,6 +1063,9 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 int read;
                 while ((read = await body.ReadAsync(chunk.AsMemory(), stall.Token).ConfigureAwait(false)) > 0)
                 {
+                    stall.CancelAfter(Timeout.InfiniteTimeSpan);
+                    await session.Limiter.AcquireAsync(read, ct).ConfigureAwait(false);
+                    await engine.GlobalLimiter.AcquireAsync(read, ct).ConfigureAwait(false);
                     stall.CancelAfter(engine.Options.StallTimeout);
                     if (buffer.Length + read > limit) throw new RunnerStop(RunOutcome.NeedsAttention("too-large", "A playlist or segment is unreasonably large."));
                     buffer.Write(chunk, 0, read);
@@ -1167,6 +1166,8 @@ public sealed partial class DownloadEngine
 {
     public async Task<MediaProbeResult> ProbeMediaAsync(string url, CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         if (!UrlPolicy.TryParse(url, out Uri uri, out string error)) return new MediaProbeResult("invalid", error, null, null, null, []);
         try
         {
@@ -1187,10 +1188,11 @@ public sealed partial class DownloadEngine
                 var buffer = new char[(int)Math.Min(4 * 1024 * 1024, 1 << 20)];
                 int n = await reader.ReadBlockAsync(buffer, ct).ConfigureAwait(false);
                 string text = new(buffer, 0, n);
+                Uri playlistUri = response.RequestMessage?.RequestUri ?? uri;
                 if (!HlsParser.IsPlaylist(text)) return new MediaProbeResult("unsupported", "That address is not a playlist VESPER understands.", type, null, null, []);
                 if (HlsParser.IsMaster(text))
                 {
-                    IReadOnlyList<HlsVariant> listed = HlsParser.ParseMaster(text, uri);
+                    IReadOnlyList<HlsVariant> listed = HlsParser.ParseMaster(text, playlistUri);
                     if (listed.Count == 0)
                         return new MediaProbeResult("unsupported", "The playlist lists no quality with a usable address.", type, null, null, []);
                     var variants = listed.Where(v => !v.NeedsSeparateAudio)
@@ -1199,7 +1201,7 @@ public sealed partial class DownloadEngine
                         ? new MediaProbeResult("unsupported", "Every quality keeps its audio in a separate track, which VESPER cannot join.", type, null, null, [])
                         : new MediaProbeResult("hls-master", "", type, null, null, variants);
                 }
-                HlsMedia media = HlsParser.ParseMedia(text, uri, allowTimelineChanges: true);
+                HlsMedia media = HlsParser.ParseMedia(text, playlistUri, allowTimelineChanges: true);
                 if (media.Unsupported is { } why) return new MediaProbeResult("unsupported", why, type, null, null, []);
                 if (media.Segments.Any(segment => segment.IsGap))
                     return new MediaProbeResult("unsupported", "The playlist omits media segments and cannot produce a complete file.", type, null, null, []);

@@ -20,11 +20,12 @@ namespace VESPER
             }
 
             bool background = args.Contains("--background", StringComparer.OrdinalIgnoreCase);
+            using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
             // Background launches can race while Chrome sends several requests.
             using var mutex = new Mutex(true, InstanceMutexName, out bool firstInstance);
             if (!firstInstance)
             {
-                if (!background) SignalRunningInstance();
+                if (!background) showEvent.Set();
                 return;
             }
 
@@ -74,23 +75,10 @@ namespace VESPER
             var form = new Form1(preferences, engine, startHidden: background);
 
             // Event-driven (no polling): a second launch signals this wait handle.
-            using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
-            ThreadPool.RegisterWaitForSingleObject(showEvent, (_, _) => form.RequestShow(), null, Timeout.Infinite, executeOnlyOnce: false);
-
-            Application.Run(form);   // Form1 disposes the engine when it closes
-        }
-
-        private static void SignalRunningInstance()
-        {
-            try
-            {
-                using var existing = EventWaitHandle.OpenExisting(ShowEventName);
-                existing.Set();
-            }
-            catch (WaitHandleCannotBeOpenedException)
-            {
-                // The first instance has not finished starting; it will show its own window.
-            }
+            RegisteredWaitHandle showWait = ThreadPool.RegisterWaitForSingleObject(showEvent,
+                (_, _) => form.RequestShow(), null, Timeout.Infinite, executeOnlyOnce: false);
+            try { Application.Run(form); }
+            finally { showWait.Unregister(null); }
         }
     }
 }

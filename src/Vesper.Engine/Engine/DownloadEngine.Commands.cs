@@ -71,7 +71,7 @@ public sealed partial class DownloadEngine
 {
     private readonly HashSet<Guid> _completedFileActions = [];
 
-    // ---- adding ---------------------------------------------------------------------------------------------------
+    // adding
 
     public AddResult Add(AddRequest request)
     {
@@ -92,6 +92,7 @@ public sealed partial class DownloadEngine
 
     private AddResult AddCore(AddRequest request)
     {
+        using var operation = EnterOperation();
         if (request.RequestId is { Length: > 0 } requestId && _store.TryGetSubmission(requestId, out Guid earlier))
         {
             lock (_lock)
@@ -299,7 +300,7 @@ public sealed partial class DownloadEngine
             && previous.Fingerprint == next.Fingerprint;
     }
 
-    // ---- run control ------------------------------------------------------------------------------------------------
+    // run control
 
     public void Pause(Guid id)
     {
@@ -379,7 +380,8 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || _sessions.ContainsKey(id) || _cancelling.Contains(id)) return;
-            if (job.BrowserProof is { AwaitingConfirmation: true } || IsCleanupPending(job)) return;
+            if (job.BrowserProof is { AwaitingConfirmation: true } || IsCleanupPending(job)
+                || job.Reason == "recovery-integrity-missing") return;
 
             if (job.PendingFinalPath is not null)
             {
@@ -467,7 +469,7 @@ public sealed partial class DownloadEngine
         Resume(id);
     }
 
-    // ---- per-job settings ------------------------------------------------------------------------------------------------
+    // per-job settings
 
     public void SetPriority(Guid id, JobPriority priority)
     {
@@ -573,7 +575,7 @@ public sealed partial class DownloadEngine
         job.NameLocked = true;
     });
 
-    // ---- remove / delete / discard — three distinct, explicit operations ---------------------------------------------------
+    // remove / delete / discard — three distinct, explicit operations
 
     /// <summary>Removes the record only. A partial file and its recovery file stay on disk and are reported to the caller.</summary>
     public RemoveResult RemoveFromList(Guid id)
@@ -681,6 +683,8 @@ public sealed partial class DownloadEngine
     public async Task<OpenCompletedFileResult> OpenCompletedFileAsync(Guid id, string? confirmedPath,
         CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         string path;
         string digest;
         string? savedIdentity;
@@ -796,6 +800,7 @@ public sealed partial class DownloadEngine
 
     private async Task<DeleteResult> ChangeCompletedFileAsync(Guid id, string? locatePath, Action<string>? remove, string? confirmedPath)
     {
+        using var operation = EnterOperation();
         bool deleting = locatePath is null;
         string path;
         string digest;
@@ -912,7 +917,7 @@ public sealed partial class DownloadEngine
         lock (_lock) _completedFileActions.Remove(id);
     }
 
-    // ---- helpers --------------------------------------------------------------------------------------------------------
+    // helpers
 
     /// <summary>
     /// A UI edit must reach SQLite before it becomes visible to an active session or the UI.

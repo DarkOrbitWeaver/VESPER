@@ -146,8 +146,8 @@ internal static class PackedAudioDemuxer
     {
         timestamp = 0;
         if (segment.Length < 10 || !segment[..3].SequenceEqual("ID3"u8)
-            || segment[3] != 3 || segment[4] != 0 || segment[5] != 0)
-            throw Bad("An AAC HLS segment must begin with an unmodified ID3v2.3 tag.");
+            || segment[3] is not (3 or 4) || segment[4] != 0 || segment[5] != 0)
+            throw Bad("An AAC HLS segment must begin with an unmodified ID3v2.3 or ID3v2.4 tag.");
 
         int tagSize = ReadSynchsafeSize(segment.Slice(6, 4));
         if (tagSize > segment.Length - 10)
@@ -170,7 +170,8 @@ internal static class PackedAudioDemuxer
             ReadOnlySpan<byte> frameHeader = segment.Slice(position, 10);
             if (!IsFrameId(frameHeader[..4]))
                 throw Bad("An ID3 tag contains an invalid frame identifier.");
-            uint rawFrameLength = BinaryPrimitives.ReadUInt32BigEndian(frameHeader[4..8]);
+            uint rawFrameLength = segment[3] == 4 ? (uint)ReadSynchsafeSize(frameHeader[4..8])
+                : BinaryPrimitives.ReadUInt32BigEndian(frameHeader[4..8]);
             if (rawFrameLength > int.MaxValue)
                 throw Bad("An ID3 frame is too large.");
             int frameLength = (int)rawFrameLength;

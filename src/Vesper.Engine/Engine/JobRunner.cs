@@ -110,8 +110,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         catch (Exception ex) { engine.Log(Job.Id, "checkpoint-failed", ErrorClassifier.Describe(ex)); }
     }
 
-    // ---- main flow ---------------------------------------------------------------------------------------------
-
+    // main flow
     private async Task<RunOutcome> FinishBrowserCopyAsync(CancellationToken ct)
     {
         // This is a finite browser-supplied body, not a downloadable HTTP URL.
@@ -130,7 +129,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         if (!UrlPolicy.TryParse(Job.SourceUrl, out _url, out string urlError))
             throw Stop(RunOutcome.NeedsLink("bad-url", urlError));
 
-        if (!Job.Extents.IsEmpty && !HttpTransport.IsResourceIdentity(Job.FinalResourceIdentity))
+        if (!Job.Extents.IsEmpty && !HttpTransport.IsCurrentResourceIdentity(Job.FinalResourceIdentity))
             throw Stop(RunOutcome.NeedsAttention("redirect-identity-missing",
                 "This saved download does not include a verified redirect destination. Its existing bytes were kept. Use a trusted checksum or piece list to verify them, or start a fresh copy."));
 
@@ -259,8 +258,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         _pieces = map;
     }
 
-    // ---- first request -----------------------------------------------------------------------------------------
-
+    // first request
     private RequestSpec BuildSpec(long? start, long? endInclusive)
     {
         RequestCredentials? credentials = engine.CredentialsFor(Job.Id);
@@ -311,6 +309,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         if (code == 200)
         {
             RejectHtml(r);
+            if (!HttpFacts.IsIdentityEncoded(r) && r.Content.Headers.ContentEncoding.Count != 1)
+                throw Stop(RunOutcome.NeedsAttention("encoding", "The server used multiple content encodings. The file was not published."));
             // A .tar.gz served with "Content-Encoding: gzip" is the file itself, not a transport encoding.
             // Decoding it would save a tar under a .tar.gz name. Chromium leaves such files alone, and so do we.
             bool decoded = !HttpFacts.IsIdentityEncoded(r) && !IsSelfCompressed(r, Job.FileName);
@@ -340,7 +340,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         {
             case IdentityLevel.StrongEtag when HttpFacts.StrongEtag(r) != Job.ETag:
                 throw Changed("different ETag");
-            case IdentityLevel.LastModified when !SameSecond(HttpFacts.LastModified(r), Job.LastModified):
+            case IdentityLevel.LastModified when !HttpFacts.HasStrongLastModified(r) || !SameSecond(HttpFacts.LastModified(r), Job.LastModified):
                 throw Changed("different modification time");
             case IdentityLevel.None when !Job.UnverifiedResumeApproved:
                 throw Stop(NoValidatorStop());
@@ -381,10 +381,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 j.FinalResourceIdentity = finalResourceIdentity;
                 j.ETag = HttpFacts.StrongEtag(r);
                 j.LastModified = HttpFacts.LastModified(r);
-                // RFC 9110 13.1.5: a Last-Modified date may be used in If-Range only when it is strong, which means
-                // the server's Date is at least one second later. Otherwise two versions could share the date.
-                bool strongDate = j.LastModified is { } modified
-                    && (r.Headers.Date is not { } date || date - modified >= TimeSpan.FromSeconds(1));
+                // If-Range dates require no ETag and a strong Last-Modified date (RFC 9110).
+                bool strongDate = HttpFacts.HasStrongLastModified(r);
                 j.Identity = j.ETag is not null ? IdentityLevel.StrongEtag
                     : j.LastModified is not null && strongDate ? IdentityLevel.LastModified : IdentityLevel.None;
                 j.TotalBytes = first.Total;
@@ -425,8 +423,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         catch (ArgumentException) { /* network share or unusual path: DriveInfo cannot tell; writes will report a full disk */ }
     }
 
-    // ---- ranged transfer (sequential first, segmented when defensible) --------------------------------------------------
-
+    // ranged transfer (sequential first, segmented when defensible)
     private async Task RunRangedAsync(FirstResult first, CancellationToken ct)
     {
         long total = first.Total!.Value;
@@ -650,8 +647,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
     }
 
-    // ---- linear transfer: unknown length, server without ranges, or replay-and-verify ----------------------------------
-
+    // linear transfer: unknown length, server without ranges, or replay-and-verify
     private async Task RunLinearAsync(FirstResult first, PartialFile file, CancellationToken ct)
     {
         long prefix = first.Replay ? Job.Extents.ContiguousFromZero() : 0;
@@ -718,10 +714,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private static bool IsSelfCompressed(HttpResponseMessage response, string fileName)
     {
         string ext = Path.GetExtension(fileName).ToLowerInvariant();
-        if (ext is ".gz" or ".tgz" or ".br" or ".zz" or ".zst" or ".bz2" or ".xz" or ".7z" or ".zip" or ".rar") return true;
-        return HttpFacts.ContentType(response)?.ToLowerInvariant() is
-            "application/gzip" or "application/x-gzip" or "application/x-bzip2" or "application/zstd"
-            or "application/x-7z-compressed" or "application/zip" or "application/x-rar-compressed";
+        string? type = HttpFacts.ContentType(response)?.ToLowerInvariant();
+        return response.Content.Headers.ContentEncoding.SingleOrDefault()?.ToLowerInvariant() switch
+        {
+            "gzip" or "x-gzip" => ext is ".gz" or ".tgz" || type is "application/gzip" or "application/x-gzip",
+            "br" => ext == ".br",
+            "deflate" => ext == ".zz",
+            "zstd" => ext == ".zst" || type == "application/zstd",
+            "bzip2" or "x-bzip2" => ext == ".bz2" || type == "application/x-bzip2",
+            "xz" => ext == ".xz" || type == "application/x-xz",
+            _ => false
+        };
     }
 
     /// <summary>
@@ -790,8 +793,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
     }
 
-    // ---- outcome helpers -------------------------------------------------------------------------------------------------
-
+    // outcome helpers
     private static RunnerStop Stop(RunOutcome outcome) => new(outcome);
 
     private RunnerStop Changed(string detail) => Stop(RunOutcome.NeedsAttention("changed",

@@ -48,7 +48,8 @@ public sealed partial class DownloadEngine
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, original)
                 || _cancelling.Contains(id) || _sessions.ContainsKey(id) || IsCleanupPending(job) || job.PendingFinalPath is not null
                 || job.State != snapshot.State || job.SourceUrl != snapshot.SourceUrl || job.MediaState != snapshot.MediaState
-                || job.MediaPlanJson != snapshot.MediaPlanJson || !ReferenceEquals(job.Extents, savedExtents)
+                || job.MediaPlanJson != snapshot.MediaPlanJson || job.Generation != snapshot.Generation
+                || job.PartialIdentity != snapshot.PartialIdentity || !ReferenceEquals(job.Extents, savedExtents)
                 || !MatchesAutomaticRefreshLocked(job, expectedExpiredSource))
                 return Rejected("The HLS job changed while its replacement was being checked. Saved data was kept.");
             if (replacement.ExpiresAt <= DateTimeOffset.UtcNow) return Rejected("The refreshed source expired before it could be installed.");
@@ -64,7 +65,8 @@ public sealed partial class DownloadEngine
                 updated.NextRetryUtc = null;
             }
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             if (credentials is not null) _credentials[id] = credentials;
             else _credentials.Remove(id);
         }

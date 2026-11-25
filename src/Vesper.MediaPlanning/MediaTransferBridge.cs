@@ -38,7 +38,7 @@ internal sealed record MediaDownloadChoice(
         MediaOutput.Wav => "WAV · decoded PCM (does not improve source quality)",
         MediaOutput.Mp3 => $"MP3 · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
         MediaOutput.M4a => $"M4A · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
-        MediaOutput.Mp4 => $"MP4 · {ConvertedVideoQuality}converted so it plays everywhere",
+        MediaOutput.Mp4 => $"MP4 · {ConvertedVideoQuality}H.264 + AAC",
         _ => MediaTransferBridge.DisplayQuality(Quality ?? "Available source")
     };
 }
@@ -66,8 +66,6 @@ internal static class MediaTransferBridge
             || r.Protocol == StreamProtocol.Dash && r.Segments is { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
                && r.Container is "mp4" or "m4a")
         && CanCarryContext(r.Context)
-        && r.Context.Origin is null
-        && r.Context.AcceptLanguage is null
         && (r.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) == 0;
 
     private static bool CanCarryContext(MediaRequestContext context) =>
@@ -163,13 +161,15 @@ internal static class MediaTransferBridge
     {
         bool opus = output == MediaOutputPreference.Opus;
         var pool = item with { Representations = item.Representations.Where(r => r.Content == StreamContent.AudioOnly
-            && r.Container is ("mp4" or "m4a" or "webm" or "mkv")
+            && (r.Container is ("mp4" or "m4a" or "webm" or "mkv")
+                || !opus && r.Protocol == StreamProtocol.Http && r.Container is ("mp3" or "ogg" or "oga" or "opus")
+                    && r.AudioCodec is ("mp3" or "vorbis" or "opus"))
             && (opus ? r.AudioCodec == "opus" : OperatingSystem.IsWindows() && CodecCapabilities.Current.CanDecode(r.AudioCodec))).ToArray() };
         var planned = PrepareSource(pool, prefs with { Mode = QualityMode.AudioOnly }, null, out _);
         if (planned.Choice is not { } choice)
             return (null, opus ? "This source has no supported native Opus track to copy." : "WAV requires a source audio track and a Windows decoder for its codec.");
         if (choice.Kind is not (JobKind.Http or JobKind.Merge))
-            return (null, "This output currently requires a complete MP4 or WebM audio source.");
+            return (null, "This output requires a complete supported audio file.");
         if (opus && start is not null) return (null, "Opus clipping is not available; choose WAV for an exact audio clip.");
         string? plan = choice.MediaPlanJson;
         if (start is double first)
@@ -242,12 +242,22 @@ internal static class MediaTransferBridge
         if (!OperatingSystem.IsWindows() || !capabilities.Known || !capabilities.Mp3Encoder)
             return (null, "MP3 conversion isn't available because this PC has no confirmed native MP3 encoder.");
 
-        string? codec = audio.AudioCodec;
-        if (codec is null || !CanConvert(choice) || choice.Kind is not (JobKind.Http or JobKind.Merge)
-            || !capabilities.CanDecode(codec)
-            || audio.AudioChannels is not (1 or 2)
-            || audio.AudioSampleRate is not (32000 or 44100 or 48000))
+        // Prefer a source the native encoder can actually consume. Picking the
+        // highest-ranked audio first can hide an available AAC alternative.
+        var convertible = item with
+        {
+            Representations = item.Representations.Where(r => r.Content == StreamContent.AudioOnly
+                && r.Container is "mp4" or "m4a" or "webm" or "mkv"
+                && r.AudioCodec is not null && capabilities.CanDecode(r.AudioCodec)
+                && r.AudioChannels is null or 1 or 2
+                && r.AudioSampleRate is null or 32000 or 44100 or 48000).ToArray()
+        };
+        var supported = PrepareSource(convertible, prefs with { Mode = QualityMode.AudioOnly }, null,
+            out FormatSelection? supportedSource);
+        if (supported.Choice is not { } supportedChoice || supportedSource?.Audio is not { AudioCodec: { } codec }
+            || !CanConvert(supportedChoice))
             return (null, "This source doesn't have a supported track and native MP3 encoder for conversion.");
+        choice = supportedChoice;
 
         string? tags = choice.MediaMetadataJson
             ?? (choice.Kind == JobKind.Http && item.Provider is not null ? SerializeAudioMetadata(item) : null);
@@ -327,6 +337,12 @@ internal static class MediaTransferBridge
         MediaRepresentation? exact, out FormatSelection? selection, double? clipStartSeconds = null, double? clipEndSeconds = null)
     {
         int unsupportedSubtitleCount = UnsupportedSelectedSubtitleCount(item, prefs);
+        if (prefs.EmbedSubtitles && prefs.SubtitleLanguages.Count > 0
+            && unsupportedSubtitleCount == prefs.SubtitleLanguages.Count)
+        {
+            selection = null;
+            return (null, "None of the selected subtitles are available. Choose another language or turn off subtitles.");
+        }
         item = item with { Subtitles = SelectableSubtitleTracks(item.Subtitles) };
         prefs = prefs with { NativeMergeOnly = true };
         if (exact is { Content: StreamContent.VideoOnly, StandaloneVideo: false })
@@ -370,6 +386,29 @@ internal static class MediaTransferBridge
         if (selection is null) return (null, prefs.AudioTrackId is null
             ? "No compatible format satisfies this preference."
             : "No supported format can use the selected audio track.");
+
+        // Segmented merge currently cannot embed captions. For presets, prefer an
+        // equivalent complete-file recipe that can, without silently reducing quality.
+        if (prefs.EmbedSubtitles && exact is null && clipStartSeconds is null
+            && selection.Video is { } selectedVideo
+            && selection.Streams.Any(track => track.Protocol != StreamProtocol.Http)
+            && item.Representations.Any(track => track.Protocol == StreamProtocol.Http))
+        {
+            var directItem = item with
+            {
+                Representations = item.Representations.Where(track => track.Protocol == StreamProtocol.Http).ToArray()
+            };
+            var direct = PrepareSource(directItem, prefs, null, out FormatSelection? alternative);
+            if (direct.Choice is { EmbeddedSubtitleCount: > 0 }
+                && alternative?.Video is { } alternativeVideo
+                && alternativeVideo.Height == selectedVideo.Height && alternativeVideo.Hdr == selectedVideo.Hdr
+                && Math.Abs((alternativeVideo.FrameRate ?? 30) - (selectedVideo.FrameRate ?? 30)) < 1
+                && alternative.HasAudio == selection.HasAudio)
+            {
+                selection = alternative;
+                return direct;
+            }
+        }
 
         PlanResult planResult = DownloadPlanBuilder.Build(item, selection);
         if (planResult.Plan is not { } plan)
@@ -435,7 +474,9 @@ internal static class MediaTransferBridge
             if (selection.Video is not { } localMuxedVideo || selection.Audio is not null
                 || !CanClipLocalMp4Tracks([localMuxedVideo], step.Container ?? selection.OutputContainer)
                 || MergeCapability.MuxedContainer(localMuxedVideo, "mp4") is not { } localMuxedContainer)
-                return (null, LocalMp4ClipSourceError);
+                return (null, step.Container == "webm"
+                    ? "This WebM cannot be trimmed by the current keyframe clipper. Only verified silent VP8/VP9 WebM is supported."
+                    : LocalMp4ClipSourceError);
             return BuildMerge(item, selection, plan, [localMuxedVideo], localMuxedContainer,
                 clipStartSeconds, clipEndSeconds, prefs.EmbedSubtitles, unsupportedSubtitleCount);
         }
@@ -714,7 +755,8 @@ internal static class MediaTransferBridge
                         : "These subtitles are saved separately for this format.";
         if (unsupportedSubtitleCount > 0)
         {
-            const string unavailable = "Some selected captions weren't available; the rest can still be saved.";
+            string unavailable = selectedCount == 0 ? "The selected captions weren't available. No subtitle files will be saved."
+                : "Some selected captions weren't available; the rest can still be saved.";
             message = message is null ? unavailable : message + " " + unavailable;
         }
         return message;
@@ -750,7 +792,7 @@ internal static class MediaTransferBridge
                 string actual = TextUtil.NormalizeLang(track.Language);
                 return actual == wanted || TextUtil.PrimaryLang(actual) == TextUtil.PrimaryLang(wanted);
             }).ToArray();
-            if (matches.Length > 0 && !matches.Any(IsSelectableSubtitle)) unavailable++;
+            if (!matches.Any(IsSelectableSubtitle)) unavailable++;
         }
         return unavailable;
     }

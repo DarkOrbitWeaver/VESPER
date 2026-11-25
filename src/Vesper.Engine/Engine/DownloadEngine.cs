@@ -21,6 +21,10 @@ public sealed partial class DownloadEngine : IDisposable
     private readonly HttpTransport _http;
     private readonly RetryPolicy _retry;
     private readonly object _lock = new();
+    private readonly CancellationTokenSource _shutdown = new();
+    private readonly HashSet<Task> _runningTasks = [];
+    private int _activeOperations;
+    private TaskCompletionSource? _operationsDrained;
     private readonly Dictionary<Guid, DownloadJob> _jobs = [];
     private readonly Dictionary<Guid, JobSession> _sessions = [];
     private readonly Dictionary<string, SemaphoreSlim> _hostGates = new(StringComparer.OrdinalIgnoreCase);
@@ -87,7 +91,7 @@ public sealed partial class DownloadEngine : IDisposable
             engine.NormalizeQueueOrdersOnStartup();
             engine.MeteredNetworkPreferenceChanged();
             engine.ScheduleNext();
-            _ = Task.Run(engine.RefreshAvailability);
+            _ = engine.RefreshAvailabilityAsync();
             return engine;
         }
         catch
@@ -105,7 +109,7 @@ public sealed partial class DownloadEngine : IDisposable
     internal ValueTask<SegmentBufferLease> AcquireSegmentBufferAsync(long bytes, CancellationToken ct) =>
         _segmentBuffers.AcquireAsync(bytes, ct);
 
-    // ---- snapshots ---------------------------------------------------------------------------------------------
+    // snapshots
 
     public IReadOnlyList<JobSnapshot> Snapshots()
     {
@@ -180,6 +184,16 @@ public sealed partial class DownloadEngine : IDisposable
         return false;
     }
 
+    private bool HasConflictingDownloadLocked(DownloadJob job)
+    {
+        if (!TryGetDuplicateKey(job, out DuplicateKey key)
+            || !_duplicateCandidates.TryGetValue(key, out List<DownloadJob>? candidates))
+            return false;
+        var request = new AddRequest(job.SourceUrl, Kind: job.Kind, MediaPlanJson: job.MediaPlanJson, Output: job.Output);
+        return candidates.Any(candidate => candidate.Id != job.Id && IsDuplicateCandidate(candidate)
+            && (job.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || SameRequestPlan(candidate, request)));
+    }
+
     private void AddDuplicateCandidateLocked(DownloadJob job)
     {
         if (!IsDuplicateCandidate(job) || !TryGetDuplicateKey(job, out DuplicateKey key)) return;
@@ -195,13 +209,6 @@ public sealed partial class DownloadEngine : IDisposable
         if (!_duplicateCandidates.TryGetValue(key, out List<DownloadJob>? candidates)) return;
         candidates.Remove(job);
         if (candidates.Count == 0) _duplicateCandidates.Remove(key);
-    }
-
-    private void ChangeSourceUrlLocked(DownloadJob job, string sourceUrl)
-    {
-        RemoveDuplicateCandidateLocked(job, job.SourceUrl);
-        job.SourceUrl = sourceUrl;
-        AddDuplicateCandidateLocked(job);
     }
 
     private void ReconcileDuplicateCandidateLocked(DownloadJob job, bool wasCandidate, string previousSourceUrl)
@@ -226,7 +233,7 @@ public sealed partial class DownloadEngine : IDisposable
         }
     }
 
-    // ---- internal services used by runners ------------------------------------------------------------------------
+    // internal services used by runners
 
     internal void Failpoint(string name)
     {
@@ -318,7 +325,7 @@ public sealed partial class DownloadEngine : IDisposable
         catch (SqliteException ex) { throw new LocalStorageException("The download database could not be written: " + ex.Message, ex); }
     }
 
-    // ---- scheduling ---------------------------------------------------------------------------------------------
+    // scheduling
 
     /// <summary>Starts as many queued jobs as the limits allow. Safe to call at any time, from any thread.</summary>
     internal void ScheduleNext()
@@ -395,7 +402,10 @@ public sealed partial class DownloadEngine : IDisposable
         }
         Changed(job);
         EnsurePump();
-        session.RunTask = Task.Run(() => RunSessionAsync(session));
+        Task running = session.RunTask = Task.Run(() => RunSessionAsync(session));
+        _runningTasks.Add(running);
+        _ = running.ContinueWith(task => { lock (_lock) _runningTasks.Remove(task); },
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     private async Task RunSessionAsync(JobSession session)
@@ -509,10 +519,11 @@ public sealed partial class DownloadEngine : IDisposable
         }
     }
 
-    // ---- timers (one wake-up timer, one progress pump; neither runs when there is nothing to do) -----------------------
+    // timers (one wake-up timer, one progress pump; neither runs when there is nothing to do)
 
     private void ArmWakeTimer()
     {
+        if (_disposed) return;
         DateTime? next = _jobs.Values.Where(j => j.State is JobState.WaitingForRetry or JobState.WaitingForNetwork && j.NextRetryUtc is not null)
             .Select(j => j.NextRetryUtc!.Value).DefaultIfEmpty(DateTime.MaxValue).Min();
         if (next == DateTime.MaxValue) next = null;
@@ -630,6 +641,7 @@ public sealed partial class DownloadEngine : IDisposable
     {
         lock (_lock)
         {
+            if (_disposed) return;
             foreach (DownloadJob job in _jobs.Values.Where(j => !_sessions.ContainsKey(j.Id)
                 && (j.State == JobState.WaitingForNetwork || (includeRetry && j.State == JobState.WaitingForRetry))))
             {
@@ -675,27 +687,77 @@ public sealed partial class DownloadEngine : IDisposable
         Progress?.Invoke(batch);
     }
 
-    // ---- shutdown -------------------------------------------------------------------------------------------------
+    private OperationLease EnterOperation(CancellationToken ct = default)
+    {
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var lease = new OperationLease(this, CancellationTokenSource.CreateLinkedTokenSource(ct, _shutdown.Token));
+            _activeOperations++;
+            return lease;
+        }
+    }
 
-    /// <summary>Stops running jobs, makes their progress durable, and releases everything. Jobs resume next start.</summary>
+    private sealed class OperationLease(DownloadEngine engine, CancellationTokenSource cancellation) : IDisposable
+    {
+        public CancellationToken Token => cancellation.Token;
+
+        public void Dispose()
+        {
+            cancellation.Dispose();
+            lock (engine._lock)
+            {
+                if (--engine._activeOperations == 0)
+                    engine._operationsDrained?.TrySetResult();
+            }
+        }
+    }
+
+    /// <summary>Stop transfers before releasing their network and storage resources.</summary>
     public void Dispose()
     {
         Task[] running;
+        Task operations;
+        Task wake;
+        Task pump;
         lock (_lock)
         {
             if (_disposed) return;
             _disposed = true;
-            running = [.. _sessions.Values.Select(s => { s.Intent = StopIntent.Shutdown; s.Cts.Cancel(); return s.RunTask ?? Task.CompletedTask; })];
+            foreach (JobSession session in _sessions.Values)
+            {
+                session.Intent = StopIntent.Shutdown;
+                session.Cts.Cancel();
+            }
+            running = [.. _runningTasks];
+            operations = _activeOperations == 0 ? Task.CompletedTask
+                : (_operationsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            wake = _wakeTimer?.DisposeAsync().AsTask() ?? Task.CompletedTask;
+            pump = _pumpTimer?.DisposeAsync().AsTask() ?? Task.CompletedTask;
+            _wakeTimer = null;
+            _pumpTimer = null;
         }
-        _browserBodies?.Dispose();
+        _shutdown.Cancel();
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
         DisposeMeteredNetworkWatcher();
-        try { Task.WaitAll(running, TimeSpan.FromSeconds(20)); }
-        catch (AggregateException) { /* each run reports its own failure through OnRunFinished */ }
-
-        _wakeTimer?.Dispose();
-        _pumpTimer?.Dispose();
-        _http.Dispose();
-        _store.Dispose();
+        Task drain = Task.WhenAll([.. running, operations, wake, pump]);
+        // Do not close SQLite or the transport underneath an operation that is still unwinding.
+        Task release = drain.ContinueWith(completed =>
+        {
+            _ = completed.Exception;
+            _browserBodies?.Dispose();
+            _conversionSlot.Dispose();
+            _remuxSlots.Dispose();
+            foreach (SemaphoreSlim gate in _hostGates.Values) gate.Dispose();
+            _http.Dispose();
+            _store.Dispose();
+            _shutdown.Dispose();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try
+        {
+            if (!release.Wait(TimeSpan.FromSeconds(20)))
+                System.Diagnostics.Trace.WriteLine("Download shutdown is still draining.", "VESPER");
+        }
+        catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex.Message, "VESPER shutdown"); }
     }
 }

@@ -20,6 +20,9 @@ internal static class MpegTsDemuxer
         internal readonly List<byte[]> SequenceSets = [];
         internal readonly List<byte[]> PictureSets = [];
         internal readonly int[] Dimensions = new int[2];
+        internal byte[]? PendingAccessUnit;
+        internal PesTiming PendingTiming;
+        internal PesTiming? NextAccessUnitTiming;
     }
 
     private sealed class TrackState(TransportStreamInfo stream)
@@ -68,6 +71,13 @@ internal static class MpegTsDemuxer
 
         foreach (TrackState state in tracks.Values)
         {
+            if (state.H264?.PendingAccessUnit is { } pending)
+            {
+                if (state.H264.NextAccessUnitTiming is not null)
+                    throw Bad("The transport stream ends before a timestamped H.264 access unit starts.");
+                ProcessH264(pending, state.H264.PendingTiming, state, payloads);
+                state.H264.PendingAccessUnit = null;
+            }
             if (state.Track.Samples.Count == 0) throw Bad("A declared transport track contains no complete media samples.");
             if (state.H264 is not null)
             {
@@ -87,7 +97,7 @@ internal static class MpegTsDemuxer
             tracks.Add(pes.Stream.Pid, state = new TrackState(pes.Stream));
 
         PesTiming timing = ReadTiming(pes.Data, state);
-        if (pes.Stream.StreamType == 0x1b) ProcessH264(pes.Data.AsMemory(timing.PayloadOffset), timing, state, payloads);
+        if (pes.Stream.StreamType == 0x1b) BufferH264(pes.Data.AsMemory(timing.PayloadOffset), timing, state, payloads);
         else ProcessAac(pes.Data.AsSpan(timing.PayloadOffset), timing, state, payloads);
     }
 
@@ -140,6 +150,69 @@ internal static class MpegTsDemuxer
         clock.Raw = raw;
         clock.Value = value;
         return value;
+    }
+
+    // A PES header timestamps the first access unit starting in that PES, not
+    // necessarily its first byte. AUD-delimited streams can carry the tail of
+    // the preceding picture before that delimiter.
+    private static void BufferH264(ReadOnlyMemory<byte> payload, PesTiming timing, TrackState state, Stream output)
+    {
+        H264State h264 = state.H264!;
+        ReadOnlySpan<byte> bytes = payload.Span;
+        int aud = -1;
+        for (int offset = FindStartCode(bytes, 0, out int prefix); offset >= 0;
+            offset = FindStartCode(bytes, offset + prefix, out prefix))
+        {
+            if (offset + prefix >= bytes.Length) break;
+            if ((bytes[offset + prefix] & 0x1f) != 9) continue;
+            if (aud >= 0) throw Bad("Multiple access-unit delimiters share a PES timestamp.");
+            aud = offset;
+        }
+
+        if (aud < 0)
+        {
+            if (h264.PendingAccessUnit is { } previousTail)
+            {
+                // Some muxers split the next timestamped PES just before its AUD.
+                // The tail belongs to the preceding access unit, and the following
+                // delimiter must confirm the timestamp before either can publish.
+                if (FindStartCode(bytes, 0, out _) >= 0
+                    || h264.NextAccessUnitTiming is { } expected && !SameAccessUnitTime(expected, timing))
+                    throw Bad("An H.264 access unit has no unambiguous delimiter for its PES timestamp.");
+                h264.PendingAccessUnit = AppendAccessUnit(previousTail, bytes);
+                h264.NextAccessUnitTiming = timing;
+                return;
+            }
+            ProcessH264(payload, timing, state, output);
+            return;
+        }
+
+        if (h264.PendingAccessUnit is { } previous)
+        {
+            if (h264.NextAccessUnitTiming is { } expected && !SameAccessUnitTime(expected, timing))
+                throw Bad("A continued H.264 access unit has conflicting timestamps.");
+            ProcessH264(aud == 0 ? previous : AppendAccessUnit(previous, bytes[..aud]),
+                h264.PendingTiming, state, output);
+            h264.NextAccessUnitTiming = null;
+        }
+        else if (bytes[..aud].IndexOfAnyExcept((byte)0) >= 0)
+            throw Bad("The initial H.264 PES starts inside an access unit.");
+
+        h264.PendingAccessUnit = bytes[aud..].ToArray();
+        h264.PendingTiming = timing;
+    }
+
+    private static bool SameAccessUnitTime(PesTiming left, PesTiming right) =>
+        left.Pts == right.Pts && left.Dts == right.Dts;
+
+    private static byte[] AppendAccessUnit(byte[] previous, ReadOnlySpan<byte> tail)
+    {
+        if (previous.Length > 16 * 1024 * 1024 - tail.Length)
+            throw Bad("An H.264 access unit exceeds the supported size limit.");
+        byte[] combined = new byte[previous.Length + tail.Length];
+        previous.CopyTo(combined, 0);
+        tail.CopyTo(combined.AsSpan(previous.Length));
+        return combined;
     }
 
     private static void ProcessH264(ReadOnlyMemory<byte> payload, PesTiming timing, TrackState state, Stream output)

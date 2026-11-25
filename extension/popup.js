@@ -17,7 +17,7 @@ async function init() {
     $('handoff-setting').hidden = browserDownloads.value === 'chrome';
   }
   showDownloadMode();
-  const { prefetchFormats = false, vesperPaused = false, vesperHiddenButterflyHosts = [] } =
+  const { prefetchFormats = true, vesperPaused = false, vesperHiddenButterflyHosts = [] } =
     await chrome.storage.local.get(['prefetchFormats', 'vesperPaused', 'vesperHiddenButterflyHosts']).catch(() => ({}));
   $('prefetch').checked = prefetchFormats;
   $('pause-vesper').checked = vesperPaused;
@@ -29,9 +29,11 @@ async function init() {
   } catch { /* Browser pages have no site butterfly. */ }
   const siteButterfly = $('site-butterfly');
   const hiddenHosts = new Set(Array.isArray(vesperHiddenButterflyHosts)
-    ? vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()) : []);
+    ? vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()).slice(0, 100) : []);
   function showSiteButterfly() {
-    siteButterfly.disabled = !butterflyHost;
+    const full = hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost);
+    siteButterfly.disabled = !butterflyHost || full;
+    siteButterfly.title = full ? 'Show the butterfly on another hidden site before adding one.' : '';
     siteButterfly.textContent = hiddenHosts.has(butterflyHost) ? 'Show butterfly on this site' : 'Hide butterfly on this site';
     $('site-butterfly-host').textContent = butterflyHost;
   }
@@ -61,7 +63,7 @@ async function init() {
     }
   };
   siteButterfly.onclick = async () => {
-    if (!butterflyHost) return;
+    if (!butterflyHost || (hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost))) return;
     siteButterfly.disabled = true;
     if (hiddenHosts.has(butterflyHost)) hiddenHosts.delete(butterflyHost);
     else hiddenHosts.add(butterflyHost);
@@ -97,8 +99,7 @@ async function init() {
       return url.protocol === 'https:' && !url.username && !url.password ? url.hostname.toLowerCase() : null;
     } catch { return null; }
   }
-  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
-  const siteHost = httpsHost(activeTab?.url);
+  const siteHost = httpsHost(siteTab?.url);
   siteHostLabel.textContent = siteHost || 'this site';
   if (siteHost) {
     try {

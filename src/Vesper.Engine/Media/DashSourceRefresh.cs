@@ -6,6 +6,8 @@ public sealed partial class DownloadEngine
     public async Task<RescueResult> RefreshDashPlanAsync(Guid id, ResolvedMediaSource replacement,
         string replacementPlanJson, CancellationToken ct = default, string? expectedExpiredSource = null)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         ArgumentNullException.ThrowIfNull(replacement);
         if (!UrlPolicy.TryParse(replacement.Url, out Uri url, out string urlError)) return Rejected(urlError);
         try { UrlPolicy.EnsureAllowed(url, Options.AllowPrivateNetworks); }
@@ -82,7 +84,8 @@ public sealed partial class DownloadEngine
                 updated.NextRetryUtc = null;
             }
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             if (credentials is not null) _credentials[id] = credentials;
             else _credentials.Remove(id);
         }

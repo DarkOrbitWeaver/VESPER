@@ -284,7 +284,7 @@ public sealed class BrowserDownloadTests
     }
 
     private static AddRequest FreshLink(FaultServer server, string path, string etag = "\"p1\"", long shorter = 0) =>
-        new(server.Url(path + "?token=fresh"), RequestId: TransferId + ":0",
+        new(server.ReopenExpired(path, "/fresh-entry"), RequestId: TransferId + ":0",
             BrowserProof: new BrowserTransferProof(server.V1.Length - shorter, etag, "application/octet-stream"));
 
     private static async Task<(Guid Id, long Saved)> WaitingForLinkAsync(Harness harness, FaultServer server, string path,

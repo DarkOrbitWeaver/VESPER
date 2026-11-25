@@ -37,7 +37,7 @@ public static class QualityMenuBuilder
             if (!seen.Add(sig)) return;
 
             string size = sel.EstimatedSize is { } s ? $" · {(sel.EstimatedSizeIsEstimate ? "~" : "")}{FormatSize(s)}" : "";
-            string note = sel.NeedsMuxing ? " · needs merge tool" : "";
+            string note = sel.NeedsMuxing ? " · separate video and audio" : "";
             options.Add(new QualityOption(kind, $"{title} ({sel.Summary}){size}", $"{sel.Summary}{size}{note}", sel));
         }
 

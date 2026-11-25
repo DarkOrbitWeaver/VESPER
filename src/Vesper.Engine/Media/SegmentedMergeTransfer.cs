@@ -22,7 +22,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         long Offset = 0, string PrefixHash = "", int[]? CompletedParts = null, long[]? PartLengths = null,
         string?[]? SourceFingerprints = null, long MuxLength = 0, string? MuxSha256 = null,
         string[]? KeyFingerprints = null, string?[]? SourceShapeFingerprints = null,
-        long TracksLength = 0, string? TracksSha256 = null, string? MuxIdentity = null, string? TracksIdentity = null);
+        long TracksLength = 0, string? TracksSha256 = null, string? MuxIdentity = null, string? TracksIdentity = null,
+        string? SamplesIdentity = null);
 
     internal async Task<RunOutcome> RunAsync(MediaMergePlan plan, CancellationToken ct)
     {
@@ -33,15 +34,31 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         string fingerprint = plan.Fingerprint;
         Cursor? cursor = ReadCursor();
         if (Job.MediaState is not null && cursor is null) return Stop("The saved segmented merge cursor is invalid.");
-        if (cursor is { Phase: "muxed" }) return await FinalizeMergedAsync(cursor, fingerprint, ct).ConfigureAwait(false);
+        if (cursor is { Phase: "muxed" })
+        {
+            if (cursor.Fingerprint != fingerprint) return Stop("The saved output belongs to a different rendition plan.");
+            if (cursor.SamplesIdentity is { } identity && !MergeTransfer.TryDeleteSidecar(Job.PartialPath + ".samples", identity, out _))
+                return Stop("A saved sample sidecar no longer belongs to this job.");
+            return await FinalizeMergedAsync(cursor, fingerprint, ct).ConfigureAwait(false);
+        }
         if (cursor is { Phase: "swapping" })
         {
             if (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint)
                 return Stop("The saved swap belongs to a different rendition plan.");
+            if (cursor.SamplesIdentity is { } samplesIdentity && !MergeTransfer.TryDeleteSidecar(Job.PartialPath + ".samples", samplesIdentity, out _))
+                return Stop("A saved sample sidecar no longer belongs to this job.");
             return await FinishSwapAsync(cursor, ct).ConfigureAwait(false);
         }
         if (cursor is not null && (cursor.Version is not (1 or 2) || cursor.Fingerprint != fingerprint || cursor.Phase != "download"))
             return Stop("The saved data belongs to a different rendition plan. Restart as a separate copy.");
+
+        // Only journaled sidecars are disposable. Older unclaimed files still require attention.
+        if (cursor?.MuxIdentity is { } stageIdentity
+            && !MergeTransfer.TryDeleteSidecar(MergeTransfer.MergingPath(Job), stageIdentity, out _))
+            return Stop("The unfinished merge output no longer belongs to this job.");
+        if (cursor?.SamplesIdentity is { } sampleIdentity
+            && !MergeTransfer.TryDeleteSidecar(Job.PartialPath + ".samples", sampleIdentity, out _))
+            return Stop("The unfinished sample store no longer belongs to this job.");
 
         PreparedTrack[] tracks;
         try
@@ -112,8 +129,6 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                         data = await DecryptAsync(data, key, part.Sequence, keys, ct).ConfigureAwait(false);
                     }
                     EnsureSpace(data.Length);
-                    await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
-                    await engine.GlobalLimiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
                     await session.WriteAsync(data, offset, report: false, ct).ConfigureAwait(false);
                     hash.AppendData(data.Span);
                     long start = offset;
@@ -342,8 +357,6 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     if (data.Length != lengths[lengthIndex])
                         return (false, null, "A refreshed HLS/DASH part has a different length from the saved bytes. Saved data was kept.");
 
-                    await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
-                    await engine.GlobalLimiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
                     int compared = 0;
                     while (compared < data.Length)
                     {
@@ -497,6 +510,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                         if (read == 0) break;
                         if (result.Length + read > bodyLimit)
                             throw new RunnerStop(NeedsAttention("too-large", "A rendition segment exceeds the supported size limit."));
+                        stall.CancelAfter(Timeout.InfiniteTimeSpan);
+                        await session.Limiter.AcquireAsync(read, ct).ConfigureAwait(false);
+                        await engine.GlobalLimiter.AcquireAsync(read, ct).ConfigureAwait(false);
                         result.Write(buffer, 0, read);
                         stall.CancelAfter(engine.Options.StallTimeout);
                     }
@@ -542,6 +558,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         string? tracksIdentity = null;
         bool swapCursorSaved = false;
         bool preserveStageForCrash = false;
+        Cursor staging = ReadCursor() ?? throw new MediaContainerException("The committed rendition cursor is missing.");
+        void RecordStage() => engine.UpdateJob(Job, job => job.MediaState =
+            JsonSerializer.Serialize(staging with { MuxIdentity = mergingIdentity, SamplesIdentity = samplesIdentity }));
         try
         {
             long length;
@@ -555,7 +574,11 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     ?? throw new IOException("Stable temporary file identity is not supported on this platform.");
                 using var samples = tracks.All(track => track.Fragmented) ? null
                     : MergeTransfer.CreateNewSidecar(samplesPath, FileOptions.RandomAccess);
-                if (samples is not null) samplesIdentity = MergeTransfer.CaptureSidecarIdentity(samples);
+                if (samples is not null)
+                {
+                    samplesIdentity = MergeTransfer.CaptureSidecarIdentity(samples);
+                    RecordStage();
+                }
                 var inputs = new List<(DemuxedTrack Track, Stream Source)>(tracks.Length);
                 int partIndex = 0;
                 long trackOffset = 0;
@@ -629,6 +652,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 using (var output = MergeTransfer.CreateNewSidecar(mergingPath))
                 {
                     mergingIdentity = MergeTransfer.CaptureSidecarIdentity(output);
+                    RecordStage();
                     MergeResult merged = MediaMerger.Merge(inputs, container, output, ct, plan.Metadata, thumbnail);
                     output.Flush(flushToDisk: true);
                     length = output.Length;
@@ -650,7 +674,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             ct.ThrowIfCancellationRequested();
             var swap = new Cursor(1, fingerprint, "swapping", MuxLength: length, MuxSha256: sha,
                 TracksLength: partLengths.Sum(), TracksSha256: ReadCursor()?.PrefixHash, MuxIdentity: mergingIdentity,
-                TracksIdentity: tracksIdentity);
+                TracksIdentity: tracksIdentity, SamplesIdentity: samplesIdentity);
             string swapState = JsonSerializer.Serialize(swap);
             try
             {
@@ -729,7 +753,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         return bytes;
     }
 
-    private bool CursorMatches(Cursor cursor, string fingerprint, PreparedTrack[] tracks)
+    private static bool CursorMatches(Cursor cursor, string fingerprint, PreparedTrack[] tracks)
     {
         if (cursor.CompletedParts is not { } completed || completed.Length != tracks.Length
             || cursor.PartLengths is not { } lengths || cursor.SourceFingerprints is not { } fingerprints
@@ -823,7 +847,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             throw new RunnerStop(RunOutcome.NeedsAttention("disk-full", "There is not enough free disk space to download and merge. Saved data was kept."));
     }
 
-    private RunnerStop StatusStop(int status, HttpResponseMessage response) => new(status switch
+    private static RunnerStop StatusStop(int status, HttpResponseMessage response) => new(status switch
     {
         401 or 403 or 404 or 410 => RunOutcome.NeedsLink("expired", "A selected rendition address expired or was refused. Saved segments were kept; refresh the source to continue."),
         408 or 429 or >= 500 => RunOutcome.Retry("server-error", $"The rendition server answered HTTP {status}.",

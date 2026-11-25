@@ -44,7 +44,7 @@ internal static class Program
         return await RunClassicAsync(input, replies, first);
     }
 
-    // ---- multiplexed request session -------------------------------------------------------------------------
+    // multiplexed request session
 
     private static async Task<int> RunSessionAsync(Stream input, ReplyWriter replies, string sessionId)
     {
@@ -101,7 +101,7 @@ internal static class Program
         await replies.TryWriteAsync(reply);
     }
 
-    // ---- one-shot and dedicated ports ------------------------------------------------------------------------
+    // one-shot and dedicated ports
 
     private static async Task<int> RunClassicAsync(Stream input, ReplyWriter replies, string json)
     {
@@ -322,7 +322,7 @@ internal static class Program
         return File.Exists(app) ? app : null;
     }
 
-    // ---- small helpers ---------------------------------------------------------------------------------------
+    // small helpers
 
     private static bool TryReadSessionOpen(string json, out string id)
     {

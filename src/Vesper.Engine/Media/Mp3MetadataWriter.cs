@@ -265,9 +265,12 @@ internal static class Mp3MetadataWriter
         output.Write(bytes);
     }
 
-    internal static bool IsMpegLayer3(Stream source, long offset = 0)
+    private readonly record struct Frame(int Length, int SampleRate, int Channels, int Samples);
+
+    private static bool TryFrame(Stream source, long offset, long limit, out Frame frame)
     {
-        if (offset < 0 || source.Length - offset < 4) return false;
+        frame = default;
+        if (offset < 0 || limit - offset < 4) return false;
         Span<byte> header = stackalloc byte[4];
         MuxIo.ReadExact(source, offset, header);
         if (header[0] != 0xFF || (header[1] & 0xE0) != 0xE0) return false;
@@ -281,9 +284,59 @@ internal static class Mp3MetadataWriter
         if (version == 2) sampleRate /= 2;
         else if (version == 0) sampleRate /= 4;
         int bitrate = (version == 3 ? Mpeg1Bitrates : Mpeg2Bitrates)[bitrateIndex] * 1000;
-        int frameLength = (version == 3 ? 144 : 72) * bitrate / sampleRate + ((header[2] >> 1) & 1);
-        return source.Length - offset >= frameLength;
+        int length = (version == 3 ? 144 : 72) * bitrate / sampleRate + ((header[2] >> 1) & 1);
+        if (length < 4 || limit - offset < length) return false;
+        frame = new Frame(length, sampleRate, (header[3] >> 6) == 3 ? 1 : 2, version == 3 ? 1152 : 576);
+        return true;
     }
+
+    internal static bool IsMpegLayer3(Stream source, long offset = 0) =>
+        TryFrame(source, offset, source.Length, out _);
+
+    // Inspect the entire frame timeline, not just an extension or first sync word.
+    internal static RawAudioTimeline ReadTimeline(Stream source, CancellationToken ct)
+    {
+        long offset = 0, end = source.Length;
+        if (HasId3v2Tag(source))
+        {
+            Span<byte> header = stackalloc byte[10];
+            if (end < header.Length) throw BadTimeline();
+            MuxIo.ReadExact(source, 0, header);
+            if (header[3] is < 2 or > 4 || !TryReadSynchsafe(header[6..], out int tagLength)
+                || tagLength > end - 10) throw BadTimeline();
+            offset = 10L + tagLength;
+            if (header[3] == 4 && (header[5] & 0x10) != 0)
+            {
+                Span<byte> footer = stackalloc byte[10];
+                if (end - offset < footer.Length) throw BadTimeline();
+                MuxIo.ReadExact(source, offset, footer);
+                if (!footer[..3].SequenceEqual("3DI"u8) || !footer[3..].SequenceEqual(header[3..]))
+                    throw BadTimeline();
+                offset += 10;
+            }
+        }
+        if (end - offset >= 128)
+        {
+            Span<byte> tail = stackalloc byte[3];
+            MuxIo.ReadExact(source, end - 128, tail);
+            if (tail.SequenceEqual("TAG"u8)) end -= 128;
+        }
+        long samples = 0;
+        int rate = 0, channels = 0;
+        while (offset < end)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!TryFrame(source, offset, end, out Frame frame)) throw BadTimeline();
+            if (rate == 0) { rate = frame.SampleRate; channels = frame.Channels; }
+            else if (frame.SampleRate != rate || frame.Channels != channels) throw BadTimeline();
+            samples = checked(samples + frame.Samples);
+            offset += frame.Length;
+        }
+        if (samples == 0 || rate == 0 || offset != end) throw BadTimeline();
+        return new RawAudioTimeline(".mp3", "mp3", channels, rate, samples / (double)rate);
+    }
+
+    private static MediaContainerException BadTimeline() => new("The MP3 frame timeline is incomplete or changes format.");
 
     internal static bool IsPlayableMpegLayer3(Stream source)
     {

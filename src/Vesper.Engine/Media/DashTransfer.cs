@@ -87,6 +87,7 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             using var prefetch = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var pending = new Queue<Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)>>();
             int fetchNext = next;
+            DateTime lastMessage = DateTime.MinValue;
             void Fill()
             {
                 while (pending.Count < 3 && fetchNext < fragments.Count)
@@ -116,7 +117,11 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                     Convert.ToHexString(hash.GetCurrentHash()), mp4.Snapshot());
                 session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
                 await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
-                engine.UpdateJob(Job, j => j.Message = $"Fragment {i + 1} of {fragments.Count}");
+                if (DateTime.UtcNow - lastMessage >= TimeSpan.FromSeconds(1))
+                {
+                    lastMessage = DateTime.UtcNow;
+                    engine.UpdateJob(Job, j => j.Message = $"Fragment {i + 1} of {fragments.Count}");
+                }
             }
             }
             finally
@@ -269,8 +274,6 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
 
     private async Task LimitedWriteAsync(ReadOnlyMemory<byte> data, long offset, CancellationToken ct)
     {
-        await session.Limiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
-        await engine.GlobalLimiter.AcquireAsync(data.Length, ct).ConfigureAwait(false);
         await session.WriteAsync(data, offset, report: false, ct).ConfigureAwait(false);
     }
 
@@ -327,6 +330,9 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                     {
                         int n = await stream.ReadAsync(buffer.AsMemory(), stall.Token).ConfigureAwait(false);
                         if (n == 0) break;
+                        stall.CancelAfter(Timeout.InfiniteTimeSpan);
+                        await session.Limiter.AcquireAsync(n, ct).ConfigureAwait(false);
+                        await engine.GlobalLimiter.AcquireAsync(n, ct).ConfigureAwait(false);
                         if (body.Length + n > bodyLimit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
                         body.Write(buffer, 0, n);
                         stall.CancelAfter(engine.Options.StallTimeout);

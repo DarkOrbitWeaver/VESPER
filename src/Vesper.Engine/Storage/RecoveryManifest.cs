@@ -19,7 +19,9 @@ internal static class RecoveryManifest
     private sealed record Body(int V, Guid JobId, long Generation, string Url, string FileName, long? Total,
         string Extents, string? ETag, string? LastModified, int Identity, string Destination, int Kind = 0,
         string? MediaMetadataJson = null, string? MediaThumbnailUrl = null, string? PartialIdentity = null,
-        string? FinalResourceIdentity = null, string? ManifestIdentity = null);
+        string? FinalResourceIdentity = null, string? ManifestIdentity = null,
+        string? ExpectedSha256 = null, string? PieceMapJson = null, bool RescueCandidate = false,
+        bool UnverifiedResumeApproved = false, int RescueMode = 0, bool IntegrityUnavailable = false);
 
     private sealed record Envelope(string? Check, string? Body);
     private sealed record MergeSwapProof(int Version, string Fingerprint, string Phase, long MuxLength,
@@ -45,12 +47,22 @@ internal static class RecoveryManifest
                 try
                 {
                     tempIdentity = PathSafety.TemporaryFileIdentity(file.SafeFileHandle);
-                    var body = new Body(1, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
+                    var body = new Body(2, job.Id, job.Generation, UrlPolicy.Redact(job.SourceUrl), job.FileName, job.TotalBytes,
                         job.Extents.Serialize(), job.ETag, job.LastModified?.ToString("O"), (int)job.Identity, job.DestinationFolder,
                         (int)job.Kind, job.MediaMetadataJson, ResourcePath(job.MediaThumbnailUrl), job.PartialIdentity,
-                        job.FinalResourceIdentity, tempIdentity);
+                        job.FinalResourceIdentity, tempIdentity, job.ExpectedSha256, job.PieceMapJson,
+                        job.RescueCandidate, job.UnverifiedResumeApproved, (int)job.RescueMode);
                     string bodyJson = JsonSerializer.Serialize(body);
                     string json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
+                    if (Encoding.UTF8.GetByteCount(json) + 3 > MaxManifestBytes)
+                    {
+                        // Keep the sidecar readable but never import an incomplete integrity obligation.
+                        body = body with { PieceMapJson = null, IntegrityUnavailable = true };
+                        bodyJson = JsonSerializer.Serialize(body);
+                        json = JsonSerializer.Serialize(new Envelope(Hash(bodyJson), bodyJson));
+                        if (Encoding.UTF8.GetByteCount(json) + 3 > MaxManifestBytes)
+                            throw new IOException("The recovery record exceeds its size limit.");
+                    }
                     using (var writer = new StreamWriter(file, Encoding.UTF8, 4096, leaveOpen: true))
                     {
                         writer.Write(json);
@@ -422,7 +434,7 @@ internal static class RecoveryManifest
 
     private static bool ManifestMatchesJob(Body body, string manifestPath, DownloadJob job)
     {
-        if (body.V != 1 || body.JobId != job.Id
+        if (body.V is not (1 or 2) || body.JobId != job.Id
             || (body.Kind != (int)job.Kind && !(body.Generation < job.Generation
                 && SwitchableKind((JobKind)body.Kind) && SwitchableKind(job.Kind)
                 && job.PartialIdentity is { Length: 64 } && body.PartialIdentity == job.PartialIdentity))
@@ -513,7 +525,7 @@ internal static class RecoveryManifest
             { problem = "malformed recovery file"; return false; }
             if (Hash(bodyJson) != check) { problem = "checksum mismatch"; return false; }
             Body? body = JsonSerializer.Deserialize<Body>(bodyJson);
-            if (body is null || body.V != 1) { problem = "unsupported version"; return false; }
+            if (body is null || body.V is not (1 or 2)) { problem = "unsupported version"; return false; }
             if (!ManifestIdentityMatches(body, manifestSource))
             { problem = "recovery file identity mismatch"; return false; }
             if (body.JobId == Guid.Empty) { problem = "invalid recovery job id"; return false; }
@@ -521,6 +533,13 @@ internal static class RecoveryManifest
             if (body.Total is < 0) { problem = "invalid recovery file length"; return false; }
             if (!Enum.IsDefined((IdentityLevel)body.Identity)) { problem = "invalid recovery identity"; return false; }
             if (!Enum.IsDefined((JobKind)body.Kind)) { problem = "invalid recovery job kind"; return false; }
+            if (body.V == 2 && (!Enum.IsDefined((RescueMode)body.RescueMode)
+                || body.ExpectedSha256 is not null && !IsSha256(body.ExpectedSha256)
+                || body.PieceMapJson is not null && (!PieceMap.TryParse(body.PieceMapJson, out PieceMap pieceMap, out _)
+                    || pieceMap.TotalLength != body.Total)
+                || body.RescueCandidate && body.ExpectedSha256 is null
+                || body.RescueMode == (int)RescueMode.R1b && body.PieceMapJson is null && !body.IntegrityUnavailable))
+            { problem = "invalid recovery integrity obligations"; return false; }
             if (body.FinalResourceIdentity is not null && !HttpTransport.IsResourceIdentity(body.FinalResourceIdentity))
             { problem = "invalid recovery resource identity"; return false; }
             if (body.Url is not { Length: > 0 } || !UrlPolicy.TryParse(body.Url, out _, out _))
@@ -593,11 +612,18 @@ internal static class RecoveryManifest
                     Id = body.JobId, Kind = (JobKind)body.Kind,
                     SourceUrl = UrlPolicy.Redact(body.Url), FileName = fileName, NameLocked = true,
                     DestinationFolder = destination, PartialPath = partial, PartialIdentity = body.PartialIdentity, TotalBytes = body.Total, Extents = extents,
-                    FinalResourceIdentity = body.FinalResourceIdentity,
-                    State = body.Kind == (int)JobKind.Http ? JobState.NeedsLink : JobState.NeedsAttention, Reason = "restored",
-                    Message = body.Kind == (int)JobKind.Http ? "Restored from a recovery file. Provide the download link again to continue."
+                    FinalResourceIdentity = body.V == 2 && !body.IntegrityUnavailable ? body.FinalResourceIdentity : null,
+                    ExpectedSha256 = body.V == 2 ? body.ExpectedSha256 : null,
+                    PieceMapJson = body.V == 2 ? body.PieceMapJson : null,
+                    RescueCandidate = body.V == 2 && body.RescueCandidate,
+                    UnverifiedResumeApproved = body.V == 2 && !body.IntegrityUnavailable && body.UnverifiedResumeApproved,
+                    RescueMode = body.V == 2 ? (RescueMode)body.RescueMode : RescueMode.None,
+                    State = body.Kind == (int)JobKind.Http && !body.IntegrityUnavailable ? JobState.NeedsLink : JobState.NeedsAttention,
+                    Reason = body.IntegrityUnavailable ? "recovery-integrity-missing" : "restored",
+                    Message = body.IntegrityUnavailable ? "The saved piece-checksum map exceeded the recovery file limit. Provide the original trusted checksums before continuing. Saved data was kept."
+                        : body.Kind == (int)JobKind.Http ? "Restored from a recovery file. Provide the download link and trusted verification evidence to continue."
                         : "Streaming partial restored without a private transfer plan. Resolve a new copy; saved fragments were kept and must not be treated as an ordinary HTTP file.",
-                    ETag = body.ETag, Identity = (IdentityLevel)body.Identity, AcceptsRanges = true, Generation = body.Generation,
+                    ETag = body.ETag, Identity = body.V == 2 && !body.IntegrityUnavailable ? (IdentityLevel)body.Identity : IdentityLevel.None, AcceptsRanges = true, Generation = body.Generation,
                     MediaMetadataJson = mediaMetadataJson,
                     MediaThumbnailUrl = thumbnailUrl,
                     LastModified = DateTimeOffset.TryParse(body.LastModified, out DateTimeOffset lm) ? lm : null

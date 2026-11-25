@@ -17,6 +17,8 @@ public sealed partial class DownloadEngine
     public async Task<RescueResult> RefreshMediaSourceAsync(Guid id, ResolvedMediaSource replacement, CancellationToken ct = default,
         string? expectedExpiredSource = null)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         ArgumentNullException.ThrowIfNull(replacement);
         string? liveState = null;
         bool vodHls = false;
@@ -136,6 +138,8 @@ public sealed partial class DownloadEngine
         DateTimeOffset? expiresAt, IReadOnlyDictionary<string, string> secrets, CancellationToken ct = default,
         string? expectedExpiredSource = null)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         ArgumentNullException.ThrowIfNull(secrets);
         if (MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var parsed, out _)
             && parsed.IsSegmented)
@@ -163,7 +167,7 @@ public sealed partial class DownloadEngine
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out next, out string parseError))
                 return Rejected(parseError);
-            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange, Metadata = current.Metadata };
             if (!current.CanContinueWith(next, out string why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             if (next.Tracks.Count == 0 || !UrlPolicy.TryParse(next.Tracks[0].Url, out Uri firstTrack, out _))
@@ -203,7 +207,8 @@ public sealed partial class DownloadEngine
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             _credentials[id] = credentials!;
         }
         FlushOutbox();
@@ -306,7 +311,8 @@ public sealed partial class DownloadEngine
                 && Uri.TryCreate(replacement.Url, UriKind.Absolute, out Uri? replacementUri)
                 && !UrlPolicy.IsSameOrigin(prior.Origin, replacementUri);
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             if (credentials is not null) _credentials[job.Id] = credentials;
             else if (removeCredentials) _credentials.Remove(job.Id);
         }
@@ -320,6 +326,8 @@ public sealed partial class DownloadEngine
     public async Task<RescueResult> RefreshMergePlanAsync(Guid id, string replacementPlanJson,
         DateTimeOffset? expiresAt = null, CancellationToken ct = default, string? expectedExpiredSource = null)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         bool parsed = false;
         bool segmented = false;
         lock (_lock)
@@ -371,7 +379,7 @@ public sealed partial class DownloadEngine
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out next, out string parseError))
                 return Rejected(parseError);
-            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange, Metadata = current.Metadata };
             if (!CanRebaseSegmentedPlan(current, next, out string shapeError)) return Rejected(shapeError);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             if (secrets is not null)
@@ -430,7 +438,8 @@ public sealed partial class DownloadEngine
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; saved parts were verified.", 0);
             ct.ThrowIfCancellationRequested();
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             if (credentials is not null) _credentials[id] = credentials;
             else _credentials.Remove(id);
         }
@@ -501,7 +510,7 @@ public sealed partial class DownloadEngine
                 return Rejected("The saved plan is unreadable. Saved data was kept; restart as a separate copy.");
             if (!MediaMergePlan.TryParse(replacementPlanJson, Options.AllowPrivateNetworks, out var next, out var error))
                 return Rejected(error);
-            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange };
+            next = next with { ClipRange = current.ClipRange, OutputRange = current.OutputRange, Metadata = current.Metadata };
             if (!current.CanContinueWith(next, out var why)) return Rejected(why);
             if (expiresAt <= DateTimeOffset.UtcNow) return Rejected("The replacement source is already expired.");
             DownloadJob updated = job.CopyForUpdate();
@@ -511,12 +520,21 @@ public sealed partial class DownloadEngine
             updated.MediaExpiresAt = expiresAt;
             if (job.State is JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.WaitingForRetry)
                 (updated.State, updated.Reason, updated.Message, updated.RetryCount) = (JobState.Queued, "", "Source refreshed; continuing saved data.", 0);
-            SaveRefreshedJobLocked(job, updated);
+            if (!SaveRefreshedJobLocked(job, updated))
+                return Rejected("The replacement source is already owned by another download. Saved data was kept.");
             _credentials.Remove(id);
         }
         FlushOutbox();
         ScheduleNext();
         return new RescueResult(true, RescueMode.R0, "The refreshed source matches the saved tracks byte-for-byte by provider identity. Download continues.", 0);
+    }
+
+    public MediaMergePlan? GetSavedMergePlan(Guid id)
+    {
+        lock (_lock)
+            return _jobs.TryGetValue(id, out DownloadJob? job) && job.Kind == JobKind.Merge
+                && MediaMergePlan.TryParse(job.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan plan, out _)
+                ? plan : null;
     }
 
     private const string AutomaticRefreshChanged = "The download changed since automatic refresh was scheduled. Saved data was kept.";
@@ -527,14 +545,16 @@ public sealed partial class DownloadEngine
             && job.SourceUrl == expectedExpiredSource && !_sessions.ContainsKey(job.Id)
             && job.BrowserProof is not { AwaitingConfirmation: true });
 
-    private void SaveRefreshedJobLocked(DownloadJob job, DownloadJob updated)
+    private bool SaveRefreshedJobLocked(DownloadJob job, DownloadJob updated)
     {
+        if (HasConflictingDownloadLocked(updated)) return false;
         bool wasCandidate = IsDuplicateCandidate(job);
         string previousSourceUrl = job.SourceUrl;
         SaveLocked(updated);
         job.ApplyPersistedState(updated);
         ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
         Changed(job);
+        return true;
     }
 
     private static string AppendPreviousUrl(string previousUrls, string sourceUrl) =>

@@ -11,6 +11,8 @@ public sealed partial class DownloadEngine
 
     public async Task<BridgeResponse> ReceiveBrowserBodyAsync(string requestId, BrowserBodyRequest request, CancellationToken ct)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         if (!BridgeProtocol.IsRequestId(request.TransferId))
             return BridgeResponse.Fail(requestId, "invalid", "Invalid browser transfer.");
         BrowserBodyReceiver receiver;

@@ -48,10 +48,9 @@ public static class UrlPolicy
     public static bool IsSameOrigin(Uri a, Uri b) =>
         a.Scheme == b.Scheme && string.Equals(a.Host, b.Host, StringComparison.OrdinalIgnoreCase) && a.Port == b.Port;
 
-    /// <summary>Same host and path; only the query (typically a signed token) may differ.</summary>
+    /// <summary>Exact resource address, excluding the fragment.</summary>
     public static bool IsSameResource(Uri a, Uri b) =>
-        string.Equals(a.Host, b.Host, StringComparison.OrdinalIgnoreCase)
-        && string.Equals(a.AbsolutePath, b.AbsolutePath, StringComparison.Ordinal);
+        string.Equals(Normalize(a), Normalize(b), StringComparison.Ordinal);
 
     /// <summary>Rejects literal private targets before connecting. The connect callback re-checks resolved addresses.</summary>
     public static void EnsureAllowed(Uri uri, bool allowPrivate)

@@ -47,13 +47,13 @@ public static class BridgeProtocol
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    // ---- framing: 4-byte little-endian length, then UTF-8 JSON -------------------------------------------------------
+    // framing: 4-byte little-endian length, then UTF-8 JSON
 
     public static Task<string?> ReadFrameAsync(Stream stream, CancellationToken ct) => SetupExitProtocol.ReadFrameAsync(stream, ct);
 
     public static Task WriteFrameAsync(Stream stream, string json, CancellationToken ct) => SetupExitProtocol.WriteFrameAsync(stream, json, ct);
 
-    // ---- validation ---------------------------------------------------------------------------------------------------
+    // validation
 
     public static bool TryParse(string json, out BridgeRequest request, out string error)
     {

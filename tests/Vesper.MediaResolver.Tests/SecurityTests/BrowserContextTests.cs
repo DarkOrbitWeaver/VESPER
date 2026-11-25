@@ -183,4 +183,25 @@ public class BrowserContextTests
         Assert.Equal(2, result.Item!.Representations.Count);
         Assert.Equal("Page title", result.Item.Title);
     }
+
+    [Theory]
+    [InlineData("vesper.discovery/10")]
+    [InlineData("vesper.discovery/1bad")]
+    public void UnsupportedSchemaIsRejected(string schema)
+    {
+        Assert.Equal(MediaErrorCode.InvalidInput, CodeOf(new BrowserDiscoveryMessage
+        {
+            Schema = schema, PageUrl = "https://example.com/watch"
+        }));
+    }
+
+    [Fact]
+    public void NullCandidateListIsRejected()
+    {
+        Assert.Equal(MediaErrorCode.InvalidInput, CodeOf(new BrowserDiscoveryMessage
+        {
+            Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = "https://example.com/watch",
+            Candidates = null!
+        }));
+    }
 }

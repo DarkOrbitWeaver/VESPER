@@ -27,6 +27,7 @@ public static class CompatibilityReport
 {
     public static string ToMarkdown(IEnumerable<AdapterDescriptor> adapters, IEnumerable<CompatibilityRecord>? records = null)
     {
+        var adapterList = adapters.ToArray();
         var byId = (records ?? []).GroupBy(r => r.AdapterId).ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.LastVerified).First());
         var sb = new StringBuilder();
         sb.AppendLine("# Vesper.MediaResolver compatibility report");
@@ -37,7 +38,7 @@ public static class CompatibilityReport
         sb.AppendLine("| Adapter | Status | Last verified | Single | Playlist | Audio | Subtitles | Auth | Known unsupported |");
         sb.AppendLine("|---|---|---|---|---|---|---|---|---|");
 
-        foreach (var a in adapters)
+        foreach (var a in adapterList)
         {
             byId.TryGetValue(a.Id, out var rec);
             var c = a.Capabilities;
@@ -54,7 +55,7 @@ public static class CompatibilityReport
         }
 
         sb.AppendLine();
-        foreach (var a in adapters)
+        foreach (var a in adapterList)
         {
             var c = a.Capabilities;
             sb.AppendLine($"## {a.DisplayName} (`{a.Id}`)");

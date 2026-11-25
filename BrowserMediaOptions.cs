@@ -252,12 +252,16 @@ internal sealed partial class BrowserBridgeHandler
         }
 
         Guid session = Guid.NewGuid();
+        DateTimeOffset sessionExpires = now.AddMinutes(5);
+        DateTimeOffset formatsExpire = jobs.Where(job => job.ExpiresAt.HasValue)
+            .Select(job => job.ExpiresAt!.Value).DefaultIfEmpty(sessionExpires).Min();
+        if (formatsExpire > sessionExpires) formatsExpire = sessionExpires;
         lock (_mediaSessionsLock)
         {
             foreach (Guid expired in _mediaSessions.Where(entry => entry.Value.Expires <= now).Select(entry => entry.Key).ToArray())
                 _mediaSessions.Remove(expired);
             if (_mediaSessions.Count >= 12) _mediaSessions.Remove(_mediaSessions.MinBy(entry => entry.Value.Expires).Key);
-            _mediaSessions[session] = new MediaSession(now.AddMinutes(5), jobs.ToArray(), playable, recipes.ToArray());
+            _mediaSessions[session] = new MediaSession(sessionExpires, jobs.ToArray(), playable, recipes.ToArray());
         }
         // Compare actual executable transfer recipes, not quality labels or
         // duration. Different URLs, track plans or outputs are not equivalent.
@@ -278,7 +282,7 @@ internal sealed partial class BrowserBridgeHandler
         return BridgeResponse.Success(requestId, data: new
         {
             playbackMatches,
-            mediaSession = session.ToString("N"), deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
+            mediaSession = session.ToString("N"), formatsExpireAt = formatsExpire, deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
             isLive = item.IsLive,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
             choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,

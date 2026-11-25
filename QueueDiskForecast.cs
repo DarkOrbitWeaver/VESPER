@@ -104,7 +104,7 @@ internal static class QueueDiskForecast
     }
 
     internal static bool IsPending(JobSnapshot job) => job.State is not (JobState.Completed or JobState.Finalizing
-        or JobState.Verifying or JobState.Suspect);
+        or JobState.Verifying or JobState.Suspect or JobState.Cancelled);
 
     private static bool CanEstimate(JobSnapshot job) => job.Kind == JobKind.Http && job.Output == MediaOutput.Original
         && job.State != JobState.NeedsLink && !job.IsLiveRecording && job.TotalBytes is >= 0;

@@ -96,7 +96,7 @@ internal static class EngineHost
         engine.SettingsChanged();
     }
 
-    // ---- sleep prevention: only while jobs run and only if the user asked for it ------------------------------------
+    // sleep prevention: only while jobs run and only if the user asked for it
 
     [Flags]
     private enum ExecutionState : uint { Continuous = 0x80000000, SystemRequired = 0x00000001 }

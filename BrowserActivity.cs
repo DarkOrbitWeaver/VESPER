@@ -18,9 +18,6 @@ internal sealed partial class BrowserBridgeHandler
     private readonly Dictionary<string, ProfileWatch> _browserWatches = new(StringComparer.Ordinal);
     private readonly object _browserWatchLock = new();
 
-    private Task<BridgeResponse> WatchBrowserActivityAsync(BridgeRequest request, CancellationToken ct) =>
-        WatchManagedBrowserActivityAsync(request.Id, request.Activity!, [], ct);
-
     private async Task<BridgeResponse> WatchManagedBrowserActivityAsync(string requestId, BrowserActivity activity,
         IReadOnlyList<string> blocked, CancellationToken ct)
     {

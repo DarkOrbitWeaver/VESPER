@@ -45,7 +45,8 @@ internal static class SettingsStore
                 File.Move(path, bad);
                 LoadWarning = $"VESPER could not read its settings file ({ex.Message}). It was kept as {Path.GetFileName(bad)} and defaults are in use.";
             }
-            catch (IOException) { LoadWarning = "VESPER could not read its settings file and is using defaults."; }
+            catch (Exception backupError) when (backupError is IOException or UnauthorizedAccessException)
+            { LoadWarning = "VESPER could not read its settings file and is using defaults."; }
             return new VesperPreferences();
         }
     }

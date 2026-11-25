@@ -13,7 +13,7 @@ public static class ChapterParser
         foreach (var raw in description.Split('\n'))
         {
             string line = raw.Trim();
-            if (line.Length < 4 || !char.IsAsciiDigit(line[0]) && line[0] != '(') continue;
+            if (line.Length < 4 || !char.IsAsciiDigit(line[0]) && line[0] != '(' && line[0] != '[') continue;
 
             int space = line.IndexOf(' ');
             if (space < 0) continue;

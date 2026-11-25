@@ -5,7 +5,7 @@ namespace Vesper.MediaResolver.Utilities;
 /// <summary>Reads well-known expiry parameters from signed URLs. Returns null when nothing defensible is present.</summary>
 public static class ExpiryParser
 {
-    private static readonly string[] UnixKeys = ["expires", "expire", "exp", "deadline", "Expires"];
+    private static readonly string[] UnixKeys = ["expires", "expire", "exp", "deadline"];
 
     public static DateTimeOffset? FromUrl(Uri url)
     {
@@ -30,7 +30,8 @@ public static class ExpiryParser
             && long.TryParse(UrlUtil.QueryValue(url, "X-Amz-Expires"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var ttl)
             && ttl is > 0 and < 31_536_000
             && DateTimeOffset.TryParseExact(amzDate, "yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var start))
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var start)
+            && start <= DateTimeOffset.MaxValue.AddSeconds(-ttl))
             return start.AddSeconds(ttl);
 
         return null;

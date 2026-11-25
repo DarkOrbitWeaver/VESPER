@@ -15,7 +15,7 @@ internal sealed class RedditAdapter : AdapterBase
             SingleItem: true, Playlist: false, AudioOnly: true, Subtitles: false,
             Authentication: "None (public posts); login-walled posts fail with LoginRequired",
             KnownUnsupported: ["external embeds (YouTube, Streamable...) inside posts", "galleries and images", "NSFW posts requiring login"],
-            Notes: "Video and audio are separate DASH streams: merging them needs an external muxer."));
+            Notes: "Video and audio are separate DASH streams. Compatible tracks use VESPER's native remuxer."));
 
     public RedditAdapter(ResolverServices svc) : base(svc) { }
 

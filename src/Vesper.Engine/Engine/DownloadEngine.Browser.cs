@@ -111,6 +111,8 @@ public sealed partial class DownloadEngine
     /// <returns>The waiting download that would continue, or null when Chrome's download is simply a new file.</returns>
     public async Task<Guid?> OfferFreshLinkAsync(AddRequest request, CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         if (request is not { Kind: JobKind.Http, StartNow: true, RequestId: { Length: > 2 } requestId,
                 BrowserProof: { IsValid: true, AwaitingConfirmation: true, Length: long length } proof }
             || !requestId.EndsWith(":0", StringComparison.Ordinal)
@@ -196,6 +198,8 @@ public sealed partial class DownloadEngine
     /// </summary>
     public async Task<bool> AcceptBrowserTransferAsync(string transferId, CancellationToken ct = default)
     {
+        using var operation = EnterOperation(ct);
+        ct = operation.Token;
         PendingAdoption? offer;
         lock (_lock)
         {

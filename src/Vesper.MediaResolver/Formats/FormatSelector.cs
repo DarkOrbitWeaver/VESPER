@@ -24,12 +24,12 @@ public static class FormatSelector
         bool anyVideo = reps.Any(r => r.HasVideo);
 
         var result = prefs.Mode == QualityMode.AudioOnly || !anyVideo
-            ? SelectAudio(item, reps, audios, prefs)
+            ? SelectAudio(reps, audios, prefs)
             : SelectVideo(item, reps, audios, prefs);
         return result.Selection is null ? result : result with { Selection = WithSubtitles(result.Selection, item, prefs) };
     }
 
-    // ------------------------------------------------------------------------------------------------ video
+    // video
 
     private sealed class Combo
     {
@@ -178,7 +178,7 @@ public static class FormatSelector
             }
         }
 
-        return Ok(BuildSelection(ordered[0], p, fallback, reason));
+        return Ok(BuildSelection(ordered[0], fallback, reason));
     }
 
     private static List<Combo> Filter(List<Combo> src, bool active, Func<Combo, bool> pred, string name, ref string? eliminatedBy)
@@ -228,7 +228,7 @@ public static class FormatSelector
         return int.MaxValue - 1;
     }
 
-    private static FormatSelection BuildSelection(Combo c, FormatPreferences p, bool fallback, string? reason)
+    private static FormatSelection BuildSelection(Combo c, bool fallback, string? reason)
     {
         var req = c.V.Requirements | (c.A?.Requirements ?? ProcessingRequirement.None);
         if (c.A is not null) req |= ProcessingRequirement.MuxAudioVideo;
@@ -252,9 +252,9 @@ public static class FormatSelector
         };
     }
 
-    // ------------------------------------------------------------------------------------------------ audio
+    // audio
 
-    private static SelectionResult SelectAudio(MediaItem item, List<MediaRepresentation> reps, List<MediaRepresentation> audios, FormatPreferences p)
+    private static SelectionResult SelectAudio(List<MediaRepresentation> reps, List<MediaRepresentation> audios, FormatPreferences p)
     {
         if (audios.Count > 0)
         {
@@ -343,7 +343,7 @@ public static class FormatSelector
         return a.IsDefaultAudio ? 3 : 4;
     }
 
-    // ------------------------------------------------------------------------------------------------ subtitles
+    // subtitles
 
     private static FormatSelection WithSubtitles(FormatSelection sel, MediaItem item, FormatPreferences p)
     {

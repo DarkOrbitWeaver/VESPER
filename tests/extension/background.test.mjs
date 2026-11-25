@@ -3124,19 +3124,91 @@ test('opening a supported video picker uses sign-in after Chrome approves it', a
   }
 });
 
-test('video format prefetch is off by default and limited to supported pages', async () => {
+test('video format prefetch defaults on, respects opt-out and skips unbound pages', async () => {
   const app = load({ 'media-options': mediaOptionsReply });
-  const disabled = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
-  assert.equal(disabled.data.prefetchSkipped, true);
-  assert.equal(app.sent.length, 0);
+  const enabled = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  assert.equal(enabled.ok, true);
+  assert.equal(app.sent.length, 1);
 
-  const enabled = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: true } });
-  const unsupportedPage = 'https://example.com/article';
-  const skipped = await enabled.message(videoOptionsMessage(unsupportedPage, { prefetch: true }), {
-    tab: { id: 17, url: unsupportedPage }, url: unsupportedPage, frameId: 0, documentId: 'doc-17'
-  });
+  const disabled = load({ 'media-options': mediaOptionsReply }, { localData: { prefetchFormats: false } });
+  const skipped = await disabled.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
   assert.equal(skipped.data.prefetchSkipped, true);
-  assert.equal(enabled.sent.length, 0);
+  assert.equal(disabled.sent.length, 0);
+
+  const unsupported = load({ 'media-options': mediaOptionsReply });
+  const page = 'https://example.com/article';
+  const result = await unsupported.message(videoOptionsMessage(page, { prefetch: true }), {
+    tab: { id: 17, url: page }, url: page, frameId: 0, documentId: 'doc-17'
+  });
+  assert.equal(result.data.prefetchSkipped, true);
+  assert.equal(unsupported.sent.length, 0);
+});
+
+test('picker joins an in-flight anonymous prefetch of the exact same player', async () => {
+  let complete, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const reply = new Promise(resolve => { complete = resolve; });
+  const app = load({ 'media-options': () => { started(); return reply; } });
+  const warm = app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  await ready;
+  const click = app.message(videoOptionsMessage(videoPage, { playerFacts: { durationSeconds: 60, height: 720 } }), videoSender);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.sent.filter(message => message.type === 'media-options').length, 1);
+  complete(mediaOptionsReply);
+  assert.deepEqual((await click).data.choices, mediaOptionsReply.data.choices);
+  assert.equal((await warm).ok, true);
+});
+
+test('prefetch never uses cookies or starts on a hidden, incognito, unbound or Chrome-only tab', async () => {
+  for (const [sender, extra, prefs] of [
+    [{ ...videoSender, tab: { ...videoSender.tab, active: false } }, {}, {}],
+    [{ ...videoSender, tab: { ...videoSender.tab, incognito: true } }, {}, {}],
+    [{ ...videoSender, documentId: undefined }, {}, {}],
+    [videoSender, { generation: 0 }, {}],
+    [videoSender, {}, { route: 'chrome' }]
+  ]) {
+    const app = load({ 'media-options': mediaOptionsReply }, { signInPermission: true, prefs });
+    const result = await app.message(videoOptionsMessage(videoPage, { prefetch: true, ...extra }), sender);
+    assert.equal(result?.data?.prefetchSkipped, true);
+    assert.equal(app.sent.length, 0);
+    assert.equal(app.cookieLookups.length, 0);
+  }
+});
+
+test('warm formats stay usable beyond thirty seconds, but not beyond the native expiry', async () => {
+  const expiresAt = new Date(Date.now() + 70_000).toISOString();
+  const reply = { ...mediaOptionsReply, data: { ...mediaOptionsReply.data, formatsExpireAt: expiresAt } };
+  const app = load({ 'media-options': reply });
+  await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  app.advanceTime(40_000);
+  await app.message(videoOptionsMessage(videoPage), videoSender);
+  assert.equal(app.sent.length, 1);
+  app.advanceTime(26_000);
+  await app.message(videoOptionsMessage(videoPage), videoSender);
+  assert.equal(app.sent.length, 2);
+});
+
+test('a changed video generation cannot reuse an earlier prepared selection', async () => {
+  const app = load({ 'media-options': mediaOptionsReply });
+  await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  await app.message(videoOptionsMessage(videoPage, { generation: 2 }), videoSender);
+  assert.equal(app.sent.length, 2);
+});
+
+test('background prefetch obeys site retry deadlines without delaying explicit picker clicks', async () => {
+  const retryAt = new Date(Date.now() + 180_000).toISOString();
+  const app = load({ 'media-options': { ok: false, code: 'rate-limited', data: { retryAt } } });
+  const first = await app.message(videoOptionsMessage(videoPage, { prefetch: true }), videoSender);
+  assert.equal(first.code, 'rate-limited');
+  app.advanceTime(20_000);
+  const other = 'https://www.youtube.com/watch?v=abcdefghijk';
+  const sender = { ...videoSender, tab: { id: 18, url: other }, url: other, documentId: 'doc-18' };
+  const second = await app.message(videoOptionsMessage(other, { prefetch: true }), sender);
+  assert.equal(second.data.prefetchSkipped, true);
+  assert.equal(app.sent.length, 1);
+  app.advanceTime(161_000);
+  await app.message(videoOptionsMessage(other, { prefetch: true }), sender);
+  assert.equal(app.sent.length, 2);
 });
 
 test('a signed-in picker click gets fresh formats after anonymous prefetch', async () => {

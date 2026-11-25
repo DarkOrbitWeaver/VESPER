@@ -727,6 +727,33 @@ public sealed class RecoveryManifestInputTests
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Recovery_preserves_trusted_verification_obligations(bool pieces)
+    {
+        string directory = CreateDirectory("vesper-manifest-integrity-");
+        string partial = CreatePartial(directory);
+        try
+        {
+            DownloadJob job = WriteJob(directory, partial);
+            job.ExpectedSha256 = new string('a', 64);
+            job.RescueCandidate = !pieces;
+            job.UnverifiedResumeApproved = true;
+            job.RescueMode = pieces ? RescueMode.R1b : RescueMode.R1;
+            if (pieces) job.PieceMapJson = new PieceMap(16384, 3, [new string('b', 64)]).ToJson();
+            RecoveryManifest.Write(job);
+            Assert.True(RecoveryManifest.TryRecover(RecoveryManifest.PathFor(partial), out DownloadJob restored,
+                out string problem), problem);
+            Assert.Equal(job.ExpectedSha256, restored.ExpectedSha256);
+            Assert.Equal(job.PieceMapJson, restored.PieceMapJson);
+            Assert.Equal(job.RescueMode, restored.RescueMode);
+            Assert.Equal(job.RescueCandidate, restored.RescueCandidate);
+            Assert.False(restored.Sha256Verified);
+        }
+        finally { Directory.Delete(directory, recursive: true); }
+    }
+
     private static string CreateDirectory(string prefix)
     {
         string directory = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
