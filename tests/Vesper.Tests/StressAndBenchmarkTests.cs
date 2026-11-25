@@ -43,6 +43,33 @@ public class StressTests
             Assert.True(OpenHandles() - handlesBefore < 60, $"handles grew from {handlesBefore} to {OpenHandles()}");
     }
 
+    [Theory]
+    [InlineData("/small-slow", true)]
+    [InlineData("/small-slow-no-validator", false)]
+    [InlineData("/file", false)]
+    public async Task Small_files_use_an_extra_range_only_when_slow_and_strongly_identified(string path, bool split)
+    {
+        await using var server = new FaultServer(2 * 1024 * 1024);
+        await server.StartAsync();
+        string root = Path.Combine(Path.GetTempPath(), "vesper-small-range-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(root, "data"), DefaultFolder = Path.Combine(root, "files"),
+                AllowPrivateNetworks = true, MaxConnectionsPerJob = 4
+            });
+            var done = new TaskCompletionSource<JobSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+            engine.JobChanged += job => { if (job.State == JobState.Completed) done.TrySetResult(job); };
+            var added = engine.Add(new AddRequest(server.Url(path), FileName: "fixture.bin"));
+            Assert.True(added.Ok, added.Message);
+            JobSnapshot result = await done.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.Equal(server.V1, await File.ReadAllBytesAsync(result.FinalPath!));
+            Assert.Equal(split, server.RangeHeaders.Any(header => !header.Contains("bytes=0-")));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     [Fact]
     public async Task Pausing_and_resuming_repeatedly_never_corrupts_the_result()
     {
@@ -91,6 +118,44 @@ public class BenchmarkTests(ITestOutputHelper output)
     /// These synthetic local numbers are not real-network performance and must not be compared with FDM/IDM.
     /// Run: dotnet test --filter Category=Benchmark --logger "console;verbosity=detailed"
     /// </summary>
+    [Fact]
+    public async Task Measure_slow_small_file_adaptive_range()
+    {
+        const int size = 2 * 1024 * 1024;
+        await using var server = new FaultServer(size);
+        await server.StartAsync();
+        var samples = new List<(int Connections, double Milliseconds)>();
+        for (int iteration = 0; iteration < 3; iteration++)
+        {
+            foreach (int connections in iteration % 2 == 0 ? new[] { 1, 4 } : new[] { 4, 1 })
+            {
+                string root = Path.Combine(Path.GetTempPath(), "vesper-adaptive-bench-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    using var engine = DownloadEngine.Start(new EngineOptions
+                    {
+                        DataDirectory = Path.Combine(root, "data"), DefaultFolder = Path.Combine(root, "files"),
+                        AllowPrivateNetworks = true, MaxConnectionsPerJob = connections
+                    });
+                    var done = new TaskCompletionSource<JobSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    engine.JobChanged += job => { if (job.State == JobState.Completed) done.TrySetResult(job); };
+                    var watch = Stopwatch.StartNew();
+                    var added = engine.Add(new AddRequest(server.Url("/small-slow"), FileName: "fixture.bin"));
+                    Assert.True(added.Ok, added.Message);
+                    JobSnapshot result = await done.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                    watch.Stop();
+                    Assert.Equal(server.V1, await File.ReadAllBytesAsync(result.FinalPath!));
+                    samples.Add((connections, watch.Elapsed.TotalMilliseconds));
+                    output.WriteLine(JsonSerializer.Serialize(new { connections, elapsedMs = watch.Elapsed.TotalMilliseconds, bytes = size }));
+                }
+                finally { Directory.Delete(root, recursive: true); }
+            }
+        }
+        output.WriteLine(JsonSerializer.Serialize(new { size, samples = samples.Count,
+            singleMedianMs = Median(samples.Where(s => s.Connections == 1).Select(s => s.Milliseconds).Order().ToArray()),
+            adaptiveMedianMs = Median(samples.Where(s => s.Connections == 4).Select(s => s.Milliseconds).Order().ToArray()) }));
+    }
+
     [Fact]
     public async Task Measure_small_direct_download_latency()
     {

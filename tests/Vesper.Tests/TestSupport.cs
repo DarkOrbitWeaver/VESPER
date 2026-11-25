@@ -205,6 +205,8 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/badrange": // honest about the first block, then answers every later range from the wrong offset
                 await Serve(ctx, V1, "\"p1\"", Modified, wrongStartAfterZero: true);
                 break;
+            case "/small-slow": await Serve(ctx, V1, "\"p1\"", Modified, delayPerChunkMs: 60); break;
+            case "/small-slow-no-validator": await Serve(ctx, V1, null, Modified, delayPerChunkMs: 60); break;
             case "/slow": await Serve(ctx, V1, "\"p1\"", Modified, delayPerChunkMs: 15); break;
             default: res.StatusCode = 404; break;
         }

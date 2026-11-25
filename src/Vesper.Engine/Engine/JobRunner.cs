@@ -430,14 +430,21 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         bool pieceMode = _pieces is not null;
         if (_pieces is not null && _pieces.TotalLength != total)
             throw Stop(RunOutcome.NeedsAttention("piece-map", "The server's file size differs from the trusted piece list. Saved data was kept."));
-        bool segmented = _o.MaxConnectionsPerJob > 1 && !_singleConnection && !Job.NonResumable
-            && (pieceMode || (total >= _o.MinSegmentedSize && Job.Identity >= IdentityLevel.LastModified));
+        bool canSplit = _o.MaxConnectionsPerJob > 1 && !_singleConnection && !Job.NonResumable;
+        bool segmented = canSplit && (pieceMode || (total >= _o.MinSegmentedSize && Job.Identity >= IdentityLevel.LastModified));
+        bool recentlyThrottled = first.Response.RequestMessage?.RequestUri is { } origin && _o.Cooldown.WasRecentlyThrottled(origin);
+        // A small file on a slow connection can take much longer than a large file on a fast one.
+        // Permit one measured extra range only with a strong validator, never on a limited or throttled link.
+        bool adaptiveSmall = canSplit && !segmented && !pieceMode && !recentlyThrottled
+            && Job.Identity == IdentityLevel.StrongEtag && total >= ConnectionAdvisor.SmallFileMinimum
+            && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0;
 
-        var board = new SegmentBoard(pieceMode ? long.MaxValue / 4 : _o.MinSplitBytes);
+        var board = new SegmentBoard(pieceMode ? long.MaxValue / 4 :
+            adaptiveSmall ? Math.Min(_o.MinSplitBytes, ConnectionAdvisor.SmallSplitMinimum) : _o.MinSplitBytes);
         foreach (ByteRange gap in Job.Extents.Gaps(total)) AddSegments(board, gap, pieceMode);
 
         var advisor = new ConnectionAdvisor(segmented ? _o.MaxConnectionsPerJob : 1);
-        if (segmented && first.Response.RequestMessage?.RequestUri is { } origin && _o.Cooldown.WasRecentlyThrottled(origin))
+        if (segmented && recentlyThrottled)
             advisor.OnThrottled(_o.MaxConnectionsPerJob);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var workers = new List<Task>();
@@ -482,6 +489,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         workers.Add(Task.Run(() => WorkerAsync(takesFirst: true), CancellationToken.None));
 
         long lastChange = Stopwatch.GetTimestamp();
+        long startingBytes = session.RunBytes;
+        bool smallProbeStarted = false;
         int target = 1;
         try
         {
@@ -498,7 +507,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     while (workers.Count(t => !t.IsCompleted) < target && hostGate.Wait(0))
                         workers.Add(Task.Run(() => WorkerAsync(takesFirst: false), CancellationToken.None));
                 }
-                await Task.WhenAny(Task.WhenAny(workers), Task.Delay(1000, CancellationToken.None)).ConfigureAwait(false);
+                if (adaptiveSmall && !smallProbeStarted
+                    && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0
+                    && ConnectionAdvisor.WorthSmallFileSplit(session.RunBytes - startingBytes, board.RemainingBytes,
+                        Stopwatch.GetElapsedTime(lastChange))
+                    && hostGate.Wait(0))
+                {
+                    smallProbeStarted = true;
+                    workers.Add(Task.Run(() => WorkerAsync(takesFirst: false), CancellationToken.None));
+                }
+                int pollMs = adaptiveSmall && !smallProbeStarted ? 250 : 1000;
+                await Task.WhenAny(Task.WhenAny(workers), Task.Delay(pollMs, CancellationToken.None)).ConfigureAwait(false);
             }
         }
         finally

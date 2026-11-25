@@ -61,6 +61,18 @@ public sealed class RetryPolicy(RetryOptions options, Random? random = null)
 /// </summary>
 public sealed class ConnectionAdvisor
 {
+    internal const long SmallFileMinimum = 1024 * 1024;
+    internal const long SmallSplitMinimum = 256 * 1024;
+
+    internal static bool WorthSmallFileSplit(long received, long remaining, TimeSpan elapsed)
+    {
+        // Measure from the first response, not from DNS/TLS or the resolving phase.
+        // A stalled connection with no verified bytes does not justify more requests.
+        if (elapsed < TimeSpan.FromMilliseconds(750) || received < 16 * 1024
+            || remaining < 2 * SmallSplitMinimum) return false;
+        return remaining / (received / elapsed.TotalSeconds) >= 3;
+    }
+
     private int _ceiling;
     private double _throughputAtLastChange;
     private int _countAtLastChange = 1;
