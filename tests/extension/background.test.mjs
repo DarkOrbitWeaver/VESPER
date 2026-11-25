@@ -3812,6 +3812,34 @@ test('a media selection carries its time range to VESPER and refuses an impossib
   assert.equal(app.sent.at(-1).range, undefined);
 });
 
+test('unrelated Chrome capture recovery does not block a scoped media picker or selection', async () => {
+  const token = 'e'.repeat(32);
+  const app = load({ 'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
+    'media-select': { ok: true } });
+  app.evaluate('captureRecovery = new Promise(resolve => { globalThis.finishQaRecovery = resolve; })');
+  let timer, managedFinished = false;
+  const managed = app.message({ type: 'managed-downloads' }).then(reply => { managedFinished = true; return reply; });
+  const scope = { pageUrl: videoPage, playerPageUrl: videoPage, playerKey: 'player-1', generation: 1, playerUrl: '' };
+  const select = { type: 'media-select', mediaSession: token, formatChoice: 0, mode: 'download', ...scope };
+  try {
+    const foreground = (async () => {
+      assert.equal((await app.message({ type: 'media-options', ...scope }, videoSender)).ok, true);
+      assert.equal((await app.message({ ...select, generation: 2 }, videoSender)).code, 'expired-selection');
+      assert.equal((await app.message(select, videoSender)).ok, true);
+    })();
+    await Promise.race([foreground, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Media operations waited for unrelated Chrome recovery')), 1000);
+    })]);
+    assert.equal(managedFinished, false);
+    assert.deepEqual(app.sent.map(m => m.type), ['media-options', 'media-select']);
+  } finally {
+    clearTimeout(timer);
+    app.evaluate('finishQaRecovery()');
+    await managed;
+    app.stopWorker();
+  }
+});
+
 test('native format sessions are bound to the requesting document, player and generation', async () => {
   const token = 'b'.repeat(32);
   const app = load({ 'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
@@ -3899,18 +3927,31 @@ test('media track intents get safe distinct idempotency keys', async () => {
   assert.ok(requests[0].id.length <= 120);
 });
 
-test('CHIPS lookup uses the browser-stamped frame partition', async () => {
+test('CHIPS lookup uses the browser-stamped frame partition without serializing cookie reads', async () => {
   const app = load({}, { signInPermission: true, prefs: { useSignIn: true } });
   app.evaluate(`globalThis.cookieQueries = [];
-    chrome.cookies.getPartitionKey = async frame => ({ partitionKey: { topLevelSite: 'https://top.example' } });
+    chrome.cookies.getAllCookieStores = async () => [{id:'current-store',tabIds:[7]}];
+    chrome.cookies.getPartitionKey = async frame => {
+      if (frame.tabId !== 7 || frame.frameId !== 3 || frame.documentId !== 'current') throw Error('wrong frame');
+      return { partitionKey: { topLevelSite: 'https://top.example' } };
+    };
     chrome.cookies.getAll = async query => { cookieQueries.push(query); return query.partitionKey
       ? [{ name: 'partition', value: 'scoped', sameSite: 'no_restriction', partitionKey: query.partitionKey }]
-      : [{ name: 'strict', value: 'withheld', sameSite: 'strict' }]; };`);
-  const result = await app.evaluate(`signInCookies('https://media.example/file', 'https://top.example/',
+      : new Promise(resolve => { globalThis.finishPlainCookies = () => resolve([{ name: 'strict', value: 'withheld', sameSite: 'strict' }]); }); };`);
+  const pending = app.evaluate(`signInCookies('https://media.example/file', 'https://top.example/',
     { frame: { tabId: 7, frameId: 3, documentId: 'current' }, userGesture: false })`);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(app.evaluate('cookieQueries.length'), 2, 'partition lookup starts while ordinary cookies are pending');
+    assert.equal(app.evaluate('cookieQueries.every(query => query.storeId === "current-store")'), true);
+    assert.equal(app.evaluate('cookieQueries[1].partitionKey.topLevelSite'), 'https://top.example');
+  } finally {
+    app.evaluate('finishPlainCookies()');
+  }
+  const result = await pending;
   assert.equal(result.length, 1);
   assert.equal(result[0].name, 'partition');
-  assert.equal(app.evaluate('cookieQueries[1].partitionKey.topLevelSite'), 'https://top.example');
+  app.stopWorker();
 });
 
 test('resource witnesses enter the five-source verification budget before weaker candidates', async () => {

@@ -290,14 +290,16 @@ async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = 
     if (!storeId) return []; // Never read another profile's cookies when a frame was supplied.
   }
   const query = { url, ...(storeId ? { storeId } : {}) };
-  const cookies = await chrome.cookies.getAll(query);
-  if (frame && chrome.cookies.getPartitionKey) {
+  const plain = chrome.cookies.getAll(query);
+  const partitioned = frame && chrome.cookies.getPartitionKey ? (async () => {
     try {
       const { partitionKey } = await chrome.cookies.getPartitionKey(frame);
-      if (partitionKey?.topLevelSite)
-        cookies.push(...await chrome.cookies.getAll({ ...query, partitionKey }));
+      if (partitionKey?.topLevelSite) return await chrome.cookies.getAll({ ...query, partitionKey });
     } catch { /* Detached frames cannot authorize a partition. Unpartitioned cookies remain scoped. */ }
-  }
+    return [];
+  })() : [];
+  const [regular, isolated] = await Promise.all([plain, partitioned]);
+  const cookies = [...regular, ...isolated];
   const fromSameSite = isSameSite(url, initiatorUrl);
   const seen = new Set();
   return cookies.filter(cookie => {
@@ -1618,14 +1620,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   (async () => {
-    if (await extensionPaused() && PAUSE_BLOCKED_COMMANDS.has(message.type))
+    if (PAUSE_BLOCKED_COMMANDS.has(message.type) && await extensionPaused())
       return { ok: false, code: 'paused', message: 'VESPER is paused in Chrome.' };
     if (message.type === 'browser-body-status') return bodyReceiptStatus(message, sender);
     if (message.type === 'browser-body-media-proof') return browserBodyMediaProof(message, sender);
     if (message.type.startsWith('batch-journal-') || message.type === 'batch-arm' || message.type === 'batch-status'
         || message.type === 'batch-clear' || message.type === 'batch-disarm')
       return VesperBatchEvents.handle(message.type, message, sender);
-    await recoverChromeCaptures();
+    const recovery = recoverChromeCaptures();
+    // Native media selection and discovery do not own a Chrome download item.
+    // A recovering attachment must not hold up an unrelated player or picker.
+    if (!['media-element', 'media-options', 'media-source-select', 'media-select', 'native-picker'].includes(message.type))
+      await recovery;
     switch (message.type) {
       case 'smart-submit': {
         const page = mediaPage({}, sender);

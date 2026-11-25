@@ -368,6 +368,14 @@ public sealed class BrowserBridgeTests
         Assert.Equal("vesper-qa-host.exe", Path.GetFileName(helper));
         Assert.True(File.Exists(helper));
         Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(helper)!, "VESPER.exe")));
+        int trials = int.TryParse(Environment.GetEnvironmentVariable("VESPER_QA_HANDOFF_TRIALS"), out int requested)
+            ? Math.Clamp(requested, 1, 5) : 1;
+        for (int trial = 1; trial <= trials; trial++)
+            await MeasureVerifiedMediaHandoffAsync(helper, trial);
+    }
+
+    private static async Task MeasureVerifiedMediaHandoffAsync(string helper, int trial)
+    {
         string pipe = "vesper-qa-" + Guid.NewGuid().ToString("N");
         string root = Path.Combine(Path.GetTempPath(), "vesper-native-media-qa-" + Guid.NewGuid().ToString("N"));
         string downloads = Path.Combine(root, "downloads");
@@ -391,8 +399,12 @@ public sealed class BrowserBridgeTests
             try
             {
                 using var session = new NativeTestSession(helper, pipe);
+                var clock = Stopwatch.StartNew();
                 Assert.True((await session.SendAsync(new { v = 1, id = "native-session-0003", type = "session-open" }, ct)).Ok);
+                double handshakeMs = clock.Elapsed.TotalMilliseconds;
+                clock.Restart();
                 BridgeResponse options = await session.SendAsync(new { v = 1, id = "native-options-0001", type = "media-options", url }, ct);
+                double discoveryMs = clock.Elapsed.TotalMilliseconds;
                 Assert.True(options.Ok, options.Message);
                 JsonElement data = Assert.IsType<JsonElement>(options.Data);
                 string token = data.GetProperty("mediaSession").GetString()!;
@@ -409,7 +421,9 @@ public sealed class BrowserBridgeTests
 
                 var request = new { v = 1, id = "native-media-select", type = "media-select", mediaSession = token,
                     formatChoice = index, mode = "download" };
+                clock.Restart();
                 BridgeResponse accepted = await session.SendAsync(request, ct);
+                double acceptanceMs = clock.Elapsed.TotalMilliseconds;
                 Assert.True(accepted.Ok, accepted.Message);
                 Guid job = Guid.Parse(Assert.Single(accepted.Results!).JobId!);
                 JobSnapshot? snapshot;
@@ -418,13 +432,21 @@ public sealed class BrowserBridgeTests
                 Assert.True(snapshot.State == JobState.Completed, snapshot.Message);
                 Assert.EndsWith(".webm", snapshot.FinalPath!);
                 Assert.Equal(payload, await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
+                double verifiedCompletionMs = clock.Elapsed.TotalMilliseconds;
 
+                clock.Restart();
                 BridgeResponse replay = await session.SendAsync(request, ct);
+                double replayMs = clock.Elapsed.TotalMilliseconds;
                 Assert.True(replay.Ok, replay.Message);
                 Assert.Equal(job, Guid.Parse(Assert.Single(replay.Results!).JobId!));
                 Assert.Single(engine.Snapshots());
                 Assert.Single(Directory.GetFiles(downloads, "*.webm"));
                 await session.CloseAsync(ct);
+                Console.WriteLine("VESPER_HANDOFF " + JsonSerializer.Serialize(new
+                {
+                    trial, handshakeMs, discoveryMs, acceptanceMs, verifiedCompletionMs, replayMs,
+                    bytes = payload.Length, verified = true, track = "isolated-native-media-select"
+                }));
             }
             finally { bridge.CloseResolver(); }
         }

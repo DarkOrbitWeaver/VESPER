@@ -102,6 +102,7 @@ globalThis.VesperNativeSession = (() => {
             multiplexed = true;
             port = connection;
             decide({ ok: true });
+            scheduleIdle();
           } else unsupported();
           return;
         }
@@ -156,7 +157,18 @@ globalThis.VesperNativeSession = (() => {
     const remaining = () => job.deadline - Date.now();
     if (remaining() <= 0) return timedOut();
     if (multiplexed !== false && typeof chrome.runtime.connectNative === 'function') {
-      const opened = await open(job.host);
+      // A warm request needs no handshake. On a cold connection, each caller
+      // still owns its deadline; timing out must not cancel other callers' handshake.
+      let opened = { ok: true };
+      if (!port) {
+        let timer;
+        try {
+          opened = await Promise.race([
+            open(job.host),
+            new Promise(resolve => { timer = setTimeout(() => resolve(timedOut()), Math.max(0, remaining())); })
+          ]);
+        } finally { clearTimeout(timer); }
+      }
       if (remaining() <= 0) return timedOut();
       if (opened.ok) {
         const reply = await sendOverPort(job, remaining());

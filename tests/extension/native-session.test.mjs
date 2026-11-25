@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 const code = readFileSync(new URL('../../extension/native-session.js', import.meta.url),'utf8');
-function setup({legacy=false}={}) {
+function setup({legacy=false,holdHandshake=false}={}) {
   let connections=0, oneShots=0;
   const requests=[], ports=[], timers=new Set();
   const runtime={
@@ -14,9 +14,11 @@ function setup({legacy=false}={}) {
         onMessage:{addListener(fn){port.reply=fn;}},
         onDisconnect:{addListener(fn){port.closed=fn;}},
         postMessage(message){
-          if(message.type==='session-open') queueMicrotask(()=>port.reply(legacy
-            ? {id:message.id,ok:false,code:'invalid'}
-            : {id:message.id,ok:true,data:{mux:true}}));
+          if(message.type==='session-open') {
+            port.handshake=()=>port.reply(legacy ? {id:message.id,ok:false,code:'invalid'}
+              : {id:message.id,ok:true,data:{mux:true}});
+            if(!holdHandshake) queueMicrotask(port.handshake);
+          }
           else requests.push({message,port});
         },
         disconnect(){if(!port.disconnected){port.disconnected=true;port.closed?.();}}
@@ -93,5 +95,26 @@ test('format discovery reserves slots for urgent transfer ownership and user act
     for (const {port,message:m} of b.requests.filter(x=>x.message.type==='media-source-options').slice(2))
       port.reply({id:m.id,ok:true});
     assert.ok((await Promise.all(lookups)).every(x=>x.ok));
+  } finally {b.stop();}
+});
+
+test('cold handshake respects individual deadlines without replaying timed-out work', async () => {
+  const b=setup({holdHandshake:true});
+  try {
+    const short=b.session.request('host',message('expired'),15);
+    const long=b.session.request('host',message('live'),1000);
+    assert.equal((await short).code,'timeout');
+    assert.equal(b.connections,1);
+    assert.equal(b.requests.length,0);
+    b.ports[0].handshake();
+    await b.tick();
+    assert.deepEqual(b.requests.map(x=>x.message.id),['live']);
+    b.ports[0].reply({id:'live',ok:true});
+    assert.equal((await long).ok,true);
+    const warm=b.session.request('host',message('warm'),1000);
+    assert.deepEqual(b.requests.map(x=>x.message.id),['live','warm']);
+    b.ports[0].reply({id:'warm',ok:true});
+    assert.equal((await warm).ok,true);
+    assert.equal(b.oneShots,0);
   } finally {b.stop();}
 });
