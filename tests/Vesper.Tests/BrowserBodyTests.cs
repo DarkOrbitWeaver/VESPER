@@ -84,6 +84,55 @@ public sealed class BrowserBodyTests
         Assert.Empty(Directory.GetFiles(h.Data, "browser-body-*.tmp"));
     }
 
+    [Theory]
+    [InlineData("av-init.mp4", false)]
+    [InlineData("av-1.m4s", false)]
+    [InlineData("instinct-mse.mp4", true)]
+    [InlineData("video-only.mp4", true)]
+    public void BrowserMediaGuardValidatesRealFiles(string fixture, bool playable)
+    {
+        string path = Path.GetTempFileName();
+        try
+        {
+            byte[] bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", fixture));
+            File.WriteAllBytes(path, bytes);
+            using (var staged = PartialFile.Open(path, create: false))
+            {
+                if (playable) MediaTrackProbe.RequireMp4Media(staged, default);
+                else Assert.Throws<MediaContainerException>(() => MediaTrackProbe.RequireMp4Media(staged, default));
+            }
+            Assert.Equal(bytes, File.ReadAllBytes(path));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Theory]
+    [InlineData("av-init.mp4", false)]
+    [InlineData("instinct-mse.mp4", true)]
+    public async Task ExplicitBrowserMediaCopyValidatesBeforeAcceptance(string fixture, bool playable)
+    {
+        using var h = new Harness();
+        byte[] bytes = await File.ReadAllBytesAsync(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", fixture));
+        var opened = await Send(h, Begin(bytes.Length) with { VerifyMp4 = true });
+        Assert.True(opened.Ok, opened.Message);
+        Assert.Equal("mp4", System.Text.Json.JsonSerializer.SerializeToElement(opened.Data, BridgeProtocol.Json).GetProperty("mediaCheck").GetString());
+        for (int offset = 0; offset < bytes.Length; offset += BrowserBodyReceiver.ChunkBytes)
+            Assert.True((await Send(h, Append(offset, bytes.AsSpan(offset, Math.Min(BrowserBodyReceiver.ChunkBytes, bytes.Length - offset)).ToArray()))).Ok);
+        var result = await Send(h, Finish());
+        if (playable)
+        {
+            var saved = await h.WaitForStateAsync(AcceptedId(result), JobState.Completed);
+            Assert.Equal(bytes, await File.ReadAllBytesAsync(saved.FinalPath!));
+        }
+        else
+        {
+            Assert.False(result.Ok);
+            Assert.Equal("invalid-media", result.Code);
+            Assert.Empty(h.Engine.Snapshots());
+            Assert.False((await Send(h, new("status", Transfer, Origin))).Ok);
+        }
+    }
+
     [Fact]
     public async Task IncompleteWrongOffsetAndWrongDigestNeverBecomeAJob()
     {

@@ -40,6 +40,12 @@ internal static class MediaTrackProbe
         RequireVideoSamples(file, expectedIdentity, ct);
     }
 
+    internal static void RequireMp4Media(PartialFile file, CancellationToken ct)
+    {
+        var tracks = ProbeMp4(file, ct);
+        if (!tracks.HasVideo && !tracks.HasAudio) throw Bad("The MP4 has no playable audio or video track.");
+    }
+
     private static Mp4ProbeResult ProbeMp4(PartialFile file, CancellationToken ct)
     {
         long offset = 0;

@@ -29,7 +29,7 @@ function connection() {
   return [left, right];
 }
 
-function bridge({ deny = false, wrongOffset = false, loseFinish = false, sender = {} } = {}) {
+function bridge({ deny = false, wrongOffset = false, loseFinish = false, oldHelper = false, invalidMedia = false, sender = {} } = {}) {
   const [client, worker] = connection();
   const [native, host] = connection();
   worker.sender = { tab: { id: 2 }, frameId: 0, documentId: 'test-document', url: origin + '/watch', ...sender };
@@ -38,7 +38,7 @@ function bridge({ deny = false, wrongOffset = false, loseFinish = false, sender 
   host.onMessage.addListener(message => {
     messages.push(message);
     let data;
-    if (message.operation === 'begin') { length = message.length; data = { offset: 0, accepted: false }; }
+    if (message.operation === 'begin') { length = message.length; data = { offset: 0, accepted: false, mediaCheck: oldHelper ? undefined : message.mediaCheck }; }
     if (message.operation === 'append') {
       const bytes = Buffer.from(message.chunk, 'base64');
       assert.equal(message.offset, offset);
@@ -52,6 +52,10 @@ function bridge({ deny = false, wrongOffset = false, loseFinish = false, sender 
       data = { offset, accepted: true, jobId: 'native-job-12345' };
     }
     if (message.operation === 'abort') data = {};
+    if (invalidMedia && message.operation === 'finish') {
+      host.postMessage({ id: message.id, ok: false, code: 'invalid-media', message: 'Incomplete MP4' });
+      return;
+    }
     if (loseFinish && message.operation === 'finish') { host.disconnect(); return; }
     host.postMessage({ id: message.id, ok: true, data });
   });
@@ -276,4 +280,19 @@ test('local media inspection distinguishes readable finite files from MediaSourc
     }});
     assert.deepEqual(Buffer.concat(b.chunks),Buffer.from(source));
   }
+});
+
+
+test('an older native helper must acknowledge MP4 validation before receiving any bytes', async () => {
+  const b = bridge({ oldHelper: true });
+  await assert.rejects(copy(b), /Update the desktop helper/);
+  assert.deepEqual(b.messages.map(message => message.operation), ['begin', 'abort']);
+  assert.equal(b.chunks.length, 0);
+});
+
+test('a confirmed media validation failure does not create an uncertain receipt', async () => {
+  const b = bridge({ invalidMedia: true });
+  let statusQueries = 0;
+  await assert.rejects(copy(b, { queryReceipt: async () => { statusQueries++; } }), { code: 'invalid-media' });
+  assert.equal(statusQueries, 0);
 });

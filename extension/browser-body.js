@@ -170,7 +170,9 @@ globalThis.VesperBrowserBody = (() => {
       clearTimeout(call.timer);
       if (reply.ok) call.resolve(reply.data || {});
       else {
-        call.reject(new Error(reply.message || 'VESPER could not accept the browser copy.'));
+        const error = new Error(reply.message || 'VESPER could not accept the browser copy.');
+        if (reply.code === 'invalid-media') error.code = reply.code;
+        call.reject(error);
         fail(reply.message || 'VESPER could not accept the browser copy.');
       }
     });
@@ -250,9 +252,13 @@ globalThis.VesperBrowserBody = (() => {
     const unanswered = [];
     try {
       channel = openChannel(connect, signal);
-      const begin = await channel.send({ operation: 'begin', ...facts, ...(generated?.automatic ? { automatic: true } : {}) });
+      const mime = mediaProof?.mime ?? (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      const mediaCheck = !generated && ['video/mp4', 'audio/mp4', 'video/quicktime'].includes(mime) ? 'mp4' : undefined;
+      const begin = await channel.send({ operation: 'begin', ...facts, ...(generated?.automatic ? { automatic: true } : {}), ...(mediaCheck ? { mediaCheck } : {}) });
       if (begin.offset !== 0 || begin.accepted) throw new Error('Unexpected initial browser copy state.');
       transferId = begin.transferId;
+      if (mediaCheck && begin.mediaCheck !== mediaCheck)
+        throw new Error('Update the desktop helper to verify this browser media.');
       reader = response.body.getReader();
       onProgress(0, facts.length);
       // Aggregate small stream reads into one fixed buffer. SubtleCrypto copies its input
@@ -300,7 +306,7 @@ globalThis.VesperBrowserBody = (() => {
         throw new Error('VESPER did not confirm acceptance of the browser file.');
       return done;
     } catch (error) {
-      if (finishing && transferId) {
+      if (finishing && transferId && error?.code !== 'invalid-media') {
         // Even explicit cancellation can race the durable native commit. A
         // receipt query is read-only and must never start a second transfer.
         const receipt = { transferId, length: facts.length };
@@ -356,7 +362,15 @@ globalThis.VesperBrowserBody = (() => {
     const onNativeReply = reply => {
       const call = calls[0];
       if (closed || !call || reply?.id !== call.id) return close();
-      if (!reply.ok) return refuse(reply.message || 'The native VESPER receiver rejected the copy.');
+      if (!reply.ok) {
+        if (call.operation !== 'finish' || reply.code !== 'invalid-media')
+          return refuse(reply.message || 'The native VESPER receiver rejected the copy.');
+        calls.shift();
+        phase = 'finished';
+        try { port.postMessage({ sequence: call.sequence, ok: false, code: reply.code, message: reply.message }); }
+        catch { close(); }
+        return;
+      }
       calls.shift();
       const result = reply.data || {};
       if (call.operation === 'begin') {
@@ -378,7 +392,8 @@ globalThis.VesperBrowserBody = (() => {
       sequence = message.sequence;
       const operation = message.operation;
       if (operation === 'begin' && phase === 'new') {
-        if (!Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES
+        if (message.mediaCheck !== undefined && message.mediaCheck !== 'mp4'
+            || !Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES
             || typeof message.fileName !== 'string' || !message.fileName || message.fileName.length > 255
             || /[\\/:\u0000-\u001f]/.test(message.fileName))
           return refuse('Invalid browser file metadata.');
@@ -389,10 +404,11 @@ globalThis.VesperBrowserBody = (() => {
         length = message.length;
         try {
           native = connectNative(nativeHost);
-          native.onDisconnect.addListener(() => refuse('The native VESPER connection closed.'));
+          native.onDisconnect.addListener(() => { if (phase !== 'finished') refuse('The native VESPER connection closed.'); });
           native.onMessage.addListener(onNativeReply);
         } catch { return refuse('The native VESPER helper is unavailable.'); }
-        forward({ id: makeId(), sequence, operation }, { origin: origin + '/', fileName: message.fileName, length });
+        forward({ id: makeId(), sequence, operation }, { origin: origin + '/', fileName: message.fileName, length,
+          ...(message.mediaCheck ? { mediaCheck: message.mediaCheck } : {}) });
       } else if (operation === 'append' && phase === 'receiving') {
         if (calls.length >= WINDOW) return refuse('Too many browser copy chunks are waiting.');
         if (message.offset !== forwarded || typeof message.chunk !== 'string'

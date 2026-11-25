@@ -2,7 +2,7 @@ namespace Vesper.Engine;
 
 /// <summary>Commands for the opt-in browser-byte receiver. No browser-provided paths or credentials.</summary>
 public sealed record BrowserBodyRequest(string Operation, string TransferId, string? Origin = null,
-    string? FileName = null, long? Length = null, long? Offset = null, byte[]? Bytes = null, string? Digest = null, bool Session = false);
+    string? FileName = null, long? Length = null, long? Offset = null, byte[]? Bytes = null, string? Digest = null, bool Session = false, bool VerifyMp4 = false);
 
 public sealed partial class DownloadEngine
 {
@@ -37,7 +37,7 @@ public sealed partial class DownloadEngine
         switch (request.Operation)
         {
             case "begin" when request.Origin is not null && request.FileName is not null && request.Length is long length:
-                reply = await receiver.BeginAsync(request.TransferId, request.Origin, request.FileName, length, ct, request.Session)
+                reply = await receiver.BeginAsync(request.TransferId, request.Origin, request.FileName, length, ct, request.Session, request.VerifyMp4)
                     .ConfigureAwait(false);
                 if (reply.Code == "storage")
                     return BridgeResponse.Fail(requestId, "storage", "Not enough free space for the browser file, or its folder is unavailable.");
@@ -55,9 +55,12 @@ public sealed partial class DownloadEngine
             default:
                 return BridgeResponse.Fail(requestId, "invalid", "Invalid browser transfer operation.");
         }
+        if (reply.Code == "invalid-media")
+            return BridgeResponse.Fail(requestId, reply.Code, "The browser returned an invalid or incomplete MP4. No file was accepted.");
         if (!reply.Ok)
             return BridgeResponse.Fail(requestId, reply.Code, "The browser copy could not be accepted. No completed file was claimed.");
-        return BridgeResponse.Success(requestId, data: new { offset = reply.Offset, accepted = reply.JobId is not null, jobId = reply.JobId });
+        return BridgeResponse.Success(requestId, data: new { offset = reply.Offset, accepted = reply.JobId is not null, jobId = reply.JobId,
+            mediaCheck = request.Operation == "begin" && request.VerifyMp4 ? "mp4" : null });
     }
 
     // The same destination rules as an ordinary download, checked once before any byte is written.

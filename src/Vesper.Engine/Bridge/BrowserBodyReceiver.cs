@@ -35,11 +35,12 @@ internal sealed class BrowserBodyReceiver : IDisposable
 
     private sealed record JournalEntry(string Id, string Path, string State, string? Identity = null);
 
-    internal sealed class Transfer(string origin, string name, long length, string folder, PartialFile file, string? identity) : IDisposable
+    internal sealed class Transfer(string origin, string name, long length, string folder, PartialFile file, string? identity, bool verifyMp4) : IDisposable
     {
         internal string Origin { get; } = origin;
         internal string Name { get; } = name;
         internal long Length { get; } = length;
+        internal bool VerifyMp4 { get; } = verifyMp4;
         internal string Folder { get; } = folder;
         internal PartialFile File { get; } = file;
         internal string? Identity { get; } = identity;
@@ -101,7 +102,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
     }
 
     internal async Task<Reply> BeginAsync(string id, string origin, string name, long length, CancellationToken ct,
-        bool exclusiveSession = false)
+        bool exclusiveSession = false, bool verifyMp4 = false)
     {
         if (!BridgeProtocol.IsRequestId(id) || origin.Length > 512 || !Uri.TryCreate(origin, UriKind.Absolute, out Uri? uri)
             || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0
@@ -119,7 +120,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 // A second persistent pipe must not attach to an active inbox:
                 // its disconnect cleanup could otherwise abort the first pipe.
                 if (exclusiveSession) return new(false, "busy");
-                if (existing.Origin != origin || existing.Name != name || existing.Length != length)
+                if (existing.Origin != origin || existing.Name != name || existing.Length != length || existing.VerifyMp4 != verifyMp4)
                     return new(false, "conflict");
                 Renew(existing);
                 return new(true, "ok", existing.Offset);
@@ -150,7 +151,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 ForgetJournal(id);
                 throw;
             }
-            var transfer = new Transfer(origin, name, length, folder, file, identity);
+            var transfer = new Transfer(origin, name, length, folder, file, identity, verifyMp4);
             _active.Add(id, transfer);
             Renew(transfer);
             return new(true, "ok");
@@ -216,6 +217,11 @@ internal sealed class BrowserBodyReceiver : IDisposable
             try
             {
                 transfer.File.Flush();
+                if (transfer.VerifyMp4)
+                {
+                    try { MediaTrackProbe.RequireMp4Media(transfer.File, ct); }
+                    catch (MediaContainerException) { return new(false, "invalid-media"); }
+                }
                 string digest = Convert.ToHexString(transfer.Hash.GetHashAndReset());
                 RememberJournal(new JournalEntry(id, transfer.File.Path, "committing", transfer.Identity));
                 AddResult result = await accept(transfer, digest, ct).ConfigureAwait(false);

@@ -324,7 +324,9 @@ public static class BridgeProtocol
                     || name.IndexOfAny(['/', '\\', ':']) >= 0
                     || !TryLength(root, "length", out long? length) || length is null or < 1 or > BrowserBodyReceiver.MaxBytes)
                     return false;
-                request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length, Session: session);
+                bool verifyMp4 = root.TryGetProperty("mediaCheck", out JsonElement check);
+                if (verifyMp4 && (check.ValueKind != JsonValueKind.String || check.GetString() != "mp4")) return false;
+                request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length, Session: session, VerifyMp4: verifyMp4);
                 return true;
             }
             case "append":
