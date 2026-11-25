@@ -4384,6 +4384,25 @@ test('verified XHR media accepts anonymous CORS wildcard exposure but not creden
   const refused=await app.message({...msg,type:'browser-body-media-proof',playerCrossOrigin:'use-credentials'},sender);
   assert.equal(refused.ok,false);
 });
+test('an exact observed XHR range permits browser continuation but a slice URL or another player does not',async()=>{
+  const page='https://video.example/watch',url='https://video.example/movie.mp4',changedAt=Date.now();
+  const sender={tab:{id:84},frameId:0,documentId:'xhr-range-doc',url:page};
+  const app=load({}, {prefs:{useSignIn:true}});
+  try {
+    const report=address=>app.onMedia({url:address,tabId:84,frameId:0,documentId:sender.documentId,method:'GET',
+      statusCode:206,type:'xmlhttprequest',timeStamp:changedAt,
+      responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Length':'1000',
+        'Content-Range':'bytes 0-999/700000',ETag:'"asset-v1"'})});
+    const request={type:'browser-body-media-proof',pageUrl:page,playerPageUrl:page,playerUrl:url,
+      generation:1,mediaChangedAt:changedAt};
+    await report(url);
+    assert.equal((await app.message(request,sender)).data.length,700000);
+    assert.equal((await app.message({...request,playerUrl:url+'?other=1'},sender)).ok,false);
+    const slice=url+'?bytestart=0&byteend=999';
+    await report(slice);
+    assert.equal((await app.message({...request,playerUrl:slice},sender)).ok,false);
+  } finally {app.stopWorker();}
+});
 test('out-of-order media callbacks cannot restore an obsolete ETag or CORS policy',async()=>{
   const app=load(), url='https://cdn.example.com/movie.mp4', at=Date.now();
   const base={url,documentId:'doc-body-1',frameId:0,kind:'direct',mime:'video/mp4',bytes:700000};

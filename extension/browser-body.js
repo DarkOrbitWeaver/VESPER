@@ -90,14 +90,14 @@ globalThis.VesperBrowserBody = (() => {
       && Number.isSafeInteger(proof.length) && proof.length > 0 && proof.length <= MAX_BYTES;
   }
 
-  function fileFacts(response, title, generated = null) {
+  function fileFacts(response, title, generated = null, verifiedPart = null) {
     const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     const lengthText = response.headers.get('content-length');
     const length = /^\d+$/.test(lengthText || '') ? Number(lengthText) : NaN;
     const encoding = response.headers.get('content-encoding');
-    if (response.status !== 200 || !response.body || response.type === 'opaque'
+    if ((!verifiedPart && response.status !== 200 || verifiedPart && response.status !== 206) || !response.body || response.type === 'opaque'
         || response.redirected || encoding && encoding.toLowerCase() !== 'identity'
-        || response.headers.has('content-range') || (!generated && !Object.hasOwn(EXTENSIONS, mime))
+        || (!verifiedPart && response.headers.has('content-range')) || (!generated && !Object.hasOwn(EXTENSIONS, mime))
         || !Number.isSafeInteger(length) || length <= 0 || length > MAX_BYTES)
       throw new Error('This browser object is not a complete, finite file.');
     if (generated) {
@@ -109,7 +109,31 @@ globalThis.VesperBrowserBody = (() => {
     const extension = EXTENSIONS[mime];
     const stem = String(title || 'Video').replace(/[<>:"/\\|?*\u0000-\u001f]/g, ' ')
       .replace(/\s+/g, ' ').replace(/[. ]+$/g, '').trim().slice(0, 140) || 'Video';
-    return { length, fileName: stem + '.' + extension };
+    return { length: verifiedPart ? verifiedPart.total : length, fileName: stem + '.' + extension };
+  }
+
+  // Only the exact resource, with a strong observed validator and a known total,
+  // can be continued after a server caps a browser response to a byte range.
+  function verifiedHttpPart(response, proof, start) {
+    const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const length = response.headers.get('content-length');
+    const encoding = response.headers.get('content-encoding');
+    if (response.redirected || response.type === 'opaque' || !response.body
+        || response.url && response.url !== proof.url
+        || response.headers.get('etag') !== proof.etag || mime !== proof.mime
+        || encoding && encoding.toLowerCase() !== 'identity')
+      throw new Error('The media representation changed. No copy was accepted.');
+    if (response.status === 200 && start === 0 && !response.headers.has('content-range')
+        && /^\d+$/.test(length || '') && Number(length) === proof.length)
+      return null;
+    const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('content-range') || '');
+    if (response.status !== 206 || !range || !/^\d+$/.test(length || ''))
+      throw new Error('The browser did not return a verifiable media range.');
+    const [first, last, total] = range.slice(1).map(Number);
+    if (![first,last,total].every(Number.isSafeInteger) || first !== start || last < first
+        || total !== proof.length || last >= total || Number(length) !== last - first + 1)
+      throw new Error('The browser returned an inconsistent media range.');
+    return { end: last + 1, total };
   }
 
   // A MediaSource object URL has the same syntax as a file Blob, but cannot
@@ -223,7 +247,7 @@ globalThis.VesperBrowserBody = (() => {
     }
     if (pendingReceipts.size >= MAX_PENDING_RECEIPTS) throw uncertainFinish();
     // A separate, explicitly requested conditional GET in the browser's own
-    // session. No cookies leave Chrome, no redirects or range requests.
+    // session. No cookies leave Chrome and redirects are rejected.
     // This is not original-response interception.
     const options = { signal, credentials: 'same-origin', redirect: 'error' };
     if (httpMedia) {
@@ -235,11 +259,12 @@ globalThis.VesperBrowserBody = (() => {
       options.cache = 'no-store';
       options.headers = { 'If-Match': mediaProof.etag };
     }
-    const response = await fetcher(url, options);
-    let facts;
+    let response = await fetcher(url, options);
+    let facts, part = null;
     try {
       if (response.url && response.url !== url) throw new Error('Browser file identity changed.');
-      facts = fileFacts(response, title, generated);
+      if (httpMedia) part = verifiedHttpPart(response, mediaProof, 0);
+      facts = fileFacts(response, title, generated, part);
       if (generated?.automatic && facts.length !== generated.expectedLength)
         throw new Error('The generated file length changed.');
       if (httpMedia && (response.headers.get('etag') !== mediaProof.etag
@@ -283,11 +308,23 @@ globalThis.VesperBrowserBody = (() => {
         unanswered.push(call);
         while (unanswered.length >= WINDOW) await unanswered.shift();
       }
+      let parts = 1;
       while (true) {
         if (signal?.aborted) throw new Error('Browser copy cancelled.');
         const { done, value } = await reader.read();
-        if (done) break;
-        if (!(value instanceof Uint8Array) || value.length > facts.length - sent - used)
+        if (done) {
+          if (!part) break;
+          if (sent + used !== part.end) throw new Error('The browser range ended before its declared length.');
+          if (part.end === facts.length) break;
+          if (++parts > 256) throw new Error('The browser returned too many small ranges.');
+          const next = part.end;
+          reader.releaseLock(); reader = null;
+          response = await fetcher(url, { ...options, headers: { ...options.headers, Range: `bytes=${next}-` } });
+          part = verifiedHttpPart(response, mediaProof, next);
+          reader = response.body.getReader();
+          continue;
+        }
+        if (!(value instanceof Uint8Array) || value.length > (part?.end ?? facts.length) - sent - used)
           throw new Error('The browser returned more bytes than declared.');
         for (let start = 0; start < value.length;) {
           const count = Math.min(CHUNK - used, value.length - start);

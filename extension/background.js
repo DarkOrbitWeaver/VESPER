@@ -1119,7 +1119,7 @@ function observedBrowserBodyProof(state, message, sender, useSignIn = false) {
     && source.documentId === sender.documentId && (source.frameId ?? 0) === (sender.frameId ?? 0)
     && source.kind === 'direct' && !source.conflictingValidator
     && (source.wholeRepresentation && ['media', 'xmlhttprequest', 'other'].includes(source.requestType)
-      || source.requestType === 'media' && source.rangeResource === true)
+      || ['media', 'xmlhttprequest'].includes(source.requestType) && source.rangeResource === true)
     && source.seen >= Math.max(now - SOURCE_TTL, message.mediaChangedAt - 15000) && source.seen <= now + 1000);
   if (!observed) return null;
   const proof = { url: url.href, etag: observed.validator, length: observed.bytes, mime: observed.mime };

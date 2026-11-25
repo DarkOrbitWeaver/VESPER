@@ -296,3 +296,55 @@ test('a confirmed media validation failure does not create an uncertain receipt'
   await assert.rejects(copy(b, { queryReceipt: async () => { statusQueries++; } }), { code: 'invalid-media' });
   assert.equal(statusQueries, 0);
 });
+
+function rangeResponse(bytes, start, end, total, etag = '"v1"', headers = {}) {
+  return new Response(bytes, { status: 206, headers: {
+    'Content-Type': 'video/mp4', 'Content-Length': String(end - start + 1),
+    'Content-Range': 'bytes ' + start + '-' + end + '/' + total, ETag: etag, ...headers
+  } });
+}
+
+test('browser conditional acquisition assembles contiguous capped ranges of one exact resource', async () => {
+  const b = bridge(), url = origin + '/capped.mp4';
+  const proof = { url, etag: '"v1"', length: source.length, mime: 'video/mp4' };
+  const requests = [];
+  const result = await copy(b, { url, mediaProof: proof, fetcher: async (actual, options) => {
+    assert.equal(actual, url);
+    assert.equal(options.headers['If-Match'], proof.etag);
+    assert.equal(options.redirect, 'error');
+    const start = options.headers.Range ? Number(options.headers.Range.slice(6, -1)) : 0;
+    requests.push(start);
+    const end = Math.min(start + 249999, source.length - 1);
+    return rangeResponse(source.slice(start, end + 1), start, end, source.length);
+  } });
+  assert.equal(result.jobId, 'native-job-12345');
+  assert.deepEqual(requests, [0, 250000, 500000]);
+  assert.deepEqual(Buffer.concat(b.chunks), Buffer.from(source));
+  assert.equal(b.messages[0].length, source.length);
+  assert.equal(b.messages[0].mediaCheck, 'mp4');
+});
+
+test('range continuation never accepts mismatched identity, gaps, changed totals, ignored ranges or short bodies', async () => {
+  const url = origin + '/capped.mp4';
+  const proof = { url, etag: '"v1"', length: source.length, mime: 'video/mp4' };
+  for (const failure of ['etag', 'gap', 'total', 'ignored', 'short', 'overlong', 'encoding']) {
+    const b = bridge();
+    let calls = 0;
+    await assert.rejects(copy(b, { url, mediaProof: proof, fetcher: async () => {
+      if (++calls === 1) return rangeResponse(source.slice(0, 550000), 0, 549999, source.length);
+      if (failure === 'ignored') return new Response(source, { headers: {
+        'Content-Type':'video/mp4', 'Content-Length':String(source.length), ETag:proof.etag
+      }});
+      const start = failure === 'gap' ? 550001 : 550000;
+      const bytes = source.slice(start, failure === 'short' ? source.length - 1 : source.length);
+      const bodyBytes = failure === 'overlong' ? new Uint8Array([...bytes, 0]) : bytes;
+      return rangeResponse(bodyBytes, start, source.length - 1,
+        failure === 'total' ? source.length + 1 : source.length,
+        failure === 'etag' ? '"changed"' : proof.etag,
+        failure === 'encoding' ? {'Content-Encoding':'gzip'} : {});
+    }}));
+    assert.equal(calls, 2, failure);
+    assert.equal(b.messages.some(m => m.operation === 'finish'), false, failure);
+    assert.equal(b.messages.at(-1).operation, 'abort', failure);
+  }
+});
