@@ -6,7 +6,8 @@ namespace VESPER;
 
 /// <summary>
 /// Replace Link / Rescue Assistant. It never promises recovery up front: the engine checks the new link first and
-/// this dialog reports its verdict honestly. A rejected link changes nothing; the saved data stays untouched.
+/// this dialog reports its verdict honestly. A rejected replacement keeps the saved link and bytes. An active
+/// download may be paused while the replacement is checked.
 /// </summary>
 [System.ComponentModel.DesignerCategory("Form")]
 internal sealed class RescueForm : VesperPopupForm
@@ -28,6 +29,7 @@ internal sealed class RescueForm : VesperPopupForm
     private readonly VesperButton _pieceButton;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly LinkLabel _refreshSource;
+    private readonly bool _refreshOnly;
     private bool _advancedVisible;
     private string? _pieceJson;
 
@@ -35,9 +37,10 @@ internal sealed class RescueForm : VesperPopupForm
     {
         _engine = engine;
         _job = job;
+        _refreshOnly = DownloadActionEligibility.IsRefreshOnly(job);
         _colors = UiKit.Palette(preferences);
         VesperWindowChrome.Brand(this);
-        Text = "Replace link — VESPER";
+        Text = _refreshOnly ? "Refresh original media link — VESPER" : "Replace link — VESPER";
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(520, 330 + VesperDialogChrome.HeaderHeight);
@@ -71,7 +74,8 @@ internal sealed class RescueForm : VesperPopupForm
         _advanced.LinkClicked += (_, _) => ToggleAdvanced();
         _refreshSource = new LinkLabel
         {
-            Text = "Refresh original media link", AutoSize = true, Location = new Point(322, 163),
+            Text = "Refresh original media link", AutoSize = true,
+            Location = _refreshOnly ? new Point(23, 94) : new Point(322, 163),
             LinkColor = _colors.Link, ActiveLinkColor = _colors.Text,
             Font = new Font("Segoe UI", 8.5F), Visible = MediaSourceRescue.CanRefresh(job)
         };
@@ -101,7 +105,8 @@ internal sealed class RescueForm : VesperPopupForm
         _footer.Paint += (_, e) => { using var pen = new Pen(_colors.Divider); e.Graphics.DrawLine(pen, 0, 0, _footer.Width, 0); };
         _cancel = new VesperButton { Text = "Close", Width = 85, Height = 34, DialogResult = DialogResult.Cancel };
         _separateCopy = new VesperButton { Text = "Download as new copy", Width = 170, Height = 34, Visible = false };
-        _replace = new VesperButton { Text = "Replace link", Width = 130, Height = 34, Primary = true, Symbol = VesperIcon.Link };
+        _replace = new VesperButton { Text = "Replace link", Width = 130, Height = 34, Primary = true,
+            Symbol = VesperIcon.Link, Visible = !_refreshOnly };
         foreach (VesperButton b in new[] { _cancel, _separateCopy, _replace }) b.ApplyPalette(_colors);
         _replace.Click += async (_, _) => await ReplaceAsync();
         _separateCopy.Click += (_, _) => StartSeparateCopy();
@@ -115,14 +120,21 @@ internal sealed class RescueForm : VesperPopupForm
         _footer.Resize += (_, _) => LayoutFooter();
 
         var body = new Panel { Dock = DockStyle.Fill, BackColor = _colors.Surface };
+        linkLabel.Visible = urlFrame.Visible = _advanced.Visible = !_refreshOnly;
         body.Controls.AddRange([name, status, linkLabel, urlFrame, _advanced, _shaLabel, _shaFrame,
             _pieceButton, _pieceLabel, _result, _refreshSource]);
         Controls.Add(body);
         Controls.Add(_footer);
-        VesperDialogChrome.Attach(this, "VESPER  /  Replace link", _colors, VesperIcon.Link);
+        VesperDialogChrome.Attach(this, _refreshOnly ? "VESPER  /  Refresh original media link" : "VESPER  /  Replace link",
+            _colors, _refreshOnly ? VesperIcon.Refresh : VesperIcon.Link);
         CancelButton = _cancel;
-        AcceptButton = _replace;
-        Shown += (_, _) => { LayoutAdvanced(); LayoutFooter(); _url.Focus(); };
+        AcceptButton = _refreshOnly ? null : _replace;
+        Shown += (_, _) =>
+        {
+            LayoutAdvanced();
+            LayoutFooter();
+            if (!_refreshOnly) _url.Focus();
+        };
         DpiChanged += (_, _) => BeginInvoke(() => { if (!IsDisposed) { LayoutAdvanced(); LayoutFooter(); } });
         LayoutAdvanced();
     }
@@ -156,10 +168,10 @@ internal sealed class RescueForm : VesperPopupForm
     {
         _shaLabel.Visible = _shaFrame.Visible = _pieceButton.Visible = _pieceLabel.Visible = _advancedVisible;
         _advanced.Text = _advancedVisible ? "Hide advanced verification" : "Advanced verification (optional)";
-        int messageY = _advancedVisible ? 310 : 191;
+        int messageY = _refreshOnly ? 132 : _advancedVisible ? 310 : 191;
         _result.SetBounds(S(23), S(messageY), S(474), S(70));
         _result.Visible = _result.Text.Length > 0;
-        int body = messageY + (_result.Text.Length > 0 ? 78 : 17);
+        int body = messageY + (_result.Text.Length > 0 ? 78 : _refreshOnly ? 18 : 17);
         int chrome = IsHandleCreated ? VesperDialogChrome.VerticalInset(this) : VesperDialogChrome.HeaderHeight + 2;
         ClientSize = new Size(S(520), S(body) + _footer.Height + chrome);
     }
@@ -181,6 +193,7 @@ internal sealed class RescueForm : VesperPopupForm
 
     private async Task ReplaceAsync()
     {
+        if (_refreshOnly) return;
         string link = _url.Text.Trim();
         if (link.Length == 0) { Show("Paste the new download link first.", error: true); return; }
         if (UrlPolicy.TryParse(link, out Uri uri, out _) && MediaPageLinks.TryGetSite(uri, out string site))
@@ -211,8 +224,13 @@ internal sealed class RescueForm : VesperPopupForm
             }
             else
             {
-                Show(result.Message, error: true);
-                _result.AccessibleDescription = result.Message;
+                string message = result.Message;
+                if (result.StateAfterAttempt == JobState.Paused)
+                    message = "The download is paused. " + message;
+                else if (result.StateAfterAttempt is JobState state && JobStates.IsActive(state))
+                    message = "The download is still active. " + message;
+                Show(message, error: true);
+                _result.AccessibleDescription = message;
                 _separateCopy.Visible = true;
             }
         }
@@ -244,6 +262,7 @@ internal sealed class RescueForm : VesperPopupForm
 
     private void StartSeparateCopy()
     {
+        if (_refreshOnly) return;
         AddResult added = _engine.Add(new AddRequest(_url.Text.Trim(), DestinationFolder: _job.Destination, StartNow: false));
         if (!added.Ok) { Show(added.Message, error: true); return; }
         Show("A separate download was queued. The original partial file was left as it was.", error: false);

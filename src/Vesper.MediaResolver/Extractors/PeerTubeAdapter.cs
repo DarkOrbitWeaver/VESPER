@@ -143,7 +143,11 @@ internal sealed partial class PeerTubeAdapter : AdapterBase
 
     private async Task<MediaDiscoveryResult> ResolvePlaylistAsync(MediaDiscoveryRequest request, string origin, string id, CancellationToken ct)
     {
-        int start = int.TryParse(request.Options.PageToken, out var st) && st >= 0 ? st : 0;
+        int start = 0;
+        if (request.Options.PageToken is { } pageToken &&
+            (!int.TryParse(pageToken, out start) || start < 0))
+            return Fail(MediaErrors.Invalid("The PeerTube playlist page token is invalid"));
+
         const int count = 50;
 
         var head = await Http.GetStringAsync(new Uri($"{origin}/api/v1/video-playlists/{Uri.EscapeDataString(id)}"), null, ct, Options.MaxJsonBytes, "application/json").ConfigureAwait(false);
@@ -154,13 +158,20 @@ internal sealed partial class PeerTubeAdapter : AdapterBase
             return Fail(MediaErrors.NotThisSite("Host does not look like a PeerTube instance"));
 
         using var list = await GetJsonAsync(new Uri($"{origin}/api/v1/video-playlists/{Uri.EscapeDataString(id)}/videos?start={start}&count={count}"), null, ct).ConfigureAwait(false);
-        int total = list.RootElement.P("total").Int() ?? 0;
+        int? total = list.RootElement.P("total").Int() is { } parsedTotal && parsedTotal >= 0 ? parsedTotal : null;
+        var rows = list.RootElement.P("data").Items().Take(count).ToList();
         var entries = new List<CollectionEntry>();
-        foreach (var e in list.RootElement.P("data").Items())
+        int skipped = 0;
+        for (int row = 0; row < rows.Count; row++)
         {
-            var video = e.P("video");
+            var video = rows[row].P("video");
             string? vid = video.P("shortUUID").Str() ?? video.P("uuid").Str();
-            if (vid is null || !IdRegex().IsMatch(vid)) continue;
+            long position = (long)start + row;
+            if (vid is null || !IdRegex().IsMatch(vid) || position > int.MaxValue)
+            {
+                skipped++;
+                continue;
+            }
             entries.Add(new CollectionEntry
             {
                 MediaId = vid,
@@ -168,13 +179,38 @@ internal sealed partial class PeerTubeAdapter : AdapterBase
                 Title = video.P("name").Str(),
                 Duration = TextUtil.Seconds(video.P("duration").Dbl()),
                 Thumbnail = UrlUtil.Resolve(new Uri(origin + "/"), video.P("thumbnailPath").Str()),
-                Index = start + entries.Count
+                Index = (int)position
             });
         }
 
-        int next = start + count;
-        bool more = entries.Count > 0 && next < total;
-        return MediaDiscoveryResult.FromCollection(new MediaCollection
+        long nextOffset = (long)start + count;
+        bool more = total is { } knownTotal
+            ? nextOffset < knownTotal
+            : rows.Count == count;
+        var warnings = new List<MediaError>();
+        if (skipped > 0)
+            warnings.Add(MediaErrors.PartialPlaylist($"PeerTube listed {skipped} playlist row(s) without a usable video id; those rows were skipped."));
+        if (rows.Count == 0 && total is { } rowTotal && start < rowTotal)
+        {
+            more = false;
+            warnings.Add(MediaErrors.PartialPlaylist("PeerTube returned an empty page before its reported playlist total; paging stopped because the next position is unknown."));
+        }
+        if (rows.Count > 0 && total is { } expectedTotal && start < expectedTotal)
+        {
+            int expectedRows = (int)Math.Min(count, (long)expectedTotal - start);
+            if (rows.Count < expectedRows)
+                warnings.Add(MediaErrors.PartialPlaylist($"PeerTube returned {rows.Count} of {expectedRows} expected playlist rows; missing rows may be unavailable."));
+        }
+        if (total is null && rows.Count < count)
+            warnings.Add(MediaErrors.PartialPlaylist("PeerTube did not report a playlist total and returned a short page; completeness is unknown."));
+        if (more && nextOffset > int.MaxValue)
+        {
+            more = false;
+            warnings.Add(MediaErrors.PartialPlaylist("The next PeerTube playlist offset exceeds the supported range; paging stopped."));
+        }
+
+        bool complete = !more && skipped == 0 && total is not null && warnings.Count == 0;
+        var collection = new MediaCollection
         {
             SourceUrl = request.Url,
             Provider = "peertube",
@@ -183,8 +219,9 @@ internal sealed partial class PeerTubeAdapter : AdapterBase
             Kind = CollectionKind.Playlist,
             TotalCount = total,
             Entries = entries,
-            NextPageToken = more ? next.ToString() : null,
-            IsComplete = !more
-        });
+            NextPageToken = more && nextOffset <= int.MaxValue ? nextOffset.ToString() : null,
+            IsComplete = complete
+        };
+        return MediaDiscoveryResult.FromCollection(collection, warnings);
     }
 }

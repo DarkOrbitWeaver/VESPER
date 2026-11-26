@@ -66,11 +66,11 @@ public sealed class MediaSourceRefreshCancellationTests
         engineLock = typeof(DownloadEngine).GetField("_lock", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(harness.Engine)!;
 
-        Task<RescueResult> refresh = harness.Engine.RefreshMediaSourceAsync(
+        Task<RescueResult> refresh = Task.Run(() => harness.Engine.RefreshMediaSourceAsync(
             added.JobId,
             new ResolvedMediaSource("fixture", "live-one", "transport-stream", server.Url(newPath),
                 DateTimeOffset.UtcNow.AddMinutes(5)),
-            cancellation.Token);
+            cancellation.Token));
 
         try
         {

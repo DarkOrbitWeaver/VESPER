@@ -1,3 +1,4 @@
+using System.Xml.Linq;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Models;
 using Vesper.MediaResolver.Protocols;
@@ -45,6 +46,17 @@ public class DashParserTests
         var o = new ResolverOptions();
         return new ManifestResolver(new SecureHttpClient(o, new FakeHttpHandler()), o);
     }
+
+    private static string MpdWithAddressing(string addressing) => $"""
+<MPD mediaPresentationDuration="PT10S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      {addressing}
+      <Representation id="v1"/>
+    </AdaptationSet>
+  </Period>
+</MPD>
+""";
 
     [Fact]
     public void Timeline_ExpandsSegmentsInitAndTiming()
@@ -131,6 +143,185 @@ public class DashParserTests
         Assert.Equal(new ByteRange(100, 400), plan.Segments[0].Range);
         Assert.Equal(new ByteRange(500, 500), plan.Segments[1].Range);
         Assert.Equal(6.0, plan.TotalDurationSeconds, 3);
+    }
+
+    [Fact]
+    public void SegmentList_InheritsTimelineAndOffsetFromPeriod()
+    {
+        const string mpd = """
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT20S">
+  <Period start="PT10S" duration="PT5S">
+    <SegmentList timescale="1000" presentationTimeOffset="2000">
+      <Initialization sourceURL="init.mp4"/>
+      <SegmentTimeline><S t="2000" d="2000"/><S t="5000" d="2000"/></SegmentTimeline>
+      <SegmentURL media="one.m4s"/>
+      <SegmentURL media="two.m4s"/>
+    </SegmentList>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentList><Initialization sourceURL="adaptation-init.mp4"/></SegmentList>
+      <Representation id="v1" codecs="avc1.4d401e"/>
+    </AdaptationSet>
+  </Period>
+</MPD>
+""";
+
+        var plan = Assert.Single(DashParser.Parse(mpd, ManifestUrl).Representations).Segments!;
+
+        Assert.Equal(new Uri("https://example.com/m/adaptation-init.mp4"), plan.InitializationUrl);
+        Assert.Equal(new[] { "/m/one.m4s", "/m/two.m4s" }, plan.Segments.Select(segment => segment.Url.AbsolutePath));
+        Assert.Equal([10d, 13d], plan.Segments.Select(segment => segment.StartSeconds));
+        Assert.Equal([2d, 2d], plan.Segments.Select(segment => segment.DurationSeconds));
+        Assert.Equal(4d, plan.TotalDurationSeconds, 3);
+        Assert.True(plan.HasDiscontinuities);
+    }
+
+    [Fact]
+    public void SegmentList_RejectsTimelineAndUrlCountMismatch()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="PT4S"><Period>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <SegmentList timescale="1">
+      <SegmentTimeline><S t="0" d="2"/><S t="2" d="2"/></SegmentTimeline>
+      <SegmentURL media="one.m4s"/>
+    </SegmentList>
+    <Representation id="v1"/>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Fact]
+    public void SegmentList_RejectsDurationCountThatDoesNotCoverThePeriod()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="PT10S"><Period>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <SegmentList timescale="1" duration="3">
+      <SegmentURL media="one.m4s"/><SegmentURL media="two.m4s"/><SegmentURL media="three.m4s"/>
+    </SegmentList>
+    <Representation id="v1"/>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Fact]
+    public void InheritedSegmentList_ConflictsWithSegmentTemplateAndIsRejected()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="PT2S"><Period>
+  <SegmentList timescale="1" duration="2"><SegmentURL media="one.m4s"/></SegmentList>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <SegmentTemplate timescale="1" duration="2" media="s$Number$.m4s"/>
+    <Representation id="v1"/>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Theory]
+    [InlineData("timescale", "0")]
+    [InlineData("timescale", "4294967296")]
+    [InlineData("timescale", "9223372036854775808")]
+    [InlineData("duration", "invalid")]
+    [InlineData("duration", "0")]
+    [InlineData("duration", "4294967296")]
+    [InlineData("startNumber", "4294967296")]
+    [InlineData("presentationTimeOffset", "-1")]
+    public void SegmentList_RejectsInvalidSuppliedNumbers(string name, string value)
+    {
+        var list = new XElement("SegmentList", new XElement("SegmentURL", new XAttribute("media", "one.m4s")));
+        list.SetAttributeValue(name, value);
+        var mpd = new XDocument(new XElement("MPD",
+            new XAttribute("mediaPresentationDuration", "PT10S"),
+            new XElement("Period",
+                new XElement("AdaptationSet",
+                    new XAttribute("contentType", "video"),
+                    new XAttribute("mimeType", "video/mp4"),
+                    list,
+                    new XElement("Representation", new XAttribute("id", "v1"))))));
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd.ToString(), ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Theory]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" duration="invalid"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" duration="0"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" duration="4294967296"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" duration="9223372036854775808"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" timescale="0"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" timescale="4294967296"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" startNumber="invalid"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" startNumber="4294967296"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s" presentationTimeOffset="-1"/>""")]
+    [InlineData("""<SegmentTemplate media="s$Time$.m4s"><SegmentTimeline><S t="invalid" d="2"/></SegmentTimeline></SegmentTemplate>""")]
+    [InlineData("""<SegmentTemplate media="s$Time$.m4s"><SegmentTimeline><S t="0" d="9223372036854775808"/></SegmentTimeline></SegmentTemplate>""")]
+    [InlineData("""<SegmentTemplate media="s$Time$.m4s"><SegmentTimeline><S t="0" d="2" r="invalid"/></SegmentTimeline></SegmentTemplate>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s"><SegmentTimeline><S t="0" d="2" n="1"/></SegmentTimeline></SegmentTemplate>""")]
+    [InlineData("""<SegmentTemplate media="s$Number$.m4s"><SegmentTimeline><S t="0" d="2" k="2"/></SegmentTimeline></SegmentTemplate>""")]
+    [InlineData("""<SegmentTemplate media="s$Time$.m4s" duration="2"><SegmentTimeline><S t="0" d="2"/></SegmentTimeline></SegmentTemplate>""")]
+    public void SegmentTemplate_RejectsInvalidSuppliedNumbers(string template)
+    {
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(MpdWithAddressing(template), ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Fact]
+    public void SegmentTemplate_RejectsSequenceNumberOverflow()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="PT2S"><Period>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <SegmentTemplate timescale="1" duration="1" startNumber="9223372036854775807" media="s$Number$.m4s"/>
+    <Representation id="v1"/>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Fact]
+    public void SegmentTemplate_RejectsDurationExpansionOverTheSegmentLimit()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="PT100S"><Period>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <SegmentTemplate timescale="1" duration="1" media="s$Number$.m4s"/>
+    <Representation id="v1"/>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl, maxSegments: 10));
+        Assert.Equal(MediaErrorCode.ResponseTooLarge, ex.Error.Code);
+    }
+
+    [Fact]
+    public void InvalidExplicitPeriodDuration_IsRejected()
+    {
+        const string mpd = """
+<MPD mediaPresentationDuration="not-a-duration"><Period>
+  <AdaptationSet contentType="video" mimeType="video/mp4">
+    <Representation id="v1"><BaseURL>video.mp4</BaseURL></Representation>
+  </AdaptationSet>
+</Period></MPD>
+""";
+
+        var ex = Assert.Throws<MediaResolverException>(() => DashParser.Parse(mpd, ManifestUrl));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
     }
 
     [Fact]

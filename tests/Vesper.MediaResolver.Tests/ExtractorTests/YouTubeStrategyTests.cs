@@ -157,6 +157,39 @@ public sealed class YouTubeStrategyTests
     private static string Entry(string id) =>
         $"{{\"playlistVideoRenderer\":{{\"videoId\":\"{id}\",\"title\":{{\"runs\":[{{\"text\":\"Video {id}\"}}]}},\"lengthSeconds\":\"61\"}}}}";
 
+    private static string PlaylistPage(IEnumerable<string> ids, string? token = null)
+    {
+        var entries = ids.Select(Entry).ToList();
+        if (token is not null)
+            entries.Add($"{{\"continuationItemRenderer\":{{\"continuationEndpoint\":{{\"continuationCommand\":{{\"token\":\"{token}\"}}}}}}}}");
+        return "<html><script>ytcfg.set({\"INNERTUBE_CLIENT_VERSION\":\"2.20261101.01.00\"});var ytInitialData = {\"metadata\":{\"playlistMetadataRenderer\":{\"title\":\"Paging\"}},\"contents\":["
+            + string.Join(",", entries) + "]};</script></html>";
+    }
+
+    private static string ContinuationPage(IEnumerable<string> ids, string? token = null)
+    {
+        var entries = ids.Select(Entry).ToList();
+        if (token is not null)
+            entries.Add($"{{\"continuationItemRenderer\":{{\"continuationEndpoint\":{{\"continuationCommand\":{{\"token\":\"{token}\"}}}}}}}}");
+        return "{\"onResponseReceivedActions\":[{\"appendContinuationItemsAction\":{\"continuationItems\":["
+            + string.Join(",", entries) + "]}}]}";
+    }
+
+    private static async Task<MediaDiscoveryResult> ResolvePlaylist(FakeHttpHandler handler, string url, int maxItems, string? pageToken = null)
+    {
+        using var resolver = new DefaultMediaResolver(handler: handler);
+        return await resolver.ResolveAsync(new()
+        {
+            Url = new Uri(url),
+            Options = new DiscoveryOptions
+            {
+                CollectionIntent = CollectionIntent.CollectionOnly,
+                MaxCollectionItems = maxItems,
+                PageToken = pageToken
+            }
+        }, CancellationToken.None);
+    }
+
     [Fact]
     public async Task PlaylistContinuation_IsFollowedAndDeduplicated()
     {
@@ -170,6 +203,74 @@ public sealed class YouTubeStrategyTests
         Assert.True(res.Collection!.IsComplete);
         Assert.Equal(["AAAAAAAAAAA", "BBBBBBBBBBB", "CCCCCCCCCCC"], res.Collection.Entries.Select(e => e.MediaId));
         Assert.Equal("1", h.Requests.Single(r => r.Url.AbsolutePath.EndsWith("/browse", StringComparison.Ordinal)).Headers["X-YouTube-Client-Name"]);
+    }
+
+    [Fact]
+    public async Task PlaylistItemCap_DetectsMoreEntriesEvenWithoutAContinuation()
+    {
+        const string url = "https://www.youtube.com/playlist?list=PLovercap";
+        var h = new FakeHttpHandler().Add(url, PlaylistPage(["AAAAAAAAAAA", "BBBBBBBBBBB", "CCCCCCCCCCC"]));
+        var result = await ResolvePlaylist(h, url, maxItems: 2);
+
+        Assert.Equal(DiscoveryStatus.Partial, result.Status);
+        Assert.Equal(2, result.Collection!.Entries.Count);
+        Assert.False(result.Collection.IsComplete);
+        Assert.Null(result.Collection.TotalCount);
+        Assert.Null(result.Collection.NextPageToken); // the cap cut through this page
+        Assert.Contains(result.Warnings, warning => warning.Diagnostic.Contains("item limit", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task PlaylistExactlyAtItemCapWithNoContinuationIsComplete()
+    {
+        const string url = "https://www.youtube.com/playlist?list=PLexactcap";
+        var h = new FakeHttpHandler().Add(url, PlaylistPage(["AAAAAAAAAAA", "BBBBBBBBBBB"]));
+        var result = await ResolvePlaylist(h, url, maxItems: 2);
+
+        Assert.Equal(DiscoveryStatus.Success, result.Status);
+        Assert.True(result.Collection!.IsComplete);
+        Assert.Equal(2, result.Collection.TotalCount);
+        Assert.Equal(2, result.Collection.Entries.Count);
+        Assert.Empty(result.Warnings);
+    }
+
+    [Fact]
+    public async Task FinalContinuationPageCrossingItemCapIsPartialAndHasNoResumeToken()
+    {
+        const string url = "https://www.youtube.com/playlist?list=PLlastpage";
+        const string token = "TOKEN_PAGE_2_abcdef";
+        var h = new FakeHttpHandler()
+            .Add(url, PlaylistPage(["AAAAAAAAAAA"], token))
+            .Add("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
+                ContinuationPage(["BBBBBBBBBBB", "CCCCCCCCCCC"]), "application/json");
+        var result = await ResolvePlaylist(h, url, maxItems: 2);
+
+        Assert.Equal(DiscoveryStatus.Partial, result.Status);
+        Assert.Equal(["AAAAAAAAAAA", "BBBBBBBBBBB"], result.Collection!.Entries.Select(entry => entry.MediaId));
+        Assert.False(result.Collection.IsComplete);
+        Assert.Null(result.Collection.TotalCount);
+        Assert.Null(result.Collection.NextPageToken);
+        Assert.Contains(result.Warnings, warning => warning.Diagnostic.Contains("item limit", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task DuplicateOnlyContinuationWithMoreTokenIsNotReportedComplete()
+    {
+        const string url = "https://www.youtube.com/playlist?list=PLduplicates";
+        const string firstToken = "TOKEN_PAGE_2_abcdef";
+        const string repeatedToken = "TOKEN_PAGE_3_abcdef";
+        var h = new FakeHttpHandler()
+            .Add(url, PlaylistPage(["AAAAAAAAAAA"], firstToken))
+            .Add("https://www.youtube.com/youtubei/v1/browse?prettyPrint=false",
+                ContinuationPage(["AAAAAAAAAAA"], repeatedToken), "application/json");
+        var result = await ResolvePlaylist(h, url, maxItems: 3);
+
+        Assert.Equal(DiscoveryStatus.Partial, result.Status);
+        Assert.Single(result.Collection!.Entries);
+        Assert.False(result.Collection.IsComplete);
+        Assert.Null(result.Collection.NextPageToken);
+        Assert.Contains(result.Warnings, warning => warning.Diagnostic.Contains("repeated", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(2, h.Requests.Count(request => request.Url.AbsolutePath.EndsWith("/browse", StringComparison.Ordinal)));
     }
 
     [Theory]

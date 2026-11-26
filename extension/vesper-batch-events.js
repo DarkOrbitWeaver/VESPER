@@ -7,7 +7,7 @@ globalThis.VesperBatchEvents = (() => {
   const MAX_WATCHES = 64;
   const JOURNAL_KEY = 'vesperGuidedJournalsV2';
   const JOURNAL_TTL = 2 * 60 * 60_000;
-  const journals = new Map();
+  let journals = new Map();
   const journalStates = new Set(['approved','activating','waiting','ready','action-recorded','reconciling',
     'submitted','verified-native','verified-chrome','needs-input','indeterminate','failed-confirmed','cancelled']);
   const unfinishedStates = new Set(['activating','waiting','ready','action-recorded','reconciling','indeterminate']);
@@ -39,12 +39,12 @@ globalThis.VesperBatchEvents = (() => {
     const key = JSON.stringify([tabId,frameId,documentId]);
     const operation = journalWrites.catch(() => {}).then(async () => {
       await journalLoad;
-      for (const [k,v] of journals) if (v.expires <= now()) journals.delete(k);
-      const previous = journals.get(key);
+      const next = new Map([...journals].filter(([, record]) => record.expires > now()));
+      const previous = next.get(key);
       if (type === 'batch-journal-read') return {ok:true,record:previous || null};
       if (type === 'batch-journal-ack') {
         if (previous?.id !== message.id) return {ok:false,code:'missing'};
-        journals.delete(key);
+        next.delete(key);
       } else {
         const value = message.record;
         if (!validId(value?.id) || !Array.isArray(value.steps) || !value.steps.length || value.steps.length > 50
@@ -54,10 +54,11 @@ globalThis.VesperBatchEvents = (() => {
         if (previous && previous.id !== value.id && unresolved(previous)) return {ok:false,code:'unresolved'};
         if (previous?.id === value.id && !canUpdateJournal(previous, value)) return {ok:false,code:'stale-journal'};
         // No labels, signed URLs, or page text persisted. This is a replay guard, not proof of ownership.
-        if (!previous && journals.size >= 32) return {ok:false,code:'busy'};
-        journals.set(key,{id:value.id,expires:now()+JOURNAL_TTL,steps:value.steps.map(({index,key,state})=>({index,key,state}))});
+        if (!previous && next.size >= 32) return {ok:false,code:'busy'};
+        next.set(key,{id:value.id,expires:now()+JOURNAL_TTL,steps:value.steps.map(({index,key,state})=>({index,key,state}))});
       }
-      await chrome.storage.session.set({[JOURNAL_KEY]:Object.fromEntries(journals)});
+      await chrome.storage.session.set({[JOURNAL_KEY]:Object.fromEntries(next)});
+      journals = next;
       return {ok:true};
     });
     journalWrites = operation;
@@ -103,7 +104,7 @@ globalThis.VesperBatchEvents = (() => {
     if (!record) return { ok: false, code: 'missing' };
     return { ok: true, batchId: record.batchId, itemId: record.itemId, status: record.status,
       matched: record.matched === true, downloadId: record.downloadId ?? null,
-      danger: record.danger || 'unknown', completed: record.completed === true,
+      danger: record.danger || 'unknown', completed: record.completed === true, ambiguous: record.ambiguous === true,
       nativeCompleted: record.nativeCompleted === true && record.completed !== true };
   }
   async function arm(message, sender) {

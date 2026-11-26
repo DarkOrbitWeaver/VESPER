@@ -63,26 +63,42 @@ public sealed class ManifestResolver
         if (master.Variants.Count == 0)
             throw new MediaResolverException(MediaErrors.UnsupportedManifest("HLS master playlist has no variants"));
 
-        // One extra request: look at a single media playlist to learn container, protection, liveness and duration.
+        // Probe one variant and, if needed, its default audio rendition.
         HlsMediaPlaylist? probe = null;
+        HlsMediaPlaylist? audioProbe = null;
         Uri? probedVariant = null;
+        Uri? probedAudio = null;
         try
         {
             var variant = SelectProbeVariant(master);
-            var pr = (await _http.GetStringAsync(variant.Url, ctx, ct, _o.MaxManifestBytes, allowBinaryManifest: true).ConfigureAwait(false)).EnsureSuccess();
-            probe = HlsParser.Parse(pr.Content, pr.FinalUrl, _o.MaxSegmentsPerRepresentation * 2).Media;
+            probe = await ProbeHlsAsync(variant.Url, ctx, ct).ConfigureAwait(false);
             if (probe is not null)
             {
-                GuardMedia(probe);
                 probedVariant = variant.Url;
+                Uri? audio = master.Renditions.Where(r => r.Type == "AUDIO" && r.GroupId == variant.AudioGroup && r.Url is not null)
+                    .OrderByDescending(r => r.IsDefault).FirstOrDefault()?.Url;
+                if (audio is not null)
+                {
+                    audioProbe = await ProbeHlsAsync(audio, ctx, ct).ConfigureAwait(false);
+                    if (audioProbe is not null) probedAudio = audio;
+                }
             }
         }
         catch (MediaResolverException ex) when (ex.Error.Code is MediaErrorCode.NetworkFailure or MediaErrorCode.VideoUnavailable)
         {
-            _o.Diagnostics?.Invoke("HLS probe playlist unavailable; continuing without container/duration metadata");
+            _o.Diagnostics?.Invoke("HLS probe playlist unavailable");
         }
 
-        return HlsRepresentationBuilder.FromMaster(master, url, ctx, probe, probedVariant);
+        return HlsRepresentationBuilder.FromMaster(master, url, ctx, probe, probedVariant, audioProbe, probedAudio);
+    }
+
+    private async Task<HlsMediaPlaylist?> ProbeHlsAsync(Uri url, MediaRequestContext ctx, CancellationToken ct)
+    {
+        var response = (await _http.GetStringAsync(url, ctx, ct, _o.MaxManifestBytes, allowBinaryManifest: true)
+            .ConfigureAwait(false)).EnsureSuccess();
+        var media = HlsParser.Parse(response.Content, response.FinalUrl, _o.MaxSegmentsPerRepresentation * 2).Media;
+        if (media is not null) GuardMedia(media);
+        return media;
     }
 
     private static HlsVariant SelectProbeVariant(HlsMasterPlaylist master)
@@ -116,6 +132,10 @@ public sealed class ManifestResolver
             throw new MediaResolverException(MediaErrors.UnsupportedManifest("HLS SAMPLE-AES encryption is not supported"));
         if (p.IsLive)
             throw new MediaResolverException(MediaErrors.Live("HLS playlist has no EXT-X-ENDLIST"));
+        if (p.HasGaps)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("HLS playlists with missing segments (EXT-X-GAP) are not supported"));
+        if (p.IsIFrameOnly)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("HLS I-frame-only playlists are not supported"));
     }
 
     private ManifestResult ResolveDash(string text, Uri url, MediaRequestContext ctx)

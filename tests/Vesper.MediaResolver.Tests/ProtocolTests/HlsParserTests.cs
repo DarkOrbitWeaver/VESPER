@@ -102,7 +102,7 @@ public class HlsParserTests
         Assert.Equal("mp4", v360.Container);                       // init segment => fragmented MP4
         Assert.Equal(1_650_000, v360.FileSize);                    // 800 kbps average * 16.5 s
         Assert.True(v360.FileSizeIsEstimate);
-        Assert.Equal(2, h.Requests.Count);                         // bounded: master + one probe playlist
+        Assert.Equal(3, h.Requests.Count);                         // master, selected variant, and its audio probe
     }
 
     [Fact]
@@ -120,6 +120,57 @@ public class HlsParserTests
 
         Assert.Equal("https://cdn.example.com/hls/high.m3u8", h.Requests[1].Url.AbsoluteUri);
         Assert.Equal(2, result.Representations.Count);
+    }
+
+    [Fact]
+    public async Task Master_ProbeMetadataAppliesOnlyToTheInspectedVariant()
+    {
+        const string master = "#EXTM3U\n"
+            + "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"English\",URI=\"audio.m3u8\"\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=800000,AVERAGE-BANDWIDTH=800000,RESOLUTION=640x360\nlow.m3u8\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=2000000,AVERAGE-BANDWIDTH=2000000,RESOLUTION=1920x1080\nhigh.m3u8\n";
+        const string inspected = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n"
+            + "#EXT-X-KEY:METHOD=AES-128,URI=\"key\",IV=0x00000000000000000000000000000000\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1,\nsegment.m4s\n#EXT-X-ENDLIST\n";
+        var h = new FakeHttpHandler()
+            .Add(MasterUrl.AbsoluteUri, master, HlsMime)
+            .Add("https://cdn.example.com/hls/high.m3u8", inspected, HlsMime);
+
+        var result = await Manifests(h).ResolveAsync(MasterUrl, MediaRequestContext.Empty, CancellationToken.None);
+
+        var high = result.Representations.Single(r => r.Height == 1080);
+        var low = result.Representations.Single(r => r.Height == 360);
+        var audio = result.Representations.Single(r => r.Content == StreamContent.AudioOnly);
+        Assert.Equal("mp4", high.Container);
+        Assert.Equal(250_000, high.FileSize);
+        Assert.True(high.Requirements.HasFlag(ProcessingRequirement.DecryptAes128));
+        Assert.Equal("https://cdn.example.com/hls/high.m3u8", h.Requests[1].Url.AbsoluteUri);
+        Assert.Null(low.Container);
+        Assert.Null(low.FileSize);
+        Assert.False(low.Requirements.HasFlag(ProcessingRequirement.DecryptAes128));
+        Assert.Null(audio.Container);
+        Assert.False(audio.Requirements.HasFlag(ProcessingRequirement.DecryptAes128));
+    }
+
+    [Fact]
+    public async Task SeparateAudio_ProbesTheDeclaredDefaultGroupRendition()
+    {
+        const string master = "#EXTM3U\n"
+            + "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Default\",DEFAULT=YES,URI=\"audio.m3u8\"\n"
+            + "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Other\",URI=\"other.m3u8\"\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\",AUDIO=\"aud\"\nvideo.m3u8\n";
+        const string vod = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2,\npiece.m4s\n#EXT-X-ENDLIST\n";
+        var handler = new FakeHttpHandler().Add(MasterUrl.AbsoluteUri, master, HlsMime)
+            .Add("https://cdn.example.com/hls/video.m3u8", vod, HlsMime)
+            .Add("https://cdn.example.com/hls/audio.m3u8", vod, HlsMime);
+
+        var result = await Manifests(handler).ResolveAsync(MasterUrl, MediaRequestContext.Empty, CancellationToken.None);
+
+        var video = result.Representations.Single(r => r.Content == StreamContent.VideoOnly);
+        var audio = result.Representations.Single(r => r.IsDefaultAudio);
+        Assert.Equal("mp4", Vesper.MediaResolver.Formats.MergeCapability.MergeContainer(video, audio));
+        Assert.Null(result.Representations.Single(r => r.Label == "Other").Container);
+        Assert.Equal(3, handler.Requests.Count);
     }
 
     [Fact]
@@ -210,6 +261,57 @@ public class HlsParserTests
         sb.Append("#EXT-X-ENDLIST\n");
         var ex = Assert.Throws<MediaResolverException>(() => HlsParser.Parse(sb.ToString(), MasterUrl, maxSegments: 10));
         Assert.Equal(MediaErrorCode.ResponseTooLarge, ex.Error.Code);
+    }
+
+    [Theory]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188\na.ts\n")]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188@0\na.ts\n#EXTINF:1,\n#EXT-X-BYTERANGE:188\nb.ts\n")]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188@0\na.ts\n#EXTINF:1,\nb.ts\n#EXTINF:1,\n#EXT-X-BYTERANGE:188\na.ts\n")]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188@-1\na.ts\n")]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188@0@1\na.ts\n")]
+    [InlineData("#EXTINF:1,\n#EXT-X-BYTERANGE:188@9223372036854775807\na.ts\n")]
+    public void InvalidByteRangesAreRejectedDuringDiscovery(string segments)
+    {
+        var ex = Assert.Throws<MediaResolverException>(() =>
+            HlsParser.Parse("#EXTM3U\n#EXT-X-TARGETDURATION:1\n" + segments + "#EXT-X-ENDLIST\n", MasterUrl));
+
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Theory]
+    [InlineData(false, "#EXT-X-GAP")]
+    [InlineData(false, "#EXT-X-I-FRAMES-ONLY")]
+    [InlineData(true, "#EXT-X-GAP")]
+    [InlineData(true, "#EXT-X-I-FRAMES-ONLY")]
+    public async Task GapAndIFrameOnlyPlaylistsAreRejectedBeforeOffering(bool throughMaster, string feature)
+    {
+        string media = $"#EXTM3U\n#EXT-X-TARGETDURATION:1\n{feature}\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n";
+        var h = new FakeHttpHandler();
+        if (throughMaster)
+        {
+            const string master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\nprobe.m3u8\n";
+            h.Add(MasterUrl.AbsoluteUri, master, HlsMime)
+                .Add("https://cdn.example.com/hls/probe.m3u8", media, HlsMime);
+        }
+
+        var manifests = Manifests(h);
+        Task<ManifestResult> resolve = throughMaster
+            ? manifests.ResolveAsync(MasterUrl, MediaRequestContext.Empty, CancellationToken.None)
+            : manifests.ResolveTextAsync(media, MasterUrl, MediaRequestContext.Empty, CancellationToken.None);
+        var ex = await Assert.ThrowsAsync<MediaResolverException>(() => resolve);
+
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+    }
+
+    [Fact]
+    public async Task LivePlaylistWithGapStillReportsLiveUnsupported()
+    {
+        const string live = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-GAP\n#EXTINF:1,\nseg.ts\n";
+
+        var ex = await Assert.ThrowsAsync<MediaResolverException>(() =>
+            Manifests().ResolveTextAsync(live, MasterUrl, MediaRequestContext.Empty, CancellationToken.None));
+
+        Assert.Equal(MediaErrorCode.LiveStreamNotSupported, ex.Error.Code);
     }
 
     [Fact]

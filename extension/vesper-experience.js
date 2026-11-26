@@ -1,6 +1,6 @@
 'use strict';
 
-// Local, bounded history of verified transfers and explicit server refusals, keyed by salted site hashes.
+// Each strategy keeps its own outcomes. Lookup measures verified formats, while takeover measures completed files.
 // Evidence decays over time and can only restrict acquisition, never override its safety checks.
 const VesperExperience = (() => {
   const KEY = 'vesperExperience';
@@ -37,7 +37,7 @@ const VesperExperience = (() => {
     return hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)).subarray(0, 12));
   }
 
-  // An entry is [verified, refused, updatedAt]. Both weights are faded to "now" before they are used.
+  // An entry stores positive outcomes, refusals, and the time of the last update.
   function faded(entry, now) {
     const factor = now > entry[2] ? 0.5 ** ((now - entry[2]) / HALF_LIFE_MS) : 1;
     return [entry[0] * factor, entry[1] * factor];
@@ -78,7 +78,7 @@ const VesperExperience = (() => {
     const key = await keyFor(memory, site, strategy);
     if (!key || state !== loaded) return;
     const [verified, refused] = memory.entries[key] ? faded(memory.entries[key], now) : [0, 0];
-    // A verified file proves the site serves the same file twice, which is what earlier refusals put in doubt.
+    // A positive outcome clears refusal history for this strategy.
     memory.entries[key] = outcome === 'verified'
       ? [Math.min(MAX_WEIGHT, verified + 1), 0, now]
       : [verified, Math.min(MAX_WEIGHT, refused + 1), now];

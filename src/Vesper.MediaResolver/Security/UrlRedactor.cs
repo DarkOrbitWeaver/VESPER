@@ -35,7 +35,12 @@ public static class UrlRedactor
                 if (!firstKey) sb.Append('&');
                 firstKey = false;
                 int eq = pair.IndexOf('=');
-                string key = eq < 0 ? pair : pair[..eq];
+                if (eq <= 0)
+                {
+                    sb.Append('…');
+                    continue;
+                }
+                string key = pair[..eq];
                 sb.Append(key.Length > 24 ? key[..24] : key).Append("=…");
             }
         }

@@ -1,18 +1,28 @@
-using System.Diagnostics;
-
 namespace Vesper.Engine;
 
 /// <summary>
-/// Bandwidth limiter based on booking time slots: each caller reserves the next free slot for its
-/// bytes and sleeps until that slot ends. That keeps competing callers (jobs sharing the global
-/// limiter) in first-come order without a background thread. A rate of 0 means unlimited.
+/// FIFO bandwidth limiter with a bounded burst. A rate change wakes the current waiter so it can
+/// recalculate using the new rate. A rate of 0 means unlimited.
 /// </summary>
 public sealed class RateLimiter
 {
     private readonly object _gate = new();
+    private readonly TimeProvider _timeProvider;
+    private readonly LinkedList<Waiter> _waiters = [];
     private long _bytesPerSecond;
     private long _revision;
-    private long _nextFree;   // Stopwatch ticks
+    private long _lastRefill;
+    private double _tokens;
+
+    private const double BurstSeconds = 0.25;
+
+    public RateLimiter() : this(TimeProvider.System) { }
+
+    internal RateLimiter(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider;
+        _lastRefill = timeProvider.GetTimestamp();
+    }
 
     public long BytesPerSecond => Interlocked.Read(ref _bytesPerSecond);
 
@@ -21,27 +31,198 @@ public sealed class RateLimiter
     public void SetRate(long bytesPerSecond)
     {
         long value = Math.Max(0, bytesPerSecond);
-        if (Interlocked.Exchange(ref _bytesPerSecond, value) != value)
-            Interlocked.Increment(ref _revision);
-    }
-
-    public async ValueTask AcquireAsync(int bytes, CancellationToken ct)
-    {
-        long rate = BytesPerSecond;
-        if (rate <= 0 || bytes <= 0) return;
-
-        long waitTicks;
         lock (_gate)
         {
-            long now = Stopwatch.GetTimestamp();
-            long burstCredit = Stopwatch.Frequency / 4;          // idle time banks at most 250 ms
-            long start = Math.Max(_nextFree, now - burstCredit);
-            _nextFree = start + (long)((double)bytes * Stopwatch.Frequency / rate);
-            waitTicks = _nextFree - now;
+            long previous = _bytesPerSecond;
+            if (previous == value) return;
+
+            long now = _timeProvider.GetTimestamp();
+            RefillTokensLocked(now, CapacityForHeadLocked(previous));
+            Interlocked.Exchange(ref _bytesPerSecond, value);
+            Interlocked.Increment(ref _revision);
+
+            if (value == 0)
+                _tokens = 0;
+            else if (previous == 0)
+                _tokens = BurstCapacity(value);
+            else
+                _tokens = Math.Min(_tokens, CapacityForHeadLocked(value));
+
+            _lastRefill = now;
+            PulseHeadLocked();
         }
-        if (waitTicks <= 0) return;
-        TimeSpan delay = TimeSpan.FromSeconds((double)waitTicks / Stopwatch.Frequency);
-        if (delay > TimeSpan.FromMilliseconds(2)) await Task.Delay(delay, ct).ConfigureAwait(false);
+    }
+
+    public ValueTask AcquireAsync(int bytes, CancellationToken ct)
+    {
+        if (bytes <= 0) return ValueTask.CompletedTask;
+        ct.ThrowIfCancellationRequested();
+
+        Waiter waiter;
+        lock (_gate)
+        {
+            if (_waiters.Count == 0)
+            {
+                if (_bytesPerSecond == 0) return ValueTask.CompletedTask;
+                RefillTokensLocked(_timeProvider.GetTimestamp(), BurstCapacity(_bytesPerSecond));
+                if (_tokens >= bytes)
+                {
+                    _tokens -= bytes;
+                    return ValueTask.CompletedTask;
+                }
+            }
+            waiter = new Waiter(bytes, ct);
+            waiter.Node = _waiters.AddLast(waiter);
+        }
+
+        return WaitAsync(waiter);
+    }
+
+    private async ValueTask WaitAsync(Waiter waiter)
+    {
+        try
+        {
+            await WaitForTurnAsync(waiter).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Remove(waiter);
+            throw;
+        }
+    }
+
+    private async ValueTask WaitForTurnAsync(Waiter waiter)
+    {
+        while (true)
+        {
+            Task changed;
+            TimeSpan delay;
+            bool isHead;
+            lock (_gate)
+            {
+                waiter.CancellationToken.ThrowIfCancellationRequested();
+                if (waiter.Node is null) throw new OperationCanceledException(waiter.CancellationToken);
+
+                isHead = ReferenceEquals(_waiters.First?.Value, waiter);
+                changed = waiter.Changed.Task;
+                if (!isHead)
+                {
+                    delay = TimeSpan.Zero;
+                }
+                else if (_bytesPerSecond == 0)
+                {
+                    _tokens = 0;
+                    _lastRefill = _timeProvider.GetTimestamp();
+                    RemoveLocked(waiter);
+                    PulseHeadLocked();
+                    return;
+                }
+                else
+                {
+                    long now = _timeProvider.GetTimestamp();
+                    RefillTokensLocked(now, CapacityForLocked(_bytesPerSecond, waiter.Bytes));
+                    if (_tokens >= waiter.Bytes)
+                    {
+                        _tokens -= waiter.Bytes;
+                        _tokens = Math.Min(_tokens, BurstCapacity(_bytesPerSecond));
+                        RemoveLocked(waiter);
+                        PulseHeadLocked();
+                        return;
+                    }
+
+                    double seconds = (waiter.Bytes - _tokens) / _bytesPerSecond;
+                    if (seconds <= 0.002)
+                    {
+                        _tokens -= waiter.Bytes;
+                        RemoveLocked(waiter);
+                        PulseHeadLocked();
+                        return;
+                    }
+                    delay = TimeSpan.FromSeconds(seconds);
+                }
+            }
+
+            if (!isHead)
+            {
+                await changed.WaitAsync(waiter.CancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            await WaitForChangeOrDelayAsync(delay, changed, waiter.CancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task WaitForChangeOrDelayAsync(TimeSpan delay, Task changed, CancellationToken ct)
+    {
+        using var timerCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task timer = Task.Delay(delay, _timeProvider, timerCancellation.Token);
+        Task winner = await Task.WhenAny(timer, changed).ConfigureAwait(false);
+        if (winner == changed)
+        {
+            timerCancellation.Cancel();
+            try { await timer.ConfigureAwait(false); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+            ct.ThrowIfCancellationRequested();
+            return;
+        }
+
+        await timer.ConfigureAwait(false);
+    }
+
+    private void Remove(Waiter waiter)
+    {
+        lock (_gate)
+        {
+            if (waiter.Node is null) return;
+            bool wasHead = ReferenceEquals(_waiters.First?.Value, waiter);
+            RemoveLocked(waiter);
+            if (!wasHead) return;
+
+            RefillTokensLocked(_timeProvider.GetTimestamp(), CapacityForLocked(_bytesPerSecond, waiter.Bytes));
+            _tokens = Math.Min(_tokens, BurstCapacity(_bytesPerSecond));
+            _lastRefill = _timeProvider.GetTimestamp();
+            PulseHeadLocked();
+        }
+    }
+
+    private void RemoveLocked(Waiter waiter)
+    {
+        if (waiter.Node is null) return;
+        _waiters.Remove(waiter.Node);
+        waiter.Node = null;
+    }
+
+    private void RefillTokensLocked(long now, double capacity)
+    {
+        long elapsed = Math.Max(0, now - _lastRefill);
+        _tokens = Math.Min(capacity, _tokens + (double)elapsed * _bytesPerSecond / _timeProvider.TimestampFrequency);
+        _lastRefill = now;
+    }
+
+    private double CapacityForLocked(long rate, int? currentRequestSize = null) =>
+        Math.Max(BurstCapacity(rate), currentRequestSize ?? 0);
+
+    private double CapacityForHeadLocked(long rate) =>
+        _waiters.First is { } node ? CapacityForLocked(rate, node.Value.Bytes) : BurstCapacity(rate);
+
+    private static double BurstCapacity(long rate) => rate * BurstSeconds;
+
+    private void PulseHeadLocked()
+    {
+        if (_waiters.First is not { } node) return;
+        TaskCompletionSource previous = node.Value.Changed;
+        node.Value.Changed = NewSignal();
+        previous.TrySetResult();
+    }
+
+    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private sealed class Waiter(int bytes, CancellationToken cancellationToken)
+    {
+        internal int Bytes { get; } = bytes;
+        internal CancellationToken CancellationToken { get; } = cancellationToken;
+        internal LinkedListNode<Waiter>? Node;
+        internal TaskCompletionSource Changed = NewSignal();
     }
 }
 

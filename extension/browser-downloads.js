@@ -906,6 +906,17 @@ async function releaseParkedChromeDownload(id, record) {
       await armBrowserRecovery();
       return;
     }
+    let resumed;
+    try { resumed = await getChromeDownload(id); }
+    catch {
+      await armBrowserRecovery();
+      return;
+    }
+    if (sameDownload(resumed, record) && (resumed.state === 'in_progress' && resumed.paused
+        || resumed.state === 'interrupted' && resumed.canResume && !resumed.error?.startsWith('USER_'))) {
+      await armBrowserRecovery();
+      return;
+    }
   }
 
   await writeBrowserRecord(id, record.standDownAfterRelease
@@ -1002,8 +1013,13 @@ async function finishBrowserHandoff(id, record) {
   }
   // Changed source, or Chrome was resumed independently.
   // Do not erase it just because VESPER finished a separate copy.
-  if (sameDownload(latest, record) && record.resumeChrome && latest.state === 'in_progress' && latest.paused)
-    await chrome.downloads.resume(id).catch(() => {});
+  const chromeNeedsResume = sameDownload(latest, record) && record.resumeChrome
+    && (latest.state === 'in_progress' && latest.paused
+      || latest.state === 'interrupted' && latest.canResume && !latest.error?.startsWith('USER_'));
+  if (chromeNeedsResume) {
+    await releaseParkedChromeDownload(id, { ...record, standDownAfterRelease: true });
+    return;
+  }
   await writeBrowserRecord(id, { ...record, stage: 'stand-down' });
 }
 

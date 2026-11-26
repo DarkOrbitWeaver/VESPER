@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Net.Sockets;
 using System.Text.Json;
 using System.Text;
 using Microsoft.AspNetCore.Builder;
@@ -68,6 +69,22 @@ public class HlsTests
         JobSnapshot done = await h.WaitForStateAsync(AddHls(h, server, path), JobState.Completed);
         Assert.Equal(FaultServer.HlsExpected(), await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.EndsWith(".ts", done.FinalPath);               // honest container: concatenated TS is a valid .ts, not a pretend .mp4
+    }
+
+    [Fact]
+    public async Task Close_delimited_HLS_segment_with_a_valid_prefix_is_not_published()
+    {
+        byte[] prefix = FaultServer.HlsSegment(0)[..(188 * 100)];
+        Assert.All(prefix.Where((_, index) => index % 188 == 0), value => Assert.Equal(0x47, value));
+        await using var server = new CloseDelimitedHlsServer(prefix);
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = harness.Engine.Add(new AddRequest(server.Url("/index.m3u8"), FileName: "partial", Kind: JobKind.Hls)).JobId;
+
+        JobSnapshot stopped = await harness.WaitAsync(id, job => job.State == JobState.NeedsAttention);
+        Assert.Equal("unframed-response", stopped.Reason);
+        Assert.Equal(0, stopped.CommittedBytes);
+        Assert.Null(stopped.FinalPath);
     }
 
     [Fact]
@@ -1724,6 +1741,76 @@ public class HlsTests
                 value = (value << 1) ^ ((value & 0x80000000) != 0 ? 0x04c11db7u : 0u);
         }
         return value;
+    }
+
+    private sealed class CloseDelimitedHlsServer(byte[] segment) : IAsyncDisposable
+    {
+        private const string Playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nsegment.ts\n#EXT-X-ENDLIST\n";
+        private readonly TcpListener _listener = new(System.Net.IPAddress.Loopback, 0);
+        private readonly CancellationTokenSource _stop = new();
+        private Task? _serve;
+
+        internal string BaseUrl { get; private set; } = "";
+        internal string Url(string path) => BaseUrl + path;
+
+        internal Task StartAsync()
+        {
+            _listener.Start();
+            int port = ((System.Net.IPEndPoint)_listener.LocalEndpoint).Port;
+            BaseUrl = $"http://127.0.0.1:{port}";
+            _serve = ServeAsync(_stop.Token);
+            return Task.CompletedTask;
+        }
+
+        private async Task ServeAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    using TcpClient client = await _listener.AcceptTcpClientAsync(ct);
+                    await using NetworkStream stream = client.GetStream();
+                    string path = await ReadPathAsync(stream, ct);
+                    byte[] body = path == "/index.m3u8"
+                        ? Encoding.UTF8.GetBytes(Playlist)
+                        : segment;
+                    string type = path == "/index.m3u8" ? "application/vnd.apple.mpegurl" : "video/mp2t";
+                    string lengthHeader = path == "/index.m3u8" ? $"Content-Length: {body.Length}\r\n" : "";
+                    byte[] header = Encoding.ASCII.GetBytes(
+                        $"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {type}\r\n{lengthHeader}\r\n");
+                    byte[] response = [.. header, .. body];
+                    await stream.WriteAsync(response, ct);
+                    await stream.FlushAsync(ct);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            catch (SocketException) when (ct.IsCancellationRequested) { }
+        }
+
+        private static async Task<string> ReadPathAsync(NetworkStream stream, CancellationToken ct)
+        {
+            var request = new List<byte>(1024);
+            byte[] next = new byte[1];
+            while (request.Count < 32 * 1024)
+            {
+                if (await stream.ReadAsync(next, ct) == 0) return "";
+                request.Add(next[0]);
+                int count = request.Count;
+                if (count >= 4 && request[count - 4] == '\r' && request[count - 3] == '\n'
+                    && request[count - 2] == '\r' && request[count - 1] == '\n') break;
+            }
+
+            string firstLine = Encoding.ASCII.GetString(request.ToArray()).Split("\r\n", StringSplitOptions.None)[0];
+            return firstLine.Split(' ', StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(1) ?? "";
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _stop.Cancel();
+            _listener.Stop();
+            if (_serve is not null) await _serve;
+            _stop.Dispose();
+        }
     }
 
 }

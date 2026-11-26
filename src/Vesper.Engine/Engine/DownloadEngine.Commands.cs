@@ -39,7 +39,7 @@ public sealed record AddRequest(
     string? MediaMetadataJson = null,
     bool InitiallyPaused = false);
 
-public sealed record AddResult(AddStatus Status, Guid JobId, string Message)
+public sealed record AddResult(AddStatus Status, Guid JobId, string Message, bool StartDeferred = false)
 {
     public bool Ok => Status is AddStatus.Added or AddStatus.AlreadySubmitted;
 }
@@ -78,7 +78,34 @@ public sealed partial class DownloadEngine
         AddResult result;
         try { result = AddCore(request); }
         finally { FlushOutbox(); }
-        if (result.Status == AddStatus.Added) ScheduleNext();
+        if (result.Status == AddStatus.Added)
+        {
+            try { ScheduleNext(); }
+            catch (LocalStorageException ex)
+            {
+                bool startDeferred;
+                lock (_lock)
+                {
+                    startDeferred = _jobs.TryGetValue(result.JobId, out DownloadJob? job)
+                        && job.State == JobState.Queued && !_sessions.ContainsKey(result.JobId);
+                    if (!_disposed && !_crashed)
+                    {
+                        Log(startDeferred ? result.JobId : null,
+                            startDeferred ? "add-start-failed" : "add-scheduler-failed", ex.Message);
+                        RetrySchedulingSoonLocked();
+                    }
+                }
+                FlushOutbox();
+                if (startDeferred)
+                {
+                    return result with
+                    {
+                        Message = "Added to the queue. Starting will retry when storage is available.",
+                        StartDeferred = true
+                    };
+                }
+            }
+        }
         return result;
     }
 
@@ -103,7 +130,7 @@ public sealed partial class DownloadEngine
             return new AddResult(AddStatus.Invalid, Guid.Empty, urlError);
         if (MediaPageLinks.TryGetSite(uri, out string mediaSite))
             return new AddResult(AddStatus.Invalid, Guid.Empty,
-                $"This is a {mediaSite} video page, not a file link. Use Add Download > Find video to discover supported media formats.");
+                $"This is a {mediaSite} media page. In Add download, choose Find media.");
         try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
         catch (BlockedAddressException ex) { return new AddResult(AddStatus.Invalid, Guid.Empty, ex.Message); }
 
@@ -220,8 +247,7 @@ public sealed partial class DownloadEngine
                         continue;
                     }
 
-                    if (existing is null && (request.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge)
-                        || SameRequestPlan(candidate, request)))
+                    if (existing is null && SameRequestPlan(candidate, request))
                         existing = candidate;
                     i++;
                 }
@@ -294,10 +320,29 @@ public sealed partial class DownloadEngine
 
     private bool SameRequestPlan(DownloadJob existing, AddRequest request)
     {
-        if (request.Kind != JobKind.Merge) return existing.MediaPlanJson == request.MediaPlanJson;
-        return MediaMergePlan.TryParse(existing.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan previous, out _)
-            && MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan next, out _)
-            && previous.Fingerprint == next.Fingerprint;
+        if (existing.Kind != request.Kind || existing.Output != request.Output) return false;
+        if (request.Kind == JobKind.Merge)
+            return MediaMergePlan.TryParse(existing.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan previous, out _)
+                && MediaMergePlan.TryParse(request.MediaPlanJson, Options.AllowPrivateNetworks, out MediaMergePlan next, out _)
+                && previous.Fingerprint == next.Fingerprint;
+
+        if (request.Kind == JobKind.Http && request.Output is (MediaOutput.Wav or MediaOutput.M4a))
+            return SameTimeRange(existing.MediaPlanJson, request.MediaPlanJson);
+
+        bool previousWebmClip = DirectMediaPlan.TryWebmClip(existing.MediaPlanJson, out MediaTimeRange previousRange);
+        bool requestedWebmClip = DirectMediaPlan.TryWebmClip(request.MediaPlanJson, out MediaTimeRange requestedRange);
+        if (previousWebmClip || requestedWebmClip)
+            return previousWebmClip && requestedWebmClip && previousRange == requestedRange;
+
+        return existing.MediaPlanJson == request.MediaPlanJson;
+    }
+
+    private static bool SameTimeRange(string? previousJson, string? requestedJson)
+    {
+        if (previousJson is null || requestedJson is null) return previousJson == requestedJson;
+        return MediaTimeRange.TryParse(previousJson, out MediaTimeRange previous)
+            && MediaTimeRange.TryParse(requestedJson, out MediaTimeRange requested)
+            && previous == requested;
     }
 
     // run control

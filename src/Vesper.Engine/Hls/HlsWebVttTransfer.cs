@@ -266,17 +266,20 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
         else if (status == 206) throw new RunnerStop(NeedsAttention("subtitle-range", "The server returned only part of a subtitle segment."));
         if (!HttpFacts.IsIdentityEncoded(response)) throw new RunnerStop(NeedsAttention("subtitle-encoding", "The server compressed an HLS subtitle segment."));
         if (HttpFacts.IsHtml(response)) throw new RunnerStop(NeedsAttention("subtitle-html", "The server sent a web page instead of a subtitle segment."));
-        byte[] bytes = await ReadBoundedAsync(response, segment.RangeLength ?? MaxSegmentBytes, ct, lease, copies: 2).ConfigureAwait(false);
+        byte[] bytes = await ReadBoundedAsync(response, segment.RangeLength ?? MaxSegmentBytes, ct, lease, copies: 2,
+            expectedLength: segment.RangeLength).ConfigureAwait(false);
         if (segment.RangeLength is long expected && bytes.LongLength != expected)
             throw new TransientNetworkException("An HLS subtitle byte-range response was incomplete.");
         return bytes;
     }
 
     private async Task<byte[]> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct,
-        SegmentBufferLease? lease = null, int copies = 1)
+        SegmentBufferLease? lease = null, int copies = 1, long? expectedLength = null)
     {
         if (response.Content.Headers.ContentLength > limit)
             throw new RunnerStop(NeedsAttention("subtitle-size", "An HLS subtitle playlist or segment is unreasonably large."));
+        if (!HttpFacts.HasTrustworthyBodyBoundary(response, expectedLength))
+            throw new RunnerStop(NeedsAttention("unframed-response", "The subtitle response did not provide complete body framing or a trusted size. Saved data was kept."));
         using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
         stall.CancelAfter(engine.Options.StallTimeout);
         try

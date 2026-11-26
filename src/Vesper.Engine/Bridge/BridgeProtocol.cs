@@ -21,7 +21,7 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
-    string? TransferReason = null);
+    string? TransferReason = null, bool? Subtitle = null);
 
 public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, string Message,
     IReadOnlyList<BridgeResult>? Results = null, object? Data = null, string? AppVersion = null)
@@ -331,7 +331,14 @@ public static class BridgeProtocol
                     return false;
                 bool verifyMp4 = root.TryGetProperty("mediaCheck", out JsonElement check);
                 if (verifyMp4 && (check.ValueKind != JsonValueKind.String || check.GetString() != "mp4")) return false;
-                request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length, Session: session, VerifyMp4: verifyMp4);
+                bool automatic = true;
+                if (root.TryGetProperty("automatic", out JsonElement intent))
+                {
+                    if (intent.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) return false;
+                    automatic = intent.GetBoolean();
+                }
+                request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length,
+                    Session: session, VerifyMp4: verifyMp4, Automatic: automatic);
                 return true;
             }
             case "append":

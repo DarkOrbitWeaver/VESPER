@@ -7,7 +7,6 @@ let managedRefresh;
 let managedPort;
 let managedWatchPending = false;
 let managedWatchHasFiles = false;
-let managedSitePolicy;
 let managedProfile;
 
 function managedHosts(item) {
@@ -137,7 +136,6 @@ function refreshManagedDownloads() {
 async function refreshManaged() {
   const [entries, records] = await Promise.all([managedItems(), readBrowserRecords()]);
   if (!entries.length) {
-    managedSitePolicy = null;
     const port = managedPort;
     managedPort = null;
     managedWatchPending = false;
@@ -178,19 +176,15 @@ async function refreshManaged() {
       managedWatchPending = false;
       if (!reply?.ok) {
         managedPort = null;
-        managedSitePolicy = null;
         port.disconnect();
         if (reply?.code === 'app-unavailable') void armBrowserRecovery().catch(() => {});
         return;
       }
       if (!managedWatchHasFiles) {
         managedPort = null;
-        managedSitePolicy = null;
         port.disconnect();
         return;
       }
-      const hosts = normalizeNeverCaptureHosts(reply.data?.siteRules?.neverCaptureHosts);
-      if (hosts && reply.data?.managedDownloads === true) managedSitePolicy = { hosts, at: Date.now() };
       const blocked = reply.data?.blocked || [];
       void forgetManaged(entries.filter(entry => blocked.includes(managedId(entry, profile))))
         .then(() => refreshManagedDownloads()).catch(() => {});
@@ -199,7 +193,6 @@ async function refreshManaged() {
       const error = chrome.runtime.lastError;
       if (managedPort !== port) return;
       managedPort = null;
-      managedSitePolicy = null;
       managedWatchPending = false;
       if (!/not found|forbidden/i.test(error?.message || ''))
         void armBrowserRecovery().catch(() => {});
@@ -216,15 +209,3 @@ async function enrollAutomaticChromeDownload(item, generation) {
   await siteRulesLoaded;
   if (!matchesNeverCaptureHost(item)) await rememberManaged(item, generation);
 }
-
-chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {
-  const policy = managedSitePolicy;
-  if (!captureAllowed() || !policy || Date.now() - policy.at > 5000 || !managedCandidate(item)
-      || managedHosts(item).some(host => policy.hosts.includes(host))) return suggest();
-  const url = item.finalUrl || item.url || '';
-  const response = recentResponse(browserUrl(item));
-  if (!/^(blob|data):/i.test(url) && !(response && (!response.replay || !response.etag))) return suggest();
-  const name = chromeFileName(item);
-  if (!name || name === '.' || name === '..' || /[<>:"/\\|?*\x00-\x1f]/.test(name)) return suggest();
-  suggest({ filename: `VESPER/${name}`, conflictAction: 'uniquify' });
-});

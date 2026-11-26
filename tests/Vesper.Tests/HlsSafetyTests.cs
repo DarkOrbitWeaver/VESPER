@@ -18,10 +18,32 @@ public sealed class HlsSafetyTests
         Assert.NotNull(parsed.Unsupported);
     }
     [Fact]
+    public void ImplicitRange_CannotFollowAnUnrangedSegment()
+    {
+        var parsed = HlsParser.ParseMedia("#EXTM3U\n#EXTINF:1,\n#EXT-X-BYTERANGE:188@0\na.ts\n#EXTINF:1,\nb.ts\n#EXTINF:1,\n#EXT-X-BYTERANGE:188\na.ts\n#EXT-X-ENDLIST", Base);
+        Assert.NotNull(parsed.Unsupported);
+    }
+    [Fact]
     public void ImplicitRanges_OfTheSameResourceAreOrdered()
     {
         var parsed = HlsParser.ParseMedia("#EXTM3U\n#EXTINF:1,\n#EXT-X-BYTERANGE:188@0\na.ts\n#EXTINF:1,\n#EXT-X-BYTERANGE:188\na.ts\n#EXT-X-ENDLIST", Base);
         Assert.Null(parsed.Unsupported); Assert.Equal(188, parsed.Segments[1].RangeOffset);
+    }
+    [Theory]
+    [InlineData("188@-1")]
+    [InlineData("188@nope")]
+    [InlineData("188@0@1")]
+    [InlineData("188@9223372036854775807")]
+    public void InvalidExplicitRange_IsRejected(string range)
+    {
+        var parsed = HlsParser.ParseMedia($"#EXTM3U\n#EXTINF:1,\n#EXT-X-BYTERANGE:{range}\na.ts\n#EXT-X-ENDLIST", Base);
+        Assert.NotNull(parsed.Unsupported);
+    }
+    [Fact]
+    public void InitializationRange_RequiresAnExplicitOffset()
+    {
+        var parsed = HlsParser.ParseMedia("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"188\"\n#EXTINF:1,\na.m4s\n#EXT-X-ENDLIST", Base);
+        Assert.NotNull(parsed.Unsupported);
     }
     [Theory]
     [InlineData("#EXT-X-DISCONTINUITY")]

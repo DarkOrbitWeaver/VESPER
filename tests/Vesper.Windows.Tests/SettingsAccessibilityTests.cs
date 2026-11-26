@@ -181,7 +181,7 @@ public sealed class SettingsAccessibilityTests
             string[] expectedNames =
             [
                 "Simultaneous downloads", "Preset 1 unit", "Preset 2 unit", "Preset 3 unit",
-                "Connections per download", "Proxy mode", "When Chrome sends a file",
+                "Connections per download", "Proxy mode",
                 "Color theme", "Download row height"
             ];
             Assert.Equal(expectedNames.Length, choices.Length);

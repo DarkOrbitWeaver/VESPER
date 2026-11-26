@@ -267,7 +267,7 @@ test('browser playlist browsing only opens the native picker from resolver colle
   assert.match(content, /formats\.playerLive = playerFacts\?\.live === true \|\| formats\.isLive === true/);
 });
 
-test('collection controls render an icon and a hidden status and forward the resolved collection', async () => {
+test('collection controls show a browse action and forward the resolved collection', async () => {
   const sent = [];
   const document = Object.assign(new EventTarget(), {
     querySelectorAll: () => [],
@@ -304,14 +304,13 @@ test('collection controls render an icon and a hidden status and forward the res
   for (const [kind, label] of [['playlist', 'playlist'], ['dynamicmix', 'mix'], ['album', 'album']]) {
     const { browse, status } = window.testControls({ collectionKind: kind, collectionUrl: url });
     assert.equal(browse.tagName, 'button');
-    assert.equal(browse.title, 'Browse ' + label + ' in VESPER');
+    assert.equal(browse.title, 'Browse ' + label);
     assert.equal(browse.attributes['aria-label'], browse.title);
-    assert.equal(browse.children.length, 1);
-    assert.equal(browse.children[0].tagName, 'img');
+    assert.equal(browse.textContent, browse.title);
     assert.equal(status.hidden, true);
     await browse.onclick();
     assert.equal(sent.at(-1).pageUrl, url);
-    assert.equal(status.textContent, '1 item(s) accepted in VESPER.');
+    assert.equal(status.textContent, '1 item added.');
     assert.equal(browse.disabled, false);
   }
   location.href = url;
@@ -899,7 +898,8 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const changedRestore = window.__testContent.restorePickerDraft(changed, 'same-video');
   assert.equal(changed.selectionNeedsChoice, true);
   assert.match(changed.selectionNotice, /no longer available/);
-  assert.match(changed.trackNotice, /selected tracks/);
+  assert.equal(changed.audioNeedsChoice, true);
+  assert.equal(changed.subtitlesNeedChoice, true);
   assert.equal(changedRestore.choice.index, 0);
 
   window.__testContent.attachForTest(video, { button: node(), panel: node(), receipt: node() });

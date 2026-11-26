@@ -18,7 +18,7 @@ internal sealed class SetupWindow : Form
     private readonly VesperButton _extension = new() { Text = "Extension files", Symbol = VesperIcon.Folder, TabIndex = 1 };
     private readonly CheckBox _deleteUserData = new()
     {
-        Text = "Delete VESPER settings, download history, and other saved data",
+        Text = "Delete VESPER settings, download history, and saved podcast feeds",
         Checked = false,
         TabIndex = 1,
         UseVisualStyleBackColor = false
@@ -69,7 +69,7 @@ internal sealed class SetupWindow : Form
         _extension.Click += (_, _) => OpenPath(Path.Combine(_paths.App, "extension"), shell: true);
         _deleteUserData.CheckedChanged += (_, _) => RefreshControls();
         _tips.SetToolTip(_extension, "Opens the bundled extension files. Setup does not enable the browser extension or verify its connection to VESPER.");
-        _tips.SetToolTip(_deleteUserData, "This removes VESPER settings, download history, and other saved data. Downloaded files are never deleted.");
+        _tips.SetToolTip(_deleteUserData, "Remove your VESPER settings, download history, and saved podcast feeds.");
         AcceptButton = _action;
         ApplyPalette();
         RefreshControls();
@@ -166,7 +166,7 @@ internal sealed class SetupWindow : Form
         _action.Text = _view switch
         {
             View.Complete => _mode == SetupMode.Uninstall ? "Close setup" : "Open VESPER",
-            View.Failed or View.Cancelled => "Try again",
+            View.Failed or View.Cancelled => "Retry",
             _ when _mode == SetupMode.Uninstall => "Uninstall VESPER",
             _ when _mode == SetupMode.Repair => "Repair VESPER",
             _ when File.Exists(_paths.Executable) => "Install update",
@@ -180,20 +180,21 @@ internal sealed class SetupWindow : Form
             View.Cancelled => "Setup canceled.",
             _ when _mode == SetupMode.Uninstall => "Remove VESPER from this Windows account?",
             _ when _mode == SetupMode.Repair => "Restore VESPER’s application files and browser helper.",
-            _ => "A home for your downloads."
+            _ when File.Exists(_paths.Executable) => "Ready to update",
+            _ => "Ready to install"
         };
         _tips.SetToolTip(_status, _view == View.Failed ? _error : null);
         _note.Text = _view switch
         {
             View.Ready when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
-                "Settings, download history, and other saved data will be deleted. Downloaded files are never deleted.",
+                "Settings, download history, and saved podcast feeds will be deleted.",
             View.Ready when _mode == SetupMode.Uninstall => "Your downloads, settings, download history, and other saved data will be kept.",
             View.Ready when _mode == SetupMode.Install => "For this Windows account only.",
             View.Complete when _mode != SetupMode.Uninstall => _extension.Enabled
                 ? "Extension files are ready. Enable the extension in Chrome to check its connection."
                 : "The bundled extension manifest is missing. Run Repair to restore the extension files.",
             View.Complete when _mode == SetupMode.Uninstall && _deleteUserData.Checked =>
-                "Settings, download history, and other saved data were deleted. Downloaded files were kept.",
+                "Settings, download history, and saved podcast feeds were deleted.",
             View.Complete => "Your downloads, settings, download history, and other saved data were kept.",
             _ => ""
         };

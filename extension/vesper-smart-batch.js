@@ -165,7 +165,7 @@
       differentPanel: Boolean(panel && candidatePanel && candidatePanel !== panel),
       blocked: evidence.assess(facts).verdict === 'blocked' };
   }
-  function suggestedAction(choices) {
+  function candidateActions(choices) {
     const active = choices.filter(item => activeHere(item.element));
     const selected = active.length === 1 ? active[0] : null;
     const candidates = [];
@@ -177,7 +177,10 @@
       if (relation.vetoed) continue;
       candidates.push({ element, score: verdict.logOdds + Math.max(-4, Math.min(4, relation.logOdds)) });
     }
-    return evidence.decide(candidates)?.element || null;   // a suggestion for review, never permission to click
+    return candidates;
+  }
+  function suggestedAction(choices) {
+    return evidence.decide(candidateActions(choices))?.element || null;
   }
   function actionKey(el) {
     if (!el) return '';
@@ -285,6 +288,7 @@
   }
   function show() {
     if (dialog || executor) return;
+    const previousFocus = document.activeElement;
     const choices = collectNav();
     let picked = suggestedAction(choices), selectionMode = false, activeBatchId = null, lastApproved = [], starting = false;
     const checked = new Set();
@@ -317,7 +321,9 @@
       : 'Shared Download button: not selected';
     const footer = document.createElement('footer');
     const close = button('Close', () => remove());
-    const choose = button('Pick shared Download button', () => chooseControl());
+    const choose = button('Choose download button', () => showChoices());
+    const controlChoices = document.createElement('div');
+    controlChoices.hidden = true;
     const start = button('Review and start', () => void startBatch(), 'primary');
     const cancel = button('Cancel remaining', () => { stopBatch(); write('Stopping remaining actions. Downloads already started are left alone.'); });
     const refresh = button('Refresh outcomes', () => void refreshResults());
@@ -344,6 +350,7 @@
       // Leave already-triggered watches to their bounded expiry. A late download
       // must not lose attribution merely because the user closes the panel.
       host.remove(); dialog = null;
+      if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
     }
     for (const choice of choices) {
       const row = document.createElement('label');
@@ -357,9 +364,33 @@
       row.append(check, text); items.append(row);
     }
     function update() {
-      start.disabled = !picked || !checked.size || !!executor || starting || unresolvedBatch;
+      start.disabled = !picked || !checked.size || !!executor || starting || selectionMode || !controlChoices.hidden || unresolvedBatch;
       choose.disabled = !!executor || selectionMode || starting;
       info.textContent = `${checked.size} selected · ${picked ? 'Action: ' + labelFor(picked) : 'Choose the shared Download button'}`;
+    }
+    function showChoices() {
+      const controls = candidateActions(choices).filter(choice => eligibleAction(choice.element))
+        .sort((a, b) => b.score - a.score).slice(0, 12).map(choice => choice.element);
+      if (controls.length === 0) return chooseControl();
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', 'Download button');
+      for (const [index, control] of controls.entries()) {
+        const option = document.createElement('option');
+        option.textContent = `${labelFor(control)}${control.id ? ` (${control.id.slice(0, 60)})` : ''}`;
+        option.value = String(index);
+        select.append(option);
+      }
+      const dismiss = () => { controlChoices.hidden = true; update(); choose.focus({ preventScroll: true }); };
+      controlChoices.replaceChildren(select, button('Confirm', () => {
+        const target = controls[Number(select.value)];
+        if (!target?.isConnected || !eligibleAction(target)) { write('That download button changed. Choose again.'); dismiss(); return; }
+        picked = target;
+        actionInfo.textContent = `Selected: ${labelFor(picked)}`;
+        dismiss();
+      }), button('Point to a button', () => { dismiss(); chooseControl(); }), button('Cancel', dismiss));
+      controlChoices.hidden = false;
+      update();
+      select.focus({ preventScroll: true });
     }
     function chooseControl() {
       if (selectionMode) return;
@@ -373,7 +404,7 @@
       host.style.cursor = 'crosshair';
       const hint = document.createElement('div');
       hint.style.cssText = 'position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#faf9f3;color:#283b30;border:1px solid #718776;border-radius:8px;padding:10px 14px;font:13px system-ui;pointer-events:none';
-      hint.textContent = 'Choose the shared Download control · Esc to cancel';
+      hint.textContent = 'Choose a download button. Esc to cancel.';
       shadow.append(hint);
       host.tabIndex = -1;
       host.focus({ preventScroll: true });
@@ -400,6 +431,7 @@
       };
       const keydown = event => {
         if (event.key === 'Escape') { swallow(event); finish(); }
+        if (event.key === 'Tab') swallow(event);
       };
       const bindings = [['pointerdown', swallow], ['pointerup', swallow], ['mousedown', swallow],
         ['mouseup', swallow], ['click', click], ['contextmenu', swallow], ['keydown', keydown]];
@@ -424,7 +456,7 @@
     function outcomeText(state) {
       return state.completed ? 'Finished in Chrome'
         : state.nativeCompleted ? 'Finished in VESPER'
-        : state.ambiguous ? 'More than one download started; ownership uncertain'
+        : state.ambiguous ? 'Couldn’t identify which download came from this action. Check your downloads before continuing.'
         : state.status === 'download-observed' ? 'Download started; final owner pending'
         : state.status === 'ownership-unresolved' ? 'Ownership uncertain; inspect downloads'
         : state.status;
@@ -557,7 +589,7 @@
             const status = await chrome.runtime.sendMessage({ type: 'batch-status', batchId,
               itemId: batchId + '-' + step.index });
             if (status?.ok && status.ambiguous)
-              return { detail: 'More than one download started after this click; ownership unresolved' };
+              return { detail: outcomeText(status) };
             if (status?.ok && status.matched && status.downloadId !== null) {
               if (!['safe', 'deepScannedSafe'].includes(status.danger))
                 return { detail: 'Chrome safety review needed; ownership unresolved' };
@@ -567,7 +599,7 @@
                 // A temporal match needs the full window to rule out a second download before continuing.
                 if (status.mode === 'next') await sleep(1500);
                 const settled = await chrome.runtime.sendMessage({ type: 'batch-status', batchId, itemId: batchId + '-' + step.index });
-                if (settled?.ambiguous) return { detail: 'More than one download started after this click; ownership unresolved' };
+                if (settled?.ambiguous) return { detail: outcomeText(settled) };
                 return { effect: 'started-confirmed', verified: true, detail: 'Chrome created the intended download; final ownership pending' };
               }
               return { detail: 'Download interrupted; origin/ownership unresolved' };
@@ -597,12 +629,30 @@
         if (!closeRequested) update();
       }
     }
+    section.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !executor && !starting) {
+        event.preventDefault(); event.stopPropagation();
+        if (!controlChoices.hidden) {
+          controlChoices.hidden = true; update(); choose.focus({ preventScroll: true });
+        } else remove();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = [...section.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)')]
+        .filter(control => !control.closest('[hidden]'));
+      const position = focusable.indexOf(shadow.activeElement);
+      if (event.shiftKey ? position <= 0 : position === focusable.length - 1) {
+        event.preventDefault();
+        (event.shiftKey ? focusable.at(-1) : focusable[0])?.focus();
+      }
+    });
     footer.append(close, choose, refresh, acknowledge, cancel, start);
-    section.append(title, info, actionInfo, items, log, footer);
+    section.append(title, info, actionInfo, items, controlChoices, log, footer);
     shadow.append(css, section);
     document.documentElement.append(host);
     if (!choices.length) write('No selectable items found on this page.');
     update();
+    (items.querySelector('input') || choose).focus({ preventScroll: true });
     void restorePrevious();
   }
   globalThis.VesperSmartBatch = Object.freeze({ open: show });

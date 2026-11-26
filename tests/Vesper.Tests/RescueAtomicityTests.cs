@@ -12,6 +12,53 @@ public sealed class RescueAtomicityTests
     }
 
     [Fact]
+    public async Task Local_invalid_replacement_keeps_a_running_download_active()
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        using var harness = new Harness();
+        Guid id = harness.Add(server.Url("/small-slow"), "active-invalid-rescue.bin");
+        JobSnapshot running = await harness.WaitAsync(id, job => job.State == JobState.Downloading && job.CommittedBytes > 0);
+
+        RescueResult invalidUrl = await harness.Engine.ReplaceLinkAsync(id, "not a link");
+        Assert.False(invalidUrl.Accepted);
+        Assert.Equal(JobState.Downloading, invalidUrl.StateAfterAttempt);
+        Assert.Equal(JobState.Downloading, harness.Engine.Snapshot(id)!.State);
+
+        RescueResult invalidChecksum = await harness.Engine.ReplaceLinkAsync(id, server.Url("/file"), new RescueInput(Sha256: "bad"));
+        Assert.False(invalidChecksum.Accepted);
+        Assert.Equal(JobState.Downloading, invalidChecksum.StateAfterAttempt);
+        JobSnapshot stillRunning = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(id));
+        Assert.Equal(JobState.Downloading, stillRunning.State);
+        Assert.Equal(running.SourceUrl, stillRunning.SourceUrl);
+
+        await harness.WaitForStateAsync(id, JobState.Completed);
+    }
+
+    [Fact]
+    public async Task Rejected_remote_proof_reports_that_the_download_was_paused()
+    {
+        await using var original = new FaultServer();
+        await using var mirror = new FaultServer();
+        await original.StartAsync();
+        await mirror.StartAsync();
+        using var harness = new Harness();
+        Guid id = harness.Add(original.Url("/small-slow"), "active-rejected-rescue.bin");
+        JobSnapshot running = await harness.WaitAsync(id, job => job.State == JobState.Downloading && job.CommittedBytes > 0);
+
+        RescueResult result = await harness.Engine.ReplaceLinkAsync(id, mirror.Url("/file"));
+
+        Assert.False(result.Accepted);
+        Assert.Equal(RescueMode.R4, result.Mode);
+        Assert.Equal(JobState.Paused, result.StateAfterAttempt);
+        JobSnapshot paused = Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(id));
+        Assert.Equal(JobState.Paused, paused.State);
+        Assert.Equal(running.SourceUrl, paused.SourceUrl);
+        Assert.True(paused.CommittedBytes >= running.CommittedBytes);
+        Assert.True(File.Exists(paused.PartialPath));
+    }
+
+    [Fact]
     public async Task A_rescue_probe_cannot_be_applied_after_a_restart_discards_its_prefix()
     {
         await using var server = new FaultServer();
@@ -95,6 +142,34 @@ public sealed class RescueAtomicityTests
         Assert.Equal(AddStatus.Added, originalAgain.Status);
         Assert.Equal(AddStatus.Duplicate, duplicateReplacement.Status);
         Assert.Equal(id, duplicateReplacement.JobId);
+    }
+
+    [Fact]
+    public async Task Rescue_duplicate_check_uses_the_clip_range()
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        AddResult AddClip(string url, double start, double end) => harness.Engine.Add(new AddRequest(url,
+            FileName: "clip.webm", MediaProvider: "generic",
+            MediaPlanJson: DirectMediaPlan.WebmClip(new MediaTimeRange(start, end)), InitiallyPaused: true));
+
+        const string original = "http://127.0.0.1:65530/original.webm";
+        const string differentRangeTarget = "http://127.0.0.1:65530/different-range.webm";
+        AddResult source = AddClip(original, 0, 1);
+        AddResult differentRange = AddClip(differentRangeTarget, 2, 3);
+
+        RescueResult moved = await harness.Engine.ReplaceLinkAsync(source.JobId, differentRangeTarget);
+        Assert.True(moved.Accepted, moved.Message);
+        Assert.Equal(differentRangeTarget, Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(source.JobId)).SourceUrl);
+        Assert.Equal(AddStatus.Added, differentRange.Status);
+
+        const string sameRangeSource = "http://127.0.0.1:65530/same-range-source.webm";
+        const string sameRangeTarget = "http://127.0.0.1:65530/same-range-target.webm";
+        AddResult anotherSource = AddClip(sameRangeSource, 4, 5);
+        AddClip(sameRangeTarget, 4, 5);
+
+        RescueResult refused = await harness.Engine.ReplaceLinkAsync(anotherSource.JobId, sameRangeTarget);
+        Assert.False(refused.Accepted);
+        Assert.Equal(sameRangeSource, Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(anotherSource.JobId)).SourceUrl);
     }
 
     [Fact]

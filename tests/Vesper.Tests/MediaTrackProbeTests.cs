@@ -210,4 +210,52 @@ public sealed class MediaTrackProbeTests
         Assert.Null(stopped.FinalPath);
         Assert.Equal(video, await File.ReadAllBytesAsync(stopped.PartialPath));
     }
+
+    [Fact]
+    public void DifferentWebmClipRangesDoNotCollideAndReplayKeepsItsOriginalReceipt()
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string url = "https://example.com/preview.webm";
+        string firstRange = DirectMediaPlan.WebmClip(new MediaTimeRange(0, 1));
+        string secondRange = DirectMediaPlan.WebmClip(new MediaTimeRange(2, 3));
+
+        AddResult first = harness.Engine.Add(new AddRequest(url, FileName: "first.webm", MediaProvider: "generic",
+            MediaPlanJson: firstRange, RequestId: "webm-clip-receipt", InitiallyPaused: true));
+        AddResult second = harness.Engine.Add(new AddRequest(url, FileName: "second.webm", MediaProvider: "generic",
+            MediaPlanJson: secondRange, InitiallyPaused: true));
+        AddResult duplicate = harness.Engine.Add(new AddRequest(url, FileName: "same.webm", MediaProvider: "generic",
+            MediaPlanJson: """{"webmClip":{"EndSeconds":1,"Version":1,"StartSeconds":0}}""", InitiallyPaused: true));
+        AddResult replay = harness.Engine.Add(new AddRequest(url, FileName: "changed.webm", MediaProvider: "generic",
+            MediaPlanJson: secondRange, RequestId: "webm-clip-receipt", InitiallyPaused: true));
+        AddResult otherKind = harness.Engine.Add(new AddRequest(url, FileName: "manifest.webm", Kind: JobKind.Hls,
+            InitiallyPaused: true));
+
+        Assert.Equal(AddStatus.Added, first.Status);
+        Assert.Equal(AddStatus.Added, second.Status);
+        Assert.Equal(AddStatus.Duplicate, duplicate.Status);
+        Assert.Equal(first.JobId, duplicate.JobId);
+        Assert.Equal(AddStatus.AlreadySubmitted, replay.Status);
+        Assert.Equal(first.JobId, replay.JobId);
+        Assert.Equal(AddStatus.Added, otherKind.Status);
+    }
+
+    [Theory]
+    [InlineData(MediaOutput.Wav, "clip.wav")]
+    [InlineData(MediaOutput.M4a, "clip.m4a")]
+    public void DifferentAudioClipRangesDoNotCollide(MediaOutput output, string fileName)
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        const string url = "https://example.com/audio.mp3";
+        AddResult first = harness.Engine.Add(new AddRequest(url, FileName: fileName, MediaProvider: "generic",
+            Output: output, MediaPlanJson: """{"StartSeconds":0,"EndSeconds":1,"Version":1}""", InitiallyPaused: true));
+        AddResult second = harness.Engine.Add(new AddRequest(url, FileName: fileName, MediaProvider: "generic",
+            Output: output, MediaPlanJson: """{"StartSeconds":2,"EndSeconds":3,"Version":1}""", InitiallyPaused: true));
+        AddResult duplicate = harness.Engine.Add(new AddRequest(url, FileName: fileName, MediaProvider: "generic",
+            Output: output, MediaPlanJson: """{"EndSeconds":1,"Version":1,"StartSeconds":0}""", InitiallyPaused: true));
+
+        Assert.Equal(AddStatus.Added, first.Status);
+        Assert.Equal(AddStatus.Added, second.Status);
+        Assert.Equal(AddStatus.Duplicate, duplicate.Status);
+        Assert.Equal(first.JobId, duplicate.JobId);
+    }
 }

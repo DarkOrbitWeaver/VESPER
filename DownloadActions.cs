@@ -1,14 +1,17 @@
 using System.Diagnostics;
+using Microsoft.Data.Sqlite;
 using Vesper.Engine;
 
 namespace VESPER;
 
 /// <summary>
 /// User-initiated operations on a download, shared by the row menu, batch toolbar and Details dialog.
-/// Every destructive action is confirmed here, revalidated by the engine, and reports what really happened.
+/// File deletion, removal from the list, and restart prompt before invoking engine operations.
 /// </summary>
 internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine, Func<VesperPreferences> preferences)
 {
+    private const string SaveFailureMessage = "The change could not be saved. Your previous download settings were kept.";
+
     // Anything Windows can execute, open with a handler that runs code, or mount as a disk image.
     private static readonly HashSet<string> RunnableExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -38,7 +41,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     {
         if (!TryGetFile(s, out string path)) return;
         if (RequiresOpenConfirmation(path) &&
-            !Confirm(OpenConfirmationText(path), "Open file", MessageBoxIcon.Warning))
+            !Confirm(OpenConfirmationText(path), "Open file", MessageBoxIcon.Warning, "Open file"))
             return;
 
         if (owner is Control control) control.UseWaitCursor = true;
@@ -56,7 +59,10 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
 
         if (result.Lease is null)
         {
-            Info(result.Message, "Open file", MessageBoxIcon.Warning);
+            string message = result.Message.StartsWith("VESPER could not save the file identity:", StringComparison.Ordinal)
+                ? "The file could not be opened because its identity could not be saved. The entry was kept unchanged."
+                : result.Message;
+            Info(message, "Open file", MessageBoxIcon.Warning);
             return;
         }
 
@@ -73,7 +79,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         RunnableExtensions.Contains(Path.GetExtension(finalPath));
 
     internal static string OpenConfirmationText(string finalPath) =>
-        $"{Path.GetFileName(finalPath)} is a program or script. Windows will treat it as downloaded from the internet.\n\nRun it?";
+        $"{Path.GetFileName(finalPath)} can run code, open a shortcut, or mount a disk image.\n\nOnly open it if you trust the source.";
 
     public void ShowFolder(JobSnapshot s)
     {
@@ -112,7 +118,12 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         {
             DeleteResult result = await engine.LocateFileAsync(s.Id, path);
             if (owner is not Control { IsDisposed: true } && !result.Deleted)
-                Info(result.Message, "Locate file", MessageBoxIcon.Warning);
+            {
+                string message = result.Message.StartsWith("The file action could not finish:", StringComparison.Ordinal)
+                    ? "Could not update the saved file location. The previous file location was kept."
+                    : result.Message;
+                Info(message, "Locate file", MessageBoxIcon.Warning);
+            }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         { Info("Could not locate this file: " + ex.Message, "Locate file", MessageBoxIcon.Warning); }
@@ -131,7 +142,11 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
     {
         if (Confirm("This server gives no way to confirm that the file is unchanged.\n\nIf it changed, the finished file could be a mix of two versions and may be corrupt.\n\nResume anyway?",
             "Resume without verification", MessageBoxIcon.Warning))
-            engine.ApproveUnverifiedResume(s.Id);
+        {
+            try { engine.ApproveUnverifiedResume(s.Id); }
+            catch (LocalStorageException)
+            { Info("The download could not be resumed. Check its current status before trying again.", "Resume without verification", MessageBoxIcon.Warning); }
+        }
     }
 
     public void StartOver(JobSnapshot s)
@@ -148,30 +163,95 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
                 ? latest.Message : "This download could not be restarted. Check its current status and try again.";
             Info(message, "Start over", MessageBoxIcon.Warning);
         }
-        catch (LocalStorageException ex)
+        catch (LocalStorageException)
         {
-            Info(ex.Message, "Start over", MessageBoxIcon.Warning);
+            Info(SaveFailureMessage, "Start over", MessageBoxIcon.Warning);
         }
     }
 
     // cancel / remove / delete
 
-    public async Task CancelAsync(JobSnapshot snapshot)
+    public Task CancelAsync(JobSnapshot snapshot) => CancelAsync([snapshot]);
+
+    public async Task CancelAsync(IReadOnlyList<JobSnapshot> snapshots)
     {
-        try
+        if (snapshots.Count == 0) return;
+
+        var latest = new List<JobSnapshot>(snapshots.Count);
+        var seen = new HashSet<Guid>();
+        var blocked = new List<string>();
+        foreach (JobSnapshot requested in snapshots)
         {
-            CancelDownloadResult result = await engine.CancelDownloadAsync(snapshot.Id);
-            if (!result.Cancelled) Info(result.Message, "Cancel download", MessageBoxIcon.Warning);
+            if (!seen.Add(requested.Id)) continue;
+
+            JobSnapshot? current = engine.Snapshot(requested.Id);
+            if (current is null)
+            {
+                blocked.Add($"{requested.FileName}: This download is no longer available.");
+                continue;
+            }
+
+            latest.Add(current);
         }
-        catch (Exception ex)
+
+        JobSnapshot[] cancellable = latest.Where(CanCancel).ToArray();
+        JobSnapshot[] savedPartials = cancellable.Where(s => !s.IsCleanupPending && s.CommittedBytes > 0).ToArray();
+        if (savedPartials.Length > 0 &&
+            !Confirm(CancelConfirmationText(cancellable.Length, savedPartials), "Cancel download", MessageBoxIcon.Warning,
+                "Cancel download", VesperIcon.Close))
+            return;
+
+        int cancelled = 0;
+        foreach (JobSnapshot snapshot in latest)
         {
-            // This is launched from a menu callback. Observe failures instead of leaving a faulted task.
-            if (owner is Control { IsDisposed: true }) return;
-            Info("Could not cancel this download: " + ex.Message, "Cancel download", MessageBoxIcon.Warning);
+            if (!CanCancel(snapshot))
+            {
+                blocked.Add($"{snapshot.FileName}: This download can no longer be cancelled.");
+                continue;
+            }
+
+            try
+            {
+                CancelDownloadResult result = await engine.CancelDownloadAsync(snapshot.Id);
+                if (result.Cancelled) cancelled++;
+                else blocked.Add($"{snapshot.FileName}: {result.Message}");
+            }
+            catch (LocalStorageException)
+            {
+                blocked.Add($"{snapshot.FileName}: The change could not be saved. The saved partial was kept, and the entry remains in the list.");
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                blocked.Add($"{snapshot.FileName}: Could not cancel this download: {ex.Message}");
+            }
+        }
+
+        if (blocked.Count > 0)
+        {
+            string summary = seen.Count > 1 ? $"Cancelled {cancelled} of {seen.Count} downloads.\n\n" : "";
+            Info(summary + string.Join("\n", blocked), "Cancel download", MessageBoxIcon.Warning);
         }
     }
 
-    // remove / delete
+    private static bool CanCancel(JobSnapshot snapshot) =>
+        snapshot.Kind != JobKind.BrowserFile && snapshot.State is not
+            (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting);
+
+    internal static string CancelConfirmationText(int downloadCount, IReadOnlyList<JobSnapshot> savedPartials)
+    {
+        long retainedBytes = 0;
+        foreach (JobSnapshot snapshot in savedPartials)
+        {
+            long bytes = Math.Max(0, snapshot.CommittedBytes);
+            retainedBytes = bytes > long.MaxValue - retainedBytes ? long.MaxValue : retainedBytes + bytes;
+        }
+
+        string question = downloadCount == 1
+            ? "Cancel this download and delete its saved partial?"
+            : $"Cancel {downloadCount} downloads and delete their saved partials?";
+        string partialLabel = savedPartials.Count == 1 ? "partial" : "partials";
+        return $"{question}\n\nSaved data to be deleted: {Formatting.Bytes(retainedBytes)} across {savedPartials.Count} {partialLabel}.";
+    }
 
     public void Remove(IReadOnlyList<JobSnapshot> items)
     {
@@ -183,12 +263,25 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         if (!Confirm(text, "Remove from list", action: "Remove", symbol: VesperIcon.RemoveList)) return;
 
         var blocked = new List<string>();
+        int removed = 0;
         foreach (JobSnapshot item in items)
         {
-            RemoveResult result = engine.RemoveFromList(item.Id);
-            if (!result.Removed) blocked.Add($"{item.FileName}: {result.Message}");
+            try
+            {
+                RemoveResult result = engine.RemoveFromList(item.Id);
+                if (result.Removed) removed++;
+                else blocked.Add($"{item.FileName}: {result.Message}");
+            }
+            catch (Exception ex) when (ex is SqliteException or LocalStorageException)
+            {
+                blocked.Add($"{item.FileName}: The change could not be saved. The entry remains in the list. No files were deleted.");
+            }
         }
-        if (blocked.Count > 0) Info(string.Join("\n", blocked), "Remove from list", MessageBoxIcon.Information);
+        if (blocked.Count > 0)
+        {
+            string summary = items.Count > 1 ? $"Removed {removed} of {items.Count} entries.\n\n" : "";
+            Info(summary + string.Join("\n", blocked), "Remove from list", MessageBoxIcon.Warning);
+        }
     }
 
     public async void DeleteFile(JobSnapshot s)
@@ -218,6 +311,10 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
             VerifyResult result = await engine.VerifyIntegrityAsync(s.Id);
             Info(result.Message, "Verify integrity", result.Matches == false ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
         }
+        catch (LocalStorageException)
+        {
+            Info("The verification result could not be saved. The file was kept.", "Verify integrity", MessageBoxIcon.Warning);
+        }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
             Info("Verification failed: " + ex.Message, "Verify integrity", MessageBoxIcon.Warning);
@@ -244,7 +341,12 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
                 ? $"You can change its name, but the {extension} extension stays to match the audio format."
                 : "Used as the file name when the download finishes.";
         string? name = AskForText("Rename entry", "Name", s.FileName, hint);
-        if (!string.IsNullOrWhiteSpace(name)) engine.Rename(s.Id, name);
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            try { engine.Rename(s.Id, name); }
+            catch (LocalStorageException)
+            { Info(SaveFailureMessage, "Rename entry", MessageBoxIcon.Warning); }
+        }
     }
 
     public void CustomLimit(JobSnapshot s)
@@ -257,7 +359,9 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
             Info("Enter a number between 1 and 10,000,000 KB/s.", "Invalid limit");
             return;
         }
-        engine.SetSpeedLimit(s.Id, kb * 1000L);
+        try { engine.SetSpeedLimit(s.Id, kb * 1000L); }
+        catch (LocalStorageException)
+        { Info(SaveFailureMessage, "Custom bandwidth", MessageBoxIcon.Warning); }
     }
 
     // small input dialog in the shared popup style

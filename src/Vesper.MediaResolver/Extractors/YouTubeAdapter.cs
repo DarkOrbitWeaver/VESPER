@@ -570,6 +570,10 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         if (t.ListId is null) return Fail(MediaErrors.Invalid("The link has no playlist id"));
         bool dynamicMix = t.IsDynamicMix;
         if (dynamicMix && t.VideoId is null) return Fail(MediaErrors.Invalid("A Mix link needs the video it was generated from"));
+        if (!dynamicMix && request.Options.PageToken is { Length: 0 or > 4096 })
+            return Fail(MediaErrors.Invalid("The YouTube playlist continuation token is invalid"));
+        int limit = Math.Min(request.Options.MaxCollectionItems, Options.MaxCollectionItems);
+        if (limit < 1) return Fail(MediaErrors.Invalid("The collection item limit must be positive"));
 
         var pageUrl = dynamicMix
             ? new Uri($"https://www.youtube.com/watch?v={t.VideoId}&list={Uri.EscapeDataString(t.ListId)}")
@@ -582,16 +586,16 @@ internal sealed partial class YouTubeAdapter : AdapterBase
 
         var entries = new List<CollectionEntry>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        int limit = Math.Min(request.Options.MaxCollectionItems, Options.MaxCollectionItems);
+        int scanLimit = limit == int.MaxValue ? int.MaxValue : limit + 1;
+        int maxPages = Math.Max(0, Options.MaxCollectionPages);
         string rendererName = dynamicMix ? "playlistPanelVideoRenderer" : "playlistVideoRenderer";
         JsonElement? mixPanel = null;
         if (dynamicMix)
         {
             // Only the watch-next playlist panel holds Mix entries; related-video lockups elsewhere on the page are not part of it.
             mixPanel = MixPanel(root);
-            if (mixPanel is { ValueKind: JsonValueKind.Object } panel) AddEntries(panel, rendererName, entries, seen, limit);
+            if (mixPanel is { ValueKind: JsonValueKind.Object } panel) AddEntries(panel, rendererName, entries, seen, scanLimit);
         }
-        else AddEntries(root, rendererName, entries, seen, limit);
 
         string title2 = dynamicMix
             ? root.FindAll("playlist").Select(p => p.P("title").Str()).FirstOrDefault(s => s is not null) ?? "YouTube Mix"
@@ -599,12 +603,13 @@ internal sealed partial class YouTubeAdapter : AdapterBase
 
         var warnings = new List<MediaError>();
         bool complete = true;
+        string? nextPageToken = null;
         if (dynamicMix)
         {
             complete = false;
             int pages = 0;
             bool pagingEnded = false;
-            while (mixPanel is { ValueKind: JsonValueKind.Object } panel && entries.Count < limit && pages < Options.MaxCollectionPages)
+            while (mixPanel is { ValueKind: JsonValueKind.Object } panel && entries.Count < limit && pages < maxPages)
             {
                 ct.ThrowIfCancellationRequested();
                 JsonElement? last = panel.P("contents").Items()
@@ -636,47 +641,77 @@ internal sealed partial class YouTubeAdapter : AdapterBase
                 }
 
                 int before = entries.Count;
-                AddEntries(nextMix, rendererName, entries, seen, limit);
+                AddEntries(nextMix, rendererName, entries, seen, scanLimit);
                 if (entries.Count == before) { pagingEnded = true; break; }
                 mixPanel = nextMix.Clone();
             }
             warnings.Add(MediaErrors.PartialPlaylist($"A Mix is generated per request; this is a snapshot of {entries.Count} entries, not a fixed playlist."));
-            if (entries.Count >= limit)
+            if (entries.Count > limit)
+                warnings.Add(MediaErrors.PartialPlaylist($"The Mix snapshot has more entries than the configured item limit ({limit})."));
+            else if (entries.Count >= limit)
                 warnings.Add(MediaErrors.PartialPlaylist($"The Mix snapshot reached the configured item limit ({limit})."));
-            else if (!pagingEnded && pages >= Options.MaxCollectionPages)
+            else if (!pagingEnded && pages >= maxPages)
                 warnings.Add(MediaErrors.PartialPlaylist($"Mix paging stopped after {pages} pages (configured page limit)."));
         }
         else
         {
-            string? token = ContinuationToken(root);
-            if (token is null && (root.FindAll("continuationItemRenderer", 1).Any() || root.FindAll("continuationItemViewModel", 1).Any()))
+            string? token = request.Options.PageToken;
+            int pages = 0;
+            if (token is null)
             {
-                complete = false;
-                warnings.Add(MediaErrors.PartialPlaylist("The playlist page announces more entries, but its continuation format was not recognised (page structure change)."));
+                AddEntries(root, rendererName, entries, seen, scanLimit);
+                token = ContinuationToken(root);
+                pages = 1;
+                if (token is null && HasContinuation(root))
+                {
+                    complete = false;
+                    warnings.Add(MediaErrors.PartialPlaylist("The playlist page announces more entries, but its continuation format was not recognised (page structure change)."));
+                }
             }
-            int pages = 1;
-            while (token is not null && entries.Count < limit && pages < Options.MaxCollectionPages)
+
+            var seenTokens = new HashSet<string>(StringComparer.Ordinal);
+            while (token is not null && entries.Count < limit && pages < maxPages)
             {
                 ct.ThrowIfCancellationRequested();
+                if (!seenTokens.Add(token))
+                {
+                    complete = false;
+                    token = null;
+                    warnings.Add(MediaErrors.PartialPlaylist("Playlist paging repeated a continuation token; stopped to avoid an endless collection."));
+                    break;
+                }
+
                 using var next = await BrowseContinuationAsync(token, cfg, ct).ConfigureAwait(false);
                 if (next.Doc is null)
                 {
                     warnings.Add(MediaErrors.PartialPlaylist($"Further playlist pages could not be loaded ({next.Problem}); {entries.Count} entries are listed."));
                     break;
                 }
-                int before = entries.Count;
-                AddEntries(next.Doc.RootElement, "playlistVideoRenderer", entries, seen, limit);
+                AddEntries(next.Doc.RootElement, rendererName, entries, seen, scanLimit);
                 token = ContinuationToken(next.Doc.RootElement);
                 pages++;
-                if (entries.Count == before) { token = null; break; }
+                if (token is null && HasContinuation(next.Doc.RootElement))
+                {
+                    complete = false;
+                    warnings.Add(MediaErrors.PartialPlaylist("The playlist continuation announces more entries, but its token was not recognised (page structure change)."));
+                }
             }
-            if (token is not null)
+
+            bool cutWithinPage = entries.Count > limit;
+            if (cutWithinPage)
             {
                 complete = false;
-                if (warnings.Count == 0)
-                    warnings.Add(MediaErrors.PartialPlaylist(entries.Count >= limit
-                        ? $"The playlist has more entries than the configured limit ({limit})."
-                        : $"Paging stopped after {pages} pages (configured page limit)."));
+                token = null;
+                warnings.Add(MediaErrors.PartialPlaylist($"The playlist has more entries than the configured item limit ({limit})."));
+            }
+            else if (token is not null)
+            {
+                complete = false;
+                nextPageToken = token;
+                if (entries.Count >= limit)
+                    warnings.Add(MediaErrors.PartialPlaylist($"The playlist has more entries than the configured item limit ({limit})."));
+                else if (pages >= maxPages && !warnings.Any(w => w.Code == MediaErrorCode.PlaylistPartiallyResolved))
+                    warnings.Add(MediaErrors.PartialPlaylist($"Paging stopped after {pages} pages (configured page limit)."));
             }
             else if (warnings.Count > 0) complete = false;
         }
@@ -686,6 +721,8 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         if (entries.Count == 0)
             return Fail(MediaErrors.Unavailable("The playlist is empty, private or unavailable"));
 
+        var listedEntries = entries.Take(limit).ToList();
+
         return MediaDiscoveryResult.FromCollection(new MediaCollection
         {
             SourceUrl = request.Url,
@@ -694,8 +731,9 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             Title = title2,
             Kind = dynamicMix ? CollectionKind.DynamicMix : CollectionKind.Playlist,
             IsDynamic = dynamicMix,
-            TotalCount = complete ? entries.Count : null,
-            Entries = entries,
+            TotalCount = complete ? listedEntries.Count : null,
+            Entries = listedEntries,
+            NextPageToken = dynamicMix ? null : nextPageToken,
             IsComplete = complete
         }, warnings);
     }
@@ -703,8 +741,9 @@ internal sealed partial class YouTubeAdapter : AdapterBase
     /// <summary>Accepts both the classic renderer and the 2025+ lockup view model (video lockups only).</summary>
     private static void AddEntries(JsonElement root, string rendererName, List<CollectionEntry> entries, HashSet<string> seen, int limit)
     {
-        AddRendererEntries(root, rendererName, entries, seen, limit);
-        foreach (var e in root.FindAll("lockupViewModel", limit * 2 + 10))
+        int maxResults = SearchLimit(limit);
+        AddRendererEntries(root, rendererName, entries, seen, limit, maxResults);
+        foreach (var e in root.FindAll("lockupViewModel", maxResults))
         {
             if (entries.Count >= limit) break;
             if (e.P("contentType").Str() is { } type && type != "LOCKUP_CONTENT_TYPE_VIDEO") continue;
@@ -721,9 +760,9 @@ internal sealed partial class YouTubeAdapter : AdapterBase
         }
     }
 
-    private static void AddRendererEntries(JsonElement root, string rendererName, List<CollectionEntry> entries, HashSet<string> seen, int limit)
+    private static void AddRendererEntries(JsonElement root, string rendererName, List<CollectionEntry> entries, HashSet<string> seen, int limit, int maxResults)
     {
-        foreach (var e in root.FindAll(rendererName, limit * 2 + 10))
+        foreach (var e in root.FindAll(rendererName, maxResults))
         {
             if (entries.Count >= limit) break;
             string? id = e.P("videoId").Str();
@@ -742,6 +781,12 @@ internal sealed partial class YouTubeAdapter : AdapterBase
             });
         }
     }
+
+    private static int SearchLimit(int limit) =>
+        limit >= (int.MaxValue - 10) / 2 ? int.MaxValue : limit * 2 + 10;
+
+    private static bool HasContinuation(JsonElement root) =>
+        root.FindAll("continuationItemRenderer", 1).Any() || root.FindAll("continuationItemViewModel", 1).Any();
 
     /// <summary>Continuation token under any continuationCommand (renderer or view-model wrappers).</summary>
     private static string? ContinuationToken(JsonElement root) =>

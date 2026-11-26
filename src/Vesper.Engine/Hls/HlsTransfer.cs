@@ -1025,7 +1025,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             else if (code == 206)
                 throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
             if (HttpFacts.IsHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
-            ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies).ConfigureAwait(false);
+            ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies,
+                expectedLength: length).ConfigureAwait(false);
             if (length is long expected && bytes.Length != expected)
                 throw new TransientNetworkException("The HLS byte-range response was incomplete.");
             return bytes;
@@ -1052,9 +1053,11 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     }
 
     private async Task<ReadOnlyMemory<byte>> ReadBoundedAsync(HttpResponseMessage response, long limit, CancellationToken ct,
-        SegmentBufferLease? lease = null, int copies = 1)
+        SegmentBufferLease? lease = null, int copies = 1, long? expectedLength = null)
     {
         if (response.Content.Headers.ContentLength > limit) throw new RunnerStop(RunOutcome.NeedsAttention("too-large", "A playlist or segment is unreasonably large."));
+        if (!HttpFacts.HasTrustworthyBodyBoundary(response, expectedLength))
+            throw new RunnerStop(RunOutcome.NeedsAttention("unframed-response", "The server did not provide complete response framing or a trusted size. Saved data was kept."));
         using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
         stall.CancelAfter(engine.Options.StallTimeout);
         try

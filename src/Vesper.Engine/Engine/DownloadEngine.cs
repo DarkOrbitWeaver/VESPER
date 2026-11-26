@@ -157,6 +157,7 @@ public sealed partial class DownloadEngine : IDisposable
             Reason = job.Reason, Message = job.Message,
             IsUnacceptedBrowserCapture = job.BrowserProof is { } proof
                 && (proof.AwaitingConfirmation || job.Reason == "browser-fallback"),
+            HasNonPortableMediaSelection = job.MediaPlanJson is not null || job.MediaMetadataJson is not null,
             TotalBytes = job.TotalBytes, CommittedBytes = committed, ProgressBytes = progress,
             SpeedBytesPerSecond = downloading && estimate?.WaitingForData != true ? session?.SpeedBytesPerSecond ?? 0 : 0,
             Eta = estimate?.Remaining, EstimatingEta = estimate?.Estimating == true, WaitingForData = estimate?.WaitingForData == true,
@@ -204,7 +205,7 @@ public sealed partial class DownloadEngine : IDisposable
             return false;
         var request = new AddRequest(job.SourceUrl, Kind: job.Kind, MediaPlanJson: job.MediaPlanJson, Output: job.Output);
         return candidates.Any(candidate => candidate.Id != job.Id && IsDuplicateCandidate(candidate)
-            && (job.Kind is not (JobKind.Hls or JobKind.Dash or JobKind.Merge) || SameRequestPlan(candidate, request)));
+            && SameRequestPlan(candidate, request));
     }
 
     private void AddDuplicateCandidateLocked(DownloadJob job)
@@ -566,6 +567,13 @@ public sealed partial class DownloadEngine : IDisposable
             Timeout.InfiniteTimeSpan);
     }
 
+    private void RetrySchedulingSoonLocked()
+    {
+        if (_disposed || _crashed) return;
+        _wakeTimer ??= new Timer(_ => OnWake(), null, Timeout.Infinite, Timeout.Infinite);
+        _wakeTimer.Change(TimeSpan.FromSeconds(2), Timeout.InfiniteTimeSpan);
+    }
+
     private void OnWake()
     {
         lock (_lock)
@@ -598,7 +606,7 @@ public sealed partial class DownloadEngine : IDisposable
                 if (_disposed || _crashed) return;
                 Log(null, "wake-start-failed", ex.Message);
                 // A queued job has no retry timestamp after waking. Re-arm the one-shot timer.
-                _wakeTimer?.Change(TimeSpan.FromSeconds(2), Timeout.InfiniteTimeSpan);
+                RetrySchedulingSoonLocked();
             }
             FlushOutbox();
         }
@@ -679,7 +687,17 @@ public sealed partial class DownloadEngine : IDisposable
                 catch (LocalStorageException ex) { Log(job.Id, "wake-save-failed", ex.Message); }
             }
         }
-        ScheduleNext();
+        try { ScheduleNext(); }
+        catch (LocalStorageException ex)
+        {
+            lock (_lock)
+            {
+                if (_disposed || _crashed) return;
+                Log(null, "wake-start-failed", ex.Message);
+                RetrySchedulingSoonLocked();
+            }
+            FlushOutbox();
+        }
     }
 
     private void EnsurePump()

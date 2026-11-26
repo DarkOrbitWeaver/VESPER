@@ -69,6 +69,9 @@ public static class MergeCapability
     public static string? MergeContainer(MediaRepresentation video, MediaRepresentation audio, string? preferred = null)
     {
         if (video.Content != StreamContent.VideoOnly || audio.Content != StreamContent.AudioOnly) return null;
+        if (video is { Protocol: StreamProtocol.Hls, AudioGroupId: { } group }
+            && (audio.Protocol != StreamProtocol.Hls || audio.AudioGroupId != group
+                || video.ManifestUrl is not null && audio.ManifestUrl != video.ManifestUrl)) return null;
         string? v = video.VideoCodec, a = audio.AudioCodec;
         if (v is null || a is null) return null;
 

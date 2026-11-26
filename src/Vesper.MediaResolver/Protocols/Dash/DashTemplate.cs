@@ -24,33 +24,68 @@ internal sealed class DashTemplate
         if (levels.Length == 0) return null;
         string? A(string n) => levels.Select(t => t?.Attribute(n)?.Value).FirstOrDefault(v => v is not null);
         var timelineEl = levels.Select(t => t!.Elements().FirstOrDefault(e => e.Name.LocalName == "SegmentTimeline")).FirstOrDefault(t => t is not null);
-
-        List<(long?, long, int)>? timeline = null;
-        if (timelineEl is not null)
-        {
-            timeline = new();
-            foreach (var s in timelineEl.Elements().Where(e => e.Name.LocalName == "S"))
-            {
-                long? t = long.TryParse(s.Attribute("t")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var tv) ? tv : null;
-                if (!long.TryParse(s.Attribute("d")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) || d <= 0)
-                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline entry without a valid duration"));
-                int r = int.TryParse(s.Attribute("r")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rv) ? rv : 0;
-                if (r < -1 || t < 0) throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid negative timeline time/repeat count"));
-                timeline.Add((t, d, r));
-                if (timeline.Count > 200_000) throw new MediaResolverException(MediaErrors.TooLarge("SegmentTimeline too long"));
-            }
-        }
+        var timeline = ReadTimeline(timelineEl);
+        if (timeline is not null && A("duration") is not null)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTemplate cannot combine duration with SegmentTimeline"));
 
         return new DashTemplate
         {
             Media = A("media"),
             Initialization = A("initialization"),
-            StartNumber = long.TryParse(A("startNumber"), out var sn) ? sn : 1,
-            Timescale = long.TryParse(A("timescale"), out var ts) && ts > 0 ? ts : 1,
-            Duration = long.TryParse(A("duration"), out var du) ? du : 0,
-            PresentationTimeOffset = long.TryParse(A("presentationTimeOffset"), out var pto) ? pto : 0,
+            StartNumber = ReadUnsignedAttribute(A("startNumber"), 1, "startNumber", allowZero: true, maxValue: uint.MaxValue),
+            Timescale = ReadUnsignedAttribute(A("timescale"), 1, "timescale", allowZero: false, maxValue: uint.MaxValue),
+            Duration = ReadUnsignedAttribute(A("duration"), 0, "duration", allowZero: false, maxValue: uint.MaxValue),
+            PresentationTimeOffset = ReadUnsignedAttribute(A("presentationTimeOffset"), 0, "presentationTimeOffset", allowZero: true),
             Timeline = timeline
         };
+    }
+
+    internal static List<(long? T, long D, int R)>? ReadTimeline(XElement? timelineElement)
+    {
+        if (timelineElement is null) return null;
+
+        var timeline = new List<(long? T, long D, int R)>();
+        foreach (var element in timelineElement.Elements().Where(e => e.Name.LocalName == "S"))
+        {
+            if (element.Attribute("n") is not null || element.Attribute("k") is not null)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline sequence attributes are not supported"));
+
+            string? startText = element.Attribute("t")?.Value;
+            long? start = null;
+            if (startText is not null)
+            {
+                if (!long.TryParse(startText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedStart) || parsedStart < 0)
+                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid SegmentTimeline start time"));
+                start = parsedStart;
+            }
+
+            if (!long.TryParse(element.Attribute("d")?.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var duration) || duration <= 0)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline entry without a valid duration"));
+
+            string? repeatText = element.Attribute("r")?.Value;
+            int repeat = 0;
+            if (repeatText is not null &&
+                (!int.TryParse(repeatText, NumberStyles.Integer, CultureInfo.InvariantCulture, out repeat) || repeat < -1))
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid SegmentTimeline repeat count"));
+
+            timeline.Add((start, duration, repeat));
+            if (timeline.Count > 200_000)
+                throw new MediaResolverException(MediaErrors.TooLarge("SegmentTimeline too long"));
+        }
+
+        if (timeline.Count == 0)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline contains no S entries"));
+        return timeline;
+    }
+
+    private static long ReadUnsignedAttribute(string? value, long defaultValue, string name, bool allowZero,
+        long maxValue = long.MaxValue)
+    {
+        if (value is null) return defaultValue;
+        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) ||
+            parsed < (allowZero ? 0 : 1) || parsed > maxValue)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest($"Invalid SegmentTemplate @{name}"));
+        return parsed;
     }
 
     public SegmentPlan Expand(string repId, long bandwidth, Uri baseUrl, double? periodDurationSeconds,
@@ -65,12 +100,11 @@ internal sealed class DashTemplate
 
         var segments = new List<MediaSegment>();
         double total = 0;
-        long number = StartNumber;
         bool discontinuities = false;
 
         if (Timeline is not null)
         {
-            long time = PresentationTimeOffset;
+            long time = 0;
             bool first = true;
             long? previousEndTime = null;
             for (int entry = 0; entry < Timeline.Count; entry++)
@@ -78,10 +112,15 @@ internal sealed class DashTemplate
                 var (t, d, r) = Timeline[entry];
                 if (t is { } tv)
                 {
-                    if (previousEndTime is long previous && tv != previous) discontinuities = true;
+                    if (previousEndTime is long previous)
+                    {
+                        if (tv < previous)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline entries overlap"));
+                        if (tv > previous) discontinuities = true;
+                    }
                     time = tv;
                 }
-                else if (first) time = PresentationTimeOffset;
+                else if (first) time = 0;
                 first = false;
 
                 long repeat = r;
@@ -104,36 +143,57 @@ internal sealed class DashTemplate
                 {
                     if (segments.Count >= maxSegments)
                         throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+                    long number;
+                    long segmentEnd;
+                    try
+                    {
+                        number = checked(StartNumber + segments.Count);
+                        segmentEnd = checked(time + d);
+                    }
+                    catch (OverflowException)
+                    {
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Timeline sequence or time overflows"));
+                    }
                     var url = ResolveUrl(baseUrl, Substitute(Media, repId, number, bandwidth, time));
                     double dur = (double)d / Timescale;
                     double start = periodStartSeconds + ((double)time - PresentationTimeOffset) / Timescale;
-                    if (!double.IsFinite(start) || start < 0 || !double.IsFinite(dur) || dur <= 0)
+                    if (!double.IsFinite(start) || start < periodStartSeconds || !double.IsFinite(dur) || dur <= 0)
                         throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid segment presentation time"));
                     segments.Add(new MediaSegment(url, dur, StartSeconds: start));
                     total += dur;
-                    if (time > long.MaxValue - d || number == long.MaxValue)
-                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Timeline arithmetic overflow"));
-                    time += d;
-                    number++;
+                    time = segmentEnd;
                 }
                 previousEndTime = time;
             }
         }
         else if (Duration > 0)
         {
-            if (periodDurationSeconds is null)
+            if (periodDurationSeconds is null || !double.IsFinite(periodDurationSeconds.Value) || periodDurationSeconds.Value <= 0)
                 throw new MediaResolverException(MediaErrors.UnsupportedManifest("Duration-based template without a known period duration"));
+            double periodDuration = periodDurationSeconds.Value;
             double segSeconds = (double)Duration / Timescale;
-            long count = (long)Math.Ceiling(periodDurationSeconds.Value / segSeconds);
-            if (count > maxSegments) throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+            double countValue = Math.Ceiling(periodDuration / segSeconds);
+            if (!double.IsFinite(countValue) || countValue > maxSegments)
+                throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+            long count = (long)countValue;
             for (long i = 0; i < count; i++)
             {
                 long time;
-                try { time = checked(PresentationTimeOffset + checked(i * Duration)); }
-                catch (OverflowException) { throw new MediaResolverException(MediaErrors.UnsupportedManifest("Duration template time overflows")); }
-                double dur = Math.Min(segSeconds, periodDurationSeconds.Value - i * segSeconds);
+                long number;
+                try
+                {
+                    time = checked(PresentationTimeOffset + checked(i * Duration));
+                    number = checked(StartNumber + i);
+                }
+                catch (OverflowException)
+                {
+                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("Duration template time or sequence overflows"));
+                }
+                double dur = Math.Min(segSeconds, periodDuration - i * segSeconds);
                 double start = periodStartSeconds + ((double)time - PresentationTimeOffset) / Timescale;
-                segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, StartNumber + i, bandwidth, time)),
+                if (!double.IsFinite(dur) || dur <= 0 || !double.IsFinite(start) || start < 0)
+                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid duration-based segment timing"));
+                segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, number, bandwidth, time)),
                     dur, StartSeconds: start));
                 total += dur;
             }
@@ -141,9 +201,14 @@ internal sealed class DashTemplate
         else
         {
             // No timeline and no duration: the template describes exactly one segment.
+            if (periodDurationSeconds is null || !double.IsFinite(periodDurationSeconds.Value) || periodDurationSeconds.Value <= 0)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("A single-segment template needs a known period duration"));
+            if (maxSegments < 1)
+                throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+            double periodDuration = periodDurationSeconds.Value;
             segments.Add(new MediaSegment(ResolveUrl(baseUrl, Substitute(Media, repId, StartNumber, bandwidth, PresentationTimeOffset)),
-                periodDurationSeconds ?? 0, StartSeconds: periodStartSeconds));
-            total = periodDurationSeconds ?? 0;
+                periodDuration, StartSeconds: periodStartSeconds));
+            total = periodDuration;
         }
 
         return new SegmentPlan { InitializationUrl = init, Segments = segments, TotalDurationSeconds = total,

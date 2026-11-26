@@ -5,17 +5,21 @@ namespace Vesper.Engine;
 /// <summary>Human-readable sizes, rates and times shared by messages and the UI.</summary>
 public static class Formatting
 {
-    public static string Bytes(long bytes)
+    private static readonly string[] SizeUnits = ["B", "KiB", "MiB", "GiB", "TiB"];
+    private static readonly string[] RateUnits = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
+
+    public static string Bytes(long bytes) => Quantity(bytes, 1024, SizeUnits);
+
+    public static string Rate(double bytesPerSecond) => Quantity(bytesPerSecond, 1000, RateUnits);
+
+    private static string Quantity(double value, int scale, string[] units)
     {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        double value = Math.Max(0, bytes);
+        if (!double.IsFinite(value) || value < 0) value = 0;
         int unit = 0;
-        while (value >= 1024 && unit < units.Length - 1) { value /= 1024; unit++; }
+        while (value >= scale && unit < units.Length - 1) { value /= scale; unit++; }
         string format = unit == 0 ? "0" : value >= 100 ? "0" : value >= 10 ? "0.0" : "0.00";
         return value.ToString(format, CultureInfo.CurrentCulture) + " " + units[unit];
     }
-
-    public static string Rate(double bytesPerSecond) => Bytes((long)bytesPerSecond) + "/s";
 
     /// <summary>Rounded in steps so the displayed value does not flicker on every update.</summary>
     public static string Eta(TimeSpan eta)

@@ -129,6 +129,38 @@ public sealed class DownloadListTransferTests
     }
 
     [Fact]
+    public void Export_skips_nonportable_media_selections_but_keeps_plain_links()
+    {
+        using var harness = new Harness();
+        AddResult clip = harness.Engine.Add(new AddRequest("https://example.test/selected.webm",
+            DestinationFolder: harness.Downloads, FileName: "selected.webm", StartNow: false,
+            Kind: JobKind.Http, MediaProvider: "generic", MediaFormatId: "webm",
+            MediaPlanJson: DirectMediaPlan.WebmClip(new MediaTimeRange(1, 2)), InitiallyPaused: true));
+        AddResult hlsClip = harness.Engine.Add(new AddRequest("https://example.test/selected.m3u8",
+            DestinationFolder: harness.Downloads, FileName: "selected.m3u8", StartNow: false,
+            Kind: JobKind.Hls, MediaPlanJson: System.Text.Json.JsonSerializer.Serialize(new MediaTimeRange(1, 2)),
+            InitiallyPaused: true));
+        AddResult plain = harness.Engine.Add(new AddRequest("https://example.test/plain.bin",
+            DestinationFolder: harness.Downloads, StartNow: false, InitiallyPaused: true));
+
+        Assert.True(clip.Ok, clip.Message);
+        Assert.True(hlsClip.Ok, hlsClip.Message);
+        Assert.True(plain.Ok, plain.Message);
+        Assert.True(harness.Engine.Snapshot(clip.JobId)!.HasNonPortableMediaSelection);
+        Assert.True(harness.Engine.Snapshot(hlsClip.JobId)!.HasNonPortableMediaSelection);
+        Assert.False(harness.Engine.Snapshot(plain.JobId)!.HasNonPortableMediaSelection);
+
+        DownloadListExportResult export = DownloadListTransfer.CreateExport(harness.Engine.Snapshots());
+
+        Assert.Single(export.Entries);
+        Assert.Equal("https://example.test/plain.bin", export.Entries[0].Url);
+        Assert.Equal(2, export.NonPortableMediaSelectionSkipped);
+        Assert.Equal(2, export.Skipped);
+        string json = DownloadListTransfer.WriteJson(export.Entries);
+        Assert.DoesNotContain("MediaPlan", json, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Initially_paused_import_does_not_start_a_request_until_resumed()
     {
         if (!OperatingSystem.IsWindows()) return;

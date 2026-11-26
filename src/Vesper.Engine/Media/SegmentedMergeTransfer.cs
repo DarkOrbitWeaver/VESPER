@@ -533,6 +533,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
             if (response.Content.Headers.ContentLength > bodyLimit)
                 throw new RunnerStop(NeedsAttention("too-large", "A rendition segment exceeds the supported size limit."));
+            if (!HttpFacts.HasTrustworthyBodyBoundary(response, length))
+                throw new RunnerStop(NeedsAttention("unframed-response", "The rendition response did not provide complete body framing or a trusted size. Saved data was kept."));
             if (lease is not null && response.Content.Headers.ContentLength is long declaredCapacity)
                 lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, declaredCapacity, copies));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);

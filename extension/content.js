@@ -942,8 +942,7 @@
         .clip-note{color:var(--muted);font-size:11px;line-height:1.35}
         small.hint{display:block;padding:4px 12px 0;color:var(--muted);font-size:11px}
         .hint.bad{color:var(--red)}
-        .collection-browse{flex:none;width:34px;height:34px;margin-right:auto;padding:4px;display:grid;place-items:center;line-height:0}
-        .collection-browse img{display:block;width:24px;height:24px;object-fit:contain}
+        .collection-browse{flex:none;margin-right:auto}
         .output[hidden]{display:none}
         :is(.output,.audio-track) select{max-width:100%;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);
           color-scheme:inherit;padding:4px 6px;font:inherit;cursor:pointer}
@@ -1488,8 +1487,8 @@
     const subtitles = saved.intent.subtitles.filter(language => availableSubtitles.some(track => track.language === language));
     const embedSubtitles = saved.intent.embedSubtitles && availableSubtitles.some(track =>
       track.embedSupported && subtitles.includes(track.language));
-    const tracksMissing = !!saved.intent.audioTrack && !audioTrack
-      || subtitles.length !== saved.intent.subtitles.length
+    formats.audioNeedsChoice = !!saved.intent.audioTrack && !audioTrack;
+    formats.subtitlesNeedChoice = subtitles.length !== saved.intent.subtitles.length
       || saved.intent.embedSubtitles && !embedSubtitles;
     formats.intent = {
       audioTrack,
@@ -1499,7 +1498,6 @@
       embedSubtitles
     };
     formats.trimDraft = { ...saved.trimDraft };
-    if (tracksMissing) formats.trackNotice = 'Some selected tracks are no longer available. Check the audio and subtitle choices.';
 
     const choices = [
       ...(saved.useOriginal ? formats.originalChoices || [] : formats.choices || []),
@@ -1804,15 +1802,11 @@
 
   function collectionPickerControls(title, request, formats) {
     const name = collectionName(formats.collectionKind);
-    const actionLabel = `Browse ${name} in VESPER`;
+    const actionLabel = `Browse ${name}`;
     const openedPage = panelMedia?.documentPage || pageAddress();
-    const browse = element('button', 'vesper-button collection-browse');
+    const browse = element('button', 'vesper-button collection-browse', actionLabel);
     browse.title = actionLabel;
     browse.setAttribute('aria-label', actionLabel);
-    const icon = element('img');
-    icon.src = chrome.runtime.getURL('icons/vesper-32.png');
-    icon.alt = '';
-    browse.append(icon);
     const status = element('small', 'hint');
     status.setAttribute('role', 'status');
     status.hidden = true;
@@ -1843,8 +1837,10 @@
         browse.disabled = false;
         browse.title = actionLabel;
         if (reply?.ok) {
-          const accepted = (reply.results || []).filter(result => ['queued', 'started', 'already-submitted'].includes(result.status)).length;
-          status.textContent = `${accepted} item(s) accepted in VESPER.`;
+          const results = reply.results || [];
+          const accepted = results.filter(result => !result.subtitle && acceptedMediaResult(result)).length;
+          const refused = results.filter(result => !acceptedMediaResult(result)).length;
+          status.textContent = `${accepted} ${accepted === 1 ? 'item' : 'items'} added${refused ? ` · ${refused} couldn’t be added` : ''}.`;
         } else {
           status.textContent = errorMessage(reply).textContent;
           status.classList.toggle('bad', reply?.code !== 'cancelled');
@@ -1887,9 +1883,19 @@
     const downloadButtons = [];
     let collectionControls = null;
     let selectionNotice = null;
-    const noticeText = () => [formats.selectionNotice, formats.trackNotice].filter(Boolean).join(' ');
+    const noticeText = () => [formats.selectionNotice,
+      formats.audioNeedsChoice && 'Your selected audio track is unavailable. Choose an audio track.',
+      formats.subtitlesNeedChoice && 'Your subtitle selection changed. Review it before downloading.'
+    ].filter(Boolean).join(' ');
+    const needsChoice = () => formats.selectionNeedsChoice || formats.audioNeedsChoice || formats.subtitlesNeedChoice;
+    function updateNotice() {
+      if (!selectionNotice) return;
+      const text = noticeText();
+      selectionNotice.textContent = text;
+      selectionNotice.hidden = !text;
+    }
     function saveDraft() {
-      if (!panelMedia?.targetKey || formats.selectionNeedsChoice) return;
+      if (!panelMedia?.targetKey || needsChoice()) return;
       retainedPickerDraft = {
         targetKey: panelMedia.targetKey,
         player: panelMedia.player,
@@ -1901,7 +1907,7 @@
       };
     }
     function updateOutput(index) {
-      const isPreset = index < presets.length;
+      const isPreset = index >= 0 && index < presets.length;
       const audio = isPreset && choice.label === 'Audio only';
       output.hidden = !isPreset || !(audio ? formats.audioOutputs?.length > 1 || formats.audioM4a : formats.originalChoices?.length);
       if (output.hidden) return;
@@ -1914,17 +1920,12 @@
       mode.selectedIndex = audio && formats.audioOutputs ? Math.max(0, formats.audioOutputs.findIndex(entry => entry.choice.index === choice.index)) : (audio ? !useM4a : useOriginal) ? 1 : 0;
     }
     function select(index, focus, userSelected = false) {
-      choice = all[index];
+      if (index >= 0) choice = all[index];
       if (userSelected) {
         formats.selectionNeedsChoice = false;
         formats.selectionNotice = '';
-        const text = noticeText();
-        if (selectionNotice) {
-          selectionNotice.textContent = text;
-          selectionNotice.hidden = !text;
-        }
+        updateNotice();
       }
-      for (const action of downloadButtons) action.disabled = !!formats.selectionNeedsChoice;
       if (pinned && presets.includes(choice)) { pinned.remove(); pinned = null; }
       for (const [i, option] of rows.entries()) {
         option.setAttribute('aria-checked', String(i === index));
@@ -1942,8 +1943,8 @@
       const labels = element('span');
       const size = Number.isSafeInteger(c.sizeBytes) && c.sizeBytes > 0
         ? (c.sizeEstimated ? '≈ ' : '') + (c.sizeBytes >= 1073741824
-          ? (c.sizeBytes / 1073741824).toFixed(2) + ' GB'
-          : (c.sizeBytes / 1048576).toFixed(1) + ' MB') : '';
+          ? (c.sizeBytes / 1073741824).toFixed(2) + ' GiB'
+          : (c.sizeBytes / 1048576).toFixed(1) + ' MiB') : '';
       labels.append(element('b', '', c.label),
         element('small', '', [c.detail, size].filter(Boolean).join(' · ')));
       const [icon, tone] = { 'Best quality': ['♕', 'best'], Balanced: ['▣', 'balanced'],
@@ -1987,10 +1988,17 @@
     let pinned = null;
     if (!expanded && moreFormats.includes(choice)) {
       pinned = element('button', 'opt pinned');
+      pinned.setAttribute('role', 'radio');
       pinned.setAttribute('aria-checked', 'true');
       pinned.append(element('b', '', 'Selected: ' + choice.label));
       pinned.onclick = () => {
         if (isCurrentRequest(request)) renderChoices(title, poster, seconds, formats, true, useOriginal, useM4a);
+      };
+      pinned.onkeydown = event => {
+        const direction = { ArrowUp: -1, ArrowLeft: -1, ArrowDown: 1, ArrowRight: 1 }[event.key];
+        if (!direction || !pinned?.isConnected || !isCurrentRequest(request)) return;
+        event.preventDefault(); event.stopPropagation();
+        select(direction > 0 ? 0 : rows.length - 1, true, true);
       };
       list.prepend(pinned);
     }
@@ -2109,7 +2117,7 @@
       clipError.hidden = true;
       clipNote.textContent = support.reason;
       for (const action of downloadButtons)
-        action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !canClip;
+        action.disabled = !!needsChoice() || draft.enabled && !canClip;
     }
     const body = [output, list];
     if (!formats.browserBody || draft.enabled) body.push(clip);
@@ -2117,16 +2125,25 @@
       selectionNotice = element('div', 'msg', noticeText());
       body.unshift(selectionNotice);
     }
-    if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length) {
+    if (formats.audioTracks?.length > 1 || formats.subtitleOptions?.length || formats.audioNeedsChoice || formats.subtitlesNeedChoice) {
       const advanced = element('details', 'languages');
+      advanced.open = !!(formats.audioNeedsChoice || formats.subtitlesNeedChoice);
       const fields = element('div', 'language-fields');
       advanced.append(element('summary', 'vesper-button more', 'Language and subtitles'), fields);
       advanced.ontoggle = () => { if (advanced.isConnected) place(true); };
-      if (formats.audioTracks?.length > 1) {
+      if (formats.audioTracks?.length > 1 || formats.audioNeedsChoice) {
         const label = element('label', 'audio-track', 'Audio track'), tracks = element('select');
         const automatic = element('option', '', 'Original / automatic'); automatic.value = ''; tracks.append(automatic);
-        for (const track of formats.audioTracks) { const option = element('option', '', track.label); option.value = track.id; tracks.append(option); }
-        tracks.value = intent.audioTrack || ''; tracks.onchange = () => { intent.audioTrack = tracks.value || null; saveDraft(); };
+        for (const track of formats.audioTracks || []) { const option = element('option', '', track.label); option.value = track.id; tracks.append(option); }
+        tracks.value = intent.audioTrack || '';
+        if (formats.audioNeedsChoice) tracks.selectedIndex = -1;
+        tracks.onchange = () => {
+          intent.audioTrack = tracks.value || null;
+          formats.audioNeedsChoice = false;
+          updateNotice();
+          refreshClip();
+          saveDraft();
+        };
         label.append(tracks); fields.append(label);
       }
       let embedSubtitleControl = null, embedLabel = null, embedHint = null;
@@ -2167,6 +2184,19 @@
         fields.append(embedLabel, embedHint);
         updateEmbedAvailability();
       }
+      if (formats.subtitlesNeedChoice) {
+        const keep = element('button', 'vesper-button', intent.subtitles.length ? 'Confirm subtitles' : 'Continue without subtitles');
+        keep.onclick = () => {
+          if (!isCurrentRequest(request)) return;
+          formats.subtitlesNeedChoice = false;
+          keep.remove();
+          updateNotice();
+          refreshClip();
+          saveDraft();
+          (downloadButtons.find(action => !action.disabled) || panel.querySelector('.audio-track select') || list.querySelector('[tabindex="0"]'))?.focus({ preventScroll: true });
+        };
+        fields.append(keep);
+      }
       body.push(advanced);
     }
     if (moreFormats.length) {
@@ -2193,7 +2223,7 @@
     for (const mode of formats.browserChoice || formats.browserBody ? ['download'] : ['queue', 'download']) {
       const label = mode === 'download' ? 'Download' : 'Queue';
       const action = element('button', mode === 'download' ? 'vesper-button primary' : 'vesper-button', label);
-      action.disabled = !!formats.selectionNeedsChoice || draft.enabled && !clipAvailability(choice, seconds, formats.playerLive === true).available;
+      action.disabled = !!needsChoice() || draft.enabled && !clipAvailability(choice, seconds, formats.playerLive === true).available;
       downloadButtons.push(action);
       action.onclick = () => {
         if (!action.isConnected) return;
@@ -2215,7 +2245,7 @@
       };
       footer.append(action);
     }
-    select(Math.max(0, all.indexOf(choice)), false);
+    select(pinned ? -1 : Math.max(0, all.indexOf(choice)), false);
     renderShell(title, poster, seconds, ...body, footer);
   }
 
@@ -2284,6 +2314,8 @@
     renderShell(title, poster, seconds, message);
   }
 
+  const acceptedMediaResult = result => ['started', 'queued', 'already-submitted'].includes(result?.status);
+
   async function deliver(title, poster, seconds, formats, formatChoice, mode, request, intent = {}) {
     if (!isCurrentRequest(request)) return;
     if (formats.browserBody) {
@@ -2301,9 +2333,26 @@
         pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
     if (!isCurrentRequest(request)) return;
     if (reply?.ok) {
-      const status = reply.results?.[0]?.status;
-      return confirmSend(formats.browserChoice ? 'Downloading in Chrome' : status === 'queued' ? 'Queued in VESPER' :
-        status === 'already-submitted' ? 'Already in VESPER' : 'Sent to VESPER', request);
+      if (formats.browserChoice) return confirmSend('Downloading in Chrome', request);
+      const [main, ...subtitles] = reply.results || [];
+      const failed = subtitles.filter(result => !acceptedMediaResult(result)).length;
+      if (acceptedMediaResult(main)) {
+        const status = main.status === 'queued' ? 'Queued in VESPER' :
+          main.status === 'already-submitted' ? 'Already in VESPER' : 'Sent to VESPER';
+        if (!failed) return confirmSend(status, request);
+        const summary = element('div', 'msg', `${status}. ${failed} ${failed === 1 ? 'subtitle' : 'subtitles'} couldn’t be added.`);
+        summary.setAttribute('role', 'status');
+        const close = renderShell(title, poster, seconds, summary);
+        if (hadFocus) close.focus({ preventScroll: true });
+        return;
+      }
+      if (subtitles.some(acceptedMediaResult)) {
+        const summary = element('div', 'msg', 'Media wasn’t added. Check VESPER for the accepted subtitles.');
+        summary.setAttribute('role', 'status');
+        const close = renderShell(title, poster, seconds, summary);
+        if (hadFocus) close.focus({ preventScroll: true });
+        return;
+      }
     }
     const error = errorMessage(reply);
     const refresh = ['expired-selection', 'source-expired', 'source-changed'].includes(reply?.code);
@@ -2350,7 +2399,7 @@
 
   function errorMessage(reply, playbackReady = false) {
     const text = {
-      'host-missing': 'Open VESPER Settings, then use Repair helper under Browser.',
+      'host-missing': 'Open VESPER → Settings → Browser to connect or repair the helper.',
       'app-unavailable': 'Could not connect to the desktop helper.',
       'host-error': 'The connection to VESPER failed.',
       'desktop-version-mismatch': 'Update VESPER and its browser helper together. This extension needs a newer desktop build.',
@@ -2367,8 +2416,8 @@
       'sign-in': 'Sign in on this site, then try again.',
       'browser-context': playbackReady ? 'VESPER couldn’t verify a downloadable stream from this playback.'
         : 'Start playback in Chrome, then try again.',
-      blocked: 'The site blocked the request or restricted its region.',
-      network: 'The media link could not be reached. Check your connection and retry.',
+      blocked: reply?.message || 'VESPER couldn’t access this source.',
+      network: 'VESPER couldn’t reach the media source.',
       'resolver-error': 'VESPER couldn’t load the video choices. Try again in a moment.',
       invalid: reply?.message || 'The current media selection is invalid.',
       unsupported: reply?.message || 'This source can’t be downloaded.'
@@ -2443,7 +2492,6 @@
             anchor.href = link.url;
             anchor.download = link.fileName;
             anchor.click();
-            notify('VESPER could not take over. Chrome is handling the file.');
           } catch { notify('Browser file could not be saved. Try the original download again.'); }
         }
       } finally {
@@ -2477,10 +2525,10 @@
           : 'Copying browser file · ' + Math.floor(received * 100 / total) + '%' });
       } }).then(() => {
       showContextNotice({ message: 'Browser file accepted by VESPER.' });
-    }).catch(() => {
-      if (!signal.aborted) showContextNotice({ message: controller.signal.aborted
-        ? 'Browser copy stopped. No completion was confirmed.'
-        : 'Browser copy could not be confirmed. Check VESPER before retrying.' });
+    }).catch(error => {
+      if (!signal.aborted) showContextNotice({ message: error?.code === 'uncertain-finish'
+        ? 'Browser copy could not be confirmed. Check VESPER before retrying.'
+        : error?.message || 'VESPER couldn’t accept this browser file. Try the original download link.' });
     }).finally(() => { if (generatedCopy === copy) generatedCopy = null; });
     return { ok: true };
   }

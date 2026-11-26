@@ -2,7 +2,8 @@ namespace Vesper.Engine;
 
 /// <summary>Commands for the opt-in browser-byte receiver. No browser-provided paths or credentials.</summary>
 public sealed record BrowserBodyRequest(string Operation, string TransferId, string? Origin = null,
-    string? FileName = null, long? Length = null, long? Offset = null, byte[]? Bytes = null, string? Digest = null, bool Session = false, bool VerifyMp4 = false);
+    string? FileName = null, long? Length = null, long? Offset = null, byte[]? Bytes = null, string? Digest = null,
+    bool Session = false, bool VerifyMp4 = false, bool Automatic = true);
 
 public sealed partial class DownloadEngine
 {

@@ -109,7 +109,10 @@ public static class DashParser
                 {
                     bool fmp4 = mime?.Contains("mp4", StringComparison.OrdinalIgnoreCase) == true;
                     var tmpl = DashTemplate.Merge(Kid(mpd, "SegmentTemplate"), Kid(period, "SegmentTemplate"), Kid(aset, "SegmentTemplate"), Kid(rep, "SegmentTemplate"));
-                    var list = Kid(rep, "SegmentList") ?? Kid(aset, "SegmentList");
+                    var list = MergeSegmentLists(Kid(mpd, "SegmentList"), Kid(period, "SegmentList"),
+                        Kid(aset, "SegmentList"), Kid(rep, "SegmentList"));
+                    if (tmpl is not null && list is not null)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("A representation cannot inherit both SegmentTemplate and SegmentList"));
                     if (tmpl is not null)
                         plan = tmpl.Expand(repId, bandwidth, repBase, periodSeconds, maxSegments, fmp4, periodStartSeconds);
                     else if (list is not null)
@@ -163,8 +166,13 @@ public static class DashParser
     private static SegmentPlan ExpandList(XElement list, Uri baseUrl, int max, double? periodSeconds, bool fmp4,
         double periodStartSeconds)
     {
-        long timescale = long.TryParse(list.Attribute("timescale")?.Value, out var ts) && ts > 0 ? ts : 1;
-        double segDuration = long.TryParse(list.Attribute("duration")?.Value, out var d) && d > 0 ? (double)d / timescale : 0;
+        long timescale = ReadOptionalLong(list, "timescale", 1, allowZero: false, maxValue: uint.MaxValue);
+        long duration = ReadOptionalLong(list, "duration", 0, allowZero: false, maxValue: uint.MaxValue);
+        long presentationTimeOffset = ReadOptionalLong(list, "presentationTimeOffset", 0, allowZero: true);
+        _ = ReadOptionalLong(list, "startNumber", 1, allowZero: true, maxValue: uint.MaxValue);
+        var timeline = DashTemplate.ReadTimeline(Kid(list, "SegmentTimeline"));
+        if (timeline is not null && list.Attribute("duration") is not null)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList cannot combine duration with SegmentTimeline"));
 
         Uri? init = null;
         ByteRange? initRange = null;
@@ -176,38 +184,223 @@ public static class DashParser
             initRange = ParseRange(initEl.Attribute("range")?.Value);
         }
 
-        var segs = new List<MediaSegment>();
-        double total = 0;
-        foreach (var su in Kids(list, "SegmentURL"))
-        {
-            if (segs.Count >= max) throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
-            string? media = su.Attribute("media")?.Value;
-            var url = media is null ? baseUrl : DashTemplate.ResolveUrl(baseUrl, media);
-            segs.Add(new MediaSegment(url, segDuration, ParseRange(su.Attribute("mediaRange")?.Value),
-                StartSeconds: periodStartSeconds + total));
-            total += segDuration;
-        }
-        if (segs.Count == 0)
+        var segmentUrls = Kids(list, "SegmentURL").ToList();
+        if (segmentUrls.Count == 0)
             throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList contains no SegmentURL"));
-        if (total == 0 && periodSeconds is { } p) total = p;
-        return new SegmentPlan { InitializationUrl = init, InitializationRange = initRange, Segments = segs, TotalDurationSeconds = total, IsFragmentedMp4 = fmp4 };
+        if (segmentUrls.Count > max)
+            throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+
+        var timings = new List<(double Start, double Duration)>(segmentUrls.Count);
+        double total = 0;
+        bool discontinuities = false;
+        if (timeline is not null)
+        {
+            long time = 0;
+            bool first = true;
+            long? previousEndTime = null;
+            for (int entry = 0; entry < timeline.Count; entry++)
+            {
+                var (startTime, segmentDuration, repeatCount) = timeline[entry];
+                if (startTime is { } explicitStart)
+                {
+                    if (previousEndTime is long previous)
+                    {
+                        if (explicitStart < previous)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline entries overlap"));
+                        if (explicitStart > previous) discontinuities = true;
+                    }
+                    time = explicitStart;
+                }
+                else if (first)
+                {
+                    time = 0;
+                }
+                first = false;
+
+                long repeat = repeatCount;
+                if (repeat < 0)
+                {
+                    long? nextTime = entry + 1 < timeline.Count ? timeline[entry + 1].T : null;
+                    if (entry + 1 < timeline.Count && nextTime is null)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("An open SegmentTimeline repeat needs the next entry's explicit start time"));
+
+                    if (nextTime is { } nextStart)
+                    {
+                        if (nextStart <= time)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid open SegmentTimeline repeat boundary"));
+                        long distance = nextStart - time;
+                        if (distance % segmentDuration != 0)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("An open SegmentTimeline repeat does not end at a segment boundary"));
+                        repeat = distance / segmentDuration - 1;
+                    }
+                    else if (periodSeconds is { } periodDuration)
+                    {
+                        double boundary = presentationTimeOffset + Math.Ceiling(periodDuration * timescale);
+                        if (!double.IsFinite(boundary) || boundary >= (double)long.MaxValue || boundary <= time)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid open SegmentTimeline repeat boundary"));
+                        long distance = (long)boundary - time;
+                        repeat = distance / segmentDuration + (distance % segmentDuration == 0 ? 0 : 1) - 1;
+                    }
+                    else
+                    {
+                        int remaining = segmentUrls.Count - timings.Count;
+                        if (remaining <= 0)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("Open SegmentTimeline repeat exceeds the SegmentURL list"));
+                        repeat = remaining - 1;
+                    }
+                }
+
+                for (long item = 0; item <= repeat; item++)
+                {
+                    if (timings.Count >= segmentUrls.Count)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline has more entries than SegmentURL"));
+
+                    double seconds = (double)segmentDuration / timescale;
+                    double start = periodStartSeconds + ((double)time - presentationTimeOffset) / timescale;
+                    if (!double.IsFinite(start) || start < periodStartSeconds || !double.IsFinite(seconds) || seconds <= 0)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid SegmentList presentation time"));
+                    timings.Add((start, seconds));
+                    total += seconds;
+
+                    try { time = checked(time + segmentDuration); }
+                    catch (OverflowException)
+                    {
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList timeline time overflows"));
+                    }
+                }
+                previousEndTime = time;
+            }
+
+            if (timings.Count != segmentUrls.Count)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentTimeline and SegmentURL counts do not match"));
+        }
+        else if (duration > 0)
+        {
+            if (periodSeconds is null || !double.IsFinite(periodSeconds.Value) || periodSeconds.Value <= 0)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("Duration-based SegmentList needs a known period duration"));
+
+            double segmentSeconds = (double)duration / timescale;
+            double expectedCount = Math.Ceiling(periodSeconds.Value / segmentSeconds);
+            if (!double.IsFinite(expectedCount) || expectedCount > max)
+                throw new MediaResolverException(MediaErrors.TooLarge("Representation exceeds the segment limit"));
+            if (expectedCount != segmentUrls.Count)
+                throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList does not cover its period duration"));
+
+            for (int index = 0; index < segmentUrls.Count; index++)
+            {
+                double remaining = periodSeconds.Value - total;
+                if (!double.IsFinite(remaining) || remaining <= 0)
+                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList extends beyond its period"));
+                double segmentDuration = Math.Min(segmentSeconds, remaining);
+
+                double start = periodStartSeconds + total;
+                if (!double.IsFinite(start) || start < 0 || !double.IsFinite(segmentDuration) || segmentDuration <= 0)
+                    throw new MediaResolverException(MediaErrors.UnsupportedManifest("Invalid duration-based SegmentList timing"));
+                timings.Add((start, segmentDuration));
+                total += segmentDuration;
+            }
+        }
+        else if (segmentUrls.Count == 1 && periodSeconds is { } singleDuration && double.IsFinite(singleDuration) && singleDuration > 0)
+        {
+            timings.Add((periodStartSeconds, singleDuration));
+            total = singleDuration;
+        }
+        else
+        {
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("SegmentList needs a duration or SegmentTimeline"));
+        }
+
+        var segments = new List<MediaSegment>(segmentUrls.Count);
+        for (int index = 0; index < segmentUrls.Count; index++)
+        {
+            var segmentUrl = segmentUrls[index];
+            string? media = segmentUrl.Attribute("media")?.Value;
+            var url = media is null ? baseUrl : DashTemplate.ResolveUrl(baseUrl, media);
+            var (start, segmentDuration) = timings[index];
+            segments.Add(new MediaSegment(url, segmentDuration, ParseRange(segmentUrl.Attribute("mediaRange")?.Value),
+                StartSeconds: start));
+        }
+
+        return new SegmentPlan
+        {
+            InitializationUrl = init,
+            InitializationRange = initRange,
+            Segments = segments,
+            TotalDurationSeconds = total,
+            IsFragmentedMp4 = fmp4,
+            HasDiscontinuities = discontinuities
+        };
+    }
+
+    private static XElement? MergeSegmentLists(params XElement?[] lists)
+    {
+        var levels = lists.Where(list => list is not null).Reverse().Select(list => list!).ToArray();
+        if (levels.Length == 0) return null;
+
+        var merged = new XElement(levels[0].Name);
+        foreach (var level in levels)
+        {
+            foreach (var attribute in level.Attributes())
+            {
+                if (merged.Attribute(attribute.Name) is null)
+                    merged.Add(new XAttribute(attribute));
+            }
+        }
+
+        foreach (string childName in new[] { "Initialization", "SegmentTimeline" })
+        {
+            var child = levels.Select(level => Kid(level, childName)).FirstOrDefault(candidate => candidate is not null);
+            if (child is not null) merged.Add(new XElement(child));
+        }
+
+        var urlLevel = levels.FirstOrDefault(level => Kids(level, "SegmentURL").Any());
+        if (urlLevel is not null)
+        {
+            foreach (var segmentUrl in Kids(urlLevel, "SegmentURL"))
+                merged.Add(new XElement(segmentUrl));
+        }
+
+        return merged;
+    }
+
+    private static long ReadOptionalLong(XElement element, string name, long defaultValue, bool allowZero,
+        long maxValue = long.MaxValue)
+    {
+        string? value = element.Attribute(name)?.Value;
+        if (value is null) return defaultValue;
+        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) ||
+            parsed < (allowZero ? 0 : 1) || parsed > maxValue)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest($"Invalid SegmentList @{name}"));
+        return parsed;
     }
 
     internal static ByteRange? ParseRange(string? s)
     {
-        if (string.IsNullOrWhiteSpace(s)) return null;
+        if (s is null) return null;
         var p = s.Split('-');
-        if (p.Length == 2 && long.TryParse(p[0], out var a) && long.TryParse(p[1], out var b) && b >= a && a >= 0)
+        if (p.Length == 2 && long.TryParse(p[0], NumberStyles.None, CultureInfo.InvariantCulture, out var a)
+            && long.TryParse(p[1], NumberStyles.None, CultureInfo.InvariantCulture, out var b) && b >= a && b < long.MaxValue)
             return new ByteRange(a, b - a + 1);
-        return null;
+        throw new MediaResolverException(MediaErrors.UnsupportedManifest("A DASH byte range is invalid"));
     }
 
     internal static TimeSpan? ParseIsoDuration(string? s)
     {
-        if (string.IsNullOrWhiteSpace(s)) return null;
-        try { return XmlConvert.ToTimeSpan(s); }
-        catch (FormatException) { return null; }
-        catch (OverflowException) { return null; }
+        if (s is null) return null;
+        TimeSpan duration;
+        try { duration = XmlConvert.ToTimeSpan(s); }
+        catch (FormatException)
+        {
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("A DASH duration value is invalid"));
+        }
+        catch (OverflowException)
+        {
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("A DASH duration value overflows"));
+        }
+
+        if (duration < TimeSpan.Zero)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("A DASH duration cannot be negative"));
+        return duration;
     }
 
     internal static double? ParseFrameRate(string? s)

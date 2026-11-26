@@ -2,6 +2,11 @@
 
 VesperTheme.install();
 const $ = id => document.getElementById(id);
+const status = $('settings-status');
+function settingsStatus(message = '') {
+  status.textContent = message;
+  status.hidden = !message;
+}
 
 const pause = $('pause-vesper');
 let savingPause = false;
@@ -14,9 +19,13 @@ VesperBrowserPreferences.watchPause(state => { pauseState = state; showPause(); 
 pause.onchange = async () => {
   const paused = pause.checked;
   savingPause = pause.disabled = true;
+  settingsStatus();
   try {
-    await chrome.storage.local.set({ vesperPaused: paused }).catch(() => {});
+    await chrome.storage.local.set({ vesperPaused: paused });
     pauseState = await VesperBrowserPreferences.readPause();
+    if (!pauseState.ready) settingsStatus('Couldn’t load settings. Reopen this popup.');
+  } catch {
+    settingsStatus('Couldn’t save this setting.');
   } finally {
     savingPause = false;
     showPause();
@@ -29,8 +38,10 @@ async function init() {
   const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'animate', useSignIn: true });
   $('theme').value = prefs.theme;
   $('motion').value = prefs.motion === 'still' ? 'still' : 'animate';
-  const { vesperHiddenButterflyHosts = [] } =
-    await chrome.storage.local.get('vesperHiddenButterflyHosts').catch(() => ({}));
+  async function readHiddenHosts() {
+    const { vesperHiddenButterflyHosts: hosts } = await chrome.storage.local.get('vesperHiddenButterflyHosts');
+    return new Set(Array.isArray(hosts) ? hosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()).slice(0, 100) : []);
+  }
   const [siteTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   let butterflyHost = '';
   try {
@@ -38,8 +49,7 @@ async function init() {
     if (site.protocol === 'http:' || site.protocol === 'https:') butterflyHost = site.hostname.toLowerCase();
   } catch { /* Browser pages have no site butterfly. */ }
   const siteButterfly = $('site-butterfly');
-  const hiddenHosts = new Set(Array.isArray(vesperHiddenButterflyHosts)
-    ? vesperHiddenButterflyHosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()).slice(0, 100) : []);
+  let hiddenHosts = await readHiddenHosts();
   function showSiteButterfly() {
     const full = hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost);
     siteButterfly.disabled = !butterflyHost || full;
@@ -48,20 +58,35 @@ async function init() {
     $('site-butterfly-host').textContent = butterflyHost;
   }
   showSiteButterfly();
-  $('theme').onchange = () => chrome.storage.sync.set({ theme: $('theme').value });
-  $('motion').onchange = () => chrome.storage.sync.set({ motion: $('motion').value });
+  for (const key of ['theme', 'motion']) {
+    const control = $(key);
+    control.onchange = async () => {
+      control.disabled = true;
+      settingsStatus();
+      try {
+        await chrome.storage.sync.set({ [key]: control.value });
+        prefs[key] = control.value;
+      } catch {
+        control.value = prefs[key];
+        settingsStatus('Couldn’t save this setting.');
+      } finally { control.disabled = false; }
+    };
+  }
   siteButterfly.onclick = async () => {
     if (!butterflyHost || (hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost))) return;
     siteButterfly.disabled = true;
-    if (hiddenHosts.has(butterflyHost)) hiddenHosts.delete(butterflyHost);
-    else hiddenHosts.add(butterflyHost);
+    settingsStatus();
+    const hide = !hiddenHosts.has(butterflyHost);
     try {
-      await chrome.storage.local.set({ vesperHiddenButterflyHosts: [...hiddenHosts].slice(0, 100) });
+      const current = await readHiddenHosts();
+      if (hide && !current.has(butterflyHost) && current.size >= 100) { hiddenHosts = current; return; }
+      if (hide) current.add(butterflyHost);
+      else current.delete(butterflyHost);
+      await chrome.storage.local.set({ vesperHiddenButterflyHosts: [...current] });
+      hiddenHosts = current;
     } catch {
-      if (hiddenHosts.has(butterflyHost)) hiddenHosts.delete(butterflyHost);
-      else hiddenHosts.add(butterflyHost);
-    }
-    showSiteButterfly();
+      settingsStatus('Couldn’t save this setting.');
+    } finally { showSiteButterfly(); }
   };
   const signIn = $('signin');
   const access = $('signin-access');
@@ -115,4 +140,4 @@ async function init() {
   showAccess(await hasAccess());
   signIn.disabled = false;
 }
-void init();
+void init().catch(() => settingsStatus('Couldn’t load settings. Reopen this popup.'));

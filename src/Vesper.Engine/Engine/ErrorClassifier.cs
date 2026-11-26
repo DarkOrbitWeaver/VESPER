@@ -19,8 +19,8 @@ internal static class ErrorClassifier
     {
         foreach (Exception e in Chain(ex))
         {
-            if (e is SocketException { SocketErrorCode: SocketError.HostNotFound or SocketError.NetworkUnreachable
-                or SocketError.NetworkDown or SocketError.HostUnreachable or SocketError.TryAgain or SocketError.NoData })
+            if (e is SocketException { SocketErrorCode: SocketError.NetworkUnreachable
+                or SocketError.NetworkDown or SocketError.HostUnreachable })
                 return true;
         }
         return !NetworkInterface.GetIsNetworkAvailable();

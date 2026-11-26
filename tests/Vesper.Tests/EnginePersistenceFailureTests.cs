@@ -75,6 +75,91 @@ public sealed class EnginePersistenceFailureTests
     }
 
     [Fact]
+    public async Task Accepted_add_survives_start_write_failure_and_retries_after_database_recovers()
+    {
+        await using var server = new FaultServer(128 * 1024);
+        await server.StartAsync();
+        using var harness = new Harness();
+        string database = Path.Combine(harness.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TRIGGER refuse_add_start BEFORE UPDATE ON jobs
+            WHEN OLD.state = 0 AND NEW.state = 1
+            BEGIN SELECT RAISE(ABORT, 'start state save refused'); END;
+            """;
+        command.ExecuteNonQuery();
+
+        AddResult added = harness.Engine.Add(new AddRequest(server.Url("/file"), FileName: "accepted.bin",
+            RequestId: "accepted-add-start-failure"));
+
+        Assert.Equal(AddStatus.Added, added.Status);
+        Assert.NotEqual(Guid.Empty, added.JobId);
+        Assert.True(added.StartDeferred);
+        Assert.Contains("retry", added.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(JobState.Queued, Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(added.JobId)).State);
+        Assert.Equal(0, server.Hits("/file"));
+        using (var store = JobStore.Open(database))
+            Assert.Equal(added.JobId, Assert.Single(store.LoadAll()).Id);
+
+        command.CommandText = "DROP TRIGGER refuse_add_start";
+        command.ExecuteNonQuery();
+
+        AddResult replay = harness.Engine.Add(new AddRequest(server.Url("/file"), RequestId: "accepted-add-start-failure"));
+        Assert.Equal(AddStatus.AlreadySubmitted, replay.Status);
+        Assert.Equal(added.JobId, replay.JobId);
+
+        JobSnapshot completed = await harness.WaitForStateAsync(added.JobId, JobState.Completed, seconds: 10);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(completed.FinalPath!));
+        using var recoveredStore = JobStore.Open(database);
+        Assert.Equal(added.JobId, Assert.Single(recoveredStore.LoadAll()).Id);
+    }
+
+    [Fact]
+    public async Task Network_wake_retries_after_start_write_failure()
+    {
+        await using var server = new FaultServer(128 * 1024);
+        await server.StartAsync();
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = harness.Add(server.Url("/file"), "network-wake-retry.bin", startNow: false);
+        DownloadJob live = ((Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(harness.Engine)!)[id];
+        harness.Engine.UpdateJob(live, job =>
+        {
+            job.State = JobState.WaitingForNetwork;
+            job.NextRetryUtc = DateTime.UtcNow.AddMinutes(2);
+        });
+
+        string database = Path.Combine(harness.Data, "vesper.db");
+        using var connection = new SqliteConnection($"Data Source={database};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TRIGGER refuse_network_start BEFORE UPDATE ON jobs
+            WHEN OLD.state = 0 AND NEW.state = 1
+            BEGIN SELECT RAISE(ABORT, 'start state save refused'); END;
+            """;
+        command.ExecuteNonQuery();
+
+        harness.Engine.Options.MaxConcurrentJobs = 1;
+        harness.Engine.WakeWaiting(includeRetry: false);
+
+        Assert.Equal(JobState.Queued, Assert.IsType<JobSnapshot>(harness.Engine.Snapshot(id)).State);
+        Assert.Contains(harness.Engine.ReadLog(), line => line.Contains("wake-start-failed", StringComparison.Ordinal));
+        Assert.Equal(0, server.Hits("/file"));
+        using (var store = JobStore.Open(database))
+            Assert.Equal(JobState.Queued, Assert.Single(store.LoadAll()).State);
+
+        command.CommandText = "DROP TRIGGER refuse_network_start";
+        command.ExecuteNonQuery();
+
+        JobSnapshot completed = await harness.WaitForStateAsync(id, JobState.Completed, seconds: 10);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(completed.FinalPath!));
+    }
+
+    [Fact]
     public async Task Wake_timer_retries_a_queued_download_after_the_start_write_is_refused()
     {
         await using var server = new FaultServer(128 * 1024);

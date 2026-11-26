@@ -65,15 +65,32 @@ public class CollectionPagerTests
         Assert.True(fake.Calls.Count <= 3);
         Assert.Contains(snap.Errors, e => e.Code == MediaErrorCode.PlaylistPartiallyResolved);
         Assert.NotEmpty(snap.Entries);
+        Assert.True(snap.Truncated);
+        Assert.Null(snap.NextPageToken);
+        Assert.Equal(CollectionStopReason.RepeatedPageToken, snap.StopReason);
     }
 
     [Fact]
-    public async Task ItemCap_TruncatesAndReportsWhereToResume()
+    public async Task ItemCapInsidePage_DoesNotClaimAnExactResumePosition()
     {
         var snap = await new CollectionPager(ThreePages(), maxItems: 4).CollectAsync(Req());
         Assert.Equal(4, snap.Entries.Count);
         Assert.True(snap.Truncated);
-        Assert.NotNull(snap.NextPageToken);
+        Assert.Null(snap.NextPageToken);
+        Assert.False(snap.IsComplete);
+        Assert.Equal(CollectionStopReason.ItemLimit, snap.StopReason);
+    }
+
+    [Fact]
+    public async Task ItemCapAtPageBoundary_ReturnsTheNextPageToken()
+    {
+        var fake = ThreePages();
+        var snap = await new CollectionPager(fake, maxItems: 3).CollectAsync(Req());
+        Assert.Equal(3, snap.Entries.Count);
+        Assert.True(snap.Truncated);
+        Assert.Equal("1", snap.NextPageToken);
+        Assert.Equal(CollectionStopReason.ItemLimit, snap.StopReason);
+        Assert.Single(fake.Calls);
     }
 
     [Fact]
@@ -85,6 +102,7 @@ public class CollectionPagerTests
         Assert.Equal(3, fake.Calls.Count);
         Assert.Equal(3, snap.Entries.Count);
         Assert.True(snap.Truncated);
+        Assert.Equal(CollectionStopReason.PageLimit, snap.StopReason);
     }
 
     [Fact]
@@ -97,6 +115,23 @@ public class CollectionPagerTests
         Assert.Equal(2, snap.Entries.Count);
         Assert.Contains(snap.Errors, e => e.Code == MediaErrorCode.RateLimited);
         Assert.Equal("2", snap.NextPageToken);
+        Assert.True(snap.Truncated);
+        Assert.Equal(CollectionStopReason.PageFailure, snap.StopReason);
+    }
+
+    [Fact]
+    public async Task IncompletePageWithoutToken_IsNotReportedAsComplete()
+    {
+        var partialPage = Page(["a"], null) with { IsComplete = false };
+        var fake = new FakeResolver(_ => MediaDiscoveryResult.FromCollection(partialPage));
+        var snap = await new CollectionPager(fake).CollectAsync(Req());
+
+        Assert.Single(snap.Entries);
+        Assert.True(snap.Truncated);
+        Assert.False(snap.IsComplete);
+        Assert.Null(snap.NextPageToken);
+        Assert.Equal(CollectionStopReason.SourceIncomplete, snap.StopReason);
+        Assert.Contains(snap.Errors, error => error.Code == MediaErrorCode.PlaylistPartiallyResolved);
     }
 
     [Fact]
@@ -118,6 +153,79 @@ public class CollectionPagerTests
         using var cts = new CancellationTokenSource();
         cts.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new CollectionPager(ThreePages()).CollectAsync(Req(), cts.Token));
+    }
+}
+
+public class ResultFinalizerCollectionTests
+{
+    private static readonly Uri ListUrl = new("https://example.com/list");
+
+    private static CollectionEntry Entry(string id, string url) => new()
+    {
+        MediaId = id,
+        Url = new Uri(url),
+        Index = 10
+    };
+
+    private static MediaCollection Collection(params CollectionEntry[] entries) => new()
+    {
+        SourceUrl = ListUrl,
+        Provider = "test",
+        TotalCount = entries.Length,
+        Entries = entries
+    };
+
+    private static MediaDiscoveryResult FinalizeCollection(MediaCollection collection) =>
+        ResultFinalizer.Finalize(MediaDiscoveryResult.FromCollection(collection), new ResolverOptions(), DateTimeOffset.UtcNow);
+
+    [Fact]
+    public void AllBlockedEntries_AreUnavailableAndNeverACompleteEmptyCollection()
+    {
+        var result = FinalizeCollection(Collection(
+            Entry("blocked-1", "file:///private/one"),
+            Entry("blocked-2", "file:///private/two")));
+
+        Assert.Equal(DiscoveryStatus.Failed, result.Status);
+        Assert.Equal(MediaErrorCode.VideoUnavailable, result.Error!.Code);
+        Assert.Null(result.Collection);
+        Assert.Contains(result.Warnings, warning => warning.Code == MediaErrorCode.PlaylistPartiallyResolved);
+    }
+
+    [Fact]
+    public void MixedBlockedAndValidEntries_KeepsSafeRowsAndReportsTheDrop()
+    {
+        var result = FinalizeCollection(Collection(
+            Entry("blocked", "file:///private/item"),
+            Entry("kept", "https://example.com/video")));
+
+        Assert.Equal(DiscoveryStatus.Partial, result.Status);
+        var entry = Assert.Single(result.Collection!.Entries);
+        Assert.Equal("kept", entry.MediaId);
+        Assert.Equal(10, entry.Index);
+        Assert.False(result.Collection.IsComplete);
+        Assert.Contains(result.Warnings, warning => warning.Code == MediaErrorCode.PlaylistPartiallyResolved);
+    }
+
+    [Fact]
+    public void DuplicateIds_AreSuppressedWithoutMarkingTheCollectionIncomplete()
+    {
+        var result = FinalizeCollection(Collection(
+            Entry("same", "https://example.com/one"),
+            Entry("same", "https://example.com/duplicate")));
+
+        Assert.Equal(DiscoveryStatus.Success, result.Status);
+        Assert.Single(result.Collection!.Entries);
+        Assert.True(result.Collection.IsComplete);
+        Assert.Empty(result.Warnings);
+    }
+
+    [Fact]
+    public void EmptySourceCollection_IsUnavailable()
+    {
+        var result = FinalizeCollection(Collection());
+        Assert.Equal(DiscoveryStatus.Failed, result.Status);
+        Assert.Equal(MediaErrorCode.VideoUnavailable, result.Error!.Code);
+        Assert.Null(result.Collection);
     }
 }
 

@@ -52,6 +52,16 @@ public sealed class SettingsStoreTests : IDisposable
     }
 
     [Fact]
+    public void OpeningAfterCompletionDefaultsOnAndCanBeDisabledSeparately()
+    {
+        Assert.True(SettingsStore.Load(_root).OpenVesperOnCompletion);
+        Assert.Null(SettingsStore.Save(new VesperPreferences { OpenVesperOnCompletion = false, NotifyOnFinish = true }, _root));
+        var saved = SettingsStore.Load(_root);
+        Assert.False(saved.OpenVesperOnCompletion);
+        Assert.True(saved.NotifyOnFinish);
+    }
+
+    [Fact]
     public void CorruptSettingsAreKeptInNumberedBackups()
     {
         string path = Path.Combine(_root, "settings.json");

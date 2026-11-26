@@ -28,6 +28,10 @@ public static class HttpFacts
         || response.Headers.TransferEncodingChunked == true
         || response.Version.Major >= 2;
 
+    /// <summary>Accepts explicit framing or a size the caller verifies against the full body.</summary>
+    internal static bool HasTrustworthyBodyBoundary(HttpResponseMessage response, long? expectedLength = null) =>
+        HasCompleteBodyFraming(response) || expectedLength is >= 0;
+
     public static string? ContentType(HttpResponseMessage response) => response.Content.Headers.ContentType?.MediaType;
 
     /// <summary>True when the server says it honours byte ranges, so a length can be confirmed after the fact.</summary>
@@ -60,7 +64,7 @@ public static class HttpFacts
     public static bool IsAttachment(HttpResponseMessage response) =>
         response.Content.Headers.ContentDisposition?.DispositionType?.Equals("attachment", StringComparison.OrdinalIgnoreCase) == true;
 
-    /// <summary>Delay requested by 429/503 responses, capped so a hostile value cannot park a job forever.</summary>
+    /// <summary>Minimum server cooldown, bounded by the latest representable retry time.</summary>
     public static TimeSpan? RetryAfter(HttpResponseMessage response, DateTimeOffset now)
     {
         RetryConditionHeaderValue? header = response.Headers.RetryAfter;

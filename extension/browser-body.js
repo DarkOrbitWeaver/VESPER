@@ -445,6 +445,7 @@ globalThis.VesperBrowserBody = (() => {
           native.onMessage.addListener(onNativeReply);
         } catch { return refuse('The native VESPER helper is unavailable.'); }
         forward({ id: makeId(), sequence, operation }, { origin: origin + '/', fileName: message.fileName, length,
+          automatic: message.automatic === true,
           ...(message.mediaCheck ? { mediaCheck: message.mediaCheck } : {}) });
       } else if (operation === 'append' && phase === 'receiving') {
         if (calls.length >= WINDOW) return refuse('Too many browser copy chunks are waiting.');

@@ -23,6 +23,8 @@ public sealed class JobSnapshot
     public string Message { get; init; } = "";
     // Candidate downloads are not VESPER jobs until Chrome has been safely paused and accepted.
     public bool IsUnacceptedBrowserCapture { get; init; }
+    // Export needs to know when a plain link would lose selection details, without exposing the private plan.
+    internal bool HasNonPortableMediaSelection { get; init; }
     public long? TotalBytes { get; init; }
 
     /// <summary>Bytes that survive a crash: validated, flushed, and recorded in the database.</summary>

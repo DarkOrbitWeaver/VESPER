@@ -78,16 +78,10 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 return await SubmitAsync(request, ct);
 
             case "browser-body":
-                if (request.BrowserBody is { Operation: "begin", Origin: { } origin }
+                if (request.BrowserBody is { Operation: "begin", Automatic: true, Origin: { } origin }
                     && SiteRule.ForPage(SiteRule.Normalize(preferences().SiteRules), origin) is { NeverCapture: true })
-                    return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
-                var bodyReply = await engine.ReceiveBrowserBodyAsync(request.Id, request.BrowserBody!, ct);
-                if (request.BrowserBody is { Operation: "finish" } body && bodyReply.Ok
-                    && bodyReply.Data is not null
-                    && System.Text.Json.JsonSerializer.SerializeToElement(bodyReply.Data).TryGetProperty("accepted", out var accepted)
-                    && accepted.ValueKind == System.Text.Json.JsonValueKind.True)
-                    owner?.RequestBrowserPresentation("body:" + body.TransferId, explicitRequest: false);
-                return bodyReply;
+                    return BridgeResponse.Fail(request.Id, "site-capture-disabled", "");
+                return await engine.ReceiveBrowserBodyAsync(request.Id, request.BrowserBody!, ct);
 
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);
@@ -193,11 +187,16 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             (IReadOnlyList<MediaDownloadChoice> jobs, bool queue) = await finished.Task.WaitAsync(ct);
             if (jobs.Count == 0) return BridgeResponse.Fail(request.Id, "cancelled", "No media was added.");
             var results = new List<BridgeResult>();
-            foreach (var (job, i) in jobs.Select((item, index) => (item, index)))
+            bool primaryAccepted = false;
+            for (int index = 0; index < jobs.Count; index++)
             {
-                results.Add(QueueMedia(job, queue, $"{request.Id}:{i}"));
+                var job = jobs[index];
+                if (job.IsSubtitle && !primaryAccepted) continue;
+                var result = QueueMedia(job, queue, $"{request.Id}:{index}");
+                results.Add(result);
+                if (!job.IsSubtitle) primaryAccepted = result.JobId is not null;
             }
-            return results.Any(x => x.Status is "started" or "queued" or "already-submitted")
+            return results.Any(x => x.Subtitle is not true && x.JobId is not null)
                 ? BridgeResponse.Success(request.Id, results: results)
                 : BridgeResponse.Fail(request.Id, "rejected", "No compatible media was accepted.");
         }
@@ -279,7 +278,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
             string status = added.Status switch
             {
-                AddStatus.Added => startNow ? "started" : "queued",
+                AddStatus.Added => startNow && !added.StartDeferred ? "started" : "queued",
                 AddStatus.AlreadySubmitted => "already-submitted",
                 AddStatus.Duplicate => "duplicate",
                 AddStatus.DestinationUnavailable => "destination",

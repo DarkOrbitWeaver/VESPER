@@ -320,6 +320,8 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             else if (status != 200) throw new RunnerStop(Stop("The server returned an unsolicited partial fragment."));
             long? declared = response.Content.Headers.ContentLength;
             if (declared > bodyLimit) throw new RunnerStop(Stop("The fragment exceeds the supported object-size limit."));
+            if (!HttpFacts.HasTrustworthyBodyBoundary(response, part.Length))
+                throw new RunnerStop(Stop("The DASH response did not provide complete body framing or a trusted size."));
             if (declared is long known) lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, known));
             using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
             stall.CancelAfter(engine.Options.StallTimeout);

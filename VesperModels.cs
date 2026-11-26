@@ -214,6 +214,7 @@ internal sealed class VesperPreferences
     public int MaxConnectionsPerJob { get; set; } = 4;
     public bool NotifyOnFinish { get; set; } = true;
     public bool PlayCompletionSound { get; set; } = true;
+    public bool OpenVesperOnCompletion { get; set; } = true;
     public bool OpenFolderWhenQueueFinishes { get; set; }
     public bool SleepWhenQueueFinishes { get; set; }
     public bool ShutdownWhenQueueFinishes { get; set; }

@@ -640,21 +640,28 @@ public partial class Form1 : Form
     private void Announce(JobStatus before, DownloadItem item)
     {
         if (before != item.Status) AnnounceToScreenReader(before, item);
-        if (!_prefs.NotifyOnFinish || _tray is null || before == item.Status || item.Snapshot?.Kind == JobKind.BrowserFile) return;
+        if (before == item.Status || item.Snapshot?.Kind == JobKind.BrowserFile) return;
         if (item.Status == JobStatus.Completed && before != JobStatus.Missing)
         {
-            _notice ??= new VesperNotice();
-            if (_notice.PresentCompletion(item.Name, _colors, NoticeArea, ShowFromTray) && _prefs.PlayCompletionSound)
-                VesperSounds.PlayCompletion();
+            if (_prefs.OpenVesperOnCompletion && Enabled && !_exiting
+                && (!Visible || WindowState == FormWindowState.Minimized || ActiveForm != this))
+                ShowFromTray();
+            if (_prefs.NotifyOnFinish && _tray is not null)
+            {
+                _notice ??= new VesperNotice();
+                if (_notice.PresentCompletion(item.Name, _colors, NoticeArea, ShowFromTray) && _prefs.PlayCompletionSound)
+                    VesperSounds.PlayCompletion();
+            }
             return;
         }
+        if (!_prefs.NotifyOnFinish || _tray is null) return;
         bool wasActive = before is JobStatus.Downloading or JobStatus.Resolving or JobStatus.Processing or JobStatus.Verifying or JobStatus.Converting
             or JobStatus.Waiting or JobStatus.WaitingRetry;
         if (!wasActive) return;
         switch (item.Status)
         {
             case JobStatus.NeedsLink:
-                PresentNotice("Link expired", item.Name, VesperIcon.Clock, ShowFromTray);
+                PresentNotice("Needs a new link", item.Name, VesperIcon.Clock, ShowFromTray);
                 break;
             case JobStatus.NeedsAttention: case JobStatus.Failed: case JobStatus.Suspect:
                 PresentNotice("Download needs attention", item.Name, VesperIcon.Warning, ShowFromTray);
@@ -799,7 +806,7 @@ public partial class Form1 : Form
     private readonly BrowserPresentationPolicy _browserPresentation = new();
 
     // A new accepted browser job can reveal the existing window, never a new
-    // dialog. Background status polling and completion must not steal focus.
+    // dialog. Completion has its own setting.
     internal void RequestBrowserPresentation(string receipt, bool explicitRequest) => PostToUi(() =>
     {
         if (_exiting || !_browserPresentation.ShouldPresent(receipt, explicitRequest, Environment.TickCount64))
@@ -1161,7 +1168,7 @@ public partial class Form1 : Form
 
         if (selected.All(CanCancel))
         {
-            foreach (JobSnapshot snapshot in selected) await _actions.CancelAsync(snapshot);
+            await _actions.CancelAsync(selected);
         }
         else if (selected.All(s => s.State == JobState.Completed))
         {
@@ -1501,7 +1508,7 @@ public partial class Form1 : Form
                 JobState.Failed => "Use Resume or Start over from its row.",
                 JobState.NeedsLink => "Use Replace link from its row.",
                 JobState.NeedsAttention => "Open Details from its row to see the recovery actions.",
-                JobState.Suspect => "Open Details from its row to inspect the file before choosing Rescue.",
+                JobState.Suspect => "Open Details to inspect the partial file or start over.",
                 _ => "Review or manage it from its row."
             };
             DialogResult show = VesperMessageBox.Show(this,
@@ -1619,7 +1626,8 @@ public partial class Form1 : Form
         DownloadListExportResult export = DownloadListTransfer.CreateExport(_engine.Snapshots());
         if (export.Entries.Count == 0)
         {
-            VesperMessageBox.Show(owner, "There are no transferable downloads in the list.", "Export download list",
+            string message = "There are no transferable downloads in the list." + ExportSkipSummary(export);
+            VesperMessageBox.Show(owner, message, "Export download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1648,18 +1656,10 @@ public partial class Form1 : Form
                 ? DownloadListTransfer.WriteCsv(export.Entries)
                 : DownloadListTransfer.WriteJson(export.Entries);
             File.WriteAllText(picker.FileName, contents, new System.Text.UTF8Encoding(false));
-            string summary = $"Exported {export.Entries.Count} downloads. Waiting or running items are marked Queued; items needing your action are marked Paused.";
-            if (export.Skipped > 0)
-            {
-                var reasons = new List<string>();
-                if (export.CompletedSkipped > 0) reasons.Add($"{export.CompletedSkipped} completed");
-                if (export.BrowserOwnedSkipped > 0) reasons.Add($"{export.BrowserOwnedSkipped} Chrome-owned");
-                if (export.UnsupportedSkipped > 0) reasons.Add($"{export.UnsupportedSkipped} unsupported");
-                if (export.UnsafeUrlSkipped > 0) reasons.Add($"{export.UnsafeUrlSkipped} with a URL that may contain access credentials");
-                if (export.DuplicateSkipped > 0) reasons.Add($"{export.DuplicateSkipped} duplicate links");
-                if (export.LimitSkipped > 0) reasons.Add($"{export.LimitSkipped} over the export limit");
-                summary += $" {export.Skipped} items were omitted: {string.Join(", ", reasons)}.";
-            }
+            string summary = $"Exported {export.Entries.Count} download{(export.Entries.Count == 1 ? "" : "s")}. "
+                + "Waiting or running items are marked Queued; items needing your action are marked Paused. "
+                + "List exports contain links and queue state only; partial files and media plans are not included."
+                + ExportSkipSummary(export);
             VesperMessageBox.Show(owner, summary, "Export download list", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
@@ -1668,6 +1668,29 @@ public partial class Form1 : Form
             VesperMessageBox.Show(owner, "The list could not be written: " + ex.Message, "Export download list",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    private static string ExportSkipSummary(DownloadListExportResult export)
+    {
+        var messages = new List<string>();
+        if (export.NonPortableMediaSelectionSkipped > 0)
+            messages.Add($"Skipped {export.NonPortableMediaSelectionSkipped} media selections that cannot be restored from a link.");
+
+        int otherSkipped = export.Skipped - export.NonPortableMediaSelectionSkipped;
+        if (otherSkipped > 0)
+        {
+            var reasons = new List<string>();
+            if (export.CompletedSkipped > 0) reasons.Add($"{export.CompletedSkipped} completed");
+            if (export.BrowserOwnedSkipped > 0) reasons.Add($"{export.BrowserOwnedSkipped} Chrome-owned");
+            if (export.UnsupportedSkipped > 0) reasons.Add($"{export.UnsupportedSkipped} unsupported");
+            if (export.UnsafeUrlSkipped > 0) reasons.Add($"{export.UnsafeUrlSkipped} with a URL that may contain access credentials");
+            if (export.DuplicateSkipped > 0) reasons.Add($"{export.DuplicateSkipped} duplicate links");
+            if (export.LimitSkipped > 0) reasons.Add($"{export.LimitSkipped} over the export limit");
+            string itemCount = otherSkipped == 1 ? "1 other item was omitted" : $"{otherSkipped} other items were omitted";
+            messages.Add($"{itemCount}: {string.Join(", ", reasons)}.");
+        }
+
+        return messages.Count == 0 ? "" : " " + string.Join(" ", messages);
     }
 
     private static bool TryReadDownloadListFile(string path, out string contents, out string error)
@@ -1776,6 +1799,7 @@ public partial class Form1 : Form
         to.PerTransferRateLimitKbs = from.PerTransferRateLimitKbs; to.BandwidthPresetsKbs = [.. from.BandwidthPresetsKbs];
         to.MaxConnectionsPerJob = from.MaxConnectionsPerJob; to.NotifyOnFinish = from.NotifyOnFinish; to.WatchClipboard = from.WatchClipboard;
         to.PlayCompletionSound = from.PlayCompletionSound;
+        to.OpenVesperOnCompletion = from.OpenVesperOnCompletion;
         to.OpenFolderWhenQueueFinishes = from.OpenFolderWhenQueueFinishes;
         to.SleepWhenQueueFinishes = from.SleepWhenQueueFinishes;
         to.ShutdownWhenQueueFinishes = from.ShutdownWhenQueueFinishes;
@@ -1910,6 +1934,7 @@ public partial class Form1 : Form
 
         bool fileAvailable = s.State == JobState.Completed && !s.FileMissing;
         bool unfinished = s.State is not (JobState.Completed or JobState.Cancelled);
+        _menuCommands["Replace link…"].Text = DownloadActionEligibility.ReplacementLabel(s) + "…";
         foreach (var (name, command) in _menuCommands)
         {
             bool available = name switch
@@ -1919,17 +1944,17 @@ public partial class Form1 : Form
                 "Cancel download" => CanCancel(s),
                 "Copy source URL" => s.Kind != JobKind.BrowserFile,
                 "Delete downloaded file…" => fileAvailable && s.Kind != JobKind.BrowserFile,
-                "Open file" or "Open containing folder" or "Verify integrity…" =>
-                    fileAvailable || (name == "Open containing folder" && s.State == JobState.Suspect),
-                "Locate file…" => s.State == JobState.Completed && s.FileMissing,
+                "Open file" => DownloadActionEligibility.CanOpenFile(s),
+                "Open containing folder" => DownloadActionEligibility.CanShowFolder(s),
+                "Verify integrity…" => fileAvailable && s.Kind != JobKind.BrowserFile,
+                "Locate file…" => DownloadActionEligibility.CanLocateFile(s),
                 "Pause" => s.State is JobState.Resolving or JobState.Downloading or JobState.Queued or JobState.WaitingForNetwork or JobState.WaitingForRetry,
-                "Resume" => !s.IsCleanupPending && s.State is (JobState.Paused or JobState.Failed or JobState.NeedsAttention or JobState.Cancelled),
+                "Resume" => DownloadActionEligibility.CanResume(s),
                 "Stop and keep" => !s.IsCleanupPending && s.IsLiveRecording && s.State is not (JobState.Completed or JobState.Finalizing or JobState.Verifying or JobState.Converting),
                 "Start now" => !s.IsCleanupPending && s.State is (JobState.Queued or JobState.Paused or JobState.WaitingForRetry or JobState.WaitingForNetwork),
-                "Replace link…" => !s.IsCleanupPending && s.State is (JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.Queued or JobState.WaitingForRetry),
+                "Replace link…" => DownloadActionEligibility.CanReplaceOrRefresh(s),
                 "Resume anyway…" => s.State == JobState.NeedsAttention && s.Reason == "no-validator",
-                "Start over…" => s is { IsCleanupPending: true, State: JobState.NeedsAttention }
-                    || s.CommittedBytes > 0 && s.State is (JobState.NeedsAttention or JobState.Failed or JobState.Suspect or JobState.Paused or JobState.NeedsLink),
+                "Start over…" => DownloadActionEligibility.CanStartOver(s),
                 _ => false
             };
             if (command.Available != available) command.Available = available;

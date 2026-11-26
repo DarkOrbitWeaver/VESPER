@@ -1,10 +1,9 @@
-using System.Text.Json;
 using Microsoft.Win32;
 
 namespace VESPER;
 
 /// <summary>
-/// Registers the per-user Chrome/Edge native-messaging helper. The installer
+/// Registers the per-user Chrome/Edge/Brave native-messaging helper. The installer
 /// puts it beside VESPER.exe; Visual Studio builds keep it in its own project.
 /// </summary>
 internal static class NativeHostSetup
@@ -62,6 +61,7 @@ internal static class NativeHostSetup
     public static string ManifestPath => NativeHostRegistration.ManifestPath(EngineHost.DataDirectory);
     public static bool HostPresent => File.Exists(HostExecutable);
     public static bool ExtensionPresent => File.Exists(Path.Combine(ExtensionFolder, "manifest.json"));
+    public static NativeHostRegistrationStatus RegistrationStatus => ReadRegistrationStatus();
 
     // Refresh a registration owned by this checkout without replacing an installed copy.
     public static bool HasDevelopmentRegistration
@@ -79,10 +79,25 @@ internal static class NativeHostSetup
 
     public static bool IsRegistered
     {
-        get
+        get => RegistrationStatus == NativeHostRegistrationStatus.Registered;
+    }
+
+    private static NativeHostRegistrationStatus ReadRegistrationStatus()
+    {
+        try
         {
-            return ReadRegisteredHost() is { } path && File.Exists(path)
-                && string.Equals(path, Path.GetFullPath(HostExecutable), StringComparison.OrdinalIgnoreCase);
+            string?[] registeredPaths = ReadRegisteredManifestPaths();
+            bool usesCurrentManifest = registeredPaths.Any(path => PathsEqual(path, ManifestPath));
+            string? manifestContents = usesCurrentManifest && File.Exists(ManifestPath)
+                ? File.ReadAllText(ManifestPath)
+                : null;
+            return NativeHostRegistration.GetRegistrationStatus(
+                registeredPaths, manifestContents, ManifestPath, HostExecutable, File.Exists);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException
+            or ArgumentException or System.Security.SecurityException)
+        {
+            return NativeHostRegistrationStatus.Unknown;
         }
     }
 
@@ -90,20 +105,60 @@ internal static class NativeHostSetup
     {
         try
         {
-            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(BrowserKeys[0]);
-            if (key?.GetValue(null) as string != ManifestPath || !File.Exists(ManifestPath)) return null;
-            using JsonDocument manifest = JsonDocument.Parse(File.ReadAllText(ManifestPath));
-            string? path = manifest.RootElement.GetProperty("path").GetString();
-            return Path.IsPathFullyQualified(path ?? "") ? Path.GetFullPath(path!) : null;
+            string?[] registeredPaths = ReadRegisteredManifestPaths();
+            if (!registeredPaths.Any(path => PathsEqual(path, ManifestPath)) || !File.Exists(ManifestPath)) return null;
+            return NativeHostRegistration.TryReadManifestPath(File.ReadAllText(ManifestPath), out string? hostPath)
+                ? hostPath
+                : null;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException
-            or InvalidOperationException or ArgumentException or System.Security.SecurityException) { return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException
+            or ArgumentException or System.Security.SecurityException)
+        {
+            return null;
+        }
     }
 
-    /// <summary>Returns an error message, or null when the helper was registered.</summary>
-    public static string? Register()
+    private static string?[] ReadRegisteredManifestPaths()
+    {
+        string?[] registeredPaths = new string?[BrowserKeys.Length];
+        for (int i = 0; i < BrowserKeys.Length; i++)
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(BrowserKeys[i]);
+            object? value = key?.GetValue(null);
+            if (value is not null && value is not string)
+                throw new InvalidOperationException("The browser helper registration has an unexpected value.");
+            registeredPaths[i] = value as string;
+        }
+        return registeredPaths;
+    }
+
+    /// <summary>Registers the helper only when no other copy needs to be replaced.</summary>
+    public static string? Register(bool replaceExisting = false)
     {
         if (!HostPresent) return "The browser helper hasn't been built yet. Build Vesper.NativeHost or use the packaged app.";
+        NativeHostRegistrationStatus status = RegistrationStatus;
+        if (status == NativeHostRegistrationStatus.Unknown)
+            return "The browser helper registration could not be checked. No changes were made.";
+        if (status == NativeHostRegistrationStatus.Registered) return null;
+        if (status == NativeHostRegistrationStatus.RepairRequired)
+            return "The browser helper needs repair. Open VESPER → Settings → Browser → Repair browser connection.";
+        if (status == NativeHostRegistrationStatus.AnotherCopyRegistered && !replaceExisting)
+            return "Another browser helper registration is in use. Open VESPER Settings, then choose Connect browser helper under Browser to replace it.";
+
+        return WriteRegistration();
+    }
+
+    /// <summary>Repairs a broken registration that points to this VESPER manifest.</summary>
+    public static string? Repair()
+    {
+        if (!HostPresent) return "The browser helper hasn't been built yet. Build Vesper.NativeHost or use the packaged app.";
+        if (RegistrationStatus != NativeHostRegistrationStatus.RepairRequired)
+            return "This browser helper does not have a repairable registration. No changes were made.";
+        return WriteRegistration();
+    }
+
+    private static string? WriteRegistration()
+    {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(ManifestPath)!);
@@ -124,7 +179,8 @@ internal static class NativeHostSetup
     /// <summary>Disconnects a portable copy before it is moved or removed.</summary>
     public static string? Unregister()
     {
-        if (!IsRegistered) return "The current browser helper belongs to a different VESPER copy.";
+        if (RegistrationStatus != NativeHostRegistrationStatus.Registered)
+            return $"The browser helper is not fully registered with this copy across {NativeHostRegistration.BrowserList}. No changes were made.";
         try
         {
             foreach (string subKey in BrowserKeys)
@@ -139,6 +195,19 @@ internal static class NativeHostSetup
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             return ex.Message;
+        }
+    }
+
+    private static bool PathsEqual(string? left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left)) return false;
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
         }
     }
 }

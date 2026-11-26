@@ -10,7 +10,8 @@ public sealed record RescueDecision(RescueMode Mode, bool Accepted, string Messa
 
 public sealed record RescueInput(string? Sha256 = null, string? PieceMapJson = null);
 
-public sealed record RescueResult(bool Accepted, RescueMode Mode, string Message, long RetainedBytes, int PiecesToRefetch = 0);
+public sealed record RescueResult(bool Accepted, RescueMode Mode, string Message, long RetainedBytes,
+    int PiecesToRefetch = 0, JobState? StateAfterAttempt = null);
 
 /// <summary>
 /// Decides whether saved bytes may be reused with a replacement link. Pure and deterministic.
@@ -81,8 +82,8 @@ public static class RescueEvaluator
 public sealed partial class DownloadEngine
 {
     /// <summary>
-    /// Replace Link / Rescue. One ranged request to the new link is evaluated BEFORE anything changes.
-    /// If it is not accepted, the job (including its partial data) is left exactly as it was.
+    /// Replace Link / Rescue. Local input is validated before a running job is paused.
+    /// Later probe or proof rejection can leave the job paused, but its saved data stays untouched.
     /// </summary>
     public Task<RescueResult> ReplaceLinkAsync(Guid id, string newUrl, RescueInput? input = null, CancellationToken ct = default) =>
         ReplaceLinkCoreAsync(id, newUrl, input, ct, null, null);
@@ -95,12 +96,13 @@ public sealed partial class DownloadEngine
         ct = operation.Token;
         // commit: false answers "would this link be accepted?" and changes nothing. It is only used together with
         // expectedExpiredSource, which refuses a download that is still running instead of stopping it.
-        DownloadJob? job;
+        DownloadJob job;
         DownloadJob snapshot;
         Task? stopping = null;
         lock (_lock)
         {
-            if (!_jobs.TryGetValue(id, out job)) return Rejected("That entry no longer exists.");
+            if (!_jobs.TryGetValue(id, out DownloadJob? found)) return Rejected("That entry no longer exists.");
+            job = found;
             if (_cancelling.Contains(id)) return Rejected("The download is being cancelled.");
             if (expectedExpiredSource is not null && (job.State != JobState.NeedsLink || job.Reason is not ("expired" or "forbidden")
                 || job.SourceUrl != expectedExpiredSource || _sessions.ContainsKey(id)))
@@ -112,6 +114,31 @@ public sealed partial class DownloadEngine
             if (job.State == JobState.Completed) return Rejected("This download is already complete.");
             if (job.Kind != JobKind.Http)
                 return Rejected("A streaming manifest is not a replacement file URL. Resolve the source into a new plan; the existing fragments remain untouched.");
+            snapshot = job.CopyForUiMutation();
+        }
+
+        string? validationError = ValidateReplacementInput(snapshot, newUrl, input, out Uri uri, out string? sha, out PieceMap? pieces);
+        if (validationError is not null) return RejectedWithCurrentState(id, validationError);
+
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(id, out DownloadJob? current) || !ReferenceEquals(current, job))
+                return Rejected("The download changed while checking the replacement. Try again.");
+            if (_cancelling.Contains(id)) return Rejected("The download is being cancelled.");
+            if (current.Reason == "restart-cleanup")
+                return Rejected("Restart from scratch must finish before this link can be replaced.");
+            if (IsCleanupPending(current) || current.PendingFinalPath is not null)
+                return Rejected("The download must finish its pending cleanup before its link can be replaced.");
+            if (current.State == JobState.Completed) return Rejected("This download is already complete.");
+            if (current.Kind != JobKind.Http)
+                return Rejected("A streaming manifest is not a replacement file URL. Resolve the source into a new plan; the existing fragments remain untouched.");
+            if (expectedExpiredSource is not null && (current.State != JobState.NeedsLink
+                || current.Reason is not ("expired" or "forbidden") || current.SourceUrl != expectedExpiredSource || _sessions.ContainsKey(id)))
+                return Rejected("The download changed since automatic refresh was scheduled. Saved data was kept.");
+            if (current.Output != snapshot.Output || current.Reason != snapshot.Reason
+                || current.ExpectedSha256 != snapshot.ExpectedSha256 || current.PieceMapJson != snapshot.PieceMapJson
+                || current.MediaMetadataJson != snapshot.MediaMetadataJson || current.MediaPlanJson != snapshot.MediaPlanJson)
+                return Rejected("The download changed while checking the replacement. Try again.");
             if (_sessions.TryGetValue(id, out JobSession? running))
             {
                 if (running.Intent is not (StopIntent.None or StopIntent.Window or StopIntent.Pause))
@@ -138,26 +165,8 @@ public sealed partial class DownloadEngine
         }
         ct.ThrowIfCancellationRequested();
 
-        if (!UrlPolicy.TryParse(newUrl, out Uri uri, out string urlError)) return Rejected(urlError);
-        if (MediaPageLinks.TryGetSite(uri, out string mediaSite))
-            return Rejected($"This is a {mediaSite} video page, not a replacement file link. No saved data was changed.");
-        try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
-        catch (BlockedAddressException ex) { return Rejected(ex.Message); }
-
-        string? sha = snapshot.ExpectedSha256;
-        if (!string.IsNullOrWhiteSpace(input?.Sha256))
-        {
-            if (!TryNormalizeSha256(input.Sha256, out string normalized)) return Rejected("A SHA-256 checksum has 64 hexadecimal characters.");
-            sha = normalized;
-        }
-        PieceMap? pieces = null;
-        string? pieceJson = input?.PieceMapJson ?? snapshot.PieceMapJson;
-        if (pieceJson is not null && !PieceMap.TryParse(pieceJson, out pieces, out string pieceError)) return Rejected(pieceError);
-        if (snapshot.Reason == "recovery-integrity-missing" && input?.PieceMapJson is null)
-            return Rejected("Provide the original trusted piece-checksum map before continuing this recovered download.");
-        if ((sha is not null || pieces is not null) && (snapshot.Output != MediaOutput.Original
-            || snapshot.MediaMetadataJson is not null || DirectMediaPlan.TryWebmClip(snapshot.MediaPlanJson, out _)))
-            return Rejected("This download changes the source file. A source checksum cannot verify its processed output. Saved data was kept.");
+        validationError = ValidateReplacementInput(snapshot, newUrl, input, out uri, out sha, out pieces);
+        if (validationError is not null) return RejectedAfterStop(id, validationError, snapshot.Extents.TotalBytes);
 
         long retained = snapshot.Extents.TotalBytes;
         if (retained == 0)
@@ -167,11 +176,11 @@ public sealed partial class DownloadEngine
             {
                 if (!ApplyRescue(job, snapshot, uri, new RescueDecision(RescueMode.None, true, ""), null, sha, pieces, null,
                         replacementCredentials, mediaExpiresAt, adoption))
-                    return Rejected("This download changed while checking its replacement link. Try again.");
+                    return RejectedAfterStop(id, "This download changed while checking its replacement link. Try again.", 0);
             }
             catch (LocalStorageException ex)
             {
-                return Rejected("The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message);
+                return RejectedAfterStop(id, "The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message, 0);
             }
             return new RescueResult(true, RescueMode.None, "Link replaced. Nothing had been saved yet, so nothing needed validating.", 0);
         }
@@ -181,18 +190,18 @@ public sealed partial class DownloadEngine
         try { probe = await ProbeAsync(snapshot, uri, offset, ct, replacementCredentials).ConfigureAwait(false); }
         catch (Exception ex) when (ex is not OperationCanceledException && (ErrorClassifier.IsTransient(ex) || ErrorClassifier.IsBlocked(ex) || ex is RedirectException))
         {
-            return Rejected("The new link could not be reached: " + ErrorClassifier.Describe(ex));
+            return RejectedAfterStop(id, "The new link could not be reached: " + ErrorClassifier.Describe(ex), retained);
         }
 
         RescueDecision decision = RescueEvaluator.Evaluate(snapshot, uri, probe, sha, pieces);
         if (!decision.Accepted)
         {
             Log(id, "rescue-rejected", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
-            return new RescueResult(false, decision.Mode, decision.Message, retained);
+            return RejectedAfterStop(id, decision.Message, retained, decision.Mode);
         }
 
         if (!HttpTransport.IsCurrentResourceIdentity(probe.FinalResourceIdentity))
-            return Rejected("The replacement did not provide a verifiable final file location. Saved data was kept.");
+            return RejectedAfterStop(id, "The replacement did not provide a verifiable final file location. Saved data was kept.", retained);
 
         bool sameFinalResource = HttpTransport.IsCurrentResourceIdentity(snapshot.FinalResourceIdentity)
             && HttpTransport.IsCurrentResourceIdentity(probe.FinalResourceIdentity)
@@ -200,7 +209,7 @@ public sealed partial class DownloadEngine
         if (!sameFinalResource && decision.Mode != RescueMode.R1b)
         {
             if (sha is null)
-                return Rejected("The replacement resolves to a different file location, or the saved download predates redirect identity checks. Add a trusted checksum or piece list to verify its saved bytes; no bytes were changed.");
+                return RejectedAfterStop(id, "The replacement resolves to a different file location, or the saved download predates redirect identity checks. Add a trusted checksum or piece list to verify its saved bytes; no bytes were changed.", retained);
 
             decision = new RescueDecision(RescueMode.R1, true,
                 "The replacement resolves to a different file location. VESPER will verify the finished file against its trusted SHA-256 before publishing it.");
@@ -220,7 +229,7 @@ public sealed partial class DownloadEngine
                 refetch = Enumerable.Range(0, pieces.PieceCount).Count(i => !verified.Covers(pieces.RangeOf(i).Start, pieces.RangeOf(i).End));
                 if (invalid > 0) Log(id, "rescue-pieces", $"{invalid} stored piece(s) failed verification.");
             }
-            catch (LocalStorageException ex) { return Rejected("The saved data could not be read for verification: " + ex.Message); }
+            catch (LocalStorageException ex) { return RejectedAfterStop(id, "The saved data could not be read for verification: " + ex.Message, retained); }
         }
 
         ct.ThrowIfCancellationRequested();
@@ -228,13 +237,11 @@ public sealed partial class DownloadEngine
         try
         {
             if (!ApplyRescue(job, snapshot, uri, decision, probe, sha, pieces, verified, replacementCredentials, mediaExpiresAt, adoption))
-                return new RescueResult(false, RescueMode.R4,
-                    "This download changed while checking its replacement link. No replacement was applied.", retained);
+                return RejectedAfterStop(id, "This download changed while checking its replacement link. No replacement was applied.", retained);
         }
         catch (LocalStorageException ex)
         {
-            return new RescueResult(false, RescueMode.R4,
-                "The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message, retained);
+            return RejectedAfterStop(id, "The replacement link could not be saved; the previous link and saved data were kept. " + ex.Message, retained);
         }
         Log(id, "rescue-accepted", $"{decision.Mode} {UrlPolicy.Redact(uri.AbsoluteUri)}");
         long keep = verified?.TotalBytes ?? retained;
@@ -256,6 +263,48 @@ public sealed partial class DownloadEngine
             ? HttpTransport.ResourceIdentity(finalUri) : null;
         return new ProbeFacts(status, check.IsValid, total, HttpFacts.StrongEtag(response), HttpFacts.LastModified(response),
             HttpFacts.IsIdentityEncoded(response), finalIdentity, HttpFacts.HasStrongLastModified(response));
+    }
+
+    private string? ValidateReplacementInput(DownloadJob snapshot, string newUrl, RescueInput? input,
+        out Uri uri, out string? sha, out PieceMap? pieces)
+    {
+        uri = null!;
+        sha = snapshot.ExpectedSha256;
+        pieces = null;
+        if (!UrlPolicy.TryParse(newUrl, out uri, out string urlError)) return urlError;
+        if (MediaPageLinks.TryGetSite(uri, out string mediaSite))
+            return $"This is a {mediaSite} video page, not a replacement file link. No saved data was changed.";
+        try { UrlPolicy.EnsureAllowed(uri, Options.AllowPrivateNetworks); }
+        catch (BlockedAddressException ex) { return ex.Message; }
+
+        if (!string.IsNullOrWhiteSpace(input?.Sha256))
+        {
+            if (!TryNormalizeSha256(input.Sha256, out string normalized))
+                return "A SHA-256 checksum has 64 hexadecimal characters.";
+            sha = normalized;
+        }
+        string? pieceJson = input?.PieceMapJson ?? snapshot.PieceMapJson;
+        if (pieceJson is not null && !PieceMap.TryParse(pieceJson, out pieces, out string pieceError)) return pieceError;
+        if (snapshot.Reason == "recovery-integrity-missing" && input?.PieceMapJson is null)
+            return "Provide the original trusted piece-checksum map before continuing this recovered download.";
+        if ((sha is not null || pieces is not null) && (snapshot.Output != MediaOutput.Original
+            || snapshot.MediaMetadataJson is not null || DirectMediaPlan.TryWebmClip(snapshot.MediaPlanJson, out _)))
+            return "This download changes the source file. A source checksum cannot verify its processed output. Saved data was kept.";
+        return null;
+    }
+
+    private RescueResult RejectedWithCurrentState(Guid id, string message)
+    {
+        JobSnapshot? current = Snapshot(id);
+        return new RescueResult(false, RescueMode.R4, message, current?.CommittedBytes ?? 0,
+            StateAfterAttempt: current?.State);
+    }
+
+    private RescueResult RejectedAfterStop(Guid id, string message, long retained, RescueMode mode = RescueMode.R4)
+    {
+        JobSnapshot? current = Snapshot(id);
+        return new RescueResult(false, mode, message, current?.CommittedBytes ?? retained,
+            StateAfterAttempt: current?.State);
     }
 
     private bool ApplyRescue(DownloadJob job, DownloadJob snapshot, Uri uri, RescueDecision decision, ProbeFacts? probe, string? sha, PieceMap? pieces,

@@ -5,8 +5,7 @@ using Vesper.Engine;
 namespace VESPER;
 
 /// <summary>
-/// Persists <see cref="VesperPreferences"/> as JSON in %LocalAppData%\VESPER. Writes are atomic (temp file + move),
-/// and an unreadable file is renamed to settings.json.bad rather than silently discarded.
+/// Saves preferences as JSON by replacing the previous file. If settings are unreadable, it tries to keep a numbered backup.
 /// </summary>
 internal static class SettingsStore
 {

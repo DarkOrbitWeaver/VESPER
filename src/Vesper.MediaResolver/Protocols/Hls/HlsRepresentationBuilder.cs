@@ -13,15 +13,12 @@ public static class HlsRepresentationBuilder
     /// <param name="ctx">Authorized request context for manifests and media.</param>
     /// <param name="probe">One fetched media playlist used to learn container type, protection and duration (may be null).</param>
     /// <param name="probedVariant">The exact variant whose playlist was inspected (if known).</param>
-    public static ManifestResult FromMaster(HlsMasterPlaylist master, Uri masterUrl, MediaRequestContext ctx, HlsMediaPlaylist? probe, Uri? probedVariant = null)
+    /// <param name="audioProbe">Verified playlist metadata for one audio rendition, if fetched.</param>
+    /// <param name="probedAudio">The URL of that audio rendition.</param>
+    public static ManifestResult FromMaster(HlsMasterPlaylist master, Uri masterUrl, MediaRequestContext ctx,
+        HlsMediaPlaylist? probe, Uri? probedVariant = null, HlsMediaPlaylist? audioProbe = null, Uri? probedAudio = null)
     {
-        bool fmp4 = probe?.HasInitSegment == true;
-        string? videoContainer = probe is null ? null : fmp4 ? "mp4" : "ts";
-        string? audioContainer = probe is null ? null : fmp4 ? "m4a" : "ts";
         TimeSpan? duration = probe is { TotalDuration: > 0 } ? TimeSpan.FromSeconds(probe.TotalDuration) : null;
-
-        var requirements = ProcessingRequirement.HlsSegmentAssembly;
-        if (probe?.Protection == HlsProtection.Aes128) requirements |= ProcessingRequirement.DecryptAes128;
 
         var audioGroups = master.Renditions
             .Where(r => r.Type == "AUDIO")
@@ -34,6 +31,13 @@ public static class HlsRepresentationBuilder
         // ---- variants ----
         foreach (var v in master.Variants)
         {
+            HlsMediaPlaylist? variantProbe = probe is not null && v.Url == probedVariant ? probe : null;
+            string? videoContainer = variantProbe is null ? null : variantProbe.HasInitSegment ? "mp4" : "ts";
+            TimeSpan? variantDuration = variantProbe is { TotalDuration: > 0 }
+                ? TimeSpan.FromSeconds(variantProbe.TotalDuration) : null;
+            ProcessingRequirement requirements = ProcessingRequirement.HlsSegmentAssembly;
+            if (variantProbe?.Protection == HlsProtection.Aes128) requirements |= ProcessingRequirement.DecryptAes128;
+
             CodecInfo.Split(v.Codecs, out var vCodec, out var aCodec, out var hdr);
             if (v.VideoRange?.ToUpperInvariant() == "PQ") hdr = HdrKind.Hdr10;
             else if (v.VideoRange?.ToUpperInvariant() == "HLG") hdr = HdrKind.Hlg;
@@ -49,7 +53,8 @@ public static class HlsRepresentationBuilder
             else content = aCodec is not null ? StreamContent.VideoAndAudio : StreamContent.VideoOnly;
 
             int kbps = (v.AverageBandwidth ?? v.Bandwidth) / 1000;
-            long? size = v.AverageBandwidth is > 0 && duration is { } d ? (long)(v.AverageBandwidth.Value / 8.0 * d.TotalSeconds) : null;
+            long? size = variantProbe is not null && v.AverageBandwidth is > 0 && variantDuration is { } d
+                ? (long)(v.AverageBandwidth.Value / 8.0 * d.TotalSeconds) : null;
 
             string idBase = content == StreamContent.AudioOnly ? $"hls-audio-{kbps}k" : $"hls-{(v.Height is null ? "x" : v.Height + "p")}-{kbps}k";
             reps.Add(new MediaRepresentation
@@ -57,8 +62,7 @@ public static class HlsRepresentationBuilder
                 Id = Unique(usedIds, idBase),
                 Url = v.Url,
                 ManifestUrl = masterUrl,
-                PlaybackEvidenceUrls = probe is not null && v.Url == probedVariant
-                    ? SampleSegments(probe) : [],
+                PlaybackEvidenceUrls = variantProbe is not null ? SampleSegments(variantProbe) : [],
                 Protocol = StreamProtocol.Hls,
                 Content = content,
                 Container = videoContainer,
@@ -79,13 +83,14 @@ public static class HlsRepresentationBuilder
             });
         }
 
-        // ---- audio renditions (one representation per distinct playlist) ----
+        // The same playlist can have different roles in different audio groups.
         var audioTracks = new List<AudioTrack>();
-        var seenAudioUrls = new HashSet<string>(StringComparer.Ordinal);
+        var seenAudio = new HashSet<HlsRendition>();
         int audioIndex = 0;
         foreach (var r in master.Renditions.Where(r => r.Type == "AUDIO" && r.Url is not null))
         {
-            if (!seenAudioUrls.Add(r.Url!.AbsoluteUri)) continue;
+            if (!seenAudio.Add(r)) continue;
+            var renditionProbe = r.Url == probedAudio ? audioProbe : null;
             string? codec = master.Variants.Where(v => v.AudioGroup == r.GroupId)
                 .Select(v => { CodecInfo.Split(v.Codecs, out _, out var a, out _); return a; })
                 .FirstOrDefault(a => a is not null);
@@ -98,11 +103,12 @@ public static class HlsRepresentationBuilder
             reps.Add(new MediaRepresentation
             {
                 Id = Unique(usedIds, $"hls-audio-{r.GroupId}-{lang}-{audioIndex++}"),
-                Url = r.Url,
+                Url = r.Url!,
                 ManifestUrl = masterUrl,
                 Protocol = StreamProtocol.Hls,
                 Content = StreamContent.AudioOnly,
-                Container = audioContainer,
+                Container = renditionProbe is null ? null : renditionProbe.HasInitSegment ? "m4a" : "ts",
+                PlaybackEvidenceUrls = renditionProbe is not null ? SampleSegments(renditionProbe) : [],
                 AudioCodec = codec,
                 AudioChannels = channels,
                 AudioLanguage = r.Language is null ? null : lang,
@@ -112,7 +118,9 @@ public static class HlsRepresentationBuilder
                 IsAudioDescription = describes,
                 Label = r.Name,
                 Context = ctx,
-                Requirements = requirements
+                Requirements = renditionProbe?.Protection == HlsProtection.Aes128
+                    ? ProcessingRequirement.HlsSegmentAssembly | ProcessingRequirement.DecryptAes128
+                    : ProcessingRequirement.HlsSegmentAssembly
             });
         }
 

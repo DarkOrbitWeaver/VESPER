@@ -335,10 +335,16 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
 
     private string Explanation() => _job.State switch
     {
+        JobState.Completed when _job.Kind == JobKind.BrowserFile => "Chrome saved this file. Open it from Chrome downloads.",
         JobState.Completed when _job.FileMissing => "The saved file is no longer at its recorded location. The download itself did not fail.",
-        JobState.Completed when _job.Kind == JobKind.BrowserFile => "Chrome saved this file.",
         JobState.Completed when _job.Reason == "live-gaps" => "The recording was saved with missing live media. " + _job.Message,
         JobState.Completed when _job.Reason == "live-stopped" => _job.Message,
+        JobState.NeedsAttention when _job.Reason == "recovery-integrity-missing" =>
+            "Provide the original trusted piece checksums to resume. Saved data was kept. Open Replace link, then Advanced verification, to choose the map.",
+        JobState.NeedsLink when _job.Kind == JobKind.BrowserStream && _job.OriginalPageUrl is { Length: > 0 } =>
+            "Open the original page below and start a new media download. The saved fragments were kept.",
+        JobState.NeedsLink when _job.Kind == JobKind.BrowserStream =>
+            "This browser stream cannot use a replacement file link. The saved fragments were kept.",
         JobState.NeedsLink => $"The link no longer works. {(_job.CommittedBytes > 0 ? $"{Formatting.Bytes(_job.CommittedBytes)} is saved. " : "")}" +
             "VESPER checks that a replacement serves the same file before reusing any saved data.",
         JobState.Paused when _job.CommittedBytes > 0 => $"{Formatting.Bytes(_job.CommittedBytes)} is saved safely and will be reused.",
@@ -402,7 +408,7 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         JobSnapshot j = _job;
         if (j.IsCleanupPending)
         {
-            if (j.State == JobState.NeedsAttention)
+            if (DownloadActionEligibility.CanStartOver(j))
                 yield return ("Start over…", true, () => _actions.StartOver(j));
             yield return ("Cancel download", j.State == JobState.Cancelled, () => _ = _actions.CancelAsync(j));
             yield break;
@@ -410,35 +416,44 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
 
         switch (j.State)
         {
-            case JobState.Completed when j.FileMissing: yield return ("Locate file", true, () => _actions.Locate(j)); break;
+            case JobState.Completed when j.FileMissing && DownloadActionEligibility.CanLocateFile(j):
+                yield return ("Locate file", true, () => _actions.Locate(j));
+                break;
             case JobState.Completed:
-                yield return ("Open", true, () => _actions.Open(j));
-                yield return ("Show in folder", false, () => _actions.ShowFolder(j));
+                if (DownloadActionEligibility.CanOpenFile(j))
+                    yield return ("Open", true, () => _actions.Open(j));
+                if (DownloadActionEligibility.CanShowFolder(j))
+                    yield return ("Show in folder", !DownloadActionEligibility.CanOpenFile(j), () => _actions.ShowFolder(j));
                 break;
             case JobState.Resolving or JobState.Downloading or JobState.WaitingForNetwork or JobState.WaitingForRetry or JobState.Converting:
                 if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
                 yield return ("Pause", false, () => _engine.Pause(j.Id));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, false);
                 break;
             case JobState.Paused:
                 if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
-                yield return ("Resume", !j.IsLiveRecording, () => _engine.Resume(j.Id));
+                if (DownloadActionEligibility.CanResume(j))
+                    yield return ("Resume", !j.IsLiveRecording, () => _engine.Resume(j.Id));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, false);
                 break;
             case JobState.Queued:
                 if (j.IsLiveRecording) yield return ("Stop and keep", true, () => _engine.StopAndKeepLive(j.Id));
                 yield return ("Start now", !j.IsLiveRecording, () => _engine.StartNow(j.Id));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, false);
                 break;
             case JobState.NeedsLink:
-                yield return ("Replace link", true, () => _actions.ReplaceLink(j));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, true);
                 if (j.IsLiveRecording) yield return ("Stop and keep", false, () => _engine.StopAndKeepLive(j.Id));
                 break;
             case JobState.Failed:
-                yield return ("Try again", true, () => _engine.Resume(j.Id));
-                yield return ("Replace link", false, () => _actions.ReplaceLink(j));
+                if (DownloadActionEligibility.CanResume(j))
+                    yield return ("Try again", true, () => _engine.Resume(j.Id));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, false);
                 if (j.IsLiveRecording) yield return ("Stop and keep", false, () => _engine.StopAndKeepLive(j.Id));
                 break;
             case JobState.Suspect:
                 yield return ("Show partial file", false, () => _actions.ShowFolder(j));
-                if (j.CommittedBytes > 0) yield return ("Start over…", false, () => _actions.StartOver(j));
+                if (DownloadActionEligibility.CanStartOver(j)) yield return ("Start over…", false, () => _actions.StartOver(j));
                 break;
             case JobState.NeedsAttention:
                 foreach (var action in AttentionActions(j)) yield return action;
@@ -447,20 +462,32 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
         }
     }
 
+    private (string Text, bool Primary, Action Action) ReplacementAction(JobSnapshot job, bool primary) =>
+        (DownloadActionEligibility.ReplacementLabel(job), primary, () => _actions.ReplaceLink(job));
+
     private IEnumerable<(string, bool, Action)> AttentionActions(JobSnapshot j)
     {
         switch (j.Reason)
         {
             case "no-validator":
                 yield return ("Resume anyway…", true, () => _actions.ApproveUnverified(j));
-                yield return ("Replace link", false, () => _actions.ReplaceLink(j));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, false);
+                if (DownloadActionEligibility.CanStartOver(j)) yield return ("Start over…", false, () => _actions.StartOver(j));
+                break;
+            case "recovery-integrity-missing":
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, true);
+                if (DownloadActionEligibility.CanStartOver(j)) yield return ("Start over…", false, () => _actions.StartOver(j));
                 break;
             case "changed" or "range-ignored" or "range-rejected" or "bad-range" or "piece-mismatch" or "html" or "auth" or "forbidden":
-                yield return ("Replace link", true, () => _actions.ReplaceLink(j));
-                if (j.CommittedBytes > 0) yield return ("Start over…", false, () => _actions.StartOver(j));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j)) yield return ReplacementAction(j, true);
+                if (DownloadActionEligibility.CanStartOver(j)) yield return ("Start over…", false, () => _actions.StartOver(j));
                 break;
             default:
-                yield return ("Try again", true, () => _engine.Resume(j.Id));
+                if (DownloadActionEligibility.CanResume(j))
+                    yield return ("Try again", true, () => _engine.Resume(j.Id));
+                if (DownloadActionEligibility.CanReplaceOrRefresh(j))
+                    yield return ReplacementAction(j, !DownloadActionEligibility.CanResume(j));
+                if (DownloadActionEligibility.CanStartOver(j)) yield return ("Start over…", false, () => _actions.StartOver(j));
                 break;
         }
     }
@@ -482,5 +509,48 @@ internal sealed class DownloadDetailsForm : VesperPopupForm
             foreach (Font font in _fonts.Values) font.Dispose();
             _fonts.Clear();
         }
+    }
+}
+
+internal static class DownloadActionEligibility
+{
+    public static bool CanOpenFile(JobSnapshot job) =>
+        job.Kind != JobKind.BrowserFile && job.State == JobState.Completed && !job.FileMissing;
+
+    public static bool CanLocateFile(JobSnapshot job) =>
+        job.Kind != JobKind.BrowserFile && job.State == JobState.Completed && job.FileMissing;
+
+    public static bool CanShowFolder(JobSnapshot job) => job.State is JobState.Completed or JobState.Suspect;
+
+    public static bool CanResume(JobSnapshot job)
+    {
+        if (job.IsCleanupPending || job.State is not
+            (JobState.Paused or JobState.Failed or JobState.NeedsAttention or JobState.Cancelled)) return false;
+        return !(job.State == JobState.NeedsAttention
+            && job.Reason is ("no-validator" or "recovery-integrity-missing"));
+    }
+
+    public static bool CanReplaceOrRefresh(JobSnapshot job)
+    {
+        if (job.IsCleanupPending || job.State is not
+            (JobState.Paused or JobState.NeedsLink or JobState.NeedsAttention or JobState.Failed or JobState.Queued or JobState.WaitingForRetry))
+            return false;
+        return job.Kind == JobKind.Http || IsRefreshOnly(job);
+    }
+
+    public static string ReplacementLabel(JobSnapshot job) =>
+        IsRefreshOnly(job)
+            ? "Refresh original media link"
+            : "Replace link";
+
+    public static bool IsRefreshOnly(JobSnapshot job) =>
+        job.Kind != JobKind.Http && MediaSourceRescue.CanRefresh(job);
+
+    public static bool CanStartOver(JobSnapshot job)
+    {
+        if (job.Kind is JobKind.BrowserFile or JobKind.BrowserStream) return false;
+        if (job.IsCleanupPending) return job.State == JobState.NeedsAttention;
+        return job.CommittedBytes > 0 && job.State is
+            (JobState.NeedsAttention or JobState.Failed or JobState.Suspect or JobState.Paused or JobState.NeedsLink);
     }
 }

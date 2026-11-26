@@ -297,7 +297,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var missingNote = Label("Only completed records are hidden. Paused and recoverable entries stay visible.", 8, muted: true);
         missingNote.SetBounds(45, 490, 470, 37);
         var separator4 = Divider(535);
-        var notify = Check("Show a notification when a download finishes", 25, 547, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);
+        var notify = Check("Notify me when downloads finish or need attention", 25, 547, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);
         var sound = Check("Play completion sound", 25, 575, _draft.PlayCompletionSound, v =>
         {
             _draft.PlayCompletionSound = v;
@@ -307,32 +307,35 @@ internal sealed class SettingsForm : VesperPopupForm
         previewSound.SetBounds(257, 574, 140, 29);
         sound.Width = Math.Max(UiKit.Scale(this, 120), previewSound.Left - sound.Left - UiKit.Scale(this, 8));
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
-        var clipboard = Check("Offer to download links I copy", 25, 612, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
-        var tray = Check("Keep VESPER in the tray when I close the window", 25, 640, _draft.CloseToTray, v => _draft.CloseToTray = v);
-        var separator5 = Divider(679);
-        var openFolder = Check("Open the latest download folder when the queue finishes", 25, 692,
+        var showOnCompletion = Check("Open VESPER when a download finishes", 25, 612,
+            _draft.OpenVesperOnCompletion, v => _draft.OpenVesperOnCompletion = v);
+        const int completionRow = 28;
+        var clipboard = Check("Offer to download links I copy", 25, 612 + completionRow, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
+        var tray = Check("Keep VESPER in the tray when I close the window", 25, 640 + completionRow, _draft.CloseToTray, v => _draft.CloseToTray = v);
+        var separator5 = Divider(679 + completionRow);
+        var openFolder = Check("Open the latest download folder when the queue finishes", 25, 692 + completionRow,
             _draft.OpenFolderWhenQueueFinishes, value => _draft.OpenFolderWhenQueueFinishes = value);
-        var sleepQueue = Check("Ask before putting the PC to sleep when the queue finishes", 25, 723,
+        var sleepQueue = Check("Ask before putting the PC to sleep when the queue finishes", 25, 723 + completionRow,
             _draft.SleepWhenQueueFinishes, value => _draft.SleepWhenQueueFinishes = value);
-        var shutdownQueue = Check("Ask before shutting down the PC when the queue finishes", 25, 754,
+        var shutdownQueue = Check("Ask before shutting down the PC when the queue finishes", 25, 754 + completionRow,
             _draft.ShutdownWhenQueueFinishes, value => _draft.ShutdownWhenQueueFinishes = value);
         var powerNote = Label("The prompt closes after 60 seconds or when new downloads start.", 8, muted: true);
-        powerNote.SetBounds(45, 782, 470, 28);
+        powerNote.SetBounds(45, 782 + completionRow, 470, 28);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
-            separator4, notify, sound, previewSound, clipboard, tray, separator5, openFolder,
+            separator4, notify, sound, previewSound, showOnCompletion, clipboard, tray, separator5, openFolder,
             sleepQueue, shutdownQueue, powerNote]);
         if (importDownloadList is not null && exportDownloadList is not null)
         {
             var lists = Label("Download lists", 9, bold: true);
-            lists.SetBounds(25, 833, 250, 22);
+            lists.SetBounds(25, 833 + completionRow, 250, 22);
             var import = Button("Import list…", 134, symbol: VesperIcon.Folder);
-            import.SetBounds(25, 863, 134, 34);
+            import.SetBounds(25, 863 + completionRow, 134, 34);
             import.Click += (_, _) => importDownloadList(this);
             var export = Button("Export list…", 134, symbol: VesperIcon.Clipboard);
-            export.SetBounds(169, 863, 134, 34);
+            export.SetBounds(169, 863 + completionRow, 134, 34);
             export.Click += (_, _) => exportDownloadList(this);
-            page.Controls.AddRange([Divider(820), lists, import, export]);
+            page.Controls.AddRange([Divider(820 + completionRow), lists, import, export]);
         }
         void Layout()
         {
@@ -706,8 +709,8 @@ internal sealed class SettingsForm : VesperPopupForm
         _proxyFrame.Visible = proxyIndex == 2;
         var separator3 = Divider(404);
 
-        var privateNetworks = Check("Allow downloads from local devices", 25, 418, _draft.AllowPrivateNetworks, v => _draft.AllowPrivateNetworks = v);
-        var privateNote = Label("Only turn this on for files on your home network, such as a NAS. Off by default for safety. Requires restart.", 8, muted: true);
+        var privateNetworks = Check("Allow direct file downloads from local devices", 25, 418, _draft.AllowPrivateNetworks, v => _draft.AllowPrivateNetworks = v);
+        var privateNote = Label("For files on your home network, such as a NAS. Restart required.", 8, muted: true);
         privateNote.SetBounds(45, 446, 480, 34);
         privateNote.AutoEllipsis = false;
         var sleep = Check("Keep the PC awake while downloads are running", 25, 488, _draft.PreventSleep, v => _draft.PreventSleep = v);
@@ -750,19 +753,12 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void BuildBrowser()
     {
-        var page = Page("Browser", "Send files and videos from Chrome.");
+        var page = Page("Browser", "Send files and videos from Chrome, Edge, or Brave.");
         var status = Label("", 8.5F, muted: true);
-        status.SetBounds(25, 192, 505, 34);
+        status.SetBounds(25, 134, 505, 34);
         status.AutoEllipsis = false;
-        var handoff = Label("When Chrome sends a file", 9, bold: true);
-        handoff.SetBounds(25, 111, 290, 23);
-        var action = Choice(["Ask me", "Download now", "Add to queue"], (int)_draft.BrowserAction, 190,
-            "When Chrome sends a file");
-        action.SetBounds(335, 106, 190, 33);
-        action.SelectedIndexChanged += (_, _) => _draft.BrowserAction = (BrowserAction)action.SelectedIndex;
-        var separator = Divider(155);
-        var extensionTitle = Label("Chrome extension", 9, bold: true);
-        extensionTitle.SetBounds(25, 168, 290, 22);
+        var extensionTitle = Label("Browser extension", 9, bold: true);
+        extensionTitle.SetBounds(25, 110, 290, 22);
         var open = Button("Open extension files", 178, symbol: VesperIcon.Folder);
         open.SetBounds(25, 236, 178, 34);
         open.Enabled = NativeHostSetup.ExtensionPresent;
@@ -773,10 +769,10 @@ internal sealed class SettingsForm : VesperPopupForm
             { VesperMessageBox.Show(this, ex.Message, "Open extension folder", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         };
         bool installed = NativeHostSetup.IsInstalledApp;
-        var helperAction = Button("Connect Chrome", 164, symbol: VesperIcon.Link);
-        helperAction.SetBounds(213, 236, 164, 34);
+        var helperAction = Button("Connect browser helper", 210, symbol: VesperIcon.Link);
+        helperAction.SetBounds(213, 236, 210, 34);
         var developerTip = Label(NativeHostSetup.ExtensionPresent
-            ? "Load the extension in Chrome from chrome://extensions using Developer mode."
+            ? "Load the extension in Chrome, Edge, or Brave from the browser's extension settings."
             : "This build does not include the extension files.", 8, muted: true);
         developerTip.SetBounds(25, 277, 505, 35);
         var siteRules = Button("Site rules…", 142, symbol: VesperIcon.Provider);
@@ -784,36 +780,57 @@ internal sealed class SettingsForm : VesperPopupForm
         siteRules.Click += (_, _) => ShowPage("Sites");
         helperAction.Click += (_, _) =>
         {
-            bool disconnect = NativeHostSetup.IsRegistered;
-            if (disconnect && installed) { RefreshHelper(); return; }
-            string title = disconnect ? "Disconnect Chrome" : "Connect Chrome";
-            string prompt = disconnect ? "Disconnect this portable copy from Chrome?"
-                : "Connect this copy of VESPER to Chrome for your Windows account?";
+            NativeHostRegistrationStatus registrationStatus = NativeHostSetup.RegistrationStatus;
+            if (registrationStatus == NativeHostRegistrationStatus.Unknown) { RefreshHelper(); return; }
+            if (registrationStatus == NativeHostRegistrationStatus.Registered && installed) { RefreshHelper(); return; }
+
+            bool disconnect = registrationStatus == NativeHostRegistrationStatus.Registered;
+            bool repair = registrationStatus == NativeHostRegistrationStatus.RepairRequired;
+            string title = disconnect ? "Disconnect browser helper"
+                : repair ? "Repair browser connection" : "Connect browser helper";
+            string prompt = disconnect
+                ? $"Disconnect this copy's helper registration from {NativeHostRegistration.BrowserList} for your Windows account?"
+                : repair
+                    ? $"Repair the browser helper registration for {NativeHostRegistration.BrowserList}? This rewrites the shared per-user helper manifest. If another VESPER copy uses this registration, it will be replaced."
+                    : registrationStatus == NativeHostRegistrationStatus.AnotherCopyRegistered
+                        ? $"At least one of Chrome, Microsoft Edge, or Brave already has a different browser helper manifest registered. Connect this copy of VESPER to replace it in {NativeHostRegistration.BrowserList} for your Windows account?"
+                        : $"Connect this copy of VESPER to {NativeHostRegistration.BrowserList} for your Windows account?";
             if (VesperMessageBox.Show(this, prompt, title, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-            string? error = disconnect ? NativeHostSetup.Unregister() : NativeHostSetup.Register();
+            string? error = disconnect ? NativeHostSetup.Unregister()
+                : repair ? NativeHostSetup.Repair()
+                : NativeHostSetup.Register(replaceExisting: registrationStatus == NativeHostRegistrationStatus.AnotherCopyRegistered);
             if (error is not null) VesperMessageBox.Show(this, error, title, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             RefreshHelper();
         };
 
-        page.Controls.AddRange([handoff, action, separator, extensionTitle, status, open, helperAction, developerTip, siteRules]);
+        page.Controls.AddRange([extensionTitle, status, open, helperAction, developerTip, siteRules]);
         void RefreshHelper()
         {
             bool hostPresent = NativeHostSetup.HostPresent;
-            bool registered = NativeHostSetup.IsRegistered;
-            status.Text = hostPresent ? "Connect this copy of VESPER to Chrome." : "This build is missing the Chrome helper.";
-            status.Visible = !registered;
-            helperAction.Visible = ShouldShowBrowserHelperAction(hostPresent, registered, installed);
-            helperAction.Text = registered ? "Disconnect Chrome" : "Connect Chrome";
-            helperAction.Top = S(registered ? 204 : 236);
-            open.Top = S(registered ? 204 : 236);
+            NativeHostRegistrationStatus registrationStatus = NativeHostSetup.RegistrationStatus;
+            status.Text = !hostPresent ? "This build is missing the browser helper."
+                : registrationStatus switch
+                {
+                    NativeHostRegistrationStatus.Registered => $"Registered for {NativeHostRegistration.BrowserList} for your Windows account.",
+                    NativeHostRegistrationStatus.NotRegistered => "The browser helper is not registered in Chrome, Microsoft Edge, or Brave.",
+                    NativeHostRegistrationStatus.RepairRequired => "The browser helper registration needs repair.",
+                    NativeHostRegistrationStatus.AnotherCopyRegistered => "A different browser helper manifest is registered for one or more browsers.",
+                    _ => "Could not check the browser helper registration. No changes were made."
+                };
+            helperAction.Visible = ShouldShowBrowserHelperAction(hostPresent, registrationStatus, installed);
+            helperAction.Text = registrationStatus switch
+            {
+                NativeHostRegistrationStatus.Registered => "Disconnect browser helper",
+                NativeHostRegistrationStatus.RepairRequired => "Repair browser connection",
+                _ => "Connect browser helper"
+            };
+            helperAction.Top = open.Top = S(178);
             developerTip.Top = open.Bottom + S(7);
             siteRules.Top = developerTip.Bottom + S(6);
         }
         void Layout()
         {
             int right = page.ClientSize.Width - S(25);
-            action.Left = Math.Max(S(315), right - action.Width);
-            handoff.Width = Math.Max(S(180), action.Left - S(36));
             status.Width = developerTip.Width = Math.Max(S(180), right - S(25));
         }
         page.Resize += (_, _) => Layout();
@@ -888,8 +905,9 @@ internal sealed class SettingsForm : VesperPopupForm
         };
     }
 
-    internal static bool ShouldShowBrowserHelperAction(bool hostPresent, bool registered, bool installed) =>
-        hostPresent && (!registered || !installed);
+    internal static bool ShouldShowBrowserHelperAction(bool hostPresent, NativeHostRegistrationStatus registrationStatus, bool installed) =>
+        hostPresent && registrationStatus != NativeHostRegistrationStatus.Unknown
+            && (registrationStatus != NativeHostRegistrationStatus.Registered || !installed);
 
     private void ExportDiagnostics()
     {
@@ -921,7 +939,7 @@ internal sealed class SettingsForm : VesperPopupForm
 
     private void BuildAppearance()
     {
-        var page = Page("Appearance", "Choose how VESPER looks.");
+        var page = Page("Appearance", "");
         var theme = Label("Color theme", 9, bold: true);
         theme.SetBounds(25, 107, 240, 23);
         var themeChoice = Choice(["System", "Light", "Dark"], (int)_draft.Theme, 184, "Color theme");
@@ -931,9 +949,9 @@ internal sealed class SettingsForm : VesperPopupForm
 
         var density = Label("Download row height", 9, bold: true);
         density.SetBounds(25, 201, 250, 23);
-        var densityNote = Label("Gallery shows media thumbnails. Compact is the default.", 8, muted: true);
+        var densityNote = Label("Gallery shows media thumbnails.", 8, muted: true);
         densityNote.SetBounds(25, 226, 260, 35);
-        var densityChoice = Choice(["Compact · 46 px (default)", "Extra compact · 34 px", "Comfortable · 58 px", "Gallery · 84 px"],
+        var densityChoice = Choice(["Compact", "Extra compact", "Comfortable", "Gallery"],
             _draft.Density switch { Density.ExtraCompact => 1, Density.Comfortable => 2, Density.Gallery => 3, _ => 0 }, 204,
             "Download row height");
         densityChoice.SetBounds(326, 207, 204, 33);

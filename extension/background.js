@@ -197,6 +197,7 @@ const pendingReady = (async () => {
   ]);
   const pending = prunePending({ ...(legacy.pending || {}), ...(session.pending || {}) });
   for (const entry of Object.values(pending)) {
+    if (entry.request.authorized === true) entry.requiresSignIn = true;
     entry.request.authorized = false;
     entry.request.items = entry.request.items.map(stripSecrets);
   }
@@ -206,19 +207,21 @@ const pendingReady = (async () => {
 
 function readPending() {
   return pendingReady.then(async () => {
-    const pending = (await chrome.storage.session.get('pending')).pending || {};
-    const previousCount = Object.keys(pending).length;
-    prunePending(pending);
-    if (Object.keys(pending).length !== previousCount) await chrome.storage.session.set({ pending });
-    return pending;
+    return prunePending({ ...(await chrome.storage.session.get('pending')).pending });
   });
 }
 function changePending(change) {
   const write = pendingWrites.then(async () => {
-    const pending = await readPending();
-    change(pending);
-    await chrome.storage.session.set({ pending: prunePending(pending) });
-    await updateBadge();
+    await pendingReady;
+    const pending = { ...(await chrome.storage.session.get('pending')).pending };
+    const originalCount = Object.keys(pending).length;
+    prunePending(pending);
+    if (!change && Object.keys(pending).length === originalCount) return pending;
+    change?.(pending);
+    prunePending(pending);
+    await chrome.storage.session.set({ pending });
+    await updateBadge(pending).catch(() => {});
+    return pending;
   });
   pendingWrites = write.catch(() => {});
   return write;
@@ -228,7 +231,7 @@ async function submit(items, mode, { authorized = false, review = false } = {}) 
   const request = envelope(review ? 'batch-review' : 'submit', { mode: mode || 'ask', items, authorized });
   await changePending(pending => {
     pending[request.id] = { request: { ...request, authorized: false, items: items.map(stripSecrets) },
-      at: Date.now() };
+      at: Date.now(), requiresSignIn: authorized };
   });
   return sendSubmission(request);
 }
@@ -254,12 +257,12 @@ async function retryPending(id) {
     await changePending(entries => { delete entries[id]; });
     return { ok: false, code: 'gone', message: 'Chrome kept this download. Check Chrome for the file.' };
   }
-  const enriched = await withSignIn(entry.request.items);
-  return sendSubmission({ ...entry.request, ...enriched });
+  if (entry.requiresSignIn) return { ok: false, code: 'sign-in-context', message: 'Return to the original page to retry this download.' };
+  return sendSubmission(entry.request);
 }
 
-async function updateBadge() {
-  const pending = await readPending();
+async function updateBadge(pending) {
+  pending ??= await readPending();
   const count = Object.keys(pending).length;
   await chrome.action.setBadgeBackgroundColor({ color: '#B25247' });
   await chrome.action.setBadgeText({ text: count ? '!' : '' });
@@ -1572,7 +1575,7 @@ async function playerOptions(message, sender) {
     const reply = explainMediaProtocol(await task);
     // A native resolver failure may also allow a verified browser copy.
     if (!prefetch && (reply.data?.browserChoice
-        || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-expired','sign-in','unsupported'].includes(reply.code)))) {
+        || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-expired','sign-in','unsupported','network','timeout'].includes(reply.code)))) {
       const useSignIn = await useBrowserSignIn();
       const proof = observedBrowserBodyProof(await tabState(tab), message, sender, useSignIn);
       if (proof && (proof.credentials !== 'include' || useSignIn)) {
@@ -1661,8 +1664,8 @@ async function confirmOrStartBrowserChoice(choice) {
 
 // describing a source: honest quality choices
 
-const mb = n => n < 1024 ? `${n} B` : n < 104858 ? `${(n / 1024).toFixed(1)} KB`
-  : n >= 1073741824 ? `${(n / 1073741824).toFixed(2)} GB` : `${(n / 1048576).toFixed(n >= 104857600 ? 0 : 1)} MB`;
+const mb = n => n < 1024 ? `${n} B` : n < 104858 ? `${(n / 1024).toFixed(1)} KiB`
+  : n >= 1073741824 ? `${(n / 1073741824).toFixed(2)} GiB` : `${(n / 1048576).toFixed(n >= 104857600 ? 0 : 1)} MiB`;
 const typeName = (mime) => ({ 'video/mp4': 'MP4', 'video/webm': 'WebM', 'audio/mpeg': 'MP3', 'audio/mp4': 'M4A', 'audio/ogg': 'Ogg' }[mime] || (mime ? mime.split('/')[1]?.toUpperCase() : 'File'));
 
 async function describe(url, durationSeconds) {
@@ -1773,8 +1776,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'tab-state': {
         const state = await tabState(message.tabId ?? sender.tab?.id);
-        const pending = await readPending();
-        return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => ({ id, at: p.at, count: p.request.items.length })) };
+        const pending = await changePending();
+        return { ok: true, state, pending: Object.entries(pending).map(([id, p]) => {
+          const first = p.request.items[0];
+          const host = VesperPlayerSource.http(first?.url)?.hostname;
+          return { id, at: p.at, count: p.request.items.length, label: first?.reviewLabel || host || 'Download request' };
+        }) };
       }
       case 'hello': {
         const reply = await nativeRequest(envelope('hello'), 20000);

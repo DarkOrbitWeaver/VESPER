@@ -62,8 +62,8 @@ public static class HlsParser
         bool pendingDiscontinuity = false;
         HlsKey? currentKey = null;
         HlsMap? currentMap = null;
-        long nextOffset = 0;
-        Uri? lastRangeUri = null;
+        long? nextOffset = null;
+        Uri? previousRangeUri = null;
         int lines = 0;
 
         using var reader = new StringReader(text);
@@ -88,12 +88,16 @@ public static class HlsParser
                     pendingDuration = double.TryParse(d, NumberStyles.Float, CultureInfo.InvariantCulture, out var dur) && dur >= 0 ? dur : 0;
                 }
                 else if (line.StartsWith("#EXT-X-BYTERANGE:", StringComparison.Ordinal))
-                    pendingRange = ParseRangeToken(line["#EXT-X-BYTERANGE:".Length..], ref nextOffset, lastRangeUri, null);
+                    pendingRange = ParseRangeToken(line["#EXT-X-BYTERANGE:".Length..]);
                 else if (line == "#EXT-X-DISCONTINUITY")
                 {
                     pendingDiscontinuity = true;
                     media.HasDiscontinuities = true;
                 }
+                else if (line == "#EXT-X-GAP")
+                    media.HasGaps = true;
+                else if (line == "#EXT-X-I-FRAMES-ONLY")
+                    media.IsIFrameOnly = true;
                 else if (line.StartsWith("#EXT-X-KEY:", StringComparison.Ordinal))
                 {
                     currentKey = ParseKey(HlsAttributes.Parse(line["#EXT-X-KEY:".Length..]), baseUri);
@@ -110,7 +114,12 @@ public static class HlsParser
                     var mapUri = a.TryGetValue("URI", out var mu) ? UrlUtil.Resolve(baseUri, mu) : null;
                     if (mapUri is null) throw new MediaResolverException(MediaErrors.UnsupportedManifest("EXT-X-MAP has an invalid URI"));
                     ByteRange? mr = null;
-                    if (a.TryGetValue("BYTERANGE", out var brs)) { long dummy = 0; mr = ParseRangeToken(brs, ref dummy, null, mapUri); }
+                    if (a.TryGetValue("BYTERANGE", out var brs))
+                    {
+                        mr = ParseRangeToken(brs);
+                        if (mr.Value.Offset < 0)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("An initialization byte range needs a valid explicit offset."));
+                    }
                     currentMap = new HlsMap(mapUri, mr);
                 }
                 else if (line.StartsWith("#EXT-X-TARGETDURATION:", StringComparison.Ordinal))
@@ -147,10 +156,23 @@ public static class HlsParser
                 if (range is { } r)
                 {
                     media.HasByteRanges = true;
-                    // A length-only BYTERANGE continues the previous range of the same resource.
-                    if (r.Offset < 0) range = new ByteRange(lastRangeUri == uri ? nextOffset : 0, r.Length);
-                    nextOffset = range!.Value.Offset + range.Value.Length;
-                    lastRangeUri = uri;
+                    long offset = r.Offset;
+                    if (offset < 0)
+                    {
+                        if (previousRangeUri != uri || nextOffset is not long previousEnd)
+                            throw new MediaResolverException(MediaErrors.UnsupportedManifest("An implicit byte range must follow a range of the same resource."));
+                        offset = previousEnd;
+                    }
+                    if (offset > long.MaxValue - r.Length)
+                        throw new MediaResolverException(MediaErrors.UnsupportedManifest("A byte range overflows."));
+                    range = new ByteRange(offset, r.Length);
+                    nextOffset = offset + r.Length;
+                    previousRangeUri = uri;
+                }
+                else
+                {
+                    nextOffset = null;
+                    previousRangeUri = uri;
                 }
                 media.Segments.Add(new HlsSegment(uri, pendingDuration, range, pendingDiscontinuity,
                     currentKey is { Protection: not HlsProtection.None } ? currentKey : null, currentMap));
@@ -171,14 +193,24 @@ public static class HlsParser
             : new HlsParseResult { Media = media };
     }
 
-    // "n[@o]" -> ByteRange; offset -1 marks "continue from previous range" (resolved by the caller).
-    private static ByteRange? ParseRangeToken(string token, ref long nextOffset, Uri? lastUri, Uri? explicitUri)
+    // Offset -1 marks a length-only range. The caller checks that it follows the same resource.
+    private static ByteRange ParseRangeToken(string token)
     {
-        var parts = token.Trim().Split('@');
-        if (!long.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var len) || len <= 0) return null;
-        if (parts.Length > 1 && long.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var off) && off >= 0)
-            return new ByteRange(off, len);
-        return explicitUri is not null ? new ByteRange(0, len) : new ByteRange(-1, len);
+        string[] parts = token.Trim().Split('@');
+        if (parts.Length is < 1 or > 2
+            || !long.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out long length)
+            || length <= 0)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("The playlist contains an invalid byte-range length."));
+
+        long offset = -1;
+        if (parts.Length == 2
+            && !long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out offset))
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("The playlist contains an invalid byte-range offset."));
+
+        if (offset >= 0 && offset > long.MaxValue - length)
+            throw new MediaResolverException(MediaErrors.UnsupportedManifest("A byte range overflows."));
+
+        return new ByteRange(offset, length);
     }
 
     private static HlsKey ParseKey(Dictionary<string, string> a, Uri baseUri)

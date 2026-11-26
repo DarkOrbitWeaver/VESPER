@@ -20,8 +20,9 @@ public sealed record DownloadListReadResult(IReadOnlyList<DownloadListEntry> Ent
 public sealed record DownloadListExportResult(IReadOnlyList<DownloadListEntry> Entries, int CompletedSkipped,
     int BrowserOwnedSkipped, int UnsupportedSkipped, int UnsafeUrlSkipped, int DuplicateSkipped, int LimitSkipped)
 {
+    public int NonPortableMediaSelectionSkipped { get; init; }
     public int Skipped => CompletedSkipped + BrowserOwnedSkipped + UnsupportedSkipped
-        + UnsafeUrlSkipped + DuplicateSkipped + LimitSkipped;
+        + UnsafeUrlSkipped + DuplicateSkipped + LimitSkipped + NonPortableMediaSelectionSkipped;
 }
 
 /// <summary>Versioned JSON and CSV formats for transferring simple download lists.</summary>
@@ -60,6 +61,7 @@ public static class DownloadListTransfer
         int completedSkipped = 0;
         int browserOwnedSkipped = 0;
         int unsupportedSkipped = 0;
+        int nonPortableMediaSelectionSkipped = 0;
         int unsafeUrlSkipped = 0;
         int duplicateSkipped = 0;
         int limitSkipped = 0;
@@ -79,6 +81,11 @@ public static class DownloadListTransfer
             if (snapshot.State == JobState.Completed)
             {
                 completedSkipped++;
+                continue;
+            }
+            if (snapshot.HasNonPortableMediaSelection)
+            {
+                nonPortableMediaSelectionSkipped++;
                 continue;
             }
             if (snapshot.Kind is not (JobKind.Http or JobKind.Hls) || snapshot.Output != MediaOutput.Original)
@@ -106,7 +113,8 @@ public static class DownloadListTransfer
         }
 
         return new DownloadListExportResult(entries, completedSkipped, browserOwnedSkipped, unsupportedSkipped,
-            unsafeUrlSkipped, duplicateSkipped, limitSkipped);
+            unsafeUrlSkipped, duplicateSkipped, limitSkipped)
+        { NonPortableMediaSelectionSkipped = nonPortableMediaSelectionSkipped };
     }
 
     public static string WriteJson(IEnumerable<DownloadListEntry> entries)

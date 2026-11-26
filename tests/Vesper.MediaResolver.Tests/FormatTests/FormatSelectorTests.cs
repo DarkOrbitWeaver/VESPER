@@ -251,10 +251,14 @@ public class FormatSelectorTests
     public void HlsVideo_PairsOnlyWithItsOwnAudioGroup()
     {
         var v = T.Video("hv", 1080, withAudio: false, protocol: StreamProtocol.Hls, audioGroup: "g2");
-        var a1 = T.Audio("g1-en") with { Protocol = StreamProtocol.Hls, AudioGroupId = "g1", IsDefaultAudio = true };
-        var a2 = T.Audio("g2-en") with { Protocol = StreamProtocol.Hls, AudioGroupId = "g2" };
+        var a1 = T.Audio("g1-en") with { Protocol = StreamProtocol.Hls, AudioGroupId = "g1", IsDefaultAudio = true, ManifestUrl = v.ManifestUrl };
+        var a2 = T.Audio("g2-en") with { Protocol = StreamProtocol.Hls, AudioGroupId = "g2", ManifestUrl = v.ManifestUrl };
         var s = Pick(T.Item(v, a1, a2), FormatPreferences.BestQuality);
         Assert.Equal("g2-en", s.Audio!.Id);
+        Assert.False(FormatSelector.Select(T.Item(v, a1), FormatPreferences.BestQuality).IsSuccess);
+        Assert.False(FormatSelector.Select(T.Item(v), FormatPreferences.BestQuality).IsSuccess);
+        var otherMaster = a2 with { ManifestUrl = new Uri("https://example.test/different/master.m3u8") };
+        Assert.False(FormatSelector.Select(T.Item(v, otherMaster), FormatPreferences.BestQuality).IsSuccess);
     }
 
     [Fact]

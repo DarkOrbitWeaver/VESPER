@@ -45,6 +45,8 @@ public sealed class HlsMediaPlaylist
     public double TotalDuration { get; set; }
     public bool HasByteRanges { get; set; }
     public bool HasDiscontinuities { get; set; }
+    public bool HasGaps { get; set; }
+    public bool IsIFrameOnly { get; set; }
     public HlsProtection Protection { get; set; }
 
     public bool HasInitSegment => Segments.Count > 0 && Segments[0].Map is not null;

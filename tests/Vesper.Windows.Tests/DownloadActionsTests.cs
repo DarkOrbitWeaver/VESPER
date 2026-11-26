@@ -29,6 +29,12 @@ public sealed class DownloadActionsTests
     }
 
     [Fact]
+    public void OpenConfirmationDoesNotBlockOrdinaryFiles()
+    {
+        Assert.False(DownloadActions.RequiresOpenConfirmation(Path.Combine("C:\\Downloads", "notes.txt")));
+    }
+
+    [Fact]
     public void OpenWarningUsesOnlyTheSanitizedNameFromTheFinalPath()
     {
         const string untrustedName = "Invoice\u202Egpj.exe";
@@ -50,5 +56,40 @@ public sealed class DownloadActionsTests
         Assert.DoesNotContain("private", warning);
         Assert.DoesNotContain("C:\\Downloads", warning);
         Assert.DoesNotContain('\u202E', warning);
+        Assert.Contains("can run code", warning);
+        Assert.Contains("open a shortcut", warning);
+        Assert.Contains("mount a disk image", warning);
+        Assert.Contains("Only open it if you trust the source.", warning);
+        Assert.DoesNotContain("program or script", warning);
+        Assert.DoesNotContain("Run it?", warning);
+    }
+
+    [Fact]
+    public void CancelConfirmationShowsSinglePartialAndRetainedTotal()
+    {
+        const long retainedBytes = 1_500_000;
+        var items = new[] { new JobSnapshot { CommittedBytes = retainedBytes } };
+
+        string text = DownloadActions.CancelConfirmationText(1, items);
+
+        Assert.StartsWith("Cancel this download and delete its saved partial?", text);
+        Assert.Contains($"Saved data to be deleted: {Formatting.Bytes(retainedBytes)} across 1 partial.", text);
+    }
+
+    [Fact]
+    public void CancelConfirmationShowsBatchCountAndCombinedRetainedTotal()
+    {
+        const long firstBytes = 1_000_000;
+        const long secondBytes = 2_500_000;
+        var items = new[]
+        {
+            new JobSnapshot { CommittedBytes = firstBytes },
+            new JobSnapshot { CommittedBytes = secondBytes }
+        };
+
+        string text = DownloadActions.CancelConfirmationText(3, items);
+
+        Assert.StartsWith("Cancel 3 downloads and delete their saved partials?", text);
+        Assert.Contains($"Saved data to be deleted: {Formatting.Bytes(firstBytes + secondBytes)} across 2 partials.", text);
     }
 }

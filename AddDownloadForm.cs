@@ -336,7 +336,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
 
         if (links.Length == 0)
         {
-            _hint.Text = "Paste a file link to continue";
+            _hint.Text = "Paste a file or media link.";
         }
         else if (mediaRoute)
         {
@@ -345,7 +345,7 @@ internal sealed class AddDownloadForm : VesperPopupForm
             _detectedTitle.Text = fileCount == 0
                 ? mediaCount == 1 ? "Media link" : $"{mediaCount} media sources"
                 : $"{mediaCount} media + {fileCount} direct file links";
-            _detectedNote.Text = fileCount == 0 ? "Find media to see available formats."
+            _detectedNote.Text = fileCount == 0 ? ""
                 : "Direct file links are added alongside your media selection.";
             _openPage.Text = "Find media";
         }
@@ -356,13 +356,13 @@ internal sealed class AddDownloadForm : VesperPopupForm
         }
         else if (links.Length > 1)
         {
-            _detectedTitle.Text = $"{links.Length} file addresses";
-            _detectedNote.Text = "VESPER will check each file when its download begins.";
+            _detectedTitle.Text = $"{links.Length} file links";
+            _detectedNote.Text = "Links are checked when downloads start.";
         }
         else
         {
-            _detectedTitle.Text = "File link to check";
-            _detectedNote.Text = "VESPER checks the file when the download starts.";
+            _detectedTitle.Text = "File link";
+            _detectedNote.Text = "The link is checked when the download starts.";
         }
         _detected.Invalidate();
         LayoutContent();

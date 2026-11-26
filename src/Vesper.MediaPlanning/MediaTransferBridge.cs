@@ -21,7 +21,8 @@ internal sealed record MediaDownloadChoice(
     IReadOnlyList<SubtitleTrack>? SubtitleTracks = null, string? MediaMetadataJson = null,
     int EmbeddedSubtitleCount = 0, string? SubtitleNotice = null,
     [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null,
-    [property: System.Text.Json.Serialization.JsonIgnore] bool CanUseFullFileClip = false)
+    [property: System.Text.Json.Serialization.JsonIgnore] bool CanUseFullFileClip = false,
+    [property: System.Text.Json.Serialization.JsonIgnore] bool IsSubtitle = false)
 {
     public string DisplayContainer => Output switch
     {
@@ -836,6 +837,7 @@ internal static class MediaTransferBridge
                     SubtitleTracks = null,
                     EmbeddedSubtitleCount = 0,
                     SubtitleNotice = null,
+                    IsSubtitle = true,
                     MediaMetadataJson = null
                 });
             }

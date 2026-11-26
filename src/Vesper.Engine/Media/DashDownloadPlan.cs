@@ -11,8 +11,8 @@ public sealed record DashFragment(string Url, long? Offset = null, long? Length 
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? StartSeconds = null);
 
 /// <summary>
-/// Immutable transfer identity, stored separately from the small transactional cursor. Only clear fragmented MP4
-/// is implemented. Separate video/audio tracks are not muxed. Refreshing URLs must never mutate a running plan.
+/// Transfer plan for one clear fragmented MP4 representation. Use MediaMergePlan for separate tracks.
+/// Refreshing URLs must never mutate a running plan.
 /// </summary>
 public sealed record DashDownloadPlan
 {

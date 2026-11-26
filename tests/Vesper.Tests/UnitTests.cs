@@ -281,6 +281,81 @@ public class UrlPolicyTests
 public class PacingTests
 {
     [Fact]
+    public async Task Rate_change_recalculates_a_waiting_reservation()
+    {
+        var clock = new ManualTimeProvider();
+        var limiter = new RateLimiter(clock);
+        limiter.SetRate(100);
+        Task waiting = limiter.AcquireAsync(10_000, CancellationToken.None).AsTask();
+        TimeSpan oldDelay = await clock.NextDelayAsync();
+
+        limiter.SetRate(1_000);
+        TimeSpan newDelay = await clock.NextDelayAsync();
+        Assert.True(newDelay < oldDelay / 5, $"Rate change left {newDelay} of the old {oldDelay} wait.");
+
+        clock.Advance(newDelay - TimeSpan.FromMilliseconds(1));
+        Assert.False(waiting.IsCompleted);
+        clock.Advance(TimeSpan.FromMilliseconds(2));
+        await waiting.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Disabling_and_reenabling_rate_drops_stale_waits()
+    {
+        var clock = new ManualTimeProvider();
+        var limiter = new RateLimiter(clock);
+        limiter.SetRate(10);
+        Task first = limiter.AcquireAsync(1_000, CancellationToken.None).AsTask();
+        TimeSpan originalDelay = await clock.NextDelayAsync();
+
+        limiter.SetRate(0);
+        await first.WaitAsync(TimeSpan.FromSeconds(1));
+        limiter.SetRate(10);
+        Task second = limiter.AcquireAsync(1_000, CancellationToken.None).AsTask();
+        TimeSpan newDelay = await clock.NextDelayAsync();
+
+        Assert.InRange(newDelay.TotalSeconds, 90, originalDelay.TotalSeconds + 1);
+        clock.Advance(newDelay);
+        await second.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Cancelling_a_waiting_reservation_does_not_charge_the_next_caller()
+    {
+        var clock = new ManualTimeProvider();
+        var limiter = new RateLimiter(clock);
+        limiter.SetRate(100);
+        using var cancel = new CancellationTokenSource();
+        Task canceled = limiter.AcquireAsync(1_000, cancel.Token).AsTask();
+        TimeSpan canceledDelay = await clock.NextDelayAsync();
+        Task next = limiter.AcquireAsync(500, CancellationToken.None).AsTask();
+
+        cancel.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled);
+        TimeSpan nextDelay = await clock.NextDelayAsync();
+        Assert.True(nextDelay < canceledDelay, "The cancelled bytes remained in the global reservation.");
+
+        clock.Advance(nextDelay);
+        await next.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Small_reservations_cannot_reuse_the_full_burst_credit()
+    {
+        var clock = new ManualTimeProvider();
+        var limiter = new RateLimiter(clock);
+        limiter.SetRate(4);
+        await limiter.AcquireAsync(1, CancellationToken.None);
+        Task waiting = limiter.AcquireAsync(1, CancellationToken.None).AsTask();
+        Assert.False(waiting.IsCompleted);
+
+        TimeSpan delay = await clock.NextDelayAsync();
+        Assert.InRange(delay.TotalMilliseconds, 249, 251);
+        clock.Advance(delay);
+        await waiting.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
     public async Task Rate_limiter_enforces_the_configured_speed()
     {
         var limiter = new RateLimiter();
@@ -338,6 +413,150 @@ public class PacingTests
         Assert.True(window.IsOpen(new DateTime(2025, 1, 2, 5, 59, 0)));
         Assert.False(window.IsOpen(new DateTime(2025, 1, 2, 12, 0, 0)));
         Assert.Equal(new DateTime(2025, 1, 2, 23, 0, 0), window.NextBoundary(new DateTime(2025, 1, 2, 12, 0, 0)));
+    }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly List<ManualTimer> _timers = [];
+        private readonly Queue<TimeSpan> _delays = [];
+        private readonly Queue<TaskCompletionSource<TimeSpan>> _delayWaiters = [];
+        private long _timestamp;
+        private DateTimeOffset _utcNow = new(2025, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp()
+        {
+            lock (_gate) return _timestamp;
+        }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            lock (_gate) return _utcNow;
+        }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new ManualTimer(this, callback, state);
+            lock (_gate) _timers.Add(timer);
+            Change(timer, dueTime, period);
+            return timer;
+        }
+
+        public Task<TimeSpan> NextDelayAsync()
+        {
+            lock (_gate)
+            {
+                if (_delays.TryDequeue(out TimeSpan delay)) return Task.FromResult(delay);
+                var waiter = new TaskCompletionSource<TimeSpan>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _delayWaiters.Enqueue(waiter);
+                return waiter.Task;
+            }
+        }
+
+        public void Advance(TimeSpan amount)
+        {
+            List<(TimerCallback Callback, object? State)> callbacks = [];
+            lock (_gate)
+            {
+                _timestamp = checked(_timestamp + amount.Ticks);
+                _utcNow += amount;
+                foreach (ManualTimer timer in _timers)
+                {
+                    if (timer.Disposed || timer.DueTimestamp is not long due || due > _timestamp) continue;
+                    if (timer.PeriodTicks > 0) timer.DueTimestamp = checked(_timestamp + timer.PeriodTicks);
+                    else timer.DueTimestamp = null;
+                    callbacks.Add((timer.Callback, timer.State));
+                }
+            }
+
+            foreach ((TimerCallback callback, object? state) in callbacks) callback(state);
+        }
+
+        private bool Change(ManualTimer timer, TimeSpan dueTime, TimeSpan period)
+        {
+            lock (_gate)
+            {
+                if (timer.Disposed) return false;
+                timer.DueTimestamp = dueTime == Timeout.InfiniteTimeSpan
+                    ? null
+                    : checked(_timestamp + Math.Max(0, dueTime.Ticks));
+                timer.PeriodTicks = period == Timeout.InfiniteTimeSpan ? 0 : Math.Max(0, period.Ticks);
+                if (dueTime > TimeSpan.FromMilliseconds(2)) RecordDelayLocked(dueTime);
+                return true;
+            }
+        }
+
+        private void Dispose(ManualTimer timer)
+        {
+            lock (_gate)
+            {
+                timer.Disposed = true;
+                _timers.Remove(timer);
+            }
+        }
+
+        private void RecordDelayLocked(TimeSpan delay)
+        {
+            if (_delayWaiters.TryDequeue(out var waiter))
+                waiter.TrySetResult(delay);
+            else
+                _delays.Enqueue(delay);
+        }
+
+        private sealed class ManualTimer(ManualTimeProvider owner, TimerCallback callback, object? state) : ITimer
+        {
+            internal TimerCallback Callback { get; } = callback;
+            internal object? State { get; } = state;
+            internal long? DueTimestamp;
+            internal long PeriodTicks;
+            internal bool Disposed;
+
+            public bool Change(TimeSpan dueTime, TimeSpan period) => owner.Change(this, dueTime, period);
+            public void Dispose() => owner.Dispose(this);
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
+        }
+    }
+}
+
+public sealed class HttpBodyFramingTests
+{
+    [Fact]
+    public void Segmented_body_requires_framing_or_an_independent_size_proof()
+    {
+        using var closeDelimited = Response(HttpVersion.Version11);
+        Assert.False(HttpFacts.HasTrustworthyBodyBoundary(closeDelimited));
+        Assert.True(HttpFacts.HasTrustworthyBodyBoundary(closeDelimited, expectedLength: 188));
+
+        using var chunked = Response(HttpVersion.Version11);
+        chunked.Headers.TransferEncodingChunked = true;
+        Assert.True(HttpFacts.HasTrustworthyBodyBoundary(chunked));
+
+        using var http2 = Response(HttpVersion.Version20);
+        Assert.True(HttpFacts.HasTrustworthyBodyBoundary(http2));
+    }
+
+    private static HttpResponseMessage Response(Version version) => new(HttpStatusCode.OK)
+    {
+        Version = version,
+        Content = new UnknownLengthContent()
+    };
+
+    private sealed class UnknownLengthContent : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context) =>
+            Task.CompletedTask;
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
     }
 }
 
@@ -865,7 +1084,7 @@ public class MediaPageLinkTests
         using var h = new Harness();
         AddResult result = h.Engine.Add(new AddRequest("https://www.youtube.com/watch?v=EK3tCffac5k&list=RDEK3tCffac5k&start_radio=1&pp=oAcB"));
         Assert.False(result.Ok);
-        Assert.Contains("video page", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("choose Find media", result.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(h.Engine.Snapshots());
     }
 

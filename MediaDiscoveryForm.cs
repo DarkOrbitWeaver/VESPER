@@ -80,6 +80,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
 
     private MediaItem? _item;
     private List<CollectionEntry>? _collection;
+    private string? _collectionProvider;
     private bool _updatingCollectionRows;
     private ViewState _state = ViewState.Inspecting;
     private bool _busy;
@@ -1275,6 +1276,7 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
         _item = null;
         _playableFormats.Clear();
         _collection = collection.Entries.Take(200).ToList();
+        _collectionProvider = collection.Provider;
         _truncated = !collection.IsComplete || collection.Entries.Count > 200;
         _collectionLabels = _collection.Select(entry => Limit(entry.Title ?? entry.MediaId, 105)).ToArray();
         _collectionAvailability.Clear();
@@ -1371,8 +1373,10 @@ internal sealed class MediaDiscoveryForm : VesperPopupForm
                 int completed = 0;
                 var progress = new Progress<int>(count =>
                 { if (!IsDisposed) _status.Text = $"Checked {count} of {selected.Length} selected media…"; });
+                int concurrency = _collectionProvider == "youtube" ? 1 : 4;
                 await Task.Run(() => Parallel.ForEachAsync(Enumerable.Range(0, selected.Length),
-                    new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = _lifetime.Token }, async (i, token) =>
+                    new ParallelOptions { MaxDegreeOfParallelism = concurrency,
+                        CancellationToken = _lifetime.Token }, async (i, token) =>
                 {
                     CollectionEntry entry = collection[selected[i]];
                     try

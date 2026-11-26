@@ -268,7 +268,7 @@ public sealed partial class DownloadEngine
                         if (File.Exists(target) && sourceStillMatches) continue;
                         if (!sourceStillMatches)
                             return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
-                        return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + moveError);
+                        return RunOutcome.Retry("locked", "Couldn’t move the verified file to its destination. VESPER will retry. " + moveError);
                     }
                 }
                 else
@@ -283,7 +283,7 @@ public sealed partial class DownloadEngine
                         if (!IsPublicationFile(job, source, expectedLength, staged: true))
                             return RunOutcome.NeedsAttention("publication-pending", "Could not confirm where the file was saved. Resume to check again.");
 
-                        return RunOutcome.Retry("locked", "Another program (often antivirus) is using the file. VESPER will try again. " + ex.Message);
+                        return RunOutcome.Retry("locked", "Couldn’t move the verified file to its destination. VESPER will retry. " + ex.Message);
                     }
                 }
 

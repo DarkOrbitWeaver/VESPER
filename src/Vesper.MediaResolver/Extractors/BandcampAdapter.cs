@@ -61,8 +61,9 @@ internal sealed class BandcampAdapter : AdapterBase
         string? releaseDate = NormalizeReleaseDate(tr.P("current").P("publish_date").Str() ?? tr.P("publish_date").Str());
         Uri? art = tr.P("art_id").Long() is { } artId && artId > 0 ? new Uri($"https://f4.bcbits.com/img/a{artId}_10.jpg") : null;
 
+        var trackRows = tr.P("trackinfo").Items().ToList();
         var items = new List<(MediaItem Item, string? Link)>();
-        foreach (var t in tr.P("trackinfo").Items())
+        foreach (var t in trackRows)
         {
             var files = t.P("file");
             if (files is null) continue;
@@ -115,10 +116,12 @@ internal sealed class BandcampAdapter : AdapterBase
             return Fail(MediaErrors.NoMedia("Bandcamp exposes no public stream for this page (purchase or login required)", browserMayHelp: false));
 
         bool isTrackPage = request.Url.AbsolutePath.StartsWith("/track/", StringComparison.Ordinal);
-        if (request.Options.CollectionIntent != CollectionIntent.CollectionOnly && (isTrackPage || items.Count == 1))
+        if (request.Options.CollectionIntent != CollectionIntent.CollectionOnly && (isTrackPage || trackRows.Count == 1))
             return MediaDiscoveryResult.FromItem(items[0].Item with { SourceUrl = request.Url });
 
-        var entries = items.Take(request.Options.MaxCollectionItems).Select((x, i) => new CollectionEntry
+        int limit = Math.Min(request.Options.MaxCollectionItems, Options.MaxCollectionItems);
+        if (limit < 1) return Fail(MediaErrors.Invalid("The collection item limit must be positive"));
+        var entries = items.Take(limit).Select((x, i) => new CollectionEntry
         {
             MediaId = x.Item.MediaId ?? $"track{i}",
             Url = x.Item.SourceUrl,
@@ -129,6 +132,14 @@ internal sealed class BandcampAdapter : AdapterBase
             Resolved = x.Item
         }).ToList();
 
+        int unavailableCount = Math.Max(0, trackRows.Count - items.Count);
+        bool capped = entries.Count < items.Count;
+        var warnings = new List<MediaError>();
+        if (unavailableCount > 0)
+            warnings.Add(MediaErrors.PartialPlaylist($"{unavailableCount} Bandcamp track(s) have no public stream and were omitted."));
+        if (capped)
+            warnings.Add(MediaErrors.PartialPlaylist($"The album has more public tracks than the configured item limit ({limit})."));
+
         return MediaDiscoveryResult.FromCollection(new MediaCollection
         {
             SourceUrl = request.Url,
@@ -136,9 +147,9 @@ internal sealed class BandcampAdapter : AdapterBase
             CollectionId = tr.P("id").Str(),
             Title = string.IsNullOrEmpty(albumTitle) ? "Bandcamp album" : albumTitle,
             Kind = CollectionKind.Album,
-            TotalCount = tr.P("trackinfo").Items().Count(),
+            TotalCount = trackRows.Count,
             Entries = entries,
-            IsComplete = entries.Count == items.Count
-        });
+            IsComplete = unavailableCount == 0 && !capped
+        }, warnings);
     }
 }

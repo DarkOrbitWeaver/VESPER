@@ -25,35 +25,72 @@ internal static class ResultFinalizer
 
         if (r.Collection is { } c)
         {
+            if (c.Entries.Count == 0 && c.IsComplete && c.NextPageToken is null && r.Warnings.Count == 0)
+                return MediaDiscoveryResult.Failure(MediaErrors.Unavailable("The collection contains no entries"));
+
             var seen = new HashSet<string>(StringComparer.Ordinal);
             var entries = new List<CollectionEntry>();
+            var warnings = r.Warnings.ToList();
             bool truncated = false;
+            int blockedCount = 0;
+            int unresolvedCount = 0;
             foreach (var e in c.Entries)
             {
-                if (!UrlValidator.IsAllowed(e.Url, o, out _)) continue;
+                if (!UrlValidator.IsAllowed(e.Url, o, out _))
+                {
+                    blockedCount++;
+                    continue;
+                }
                 if (!seen.Add(e.MediaId)) continue;
                 if (entries.Count >= o.MaxCollectionItems) { truncated = true; break; }
 
-                var entry = e with { Index = entries.Count, Title = e.Title is null ? null : TextUtil.Clip(e.Title.Trim(), 300) };
+                var entry = e with { Title = e.Title is null ? null : TextUtil.Clip(e.Title.Trim(), 300) };
                 if (e.Resolved is not null)
                 {
                     var fi = FinalizeItem(e.Resolved, o, now, out var ierr);
-                    entry = fi is null ? entry with { Resolved = null, Error = ierr } : entry with { Resolved = fi };
+                    if (fi is null)
+                    {
+                        unresolvedCount++;
+                        entry = entry with { Resolved = null, Error = ierr };
+                    }
+                    else entry = entry with { Resolved = fi };
                 }
                 entries.Add(entry);
             }
+
+            if (blockedCount > 0)
+                warnings.Add(MediaErrors.PartialPlaylist($"{blockedCount} collection row(s) had URLs that could not be used safely and were omitted."));
+            if (unresolvedCount > 0)
+                warnings.Add(MediaErrors.PartialPlaylist($"{unresolvedCount} collection row(s) had no usable media after validation."));
+            if (truncated)
+                warnings.Add(MediaErrors.PartialPlaylist($"The collection reached the configured item limit ({o.MaxCollectionItems})."));
+            if (entries.Count == 0 && warnings.Count == 0)
+                warnings.Add(MediaErrors.PartialPlaylist("No collection entries could be retained."));
+
+            if (entries.Count == 0 && c.NextPageToken is null && !truncated && (c.Entries.Count == 0 || blockedCount > 0))
+            {
+                return new MediaDiscoveryResult
+                {
+                    Status = DiscoveryStatus.Failed,
+                    Error = MediaErrors.Unavailable("No usable entries remained in the collection"),
+                    Warnings = warnings,
+                    Notes = r.Notes
+                };
+            }
+
+            bool complete = c.IsComplete && !truncated && blockedCount == 0 && unresolvedCount == 0 && entries.Count > 0;
             var fc = c with
             {
                 Entries = entries,
-                IsComplete = c.IsComplete && !truncated,
+                IsComplete = complete,
                 NextPageToken = truncated ? null : c.NextPageToken,
                 Title = TextUtil.Clip(c.Title.Trim(), 300)
             };
             return new MediaDiscoveryResult
             {
-                Status = fc.IsComplete && r.Warnings.Count == 0 ? DiscoveryStatus.Success : DiscoveryStatus.Partial,
+                Status = fc.IsComplete && warnings.Count == 0 ? DiscoveryStatus.Success : DiscoveryStatus.Partial,
                 Collection = fc,
-                Warnings = r.Warnings,
+                Warnings = warnings,
                 Notes = r.Notes
             };
         }

@@ -95,28 +95,6 @@ async function main() {
     download: { default_directory: output, prompt_for_download: false, directory_upgrade: true }
   }));
   await cp(extension, testExtension, { recursive: true });
-  const managedPath = join(testExtension, 'browser-managed.js');
-  let managedSource = await readFile(managedPath, 'utf8');
-  const listener = 'chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {';
-  assert.equal(managedSource.split(listener).length - 1, 1, 'Expected one VESPER filename listener.');
-  managedSource = managedSource.replace(listener, `chrome.downloads.onDeterminingFilename?.addListener((item, originalSuggest) => {
-  const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
-  globalThis.__filenameTiming.push({ type: 'filename', id: item.id, testId, at: Date.now(),
-    bytesReceived: item.bytesReceived, filename: item.filename, state: item.state, paused: item.paused });
-  const suggest = (...args) => {
-    const finish = () => {
-      globalThis.__filenameTiming.push({ type: 'suggest', id: item.id, testId, at: Date.now() });
-      originalSuggest(...args);
-    };
-    const wait = Number(globalThis.__filenameDelay) || 0;
-    if (wait <= 0) finish();
-    else setTimeout(finish, wait);
-    return true;
-  };`);
-  const finalSuggestion = `suggest({ filename: \`VESPER/\${name}\`, conflictAction: 'uniquify' });`;
-  assert.equal(managedSource.split(finalSuggestion).length - 1, 1, 'Expected the VESPER save-folder suggestion.');
-  managedSource = managedSource.replace(finalSuggestion, finalSuggestion + '\n  return true;');
-  await writeFile(managedPath, managedSource);
   const serverEvents = [];
   const server = createServer((request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -226,6 +204,19 @@ async function main() {
       await browserPreferencesReady;
       await chrome.storage.local.set({ vesperPaused: true });
       globalThis.__filenameTiming ||= [];
+      chrome.downloads.onDeterminingFilename.addListener((item, originalSuggest) => {
+        const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
+        __filenameTiming.push({ type: 'filename', id: item.id, testId, at: Date.now(),
+          bytesReceived: item.bytesReceived, filename: item.filename, state: item.state, paused: item.paused });
+        const finish = () => {
+          __filenameTiming.push({ type: 'suggest', id: item.id, testId, at: Date.now(), filenameSuggestion: null });
+          originalSuggest();
+        };
+        const wait = Number(globalThis.__filenameDelay) || 0;
+        if (wait <= 0) finish();
+        else setTimeout(finish, wait);
+        return true;
+      });
       chrome.downloads.onCreated.addListener(item => {
         const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
         __filenameTiming.push({ type: 'created', id: item.id, testId, at: Date.now(),
@@ -287,6 +278,7 @@ async function main() {
       15000, 'Download did not complete: ' + id);
       const filename = join(output, 'timing-' + id + '.bin');
       assert.equal((await readFile(filename)).compare(bytes), 0);
+      assert.equal(complete.filename, filename, 'VESPER must leave Chrome’s selected destination unchanged.');
       const observed = await evaluateWorker(browser, workerSession,
         `__filenameTiming.slice(${before}).filter(item => item.id === ${complete.id})`);
       if (!atSuggest) throw new Error(suggestionError + ' Chrome events: ' + JSON.stringify(observed)
@@ -302,6 +294,7 @@ async function main() {
         events: observed.map(item => ({ ...item, offsetMs: item.at - serverEvent.start })),
         onCreatedBytes: created.bytesReceived, onFilenameBytes: callback.bytesReceived,
         partialVisibleAtSuggest: atSuggest.partialVisible, partialSizeAtSuggest: atSuggest.partialSize,
+        filenameSuggestion: suggested.filenameSuggestion, savedPath: complete.filename,
         suggestAt: atSuggest.event.at, finalBytes: complete.fileSize
       });
     }

@@ -3,6 +3,7 @@ using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Extractors;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
+using Vesper.MediaResolver.Playlists;
 using Vesper.MediaResolver.Tests.TestSupport;
 using Xunit;
 
@@ -495,6 +496,42 @@ public class SiteAdapterTests
         Assert.Equal("https://peertube.example.org/w/aaaaaaaaaaaaaaaaaaaaaa", c.Entries[0].Url.AbsoluteUri);
     }
 
+    [Fact]
+    public async Task PeerTube_UnusablePageStillAdvancesBySourcePosition()
+    {
+        const string playlist = "https://peertube.example.org/w/p/pl1abcdefghij";
+        const string head = "https://peertube.example.org/api/v1/video-playlists/pl1abcdefghij";
+        string unusableRows = string.Join(",", Enumerable.Range(0, 50).Select(i => $"{{\"video\":{{\"shortUUID\":\"bad{i}\"}}}}"));
+        string firstPage = "{\"total\":51,\"data\":[" + unusableRows + "]}";
+        const string lastPage = "{\"total\":51,\"data\":[{\"video\":{\"shortUUID\":\"aaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"Last video\"}}]}";
+        var h = new FakeHttpHandler()
+            .Add(head, "{\"displayName\":\"My list\",\"videosLength\":51}", "application/json")
+            .Add(head + "/videos?start=0&count=50", firstPage, "application/json")
+            .Add(head + "/videos?start=50&count=50", lastPage, "application/json");
+        using var resolver = T.Resolver(h);
+
+        var snapshot = await new CollectionPager(resolver, maxPages: 3).CollectAsync(new()
+        {
+            Url = new Uri(playlist),
+            Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.CollectionOnly }
+        });
+
+        Assert.Single(snapshot.Entries);
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaa", snapshot.Entries[0].MediaId);
+        Assert.True(snapshot.Truncated); // the 50 skipped rows remain unavailable
+        Assert.Equal(CollectionStopReason.SourceIncomplete, snapshot.StopReason);
+        Assert.Contains(snapshot.Errors, error => error.Code == MediaErrorCode.PlaylistPartiallyResolved);
+        Assert.Equal(2, h.Requests.Count(request => request.Url.AbsolutePath.EndsWith("/videos", StringComparison.Ordinal)));
+        Assert.Contains(h.Requests, request => request.Url.Query == "?start=50&count=50");
+
+        var secondPage = await resolver.ResolveAsync(new()
+        {
+            Url = new Uri(playlist),
+            Options = new DiscoveryOptions { CollectionIntent = CollectionIntent.CollectionOnly, PageToken = "50" }
+        }, CancellationToken.None);
+        Assert.Equal(50, Assert.Single(secondPage.Collection!.Entries).Index);
+    }
+
     // ---------------------------------------------------------------------------------------------- Bandcamp
 
     [Fact]
@@ -532,6 +569,9 @@ public class SiteAdapterTests
         Assert.Equal(CollectionKind.Album, c.Kind);
         Assert.Equal(2, c.Entries.Count);                     // third track has file:null
         Assert.Equal(3, c.TotalCount);
+        Assert.Equal(DiscoveryStatus.Partial, res.Status);
+        Assert.False(c.IsComplete);
+        Assert.Contains(res.Warnings, warning => warning.Diagnostic.Contains("1 Bandcamp track", StringComparison.Ordinal));
         Assert.Equal("Fixture Album", c.Title);
         Assert.All(c.Entries, e => Assert.NotNull(e.Resolved));
         MediaItem firstTrack = Assert.IsType<MediaItem>(c.Entries[0].Resolved);
@@ -541,6 +581,45 @@ public class SiteAdapterTests
         Assert.Equal(1, firstTrack.TrackNumber);
         Assert.Equal("2024-03-12", firstTrack.ReleaseDate);
         Assert.Equal("https://fixtureband.bandcamp.com/track/song-two", c.Entries[1].Url.AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task Bandcamp_AlbumItemCapIsPartial_AndAllPublicTracksCanBeComplete()
+    {
+        const string url = "https://fixtureband.bandcamp.com/album/fixture-album";
+        var cappedHandler = new FakeHttpHandler().AddFile(url, "bandcamp_album.html", "text/html");
+        using (var resolver = T.Resolver(cappedHandler))
+        {
+            var capped = await resolver.ResolveAsync(new()
+            {
+                Url = new Uri(url),
+                Options = new DiscoveryOptions { MaxCollectionItems = 1 }
+            }, CancellationToken.None);
+
+            Assert.Equal(DiscoveryStatus.Partial, capped.Status);
+            Assert.Single(capped.Collection!.Entries);
+            Assert.Equal(3, capped.Collection.TotalCount);
+            Assert.False(capped.Collection.IsComplete);
+            Assert.Null(capped.Collection.NextPageToken);
+            Assert.Contains(capped.Warnings, warning => warning.Diagnostic.Contains("item limit", StringComparison.Ordinal));
+        }
+
+        const string publicData = """
+            {"artist":"Fixture Band","id":777,"current":{"title":"Public Album"},"trackinfo":[
+              {"track_id":1,"title":"One","duration":60,"file":{"mp3-128":"https://t4.bcbits.com/stream/one"}},
+              {"track_id":2,"title":"Two","duration":90,"file":{"mp3-128":"https://t4.bcbits.com/stream/two"}}
+            ]}
+            """;
+        string html = $"<script data-tralbum=\"{System.Net.WebUtility.HtmlEncode(publicData)}\"></script>";
+        var publicHandler = new FakeHttpHandler().Add(url, html, "text/html");
+        using var publicResolver = T.Resolver(publicHandler);
+        var allPublic = await publicResolver.ResolveAsync(new() { Url = new Uri(url) }, CancellationToken.None);
+
+        Assert.Equal(DiscoveryStatus.Success, allPublic.Status);
+        Assert.Equal(2, allPublic.Collection!.Entries.Count);
+        Assert.Equal(2, allPublic.Collection.TotalCount);
+        Assert.True(allPublic.Collection.IsComplete);
+        Assert.Empty(allPublic.Warnings);
     }
 
     // ---------------------------------------------------------------------------------------------- Bilibili

@@ -68,7 +68,7 @@ public static class HlsParser
             bool audioOnly = height == 0 && codecs is not null && !codecs.Contains("avc", StringComparison.OrdinalIgnoreCase)
                 && !codecs.Contains("hvc", StringComparison.OrdinalIgnoreCase) && !codecs.Contains("hev", StringComparison.OrdinalIgnoreCase)
                 && !codecs.Contains("vp0", StringComparison.OrdinalIgnoreCase) && !codecs.Contains("av01", StringComparison.OrdinalIgnoreCase);
-            // A variant that points at an audio group carries picture only; joining needs a muxer VESPER does not ship.
+            // An external audio group needs a separate track and a merge plan.
             bool separateAudio = a.TryGetValue("AUDIO", out var group) && externalAudioGroups.Contains(group) && !audioOnly;
             bool valid = Uri.TryCreate(baseUri, uri, out Uri? address)
                 && UrlPolicy.TryParse(address.AbsoluteUri, out _, out _);
@@ -146,13 +146,19 @@ public static class HlsParser
             else if (line.StartsWith("#EXT-X-BYTERANGE:", StringComparison.Ordinal))
             {
                 string[] parts = line["#EXT-X-BYTERANGE:".Length..].Split('@');
-                if (parts.Length > 2 || !long.TryParse(parts[0], out long len) || len <= 0)
+                rangeLength = rangeOffset = null;
+                implicitRange = false;
+                if (parts.Length is < 1 or > 2
+                    || !TryParseByteRangeInteger(parts[0], out long len) || len <= 0)
                     SetUnsupported(media, "The playlist contains an invalid byte-range length.");
-                else rangeLength = len;
-                implicitRange = parts.Length == 1;
-                if (implicitRange) rangeOffset = nextOffset;
-                else if (long.TryParse(parts[1], out long off) && off >= 0) rangeOffset = off;
-                else SetUnsupported(media, "The playlist contains an invalid byte-range offset.");
+                else
+                {
+                    rangeLength = len;
+                    implicitRange = parts.Length == 1;
+                    if (implicitRange) rangeOffset = nextOffset;
+                    else if (TryParseByteRangeInteger(parts[1], out long off)) rangeOffset = off;
+                    else SetUnsupported(media, "The playlist contains an invalid byte-range offset.");
+                }
             }
             else if (line.StartsWith("#EXT-X-KEY:", StringComparison.Ordinal))
             {
@@ -184,7 +190,8 @@ public static class HlsParser
                 long? length = null, offset = null;
                 if (a.GetValueOrDefault("BYTERANGE")?.Split('@') is { } br)
                 {
-                    if (br.Length != 2 || !long.TryParse(br[0], out long l) || l <= 0 || !long.TryParse(br[1], out long o) || o < 0 || o > long.MaxValue - l)
+                    if (br.Length != 2 || !TryParseByteRangeInteger(br[0], out long l) || l <= 0
+                        || !TryParseByteRangeInteger(br[1], out long o) || o > long.MaxValue - l)
                         SetUnsupported(media, "An initialization byte range needs a valid explicit offset.");
                     else { length = l; offset = o; }
                 }
@@ -255,6 +262,9 @@ public static class HlsParser
         media.Unsupported = reason;
         media.UnsupportedReasonCode = code;
     }
+
+    private static bool TryParseByteRangeInteger(string value, out long result) =>
+        long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out result);
 
     private static byte[]? ParseIv(string? text)
     {

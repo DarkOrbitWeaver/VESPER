@@ -70,7 +70,8 @@ public static class FormatSelector
             {
                 if (string.IsNullOrWhiteSpace(p.AudioTrackId)) combos.Add(new Combo(v, null, p.Container));
             }
-            else if (audios.Count == 0) combos.Add(new Combo(v, null, p.Container));
+            else if (audios.Count == 0 && !(v.Protocol == StreamProtocol.Hls && v.AudioGroupId is not null))
+                combos.Add(new Combo(v, null, p.Container));
             else if (p.AllowMuxing)
             {
                 var pool = p.NativeMergeOnly ? audios.Where(x => MergeCapability.MergeContainer(v, x) is not null).ToList() : audios;
@@ -80,7 +81,7 @@ public static class FormatSelector
         }
 
         if (combos.Count == 0)
-            return Fail(MediaErrors.NoFormat("Only separate video/audio streams exist and muxing is disabled by preference"));
+            return Fail(MediaErrors.NoFormat("No compatible video and audio combination is available"));
 
         // "Best available with audio": never prefer a silent stream over one with sound.
         if (combos.Any(c => c.HasAudio)) combos = combos.Where(c => c.HasAudio).ToList();
@@ -127,6 +128,8 @@ public static class FormatSelector
                 List<Combo> tier;
                 if (under.Count == 0)
                 {
+                    if (p.Fallback is FallbackPolicy.Fail or FallbackPolicy.LowerOnly)
+                        return Fail(MediaErrors.NoFormat($"Nothing at or below {cap}p"));
                     int low = combos.Min(c => c.Height);
                     tier = combos.Where(c => c.Height == low).ToList();
                     fallback = true;
@@ -261,9 +264,12 @@ public static class FormatSelector
 
     private static SelectionResult SelectAudio(List<MediaRepresentation> reps, List<MediaRepresentation> audios, FormatPreferences p)
     {
+        bool FitsLimits(MediaRepresentation r) => (!p.ContainerStrict || p.Container is null
+                || string.Equals(r.Container, p.Container, StringComparison.OrdinalIgnoreCase))
+            && (p.MaxFileSizeBytes is null || r.FileSize is null || r.FileSize <= p.MaxFileSizeBytes);
         if (audios.Count > 0)
         {
-            var a = PickAudio(audios, p, null);
+            var a = PickAudio(audios.Where(FitsLimits).ToList(), p, null);
             if (a is not null) return Ok(new FormatSelection
             {
                 Audio = a,
@@ -273,15 +279,13 @@ public static class FormatSelector
                 EstimatedSizeIsEstimate = a.FileSizeIsEstimate,
                 Summary = $"audio {a.AudioCodec ?? a.Container ?? ""} {(a.BitrateKbps is { } k ? k + " kbps" : "")}".Trim()
             });
-            if (string.IsNullOrWhiteSpace(p.AudioTrackId))
-                return Fail(MediaErrors.NoFormat("No playable audio-only format is available"));
         }
 
         // No audio-only stream: the only honest answer is a muxed stream plus an explicit extraction requirement.
-        var muxed = reps.Where(r => r.Content == StreamContent.VideoAndAudio
+        var muxed = reps.Where(r => r.Content == StreamContent.VideoAndAudio && FitsLimits(r)
             && (string.IsNullOrWhiteSpace(p.AudioTrackId) || r.AudioTrackId == p.AudioTrackId)).ToList();
         if (muxed.Count == 0)
-            return Fail(MediaErrors.NoFormat("No stream with audio exists"));
+            return Fail(MediaErrors.NoFormat("No audio format matches your selection"));
 
         var smallest = muxed.OrderBy(r => r.Height ?? 0).ThenBy(r => r.BitrateKbps ?? 0).ThenBy(r => r.Id, StringComparer.Ordinal).First();
         return Ok(new FormatSelection
@@ -306,8 +310,8 @@ public static class FormatSelector
         // HLS video variants pair only with renditions of their AUDIO group.
         if (video is { Protocol: StreamProtocol.Hls, AudioGroupId: { } group })
         {
-            var inGroup = audios.Where(a => a.Protocol == StreamProtocol.Hls && a.AudioGroupId == group).ToList();
-            if (inGroup.Count > 0) pool = inGroup;
+            pool = audios.Where(a => a.Protocol == StreamProtocol.Hls && a.AudioGroupId == group
+                && (video.ManifestUrl is null || a.ManifestUrl == video.ManifestUrl));
         }
         else if (video is not null)
         {

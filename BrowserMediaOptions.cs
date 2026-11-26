@@ -355,7 +355,7 @@ internal sealed partial class BrowserBridgeHandler
                 accepted.Add(new BridgeResult("", "already-submitted", first.ToString("D"), "Previously accepted."));
                 for (int i = 1; i < 64; i++)
                     if (engine.FindAcceptedSubmission(request.Id + ":" + i) is Guid extra)
-                        accepted.Add(new BridgeResult("", "already-submitted", extra.ToString("D"), "Previously accepted."));
+                        accepted.Add(new BridgeResult("", "already-submitted", extra.ToString("D"), "Previously accepted.", Subtitle: true));
                 return BridgeResponse.Success(request.Id, message: "The original download was accepted. Check any requested subtitle jobs before retrying.", results: accepted.ToArray());
             }
             return BridgeResponse.Fail(request.Id, "expired-selection", "These formats have expired. Refresh them to try again.");
@@ -381,13 +381,18 @@ internal sealed partial class BrowserBridgeHandler
             if (planned.Choice is null) return BridgeResponse.Fail(request.Id, "invalid", planned.Error ?? "This selection cannot be downloaded.");
             job = planned.Choice;
         }
+        bool queue = request.Mode == "queue";
         var jobs = ExpandSubtitleChoices([job]);
-        var results = jobs.Select((choice, index) => QueueMedia(choice, request.Mode == "queue", $"{request.Id}:{index}")).ToArray();
-        if (results.Any(result => result.Status is "started" or "queued"))
+        BridgeResult primary = QueueMedia(jobs[0], queue, request.Id + ":0");
+        if (primary.JobId is null)
+            return BridgeResponse.Fail(request.Id, "rejected", primary.Message) with { Results = [primary] };
+
+        var results = new List<BridgeResult> { primary };
+        for (int index = 1; index < jobs.Count; index++)
+            results.Add(QueueMedia(jobs[index], queue, $"{request.Id}:{index}"));
+        if (primary.Status is "started" or "queued")
             owner?.RequestBrowserPresentation("media:" + request.Id, explicitRequest: true);
-        return results.Any(result => result.JobId is not null)
-            ? BridgeResponse.Success(request.Id, message: job.SubtitleNotice ?? "", results: results)
-            : BridgeResponse.Fail(request.Id, "rejected", results[0].Message);
+        return BridgeResponse.Success(request.Id, message: job.SubtitleNotice ?? "", results: results);
     }
 
     internal BridgeResult QueueMedia(MediaDownloadChoice job, bool queue, string requestId)
@@ -402,10 +407,11 @@ internal sealed partial class BrowserBridgeHandler
             MediaMetadataJson: job.MediaMetadataJson, Secrets: job.Secrets));
         string status = added.Status switch
         {
-            AddStatus.Added => queue ? "queued" : "started",
+            AddStatus.Added => queue || added.StartDeferred ? "queued" : "started",
             AddStatus.AlreadySubmitted => "already-submitted",
             _ => "rejected"
         };
-        return new BridgeResult(UrlPolicy.Redact(job.Url), status, added.Ok ? added.JobId.ToString("D") : null, added.Message);
+        return new BridgeResult(UrlPolicy.Redact(job.Url), status, added.Ok ? added.JobId.ToString("D") : null,
+            added.Message, Subtitle: job.IsSubtitle ? true : null);
     }
 }
