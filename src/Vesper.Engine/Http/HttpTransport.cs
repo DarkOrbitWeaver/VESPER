@@ -198,9 +198,20 @@ internal sealed class HttpTransport : IDisposable
         }
     }
 
-    private static HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameRequestOrigin, bool sameCredentialOrigin)
+    private HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameRequestOrigin, bool sameCredentialOrigin)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, url);
+        if (_options.Http2Experiment && url.Scheme == Uri.UriSchemeHttps)
+        {
+            request.Version = HttpVersion.Version20;
+            request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
+        }
+        else if (_options.Http2Experiment && _options.AllowPrivateNetworks && url.IsLoopback)
+        {
+            // Prior-knowledge h2c is restricted to explicitly allowed loopback fixtures.
+            request.Version = HttpVersion.Version20;
+            request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+        }
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
         request.Headers.TryAddWithoutValidation("User-Agent", string.IsNullOrWhiteSpace(spec.UserAgent) ? DefaultUserAgent : spec.UserAgent);
         // Page URLs can carry tokens. Keep the full referrer on the source origin only.

@@ -61,6 +61,8 @@ public sealed class EngineOptions
     public string? ProxyAddress { get; init; }
     internal Func<string, CancellationToken, Task<IPAddress[]>>? ResolveHost { get; init; }
     public OriginCooldown Cooldown { get; } = new();
+    // Opt-in protocol experiment only. Production remains on the verified H1 transport.
+    internal bool Http2Experiment { get; init; }
 
     public RetryOptions Retry { get; init; } = new();
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(20);
