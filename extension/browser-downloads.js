@@ -1404,16 +1404,13 @@ async function earlyDirectDownload(message, sender) {
     try {
       await siteRulesLoaded;
       if (!await enabled() || matchesNeverCaptureHost({ url, referrer: page.href })) return fallback;
-      // Anonymous first. Only an explicitly enabled sign-in and a concrete
-      // same-origin link may retry a 401/403 with credentials; never follow
-      // a credentialed redirect or transfer cookies to another origin.
+      // With permission, check the same signed-in representation the click would see.
+      // A guest file can look valid while containing different data.
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 2500);
       let response, signedItems = null;
       try {
-        response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
-          cache: 'no-store', signal: controller.signal });
-        if ([401,403].includes(response.status) && new URL(url).origin === page.origin
+        if (new URL(url).origin === page.origin
             && page.protocol === 'https:' && await enabled() && await signInEnabled()) {
           const enriched = await withSignIn([{url, originalUrl:url, referer:page.href, userAgent:navigator.userAgent}],
             {frame:{tabId:sender.tab.id, frameId:sender.frameId ?? 0,
@@ -1424,6 +1421,8 @@ async function earlyDirectDownload(message, sender) {
             signedItems = enriched.items;
           }
         }
+        if (!response) response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
+          cache: 'no-store', signal: controller.signal });
       } finally { clearTimeout(timeout); }
       const final = VesperPlayerSource.http(response.url);
       const mime = mimeType(response.headers.get('content-type'));
@@ -1436,16 +1435,18 @@ async function earlyDirectDownload(message, sender) {
       const lengthText = response.headers.get('content-length') || '';
       const length = /^\d+$/.test(lengthText) ? Number(lengthText) : 0;
       const etag = response.headers.get('etag')?.trim();
+      const lastModified = !etag ? strongLastModified(response.headers.get('last-modified'), response.headers.get('date')) : undefined;
       const encoding = response.headers.get('content-encoding');
       if (response.status !== 200 || !final || final.username || final.password
           || signedItems && (final.href !== url || response.redirected)
           || final.protocol !== 'https:' && final.origin !== page.origin
           || !mime || !documentAttachment && (mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json')
           || (!attachment && !binary) || !Number.isSafeInteger(length) || length <= 0
-          || !etag || !/^"[^"\x00-\x20\x7f]{0,254}"$/.test(etag)
+          || !lastModified && (!etag || !/^"[^"\x00-\x20\x7f]{0,254}"$/.test(etag))
           || encoding && encoding.toLowerCase() !== 'identity'
           || matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !await enabled()) return fallback;
-      const proof = { length, etag, contentType: mime, attachment, basis: 'etag' };
+      const proof = { length, contentType: mime, attachment,
+        ...(lastModified ? { lastModified, basis: 'last-modified' } : { etag, basis: 'etag' }) };
       const items = signedItems || [{ url: final.href, originalUrl: url, referer: page.href, userAgent: navigator.userAgent }];
       // A server-specified attachment filename wins over the HTML download name.
       const disposition = response.headers.get('content-disposition') || '';

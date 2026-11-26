@@ -81,6 +81,8 @@ public sealed class Mp4HeaderFactsTests
     [InlineData("tail-silent", true)]
     [InlineData("tail-changed", false)]
     [InlineData("tail-fragmented", false)]
+    [InlineData("slice-lower-bound", true)]
+    [InlineData("slice-outside-extent", false)]
     public async Task Observed_partial_response_requires_the_same_complete_muxed_representation(string mode, bool success)
     {
         const string url = "https://cdn.example.com/opaque";
@@ -92,6 +94,7 @@ public sealed class Mp4HeaderFactsTests
             mode == "tail-fragmented" ? Box("mvex") : []);
         byte[] file = tail ? Join(Box("ftyp", Ascii("isom")), Box("mdat", new byte[300_000]), moov)
             : Join(Box("ftyp", Ascii("isom")), moov, Box("mdat", new byte[64]));
+        bool slice = mode.StartsWith("slice-", StringComparison.Ordinal);
         using var resolver = new DefaultMediaResolver(handler: new RangeFixture(file, mode));
         var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
         {
@@ -100,7 +103,9 @@ public sealed class Mp4HeaderFactsTests
             {
                 Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
                 Candidates = [new BrowserMediaCandidate { Url = url, Kind = "direct", MimeType = "video/mp4",
-                    ObservedLength = file.Length + (mode == "wrong-size" ? 1 : 0), ObservedETag = "\"original\"" }]
+                    ObservedLength = slice ? null : file.Length + (mode == "wrong-size" ? 1 : 0),
+                    ObservedMinimumLength = slice ? file.Length + (mode == "slice-outside-extent" ? 1 : -1) : null,
+                    ObservedETag = "\"original\"" }]
             }
         }, CancellationToken.None);
         Assert.Equal(success, result.IsSuccess);

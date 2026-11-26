@@ -589,7 +589,8 @@ function sourceAffinity(source, fragments) {
 
 function rankObservedSources(sources, changedAt, resourceWitness = new Set(), fragments = [], exactResources = new Set()) {
   const ranked = sources.map(source => ({ source, score: evidenceStrength(source, changedAt)
-    + (exactResources.has(source.url) ? 24 : 0) + (resourceWitness.has(source.url) ? 8 : 0) + 4 * sourceAffinity(source, fragments),
+    + (exactResources.has(source.url) ? 24 : 0) + (source.sliceEvidence ? 24 : 0)
+    + (resourceWitness.has(source.url) ? 8 : 0) + 4 * sourceAffinity(source, fragments),
     distance: Math.abs(source.seen - changedAt) }))
     .sort((a, b) => b.score - a.score || a.distance - b.distance)
     .map(entry => entry.source);
@@ -643,7 +644,8 @@ function exactSourceRequest(source, auth, pageUrl, title, playbackFingerprints) 
     ...auth, url: pageUrl, pageTitle: title,
     ...(playbackFingerprints?.length ? { playbackFingerprints } : {}),
     candidates: group.map(item => ({ url: item.url, kind: item.kind, mimeType: item.mime || undefined,
-      ...(ranged ? { observedLength: item.bytes, observedETag: item.validator } : {}) }))
+      ...(ranged ? { observedLength: item.bytes ?? undefined, observedMinimumLength: item.minimumLength,
+        observedETag: item.validator } : {}) }))
   });
 }
 
@@ -702,7 +704,7 @@ function distinctVerifiedDeliveries(results, signed) {
 
 // The most specific reason none of the candidates could be used, so the picker can say what to do.
 function bestRefusal(results) {
-  const order = ['desktop-version-mismatch', 'protected', 'blocked', 'sign-in', 'site-refused', 'source-expired', 'rate-limited',
+  const order = ['desktop-version-mismatch', 'protected', 'blocked', 'sign-in', 'site-refused', 'source-changed', 'source-expired', 'rate-limited',
     'browser-context', 'unsupported', 'network', 'host-missing', 'app-unavailable', 'host-error', 'timeout'];
   const failures = results.map(result => result.reply).filter(reply => reply && !reply.ok && reply.code);
   for (const code of order) {
@@ -742,7 +744,8 @@ function watchTabForManifests(tabId) {
     // Segment/range responses must never become full-file suggestions just because
     // their MIME says video. The normal observer still validates headers and kind.
     const url = VesperPlayerSource.http(details.url);
-    if (!url || isPartialMediaUrl(url) || VesperIntelligence.sourceKind(url.href, type) === 'fragment') return;
+    if (!url || isPartialMediaUrl(url) && !queryByteRange(url)
+        || VesperIntelligence.sourceKind(url.href, type) === 'fragment') return;
     return observeMediaResponse(details);
   };
   try {
@@ -869,12 +872,24 @@ function isPartialMediaUrl(url) {
     .some(key => /^(?:range|sq|segment|chunk|frag|bytestart|byteend)$/i.test(key));
 }
 
+const MAX_MEDIA_RANGE_LENGTH = 17_179_869_184;
+
+function queryByteRange(url) {
+  const starts = url.searchParams.getAll('bytestart'), ends = url.searchParams.getAll('byteend');
+  if (starts.length !== 1 || ends.length !== 1 || !/^\d+$/.test(starts[0]) || !/^\d+$/.test(ends[0])) return null;
+  const start = Number(starts[0]), end = Number(ends[0]);
+  if (Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end && end < MAX_MEDIA_RANGE_LENGTH)
+    return { start, end };
+  return null;
+}
+
 // A partial response with a strong validator and complete extent is only a
 // candidate for the separate native verification command, never a whole file.
 function isRangedMediaCandidate(source) {
   const url = VesperPlayerSource.http(source.url);
+  const length = source.bytes ?? source.minimumLength;
   return source.kind === 'direct' && source.rangeResource === true && !source.conflictingValidator
-    && Number.isSafeInteger(source.bytes) && source.bytes > 0 && source.bytes <= 17_179_869_184
+    && Number.isSafeInteger(length) && length > 0 && length <= MAX_MEDIA_RANGE_LENGTH
     && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(source.validator || '')
     && source.mime === 'video/mp4' && !!url && !isPartialMediaUrl(url);
 }
@@ -885,18 +900,18 @@ function isRangedMediaCandidate(source) {
 function observedSliceCandidates(sources, witnessed) {
   const groups = new Map();
   for (const source of sources) {
-    if (!witnessed.has(source.url) || source.conflictingValidator || !source.rangeResource
+    if (!witnessed.has(source.url) || source.conflictingValidator || !(source.rangeResource || source.querySlice)
         || source.mime !== 'video/mp4' || !Number.isSafeInteger(source.bytes) || source.bytes <= 0
         || !source.validator || !Number.isSafeInteger(source.rangeStart) || !Number.isSafeInteger(source.rangeEnd)) continue;
     const url = VesperPlayerSource.http(source.url);
     if (!url || url.protocol !== 'https:' || url.hash || url.username || url.password) continue;
-    const starts = url.searchParams.getAll('bytestart'), ends = url.searchParams.getAll('byteend');
-    if (starts.length !== 1 || ends.length !== 1 || !/^\d+$/.test(starts[0]) || !/^\d+$/.test(ends[0])
-        || Number(starts[0]) !== source.rangeStart || Number(ends[0]) !== source.rangeEnd) continue;
+    const range = queryByteRange(url);
+    if (!range || range.start !== source.rangeStart || range.end !== source.rangeEnd) continue;
     const raw = url.search.slice(1).split('&').filter(part => !/^(?:bytestart|byteend)=/.test(part));
     url.search = raw.length ? '?' + raw.join('&') : '';
     if (isPartialMediaUrl(url) || url.href === source.url) continue;
-    const key = JSON.stringify([url.href, source.validator, source.bytes]);
+    const total = source.querySlice ? null : source.bytes;
+    const key = JSON.stringify([url.href, source.validator, total]);
     const group = groups.get(key) || {url: url.href, members: []};
     group.members.push(source);
     groups.set(key, group);
@@ -907,7 +922,8 @@ function observedSliceCandidates(sources, witnessed) {
     const other = members.find((member,i) => i > 0 && member.rangeStart > members[0].rangeEnd);
     if (!other) continue;
     const first = members[0];
-    const candidate = {...first, url:group.url, seen:Math.max(first.seen, other.seen),
+    const candidate = {...first, url:group.url, seen:Math.max(first.seen, other.seen), rangeResource:true,
+      bytes:first.querySlice ? null : first.bytes, minimumLength:first.querySlice ? other.rangeEnd + 1 : undefined,
       wholeRepresentation:false, sliceEvidence:[first,other]};
     if (isRangedMediaCandidate(candidate)) candidates.push(candidate);
   }
@@ -1019,6 +1035,7 @@ function verifiedSourceLabel(source, reply) {
   const countText = count > 1 ? `${count} formats` : '1 format';
   return {
     token: source.token,
+    fingerprint: /^[a-f0-9]{64}$/i.test(data.deliveryFingerprint || '') ? data.deliveryFingerprint : undefined,
     label: [duration, facts.live === true ? 'Live' : '', facts.height ? `${facts.height}p` : '',
       tracks, format, countText].filter(Boolean).join(' · '),
     detail: best?.detail || best?.label || '',
@@ -1040,7 +1057,7 @@ function rememberSourceSelections(sources, context) {
   return sources.map(source => {
     const token = crypto.randomUUID();
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
-      seen: source.seen, validator: source.validator, bytes: source.bytes,
+      seen: source.seen, validator: source.validator, bytes: source.bytes, minimumLength: source.minimumLength,
       rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
       sliceEvidence: source.sliceEvidence,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
@@ -1078,9 +1095,14 @@ const observeMediaResponse = (details) => {
     && (details.statusCode === 200 && !range || validRange)
     && rawTag && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(rawTag) ? rawTag : null;
   if (!isPlaylist && !(details.type === 'media' || DIRECT.test(details.url) || /^(?:audio|video)\//i.test(type))) return;
+  const mime = type.split(';')[0].trim().toLowerCase();
+  const url = details.statusCode === 200 && !range && validator && mime === 'video/mp4'
+    && details.url.includes('bytestart=') ? VesperPlayerSource.http(details.url) : null;
+  const slice = url && queryByteRange(url);
+  const querySlice = !!slice && contentLength === slice.end - slice.start + 1;
   return addSource(details.tabId, {
     url: details.url,
-    kind: VesperPlayerSource.kind(details.url, type), mime: type.split(';')[0].trim().toLowerCase(), bytes, validator,
+    kind: VesperPlayerSource.kind(details.url, type), mime, bytes, validator,
     // Store only the CORS policy, not request cookies or response secrets.
     corsOrigin: (() => {
       const value = header('access-control-allow-origin')?.trim();
@@ -1091,9 +1113,11 @@ const observeMediaResponse = (details) => {
     corsExposeEtag: (header('access-control-expose-headers') || '').split(',').some(name => name.trim().toLowerCase() === 'etag'),
     corsExposeWildcard: (header('access-control-expose-headers') || '').split(',').some(name => name.trim() === '*'),
     // This means headers describe the whole representation; VESPER still fetches and validates the URL itself.
-    wholeRepresentation: !isPlaylist && (details.statusCode === 200 && !range || fullRange),
+    wholeRepresentation: !isPlaylist && (details.statusCode === 200 && !range && !querySlice || fullRange),
     rangeResource: !isPlaylist && !!validRange && !!validator,
-    rangeStart: validRange ? rangeStart : null, rangeEnd: validRange ? rangeEnd : null,
+    querySlice,
+    rangeStart: validRange ? rangeStart : querySlice ? slice.start : null,
+    rangeEnd: validRange ? rangeEnd : querySlice ? slice.end : null,
     unexpectedRange: details.statusCode === 200 && !!range,
     requestType: details.type, ...(details.typedManifest ? { typedManifest: true } : {}),
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
@@ -1249,7 +1273,7 @@ async function playerOptions(message, sender) {
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
   const lookupKey = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
-    route, mutedLoop, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
+    route, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
@@ -1345,6 +1369,14 @@ async function playerOptions(message, sender) {
     const title = binding || !youTube ? message.title : undefined;
 
     if (route !== 'chrome') {
+      // A page-wide result could describe a different player on an unfamiliar page.
+      if (binding && message.multiplePlayers === true && /^https?:/.test(identity) && !possibleSources.length) {
+        if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
+        const exact = usableSource ? candidate(usableSource) : matchedManifest;
+        if (exact) return explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
+        return { ok: false, code: 'no-reusable-source',
+          message: 'VESPER couldn’t verify a source for this player. Start playback and refresh formats.' };
+      }
       // A single-video page can give the resolver a better identity than nearby network traffic.
       const pageInput = { ...auth, url: page.href, pageTitle: title,
         candidates: !youTube || candidates.length ? candidates : undefined,
@@ -1455,6 +1487,7 @@ async function playerOptions(message, sender) {
         // One additional bounded wave is allowed if no verified source matches it.
         const boundMatch = result => usableReply(result) && (exactResources.has(result.source.url)
           || result.source.group?.some(member => exactResources.has(member.url))
+          || result.source.sliceEvidence?.every(member => exactResources.has(member.url))
           || Number.isInteger(result.reply.data?.playbackMatches) && result.reply.data.playbackMatches > 0
             && result.reply.data.playbackMatches <= fingerprints.size);
         const needsMore = !checked.some(usableReply) || fingerprints.size > 0 && !checked.some(boundMatch);
@@ -1469,7 +1502,8 @@ async function playerOptions(message, sender) {
             fragment.origin + '/' + fragment.parts.join('/'))
         });
         const ordered = association.nodes.map(node => node.entry);
-        const usable = distinctVerifiedDeliveries(ordered, auth.authorized === true);
+        const usable = distinctVerifiedDeliveries(association.nodes.filter(node => node.compatible).map(node => node.entry),
+          auth.authorized === true);
         if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) return association.selected.reply;
         // Timing found these, so the user confirms which one is this player, even when only one
         // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
@@ -1581,7 +1615,8 @@ async function selectMediaSource(message, sender) {
     && (source.frameId ?? 0) === selection.frame && source.seen >= selected.seen && source.kind === selected.kind
     && source.seen >= now - (selected.kind === 'direct' ? 120_000 : sourceLifetime(selected)) && source.seen <= now + 1000
     && (source.kind !== 'direct' || (isWholeDirectSource(source) || isRangedMediaCandidate(source)
-      || selected.sliceWitness === true && source.rangeResource === true
+      || selected.sliceWitness === true && (source.rangeResource === true || source.querySlice === true)
+        && source.querySlice === selected.querySlice
         && source.rangeStart === selected.rangeStart && source.rangeEnd === selected.rangeEnd) && !source.conflictingValidator
       && source.validator === selected.validator && source.bytes === selected.bytes && source.mime === selected.mime));
   const selectedEvidence = selection.sliceEvidence?.map(source => ({...source, sliceWitness:true})) || selection.group || [selection];
@@ -1592,7 +1627,8 @@ async function selectMediaSource(message, sender) {
     return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
   const auth = await mediaAuthorization(page.href, sender, { userGesture: true });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
-  if (!auth.authorized && selection.verified?.ok) return selection.verified;
+  const expiry = Date.parse(selection.verified?.data?.formatsExpireAt || '');
+  if (!auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)) return selection.verified;
   return explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
 }
 

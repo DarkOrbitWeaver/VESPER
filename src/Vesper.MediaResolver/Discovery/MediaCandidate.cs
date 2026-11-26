@@ -16,8 +16,12 @@ internal sealed record MediaCandidate(
     string? Label = null,
     bool MutedLoop = false,
     long? ObservedLength = null,
-    string? ObservedETag = null)
+    string? ObservedETag = null,
+    long? ObservedMinimumLength = null)
 {
+    internal const long MaxObservedLength = 17_179_869_184;
+    internal bool HasRangeEvidence => ObservedLength is not null || ObservedMinimumLength is not null;
+
     public static readonly IReadOnlySet<string> MediaExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "mp4", "m4v", "webm", "mkv", "mov", "avi", "flv", "ts", "mpg", "mpeg", "3gp", "ogv", "wmv",

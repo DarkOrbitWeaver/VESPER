@@ -112,6 +112,7 @@ test('a manually pinned small player remains draggable', () => {
     video,
     drag,
     Math,
+    playerAnchor: player => player,
     visiblePlayer: (...args) => { sizes.push(args); return { left: 0, top: 0, right: 150, bottom: 90 }; },
     button: { classList: { add() {} } },
     dragPerch: () => ({ x: 0.5, y: 0.5 }),

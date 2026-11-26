@@ -26,6 +26,14 @@
       ? value : null;
   }
 
+  function fileAddress(element) {
+    const raw = element.getAttribute('href')?.trim();
+    const href = raw && !raw.startsWith('#') ? http(raw) : null;
+    const download = http(element.dataset.downloadUrl);
+    if (href && download && href !== download) return null;
+    return download || href || http(element.dataset.url) || http(element.dataset.href);
+  }
+
   function fileDetails(element, url, player) {
     const name = element.getAttribute('download') || new URL(url).pathname.split('/').pop() || '';
     const extension = /\.([a-z0-9]{1,8})$/i.exec(name)?.[1];
@@ -54,7 +62,7 @@
       const links = scope.querySelectorAll(LINK_SELECTOR);
       let count = 0, onlyUrl;
       for (const link of links) {
-        const target = http(link.getAttribute('href') || link.dataset.downloadUrl || link.dataset.url || link.dataset.href);
+        const target = fileAddress(link);
         if (target) { count++; onlyUrl = target; if (count > 1) break; }
       }
       if (count !== 1 || onlyUrl !== url) continue;
@@ -80,15 +88,16 @@
     const status = document.createElement('p'); status.setAttribute('role', 'status');
     const footer = document.createElement('footer');
     const close = document.createElement('button'); close.textContent = 'Cancel';
-    const all = document.createElement('button'); all.textContent = 'Select visible';
+    const all = document.createElement('button'); all.textContent = 'Select matches';
     const guided = document.createElement('button'); guided.textContent = 'Guided batch…';
     guided.addEventListener('click', () => { finish(); globalThis.VesperSmartBatch?.open(); });
     const review = document.createElement('button'); review.textContent = 'Review in VESPER';
-    const selected = new Set(), settled = new Set(), uncertain = new Set();
-    let candidates = [], scheduled = false, copying = false, copyController = null, copyStatus = '';
+    const selected = new Map(), settled = new Set(), uncertain = new Set();
+    let candidates = [], scheduled = false, copying = false, reviewing = false, copyController = null;
+    let copyStatus = '', selectionChanged = false;
     const previousFocus = document.activeElement;
     function scheduleCollect() {
-      if (scheduled || copying) return;
+      if (scheduled || copying || reviewing) return;
       scheduled = true;
       queueMicrotask(() => { if (panel === host) collect(); });
     }
@@ -115,16 +124,22 @@
           else generated.set(blob, filename);
           if (ambiguous.has(blob)) { found.delete(blob); continue; }
         }
-        const url = blob || http(element.getAttribute('href') || element.dataset.downloadUrl || element.dataset.url || element.dataset.href);
+        const url = blob || fileAddress(element);
         if (!url || found.has(url) || url.split('#')[0] === location.href.split('#')[0]) continue;
         const details = fileDetails(element, url, players.get(url));
         if (!details) continue;
         const label = (element.textContent?.trim() || element.getAttribute('aria-label') || element.getAttribute('download') || new URL(url).pathname.split('/').pop() || 'File').trim().replace(/\s+/g, ' ').slice(0, 200);
-        found.set(url, { url, label, ...details, generated: Boolean(blob), originalName: blob ? generated.get(blob) : undefined,
-          sha256: blob ? null : publisherChecksum(element, url) });
+        const originalName = element.getAttribute('download');
+        const sha256 = blob ? null : publisherChecksum(element, url);
+        const identity = JSON.stringify([Boolean(blob), originalName, sha256]);
+        found.set(url, { url, label, ...details, generated: Boolean(blob), originalName, sha256, identity });
       }
       candidates = [...found.values()];
-      for (const url of selected) if (!found.has(url)) selected.delete(url);
+      for (const [url, identity] of selected) {
+        if (found.get(url)?.identity === identity) continue;
+        selected.delete(url);
+        selectionChanged = true;
+      }
       render();
     }
     const matchesFilter = (candidate, query) => `${candidate.label} ${candidate.type} ${candidate.url}`.toLowerCase().includes(query);
@@ -135,8 +150,14 @@
       for (const candidate of visible) {
         const item = document.createElement('li'), label = document.createElement('label');
         const check = document.createElement('input'); check.type = 'checkbox'; check.checked = selected.has(candidate.url);
-        check.disabled = copying || settled.has(candidate.url) || uncertain.has(candidate.url) || !check.checked && selected.size >= 50;
-        check.addEventListener('change', () => { check.checked ? selected.add(candidate.url) : selected.delete(candidate.url); render(); });
+        check.disabled = copying || reviewing || settled.has(candidate.url) || uncertain.has(candidate.url)
+          || !check.checked && selected.size >= 50;
+        check.addEventListener('change', () => {
+          if (check.checked) selected.set(candidate.url, candidate.identity);
+          else selected.delete(candidate.url);
+          selectionChanged = false;
+          render();
+        });
         const text = document.createElement('span'); text.textContent = candidate.label;
         const address = document.createElement('small');
         // Signed query strings are never copied into a label or tooltip.
@@ -155,18 +176,20 @@
       const mixed = blobs > 0 && blobs < selectedFiles.length;
       review.textContent = blobs ? 'Copy with VESPER' : 'Review in VESPER';
       status.textContent = copying || copyStatus ? copyStatus : mixed ? 'Select generated browser files separately from ordinary links.'
+        : selectionChanged ? 'Some selected files changed. Review your selection.'
         : candidates.length ? `${selected.size} selected · ${visible.length} matching files. Maximum 50 per review.`
         : 'No direct file links found on this page.';
-      all.disabled = copying || visible.length === 0 || selected.size >= 50;
+      all.disabled = copying || reviewing || visible.length === 0 || selected.size >= 50;
       guided.disabled = copying;
       filter.disabled = copying;
-      review.disabled = copying || selected.size === 0 || mixed;
+      review.disabled = copying || reviewing || selectionChanged || selected.size === 0 || mixed;
     }
     filter.addEventListener('input', render);
     all.addEventListener('click', () => {
       const query = filter.value.toLowerCase().trim();
       for (const candidate of candidates) if (selected.size < 50 && matchesFilter(candidate, query)
-          && !settled.has(candidate.url) && !uncertain.has(candidate.url)) selected.add(candidate.url);
+          && !settled.has(candidate.url) && !uncertain.has(candidate.url)) selected.set(candidate.url, candidate.identity);
+      selectionChanged = false;
       render();
     });
     close.addEventListener('click', finish);
@@ -212,21 +235,29 @@
       }
     }
     review.addEventListener('click', async () => {
+      if (copying || reviewing) return;
+      collect();
       const files = candidates.filter(item => selected.has(item.url));
-      if (copying || !files.length) return;
+      if (selectionChanged || !files.length) return;
       if (files.every(item => item.generated)) return copyGeneratedFiles(files);
       if (files.some(item => item.generated)) return;
-      review.disabled = true; status.textContent = 'Review the selected files in the VESPER desktop window…';
+      reviewing = true;
+      render();
+      status.textContent = 'Review the selected files in VESPER…';
       try {
-        const reply = await chrome.runtime.sendMessage({ type: 'smart-submit', items: [...selected].map(url => {
-          const candidate = candidates.find(item => item.url === url);
-          return { url, reviewLabel: candidate?.label, reviewType: candidate?.type, reviewDurationSeconds: candidate?.duration,
-            ...(candidate?.sha256 ? { sha256: candidate.sha256 } : {}) };
-        }) });
+        const reply = await chrome.runtime.sendMessage({ type: 'smart-submit', items: files.map(candidate => ({
+          url: candidate.url, reviewLabel: candidate.label, reviewType: candidate.type, reviewDurationSeconds: candidate.duration,
+          ...(candidate.sha256 ? { sha256: candidate.sha256 } : {})
+        })) });
         if (reply?.ok) { finish(); return; }
-        status.textContent = reply?.message || 'VESPER did not answer. No files were removed from Chrome.';
-      } catch { status.textContent = 'The extension connection was closed. Refresh this page and try again.'; }
-      review.disabled = false;
+        reviewing = false;
+        render();
+        status.textContent = reply?.message || 'VESPER did not open the review. Try again.';
+      } catch {
+        reviewing = false;
+        render();
+        status.textContent = 'The extension connection was closed. Refresh this page and try again.';
+      }
     });
     section.addEventListener('keydown', event => {
       if (event.key === 'Escape') { event.stopPropagation(); finish(); }

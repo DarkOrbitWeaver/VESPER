@@ -161,6 +161,7 @@ async function main() {
   }
   await access(chromeExe);
   const playerClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/muxed.webm'));
+  const audioClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/quiet-track.mp3'));
   const mseClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/instinct-mse.mp4'));
   const profile = await mkdtemp(join(profileRoot, '.chrome-ownership-smoke-'));
   const downloadFolder = join(profile, 'downloads');
@@ -248,6 +249,20 @@ async function main() {
         + '<video width="640" height="360" src="/player.webm" autoplay muted loop controls></video>'
         + '</div><style>#player:fullscreen video, #player.expanded video{width:100%;height:100%}'
         + '#player.expanded{position:fixed;inset:0}</style>');
+      return;
+    }
+    if (request.url === '/custom-audio') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><title>Custom audio fixture</title>'
+        + '<video id="ad" class="ad-slot" style="width:440px;height:250px" src="/player.webm" autoplay muted></video>'
+        + '<button id="audio-control" style="position:absolute;left:580px;top:250px;width:160px;height:32px" aria-controls="episode">Play episode</button>'
+        + '<audio id="episode" src="/episode.mp3" preload="auto"></audio>'
+        + '<script>document.getElementById("audio-control").onclick = () => document.getElementById("episode").play();</script>');
+      return;
+    }
+    if (request.url === '/episode.mp3') {
+      response.writeHead(200, { 'Content-Type': 'audio/mpeg', 'Content-Length': audioClip.length });
+      response.end(audioClip);
       return;
     }
     if (request.url.startsWith('/intent-feed?')) {
@@ -798,6 +813,15 @@ async function main() {
       await waitFor(() => butterflyInside('main-media'), 5000, 'A reused player retained stale intent, case ' + variant);
       intentScenarios.at(-1).generationReset = true;
     }
+    await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/custom-audio' }, tab);
+    await waitFor(() => butterflyInside('ad'), 5000, 'The audio fixture did not load the extension.');
+    await waitFor(() => playerBounds('episode'), 5000, 'The custom audio source never loaded.');
+    const audioControl = await playerBounds('audio-control');
+    const x = (audioControl.left + audioControl.right) / 2;
+    const y = (audioControl.top + audioControl.bottom) / 2;
+    await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
+    await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
+    await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
     let recycledPlayer = null;
     if (playerRaceTest) {
       await evaluate('Stub only the picker lookup and native enqueue', `(() => {
@@ -868,6 +892,7 @@ async function main() {
       keptInChrome: true,
       pageMadeKeptInChrome: true,
       fullscreenButterfly: true,
+      customAudioButterfly: true,
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,

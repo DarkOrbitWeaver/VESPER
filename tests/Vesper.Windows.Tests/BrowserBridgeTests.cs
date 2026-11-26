@@ -911,6 +911,7 @@ public sealed class BrowserBridgeTests
     [InlineData(MediaErrorCode.NoDownloadableMedia, "no-media")]
     [InlineData(MediaErrorCode.VideoUnavailable, "unavailable")]
     [InlineData(MediaErrorCode.SourceExpired, "source-expired")]
+    [InlineData(MediaErrorCode.SourceChanged, "source-changed")]
     [InlineData(MediaErrorCode.LoginRequired, "sign-in")]
     [InlineData(MediaErrorCode.AuthorizationRequired, "site-refused")]
     [InlineData(MediaErrorCode.DrmProtected, "protected")]

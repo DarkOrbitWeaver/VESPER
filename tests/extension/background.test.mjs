@@ -2546,6 +2546,22 @@ test('a partial video range is not offered as a complete Instagram source', asyn
   assert.equal(full.data.sourceChoices.length, 1);
 });
 
+test('an unfamiliar page with multiple players cannot substitute page-wide formats for the current player', async () => {
+  const app = load({ 'media-options': checkedSource(15), 'media-source-options': {ok:false, code:'source-unavailable'} });
+  const page = 'https://media.example.com/feed';
+  const source = 'https://media.example.com/current.mp4';
+  const sender = {url:page, tab:{id:81}, frameId:0, documentId:'multi-player-document'};
+  const request = {type:'media-options', pageUrl:page, playerPageUrl:page, playerUrl:source, playerKey:'player-1',
+    generation:5, playerHasMedia:true, mediaChangedAt:Date.now()};
+  try {
+    assert.equal((await app.message(request, sender)).ok, true);
+    const result = await app.message({...request, multiplePlayers:true}, sender);
+    assert.equal(result.code, 'source-unavailable');
+    assert.deepEqual(app.sent.map(message => message.type), ['media-options', 'media-source-options']);
+    assert.equal(app.sent[1].candidates[0].url, source);
+  } finally { app.stopWorker(); }
+});
+
 test('a strongly validated partial media response gets a separate full-file verification command', async () => {
   const app = load({ 'media-options': {ok:false, code:'no-media'}, 'media-range-options': checkedSource(15) });
   const page='https://www.instagram.com/reel/ranged/', url='https://cdn.example.com/opaque-video';
@@ -2575,15 +2591,18 @@ test('two independently witnessed query-addressed ranges can propose a verified 
   const sender={url:page,tab:{id:81},frameId:0,documentId:'query-range-document'};
   const changedAt=Date.now(), urls=[base+'&bytestart=0&byteend=999',base+'&bytestart=1000&byteend=1999'];
   const hash=async url=>Buffer.from(await webcrypto.subtle.digest('SHA-256',new TextEncoder().encode(url))).toString('hex');
-  for(const scenario of ['verified','one-witness','changed-tag','wrong-offset','other-document','changed-after-picker']){
+  for(const scenario of ['verified','one-witness','changed-tag','wrong-offset','other-document','changed-after-picker',
+    'query-200','query-200-incorrect-length','query-200-replaced']){
     const app=load({'media-options':{ok:false,code:'no-media'},'media-range-options':checkedSource(15)});
     try {
       async function report(i,tag,at=changedAt){
+        const querySlice = scenario.startsWith('query-200');
         await app.onMedia({url:urls[i],tabId:81,frameId:0,documentId:scenario==='other-document'&&i===1?'other':sender.documentId,
-          method:'GET',statusCode:206,type:'xmlhttprequest',timeStamp:at,responseHeaders:[
+          method:'GET',statusCode:querySlice ? 200 : 206,type:'xmlhttprequest',timeStamp:at,responseHeaders:[
             {name:'Content-Type',value:'video/mp4'},
-            {name:'Content-Range',value:scenario==='wrong-offset'&&i===1?'bytes 2000-2999/700000':'bytes '+(i*1000)+'-'+(i*1000+999)+'/700000'},
-            {name:'Content-Length',value:'1000'},{name:'ETag',value:tag}]});
+            ...(!querySlice ? [{name:'Content-Range',value:scenario==='wrong-offset'&&i===1?'bytes 2000-2999/700000'
+              :'bytes '+(i*1000)+'-'+(i*1000+999)+'/700000'}] : []),
+            {name:'Content-Length',value:scenario==='query-200-incorrect-length'&&i===1?'999':'1000'},{name:'ETag',value:tag}]});
       }
       await report(0,'"v1"');await report(1,scenario==='changed-tag'?'"v2"':'"v1"');
       const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
@@ -2591,7 +2610,7 @@ test('two independently witnessed query-addressed ranges can propose a verified 
         playerResourceFingerprints:await Promise.all((scenario==='one-witness'?urls.slice(0,1):urls).map(hash))};
       const result=await app.message(request,sender);
       const checks=app.sent.filter(m=>m.type==='media-range-options');
-      if(!['verified','changed-after-picker'].includes(scenario)){
+      if(!['verified','changed-after-picker','query-200','query-200-replaced'].includes(scenario)){
         assert.equal(checks.length,0,scenario);
         assert.equal(result.ok,false,scenario);
         continue;
@@ -2599,11 +2618,13 @@ test('two independently witnessed query-addressed ranges can propose a verified 
       assert.equal(checks.length,1);
       assert.equal(checks[0].candidates[0].url,base);
       assert.equal(checks[0].candidates[0].observedETag,'"v1"');
-      assert.equal(checks[0].candidates[0].observedLength,700000);
+      const querySlice = scenario.startsWith('query-200');
+      assert.equal(checks[0].candidates[0].observedLength,querySlice ? undefined : 700000);
+      assert.equal(checks[0].candidates[0].observedMinimumLength,querySlice ? 2000 : undefined);
       assert.equal(result.data.sourceChoices.length,1);
-      if(scenario==='changed-after-picker')await report(1,'"changed"',changedAt+1);
+      if(['changed-after-picker','query-200-replaced'].includes(scenario))await report(1,'"changed"',changedAt+1);
       const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
-      assert.equal(selected.ok,scenario==='verified',scenario);
+      assert.equal(selected.ok,['verified','query-200'].includes(scenario),scenario);
     }finally{app.stopWorker()}
   }
 });
@@ -4508,6 +4529,24 @@ test('trusted direct intent stages and accepts before any Chrome download exists
     assert.equal(app.downloadHistory.length,0);
   }finally{app.stopWorker()}
 });
+test('trusted direct intent accepts a seasoned Last-Modified only without an ETag', async () => {
+  for (const [etag, date, allowed] of [
+    ['', 'Tue, 03 Nov 2026 10:02:00 GMT', true],
+    ['', 'Tue, 03 Nov 2026 10:00:30 GMT', false],
+    ['W/"v1"', 'Tue, 03 Nov 2026 10:02:00 GMT', false]
+  ]) {
+    const modified = 'Tue, 03 Nov 2026 10:00:00 GMT';
+    const app = load({'browser-capture':started,'browser-transfer':transfer('active')}, {
+      earlyFetch: async () => earlyHeaders(earlyUrl, {ETag: etag, 'Last-Modified': modified, Date: date})
+    });
+    try {
+      const reply = await app.message({type:'early-download', url:earlyUrl}, earlySender);
+      assert.equal(reply.ok === true, allowed);
+      if (allowed) assert.equal(app.sent[0].browserProof.lastModified, modified);
+      else assert.equal(app.sent.length, 0);
+    } finally { app.stopWorker(); }
+  }
+});
 test('explicit same-origin named exports admit extensionless URLs and safe query parameters',async()=>{
   for(const [url,name,mime] of [
     ['https://example.com/export','archive.zip','application/zip'],
@@ -4555,19 +4594,25 @@ test('same-origin signed-in early download requires permission and never follows
       prefs:{useSignIn:scenario!=='disabled'},signInPermission:scenario!=='no-permission',
       earlyFetch:async(address,options)=>{
         requests.push(options);
-        if(options.credentials==='omit')return {status:403,url:address,headers:new Headers()};
+        if(options.credentials==='omit')return earlyHeaders(address, {'ETag':'"guest-file"'});
         assert.equal(options.redirect,'error');
         return scenario==='redirect'?{...earlyHeaders('https://other.example/setup.msi'),redirected:true}:earlyHeaders(address);
       }});
     try{
       const reply=await app.message({type:'early-download',url},earlySender);
-      assert.equal(reply.ok,scenario==='approved',scenario);
-      assert.equal(requests.length,['approved','redirect'].includes(scenario)?2:1,scenario);
+      assert.equal(reply.ok,scenario!=='redirect',scenario);
+      assert.equal(requests.length,1,scenario);
       if(scenario==='approved'){
         assert.equal(app.sent[0].type,'browser-submit');
         assert.equal(app.sent[0].authorized,true);
         assert.equal(app.sent[0].items[0].cookie,'session=test-value');
-      }else assert.equal(app.sent.length,0);
+        assert.equal(app.sent[0].browserProof.etag,'"v1"');
+      }else if(scenario==='redirect') assert.equal(app.sent.length,0);
+      else {
+        assert.equal(requests[0].credentials,'omit');
+        assert.equal(app.sent[0].type,'browser-capture');
+        assert.equal(app.sent[0].items[0].cookie,undefined);
+      }
     }finally{app.stopWorker()}
   }
 });

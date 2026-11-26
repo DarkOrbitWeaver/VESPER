@@ -44,11 +44,11 @@ internal sealed class CandidateProcessor
             .Take(_o.MaxCandidatesPerPage).ToArray();
         var direct = new DirectProbe?[ordered.Length];
         using var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        headerDeadline.CancelAfter(TimeSpan.FromSeconds(ordered.Any(c => c.ObservedLength is not null) ? 12 : 6));
+        headerDeadline.CancelAfter(TimeSpan.FromSeconds(ordered.Any(c => c.HasRangeEvidence) ? 12 : 6));
         // Reserve header slots in input order; network completion order must not change the result.
         var headerSlots = ordered.Select((c, i) => (c, i))
             .Where(x => x.c.Kind is not (CandidateKind.Hls or CandidateKind.Dash)
-                && (x.c.ObservedLength is not null || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov" or "webm" or "ogg" or "oga" or "ogv" or "opus"))
+                && (x.c.HasRangeEvidence || UrlUtil.Extension(x.c.Url) is null or "mp4" or "m4v" or "m4a" or "mov" or "webm" or "ogg" or "oga" or "ogv" or "opus"))
             .Take(MaxHeaderReads).Select(x => x.i).ToHashSet();
         await Parallel.ForEachAsync(Enumerable.Range(0, ordered.Length),
             new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _o.MaxConcurrentRequests), CancellationToken = ct },
@@ -108,7 +108,7 @@ internal sealed class CandidateProcessor
     {
         try
         {
-            bool rangedWitness = c.ObservedLength is not null;
+            bool rangedWitness = c.HasRangeEvidence;
             byte[]? start = null;
             ProbeResult probe;
             if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
@@ -128,10 +128,6 @@ internal sealed class CandidateProcessor
                 { probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false); }
             }
             else probe = await _http.ProbeAsync(c.Url, ctx, ct).ConfigureAwait(false);
-            if (rangedWitness && (probe.StatusCode != 206 || probe.InvalidExtent || probe.FinalUrl != c.Url
-                || !string.Equals(probe.ContentType, "video/mp4", StringComparison.OrdinalIgnoreCase)
-                || probe.ContentLength != c.ObservedLength || probe.StrongETag != c.ObservedETag))
-                return new(null, null, MediaErrors.NoMedia("The observed range no longer identifies the same complete file.", false));
             if (probe.InvalidExtent)
             {
                 if (rangedWitness || IsMp4(probe, c))
@@ -144,6 +140,13 @@ internal sealed class CandidateProcessor
             }
             if (!probe.IsSuccess)
                 return new(null, null, MediaErrors.FromHttpStatus(probe.StatusCode, c.Url));
+            if (rangedWitness && (probe.StatusCode != 206 || probe.FinalUrl != c.Url
+                || !string.Equals(probe.ContentType, "video/mp4", StringComparison.OrdinalIgnoreCase)
+                || probe.ContentLength is not (> 0 and <= MediaCandidate.MaxObservedLength)
+                || c.ObservedLength is long exact && probe.ContentLength != exact
+                || c.ObservedMinimumLength is long minimum && probe.ContentLength < minimum
+                || probe.StrongETag != c.ObservedETag))
+                return new(null, null, MediaErrors.NoMedia("The observed range no longer identifies the same complete file.", false));
             if (exactAssetGroup && BrowserAssetIdentity.XVideo(c.Url) != BrowserAssetIdentity.XVideo(probe.FinalUrl))
                 return new(null, null, MediaErrors.Invalid("A source redirected to a different media asset."));
 
@@ -280,7 +283,7 @@ internal sealed class CandidateProcessor
         {
             Id = $"direct-{index}",
             ResourceETag = resourceHash is not null ? p.StrongETag : null,
-            BrowserRangeVerified = c.ObservedLength is not null,
+            BrowserRangeVerified = c.HasRangeEvidence,
             ResourceUrlSha256 = resourceHash,
             ContentIdentity = contentIdentity,
             // An unreadable track table cannot establish equivalent quality.

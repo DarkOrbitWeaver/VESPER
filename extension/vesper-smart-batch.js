@@ -503,24 +503,30 @@
         },
         waitReady: async (step, selected) => {
           const item = approved[step.index];
-          let stableSince = 0, lastLabel = '';
+          let stableSince = 0, lastLabel = '', lastUrl = '', lastControl = null;
           const value = await waitForChange(() => {
             if (location.origin !== plan.origin) return null;
             const el = selectedItem(item);
             const download = matchingAction(key, approvedControl);
-            if (!el || !download || !eligibleAction(download)) { stableSince = 0; return null; }
+            const url = actionUrl(download);
+            if (!el || !download || !url || !eligibleAction(download)
+                || !activeHere(el) || !actionProvesItem(download, item, el)) {
+              lastControl = null;
+              return null;
+            }
             // The label must hold still briefly: countdown and "preparing" texts change several times.
             const label = labelFor(download);
-            if (label !== lastLabel) { lastLabel = label; stableSince = Date.now(); return null; }
-            if (Date.now() - stableSince < STABLE_MS) return null;
-            const url = actionUrl(download);
-            if (activeHere(el) && actionProvesItem(download, item, el) && url) {
-              const binding = ITEM_ATTRIBUTES.map(attr => download.getAttribute(attr)).find(Boolean);
-              if (!selected.wasActive && url.href === selected.previousActionUrl && binding !== item.id) return null;
-              return { verified: true, itemKey: step.key, actionKey: key, url: url.href, mode: 'exact', button: download };
+            if (label !== lastLabel || url.href !== lastUrl || download !== lastControl) {
+              lastLabel = label;
+              lastUrl = url.href;
+              lastControl = download;
+              stableSince = Date.now();
+              return null;
             }
-            // Selection state alone cannot prove that a scripted download belongs to this item.
-            return null;
+            if (Date.now() - stableSince < STABLE_MS) return null;
+            const binding = ITEM_ATTRIBUTES.map(attr => download.getAttribute(attr)).find(Boolean);
+            if (!selected.wasActive && url.href === selected.previousActionUrl && binding !== item.id) return null;
+            return { verified: true, itemKey: step.key, actionKey: key, url: url.href, mode: 'exact', button: download };
           }, READY_TIMEOUT, batchController.signal);
           if (!value || batchController.signal.aborted) return { verified: false };
           const armed = await chrome.runtime.sendMessage({ type: 'batch-arm', batchId,

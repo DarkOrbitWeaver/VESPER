@@ -34,6 +34,7 @@ public sealed class BrowserMediaCandidate
     public string? Label { get; init; }
     public bool MutedLoop { get; init; }
     public long? ObservedLength { get; init; }
+    public long? ObservedMinimumLength { get; init; }
     public string? ObservedETag { get; init; }
     /// <summary>"video-element", "network", "metadata" - informational only.</summary>
     public string? Source { get; init; }

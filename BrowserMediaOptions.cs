@@ -26,7 +26,8 @@ internal sealed partial class BrowserBridgeHandler
         MediaErrorCode.RateLimited => "rate-limited",
         MediaErrorCode.LoginRequired => "sign-in",
         MediaErrorCode.AuthorizationRequired => "site-refused",
-        MediaErrorCode.SourceExpired or MediaErrorCode.SourceChanged => "source-expired",
+        MediaErrorCode.SourceExpired => "source-expired",
+        MediaErrorCode.SourceChanged => "source-changed",
         MediaErrorCode.BlockedBySecurityPolicy or MediaErrorCode.RegionRestricted => "blocked",
         MediaErrorCode.NetworkFailure => "network",
         MediaErrorCode.BrowserContextRequired => "browser-context",
@@ -44,7 +45,10 @@ internal sealed partial class BrowserBridgeHandler
         Title = request.PageTitle, UserAgent = request.MediaAuth?.UserAgent,
         Authorization = MediaAuthorization(request, page),
         Candidates = (request.Candidates ?? []).Select(h => new BrowserMediaCandidate
-        { Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network", MutedLoop = h.MutedLoop, ObservedLength = h.ObservedLength, ObservedETag = h.ObservedETag }).ToList()
+        {
+            Url = h.Url, Kind = h.Kind, MimeType = h.MimeType, Source = "network", MutedLoop = h.MutedLoop,
+            ObservedLength = h.ObservedLength, ObservedETag = h.ObservedETag, ObservedMinimumLength = h.ObservedMinimumLength
+        }).ToList()
     };
 
     private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page) =>

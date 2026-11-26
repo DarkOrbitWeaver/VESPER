@@ -9,7 +9,7 @@ public sealed record BridgeItem(string Url, string? FileName, string Kind, strin
     string? ReviewLabel = null, string? ReviewType = null, double? ReviewDurationSeconds = null);
 
 public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false,
-    long? ObservedLength = null, string? ObservedETag = null);
+    long? ObservedLength = null, string? ObservedETag = null, long? ObservedMinimumLength = null);
 
 public sealed record BridgeRequest(string Id, string Type, string Mode, string? Url, IReadOnlyList<BridgeItem> Items,
     IReadOnlyList<BridgeMediaHint>? Candidates = null, string? PageTitle = null, bool ConfirmTransfer = false,
