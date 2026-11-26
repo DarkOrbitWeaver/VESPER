@@ -11,7 +11,7 @@
 #>
 param(
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
-    [string]$Version = "1.0.3-preview.1",
+    [string]$Version,
     [switch]$SkipTests,
     [string]$SigningCertificateThumbprint = $env:VESPER_SIGN_CERT_SHA1,
     [uri]$TimestampServer = 'https://timestamp.digicert.com',
@@ -57,6 +57,11 @@ $sourceRevision = Get-SourceRevision ([bool]$AllowDirtyWorkingTreeForDevelopment
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     [xml]$props = Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw
     $Version = [string]$props.Project.PropertyGroup.Version
+}
+$sourceManifest = Get-Content -LiteralPath (Join-Path $root 'extension/manifest.json') -Raw | ConvertFrom-Json
+if (-not $PSBoundParameters.ContainsKey('Version') -and
+    ($sourceManifest.version_name -ne $Version -or $sourceManifest.version -ne ($Version -split '-')[0])) {
+    throw 'Desktop and source extension versions disagree. Update both before packaging.'
 }
 if (-not $SigningCertificateThumbprint -and -not $AllowUnsigned) {
     throw 'A release needs an Authenticode certificate. Set VESPER_SIGN_CERT_SHA1, or explicitly use -AllowUnsigned for local development.'
