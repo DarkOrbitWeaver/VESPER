@@ -1,4 +1,4 @@
-// Page-world media provenance. No body is copied, intercepted or retained.
+// Page-world media provenance. No complete body is copied, intercepted or retained.
 // A response body object can sometimes be recognized when it becomes an object
 // URL or is appended to an MSE SourceBuffer. A player-scoped path hint is useful for
 // ranking, but is never authority to download or proof of the complete asset.
@@ -35,12 +35,60 @@
       return path.length <= 2048 && url.href.length <= 4096 ? { path, address: url.href } : null;
     } catch { return null; }
   }
+  // Inspect only bytes the page already read. Keep two short, distinctive
+  // samples from an MP4 media-data box, not the body or any encryption keys.
+  // Equal-length, zero-filled or ambiguous matches never become provenance.
+  function mediaSample(input) {
+    try {
+      const bytes = ArrayBuffer.isView(input)
+        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+        : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
+      if (!bytes || bytes.length < 136) return null;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      let offset = 0, sample = null;
+      for (let i = 0; i < 128 && offset + 8 <= bytes.length; i++) {
+        let size = view.getUint32(offset), header = 8;
+        const type = view.getUint32(offset + 4);
+        if (size === 1) {
+          if (offset + 16 > bytes.length || view.getUint32(offset + 8) !== 0) return null;
+          size = view.getUint32(offset + 12); header = 16;
+        } else if (size === 0) size = bytes.length - offset;
+        if (size < header || size > bytes.length - offset) return null;
+        if (type === 0x6d646174 && size - header >= 128) {
+          const first = bytes.slice(offset + header, offset + header + 32);
+          const last = bytes.slice(offset + size - 32, offset + size);
+          if (new Set(first).size >= 12 && new Set(last).size >= 12
+              && first.some((value, j) => value !== last[j]))
+            sample = { length: size - header, first, last };
+        }
+        offset += size;
+      }
+      return offset === bytes.length ? sample : null;
+    } catch { return null; }
+  }
+  function matchingSample(input) {
+    const sample = mediaSample(input);
+    if (!sample) return null;
+    const at = now();
+    let match = null;
+    for (const { evidence } of bufferSlots) {
+      const prior = evidence.sample;
+      if (!prior || at - evidence.at > TTL || sample.length !== prior.length
+          || !sample.first.every((value, i) => value === prior.first[i])
+          || !sample.last.every((value, i) => value === prior.last[i])) continue;
+      // Even two matching samples cannot distinguish different requests.
+      if (match && match !== evidence) return null;
+      match = evidence;
+    }
+    return match && (match.sampleHint ||= { path: match.path, at: match.at, sampleOnly: true });
+  }
+
   function rememberBuffer(buffer, source) {
     if (!source || !(buffer instanceof ArrayBuffer || typeof Blob === 'function' && buffer instanceof Blob)) return;
     const { path, address } = source;
     const previous = buffers.get(buffer);
     if (previous?.path === path && now() - previous.at < TTL) return;
-    const evidence = { path, at: now(), fingerprint: null };
+    const evidence = { path, at: now(), fingerprint: null, sample: mediaSample(buffer) };
     buffers.set(buffer, evidence);
     // Hash the exact URL, including its query, without keeping or exporting it.
     // The asynchronous digest never blocks playback, and outstanding work is capped.
@@ -122,10 +170,13 @@
     try {
       const input = args[0];
       const buffer = ArrayBuffer.isView(input) ? input.buffer : input;
-      const evidence = buffers.get(buffer);
+      const exact = buffers.get(buffer);
+      // A typed view over a larger response does not prove its whole contents.
+      const full = !ArrayBuffer.isView(input) || input.byteOffset === 0 && input.byteLength === buffer.byteLength;
+      const evidence = full && exact || matchingSample(input);
       const owner = owners.get(this)?.deref();
       if (owner && evidence && now() - evidence.at <= TTL) {
-        // Never retain the buffer. Match the exact object, not its length.
+        // Never retain the buffer. Exact-object and sample-only evidence stay distinct.
         for (const record of urls.values()) {
           if (record.ref.deref() !== owner) continue;
           record.paths.delete(evidence);
@@ -145,7 +196,7 @@
     try {
       const url = player.currentSrc || player.src;
       const record = urls.get(url);
-      if (!record?.ref.deref()) return;
+      if (!record?.ref.deref() || player.mediaKeys) return;
       const at = now();
       const paths = [...record.paths].filter(([, seen]) => at - seen <= TTL)
         .map(([evidence, seen]) => ({ path: evidence.path, seen,

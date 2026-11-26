@@ -137,3 +137,56 @@ test('media evidence graph ranks without confusing duration or directory with as
   assert.equal(result.selected,null);
   assert.equal(graph.associate({sources:[entry('https://cdn.test/bad.mpd',999),unrelated]}).nodes[0].edges.length,0);
 });
+
+function fragment(seed = 1) {
+  const bytes = new Uint8Array(264);
+  new DataView(bytes.buffer).setUint32(0, bytes.length);
+  bytes.set([109,100,97,116],4);
+  for (let i=8;i<bytes.length;i++) bytes[i]=(i*37+seed*13+i*i)%251;
+  return bytes;
+}
+
+test('copied media buffers yield a scoped path hint without exact resource authority', async () => {
+  const b=setup(), a=b.player(), other=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/clip.m4s?secret=1','video/mp4',bytes.buffer).arrayBuffer();
+  const copied=bytes.slice();
+  a.buffer.appendBuffer(copied);
+  assert.deepEqual(b.request(a.el),[{path:'https://cdn.test/clip.m4s',seen:100000}]);
+  assert.deepEqual(b.request(other.el),[]);
+  a.el.mediaKeys={};
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('distinct request instances with identical samples remain ambiguous', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/a.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  await new b.FetchResponse('https://cdn.test/b.m4s','video/mp4',bytes.slice().buffer).arrayBuffer();
+  a.buffer.appendBuffer(bytes.slice());
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('sample evidence expires and unrelated or low-entropy payloads are not associated', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/a.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  a.buffer.appendBuffer(fragment(2));
+  assert.deepEqual(b.request(a.el),[]);
+  b.advance(120001);
+  a.buffer.appendBuffer(bytes.slice());
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('header-only transformations retain the media sample but flat payloads do not', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/transformed.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  const transformed=new Uint8Array(bytes.length+8);
+  new DataView(transformed.buffer).setUint32(0,8);
+  transformed.set([102,114,101,101],4); // extra free box
+  transformed.set(bytes,8);
+  a.buffer.appendBuffer(transformed);
+  a.buffer.appendBuffer(transformed.slice());
+  assert.deepEqual(b.request(a.el),[{path:'https://cdn.test/transformed.m4s',seen:100000}]);
+  const flat=fragment(); flat.fill(0,8);
+  await new b.FetchResponse('https://cdn.test/flat.m4s','video/mp4',flat.buffer).arrayBuffer();
+  const other=b.player();other.buffer.appendBuffer(flat.slice());
+  assert.deepEqual(b.request(other.el),[]);
+});
