@@ -70,9 +70,12 @@ public sealed class DiscoveryAndNativeOutputTests
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            var content = new ByteArrayContent([]);
+            string directory = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
+            byte[] bytes = new[] { "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s" }
+                .SelectMany(name => File.ReadAllBytes(Path.Combine(directory, name))).ToArray();
+            var content = new ByteArrayContent(bytes);
             content.Headers.ContentType = new("video/mp4");
-            content.Headers.ContentLength = 4500;
+            content.Headers.ContentLength = bytes.Length;
             return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { RequestMessage = request, Content = content });
         }
     }
@@ -89,15 +92,15 @@ public sealed class DiscoveryAndNativeOutputTests
             Url = new(page), Browser = new BrowserDiscoveryMessage
             {
                 Schema = BrowserDiscoveryMessage.CurrentSchema, PageUrl = page,
-                Candidates = [new BrowserMediaCandidate { Url = target, Width = 1280, Height = 720, DurationSeconds = 12 }],
+                Candidates = [new BrowserMediaCandidate { Url = target, Width = 640, Height = 360, DurationSeconds = 3 }],
                 Authorization = new BrowserAuthorization { Origin = "https://video.example", ConsentGranted = true, CookieHeader = "session=fixture" }
             }
         }, CancellationToken.None);
 
         Assert.True(resolved.IsSuccess, resolved.Error?.Diagnostic);
         var item = MediaTransferBridge.PlayableOnly(resolved.Item!);
-        Assert.Equal(720, Assert.Single(item.Representations).Height);
-        Assert.Equal(TimeSpan.FromSeconds(12), item.Duration);
+        Assert.Equal(360, Assert.Single(item.Representations).Height);
+        Assert.Equal(TimeSpan.FromSeconds(3), item.Duration);
         var plan = MediaTransferBridge.Prepare(item, FormatPreferences.BestQuality);
         Assert.NotNull(plan.Choice);
         Assert.Equal(sameOrigin, plan.Choice.Secrets?.ContainsKey("Cookie") == true);
