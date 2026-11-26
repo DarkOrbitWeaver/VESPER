@@ -18,5 +18,6 @@
     <Project Path="tests/Vesper.Intelligence.Tests/Vesper.Intelligence.Tests.csproj" />
     <Project Path="tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj" />
     <Project Path="tests/Vesper.Windows.Tests/Vesper.Windows.Tests.csproj" />
+    <Project Path="tests/Vesper.NativeHost.Qa/Vesper.NativeHost.Qa.csproj" />
   </Folder>
 </Solution>

@@ -21,6 +21,9 @@ internal static class BridgePipe
     public static Task<string> ExchangeAsync(Stream pipe, string json, TimeSpan replyTimeout, CancellationToken ct) =>
         Vesper.Engine.BridgePipe.ExchangeAsync(pipe, json, replyTimeout, ct);
 
+    public static void AllowDesktopForeground(NamedPipeClientStream client) =>
+        Vesper.Engine.BridgePipe.AllowDesktopForeground(client);
+
     public static Task<string> RequestAsync(string pipe, string json, TimeSpan connectTimeout,
         TimeSpan replyTimeout, CancellationToken ct, bool bringReviewForward = false) =>
         Vesper.Engine.BridgePipe.RequestAsync(pipe, json, connectTimeout, replyTimeout, ct, bringReviewForward);

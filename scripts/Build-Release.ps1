@@ -75,15 +75,7 @@ function Sign-ReleaseFile([string]$path) {
 }
 
 if (-not $SkipTests) {
-    Run "Engine, bridge and storage tests" { dotnet test tests/Vesper.Tests/Vesper.Tests.csproj -c Release --nologo }
-    Run "Media resolver tests" { dotnet test tests/Vesper.MediaResolver.Tests/Vesper.MediaResolver.Tests.csproj -c Release --nologo }
-    Run "Setup and recovery tests" { dotnet test tests/Vesper.Setup.Tests/Vesper.Setup.Tests.csproj -c Release --nologo }
-    Run "Desktop persistence tests" { dotnet test tests/Vesper.Windows.Tests/Vesper.Windows.Tests.csproj -c Release --nologo }
-    if (Get-Command node -ErrorAction SilentlyContinue) {
-        $extensionTests = @(Get-ChildItem (Join-Path $root 'tests/extension') -Filter '*.test.mjs' -File | ForEach-Object FullName)
-        if ($extensionTests.Count -eq 0) { throw 'No extension regression tests were found.' }
-        Run "Extension logic tests" { node --test @extensionTests }
-    } else { Write-Warning "Node.js not found: extension logic tests were skipped." }
+    Run "Release tests" { & (Join-Path $PSScriptRoot 'Run-Tests.ps1') }
 }
 
 $out = Join-Path $root "release\VESPER-$Version"
