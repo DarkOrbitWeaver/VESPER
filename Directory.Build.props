@@ -4,7 +4,7 @@
        passes -p:Version). The short commit is stamped into InformationalVersion so a running build can be told
        apart from the repository: "1.0.2+2620e76". Local builds that have no commit say "+local". -->
   <PropertyGroup>
-    <Version Condition="'$(Version)' == ''">1.0.5-preview.1</Version>
+    <Version Condition="'$(Version)' == ''">1.0.5-preview.2</Version>
     <SourceRevisionId Condition="'$(SourceRevisionId)' == ''">local</SourceRevisionId>
     <IncludeSourceRevisionInInformationalVersion>true</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
