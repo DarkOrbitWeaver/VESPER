@@ -45,6 +45,7 @@ internal sealed class HttpTransport : IDisposable
     private readonly OriginAwareProxy? _originAwareProxy;
     private readonly bool _validateProxyDns;
     private readonly string? _proxyError;
+    private readonly StreamAdmission _streams = new();
 
     public HttpTransport(EngineOptions options)
     {
@@ -145,7 +146,23 @@ internal sealed class HttpTransport : IDisposable
             using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
             if (proxyAddress is not null)
                 _originAwareProxy!.PinRequest(request, current, proxyAddress);
-            HttpResponseMessage response = await SendOnceAsync(request, ct).ConfigureAwait(false);
+            // HTTP/2 multiplexes streams on one physical connection. A socket limit
+            // is therefore not a request limit. Retain admission until disposal of
+            // the response body, including on redirects and failed requests.
+            IDisposable? lease = _options.Http2Experiment
+                ? await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false)
+                : null;
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendOnceAsync(request, ct).ConfigureAwait(false);
+                if (lease is not null)
+                {
+                    response.Content = new AdmittedContent(response.Content, lease);
+                    lease = null;
+                }
+            }
+            finally { lease?.Dispose(); }
             request.RequestUri = current;
             if (response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
             {
@@ -303,4 +320,79 @@ internal sealed class HttpTransport : IDisposable
     }
 
     public void Dispose() => _client.Dispose();
+
+    // Only active/waiting origins occupy entries. No lifetime-growing host map.
+    private sealed class StreamAdmission
+    {
+        private sealed class Entry(int limit)
+        {
+            internal readonly SemaphoreSlim Gate = new(Math.Max(1, limit));
+            internal int References;
+        }
+        private readonly Dictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
+        internal async Task<IDisposable> AcquireAsync(Uri uri, int limit, CancellationToken ct)
+        {
+            string key = uri.IdnHost; // match the engine's per-host limit across ports
+            Entry entry;
+            lock (_entries)
+            {
+                if (!_entries.TryGetValue(key, out entry!))
+                    _entries.Add(key, entry = new Entry(limit));
+                entry.References++;
+            }
+            try { await entry.Gate.WaitAsync(ct).ConfigureAwait(false); }
+            catch { RemoveReference(key, entry); throw; }
+            return new Lease(this, key, entry);
+        }
+        private void RemoveReference(string key, Entry entry)
+        {
+            lock (_entries)
+            {
+                if (--entry.References != 0) return;
+                _entries.Remove(key);
+                entry.Gate.Dispose();
+            }
+        }
+        private sealed class Lease(StreamAdmission owner, string key, Entry entry) : IDisposable
+        {
+            private int _disposed;
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+                entry.Gate.Release();
+                owner.RemoveReference(key, entry);
+            }
+        }
+    }
+
+    private sealed class AdmittedContent : HttpContent
+    {
+        private readonly HttpContent _inner;
+        private readonly IDisposable _lease;
+        internal AdmittedContent(HttpContent inner, IDisposable lease)
+        {
+            _inner = inner;
+            _lease = lease;
+            foreach (var header in inner.Headers)
+                Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+        protected override bool TryComputeLength(out long length)
+        {
+            length = _inner.Headers.ContentLength ?? 0;
+            return _inner.Headers.ContentLength.HasValue;
+        }
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            _inner.CopyToAsync(stream, context);
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken ct) =>
+            _inner.CopyToAsync(stream, context, ct);
+        protected override Task<Stream> CreateContentReadStreamAsync() => _inner.ReadAsStreamAsync();
+        protected override Task<Stream> CreateContentReadStreamAsync(CancellationToken ct) => _inner.ReadAsStreamAsync(ct);
+        protected override Stream CreateContentReadStream(CancellationToken ct) => _inner.ReadAsStream(ct);
+        protected override void Dispose(bool disposing)
+        {
+            if (!disposing) { base.Dispose(false); return; }
+            try { base.Dispose(true); _inner.Dispose(); }
+            finally { _lease.Dispose(); }
+        }
+    }
 }

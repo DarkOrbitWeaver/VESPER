@@ -21,12 +21,19 @@ public sealed class ConnectionLimitTests
         await using var app = builder.Build();
         byte[] expected = Payloads.Make(256 * 1024, 1234);
         var connectionIds = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+        int active = 0, peak = 0;
+        var guard = new object();
         app.MapGet("/part", async (HttpContext context) =>
         {
             connectionIds.TryAdd(context.Connection.Id, 0);
-            await Task.Delay(100, context.RequestAborted);
-            context.Response.ContentLength = expected.Length;
-            await context.Response.Body.WriteAsync(expected, context.RequestAborted);
+            lock (guard) peak = Math.Max(peak, ++active);
+            try
+            {
+                await Task.Delay(100, context.RequestAborted);
+                context.Response.ContentLength = expected.Length;
+                await context.Response.Body.WriteAsync(expected, context.RequestAborted);
+            }
+            finally { lock (guard) active--; }
         });
         await app.StartAsync();
         using var http = new HttpTransport(new EngineOptions
@@ -45,7 +52,8 @@ public sealed class ConnectionLimitTests
         await Fetch();
         var watch = Stopwatch.StartNew();
         await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Fetch()));
-        Console.WriteLine($"HTTP_PROTOCOL h2={h2} elapsedMs={watch.Elapsed.TotalMilliseconds:F1} connections={connectionIds.Count} bytes={8 * expected.Length}");
+        Console.WriteLine($"HTTP_PROTOCOL h2={h2} elapsedMs={watch.Elapsed.TotalMilliseconds:F1} connections={connectionIds.Count} peak={peak} bytes={8 * expected.Length}");
+        Assert.InRange(peak, 2, 4);
         if (h2) Assert.Single(connectionIds);
         else Assert.InRange(connectionIds.Count, 1, 4);
     }
