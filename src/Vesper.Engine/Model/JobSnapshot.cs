@@ -27,7 +27,7 @@ public sealed class JobSnapshot
 
     /// <summary>Bytes that survive a crash: validated, flushed, and recorded in the database.</summary>
     public long CommittedBytes { get; init; }
-    /// <summary>Committed plus bytes written but not yet checkpointed. Used only for the progress bar.</summary>
+    /// <summary>Committed plus validated bytes waiting for a checkpoint.</summary>
     public long ProgressBytes { get; init; }
 
     public double SpeedBytesPerSecond { get; init; }

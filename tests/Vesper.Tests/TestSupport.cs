@@ -126,6 +126,15 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/lmonly": await Serve(ctx, V1, null, Modified); break;
             case "/norange": await Serve(ctx, V1, "\"p1\"", Modified, ranges: false); break;
             case "/norange-same-tag-changed": await Serve(ctx, V2, "\"p1\"", Modified, ranges: false); break;
+            case "/reject-ranges":
+            case "/reject-ranges-same-tag-changed":
+                if (ctx.Request.Headers.ContainsKey("Range"))
+                {
+                    res.StatusCode = 416;
+                    res.Headers.ContentRange = $"bytes */{V1.Length}";
+                }
+                else await Serve(ctx, path == "/reject-ranges" ? V1 : V2, "\"p1\"", Modified, ranges: false);
+                break;
             case "/truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, truncate: hit == 1 ? 0.6 : null); break;
             case "/norange-truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, ranges: false, truncate: hit == 1 ? 0.6 : null); break;
             case "/expires-after-truncate":

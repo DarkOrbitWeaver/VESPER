@@ -46,6 +46,7 @@ internal sealed class JobSession : IDisposable
         _engine = engine;
         Job = job;
         CommittedAtStart = job.Extents.TotalBytes;
+        _sampleBytes = CommittedAtStart;
         if (job.BrowserProof is { AwaitingConfirmation: true })
             BrowserApproval = new(TaskCreationOptions.RunContinuationsAsynchronously);
         Host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? uri) ? uri.Host.ToLowerInvariant() : "";
@@ -161,7 +162,7 @@ internal sealed class JobSession : IDisposable
 
     // Time-first: the 2 s timer already bounds the loss window, so the byte trigger only needs to stop a
     // very fast link from checkpointing every few milliseconds. Scale it to about 4 s of transfer.
-    private bool CheckpointDue()
+    internal bool CheckpointDue()
     {
         if (Stopwatch.GetElapsedTime(Volatile.Read(ref _lastCheckpointTicks)) >= _engine.Options.CheckpointInterval)
             return true;
@@ -177,6 +178,14 @@ internal sealed class JobSession : IDisposable
             _pending.Add(range);
             _writtenSinceCheckpoint += range.Length;
             if (mediaState is not null) _pendingMediaState = mediaState;
+        }
+    }
+
+    internal void SavePendingMediaState(string mediaState)
+    {
+        lock (Gate)
+        {
+            if (!_pending.IsEmpty) _pendingMediaState = mediaState;
         }
     }
 
@@ -234,18 +243,14 @@ internal sealed class JobSession : IDisposable
         long now = Stopwatch.GetTimestamp();
         double seconds = (double)(now - _sampleTicks) / Stopwatch.Frequency;
         if (seconds < 0.2) return;
-        long bytes = RunBytes;
-        double instant = (bytes - _sampleBytes) / seconds;
+        long progress;
+        lock (Gate) progress = Job.Extents.TotalBytes + _pending.TotalBytes;
+        double instant = Math.Max(0, progress - _sampleBytes) / seconds;
         _speed = _speed == 0 ? instant : _speed * 0.7 + instant * 0.3;
-        _sampleBytes = bytes;
+        _sampleBytes = progress;
         _sampleTicks = now;
 
-        if (Job.State == JobState.Downloading)
-        {
-            long progress;
-            lock (Gate) progress = Job.Extents.TotalBytes + _pending.TotalBytes;
-            Estimate.Sample(now, progress, Job.TotalBytes);
-        }
+        if (Job.State == JobState.Downloading) Estimate.Sample(now, progress, Job.TotalBytes);
         else Estimate.Reset();
     }
 

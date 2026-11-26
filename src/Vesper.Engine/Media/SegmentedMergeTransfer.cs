@@ -99,6 +99,21 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
 
         using var keys = new HlsKeyCache(cursor?.KeyFingerprints);
         if (!keys.Valid) return Stop("The saved HLS key identities are invalid.");
+        string[] sourceFingerprints = tracks.Select(track => track.SourceFingerprint).ToArray();
+        string[] sourceShapes = tracks.Select(track => track.SourceShapeFingerprint).ToArray();
+        long savedOffset = offset;
+        int savedTrack = trackIndex, savedNext = next;
+
+        void SaveCursor()
+        {
+            if (savedOffset == offset) return;
+            var saved = new Cursor(2, fingerprint, "download", savedTrack, savedNext, offset,
+                Convert.ToHexString(hash.GetCurrentHash()), completed, [.. lengths], sourceFingerprints,
+                KeyFingerprints: keys.Fingerprints.ToArray(), SourceShapeFingerprints: sourceShapes);
+            session.SavePendingMediaState(JsonSerializer.Serialize(saved));
+            savedOffset = offset;
+        }
+
         using var fetchStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var pending = new Dictionary<(int Track, int Part), Task<BufferedPart>>();
         var window = new SegmentLookahead(engine.Options, session.Limiter, engine.GlobalLimiter);
@@ -161,15 +176,15 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     offset = checked(offset + data.Length);
                     completed[ti] = pi + 1;
                     lengths.Add(data.Length);
-                    int savedTrack = ti, savedNext = pi + 1;
+                    savedTrack = ti;
+                    savedNext = pi + 1;
                     if (savedNext == prepared.Parts.Count) { savedTrack++; savedNext = 0; }
-                    var saved = new Cursor(2, fingerprint, "download", savedTrack, savedNext, offset,
-                        Convert.ToHexString(hash.GetCurrentHash()), (int[])completed.Clone(), [.. lengths],
-                        tracks.Select(track => (string?)track.SourceFingerprint).ToArray(),
-                        KeyFingerprints: keys.Fingerprints.ToArray(),
-                        SourceShapeFingerprints: tracks.Select(track => (string?)track.SourceShapeFingerprint).ToArray());
-                    session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
-                    await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
+                    session.Report(new ByteRange(start, offset));
+                    if (session.CheckpointDue())
+                    {
+                        SaveCursor();
+                        await session.CheckpointAsync(force: false, ct).ConfigureAwait(false);
+                    }
                 }
             }
         }
@@ -179,6 +194,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         }
         finally
         {
+            // The runner can checkpoint the last written parts after an error or pause.
+            SaveCursor();
             fetchStop.Cancel();
             foreach (var fetch in pending.Values)
             {

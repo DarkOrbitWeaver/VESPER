@@ -10,6 +10,45 @@ namespace Vesper.Tests;
 
 public sealed class ConnectionLimitTests
 {
+    [Fact]
+    public async Task Download_reserves_its_host_slot_before_opening_the_first_response()
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        byte[] expected = Payloads.Make(300 * 1024, 12);
+        int requests = 0;
+        app.MapGet("/file.bin", async (HttpContext context) =>
+        {
+            Interlocked.Increment(ref requests);
+            context.Response.StatusCode = 206;
+            context.Response.Headers.ContentRange = $"bytes 0-{expected.Length - 1}/{expected.Length}";
+            context.Response.Headers.ETag = "\"file\"";
+            context.Response.ContentType = "application/octet-stream";
+            context.Response.ContentLength = expected.Length;
+            await context.Response.Body.WriteAsync(expected, context.RequestAborted);
+        });
+        await app.StartAsync();
+
+        using var harness = new Harness(tweak: options => options.MaxConnectionsPerHost = 1);
+        var uri = new Uri(app.Urls.Single() + "/file.bin");
+        SemaphoreSlim slot = harness.Engine.HostGate(uri.Host);
+        await slot.WaitAsync();
+        Guid id;
+        try
+        {
+            id = harness.Add(uri.AbsoluteUri);
+            await harness.WaitAsync(id, job => File.Exists(job.PartialPath), seconds: 5);
+            await Task.Delay(150);
+            Assert.Equal(0, Volatile.Read(ref requests));
+        }
+        finally { slot.Release(); }
+
+        JobSnapshot job = await harness.WaitForStateAsync(id, JobState.Completed, seconds: 10);
+        Assert.Equal(1, requests);
+        Assert.Equal(expected, await File.ReadAllBytesAsync(job.FinalPath!));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

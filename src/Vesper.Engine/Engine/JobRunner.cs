@@ -138,14 +138,17 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         ReconcileWithFile(file);
         if (Job.PieceMapJson is not null) LoadPieces(file, ct);
 
+        SemaphoreSlim hostGate = engine.HostGate(session.Host);
         for (int pass = 0; pass < 2; pass++)
         {
             if (Job.TotalBytes is long known && Job.Extents.Covers(0, known)) return await FinishAsync(ct).ConfigureAwait(false);
 
             long start = Job.Extents.Gaps(Job.TotalBytes ?? long.MaxValue).FirstOrDefault().Start;
-            FirstResult first = await OpenFirstAsync(start, ct).ConfigureAwait(false);
+            await hostGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                FirstResult first = await OpenFirstAsync(start, ct).ConfigureAwait(false);
+                using HttpResponseMessage response = first.Response;
                 CheckBrowserResponse(first);
                 CaptureMetadata(first);
                 if (first.Total is long total) { EnsureSpace(file, total); file.EnsureLength(total); }
@@ -153,7 +156,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
                 using (ProcessingTiming.Measure(Job.Id, ProcessingPhase.Transfer, first.Total ?? 0))
                 {
-                    if (first.Ranged) await RunRangedAsync(first, ct).ConfigureAwait(false);
+                    if (first.Ranged) await RunRangedAsync(first, hostGate, ct).ConfigureAwait(false);
                     else await RunLinearAsync(first, file, ct).ConfigureAwait(false);
                 }
             }
@@ -168,7 +171,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             }
             finally
             {
-                first.Response.Dispose();
+                hostGate.Release();
             }
             return await FinishAsync(ct).ConfigureAwait(false);
         }
@@ -285,9 +288,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         session.SetPhase(JobState.Resolving);
         long? rangeStart = Job.NonResumable || _forceLinear ? null : start;
         HttpResponseMessage response = await http.SendAsync(_url, BuildSpec(rangeStart, null), ct).ConfigureAwait(false);
-        if (fresh && response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        if (rangeStart is not null && response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable
+            && (fresh || Job.Identity == IdentityLevel.StrongEtag && _pieces is null
+                && Job.TotalBytes is long known && (response.Content.Headers.ContentRange?.Length ?? known) == known))
         {
-            // An empty file cannot satisfy "bytes=0-". Ask again without a range before giving up.
+            // A server can stop accepting ranges between runs. The full response
+            // still needs the same identity and all saved intervals must match.
             response.Dispose();
             response = await http.SendAsync(_url, BuildSpec(null, null), ct).ConfigureAwait(false);
         }
@@ -435,7 +441,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         internal Task Task = Task.CompletedTask;
     }
 
-    private async Task RunRangedAsync(FirstResult first, CancellationToken ct)
+    private async Task RunRangedAsync(FirstResult first, SemaphoreSlim hostGate, CancellationToken ct)
     {
         long total = first.Total!.Value;
         bool pieceMode = _pieces is not null;
@@ -460,13 +466,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             advisor.OnThrottled(_o.MaxConnectionsPerJob);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var workers = new List<RangeWorker>();
-        HttpResponseMessage? firstResponse = first.Response;
-        SemaphoreSlim hostGate = engine.HostGate(session.Host);
+        RangeWorker? primaryWorker = null;
 
-        async Task WorkerAsync(RangeWorker worker, bool takesFirst)
+        async Task WorkerAsync(RangeWorker worker, bool primary, HttpResponseMessage? open)
         {
             session.AddConnection();
-            HttpResponseMessage? open = takesFirst ? firstResponse : null;
             try
             {
                 while (!workersCts.IsCancellationRequested && !worker.Draining)
@@ -487,25 +491,20 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             {
                 open?.Dispose();
                 session.RemoveConnection();
-                hostGate.Release();
+                if (!primary) hostGate.Release();
             }
         }
 
-        void StartWorker(bool takesFirst = false)
+        void StartWorker(bool primary = false, HttpResponseMessage? response = null)
         {
             var worker = new RangeWorker();
-            worker.Task = Task.Run(() => WorkerAsync(worker, takesFirst), CancellationToken.None);
+            worker.Task = Task.Run(() => WorkerAsync(worker, primary, response), CancellationToken.None);
             workers.Add(worker);
+            if (primary) primaryWorker = worker;
         }
 
-        // The first connection may wait for a free host slot; extra ones are only opened if a slot is free right now.
-        if (!hostGate.Wait(0))
-        {
-            firstResponse?.Dispose();
-            firstResponse = null;
-            await hostGate.WaitAsync(ct).ConfigureAwait(false);
-        }
-        StartWorker(takesFirst: true);
+        // The initial response already holds the job's first host slot.
+        StartWorker(primary: true, first.Response);
 
         long lastChange = Stopwatch.GetTimestamp();
         long startingBytes = session.RunBytes;
@@ -521,8 +520,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 if (workers.Count == 0)
                 {
                     if (!board.HasWork || ct.IsCancellationRequested) break;
-                    await hostGate.WaitAsync(ct).ConfigureAwait(false);
-                    StartWorker();
+                    StartWorker(primary: true);
                     target = 1;
                     lastChange = Stopwatch.GetTimestamp();
                     sampleBytes = session.RunBytes;
@@ -549,9 +547,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     foreach (var worker in workers.Where(w => !w.Task.IsCompleted && !w.Draining).Reverse().Take(Math.Max(0, active - target)))
                         worker.Draining = true;
                     int missing = target - workers.Count(w => !w.Task.IsCompleted);
-                    for (int i = 0; i < missing && board.HasAssignableWork && hostGate.Wait(0); i++)
+                    for (int i = 0; i < missing && board.HasAssignableWork; i++)
                     {
-                        StartWorker();
+                        if (primaryWorker!.Task.IsCompleted) StartWorker(primary: true);
+                        else if (hostGate.Wait(0)) StartWorker();
+                        else break;
                         lastChange = Stopwatch.GetTimestamp();
                         sampleBytes = session.RunBytes;
                     }
@@ -575,7 +575,6 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         finally
         {
             workersCts.Cancel();
-            firstResponse?.Dispose();
         }
 
         Exception? error = null;

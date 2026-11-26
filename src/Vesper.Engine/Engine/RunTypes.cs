@@ -37,6 +37,7 @@ internal sealed class Segment(long start, long end)
     public long SampleAt { get; set; }
     public long SampleBytes { get; set; }
     public double Rate { get; set; }
+    internal LinkedListNode<Segment>? Node { get; set; }
 }
 
 /// <summary>
@@ -47,9 +48,9 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
 {
     private const long Alignment = 64 * 1024;
     private readonly object _gate = new();
-    private readonly List<Segment> _segments = [];
+    private readonly LinkedList<Segment> _segments = new();
 
-    public void Add(Segment segment) { lock (_gate) _segments.Add(segment); }
+    public void Add(Segment segment) { lock (_gate) segment.Node = _segments.AddLast(segment); }
 
     public bool HasWork { get { lock (_gate) return _segments.Any(s => s.Next < s.End); } }
 
@@ -74,27 +75,42 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
             if (free is not null) { free.Owned = true; free.SampleAt = 0; free.SampleBytes = 0; free.Rate = 0; return free; }
 
             // Nothing free: split the span with the most bytes left, if it is worth a new connection.
-            var eligible = _segments.Where(s => s.Owned && s.End - Math.Max(s.Next, s.Claimed) >= 2 * minSplitBytes).ToArray();
-            double[] rates = eligible.Where(s => s.Rate > 0).Select(s => s.Rate).ToArray();
-            double helperRate = rateAware && rates.Length > 0 ? rates.Average() : 0;
-            Segment? largest = eligible.MaxBy(s => helperRate > 0 && s.Rate > 0
-                ? (s.End - Math.Max(s.Next, s.Claimed)) / s.Rate
-                : helperRate > 0 ? (s.End - Math.Max(s.Next, s.Claimed)) / helperRate : s.End - Math.Max(s.Next, s.Claimed));
+            double helperRate = 0;
+            if (rateAware)
+            {
+                int samples = 0;
+                foreach (Segment segment in _segments)
+                {
+                    if (!segment.Owned || segment.Rate <= 0 || SplittableBytes(segment) < 2 * minSplitBytes) continue;
+                    helperRate += segment.Rate;
+                    samples++;
+                }
+                if (samples > 0) helperRate /= samples;
+            }
+            Segment? largest = null;
+            double longest = 0;
+            foreach (Segment segment in _segments)
+            {
+                long bytes = SplittableBytes(segment);
+                if (!segment.Owned || bytes < 2 * minSplitBytes) continue;
+                double cost = helperRate > 0 ? bytes / (segment.Rate > 0 ? segment.Rate : helperRate) : bytes;
+                if (cost <= longest) continue;
+                longest = cost;
+                largest = segment;
+            }
             if (largest is null) return null;
 
             long floor = Math.Max(largest.Next, largest.Claimed);
             long remaining = largest.End - floor;
-            if (remaining < 2 * minSplitBytes) return null;
-
             long stolen = remaining / 2;
             if (helperRate > 0 && largest.Rate > 0)
                 stolen = (long)Math.Clamp(helperRate * (remaining - largest.Rate * 0.15) / (helperRate + largest.Rate), minSplitBytes, remaining - minSplitBytes);
             long mid = (largest.End - stolen) / Alignment * Alignment;
-            if (mid <= floor || mid >= largest.End) return null;
+            mid = Math.Clamp(mid, floor + minSplitBytes, largest.End - minSplitBytes);
 
             var tail = new Segment(mid, largest.End) { Owned = true };
             largest.End = mid;
-            _segments.Add(tail);
+            tail.Node = _segments.AddAfter(largest.Node!, tail);
             return tail;
         }
     }
@@ -109,12 +125,28 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
                 && s.Next == s.Start && s.Claimed <= s.Start && s.End <= responseEndExclusive);
             if (next is null) return false;
             segment.End = next.End;
-            _segments.Remove(next);
+            Remove(next);
             return true;
         }
     }
 
-    public void Release(Segment segment) { lock (_gate) segment.Owned = false; }
+    public void Release(Segment segment)
+    {
+        lock (_gate)
+        {
+            segment.Owned = false;
+            if (segment.Next == segment.End) Remove(segment);
+        }
+    }
+
+    private static long SplittableBytes(Segment segment) => segment.End - Math.Max(segment.Next, segment.Claimed);
+
+    private void Remove(Segment segment)
+    {
+        if (segment.Node is not { } node) return;
+        _segments.Remove(node);
+        segment.Node = null;
+    }
 
     /// <summary>Reserves up to <paramref name="want"/> bytes for the next write. Returns 0 if the span has shrunk away.</summary>
     public int ClaimChunk(Segment segment, int want)

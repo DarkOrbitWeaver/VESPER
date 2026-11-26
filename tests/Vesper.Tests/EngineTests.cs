@@ -92,13 +92,17 @@ public class SequentialAndResumeTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task Sparse_replay_checks_every_saved_interval_before_admitting_new_bytes(bool changed)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task Sparse_replay_checks_every_saved_interval_before_admitting_new_bytes(bool changed, bool rejectRange)
     {
         await using var server = new FaultServer(1024 * 1024); await server.StartAsync();
         using var h = new Harness();
-        string url = server.Url(changed ? "/norange-same-tag-changed" : "/norange");
+        string path = rejectRange ? "/reject-ranges" : "/norange";
+        if (changed) path += "-same-tag-changed";
+        string url = server.Url(path);
         Guid id = h.Add(url, "sparse.bin", startNow: false);
         var job = ((Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
             .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
@@ -122,6 +126,7 @@ public class SequentialAndResumeTests
         });
         h.Engine.Resume(id);
         JobSnapshot result = await h.WaitAsync(id, j => j.State is JobState.Completed or JobState.NeedsAttention);
+        Assert.Equal(rejectRange ? 2 : 1, server.Hits(path));
         if (!changed)
         {
             Assert.Equal(JobState.Completed, result.State);

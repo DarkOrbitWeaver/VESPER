@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace Vesper.Engine;
 
-/// <summary>Samples unique byte progress for the ETA without changing the transfer scheduler's rate meter.</summary>
+/// <summary>Estimates time remaining from recent unique byte progress.</summary>
 internal sealed class TransferEstimate
 {
     private static readonly TimeSpan Window = TimeSpan.FromSeconds(3);
