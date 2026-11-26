@@ -151,8 +151,9 @@ if ($InstallerOnly) { return }
 
 Copy-Item (Join-Path $root "DOCUMENTATION\RELEASE.md") (Join-Path $out "RELEASE.md")
 
-Get-ChildItem $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
-    ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" } | Set-Content (Join-Path $out "SHA256SUMS.txt")
+$payloadChecksums = Get-ChildItem -LiteralPath $out -Recurse -File | Get-FileHash -Algorithm SHA256 |
+    ForEach-Object { "$($_.Hash)  $($_.Path.Substring($out.Length + 1))" }
+$payloadChecksums | Set-Content -LiteralPath (Join-Path $out "SHA256SUMS.txt") -Encoding ascii
 Compress-Archive -Path "$out\*" -DestinationPath $zip
 $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 "$zipHash  $(Split-Path -Leaf $zip)" | Set-Content -LiteralPath $zipChecksumPath -Encoding ascii
