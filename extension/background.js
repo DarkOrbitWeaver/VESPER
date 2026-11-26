@@ -1362,10 +1362,13 @@ async function playerOptions(message, sender) {
     const singleVideo = binding && identity && (identity.startsWith('tiktok:')
       || identity.startsWith('dailymotion:')
       || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
-    if (prefetch && fingerprints.size && possibleSources.length === 1) {
+    const observedRange = matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching);
+    if (observedRange) possibleSources.unshift(matching);
+    if (prefetch && possibleSources.length === 1) {
       const observed = possibleSources[0];
-      const witnessed = exactResources.has(observed.url)
-        || ['hls', 'dash'].includes(observed.kind) && fragmentAffinity(observed.url, playerFragments) > 0;
+      const witnessed = observedRange ? playerActiveOrLoaded && !mutedLoop
+        : fingerprints.size > 0 && (exactResources.has(observed.url)
+          || ['hls', 'dash'].includes(observed.kind) && fragmentAffinity(observed.url, playerFragments) > 0);
       if (witnessed) {
         const reply = await prepareMediaFormats(tab, page.hostname, () => verifyObservedSource(observed, {
           auth, pageUrl: page.href, title: message.title, playbackFingerprints, tab, verificationScope
@@ -1374,19 +1377,12 @@ async function playerOptions(message, sender) {
         return reply.ok && reply.data?.choices?.length ? { ok: true, data: { prepared: true } } : reply;
       }
     }
-    if (prefetch && possibleSources.length > 0 && !singleVideo)
+    if (prefetch && possibleSources.length > 0 && (observedRange || !singleVideo))
       return { ok: true, data: { prefetchSkipped: true } };
     if (prefetch && !(supportsMediaPrefetch(page) && identity && !/^https?:/.test(identity)) && !matching && !matchedManifest)
       return { ok: true, data: { prefetchSkipped: true } };
-    // A direct current player also benefits from the verified range route.
-    // Do not downgrade a known partial representation into an unchecked URL.
-    if (matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching)
-        && !possibleSources.some(item => item.url === matching.url)) {
-      if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
-      possibleSources.unshift(matching);
-    }
     const usableSource = source && !isPartialMediaUrl(source) && !matching?.unexpectedRange
-      && !(matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching)) ? source : null;
+      && !observedRange ? source : null;
     const candidates = [usableSource, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
       .filter(Boolean).map(url => {
         const hint = candidate(url);

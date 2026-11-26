@@ -3346,6 +3346,35 @@ test('generic player prefetch requires a media URL observed by Chrome', async ()
   assert.equal(request.candidates[0].url, mediaUrl);
 });
 
+test('a verified range for the current player is prepared once and reused on click', async () => {
+  const page = 'https://example.com/watch/current';
+  const url = 'https://media.example/current.webm';
+  const sender = { tab: { id: 22, url: page }, url: page, frameId: 0, documentId: 'range-doc' };
+  const app = load({ 'media-range-options': mediaOptionsReply });
+  const message = videoOptionsMessage(page, { playerUrl: url, playerHasMedia: true,
+    playerKey: 'media-1', mediaChangedAt: Date.now(), title: 'Current video' });
+  try {
+    await app.onMedia({ url, method: 'GET', type: 'media', statusCode: 206, tabId: 22,
+      frameId: 0, documentId: sender.documentId, timeStamp: Date.now(),
+      responseHeaders: responseHeaders({ 'Content-Type': 'video/webm', 'Content-Range': 'bytes 0-999/700000',
+        'Content-Length': '1000', ETag: '"current"' }) });
+
+    const preview = await app.message({ ...message, prefetch: true, mutedLoop: true }, sender);
+    assert.equal(preview.data.prefetchSkipped, true);
+    assert.equal(app.sent.length, 0);
+
+    const prepared = await app.message({ ...message, prefetch: true }, sender);
+    assert.equal(prepared.data.prepared, true);
+    const reply = await app.message(message, sender);
+    assert.equal(reply.ok, true);
+    assert.deepEqual(app.sent.map(request => request.type), ['media-range-options']);
+    assert.equal(app.sent[0].candidates[0].observedETag, '"current"');
+
+    await app.message({ ...message, generation: 2 }, sender);
+    assert.equal(app.sent.length, 2, 'A recycled player gets a fresh check.');
+  } finally { app.stopWorker(); }
+});
+
 test('verified playback evidence prepares an unfamiliar stream and reuses the check on click', async () => {
   const page = 'https://example.com/watch/current';
   const manifest = 'https://media.example/asset-481562/master.m3u8';
