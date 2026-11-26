@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
@@ -49,7 +50,12 @@ internal sealed class BilibiliAdapter : AdapterBase
         var id = UrlUtil.HostIs(pageUrl, "bilibili.com") ? ParseVideo(pageUrl) : null;
         if (id is null) return Fail(MediaErrors.NotThisSite("Not a Bilibili video URL"));
 
-        var ctx = new MediaRequestContext { Referer = "https://www.bilibili.com/" };
+        var ctx = new MediaRequestContext
+        {
+            Referer = "https://www.bilibili.com/",
+            Origin = "https://www.bilibili.com",
+            UserAgent = request.AuthContext.UserAgent ?? YouTubeAdapter.DesktopUserAgent
+        };
         string idQuery = id.Value.Bvid is { } bv ? $"bvid={bv}" : $"aid={id.Value.Aid}";
 
         using var viewDoc = await GetJsonAsync(new Uri($"https://api.bilibili.com/x/web-interface/view?{idQuery}"), ctx, ct).ConfigureAwait(false);
@@ -91,10 +97,16 @@ internal sealed class BilibiliAdapter : AdapterBase
         var pdata = play.P("data");
 
         var reps = new List<MediaRepresentation>();
+        var backupUrls = new Dictionary<string, List<Uri>>(StringComparer.Ordinal);
         var dash = pdata.P("dash");
         int idx = 0;
         if (dash is not null)
         {
+            List<Uri> Backups(JsonElement item) =>
+                (item.P("backupUrl") ?? item.P("backup_url")).Items()
+                .Select(entry => U(entry.Str()))
+                .Where(u => u is not null).Select(u => u!).ToList();
+
             foreach (var v in dash.P("video").Items())
             {
                 var url = U(v.P("baseUrl").Str() ?? v.P("base_url").Str());
@@ -102,9 +114,11 @@ internal sealed class BilibiliAdapter : AdapterBase
                 int qn = v.P("id").Int() ?? 0;
                 string? codecs = v.P("codecs").Str();
                 CodecInfo.Split(codecs, out var vc, out _, out var hdr0);
+                string repId = $"bili-v-{qn}-{vc ?? "x"}-{idx++}";
+                backupUrls[repId] = Backups(v);
                 reps.Add(new MediaRepresentation
                 {
-                    Id = $"bili-v-{qn}-{vc ?? "x"}-{idx++}",
+                    Id = repId,
                     Url = url,
                     Protocol = StreamProtocol.Http,
                     Content = StreamContent.VideoOnly,
@@ -125,9 +139,11 @@ internal sealed class BilibiliAdapter : AdapterBase
                 var url = U(a.P("baseUrl").Str() ?? a.P("base_url").Str());
                 if (url is null) continue;
                 string? codecs = a.P("codecs").Str();
+                string repId = $"bili-a-{a.P("id").Int() ?? 0}-{idx++}";
+                backupUrls[repId] = Backups(a);
                 reps.Add(new MediaRepresentation
                 {
-                    Id = $"bili-a-{a.P("id").Int() ?? 0}-{idx++}",
+                    Id = repId,
                     Url = url,
                     Protocol = StreamProtocol.Http,
                     Content = StreamContent.AudioOnly,
@@ -179,7 +195,7 @@ internal sealed class BilibiliAdapter : AdapterBase
                 .Take(budget).Select(pair => pair.index).ToArray();
 
             var checkedTracks = await Task.WhenAll(candidates.Select(async index =>
-                (Index: index, Track: await VerifyTrackAsync(reps[index], ct).ConfigureAwait(false)))).ConfigureAwait(false);
+                (Index: index, Track: await VerifyTrackAsync(reps[index], backupUrls.GetValueOrDefault(reps[index].Id), ct).ConfigureAwait(false)))).ConfigureAwait(false);
             foreach (var track in checkedTracks)
                 reps[track.Index] = track.Track;
         }
@@ -202,32 +218,38 @@ internal sealed class BilibiliAdapter : AdapterBase
         return MediaDiscoveryResult.FromItem(item);
     }
 
-    private async Task<MediaRepresentation> VerifyTrackAsync(MediaRepresentation track, CancellationToken ct)
+    private async Task<MediaRepresentation> VerifyTrackAsync(MediaRepresentation track, IReadOnlyList<Uri>? backups, CancellationToken ct)
     {
-        try
+        IEnumerable<Uri> mirrors = backups is { Count: > 0 } ? [track.Url, .. backups] : [track.Url];
+        foreach (Uri mirror in mirrors.Distinct())
         {
-            ProbeResult probe = await Http.ProbeGetAsync(track.Url, track.Context, ct).ConfigureAwait(false);
-            if (!probe.IsSuccess || probe.StatusCode != 206 || probe.ContentLength is not > 0
-                || probe.StrongETag is not { } tag
-                || probe.ContentType?.StartsWith("text/", StringComparison.OrdinalIgnoreCase) == true)
-                return track;
-
-            string resourceHash = Hash(probe.FinalUrl.AbsoluteUri);
-            string identity = "http-v1:" + Hash(resourceHash + "|" + tag + "|" +
-                probe.ContentLength.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            return track with
+            try
             {
-                FileSize = probe.ContentLength,
-                ResourceETag = tag,
-                ResourceUrlSha256 = resourceHash,
-                ContentIdentity = identity
-            };
+                ProbeResult probe = await Http.ProbeGetAsync(mirror, track.Context, ct).ConfigureAwait(false);
+                if (!probe.IsSuccess || probe.StatusCode != 206 || probe.ContentLength is not > 0
+                    || probe.StrongETag is not { } tag
+                    || probe.ContentType?.StartsWith("text/", StringComparison.OrdinalIgnoreCase) == true)
+                    continue;
+
+                string resourceHash = Hash(probe.FinalUrl.AbsoluteUri);
+                string identity = "http-v1:" + Hash(resourceHash + "|" + tag + "|" +
+                    probe.ContentLength.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                return track with
+                {
+                    Url = mirror,
+                    FileSize = probe.ContentLength,
+                    ResourceETag = tag,
+                    ResourceUrlSha256 = resourceHash,
+                    ContentIdentity = identity,
+                    ExpiresAt = ExpiryParser.FromUrl(mirror) ?? track.ExpiresAt
+                };
+            }
+            catch (MediaResolverException)
+            {
+                // A refused mirror must try backup CDNs before leaving the track unverified.
+            }
         }
-        catch (MediaResolverException)
-        {
-            // A refused probe must not turn an estimated size into a usable merge plan.
-            return track;
-        }
+        return track;
     }
 
     private static string Hash(string value) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
@@ -241,7 +263,7 @@ internal sealed class BilibiliAdapter : AdapterBase
             -404 or 62002 or 62004 or 62012 => MediaErrors.Unavailable(diag),
             -403 or 87007 or 87008 => MediaErrors.LoginRequired(diag),
             -10403 => MediaErrors.Region(diag),
-            -412 or -799 => MediaErrors.RateLimited(diag),
+            -412 or -799 or -352 => MediaErrors.RateLimited(diag),
             _ => MediaErrors.SourceChanged(diag)
         };
     }

@@ -25,9 +25,11 @@ function managedHosts(item) {
 }
 
 function managedCandidate(item) {
-  return isSafe(item) && !startedByVesper(item) && Number.isSafeInteger(item.id)
-    && Number.isFinite(Date.parse(item.startTime))
-    && /^(https?:|blob:|data:)/i.test(item.finalUrl || item.url || '')
+  const notMalicious = !['content', 'url', 'unwanted'].includes(item?.danger);
+  const safeState = item?.state === 'complete' ? isSafe(item) : notMalicious;
+  return safeState && !startedByVesper(item) && Number.isSafeInteger(item?.id)
+    && Number.isFinite(Date.parse(item?.startTime))
+    && /^(https?:|blob:|data:)/i.test(item?.finalUrl || item?.url || '')
     && managedHosts(item).length > 0;
 }
 

@@ -2,10 +2,12 @@
 (() => {
   'use strict';
   const file = /\.(?:zip|7z|rar|tar|gz|xz|bz2|msi|exe|msix|msixbundle|appx|apk|iso|dmg|deb|rpm|bin)$/i;
+  const archivePath = /(?:^|\/)(?:zip|tarball|archive)(?:\/|$)/i;
   // Explicit same-origin download attributes are stronger evidence than a suffix.
   // Never speculate on signed, one-use or opaque query parameters.
   const explicitFile = /\.(?:txt|md|csv|json|docx|xlsx|pptx|odt|ods|epub|torrent|wasm|map|log|sql|bak)$/i;
-  const queryKeys = new Set(['id','file','filename','name','format','download','version','arch','platform','lang']);
+  const queryKeys = new Set(['id','file','filename','name','format','download','version','arch','platform','lang',
+    'ref','tag','branch','commit','sha','rev','release','path']);
   function explicitName(address, page, name) {
     try {
       return typeof name === 'string' && name.length > 0 && name.length <= 255
@@ -22,9 +24,10 @@
       let name = '';
       try { name = decodeURIComponent(url.pathname.split('/').at(-1)); } catch { return null; }
       const explicit = explicitName(url.href, origin.href, downloadName);
-      if (url.search && (!explicit || [...url.searchParams.keys()].some(key => !queryKeys.has(key.toLowerCase())))) return null;
+      if (url.search && [...url.searchParams.keys()].some(key => !queryKeys.has(key.toLowerCase()))) return null;
       if (explicit) name = explicit;
-      return (file.test(name) || explicit && explicitFile.test(name)) && !/[\\/\x00-\x1f\x7f]/.test(name) ? url.href : null;
+      const isEligible = file.test(name) || (explicit && explicitFile.test(name)) || archivePath.test(url.pathname);
+      return isEligible && !/[\\/\x00-\x1f\x7f]/.test(name) ? url.href : null;
     } catch { return null; }
   }
   function clickCandidate(event, page) {

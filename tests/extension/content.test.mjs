@@ -1106,3 +1106,25 @@ test('prefetch and picker share exact-post metadata and never borrow a social fe
   page='https://example.com/watch';location.hostname='example.com';
   assert.equal(title(player,page,true),'Outer quoted post');
 });
+
+test('mediaTreeChanged refreshes players when a recycled container swaps post links', () => {
+  const content = source('content');
+  const start = content.indexOf('  function mediaTreeChanged(');
+  const end = content.indexOf('  function refreshPlayers(', start);
+  const video = { isConnected: true, matches: () => true };
+  const container = { nodeType: 1, matches: () => false, querySelector: () => null, contains: el => el === video };
+  const link = { nodeType: 1, matches: () => false, querySelector: () => null };
+  let scheduled = 0;
+  const context = vm.createContext({
+    alive: () => true,
+    discoveryFrame: 0,
+    host: null,
+    observed: new Set([video]),
+    audioControls: new WeakMap(),
+    requestAnimationFrame: fn => (scheduled++, 1),
+    refreshPlayers: () => {}
+  });
+  const mediaTreeChanged = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
+  mediaTreeChanged([{ type: 'childList', target: container, addedNodes: [link] }]);
+  assert.equal(scheduled, 1);
+});

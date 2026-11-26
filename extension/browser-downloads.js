@@ -1187,13 +1187,13 @@ chrome.downloads.onChanged.addListener(async change => {
         if (record?.stage === 'parked') await reconcileChromeDownload(change.id, record);
       });
     } else if (change.state?.current === 'complete' || ['safe', 'deepScannedSafe'].includes(change.danger?.current)
-        || change.finalUrl || change.totalBytes || change.fileSize) {
+        || change.finalUrl || change.totalBytes || change.fileSize || change.filename) {
       const item = await getChromeDownload(change.id);
       if (item?.state === 'complete') {
-        if (recentlyCreated(item)) await enrollAutomaticChromeDownload(item, generation).catch(() => {});
+        await enrollAutomaticChromeDownload(item, generation).catch(() => {});
         await captureChromeDownloadSafely(item, generation);
       }
-      else if (recentlyCreated(item)) {
+      else if (recentlyCreated(item) || isSafe(item)) {
         await Promise.all([captureChromeDownloadSafely(item, generation), enrollAutomaticChromeDownload(item, generation).catch(() => {})]);
       }
     }

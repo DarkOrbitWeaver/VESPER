@@ -19,7 +19,7 @@ const VERIFY_LIMIT = 5;
 const VERIFY_DEADLINE_MS = 20_000;
 const LOOKUP_HEDGE_MS = 450; // Do not serialize two slow, independent read-only discovery paths.
 // Answers that mean the page lookup itself was turned down, as opposed to a helper or network problem.
-const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-expired'];
+const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-expired', 'blocked', 'rate-limited', 'network'];
 // Tabs with video get a short-lived listener for script-fetched media identified by Content-Type.
 const MANIFEST_WATCH_MS = 3 * 60_000;
 const MAX_WATCHED_TABS = 6;
@@ -1153,7 +1153,8 @@ chrome.webRequest.onResponseStarted.addListener(observeMediaResponse,
 chrome.webRequest.onResponseStarted.addListener(observeMediaResponse, {
   urls: ['*://*/*.m3u8*', '*://*/*.mpd*', '*://*/*.mp4*', '*://*/*.webm*', '*://*/*.m4a*',
     '*://*/*.mp3*', '*://*/*.opus*', '*://*/*.flac*', '*://*.googlevideo.com/videoplayback*',
-    '*://*.tiktok.com/video/*', '*://*.tiktokcdn.com/*', '*://*.tiktokcdn-us.com/*',
+    '*://*.bilivideo.com/*', '*://*.bilivideo.cn/*', '*://video.twimg.com/*',
+    '*://*.tiktok.com/video/*', '*://*.tiktokcdn.com/*', '*://*.tiktokcdn-us.com/*', '*://*.tiktokv.com/*',
     '*://*.vimeocdn.com/*', '*://*.fbcdn.net/*', '*://*.cdninstagram.com/*'],
   types: ['xmlhttprequest', 'other']
 }, ['responseHeaders']);
@@ -1364,6 +1365,8 @@ async function playerOptions(message, sender) {
     // A page-specific adapter may identify a single video without guessing among feed resources.
     const singleVideo = binding && identity && (identity.startsWith('tiktok:')
       || identity.startsWith('dailymotion:')
+      || identity.startsWith('youtube:')
+      || identity.startsWith('bilibili:')
       || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
     const observedRange = matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching);
     if (observedRange) possibleSources.unshift(matching);

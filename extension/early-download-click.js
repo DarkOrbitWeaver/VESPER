@@ -30,7 +30,7 @@
       if (anchor.hasAttribute(name)) original.setAttribute(name, anchor.getAttribute(name));
     event.preventDefault();
     start(url, original);
-  });
+  }, { capture: true });
 
   document.addEventListener('vesper-early-download-request', event => {
     // Page-authored events are only proposals. Independently verify a recent,

@@ -692,6 +692,60 @@ public class SiteAdapterTests
         var h = new FakeHttpHandler().Add("https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
             "{\"code\":-404,\"message\":\"not found\"}", "application/json");
         Assert.Equal(MediaErrorCode.VideoUnavailable, (await Resolve(h, "https://www.bilibili.com/video/BV1xx411c7mD")).Error!.Code);
+
+        var blocked = new FakeHttpHandler().Add("https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD",
+            "{\"code\":-352,\"message\":\"risk control\"}", "application/json");
+        Assert.Equal(MediaErrorCode.RateLimited, (await Resolve(blocked, "https://www.bilibili.com/video/BV1xx411c7mD")).Error!.Code);
+    }
+
+    [Fact]
+    public async Task Bilibili_BackupUrlFallback_SelectsWorkingMirrorAndForwardsUserAgent()
+    {
+        string playurl = """
+        {
+          "code": 0,
+          "data": {
+            "dash": {
+              "duration": 212,
+              "video": [
+                {
+                  "id": 80,
+                  "baseUrl": "https://upos-dead.bilivideo-fixture.example/v80.m4s",
+                  "backupUrl": ["https://upos-mirror.bilivideo-fixture.example/v80.m4s"],
+                  "bandwidth": 2500000, "codecs": "avc1.640032", "width": 1920, "height": 1080
+                }
+              ],
+              "audio": [
+                {
+                  "id": 30280,
+                  "baseUrl": "https://upos-dead.bilivideo-fixture.example/a192.m4s",
+                  "backupUrl": ["https://upos-mirror.bilivideo-fixture.example/a192.m4s"],
+                  "bandwidth": 192000, "codecs": "mp4a.40.2"
+                }
+              ]
+            }
+          }
+        }
+        """;
+        var h = new FakeHttpHandler()
+            .AddFile("https://api.bilibili.com/x/web-interface/view?bvid=BV1xx411c7mD", "bilibili_view.json")
+            .Add("https://api.bilibili.com/x/player/playurl?bvid=BV1xx411c7mD&cid=279786&fnval=4048&fourk=1", playurl, "application/json")
+            .Add("https://upos-dead.bilivideo-fixture.example/v80.m4s", "", "text/plain", 403)
+            .Add("https://upos-dead.bilivideo-fixture.example/a192.m4s", "", "text/plain", 403)
+            .Add("https://upos-mirror.bilivideo-fixture.example/v80.m4s", new string('v', 2048), "video/mp4",
+                headers: new Dictionary<string, string> { ["ETag"] = "\"v-mirror\"" })
+            .Add("https://upos-mirror.bilivideo-fixture.example/a192.m4s", new string('a', 1024), "audio/mp4",
+                headers: new Dictionary<string, string> { ["ETag"] = "\"a-mirror\"" });
+
+        var result = await Resolve(h, "https://www.bilibili.com/video/BV1xx411c7mD");
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        var video = Assert.Single(result.Item!.Representations, r => r.Content == StreamContent.VideoOnly);
+        var audio = Assert.Single(result.Item!.Representations, r => r.Content == StreamContent.AudioOnly);
+        Assert.Equal("https://upos-mirror.bilivideo-fixture.example/v80.m4s", video.Url.AbsoluteUri);
+        Assert.Equal(2048, video.FileSize);
+        Assert.Equal("https://upos-mirror.bilivideo-fixture.example/a192.m4s", audio.Url.AbsoluteUri);
+        Assert.Equal(1024, audio.FileSize);
+        Assert.All(h.Requests, req => Assert.True(req.Headers.ContainsKey("User-Agent")));
     }
 
     // ---------------------------------------------------------------------------------------------- YouTube

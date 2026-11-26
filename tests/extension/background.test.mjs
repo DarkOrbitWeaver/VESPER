@@ -4729,3 +4729,87 @@ test('refused native stage permits replay but uncertain acceptance never starts 
     }finally{app.stopWorker()}
   }
 });
+
+test('F-46: archive paths and repository query parameters are recognized as early download candidates', () => {
+  const app = load({});
+  try {
+    const page = 'https://github.com/DarkOrbitWeaver/VESPER';
+    const cand = app.evaluate('VesperEarlyDownload.candidate');
+    // GitHub zip endpoint
+    assert.equal(cand('https://github.com/DarkOrbitWeaver/VESPER/archive/refs/heads/main.zip', page),
+      'https://github.com/DarkOrbitWeaver/VESPER/archive/refs/heads/main.zip');
+    // Codeload extensionless zip path
+    assert.equal(cand('https://codeload.github.com/DarkOrbitWeaver/VESPER/zip/refs/heads/main', page),
+      'https://codeload.github.com/DarkOrbitWeaver/VESPER/zip/refs/heads/main');
+    // GitLab archive with ref query parameter
+    assert.equal(cand('https://gitlab.com/group/repo/-/archive/main/repo-main.tar.gz?ref=main', 'https://gitlab.com/group/repo'),
+      'https://gitlab.com/group/repo/-/archive/main/repo-main.tar.gz?ref=main');
+    // Tarball path
+    assert.equal(cand('https://github.com/DarkOrbitWeaver/VESPER/tarball/main', page),
+      'https://github.com/DarkOrbitWeaver/VESPER/tarball/main');
+  } finally { app.stopWorker(); }
+});
+
+test('F-46: server-generated extensionless archive without validator falls back to managed Chrome and completes after window', async () => {
+  const codeloadUrl = 'https://codeload.github.com/DarkOrbitWeaver/VESPER/zip/refs/heads/main';
+  const download = {
+    id: 1046, url: codeloadUrl, finalUrl: codeloadUrl,
+    filename: 'C:\\Downloads\\VESPER-main.zip', state: 'in_progress',
+    danger: 'file', startTime: '2026-11-26T18:00:00.000Z', totalBytes: 6882236,
+    bytesReceived: 0, canResume: false
+  };
+  const app = load({ 'browser-managed': { ok: true } }, { download, activity: true });
+  await app.onCreated(download);
+  // Chrome downloads it and danger becomes safe once SafeBrowsing finishes
+  download.danger = 'safe';
+  await app.onChanged({ id: download.id, danger: { previous: 'file', current: 'safe' } });
+  // Simulated long download finishing 30 seconds later (well past 15s window)
+  Object.assign(download, { state: 'complete', fileSize: 6882236, exists: true });
+  await app.onChanged({ id: download.id, state: { current: 'complete' } });
+  await app.recover();
+  const completed = app.sent.find(m => m.type === 'browser-managed' && m.operation === 'complete');
+  assert.ok(completed, 'Completed Chrome download must be sent to desktop via browser-managed complete');
+  assert.equal(completed.path, download.filename);
+  assert.equal(completed.length, 6882236);
+});
+
+test('player identity recognizes TikTok /video/ID, Facebook share/watch, Instagram stories, and Reanime', () => {
+  const app = load({});
+  try {
+    const id = app.evaluate('VesperPlayerSource.identity');
+    assert.equal(id('https://www.tiktok.com/video/7704503448573578527'), 'tiktok:7704503448573578527');
+    assert.equal(id('https://vm.tiktok.com/video/7704503448573578527'), 'tiktok:7704503448573578527');
+    assert.equal(id('https://fb.watch/xyz123'), 'facebook:watch:xyz123');
+    assert.equal(id('https://www.facebook.com/share/r/abc789/'), 'facebook:share:abc789');
+    assert.equal(id('https://www.instagram.com/stories/creator/350123456789/'), 'instagram:story:creator:350123456789');
+    assert.equal(id('https://reanime.to/watch/demon-slayer/episode-1'), 'reanime:demon-slayer:episode-1');
+  } finally { app.stopWorker(); }
+});
+
+test('YouTube and Bilibili fall back to browser-observed streams when desktop lookup is rate-limited or blocked', async () => {
+  for (const [pageUrl, streamUrl, failureCode] of [
+    ['https://www.youtube.com/watch?v=EK3tCffac5k', 'https://cdn.example/yt-hls/master.m3u8', 'rate-limited'],
+    ['https://www.bilibili.com/video/BV1xx411c7mD', 'https://cdn.example/bili/master.m3u8', 'blocked']
+  ]) {
+    const app = load({
+      'media-options': { ok: false, code: failureCode, message: 'Blocked on VPN' },
+      'media-source-options': { ...mediaOptionsReply, data: { ...mediaOptionsReply.data, playbackMatches: 1 } }
+    });
+    const sender = { url: pageUrl, tab: { id: 19 }, frameId: 0, documentId: 'vpn-doc' };
+    const now = Date.now();
+    try {
+      await app.onMedia({
+        url: streamUrl, tabId: 19, frameId: 0, documentId: sender.documentId,
+        method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: now,
+        responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }]
+      });
+      const reply = await app.message(videoOptionsMessage(pageUrl, {
+        playerUrl: `blob:${new URL(pageUrl).origin}/player`, playerPlaying: true, mediaChangedAt: now
+      }), sender);
+      assert.equal(reply.ok, true, `${pageUrl} should fall back to observed traffic after ${failureCode}`);
+      assert.equal(app.sent[0].type, 'media-options');
+      assert.equal(app.sent[1].type, 'media-source-options');
+      assert.equal(app.sent[1].candidates[0].url, streamUrl);
+    } finally { app.stopWorker(); }
+  }
+});

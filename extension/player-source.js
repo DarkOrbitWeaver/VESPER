@@ -26,9 +26,12 @@ globalThis.VesperPlayerSource = (() => {
         if (index !== null && !/^[1-9]\d{0,3}$/.test(index)) return url.href;
         return `instagram:${parts[1]}${index && index !== '1' ? ':' + index : ''}`;
       }
-    } else if (/(?:^|\.)tiktok\.com$/.test(host)) {
+      if (parts[0] === 'stories' && /^[\w.-]+$/.test(parts[1] || '') && /^\d+$/.test(parts[2] || ''))
+        return `instagram:story:${parts[1]}:${parts[2]}`;
+    } else if (/(?:^|\.)(?:tiktok\.com|v[mt]\.tiktok\.com)$/.test(host)) {
       const id = parts[0]?.startsWith('@') && parts[1] === 'video' ? parts[2]
-        : (parts[0] === 'embed' && parts[1] === 'v2' || parts[0] === 'player' && parts[1] === 'v1') ? parts[2] : null;
+        : (parts[0] === 'embed' && parts[1] === 'v2' || parts[0] === 'player' && parts[1] === 'v1') ? parts[2]
+        : parts[0] === 'video' ? parts[1] : null;
       if (/^\d+$/.test(id || '')) return `tiktok:${id}`;
     } else if (host === 'dai.ly' || /(?:^|\.)dailymotion\.com$/.test(host)) {
       const video = parts.indexOf('video');
@@ -46,10 +49,17 @@ globalThis.VesperPlayerSource = (() => {
         if (rest.length === 2 && rest[0] === 'video' && /^[1-9]\d?$/.test(rest[1]))
           return 'x:' + id + ':video:' + rest[1];
       }
-    } else if (/(?:^|\.)facebook\.com$/.test(host)) {
-      const index = parts.findIndex(part => part === 'reel' || part === 'videos');
+    } else if (/(?:^|\.)(?:facebook\.com|fb\.watch)$/.test(host)) {
+      if (host === 'fb.watch' && parts[0]) return `facebook:watch:${parts[0]}`;
+      const index = parts.findIndex(part => part === 'reel' || part === 'videos' || part === 'watch');
       const id = url.searchParams.get('v') || (index >= 0 ? parts[index + 1] : null);
       if (/^\d+$/.test(id || '')) return `facebook:${id}`;
+      if (parts[0] === 'share' && (parts[1] === 'r' || parts[1] === 'v') && parts[2])
+        return `facebook:share:${parts[2]}`;
+    } else if (/(?:^|\.)reanime\.[a-z]+$/.test(host)) {
+      const ep = parts.findIndex(p => p === 'watch' || p === 'episode');
+      if (ep >= 0 && parts[ep + 1])
+        return `reanime:${parts.slice(ep + 1).join(':')}`;
     } else if (host === 'redd.it' || host === 'v.redd.it') {
       const id = parts[0];
       if (/^[a-z0-9]+$/i.test(id || '')) return host === 'v.redd.it' ? `reddit-video:${id}` : `reddit:${id}`;

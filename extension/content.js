@@ -693,11 +693,12 @@
     if (!alive() || discoveryFrame) return;
     const selector = 'video,audio[controls],source';
     const relevant = (node) => node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector));
-    // Feed virtualization can insert a ready, paused player without firing a
-    // new media event. Batch DOM changes into a single discovery pass.
+    // Feed virtualization can insert a ready, paused player or swap post
+    // links inside a recycled card without firing a new media event.
+    const touchesObserved = target => target?.nodeType === 1 && [...observed].some(el => target.contains?.(el));
     if (host && !host.isConnected || [...observed].some(el => !el.isConnected || audioControls.get(el)?.isConnected === false)
-        || records.some(record => record.type === 'attributes' ? relevant(record.target)
-          : [...record.addedNodes].some(relevant))) {
+        || records.some(record => record.type === 'attributes' ? relevant(record.target) || touchesObserved(record.target)
+          : [...record.addedNodes].some(relevant) || touchesObserved(record.target))) {
       discoveryFrame = requestAnimationFrame(() => {
         discoveryFrame = 0;
         refreshPlayers();
