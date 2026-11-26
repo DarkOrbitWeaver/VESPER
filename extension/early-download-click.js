@@ -54,7 +54,10 @@
     intentAt = 0;
     void (async () => {
       try {
-        const reply = await chrome.runtime.sendMessage({type:'early-download', url, downloadName:original.getAttribute('download')});
+        const omitReferrer = original.rel?.split(/\s+/).includes('noreferrer')
+          || original.getAttribute('referrerpolicy')?.toLowerCase() === 'no-referrer';
+        const reply = await chrome.runtime.sendMessage({type:'early-download', url,
+          downloadName:original.getAttribute('download'), ...(omitReferrer ? { omitReferrer: true } : {})});
         if (reply?.ok) return;
         if (reply?.fallback === true) {
           original.click();

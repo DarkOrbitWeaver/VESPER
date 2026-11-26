@@ -1,7 +1,7 @@
 // High-confidence download intent, shared by the isolated click listener and worker.
 (() => {
   'use strict';
-  const file = /\.(?:zip|7z|rar|tar|gz|xz|bz2|msi|exe|msix|msixbundle|appx|apk|iso|dmg|deb|rpm|bin)$/i;
+  const file = /\.(?:zip|7z|rar|tar|gz|xz|bz2|zst|tgz|msi|exe|msix|msixbundle|appx|apk|appimage|pkg|iso|dmg|deb|rpm|bin|whl)$/i;
   const archivePath = /(?:^|\/)(?:zip|tarball|archive)(?:\/|$)/i;
   // Explicit same-origin download attributes are stronger evidence than a suffix.
   // Never speculate on signed, one-use or opaque query parameters.
@@ -35,8 +35,7 @@
         || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey) return null;
     const anchor = event.composedPath().find(node => node?.tagName === 'A');
     if (!anchor || anchor.hasAttribute('ping') || anchor.hasAttribute('onclick')
-        || anchor.hasAttribute('attributionsrc') || anchor.target && anchor.target.toLowerCase() !== '_self'
-        || anchor.hasAttribute('referrerpolicy') || anchor.rel?.split(/\s+/).includes('noreferrer')) return null;
+        || anchor.hasAttribute('attributionsrc')) return null;
     const url = candidate(anchor.href, page, anchor.getAttribute('download'));
     return url && { anchor, url };
   }

@@ -44,9 +44,9 @@ public sealed class EngineOptions
     public string? BrowserDownloadsFolder { get; init; }
 
     public int MaxConcurrentJobs { get; set; } = 3;
-    public int MaxConnectionsPerJob { get; set; } = 4;
+    public int MaxConnectionsPerJob { get; set; } = 8;
     public int MaxJobsPerHost { get; set; } = 2;
-    public int MaxConnectionsPerHost { get; set; } = 8;
+    public int MaxConnectionsPerHost { get; set; } = 12;
     public long GlobalLimitBytesPerSecond { get; set; }
     public bool CategorySubfolders { get; set; }
     public string FileNameTemplate { get; set; } = "";
@@ -73,9 +73,9 @@ public sealed class EngineOptions
     public long CheckpointBytes { get; init; } = 4L * 1024 * 1024;
     public TimeSpan CheckpointInterval { get; init; } = TimeSpan.FromSeconds(2);
 
-    public long MinSegmentedSize { get; init; } = 8L * 1024 * 1024;
+    public long MinSegmentedSize { get; init; } = 4L * 1024 * 1024;
     public long MinSplitBytes { get; init; } = 2L * 1024 * 1024;
-    public TimeSpan RampInterval { get; init; } = TimeSpan.FromSeconds(3);
+    public TimeSpan RampInterval { get; init; } = TimeSpan.FromMilliseconds(1500);
     public long FreeSpaceReserve { get; init; } = 64L * 1024 * 1024;
     public TimeSpan ProgressInterval { get; init; } = TimeSpan.FromMilliseconds(200);
 

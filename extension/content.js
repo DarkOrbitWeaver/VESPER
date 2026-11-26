@@ -78,7 +78,7 @@
   const prefetchRetried = new WeakMap();
   let generation = 0;
   const observed = new Set();
-  let discoveryObserver = null, discoveryFrame = 0;
+  let discoveryObserver = null, discoveryFrame = 0, scrollScanTimer = 0;
   const intersecting = new WeakMap();
   const resize = new ResizeObserver(schedule);
   const visibility = new IntersectionObserver((entries) => {
@@ -87,7 +87,10 @@
       if (!entry.target.isConnected) {
         visibility.unobserve(entry.target);
         observed.delete(entry.target);
-      } else intersecting.set(entry.target, entry.isIntersecting);
+      } else {
+        intersecting.set(entry.target, entry.isIntersecting);
+        if (entry.isIntersecting) consider(entry.target);
+      }
     }
     selectPlayer();
   }, { threshold: [0, 0.1, 0.25, 0.5, 0.75, 1] });
@@ -101,6 +104,8 @@
     discoveryObserver?.disconnect();
     if (discoveryFrame) cancelAnimationFrame(discoveryFrame);
     discoveryFrame = 0;
+    clearTimeout(scrollScanTimer);
+    scrollScanTimer = 0;
     resourceObserver?.disconnect();
     resourceObserver = null;
     observed.clear();
@@ -325,10 +330,10 @@
   function cardContext(node, includePlayer) {
     if (!(node instanceof Element)) return null;
     const origin = new URL(pageAddress()).origin;
-    for (let card = node, depth = 0; card && depth < 9 && card !== document.body; card = card.parentElement, depth++) {
+    for (let card = node, depth = 0; card && depth < 16 && card !== document.body; card = card.parentElement, depth++) {
       const allVideos = [...card.querySelectorAll('video')];
-      // Never derive one video's post from a shared multi-player feed container.
-      if (allVideos.length > 1) break;
+      // Never derive one video's post from a shared multi-player feed container; a single carousel article keeps at most one visible player.
+      if (allVideos.length > 1 && !(card.tagName === 'ARTICLE' && allVideos.filter(el => visiblePlayer(el)).length <= 1)) break;
       const videos = includePlayer ? allVideos.filter(el => observed.has(el) && visiblePlayer(el)) : [];
       if (includePlayer && !videos.length) continue;
       const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
@@ -432,7 +437,7 @@
     if (!/(?:^|\.)tiktok\.com$/i.test(location.hostname || '') || el?.tagName !== 'VIDEO') return null;
     // The feed keeps its address at /, but its player wrapper carries the
     // actual post ID. Only use the nearest wrapper enclosing this exact video.
-    for (let node = el.parentElement, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+    for (let node = el.parentElement, depth = 0; node && depth < 12; node = node.parentElement, depth++) {
       const match = /^xgwrapper-\d+-(\d{10,24})$/.exec(node.id || '');
       if (!match) continue;
       const videos = node.querySelectorAll('video');
@@ -696,8 +701,15 @@
     // Feed virtualization can insert a ready, paused player or swap post
     // links inside a recycled card without firing a new media event.
     const touchesObserved = target => target?.nodeType === 1 && [...observed].some(el => target.contains?.(el));
+    const linkInObservedCard = target => {
+      if (target?.tagName !== 'A') return false;
+      for (let parent = target.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth++)
+        if (touchesObserved(parent)) return true;
+      return false;
+    };
     if (host && !host.isConnected || [...observed].some(el => !el.isConnected || audioControls.get(el)?.isConnected === false)
-        || records.some(record => record.type === 'attributes' ? relevant(record.target) || touchesObserved(record.target)
+        || records.some(record => record.type === 'attributes'
+          ? (record.attributeName === 'href' ? linkInObservedCard(record.target) : relevant(record.target) || touchesObserved(record.target))
           : [...record.addedNodes].some(relevant) || touchesObserved(record.target))) {
       discoveryFrame = requestAnimationFrame(() => {
         discoveryFrame = 0;
@@ -723,7 +735,7 @@
     prefetchTarget = null;
   }
 
-  function schedulePrefetch(el, delay = 800) {
+  function schedulePrefetch(el, delay = 250) {
     if (!intentCertain || !el || butterflyHidden() || document.hidden || panelMedia || el !== video) return;
     if (prefetchTimer && prefetchTarget === el) return;
     cancelPrefetch();
@@ -770,7 +782,7 @@
   }
 
   // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
-  for (const type of ['loadedmetadata', 'playing']) document.addEventListener(type, (e) => {
+  for (const type of ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'durationchange']) document.addEventListener(type, (e) => {
     if (type === 'playing') {
       endedPlayer = null;
       clearTimeout(endedPlayerTimer);
@@ -829,6 +841,10 @@
     if (type === 'loadstart' && endedPlayer?.player === e.target) {
       endedPlayer = null;
       clearTimeout(endedPlayerTimer);
+    }
+    if (type === 'loadstart' && e.target instanceof HTMLMediaElement && (playerSource(e.target) || e.target.srcObject)) {
+      consider(e.target);
+      refreshPlayer(e.target);
     }
     if (e.target !== video) return;
     if (type === 'emptied') {
@@ -976,7 +992,7 @@
         .link{border:0;background:none;color:var(--blue);text-decoration:underline;cursor:pointer;font-size:12.5px;padding:0}
     `;
     button = element('button', 'fly');
-    button.title = 'Find media with VESPER (Alt+Shift+V)';
+    button.title = 'Find media with VESPER (Alt+Shift+V · Shift+Click for quick download)';
     button.setAttribute('aria-label', button.title);
     button.setAttribute('aria-expanded', 'false');
     const fallback = element('span', 'fly-fallback', '↓');
@@ -990,6 +1006,9 @@
     receipt = element('div', 'receipt');
     receipt.setAttribute('role', 'status');
     root.append(style, button, panel, receipt);
+    button.addEventListener('pointerenter', () => {
+      if (alive() && video && !panel?.classList.contains('show')) prefetchPlayer(video);
+    }, { passive: true, signal });
     button.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -999,7 +1018,8 @@
         suppressDragClickTimer = 0;
         return;
       }
-      void togglePanel();
+      if (e.shiftKey) void quickDownload();
+      else void togglePanel();
     }, { signal });
     // Feed players often handle pointer/mouse events on a common ancestor.
     // Do not let interaction with our overlay toggle their playback controls.
@@ -1555,6 +1575,13 @@
     });
   }
 
+  async function quickDownload() {
+    if (!alive() || butterflyHidden()) return;
+    syncPage();
+    if (panel.classList.contains('show')) closePanel();
+    await loadFormats(false, true, true);
+  }
+
   async function togglePanel() {
     if (!alive() || butterflyHidden()) return;
     syncPage();
@@ -1562,7 +1589,7 @@
     await loadFormats();
   }
 
-  async function loadFormats(refresh = false, keepSource = true) {
+  async function loadFormats(refresh = false, keepSource = true, quick = false) {
     syncPage();
     if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
     // A new click also renews the bounded script-response watcher after MV3
@@ -1694,6 +1721,11 @@
     }
     const restored = restorePickerDraft(formats, targetKey, player);
     choice = restored.choice;
+    if (quick && choice && !formats.sourceChoices?.length && !formats.selectionNeedsChoice
+        && !formats.audioNeedsChoice && !formats.subtitlesNeedChoice) {
+      return deliver(formats.title || title, formats.thumbnail || poster, pickerDuration,
+        formats, choice.index, 'download', request, restored.intent);
+    }
     renderChoices(formats.title || title, formats.thumbnail || poster, pickerDuration,
       formats, false, restored.useOriginal, restored.useM4a);
   }
@@ -2617,13 +2649,17 @@
   }, { signal });
   window.addEventListener('pageshow', refreshPlayers, { signal });
   // These remain installed when the overlay is temporarily absent. No polling.
-  const geometryChanged = () => { if (observed.size) schedule(); };
+  const geometryChanged = () => {
+    if (observed.size) schedule();
+    if (!scrollScanTimer) scrollScanTimer = setTimeout(() => { scrollScanTimer = 0; refreshPlayers(); }, 120);
+  };
   window.addEventListener('scroll', geometryChanged, { passive: true, capture: true, signal });
+  window.addEventListener('scrollend', refreshPlayers, { passive: true, capture: true, signal });
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {
     discoveryObserver = new MutationObserver(mediaTreeChanged);
     discoveryObserver.observe(document.documentElement, { childList: true, subtree: true,
-      attributes: true, attributeFilter: ['src', 'controls', 'id', 'data-permalink'] });
+      attributes: true, attributeFilter: ['src', 'href', 'controls', 'id', 'data-permalink'] });
   }
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;

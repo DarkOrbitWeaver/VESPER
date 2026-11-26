@@ -1128,3 +1128,25 @@ test('mediaTreeChanged refreshes players when a recycled container swaps post li
   mediaTreeChanged([{ type: 'childList', target: container, addedNodes: [link] }]);
   assert.equal(scheduled, 1);
 });
+
+test('mediaTreeChanged refreshes when an observed card updates an anchor href', () => {
+  const content = source('content');
+  const start = content.indexOf('  function mediaTreeChanged(');
+  const end = content.indexOf('  function refreshPlayers(', start);
+  const video = { isConnected: true, matches: () => true };
+  const article = { nodeType: 1, contains: el => el === video };
+  const anchor = { tagName: 'A', parentElement: article };
+  let scheduled = 0;
+  const context = vm.createContext({
+    alive: () => true,
+    discoveryFrame: 0,
+    host: null,
+    observed: new Set([video]),
+    audioControls: new WeakMap(),
+    requestAnimationFrame: fn => (scheduled++, 1),
+    refreshPlayers: () => {}
+  });
+  const mediaTreeChanged = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
+  mediaTreeChanged([{ type: 'attributes', attributeName: 'href', target: anchor }]);
+  assert.equal(scheduled, 1);
+});

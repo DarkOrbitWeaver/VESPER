@@ -153,7 +153,7 @@ public sealed class SettingsAccessibilityTests
                 {
                     string[] noteText =
                     [
-                        "Downloads use parts when supported; four is a good default.",
+                        "Downloads use parts when supported; eight is a good default.",
                         "Downloads wait outside these hours; active downloads pause.",
                         "Direct is fine for most people. Use a proxy if needed."
                     ];

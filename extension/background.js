@@ -19,7 +19,7 @@ const VERIFY_LIMIT = 5;
 const VERIFY_DEADLINE_MS = 20_000;
 const LOOKUP_HEDGE_MS = 450; // Do not serialize two slow, independent read-only discovery paths.
 // Answers that mean the page lookup itself was turned down, as opposed to a helper or network problem.
-const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-expired', 'blocked', 'rate-limited', 'network'];
+const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-expired', 'blocked', 'rate-limited', 'network'];
 // Tabs with video get a short-lived listener for script-fetched media identified by Content-Type.
 const MANIFEST_WATCH_MS = 3 * 60_000;
 const MAX_WATCHED_TABS = 6;
@@ -1302,8 +1302,8 @@ async function playerOptions(message, sender) {
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
-  // A click can use sign-in even while a background lookup is in flight.
-  const pendingKey = [lookupKey, prefetch ? 'prefetch' : auth.authorized ? 'signed' : '', JSON.stringify(player)].join('|');
+  // Coalesce explicit clicks onto any matching in-flight anonymous prefetch.
+  const pendingKey = [lookupKey, auth.authorized ? 'signed' : ''].join('|');
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   const task = (async () => {
     const state = await tabState(tab);
@@ -1498,7 +1498,7 @@ async function playerOptions(message, sender) {
         // An exact observed player resource can be checked without the page
         // adapter. Do not retry policy/protection or uncertain identity failures.
         const exact = wholeRepresentation ? matching : matchedManifest;
-        if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
+        if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
           const checked = explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
           if (checked.ok && checked.data?.choices?.length) return checked;
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;

@@ -468,14 +468,15 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         var workers = new List<RangeWorker>();
         RangeWorker? primaryWorker = null;
 
-        async Task WorkerAsync(RangeWorker worker, bool primary, HttpResponseMessage? open)
+        async Task WorkerAsync(RangeWorker worker, bool primary, HttpResponseMessage? open, Segment? initial = null)
         {
             session.AddConnection();
             try
             {
                 while (!workersCts.IsCancellationRequested && !worker.Draining)
                 {
-                    Segment? segment = board.Acquire();
+                    Segment? segment = initial ?? board.Acquire();
+                    initial = null;
                     if (segment is null) break;
                     try
                     {
@@ -489,28 +490,37 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             }
             finally
             {
+                if (initial is not null) board.Release(initial);
                 open?.Dispose();
                 session.RemoveConnection();
                 if (!primary) hostGate.Release();
             }
         }
 
-        void StartWorker(bool primary = false, HttpResponseMessage? response = null)
+        void StartWorker(bool primary = false, HttpResponseMessage? response = null, Segment? initial = null)
         {
             var worker = new RangeWorker();
-            worker.Task = Task.Run(() => WorkerAsync(worker, primary, response), CancellationToken.None);
+            worker.Task = Task.Run(() => WorkerAsync(worker, primary, response, initial), CancellationToken.None);
             workers.Add(worker);
             if (primary) primaryWorker = worker;
         }
 
-        // The initial response already holds the job's first host slot.
-        StartWorker(primary: true, first.Response);
+        // Claim segment 0 for primary before spawning worker #2 so the already-open stream isn't raced off it.
+        Segment? primarySegment = board.Acquire();
+        StartWorker(primary: true, first.Response, primarySegment);
+        int target = 1;
+        if (primarySegment is not null && segmented && Job.Identity == IdentityLevel.StrongEtag && !pieceMode && !recentlyThrottled
+            && _o.MaxConnectionsPerJob >= 2 && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0
+            && board.HasAssignableWork && hostGate.Wait(0))
+        {
+            target = 2;
+            StartWorker();
+        }
 
         long lastChange = Stopwatch.GetTimestamp();
         long startingBytes = session.RunBytes;
         long sampleBytes = startingBytes;
         bool smallProbeStarted = false;
-        int target = 1;
         try
         {
             while (true)
@@ -530,7 +540,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 {
                     int active = workers.Count(w => !w.Task.IsCompleted && !w.Draining);
                     TimeSpan interval = Job.Identity == IdentityLevel.StrongEtag && !pieceMode
-                        ? TimeSpan.FromMilliseconds(Math.Min(_o.RampInterval.TotalMilliseconds, 1500)) : _o.RampInterval;
+                        ? TimeSpan.FromMilliseconds(Math.Min(_o.RampInterval.TotalMilliseconds, 800)) : _o.RampInterval;
                     TimeSpan elapsed = Stopwatch.GetElapsedTime(lastChange);
                     long bytes = session.RunBytes - sampleBytes;
                     double rate = elapsed.TotalSeconds > 0 ? bytes / elapsed.TotalSeconds : 0;

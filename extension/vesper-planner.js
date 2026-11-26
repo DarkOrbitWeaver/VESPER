@@ -167,7 +167,7 @@ globalThis.VesperPlanner = (() => {
 
   // Early format lookup admission. Respects per-tab and per-site cooldowns, a global concurrency
   // limit, server Retry-After deadlines and escalating backoff after repeated refusals.
-  function createPrefetchGovernor({ now = Date.now, tabCooldownMs = 5_000, siteCooldownMs = 15_000, maxActive = 2,
+  function createPrefetchGovernor({ now = Date.now, tabCooldownMs = 1500, siteCooldownMs = 2000, maxActive = 2,
     maxSites = 64, refusalBackoffMs = 60_000, maxBackoffMs = 15 * 60_000 } = {}) {
     const tabAt = new Map(), siteUntil = new Map(), refusals = new Map();
     const active = new Map();

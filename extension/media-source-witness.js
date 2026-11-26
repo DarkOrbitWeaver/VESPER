@@ -9,6 +9,8 @@
   const urls = new Map();
   const owners = new WeakMap();
   const buffers = new WeakMap();
+  const streams = new WeakMap();
+  const readers = new WeakMap();
   const bufferSlots = [];
   const MAX_SOURCES = 24, MAX_BUFFERS = 96, MAX_PATHS = 12, TTL = 120_000;
   let observingResponses = false, pendingHashes = 0;
@@ -157,6 +159,43 @@
       } catch { /* Optional observation. */ }
       return promise;
     });
+    if (typeof ReadableStream === 'function' && typeof ReadableStreamDefaultReader === 'function') {
+      try {
+        const bodyDesc = Object.getOwnPropertyDescriptor(Response.prototype, 'body');
+        if (bodyDesc?.get && bodyDesc.configurable) {
+          Object.defineProperty(Response.prototype, 'body', {
+            ...bodyDesc,
+            get() {
+              const stream = apply(bodyDesc.get, this, []);
+              try {
+                const source = stream && pathOf(this.url, this.headers.get('content-type'));
+                if (source) streams.set(stream, source);
+              } catch { /* Optional observation. */ }
+              return stream;
+            }
+          });
+        }
+        replace(ReadableStream.prototype, 'getReader', original => function (...args) {
+          const reader = apply(original, this, args);
+          try {
+            const source = streams.get(this);
+            if (reader && source) readers.set(reader, source);
+          } catch { /* Optional observation. */ }
+          return reader;
+        });
+        replace(ReadableStreamDefaultReader.prototype, 'read', original => function (...args) {
+          const promise = apply(original, this, args);
+          try {
+            const source = readers.get(this);
+            if (source) promise.then(chunk => {
+              const value = chunk && !chunk.done ? chunk.value : null;
+              if (value) rememberBuffer(value.buffer || value, source);
+            }, () => {}).catch(() => {});
+          } catch { /* Optional observation. */ }
+          return promise;
+        });
+      } catch { /* Optional observation. */ }
+    }
   }
   replace(URL, 'createObjectURL', original => function (...args) {
     const url = apply(original, this, args);

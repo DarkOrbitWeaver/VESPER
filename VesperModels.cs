@@ -211,7 +211,7 @@ internal sealed class VesperPreferences
     public int GlobalRateLimitKbs { get; set; }
     public int PerTransferRateLimitKbs { get; set; }
     public List<int> BandwidthPresetsKbs { get; set; } = [128, 512, 2000];
-    public int MaxConnectionsPerJob { get; set; } = 4;
+    public int MaxConnectionsPerJob { get; set; } = 8;
     public bool NotifyOnFinish { get; set; } = true;
     public bool PlayCompletionSound { get; set; } = true;
     public bool OpenVesperOnCompletion { get; set; } = true;

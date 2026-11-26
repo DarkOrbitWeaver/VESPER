@@ -669,7 +669,7 @@ internal sealed class SettingsForm : VesperPopupForm
         var page = Page("Network", "Connections, schedule and privacy.");
         var connLabel = Label("Connections per download", 9, bold: true);
         connLabel.SetBounds(25, 108, 300, 22);
-        var connNote = Label("Downloads use parts when supported; four is a good default.", 8, muted: true);
+        var connNote = Label("Downloads use parts when supported; eight is a good default.", 8, muted: true);
         connNote.SetBounds(25, 133, 360, 20);
         int[] counts = [1, 2, 3, 4, 6, 8];
         var connections = Choice(["1", "2", "3", "4", "6", "8"],

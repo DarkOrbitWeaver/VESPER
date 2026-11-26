@@ -211,3 +211,50 @@ test('mutated sampled buffers lose exact provenance instead of certifying altere
   a.buffer.appendBuffer(bytes);
   assert.deepEqual(b.request(a.el),[]);
 });
+
+test('streaming ReadableStream reader chunks associate with the SourceBuffer that appends them', async () => {
+  const b = setup(), a = b.player(), neighbour = b.player();
+  class MockReader {
+    constructor(chunks, stream) { this.chunks = chunks; this.stream = stream; }
+    async read() { return this.chunks.length ? { done: false, value: this.chunks.shift() } : { done: true, value: undefined }; }
+  }
+  class MockStream {
+    constructor(chunks) { this.chunks = chunks; }
+    getReader() { return new MockReader(this.chunks, this); }
+  }
+  const chunk = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  class StreamResponse extends b.FetchResponse {
+    get body() { return new MockStream([chunk]); }
+  }
+  // Re-run witness inside a context providing ReadableStream globals.
+  let time = 100_000, serial = 0;
+  const listeners = new Map();
+  class StreamURL extends URL { static createObjectURL() { return 'blob:https://site.test/' + ++serial; } }
+  class StreamBuf { appendBuffer(value) { this.last = value; } }
+  class StreamMS { addSourceBuffer() { return new StreamBuf(); } }
+  class StreamPlayer { constructor(src) { this.currentSrc = src; this.attributes = new Map(); } setAttribute(k, v) { this.attributes.set(k, v); } }
+  class FetchRes {
+    constructor(url, mime, stream) { this._url = url; this._mime = mime; this._stream = stream; this.headers = { get: () => mime }; }
+    get url() { return this._url; }
+    get body() { return this._stream; }
+    arrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); }
+    blob() { return Promise.resolve(new ArrayBuffer(0)); }
+  }
+  const ctx = vm.createContext({
+    URL: StreamURL, MediaSource: StreamMS, SourceBuffer: StreamBuf, HTMLMediaElement: StreamPlayer,
+    Response: FetchRes, ReadableStream: MockStream, ReadableStreamDefaultReader: MockReader,
+    WeakRef, ArrayBuffer, Blob, Date: class extends Date { static now() { return time; } },
+    document: { addEventListener: (t, fn) => listeners.set(t, fn) }
+  });
+  vm.runInContext(script('media-source-witness'), ctx);
+  const ms = new StreamMS();
+  const el = new StreamPlayer(StreamURL.createObjectURL(ms));
+  const buf = ms.addSourceBuffer('video/mp4');
+  const reader = new FetchRes('https://cdninstagram.com/v/clip.mp4?bytestart=0&byteend=999', 'video/mp4', new MockStream([chunk])).body.getReader();
+  const res = await reader.read();
+  buf.appendBuffer(res.value);
+  listeners.get('vesper-media-provenance-request')({ target: el });
+  assert.deepEqual(JSON.parse(el.attributes.get('data-vesper-media-provenance')).paths,
+    [{ path: 'https://cdninstagram.com/v/clip.mp4', seen: 100_000 }]);
+  assert.ok(a && neighbour && b);
+});

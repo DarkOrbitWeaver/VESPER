@@ -18,6 +18,11 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
     private const int ChunkAttempts = 3;
     private DownloadJob Job => session.Job;
 
+    internal static long ChunkSizeFor(long trackSize) =>
+        trackSize <= 64L * 1024 * 1024 ? 2L * 1024 * 1024
+        : trackSize <= 256L * 1024 * 1024 ? 4L * 1024 * 1024
+        : ChunkBytes;
+
     internal sealed record Cursor(int Version, string Fingerprint, string Phase, long MuxLength = 0, string? MuxSha256 = null,
         long TracksLength = 0, string? TracksSha256 = null, string? MuxIdentity = null, string? TracksIdentity = null,
         string? SubtitleNotice = null);
@@ -101,7 +106,7 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             EnsureSpace(missing + (plan.ClipRange is null ? total : 0));
             // Snapshot gaps once. The work iterator stays bounded even when a
             // multi-gigabyte track has thousands of pending range chunks.
-            using var work = TrackWork(plan, Job.Extents.Clone()).GetEnumerator();
+            using var work = TrackWork(plan, Job.Extents.Clone(), adaptiveChunks: true).GetEnumerator();
             await RunWorkersAsync(plan, work, state, ct).ConfigureAwait(false);
             await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
         }
@@ -113,19 +118,20 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
     // download
 
-    internal static IEnumerable<(int Track, long Start, long End)> TrackWork(MediaMergePlan plan, ExtentSet saved)
+    internal static IEnumerable<(int Track, long Start, long End)> TrackWork(MediaMergePlan plan, ExtentSet saved, bool adaptiveChunks = false)
     {
         // Each track has an independent bounded cursor. Interleave so a long
         // video does not monopolize every worker while its audio waits.
         IEnumerable<(int Track, long Start, long End)> Chunks(int index)
         {
-            long start = plan.OffsetOf(index), end = start + plan.Tracks[index].Size;
+            long start = plan.OffsetOf(index), size = plan.Tracks[index].Size, end = start + size;
+            long chunk = adaptiveChunks ? ChunkSizeFor(size) : ChunkBytes;
             foreach (ByteRange gap in saved.Gaps(plan.TotalBytes))
             {
                 long left = Math.Max(gap.Start, start), right = Math.Min(gap.End, end);
                 for (long pos = left; pos < right;)
                 {
-                    long next = pos + Math.Min(right - pos, ChunkBytes);
+                    long next = pos + Math.Min(right - pos, chunk);
                     yield return (index, pos, next);
                     pos = next;
                 }

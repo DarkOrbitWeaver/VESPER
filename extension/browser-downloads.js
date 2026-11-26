@@ -42,8 +42,7 @@ const chromeCanResume = response => response?.replay === true && response.accept
   && Number.isSafeInteger(response.length) && response.length > 0 && !!(response.etag || response.lastModified);
 // Parking discards what Chrome received: VESPER fetches the whole file itself and never mixes in Chrome's bytes.
 // Past the halfway mark a native transfer must be more than twice as fast to finish first, so Chrome keeps the file.
-const canPark = (item, response) => isOpenTransfer(item)
-  && (item.bytesReceived === 0 || chromeCanResume(response) && item.bytesReceived * 2 <= response.length);
+const canPark = (item, response) => isOpenTransfer(item) && item.bytesReceived === 0;
 // Response evidence does not outlive the worker, so a parked record carries the one fact recovery needs from it.
 const stillParked = (item, record) => isOpenTransfer(item) && item.paused
   && (item.bytesReceived === 0 || record?.chromeResumable === true);
@@ -411,12 +410,11 @@ function canPauseBeforeNative(item, proof) {
   const response = responseForDownload(item);
   const now = Date.now();
   const warm = capturePreflightReadyAt > 0 && now >= capturePreflightReadyAt
-    && now - capturePreflightReadyAt <= 15_000;
+    && now - capturePreflightReadyAt <= 300_000;
   const warming = capturePreflightPromise && now >= capturePreflightAt
     && now - capturePreflightAt <= EARLY_CAPTURE_WINDOW;
-  // A known resumable, fresh attachment need not race a cold native handshake.
-  // The durable parking deadline and Chrome recovery still apply.
-  return (warm || warming) && response && chromeCanResume(response)
+  // Pause only at 0 bytes while the preflight is warm; once Chrome receives bytes it keeps the download.
+  return item?.bytesReceived === 0 && (warm || warming) && response && chromeCanResume(response)
     && response.length === proof?.length && now >= response.seen && now - response.seen <= EARLY_CAPTURE_WINDOW;
 }
 
@@ -775,7 +773,7 @@ function moveChromeDownload(id, generation) {
     const ownership = VesperPlanner.ownershipRoute({ approved: true,
       nativeReplayVerified: reply.ok === true && result?.transferReady === true,
       chromeHasBytes: current?.bytesReceived > 0,
-      chromeReplaySafe: chromeCanResume(response) && canPark(current, response) });
+      chromeReplaySafe: false });
     if (ownership.route !== 'native-http' || !sameDownload(current, record) || !canPark(current, response) || !(await sameSource(current, record))
         || current.paused !== earlyPaused) {
       if (earlyPaused) await restoreChromeDownload(id, record);
@@ -1242,9 +1240,19 @@ async function earlyDirectDownload(message, sender) {
           }
         }
         if (!captureAllowed(generation)) return fallback;
-        if (!response) response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
-          cache: 'no-store', signal: controller.signal });
+        if (!response) {
+          response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
+            cache: 'no-store', signal: controller.signal });
+          if (response.status === 405 || response.status === 501) {
+            await response.body?.cancel?.().catch(() => {});
+            response = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, credentials: 'omit', redirect: 'follow',
+              cache: 'no-store', signal: controller.signal });
+          }
+        }
       } finally { clearTimeout(timeout); }
+      const rangeTotal = response.status === 206 ? /^bytes\s+0-0\/(\d+)$/i.exec(response.headers.get('content-range') || '')?.[1] : null;
+      if (response.status === 206) await response.body?.cancel?.().catch(() => {});
+      const statusOk = response.status === 200 || (response.status === 206 && !!rangeTotal);
       const final = VesperPlayerSource.http(response.url);
       const mime = mimeType(response.headers.get('content-type'));
       const attachment = /^attachment\b/i.test(response.headers.get('content-disposition') || '');
@@ -1252,13 +1260,13 @@ async function earlyDirectDownload(message, sender) {
       const explicitlyNamed = !!explicitName;
       const documentAttachment = explicitlyNamed && attachment
         && /^(?:text\/(?:plain|markdown|csv)|application\/(?:json|vnd\.openxmlformats-officedocument\.[a-z.]+|vnd\.oasis\.opendocument\.[a-z-]+|epub\+zip|x-bittorrent))$/.test(mime || '');
-      const binary = /^(?:application\/(?:octet-stream|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-msdownload|x-msi|x-msdos-program|vnd\.android\.package-archive|x-iso9660-image|x-apple-diskimage|vnd\.debian\.binary-package|x-rpm|x-tar|x-xz|x-bzip2))$/.test(mime || '');
-      const lengthText = response.headers.get('content-length') || '';
+      const binary = /^(?:application\/(?:octet-stream|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-msdownload|x-msi|x-msdos-program|vnd\.android\.package-archive|x-iso9660-image|x-apple-diskimage|vnd\.debian\.binary-package|x-rpm|x-tar|x-xz|x-bzip2|zstd))$/.test(mime || '');
+      const lengthText = rangeTotal || response.headers.get('content-length') || '';
       const length = /^\d+$/.test(lengthText) ? Number(lengthText) : 0;
       const etag = response.headers.get('etag')?.trim();
       const lastModified = !etag ? strongLastModified(response.headers.get('last-modified'), response.headers.get('date')) : undefined;
       const encoding = response.headers.get('content-encoding');
-      if (response.status !== 200 || !final || final.username || final.password
+      if (!statusOk || !final || final.username || final.password
           || signedItems && (final.href !== url || response.redirected)
           || final.protocol !== 'https:' && final.origin !== page.origin
           || !mime || !documentAttachment && (mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json')
@@ -1268,7 +1276,8 @@ async function earlyDirectDownload(message, sender) {
           || matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !captureAllowed(generation)) return fallback;
       const proof = { length, contentType: mime, attachment,
         ...(lastModified ? { lastModified, basis: 'last-modified' } : { etag, basis: 'etag' }) };
-      const items = signedItems || [{ url: final.href, originalUrl: url, referer: page.href, userAgent: navigator.userAgent }];
+      const items = signedItems || [{ url: final.href, originalUrl: url,
+        ...(message.omitReferrer ? {} : { referer: page.href }), userAgent: navigator.userAgent }];
       // A server-specified attachment filename wins over the HTML download name.
       const disposition = response.headers.get('content-disposition') || '';
       if (explicitName && !/;\s*filename\*?\s*=/i.test(disposition)) items[0].fileName = explicitName;
