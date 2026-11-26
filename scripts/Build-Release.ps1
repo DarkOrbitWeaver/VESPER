@@ -56,7 +56,7 @@ $sourceRevision = Get-SourceRevision ([bool]$AllowDirtyWorkingTreeForDevelopment
 
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     [xml]$props = Get-Content -LiteralPath (Join-Path $root 'Directory.Build.props') -Raw
-    $Version = [string]$props.Project.PropertyGroup.Version
+    $Version = [string]$props.Project.PropertyGroup.Version.InnerText
 }
 $sourceManifest = Get-Content -LiteralPath (Join-Path $root 'extension/manifest.json') -Raw | ConvertFrom-Json
 if (-not $PSBoundParameters.ContainsKey('Version') -and
