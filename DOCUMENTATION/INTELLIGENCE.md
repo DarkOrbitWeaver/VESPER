@@ -45,7 +45,7 @@ Each case has a stable site-family group, a chosen ephemeral candidate ID or nul
 
 Adapter results are useful as weak teachers: extract the expected program ID, source relationships, known format combinations and verified outcomes. They are not automatically correct labels. Actual user-selected player identity, independently observed provenance, decoded media, byte comparison and manual review determine ground truth. Group all variations of the same site or fixture family in the same partition, including mirrors and structural mutations. Keep a later time-based holdout for site changes.
 
-The current training implementation is verified against synthetic fixtures only. A production learned model requires enough independent real labels, measured holdout improvement, regression checks, and explicit release review. Runtime never retrains itself or downloads executable model code.
+The training implementation has been exercised against synthetic fixtures and 54 controlled browser observations. These are not an independent public-site label set. Acquisition outcomes and measured delivery speeds inform route ordering locally; they do not turn unverified player choices into training labels. A production learned model requires enough independent real labels, measured holdout improvement, regression checks, and explicit release review. Runtime never retrains itself or downloads executable model code.
 
 ## Roadmap and release gates
 
