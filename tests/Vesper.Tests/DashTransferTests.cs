@@ -333,7 +333,7 @@ public sealed class DashTransferTests
         Assert.True(added.Ok, added.Message);
         var done = await h.WaitAsync(added.JobId, job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed);
         Assert.True(done.State == JobState.Completed, done.Message);
-        Assert.Equal(2, server.MaxActiveFragmentRequests);
+        Assert.Equal(3, server.MaxActiveFragmentRequests);
         foreach (string path in new[] { "/av-1.m4s", "/av-2.m4s", "/av-3.m4s" })
             Assert.Equal(2, server.Hits(path));
         using var output = File.OpenRead(done.FinalPath!);

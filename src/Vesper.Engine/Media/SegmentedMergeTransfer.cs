@@ -100,7 +100,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         using var keys = new HlsKeyCache(cursor?.KeyFingerprints);
         if (!keys.Valid) return Stop("The saved HLS key identities are invalid.");
         using var fetchStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        Task<BufferedPart>? prefetched = null;
+        var pending = new Dictionary<(int Track, int Part), Task<BufferedPart>>();
         var window = new SegmentLookahead(engine.Options, session.Limiter, engine.GlobalLimiter);
         try
         {
@@ -110,19 +110,43 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                 PreparedTrack prepared = tracks[ti];
                 int firstPart = ti == trackIndex ? next : 0;
                 if (completed[ti] != firstPart) return Stop("The saved segment cursor is inconsistent.");
+                // Track transitions are durable; per-segment progress already has checkpointed bytes.
+                // Do not issue a second database transaction for cosmetic text on every segment.
+                engine.UpdateJob(Job, job => job.Message = $"Track {ti + 1} of {tracks.Length}");
                 for (int pi = firstPart; pi < prepared.Parts.Count; pi++)
                 {
                     ct.ThrowIfCancellationRequested();
                     Part part = prepared.Parts[pi];
-                    var current = prefetched ?? FetchBufferedPartAsync(part, fetchStop.Token);
-                    prefetched = null;
-                    // One lookahead, using the existing global memory/connection budget.
-                    // Initialize and decrypt in order; only independent clear media GETs
-                    // are eligible. Never advance the durable cursor until this part commits.
-                    if (pi + 1 < prepared.Parts.Count && window.Limit(prepared.Parts[pi + 1].Url) > 1
-                        && CanPrefetch(part, prepared.Parts[pi + 1]))
-                        prefetched = FetchBufferedPartAsync(prepared.Parts[pi + 1], fetchStop.Token);
+                    var keyForPart = (ti, pi);
+                    if (!pending.TryGetValue(keyForPart, out var current))
+                        pending[keyForPart] = current = FetchBufferedPartAsync(part, fetchStop.Token);
+                    // Reserve the next-to-write part first, then independent clear parts
+                    // in order. This preserves FIFO buffer admission across concurrent jobs.
+                    int lookahead = pi + 1;
+                    for (; lookahead < prepared.Parts.Count; lookahead++)
+                    {
+                        Part candidate = prepared.Parts[lookahead];
+                        if (pending.ContainsKey((ti, lookahead))) continue;
+                        if (pending.Count >= window.Limit(candidate.Url)
+                            || !CanPrefetch(prepared.Parts[lookahead - 1], candidate)) break;
+                        pending[(ti, lookahead)] = FetchBufferedPartAsync(candidate, fetchStop.Token);
+                    }
+                    // Only when all remaining parts of this track are already admitted
+                    // may a clear initialization/first object from the next track overlap.
+                    // Its independent stage is not committed until the previous track ends.
+                    if (lookahead == prepared.Parts.Count && ti + 1 < tracks.Length
+                        && tracks[ti + 1].Parts.Count > 0 && !pending.ContainsKey((ti + 1, 0)))
+                    {
+                        Part nextTrack = tracks[ti + 1].Parts[0];
+                        if (pending.Count < window.Limit(nextTrack.Url)
+                            && part.Key is null && nextTrack.Key is null
+                            && !string.Equals(part.Url, nextTrack.Url, StringComparison.Ordinal))
+                            pending[(ti + 1, 0)] = FetchBufferedPartAsync(nextTrack, fetchStop.Token);
+                    }
+                    long waitStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     using BufferedPart received = await current.ConfigureAwait(false);
+                    window.ObserveWait(System.Diagnostics.Stopwatch.GetElapsedTime(waitStart));
+                    pending.Remove(keyForPart);
                     ReadOnlyMemory<byte> data = received.Data;
                     if (part.Key is { } key)
                     {
@@ -146,7 +170,6 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                         SourceShapeFingerprints: tracks.Select(track => (string?)track.SourceShapeFingerprint).ToArray());
                     session.Report(new ByteRange(start, offset), JsonSerializer.Serialize(saved));
                     await session.MaybeCheckpointAsync(ct).ConfigureAwait(false);
-                    engine.UpdateJob(Job, job => job.Message = $"Track {ti + 1} of {tracks.Length}, segment {pi + 1} of {prepared.Parts.Count}");
                 }
             }
         }
@@ -157,9 +180,9 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         finally
         {
             fetchStop.Cancel();
-            if (prefetched is not null)
+            foreach (var fetch in pending.Values)
             {
-                try { (await prefetched.ConfigureAwait(false)).Dispose(); }
+                try { (await fetch.ConfigureAwait(false)).Dispose(); }
                 catch (Exception) { /* Observe speculative fetch failure; the ordered result owns the outcome. */ }
             }
             keys.Clear();

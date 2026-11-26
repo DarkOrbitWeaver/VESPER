@@ -11,6 +11,17 @@ public sealed partial class DownloadEngine
 {
     private sealed record HttpPrefixProof(long Total, string ETag, string ResourceIdentity, string? ContentType);
 
+    public static bool IsRecoverableDeliveryFailure(JobState state, string reason) =>
+        state == JobState.NeedsAttention && reason is ("range-ignored" or "range-rejected" or
+            "invalid-response" or "invalid-range" or "unexpected-range" or "not-playlist" or
+            "media-validation" or "invalid-container");
+
+    private bool MatchesDeliverySwitchLocked(DownloadJob job, string expectedSource) =>
+        MatchesAutomaticRefreshLocked(job, expectedSource)
+        || IsRecoverableDeliveryFailure(job.State, job.Reason)
+            && job.SourceUrl == expectedSource && !_sessions.ContainsKey(job.Id)
+            && job.BrowserProof is null;
+
     /// <summary>Switch compatible delivery routes, retaining only exactly verified committed data.</summary>
     public async Task<RescueResult> SwitchMediaAcquisitionAsync(Guid id, MediaAcquisitionReplacement replacement,
         string expectedExpiredSource, CancellationToken ct = default)
@@ -32,7 +43,7 @@ public sealed partial class DownloadEngine
         lock (_lock)
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job)) return Rejected("That entry no longer exists.");
-            if (!MatchesAutomaticRefreshLocked(job, expectedExpiredSource) || _cancelling.Contains(id)
+            if (!MatchesDeliverySwitchLocked(job, expectedExpiredSource) || _cancelling.Contains(id)
                 || IsCleanupPending(job) || job.PendingFinalPath is not null || job.BrowserProof is not null
                 || job.ExpectedSha256 is not null || job.PieceMapJson is not null || job.MediaMetadataJson is not null
                 || job.Output != MediaOutput.Original || job.Kind == replacement.Kind
@@ -129,9 +140,10 @@ public sealed partial class DownloadEngine
         {
             if (!_jobs.TryGetValue(id, out DownloadJob? job) || !ReferenceEquals(job, original)
                 || _cancelling.Contains(id) || IsCleanupPending(job) || job.PendingFinalPath is not null
-                || !MatchesAutomaticRefreshLocked(job, expectedExpiredSource) || job.Kind != snapshot.Kind
+                || !MatchesDeliverySwitchLocked(job, expectedExpiredSource) || job.Kind != snapshot.Kind
                 || job.MediaState != snapshot.MediaState || job.MediaPlanJson != snapshot.MediaPlanJson
                 || job.Generation != snapshot.Generation || job.PartialIdentity != snapshot.PartialIdentity
+                || job.State != snapshot.State || job.Reason != snapshot.Reason
                 || !ReferenceEquals(job.Extents, savedExtents) || job.FileName != snapshot.FileName
                 || source.ExpiresAt <= DateTimeOffset.UtcNow)
                 return Rejected("The download changed while its alternate delivery was being checked.");

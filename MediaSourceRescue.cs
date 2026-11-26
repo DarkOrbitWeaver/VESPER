@@ -30,7 +30,9 @@ internal static class MediaSourceRescue
     public static bool ShouldTryAutomatically(JobSnapshot job)
     {
         if (!CanRefresh(job)) return false;
-        if (job.State != JobState.NeedsLink || job.Reason is not ("expired" or "forbidden")
+        if (!(job.State == JobState.NeedsLink && job.Reason is ("expired" or "forbidden")
+            || job.Kind != JobKind.Merge && !job.IsLiveRecording && job.Output == MediaOutput.Original
+                && DownloadEngine.IsRecoverableDeliveryFailure(job.State, job.Reason))
             || job.IsUnacceptedBrowserCapture || string.IsNullOrWhiteSpace(job.MediaProvider)
             || job.MediaProvider == "generic" || string.IsNullOrWhiteSpace(job.MediaId)
             || string.IsNullOrWhiteSpace(job.MediaFormatId)) return false;
@@ -114,7 +116,8 @@ internal static class MediaSourceRescue
         RescueResult last = new(false, RescueMode.None, "The exact selected format is unavailable. Saved data was kept.", 0);
         // Try the original delivery first. Different URLs with the exact format ID are not
         // assumed equivalent: each goes through the engine's independent identity checks.
-        foreach (MediaRepresentation format in exact.Where(r => r.Protocol == protocol).Take(3))
+        foreach (MediaRepresentation format in exact.Where(r => r.Protocol == protocol
+            && !DownloadEngine.IsRecoverableDeliveryFailure(job.State, job.Reason)).Take(3))
         {
             ct.ThrowIfCancellationRequested();
             if (automatic && job.Kind == JobKind.Http && AlreadyFailed(job.Id, job.Kind, format.Url.AbsoluteUri)
@@ -129,12 +132,23 @@ internal static class MediaSourceRescue
             if (last.Accepted) return last;
             if (automatic && !StillAwaitingSource(engine, job)) return last;
         }
-        if (job.State != JobState.NeedsLink || job.Reason is not ("expired" or "forbidden")
+        if (!(job.State == JobState.NeedsLink && job.Reason is ("expired" or "forbidden")
+                || DownloadEngine.IsRecoverableDeliveryFailure(job.State, job.Reason))
             || job.Output != MediaOutput.Original || job.IsLiveRecording || !StillAwaitingSource(engine, job))
             return last;
+        var preferred = engine.PreferredMediaDelivery(item.Provider, exact.Select(r => r.Protocol switch
+        {
+            StreamProtocol.Http => JobKind.Http, StreamProtocol.Hls => JobKind.Hls,
+            StreamProtocol.Dash => JobKind.Dash, _ => JobKind.Merge
+        }).Distinct().ToArray());
         foreach (MediaRepresentation format in exact.Where(r => !r.IsLive
             && (r.Protocol != protocol && r.Protocol is (StreamProtocol.Http or StreamProtocol.Dash or StreamProtocol.Hls)
-                || protocol == StreamProtocol.Http && r.Protocol == protocol && r.Url.AbsoluteUri != job.SourceUrl)).Take(3))
+                || protocol == StreamProtocol.Http && r.Protocol == protocol && r.Url.AbsoluteUri != job.SourceUrl))
+            .OrderByDescending(r => preferred == (r.Protocol switch
+            {
+                StreamProtocol.Http => JobKind.Http, StreamProtocol.Hls => JobKind.Hls,
+                StreamProtocol.Dash => JobKind.Dash, _ => JobKind.Merge
+            })).Take(3))
         {
             ct.ThrowIfCancellationRequested();
             if (!TryRefreshCredentials(format, out var secrets, out _)) continue;
@@ -160,8 +174,10 @@ internal static class MediaSourceRescue
     }
 
     private static bool StillAwaitingSource(DownloadEngine engine, JobSnapshot job) =>
-        engine.Snapshot(job.Id) is { State: JobState.NeedsLink } current
-        && current.SourceUrl == job.SourceUrl && current.Reason is ("expired" or "forbidden");
+        engine.Snapshot(job.Id) is { } current && current.State == job.State && current.Reason == job.Reason
+        && current.SourceUrl == job.SourceUrl
+        && (current.State == JobState.NeedsLink && current.Reason is ("expired" or "forbidden")
+            || DownloadEngine.IsRecoverableDeliveryFailure(current.State, current.Reason));
 
     internal static async Task<RescueResult> RefreshDirectAsync(DownloadEngine engine, JobSnapshot job, MediaItem item, CancellationToken ct,
         string? expectedExpiredSource = null)

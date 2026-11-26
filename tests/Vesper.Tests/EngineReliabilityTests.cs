@@ -603,6 +603,26 @@ public sealed class MediaSourceRescueTests
         finally { VESPER.MediaSourceRescue.ForgetAutomaticAttempt(ready.Id); }
     }
 
+    [Theory]
+    [InlineData("invalid-container", JobKind.Dash, false, true)]
+    [InlineData("media-validation", JobKind.Http, false, true)]
+    [InlineData("range-rejected", JobKind.Http, false, true)]
+    [InlineData("destination", JobKind.Http, false, false)]
+    [InlineData("invalid-container", JobKind.Merge, false, false)]
+    [InlineData("not-playlist", JobKind.Hls, true, false)]
+    public void Automatic_delivery_recovery_is_bounded_to_compatible_media_failures(string reason, JobKind kind, bool live, bool expected)
+    {
+        var job = new JobSnapshot { Kind = kind, State = JobState.NeedsAttention, Reason = reason,
+            MediaProvider = "youtube", MediaId = "fixture", MediaFormatId = "18",
+            SourceUrl = "https://cdn.example.com/18", OriginalPageUrl = "https://www.youtube.com/watch?v=fixture", IsLiveRecording = live };
+        try
+        {
+            Assert.Equal(expected, VESPER.MediaSourceRescue.ShouldTryAutomatically(job));
+            Assert.False(VESPER.MediaSourceRescue.ShouldTryAutomatically(job));
+        }
+        finally { VESPER.MediaSourceRescue.ForgetAutomaticAttempt(job.Id); }
+    }
+
     [Fact]
     public void Automatic_recovery_allows_three_distinct_deliveries_but_does_not_loop()
     {
