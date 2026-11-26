@@ -81,7 +81,13 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
                 if (request.BrowserBody is { Operation: "begin", Origin: { } origin }
                     && SiteRule.ForPage(SiteRule.Normalize(preferences().SiteRules), origin) is { NeverCapture: true })
                     return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
-                return await engine.ReceiveBrowserBodyAsync(request.Id, request.BrowserBody!, ct);
+                var bodyReply = await engine.ReceiveBrowserBodyAsync(request.Id, request.BrowserBody!, ct);
+                if (request.BrowserBody is { Operation: "finish" } body && bodyReply.Ok
+                    && bodyReply.Data is not null
+                    && System.Text.Json.JsonSerializer.SerializeToElement(bodyReply.Data).TryGetProperty("accepted", out var accepted)
+                    && accepted.ValueKind == System.Text.Json.JsonValueKind.True)
+                    owner?.RequestBrowserPresentation("body:" + body.TransferId, explicitRequest: false);
+                return bodyReply;
 
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);
@@ -289,7 +295,12 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         }
 
         bool anyAccepted = results.Any(r => r.Status is "started" or "queued" or "already-submitted");
-        if (anyAccepted) return BridgeResponse.Success(request.Id, results: results);
+        if (anyAccepted)
+        {
+            if (!browserCapture && results.Any(r => r.Status is "started" or "queued"))
+                owner?.RequestBrowserPresentation("submit:" + request.Id, explicitRequest: true);
+            return BridgeResponse.Success(request.Id, results: results);
+        }
         bool allDuplicate = results.All(r => r.Status == "duplicate");
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
     }
@@ -386,6 +397,8 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         string id = request.TransferId!;
         if (request.Operation == "accept" && !await engine.AcceptBrowserTransferAsync(id, ct))
             return BridgeResponse.Fail(request.Id, "unavailable", "VESPER could not take over this download.");
+        if (request.Operation == "accept")
+            owner?.RequestBrowserPresentation("transfer:" + id, explicitRequest: false);
         if (request.Operation == "abandon") engine.AbandonBrowserTransfer(id);
 
         string State()

@@ -187,6 +187,7 @@ internal static class Program
                             "Browser copy session changed.")));
                         return 1;
                     }
+                    if (body.Operation == "finish") BridgePipe.AllowDesktopForeground(pipe);
                     await BridgeProtocol.WriteFrameAsync(pipe, frame, lifetime.Token);
                 }
             }
@@ -241,10 +242,10 @@ internal static class Program
     private static async Task<string> HandleAsync(BridgeRequest request, string rawJson, CancellationToken ct)
     {
         string pipe = BridgePipe.NameForCurrentUser();
-        bool bringReviewForward = request.Type is "batch-review" or "media-picker"
+        bool bringReviewForward = request.Type is "batch-review" or "media-picker" or "submit" or "media-select"
             || request.Type == "browser-managed" && request.Operation == "connect"
-            || request.Type == "submit" && (request.Mode == "ask" || request.Items.Count > 1
-                || request.Items.Any(item => item.Sha256 is not null));
+            || request.Type == "browser-transfer" && request.Operation == "accept"
+            || request.Type == "browser-body" && request.BrowserBody?.Operation == "finish";
 
         string? answer = await TryRequestAsync(pipe, rawJson, ct, bringReviewForward);
         if (answer is not null) return answer;

@@ -796,6 +796,18 @@ public partial class Form1 : Form
 
     internal void RequestShow() => PostToUi(ShowFromTray);
 
+    private readonly BrowserPresentationPolicy _browserPresentation = new();
+
+    // A new accepted browser job can reveal the existing window, never a new
+    // dialog. Background status polling and completion must not steal focus.
+    internal void RequestBrowserPresentation(string receipt, bool explicitRequest) => PostToUi(() =>
+    {
+        if (_exiting || !_browserPresentation.ShouldPresent(receipt, explicitRequest, Environment.TickCount64))
+            return;
+        if (Enabled && (!Visible || WindowState == FormWindowState.Minimized || Form.ActiveForm != this))
+            ShowFromTray();
+    });
+
     internal void ShowFromTray()
     {
         _allowVisible = true;

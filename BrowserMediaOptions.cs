@@ -379,6 +379,8 @@ internal sealed partial class BrowserBridgeHandler
         }
         var jobs = ExpandSubtitleChoices([job]);
         var results = jobs.Select((choice, index) => QueueMedia(choice, request.Mode == "queue", $"{request.Id}:{index}")).ToArray();
+        if (results.Any(result => result.Status is "started" or "queued"))
+            owner?.RequestBrowserPresentation("media:" + request.Id, explicitRequest: true);
         return results.Any(result => result.JobId is not null)
             ? BridgeResponse.Success(request.Id, message: job.SubtitleNotice ?? "", results: results)
             : BridgeResponse.Fail(request.Id, "rejected", results[0].Message);

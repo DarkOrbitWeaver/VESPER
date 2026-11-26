@@ -20,9 +20,15 @@ public static class BridgePipe
         CancellationToken ct, bool bringReviewForward = false)
     {
         await using var client = await ConnectAsync(pipeName, connectTimeout, ct).ConfigureAwait(false);
-        if (bringReviewForward && OperatingSystem.IsWindows() && GetNamedPipeServerProcessId(client.SafePipeHandle, out uint processId))
-            _ = AllowSetForegroundWindow(processId);
+        if (bringReviewForward) AllowDesktopForeground(client);
         return await ExchangeAsync(client, json, replyTimeout, ct).ConfigureAwait(false);
+    }
+
+    // Transfer existing Windows foreground permission only; never bypass focus policy.
+    public static void AllowDesktopForeground(NamedPipeClientStream client)
+    {
+        if (OperatingSystem.IsWindows() && GetNamedPipeServerProcessId(client.SafePipeHandle, out uint processId))
+            _ = AllowSetForegroundWindow(processId);
     }
 
     public static async Task<NamedPipeClientStream> ConnectAsync(string pipeName, TimeSpan timeout, CancellationToken ct)
