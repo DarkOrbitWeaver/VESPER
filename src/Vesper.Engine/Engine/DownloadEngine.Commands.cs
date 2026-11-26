@@ -593,6 +593,7 @@ public sealed partial class DownloadEngine
             _store.Delete(id);
             RemoveDuplicateCandidateLocked(job, job.SourceUrl);
             _jobs.Remove(id);
+            _mediaDeliveryHistory.Forget(id);
             _credentials.Remove(id);
             _missing.Remove(id);
             _forced.Remove(id);

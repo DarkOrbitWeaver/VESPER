@@ -26,6 +26,7 @@ public sealed partial class DownloadEngine : IDisposable
     private int _activeOperations;
     private TaskCompletionSource? _operationsDrained;
     private readonly Dictionary<Guid, DownloadJob> _jobs = [];
+    private readonly MediaDeliveryHistory _mediaDeliveryHistory = new();
     private readonly Dictionary<Guid, JobSession> _sessions = [];
     private readonly Dictionary<string, SemaphoreSlim> _hostGates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Guid, RequestCredentials> _credentials = [];
@@ -88,6 +89,8 @@ public sealed partial class DownloadEngine : IDisposable
         try
         {
             engine.Recover();
+            lock (engine._lock)
+                foreach (DownloadJob job in engine._jobs.Values) engine._mediaDeliveryHistory.Observe(job);
             engine.NormalizeQueueOrdersOnStartup();
             engine.MeteredNetworkPreferenceChanged();
             engine.ScheduleNext();
@@ -167,7 +170,17 @@ public sealed partial class DownloadEngine : IDisposable
         };
     }
 
-    private void Changed(DownloadJob job) => _outbox.Enqueue(SnapshotLocked(job));
+    private void Changed(DownloadJob job)
+    {
+        _mediaDeliveryHistory.Observe(job);
+        _outbox.Enqueue(SnapshotLocked(job));
+    }
+
+    /// <summary>Advisory route preference from recent native outcomes; never evidence of media identity.</summary>
+    public JobKind? PreferredMediaDelivery(string provider, IReadOnlyCollection<JobKind> available)
+    {
+        lock (_lock) return _mediaDeliveryHistory.Preferred(provider, available, DateTime.UtcNow);
+    }
 
     private static bool IsDuplicateCandidate(DownloadJob job) =>
         job.Kind is not (JobKind.BrowserFile or JobKind.BrowserStream) && job.State is not (JobState.Completed or JobState.Cancelled);

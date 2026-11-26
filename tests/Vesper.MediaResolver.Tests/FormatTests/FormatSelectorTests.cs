@@ -48,6 +48,19 @@ public class FormatSelectorTests
     }
 
     [Fact]
+    public void DeliveryHistoryBreaksOnlyEquivalentQualityTies()
+    {
+        var http = T.Video("http", 1080, kbps: 4000);
+        var hls = T.Video("hls", 1080, kbps: 4000) with { Protocol = StreamProtocol.Hls };
+        var preference = FormatPreferences.BestQuality with { PreferredDelivery = StreamProtocol.Hls };
+        Assert.Equal("http", Pick(T.Item(http, hls), FormatPreferences.BestQuality).Video!.Id);
+        Assert.Equal("hls", Pick(T.Item(http, hls), preference).Video!.Id);
+        Assert.Equal("http", Pick(T.Item(http, hls with { Height = 720 }), preference).Video!.Id);
+        Assert.Equal("http", Pick(T.Item(http, hls with { BitrateKbps = 2000 }), preference).Video!.Id);
+        Assert.Equal("http", Pick(T.Item(http with { Mp4LayoutVerified = true }, hls), preference).Video!.Id);
+    }
+
+    [Fact]
     public void Best_RespectsMaxHeightWithoutCallingItAFallback()
     {
         var s = Pick(Ladder(), new FormatPreferences { Mode = QualityMode.Best, MaxHeight = 1080 });

@@ -15,6 +15,26 @@ namespace Vesper.Windows.Tests;
 
 public sealed class BrowserBridgeTests
 {
+    private sealed class PickerEngineFixture : IDisposable
+    {
+        private readonly string _root = Path.Combine(Path.GetTempPath(), "vesper-picker-" + Guid.NewGuid().ToString("N"));
+        internal DownloadEngine Engine { get; }
+
+        internal PickerEngineFixture()
+        {
+            Engine = DownloadEngine.Start(new EngineOptions
+            {
+                DataDirectory = Path.Combine(_root, "data"), DefaultFolder = Path.Combine(_root, "files")
+            });
+        }
+
+        public void Dispose()
+        {
+            Engine.Dispose();
+            Directory.Delete(_root, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData("https://example.com/demos", true, true)]
     [InlineData("https://example.com/demos", false, false)]
@@ -67,7 +87,8 @@ public sealed class BrowserBridgeTests
             SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "test", Title = "Video",
             Duration = TimeSpan.FromSeconds(60), Representations = [http, hls]
         };
-        var bridge = new BrowserBridgeHandler(null!, null!, () => new VesperPreferences());
+        using var fixture = new PickerEngineFixture();
+        var bridge = new BrowserBridgeHandler(null!, fixture.Engine, () => new VesperPreferences());
         var createOptions = typeof(BrowserBridgeHandler).GetMethod("CreateBrowserOptions",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
 

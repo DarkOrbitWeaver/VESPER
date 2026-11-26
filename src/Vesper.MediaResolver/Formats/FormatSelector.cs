@@ -218,6 +218,7 @@ public static class FormatSelector
             .ThenBy(c => preferLowBitrate ? c.Kbps : -c.Kbps)
             .ThenByDescending(c => CodecInfo.CompatibilityRank(c.VCodec))
             .ThenBy(c => c.A is null ? 0 : 1)
+            .ThenBy(c => c.A is null && c.V.Protocol == p.PreferredDelivery ? 0 : 1)
             .ThenBy(c => (int)c.V.Protocol)
             .ThenBy(c => c.V.Id, StringComparer.Ordinal)
             .ToList();

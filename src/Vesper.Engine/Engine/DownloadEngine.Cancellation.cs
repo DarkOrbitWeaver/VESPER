@@ -123,6 +123,7 @@ public sealed partial class DownloadEngine
         }
 
         _jobs.Remove(job.Id);
+        _mediaDeliveryHistory.Forget(job.Id);
         _credentials.Remove(job.Id);
         _missing.Remove(job.Id);
         Log(job.Id, "cancelled", "The unfinished download and its owned temporary files were removed.");

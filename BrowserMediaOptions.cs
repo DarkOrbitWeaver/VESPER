@@ -101,6 +101,21 @@ internal sealed partial class BrowserBridgeHandler
     private BridgeResponse CreateBrowserOptions(string requestId, MediaItem item, string pageUrl, CancellationToken ct, IReadOnlyList<string>? playbackFingerprints = null)
     {
         var playable = PlayableOnly(item);
+        JobKind[] deliveries = playable.Representations.Where(r => r.Content == StreamContent.VideoAndAudio)
+            .Select(r => r.Protocol switch
+            {
+                StreamProtocol.Http => JobKind.Http,
+                StreamProtocol.Hls => JobKind.Hls,
+                StreamProtocol.Dash => JobKind.Dash,
+                _ => JobKind.Merge
+            }).Distinct().ToArray();
+        StreamProtocol? preferredDelivery = (deliveries.Length < 2 ? null : engine.PreferredMediaDelivery(item.Provider, deliveries)) switch
+        {
+            JobKind.Http => StreamProtocol.Http,
+            JobKind.Hls => StreamProtocol.Hls,
+            JobKind.Dash => StreamProtocol.Dash,
+            _ => null
+        };
         var jobs = new List<MediaDownloadChoice>();
         var recipes = new List<ChoiceRecipe>();
         ChoiceRecipe? recipe = null;
@@ -108,6 +123,7 @@ internal sealed partial class BrowserBridgeHandler
         (MediaDownloadChoice? Choice, string? Error) Plan(FormatPreferences preferences, MediaRepresentation? exact = null,
             MediaOutputPreference output = MediaOutputPreference.Original)
         {
+            if (exact is null) preferences = preferences with { PreferredDelivery = preferredDelivery };
             recipe = new ChoiceRecipe(preferences, exact, output);
             var planned = Prepare(playable, preferences, exact, output);
             if (planned.Error is { } error && !problems.Contains(error)) problems.Add(error);

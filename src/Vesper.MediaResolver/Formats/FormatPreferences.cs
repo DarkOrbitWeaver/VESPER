@@ -55,6 +55,9 @@ public sealed record FormatPreferences
     /// <summary>Pair video with audio only when VESPER's native remuxer can execute it (see <see cref="MergeCapability"/>).</summary>
     public bool NativeMergeOnly { get; init; }
 
+    /// <summary>Host-supplied transport advice, used only after quality and safety preferences.</summary>
+    [JsonIgnore] public StreamProtocol? PreferredDelivery { get; init; }
+
     public long? MaxFileSizeBytes { get; init; }
 
     public IReadOnlyList<string> SubtitleLanguages { get; init; } = [];
