@@ -143,7 +143,7 @@ internal static class MediaSourceRescue
         }).Distinct().ToArray());
         foreach (MediaRepresentation format in exact.Where(r => !r.IsLive
             && (r.Protocol != protocol && r.Protocol is (StreamProtocol.Http or StreamProtocol.Dash or StreamProtocol.Hls)
-                || protocol == StreamProtocol.Http && r.Protocol == protocol && r.Url.AbsoluteUri != job.SourceUrl))
+                || r.Protocol == protocol && r.Url.AbsoluteUri != job.SourceUrl))
             .OrderByDescending(r => preferred == (r.Protocol switch
             {
                 StreamProtocol.Http => JobKind.Http, StreamProtocol.Hls => JobKind.Hls,
@@ -155,7 +155,7 @@ internal static class MediaSourceRescue
             var prefs = format.HasVideo ? FormatPreferences.BestQuality : FormatPreferences.AudioOnly with { AudioCodecs = [] };
             (MediaDownloadChoice? choice, _) = MediaTransferBridge.Prepare(item with { Representations = [format] }, prefs);
             if (choice is null || choice.Kind is not (JobKind.Http or JobKind.Dash or JobKind.Hls)
-                || choice.Kind == job.Kind && choice.Kind != JobKind.Http
+                || choice.Kind == job.Kind && choice.Url == job.SourceUrl
                 || choice.Output != job.Output || choice.FormatId != job.MediaFormatId || choice.Quality != job.MediaQuality
                 || choice.SubtitleTracks is { Count: > 0 } || choice.MediaMetadataJson is not null
                 || automatic && AlreadyFailed(job.Id, choice.Kind, choice.Url)) continue;

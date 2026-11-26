@@ -604,13 +604,14 @@ public sealed class DashTransferTests
     [Theory]
     [InlineData(JobKind.Http)]
     [InlineData(JobKind.Dash)]
+    [InlineData(JobKind.Hls)]
     public async Task AcquisitionSwitchImportsACompleteHlsPrefixAndSurvivesRestart(JobKind originalKind)
     {
         await using var server = await FixtureServer.StartAsync();
         using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
         const string quality = "720p h264 with audio";
         var plan = server.Plan(ranges: false);
-        string oldUrl = server.Url(originalKind == JobKind.Http ? "/all.mp4" : "/manifest.mpd");
+        string oldUrl = server.Url(originalKind switch { JobKind.Http => "/all.mp4", JobKind.Hls => "/old.m3u8", _ => "/manifest.mpd" });
         AddResult added = h.Engine.Add(new AddRequest(oldUrl, FileName: "switch.mp4", Kind: originalKind,
             MediaProvider: "fixture", MediaId: "av", MediaFormatId: plan.RepresentationId, MediaQuality: quality,
             MediaPlanJson: originalKind == JobKind.Dash ? plan.ToJson() : null));
@@ -629,7 +630,8 @@ public sealed class DashTransferTests
         {
             current.Extents = extents;
             current.State = JobState.NeedsLink;
-            current.Reason = "expired";
+            current.Reason = originalKind == JobKind.Hls ? "invalid-container" : "expired";
+            if (originalKind == JobKind.Hls) current.State = JobState.NeedsAttention;
         });
         var choice = new MediaAcquisitionReplacement(new ResolvedMediaSource("fixture", "av", plan.RepresentationId,
             server.Url("/hls.m3u8")), JobKind.Hls, "switch.mp4", quality);

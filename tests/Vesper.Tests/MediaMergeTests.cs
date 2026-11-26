@@ -27,6 +27,29 @@ public sealed class MediaMergeTests
     public MediaMergeTests(ITestOutputHelper output) => _output = output;
 
     [Fact]
+    public void Direct_track_work_interleaves_audio_and_video_and_skips_committed_extents()
+    {
+        long chunk = MergeTransfer.ChunkBytes;
+        var plan = new MediaMergePlan
+        {
+            OutputContainer = "mp4", RequireAudio = true, RequireVideo = true,
+            Tracks = [
+                new MergeTrack("video", "video", "https://example.test/video", 100 * chunk, "mp4", "h264", "v"),
+                new MergeTrack("audio", "audio", "https://example.test/audio", chunk, "m4a", "aac", "a")
+            ]
+        };
+        var saved = new ExtentSet();
+        saved.Add(new Vesper.Engine.ByteRange(0, chunk));
+        saved.Add(new Vesper.Engine.ByteRange(100 * chunk, 100 * chunk + 1024));
+        var first = MergeTransfer.TrackWork(plan, saved).Take(4).ToArray();
+        Assert.Equal((0, chunk, 2 * chunk), first[0]);
+        Assert.Equal((1, 100 * chunk + 1024, 101 * chunk), first[1]);
+        Assert.Equal((0, 2 * chunk, 3 * chunk), first[2]);
+        Assert.Equal((0, 3 * chunk, 4 * chunk), first[3]);
+        Assert.Equal(plan.TotalBytes - saved.TotalBytes, MergeTransfer.TrackWork(plan, saved).Sum(w => w.End - w.Start));
+    }
+
+    [Fact]
     public void MediaTimeRange_RequiresFullContinuousCoverage()
     {
         var range = new MediaTimeRange(0.5, 2.5);

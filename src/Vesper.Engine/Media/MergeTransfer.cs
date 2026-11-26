@@ -15,7 +15,6 @@ namespace Vesper.Engine;
 internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, HttpTransport http)
 {
     internal const long ChunkBytes = 8L * 1024 * 1024;
-    private const int Workers = 3;
     private const int ChunkAttempts = 3;
     private DownloadJob Job => session.Job;
 
@@ -96,19 +95,13 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
         session.OpenFile();
         session.SetPhase(JobState.Downloading);
-        var work = new Queue<(int Track, long Start, long End)>();
-        for (int i = 0; i < plan.Tracks.Count; i++)
+        long missing = total - Job.Extents.TotalBytes;
+        if (missing > 0)
         {
-            long trackStart = plan.OffsetOf(i), trackEnd = trackStart + plan.Tracks[i].Size;
-            foreach (ByteRange gap in Job.Extents.Gaps(total))
-            {
-                long s = Math.Max(gap.Start, trackStart), e = Math.Min(gap.End, trackEnd);
-                for (long p = s; p < e; p += ChunkBytes) work.Enqueue((i, p, Math.Min(e, p + ChunkBytes)));
-            }
-        }
-        if (work.Count > 0)
-        {
-            EnsureSpace(work.Sum(w => w.End - w.Start) + (plan.ClipRange is null ? total : 0));
+            EnsureSpace(missing + (plan.ClipRange is null ? total : 0));
+            // Snapshot gaps once. The work iterator stays bounded even when a
+            // multi-gigabyte track has thousands of pending range chunks.
+            using var work = TrackWork(plan, Job.Extents.Clone()).GetEnumerator();
             await RunWorkersAsync(plan, work, state, ct).ConfigureAwait(false);
             await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
         }
@@ -120,7 +113,41 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
 
     // download
 
-    private async Task RunWorkersAsync(MediaMergePlan plan, Queue<(int Track, long Start, long End)> work, string state, CancellationToken ct)
+    internal static IEnumerable<(int Track, long Start, long End)> TrackWork(MediaMergePlan plan, ExtentSet saved)
+    {
+        // Each track has an independent bounded cursor. Interleave so a long
+        // video does not monopolize every worker while its audio waits.
+        IEnumerable<(int Track, long Start, long End)> Chunks(int index)
+        {
+            long start = plan.OffsetOf(index), end = start + plan.Tracks[index].Size;
+            foreach (ByteRange gap in saved.Gaps(plan.TotalBytes))
+            {
+                long left = Math.Max(gap.Start, start), right = Math.Min(gap.End, end);
+                for (long pos = left; pos < right;)
+                {
+                    long next = pos + Math.Min(right - pos, ChunkBytes);
+                    yield return (index, pos, next);
+                    pos = next;
+                }
+            }
+        }
+        var cursors = Enumerable.Range(0, plan.Tracks.Count).Select(i => Chunks(i).GetEnumerator()).ToArray();
+        try
+        {
+            var finished = new bool[cursors.Length];
+            int remaining = cursors.Length;
+            while (remaining > 0)
+                for (int i = 0; i < cursors.Length; i++)
+                {
+                    if (finished[i]) continue;
+                    if (cursors[i].MoveNext()) yield return cursors[i].Current;
+                    else { finished[i] = true; remaining--; }
+                }
+        }
+        finally { foreach (var cursor in cursors) cursor.Dispose(); }
+    }
+
+    private async Task RunWorkersAsync(MediaMergePlan plan, IEnumerator<(int Track, long Start, long End)> work, string state, CancellationToken ct)
     {
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var gate = new object();
@@ -133,8 +160,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                 (int Track, long Start, long End) item;
                 lock (gate)
                 {
-                    if (work.Count == 0 || failure is not null) return;
-                    item = work.Dequeue();
+                    if (failure is not null || !work.MoveNext()) return;
+                    item = work.Current;
                 }
                 try { await FetchChunkAsync(plan, item.Track, item.Start, item.End, state, stop.Token).ConfigureAwait(false); }
                 catch (Exception ex)
@@ -146,7 +173,9 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
             }
         }
 
-        await Task.WhenAll(Enumerable.Range(0, Math.Min(Workers, work.Count)).Select(_ => Worker())).ConfigureAwait(false);
+        int workers = Math.Clamp(Math.Min(engine.Options.MaxConnectionsPerJob, engine.Options.MaxConnectionsPerHost), 1, 8);
+        if (session.Limiter.BytesPerSecond > 0 || engine.GlobalLimiter.BytesPerSecond > 0) workers = 1;
+        await Task.WhenAll(Enumerable.Range(0, workers).Select(_ => Worker())).ConfigureAwait(false);
         if (failure is not null)
         {
             ct.ThrowIfCancellationRequested();

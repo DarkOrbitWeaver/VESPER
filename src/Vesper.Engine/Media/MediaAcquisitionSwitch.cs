@@ -47,7 +47,7 @@ public sealed partial class DownloadEngine
                 || IsCleanupPending(job) || job.PendingFinalPath is not null || job.BrowserProof is not null
                 || job.ExpectedSha256 is not null || job.PieceMapJson is not null || job.MediaMetadataJson is not null
                 || job.Output != MediaOutput.Original || job.Kind == replacement.Kind
-                    && (job.Kind != JobKind.Http || job.SourceUrl == url.AbsoluteUri)
+                    && job.SourceUrl == url.AbsoluteUri
                 || job.Kind is not (JobKind.Http or JobKind.Dash or JobKind.Hls)
                 || replacement.Kind is not (JobKind.Http or JobKind.Dash or JobKind.Hls))
                 return Rejected("The download cannot safely switch acquisition routes. Saved data was kept.");
