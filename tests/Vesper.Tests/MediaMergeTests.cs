@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using VESPER;
 using Vesper.Engine;
+using Vesper.MediaResolver.Core;
 using Vesper.MediaResolver.Formats;
 using Vesper.MediaResolver.Models;
 using Xunit;
@@ -618,6 +619,7 @@ public sealed class MediaMergeTests
             MuxIo.ReadExact(mergedStream, merged.Samples[i].Offset, b);
             Assert.True(a.AsSpan().SequenceEqual(b), $"{source.Kind} sample {i} differs after remux");
             Assert.Equal(source.Samples[i].Key, merged.Samples[i].Key);
+            Assert.Equal(source.Samples[i].DiscardPaddingNs, merged.Samples[i].DiscardPaddingNs);
         }
     }
 
@@ -639,6 +641,7 @@ public sealed class MediaMergeTests
         var (output, container) = Merge(Fixture("video-only.webm"), Fixture("muxed.webm"));
         Assert.Equal("webm", container);
         Assert.True(output.ToArray().AsSpan().IndexOf("webm"u8) is > 0 and < 64);
+        Assert.Equal(13_500_000, Track(output, TrackKind.Audio).Samples[^1].DiscardPaddingNs);
     }
 
     [Fact]
@@ -1815,6 +1818,93 @@ public sealed class MediaMergeTests
         Assert.Equal("missing-audio", done.Reason);
         Assert.Null(done.FinalPath);
         Assert.True(File.Exists(done.PartialPath), "downloaded track data must be kept");
+    }
+
+    [Theory]
+    [InlineData("video-only.mp4", "video/mp4", true)]
+    [InlineData("muxed.webm", "video/webm", false)]
+    [InlineData("quiet-track.webm", "audio/webm", false)]
+    [InlineData("quiet-track-aac.m4a", "audio/mp4", false)]
+    public async Task A_browser_range_hint_can_publish_the_verified_file(string name, string mime, bool minimumOnly)
+    {
+        await using var server = new FaultServer();
+        const string path = "/media/complete";
+        byte[] file = Fixture(name);
+        server.Extra[path] = file;
+        server.ExtraContentTypes[path] = mime;
+        await server.StartAsync();
+        const string origin = "http://media.example.test";
+        string page = origin + "/player", url = origin + path;
+        string extent = minimumOnly ? "observedMinimumLength" : "observedLength";
+        long length = minimumOnly ? file.LongLength / 2 : file.LongLength;
+        string frame = JsonSerializer.Serialize(new
+        {
+            v = BridgeProtocol.Version, id = "observed-range-001", type = "media-range-options", url = page,
+            candidates = new[] { new Dictionary<string, object>
+            {
+                ["url"] = url, ["kind"] = "direct", ["mimeType"] = mime, ["observedETag"] = "\"x\"", [extent] = length
+            } }
+        });
+        Assert.True(BridgeProtocol.TryParse(frame, out var request, out var error), error);
+        BridgeMediaHint hint = Assert.Single(request.Candidates!);
+        Assert.Equal(minimumOnly ? (long?)length : null, hint.ObservedMinimumLength);
+        Assert.Equal(minimumOnly ? null : (long?)length, hint.ObservedLength);
+
+        using var resolver = new DefaultMediaResolver(new ResolverOptions
+        {
+            AllowPrivateNetworks = true,
+            ProxyAddress = new Uri(server.BaseUrl)
+        });
+        var result = await resolver.ResolveAsync(new MediaDiscoveryRequest
+        {
+            Url = new Uri(page), Options = new DiscoveryOptions { ExactBrowserSource = true },
+            Browser = new BrowserDiscoveryMessage
+            {
+                PageUrl = page, Schema = BrowserDiscoveryMessage.CurrentSchema,
+                Candidates = [new BrowserMediaCandidate { Url = hint.Url, Kind = hint.Kind, MimeType = hint.MimeType,
+                    ObservedLength = hint.ObservedLength, ObservedMinimumLength = hint.ObservedMinimumLength, ObservedETag = hint.ObservedETag }]
+            }
+        }, CancellationToken.None);
+        Assert.True(result.Item is not null, result.Error?.Diagnostic);
+        Assert.Equal(file.LongLength, Assert.Single(result.Item!.Representations).FileSize);
+        var prepared = MediaTransferBridge.Prepare(result.Item, FormatPreferences.BestQuality);
+        Assert.True(prepared.Choice is not null, prepared.Error);
+        MediaDownloadChoice choice = prepared.Choice!;
+        Assert.Equal(JobKind.Merge, choice.Kind);
+        Assert.True(MediaMergePlan.TryParse(choice.MediaPlanJson, false, out var plan, out error), error);
+        Assert.Equal("\"x\"", Assert.Single(plan.Tracks).ResourceETag);
+
+        using var h = new Harness(proxyAddress: server.BaseUrl);
+        var added = h.Engine.Add(new AddRequest(choice.Url, FileName: choice.FileName,
+            Kind: choice.Kind, MediaPlanJson: choice.MediaPlanJson));
+        Assert.True(added.Ok, added.Message);
+        var done = await h.WaitAsync(added.JobId, job => job.State is
+            JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink);
+        Assert.True(done.State == JobState.Completed, $"{done.State}: {done.Message}");
+        using var input = new MemoryStream(file);
+        using var output = File.OpenRead(done.FinalPath!);
+        var sourceTracks = MediaMerger.Demux(input, input.Length, default);
+        var finalTracks = MediaMerger.Demux(output, output.Length, default);
+        Assert.Equal(sourceTracks.Count, finalTracks.Count);
+        foreach (var track in sourceTracks)
+            AssertSamePayloads(track, input, finalTracks.Single(t => t.Kind == track.Kind), output);
+    }
+
+    [Theory]
+    [InlineData("media-range-options", "\"observedLength\":99,\"observedMinimumLength\":1")]
+    [InlineData("media-range-options", "\"observedMinimumLength\":0")]
+    [InlineData("media-range-options", "\"observedMinimumLength\":17179869185")]
+    [InlineData("media-range-options", "\"observedMinimumLength\":\"99\"")]
+    [InlineData("media-source-options", "\"observedMinimumLength\":99")]
+    public void A_browser_range_hint_rejects_invalid_extent_fields(string type, string extent)
+    {
+        string validator = type == "media-range-options" ? "\"observedETag\":\"\\\"x\\\"\"," : "";
+        string json = $$"""
+            {"v":1,"id":"observed-range-002","type":"{{type}}","url":"https://example.com/player","candidates":[
+              {"url":"https://media.example.com/file.mp4","kind":"direct",{{validator}}{{extent}}}
+            ]}
+            """;
+        Assert.False(BridgeProtocol.TryParse(json, out _, out _));
     }
 
     [Theory]

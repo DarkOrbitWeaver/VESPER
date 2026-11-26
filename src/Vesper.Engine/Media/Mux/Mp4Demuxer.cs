@@ -13,9 +13,11 @@ internal struct TrackSample
 {
     /// <summary>Absolute position of the payload inside the source stream.</summary>
     public long Offset;
-    public int Size;
     /// <summary>MP4: decode time. Matroska: block (presentation) time.</summary>
     public long Dts;
+    // Matroska padding to discard, positive at the end and negative at the start.
+    public long DiscardPaddingNs;
+    public int Size;
     /// <summary>MP4 composition offset (PTS - DTS). Always 0 for Matroska sources.</summary>
     public int CtsOffset;
     public int Duration;

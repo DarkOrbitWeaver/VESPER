@@ -109,6 +109,9 @@ internal sealed class CandidateProcessor
         try
         {
             bool rangedWitness = c.HasRangeEvidence;
+            string witnessedMime = c.MimeType?.ToLowerInvariant() ?? "video/mp4";
+            if (rangedWitness && witnessedMime is not ("video/mp4" or "audio/mp4" or "audio/m4a" or "audio/x-m4a" or "video/webm" or "audio/webm"))
+                return new(null, null, MediaErrors.NoMedia("The observed range uses an unsupported media type.", false));
             byte[]? start = null;
             ProbeResult probe;
             if (rangedWitness && headerSlot && !headerToken.IsCancellationRequested)
@@ -141,7 +144,7 @@ internal sealed class CandidateProcessor
             if (!probe.IsSuccess)
                 return new(null, null, MediaErrors.FromHttpStatus(probe.StatusCode, c.Url));
             if (rangedWitness && (probe.StatusCode != 206 || probe.FinalUrl != c.Url
-                || !string.Equals(probe.ContentType, "video/mp4", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(probe.ContentType, witnessedMime, StringComparison.OrdinalIgnoreCase)
                 || probe.ContentLength is not (> 0 and <= MediaCandidate.MaxObservedLength)
                 || c.ObservedLength is long exact && probe.ContentLength != exact
                 || c.ObservedMinimumLength is long minimum && probe.ContentLength < minimum
@@ -172,13 +175,22 @@ internal sealed class CandidateProcessor
                 facts = ReadOggAudioFacts(start);
             if (facts is { Encrypted: true })
                 return new(null, null, MediaErrors.Drm($"{UrlRedactor.Redact(c.Url)} declares encrypted tracks"));
-            if (rangedWitness && (facts is not { HasVideo: true, DurationSeconds: > 0, CompleteFileCandidate: true }
-                || facts.VideoCodec is not ("h264" or "h265" or "av1")
-                || facts.HasAudio && facts.AudioCodec is not ("aac" or "mp3")))
-                return new(null, null, MediaErrors.NoMedia("The ranged source is not a verified complete audio/video file.", false));
+            if (rangedWitness && !CanUseRangedFile(facts, witnessedMime))
+                return new(null, null, MediaErrors.NoMedia("The ranged source could not be verified as a complete media file.", false));
             return new(probe, facts, null, Mp4LayoutUnverified: layoutUnverified);
         }
         catch (MediaResolverException ex) { return new(null, null, ex.Error); }
+    }
+
+    private static bool CanUseRangedFile(DirectMediaFacts? facts, string mime)
+    {
+        if (facts is not { DurationSeconds: > 0, CompleteFileCandidate: true }
+            || facts.HasVideo != mime.StartsWith("video/", StringComparison.Ordinal)) return false;
+        bool webm = mime.EndsWith("/webm", StringComparison.Ordinal);
+        return (!facts.HasVideo || (webm ? facts.VideoCodec is "vp8" or "vp9" or "av1"
+                                        : facts.VideoCodec is "h264" or "h265" or "av1"))
+            && (!facts.HasAudio || (webm ? facts.AudioCodec is "opus" or "vorbis"
+                                        : facts.AudioCodec is "aac" or "mp3"));
     }
 
     private async Task AddManifestAsync(Uri url, MediaRequestContext ctx, CandidateOutcome outcome, int index, CancellationToken ct)

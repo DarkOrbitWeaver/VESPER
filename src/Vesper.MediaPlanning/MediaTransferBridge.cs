@@ -424,10 +424,12 @@ internal static class MediaTransferBridge
             return BuildMerge(item, selection, plan, [video, audio], container, clipStartSeconds, clipEndSeconds,
                 prefs.EmbedSubtitles, unsupportedSubtitleCount);
         }
-        if (selection.Video is { BrowserRangeVerified: true } ranged && selection.Audio is null)
+        if ((selection.Video ?? selection.Audio) is { BrowserRangeVerified: true } ranged)
         {
+            string? rangedContainer = ranged.HasVideo ? MergeCapability.MuxedContainer(ranged, prefs.Container)
+                : MergeCapability.AudioContainer(ranged);
             if (ranged.ResourceETag is null || ranged.ResourceUrlSha256 is null || ranged.ContentIdentity is null
-                || MergeCapability.MuxedContainer(ranged, prefs.Container) is not { } rangedContainer)
+                || rangedContainer is null)
                 return (null, "The observed file has no verified native delivery plan.");
             return BuildMerge(item, selection, plan, [ranged], rangedContainer, clipStartSeconds, clipEndSeconds,
                 prefs.EmbedSubtitles, unsupportedSubtitleCount);

@@ -97,8 +97,8 @@ internal static class WebmHeaderFacts
             }
             if (tracks && duration is not null) break;
         }
-        return tracks && (video || audio) ? new(video, audio, width, height, vc, ac, duration, encrypted,
-            finite && duration is not null && vc is not null) : null;
+        bool complete = finite && duration is not null && (!video || vc is not null) && (!audio || ac is not null);
+        return tracks && (video || audio) ? new(video, audio, width, height, vc, ac, duration, encrypted, complete) : null;
     }
 
     private static ulong UInt(ReadOnlySpan<byte> data)

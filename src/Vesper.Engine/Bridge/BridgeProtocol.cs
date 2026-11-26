@@ -141,20 +141,25 @@ public static class BridgeProtocol
                         { error = "Invalid media-hint MIME type."; return false; }
                         bool mutedLoop = hint.TryGetProperty("mutedLoop", out var muted) && muted.ValueKind == JsonValueKind.True;
                         long? observedLength = null;
+                        long? observedMinimumLength = null;
                         string? observedTag = Str(hint, "observedETag");
+                        bool hasLength = hint.TryGetProperty("observedLength", out var size);
+                        bool hasMinimum = hint.TryGetProperty("observedMinimumLength", out var minimum);
                         if (type == "media-range-options")
                         {
-                            if (kind != "direct" || !hint.TryGetProperty("observedLength", out var size)
-                                || size.ValueKind != JsonValueKind.Number || !size.TryGetInt64(out long length)
+                            var extent = hasLength ? size : minimum;
+                            if (kind != "direct" || hasLength == hasMinimum
+                                || extent.ValueKind != JsonValueKind.Number || !extent.TryGetInt64(out long length)
                                 || length is <= 0 or > 17_179_869_184 || observedTag is not { Length: > 2 and <= 256 }
                                 || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
                                 || tag.IsWeak || tag.Tag == "*" || tag.ToString() != observedTag)
-                            { error = "A ranged media hint needs an exact size and strong ETag."; return false; }
-                            observedLength = length;
+                            { error = "A ranged media hint needs one total or minimum size and a strong ETag."; return false; }
+                            if (hasLength) observedLength = length;
+                            else observedMinimumLength = length;
                         }
-                        else if (observedTag is not null || hint.TryGetProperty("observedLength", out _))
+                        else if (observedTag is not null || hasLength || hasMinimum)
                         { error = "Ranged media evidence requires the exact range command."; return false; }
-                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop, observedLength, observedTag));
+                        hints.Add(new BridgeMediaHint(hintUrl.AbsoluteUri, kind, mime, mutedLoop, observedLength, observedTag, observedMinimumLength));
                     }
                 }
                 if (type is ("media-source-options" or "media-range-options") && hints.Count != 1)

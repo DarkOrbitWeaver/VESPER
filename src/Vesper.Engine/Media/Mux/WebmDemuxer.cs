@@ -63,6 +63,14 @@ internal static class WebmDemuxer
             return value;
         }
 
+        public long ReadInt(long pos, int count)
+        {
+            if (count == 0) return 0;
+            ulong value = ReadUInt(pos, count);
+            int shift = (8 - count) * 8;
+            return unchecked((long)(value << shift)) >> shift;
+        }
+
         public byte[] Read(long pos, int count)
         {
             var data = new byte[count];
@@ -352,12 +360,12 @@ internal static class WebmDemuxer
                     clusterTime = (long)time;
                     break;
                 case 0xA3: // SimpleBlock
-                    AddBlock(r, dataStart, e.Size, clusterTime, simple: true, keyHint: false, duration: 0, tracks);
+                    AddBlock(r, dataStart, e.Size, clusterTime, simple: true, keyHint: false, duration: 0, padding: 0, tracks);
                     if (++total > MaxSamples) throw Bad("too many blocks");
                     break;
                 case 0xA0: // BlockGroup
                 {
-                    long blockPos = -1, blockSize = 0, duration = 0;
+                    long blockPos = -1, blockSize = 0, duration = 0, padding = 0;
                     bool referenced = false;
                     long p = dataStart;
                     while (p < dataEnd)
@@ -377,10 +385,15 @@ internal static class WebmDemuxer
                                 throw Bad("a block duration exceeds the supported range");
                             duration = (long)ticks;
                         }
+                        else if (c.Id == 0x75A2)
+                        {
+                            if (c.Size > 8) throw Bad("a discard padding element is too large");
+                            padding = r.ReadInt(cs, (int)c.Size);
+                        }
                         p = cs + c.Size;
                     }
                     if (blockPos < 0) throw Bad("a block group has no block");
-                    AddBlock(r, blockPos, blockSize, clusterTime, simple: false, keyHint: !referenced, duration, tracks);
+                    AddBlock(r, blockPos, blockSize, clusterTime, simple: false, keyHint: !referenced, duration, padding, tracks);
                     if (++total > MaxSamples) throw Bad("too many blocks");
                     break;
                 }
@@ -390,7 +403,7 @@ internal static class WebmDemuxer
         return end;
     }
 
-    private static void AddBlock(Reader r, long start, long size, long clusterTime, bool simple, bool keyHint, long duration,
+    private static void AddBlock(Reader r, long start, long size, long clusterTime, bool simple, bool keyHint, long duration, long padding,
         Dictionary<ulong, DemuxedTrack> tracks)
     {
         if (size < 4) throw Bad("a block is truncated");
@@ -412,6 +425,7 @@ internal static class WebmDemuxer
             Offset = start + headerLen,
             Size = (int)payload,
             Dts = checked(clusterTime + rel),
+            DiscardPaddingNs = padding,
             Duration = (int)Math.Clamp(duration, 0, int.MaxValue),
             Key = t.Kind == TrackKind.Audio || (simple ? (flags & 0x80) != 0 : keyHint),
             Lacing = (byte)((flags >> 1) & 3)

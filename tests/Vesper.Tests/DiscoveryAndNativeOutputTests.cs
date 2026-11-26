@@ -141,6 +141,8 @@ public sealed class DiscoveryAndNativeOutputTests
         Assert.True(bytes.AsSpan(0, 4).SequenceEqual("OggS"u8));
         Assert.Contains("TITLE=Native song", Encoding.UTF8.GetString(bytes));
         Assert.Contains("ARTIST=Fixture", Encoding.UTF8.GetString(bytes));
+        output.Position = 0;
+        Assert.Equal(0.5, OggAudioMetadataWriter.ReadTimeline(output, CancellationToken.None).DurationSeconds, 8);
     }
 
     [Theory]

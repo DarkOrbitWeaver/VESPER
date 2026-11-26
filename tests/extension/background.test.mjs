@@ -2540,29 +2540,32 @@ test('an unfamiliar page with multiple players cannot substitute page-wide forma
   } finally { app.stopWorker(); }
 });
 
-test('a strongly validated partial media response gets a separate full-file verification command', async () => {
-  const app = load({ 'media-options': {ok:false, code:'no-media'}, 'media-range-options': checkedSource(15) });
-  const page='https://www.instagram.com/reel/ranged/', url='https://cdn.example.com/opaque-video';
-  const sender={url:page,tab:{id:81},frameId:0,documentId:'ranged-document'};
-  const changedAt=Date.now();
-  const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
-    generation:5,playerPlaying:true,mediaChangedAt:changedAt};
-  try {
-    await app.onMedia({url,tabId:81,frameId:0,documentId:sender.documentId,method:'GET',statusCode:206,
-      type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:[
-        {name:'Content-Type',value:'video/mp4'},{name:'Content-Range',value:'bytes 0-999/700000'},
-        {name:'Content-Length',value:'1000'},{name:'ETag',value:'"original"'}]});
-    const result=await app.message(request,sender);
-    assert.equal(result.data.sourceChoices.length,1);
-    const check=app.sent.find(message=>message.type==='media-range-options');
-    assert.equal(check.candidates[0].observedLength,700000);
-    assert.equal(check.candidates[0].observedETag,'"original"');
-    assert.equal(check.candidates[0].url,url);
-    assert.equal(app.sent.some(message=>message.type==='media-source-options'),false);
-    const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
-    assert.equal(selected.ok,true);
-  } finally {app.stopWorker();}
-});
+for (const mime of ['video/mp4', 'video/webm', 'audio/webm', 'audio/mp4']) {
+  test(`${mime} with a strong range validator gets full-file verification`, async () => {
+    const app = load({ 'media-options': {ok:false, code:'no-media'}, 'media-range-options': checkedSource(15) });
+    const page='https://www.instagram.com/reel/ranged/', url='https://cdn.example.com/opaque-video';
+    const sender={url:page,tab:{id:81},frameId:0,documentId:'ranged-document'};
+    const changedAt=Date.now();
+    const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
+      generation:5,playerPlaying:true,mediaChangedAt:changedAt};
+    try {
+      await app.onMedia({url,tabId:81,frameId:0,documentId:sender.documentId,method:'GET',statusCode:206,
+        type:'xmlhttprequest',timeStamp:changedAt,responseHeaders:[
+          {name:'Content-Type',value:mime},{name:'Content-Range',value:'bytes 0-999/700000'},
+          {name:'Content-Length',value:'1000'},{name:'ETag',value:'"original"'}]});
+      const result=await app.message(request,sender);
+      assert.equal(result.data.sourceChoices.length,1);
+      const check=app.sent.find(message=>message.type==='media-range-options');
+      assert.equal(check.candidates[0].mimeType,mime);
+      assert.equal(check.candidates[0].observedLength,700000);
+      assert.equal(check.candidates[0].observedETag,'"original"');
+      assert.equal(check.candidates[0].url,url);
+      assert.equal(app.sent.some(message=>message.type==='media-source-options'),false);
+      const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
+      assert.equal(selected.ok,true);
+    } finally {app.stopWorker();}
+  });
+}
 
 test('two independently witnessed query-addressed ranges can propose a verified full resource, not automatically select it',async()=>{
   const page='https://www.instagram.com/reel/ranged/', base='https://cdn.example.com/asset.mp4?signature=abc%2Fdef';

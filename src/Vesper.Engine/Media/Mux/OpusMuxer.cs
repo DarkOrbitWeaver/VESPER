@@ -52,11 +52,13 @@ internal static class OpusMuxer
                 throw new MediaContainerException("An Opus packet has an invalid size or position.");
             byte[] packet = new byte[sample.Size]; source.Position = sample.Offset; source.ReadExactly(packet);
             int duration = PacketSamples(packet);
+            bool final = i == track.Samples.Count - 1;
+            int padding = EndPaddingSamples(sample, duration, final);
             int packetLaces = packet.Length / 255 + 1;
             if (laces + packetLaces > 255 || bytes + packet.Length > 65025 || samplesOnPage >= 48000) Flush(false);
             packets.Add(packet); laces += packetLaces; bytes += packet.Length; samplesOnPage += duration;
-            granule = checked(granule + duration); packetCount++;
-            if (i == track.Samples.Count - 1) Flush(true);
+            granule = checked(granule + duration - padding); packetCount++;
+            if (final) Flush(true);
         }
         if (granule <= BinaryPrimitives.ReadUInt16LittleEndian(head.AsSpan(10)))
             throw new MediaContainerException("Opus pre-skip consumes the entire output.");
@@ -64,6 +66,17 @@ internal static class OpusMuxer
         output.Position = 0;
         OggAudioMetadataWriter.ValidateOpus(output, packetCount, granule);
         return Convert.ToHexString(digest.Hash!);
+    }
+
+    internal static int EndPaddingSamples(TrackSample sample, int duration, bool final)
+    {
+        long nanoseconds = sample.DiscardPaddingNs;
+        if (nanoseconds == 0) return 0;
+        if (!final || nanoseconds < 0)
+            throw new MediaContainerException("This Opus output can only preserve padding at the end of the last packet.");
+        Int128 samples = ((Int128)nanoseconds * 48_000 + 500_000_000) / 1_000_000_000;
+        if (samples > duration) throw new MediaContainerException("Opus padding exceeds the packet duration.");
+        return (int)samples;
     }
 
     internal static int PacketSamples(ReadOnlySpan<byte> packet)

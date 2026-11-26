@@ -489,15 +489,17 @@ public sealed partial class DownloadEngine
             throw new MediaContainerException("The source does not have reusable Opus packets.");
 
         long granule = 0;
-        foreach (TrackSample sample in audio.Samples)
+        for (int i = 0; i < audio.Samples.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
+            TrackSample sample = audio.Samples[i];
             if (sample.Size is < 1 or > 61_440 || sample.Offset < 0 || sample.Offset > source.Length - sample.Size)
                 throw new MediaContainerException("An Opus packet has an invalid size or position.");
             byte[] packet = new byte[sample.Size];
             source.Position = sample.Offset;
             source.ReadExactly(packet);
-            granule = checked(granule + OpusMuxer.PacketSamples(packet));
+            int duration = OpusMuxer.PacketSamples(packet);
+            granule = checked(granule + duration - OpusMuxer.EndPaddingSamples(sample, duration, i == audio.Samples.Count - 1));
         }
 
         OggAudioMetadataWriter.ValidateOpus(output, audio.Samples.Count, granule);

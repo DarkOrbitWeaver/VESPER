@@ -119,14 +119,16 @@ internal static class MatroskaMuxer
                     if (videoKey || !hasVideo) cues.Add((clusterStartMs, pick + 1, clusterPos));
                     rel = pts - clusterStartMs;
                 }
-                bool blockGroup = sampleDuration > 0;
+                bool hasPadding = s.DiscardPaddingNs != 0;
+                bool blockGroup = sampleDuration > 0 || hasPadding;
                 if (blockGroup)
                 {
                     // All children have known sizes. Preserve the existing eight-byte
                     // encoding, but avoid two seeks and a buffer flush for every frame.
                     long blockBytes = 4L + s.Size;
-                    long groupBytes = 1 + SizeLength(blockBytes) + blockBytes
-                        + (s.Key ? 0 : 3) + 2 + UIntLength((ulong)sampleDuration);
+                    long groupBytes = 1 + SizeLength(blockBytes) + blockBytes + (s.Key ? 0 : 3);
+                    if (sampleDuration > 0) groupBytes += 2 + UIntLength((ulong)sampleDuration);
+                    if (hasPadding) groupBytes += 3 + SignedIntegerLength(s.DiscardPaddingNs);
                     Id(output, 0xA0);
                     Size8(output, groupBytes);
                     Id(output, 0xA1);
@@ -144,7 +146,8 @@ internal static class MatroskaMuxer
                 {
                     if (!s.Key)
                         WriteSignedInteger(output, 0xFB, 0); // The source gives no dependency graph; mark the frame non-RAP.
-                    UInt(output, 0x9B, (ulong)sampleDuration);
+                    if (sampleDuration > 0) UInt(output, 0x9B, (ulong)sampleDuration);
+                    if (hasPadding) WriteSignedInteger(output, 0x75A2, s.DiscardPaddingNs);
                 }
                 clusterBytes += s.Size;
             }
@@ -293,7 +296,10 @@ internal static class MatroskaMuxer
                 long startMs = startNs / NanosecondsPerMillisecond;
                 presentationMilliseconds[sampleIndex] = startMs;
                 long sampleDuration = SampleDurationMilliseconds(track, sample, shift, startMs);
-                durationMilliseconds = Math.Max(durationMilliseconds, checked(startMs + sampleDuration));
+                long endMs = checked(startMs + sampleDuration);
+                if (sample.DiscardPaddingNs > 0)
+                    endMs = Math.Max(startMs, endMs - sample.DiscardPaddingNs / NanosecondsPerMillisecond);
+                durationMilliseconds = Math.Max(durationMilliseconds, endMs);
             }
             timing[trackIndex] = new TrackTiming(decodeNanoseconds, presentationMilliseconds);
         }
@@ -353,7 +359,7 @@ internal static class MatroskaMuxer
 
     private static long ToNs(long ticks, uint timescale) => checked((long)((Int128)ticks * 1_000_000_000 / timescale));
 
-    private static void WriteSignedInteger(Stream output, uint id, long value)
+    private static int SignedIntegerLength(long value)
     {
         int bytes = 1;
         while (bytes < sizeof(long))
@@ -364,7 +370,12 @@ internal static class MatroskaMuxer
             if (value >= minimum && value <= maximum) break;
             bytes++;
         }
+        return bytes;
+    }
 
+    private static void WriteSignedInteger(Stream output, uint id, long value)
+    {
+        int bytes = SignedIntegerLength(value);
         Id(output, id);
         Size(output, bytes);
         ulong encoded = unchecked((ulong)value);
@@ -870,7 +881,8 @@ internal static class MediaMerger
                         wanted.ShiftNanoseconds, sourceTiming.PresentationMilliseconds[sampleIndex]);
                     if (outputSample.Dts != sourceTiming.PresentationMilliseconds[sampleIndex]
                         || outputSample.CtsOffset != 0
-                        || outputSample.Duration != durationMilliseconds)
+                        || outputSample.Duration != durationMilliseconds
+                        || outputSample.DiscardPaddingNs != sourceSample.DiscardPaddingNs)
                         throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} timing.");
                     if (outputSample.Key != sourceSample.Key)
                         throw new MediaContainerException($"The merged {sourceTrack.Kind.ToString().ToLowerInvariant()} track changed sample {sampleIndex + 1} keyframe status.");

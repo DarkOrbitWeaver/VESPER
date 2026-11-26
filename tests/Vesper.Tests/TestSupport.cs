@@ -53,6 +53,7 @@ internal sealed class FaultServer : IAsyncDisposable
     public ConcurrentDictionary<string, ConcurrentQueue<ObservedHeaders>> Requests { get; } = new();
     /// <summary>Additional range-capable payloads by path (merge-job tests register synthetic media here).</summary>
     public ConcurrentDictionary<string, byte[]> Extra { get; } = new();
+    public ConcurrentDictionary<string, string> ExtraContentTypes { get; } = new();
     public ConcurrentDictionary<string, (string Cookie, byte[] Data)> AuthenticatedFiles { get; } = new();
 
     public sealed record ObservedHeaders(string? Cookie, string? Authorization, string? Referer);
@@ -115,7 +116,11 @@ internal sealed class FaultServer : IAsyncDisposable
             await Serve(ctx, authenticated.Data, "\"x\"", Modified);
             return;
         }
-        if (Extra.TryGetValue(path, out byte[]? extra)) { await Serve(ctx, extra, "\"x\"", Modified); return; }
+        if (Extra.TryGetValue(path, out byte[]? extra))
+        {
+            await Serve(ctx, extra, "\"x\"", Modified, contentType: ExtraContentTypes.GetValueOrDefault(path));
+            return;
+        }
 
         switch (path)
         {
@@ -318,7 +323,7 @@ internal sealed class FaultServer : IAsyncDisposable
     }
 
     private static async Task Serve(HttpContext ctx, byte[] data, string? etag, DateTimeOffset? modified,
-        bool ranges = true, double? truncate = null, bool wrongStartAfterZero = false, int delayPerChunkMs = 0)
+        bool ranges = true, double? truncate = null, bool wrongStartAfterZero = false, int delayPerChunkMs = 0, string? contentType = null)
     {
         HttpResponse res = ctx.Response;
         long start = 0, end = data.Length - 1;
@@ -341,7 +346,7 @@ internal sealed class FaultServer : IAsyncDisposable
         if (etag is not null) res.Headers.ETag = etag;
         if (modified is not null) res.Headers.LastModified = modified.Value.ToString("R");
         if (ranges) res.Headers.AcceptRanges = "bytes";
-        res.ContentType = "application/octet-stream";
+        res.ContentType = contentType ?? "application/octet-stream";
         res.ContentLength = length;
 
         long toSend = truncate is { } fraction ? (long)(length * fraction) : length;
@@ -480,13 +485,15 @@ internal sealed class Harness : IDisposable
 
     private readonly Action<string, string, string, MediaOutput, CancellationToken>? _convertMedia;
     private readonly long _freeSpaceReserve;
+    private readonly string? _proxyAddress;
 
     public Harness(Action<string>? failpoint = null, Action<EngineOptions>? tweak = null,
         Action<string, string, string, MediaOutput, CancellationToken>? convertMedia = null,
-        long freeSpaceReserve = 64L * 1024 * 1024)
+        long freeSpaceReserve = 64L * 1024 * 1024, string? proxyAddress = null)
     {
         _convertMedia = convertMedia;
         _freeSpaceReserve = freeSpaceReserve;
+        _proxyAddress = proxyAddress;
         Directory.CreateDirectory(Downloads);
         Engine = Start(failpoint, tweak);
     }
@@ -497,6 +504,8 @@ internal sealed class Harness : IDisposable
         {
             DataDirectory = Data,
             AllowPrivateNetworks = true,                 // the fault server is on loopback
+            Proxy = _proxyAddress is null ? ProxyMode.Direct : ProxyMode.Custom,
+            ProxyAddress = _proxyAddress,
             Retry = new RetryOptions { BaseDelay = TimeSpan.FromMilliseconds(40), MaxDelay = TimeSpan.FromMilliseconds(400), MaxAttempts = 6 },
             CheckpointBytes = 64 * 1024,
             CheckpointInterval = TimeSpan.FromMilliseconds(100),

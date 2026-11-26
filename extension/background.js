@@ -912,7 +912,8 @@ function isRangedMediaCandidate(source) {
   return source.kind === 'direct' && source.rangeResource === true && !source.conflictingValidator
     && Number.isSafeInteger(length) && length > 0 && length <= MAX_MEDIA_RANGE_LENGTH
     && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(source.validator || '')
-    && source.mime === 'video/mp4' && !!url && !isPartialMediaUrl(url);
+    && ['video/mp4', 'audio/mp4', 'audio/m4a', 'audio/x-m4a', 'video/webm', 'audio/webm'].includes(source.mime)
+    && !!url && !isPartialMediaUrl(url);
 }
 
 // Two actual playback-witnessed URL slices can suggest a full MP4 endpoint.
