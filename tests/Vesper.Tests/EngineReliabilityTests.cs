@@ -718,7 +718,7 @@ public sealed class BridgeClipRangeTests
     [Fact]
     public void A_valid_range_is_parsed()
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"range\":{{\"start\":72,\"end\":102.5}}}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"range\":{{\"start\":72,\"end\":102.5}}}}";
         Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out string error), error);
         Assert.NotNull(request.Clip);
         Assert.Equal(72, request.Clip!.StartSeconds);
@@ -733,7 +733,7 @@ public sealed class BridgeClipRangeTests
     [InlineData("[0,5]")]
     public void A_bad_range_is_refused(string range)
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"range\":{range}}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"range\":{range}}}";
         Assert.False(BridgeProtocol.TryParse(json, out _, out string error));
         Assert.Equal("Invalid time range.", error);
     }
@@ -741,7 +741,7 @@ public sealed class BridgeClipRangeTests
     [Fact]
     public void No_range_means_the_whole_file()
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2}}";
         Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out _));
         Assert.Null(request.Clip);
     }
@@ -754,7 +754,7 @@ public sealed class BridgeSubtitleEmbeddingTests
     [Fact]
     public void Explicit_subtitle_embedding_is_parsed_with_selected_languages()
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en-US\"],\"embedSubtitles\":true}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en-US\"],\"embedSubtitles\":true}}";
         Assert.True(BridgeProtocol.TryParse(json, out BridgeRequest request, out string error), error);
         Assert.True(request.EmbedSubtitles);
         Assert.Equal(new[] { "en-US" }, request.SubtitleLanguages);
@@ -766,7 +766,7 @@ public sealed class BridgeSubtitleEmbeddingTests
     [InlineData("null")]
     public void Invalid_embedding_preferences_are_refused(string value)
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en\"],\"embedSubtitles\":{value}}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"subtitles\":[\"en\"],\"embedSubtitles\":{value}}}";
         Assert.False(BridgeProtocol.TryParse(json, out _, out string error));
         Assert.Equal("Invalid subtitle embedding preference.", error);
     }
@@ -774,7 +774,7 @@ public sealed class BridgeSubtitleEmbeddingTests
     [Fact]
     public void Embedding_without_a_selected_language_is_refused()
     {
-        string json = $"{{\"v\":1,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"embedSubtitles\":true}}";
+        string json = $"{{\"v\":2,\"id\":\"request-01\",\"type\":\"media-select\",\"mode\":\"download\",\"mediaSession\":\"{Session}\",\"formatChoice\":2,\"embedSubtitles\":true}}";
         Assert.False(BridgeProtocol.TryParse(json, out _, out string error));
         Assert.Equal("Choose at least one subtitle language before embedding.", error);
     }

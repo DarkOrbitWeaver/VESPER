@@ -1900,7 +1900,7 @@ public sealed class MediaMergeTests
     {
         string validator = type == "media-range-options" ? "\"observedETag\":\"\\\"x\\\"\"," : "";
         string json = $$"""
-            {"v":1,"id":"observed-range-002","type":"{{type}}","url":"https://example.com/player","candidates":[
+            {"v":2,"id":"observed-range-002","type":"{{type}}","url":"https://example.com/player","candidates":[
               {"url":"https://media.example.com/file.mp4","kind":"direct",{{validator}}{{extent}}}
             ]}
             """;

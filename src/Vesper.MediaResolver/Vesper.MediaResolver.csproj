@@ -19,6 +19,7 @@
     <Compile Include="..\Shared\NetworkAddressPolicy.cs" Link="Security\NetworkAddressPolicy.cs" />
     <Compile Include="..\Shared\FileNameRules.cs" Link="Security\FileNameRules.cs" />
     <Compile Include="..\Shared\Mp4TopLevelExtent.cs" Link="Discovery\Mp4TopLevelExtent.cs" />
+    <EmbeddedResource Include="..\..\intelligence\rules\default-extractor-pack.json" LogicalName="Vesper.MediaResolver.Rules.default-extractor-pack.json" />
     <ProjectReference Include="..\Vesper.Intelligence\Vesper.Intelligence.csproj" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Tests" />
     <InternalsVisibleTo Include="Vesper.MediaResolver.Benchmarks" />

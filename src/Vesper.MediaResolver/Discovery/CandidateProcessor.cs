@@ -148,7 +148,7 @@ internal sealed class CandidateProcessor
                 || probe.ContentLength is not (> 0 and <= MediaCandidate.MaxObservedLength)
                 || c.ObservedLength is long exact && probe.ContentLength != exact
                 || c.ObservedMinimumLength is long minimum && probe.ContentLength < minimum
-                || probe.StrongETag != c.ObservedETag))
+                || probe.StrongETag is null || c.ObservedETag is not null && probe.StrongETag != c.ObservedETag))
                 return new(null, null, MediaErrors.NoMedia("The observed range no longer identifies the same complete file.", false));
             if (exactAssetGroup && BrowserAssetIdentity.XVideo(c.Url) != BrowserAssetIdentity.XVideo(probe.FinalUrl))
                 return new(null, null, MediaErrors.Invalid("A source redirected to a different media asset."));

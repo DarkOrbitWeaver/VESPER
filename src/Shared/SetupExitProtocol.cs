@@ -7,7 +7,7 @@ namespace Vesper.Shared;
 
 public static class SetupExitProtocol
 {
-    public const int Version = 1;
+    public const int Version = 2;
     public const int MaxMessageBytes = 1024 * 1024;
     public const string RequestType = "setup-exit";
 
@@ -17,6 +17,14 @@ public static class SetupExitProtocol
         => await RequestExitAsync(PipeNameForCurrentUser(), connectTimeout, replyTimeout, ct).ConfigureAwait(false);
 
     public static async Task<bool> RequestExitAsync(string pipeName, TimeSpan connectTimeout, TimeSpan replyTimeout, CancellationToken ct)
+    {
+        bool? accepted = await RequestExitAsync(pipeName, connectTimeout, replyTimeout, Version, ct).ConfigureAwait(false);
+        accepted ??= await RequestExitAsync(pipeName, connectTimeout, replyTimeout, 1, ct).ConfigureAwait(false);
+        return accepted ?? throw new InvalidDataException("VESPER returned an invalid setup shutdown response.");
+    }
+
+    private static async Task<bool?> RequestExitAsync(string pipeName, TimeSpan connectTimeout, TimeSpan replyTimeout,
+        int version, CancellationToken ct)
     {
         string id = Guid.NewGuid().ToString("N");
         await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
@@ -33,12 +41,9 @@ public static class SetupExitProtocol
 
         using var reply = CancellationTokenSource.CreateLinkedTokenSource(ct);
         reply.CancelAfter(replyTimeout);
-        await WriteFrameAsync(pipe, CreateRequest(id), reply.Token).ConfigureAwait(false);
-        string response = await ReadFrameAsync(pipe, reply.Token).ConfigureAwait(false)
-            ?? throw new InvalidDataException("VESPER closed the setup shutdown request without answering.");
-        if (!TryReadResponse(response, id, out bool accepted))
-            throw new InvalidDataException("VESPER returned an invalid setup shutdown response.");
-        return accepted;
+        await WriteFrameAsync(pipe, CreateRequest(id, version), reply.Token).ConfigureAwait(false);
+        string? response = await ReadFrameAsync(pipe, reply.Token).ConfigureAwait(false);
+        return response is not null && TryReadResponse(response, id, out bool accepted) ? accepted : null;
     }
 
     public static bool TryReadRequest(string json, out string id)
@@ -50,7 +55,7 @@ public static class SetupExitProtocol
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Count() != 3
                 || !root.TryGetProperty("v", out JsonElement version) || version.ValueKind != JsonValueKind.Number
-                || version.GetInt32() != Version || !root.TryGetProperty("id", out JsonElement requestId)
+                || (!version.TryGetInt32(out int number) || number is not (1 or Version)) || !root.TryGetProperty("id", out JsonElement requestId)
                 || requestId.ValueKind != JsonValueKind.String || !IsRequestId(requestId.GetString())
                 || !root.TryGetProperty("type", out JsonElement type) || type.ValueKind != JsonValueKind.String
                 || type.GetString() != RequestType)
@@ -64,7 +69,10 @@ public static class SetupExitProtocol
         }
     }
 
-    public static string CreateRequest(string id) => JsonSerializer.Serialize(new { v = Version, id, type = RequestType });
+    public static string CreateRequest(string id) => CreateRequest(id, Version);
+
+    private static string CreateRequest(string id, int version) =>
+        JsonSerializer.Serialize(new { v = version, id, type = RequestType });
 
     public static string CreateResponse(string id, bool accepted) => JsonSerializer.Serialize(new { v = Version, id, accepted });
 
@@ -77,7 +85,7 @@ public static class SetupExitProtocol
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Count() != 3
                 || !root.TryGetProperty("v", out JsonElement version) || version.ValueKind != JsonValueKind.Number
-                || version.GetInt32() != Version || !root.TryGetProperty("id", out JsonElement requestId)
+                || (!version.TryGetInt32(out int number) || number is not (1 or Version)) || !root.TryGetProperty("id", out JsonElement requestId)
                 || requestId.ValueKind != JsonValueKind.String || requestId.GetString() != expectedId
                 || !root.TryGetProperty("accepted", out JsonElement decision)
                 || decision.ValueKind is not (JsonValueKind.True or JsonValueKind.False))

@@ -197,9 +197,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         bool sameRepresentation = proof.UsesLastModified
             ? response.Headers.ETag is null && proof.LastModifiedValue is { } stamp
                 && response.Headers.Date is { } served && served - stamp >= TimeSpan.FromSeconds(60)
-            : proof.UsesMetadata
-                ? proof.ETag is null || string.Equals(etag, proof.ETag, StringComparison.Ordinal)
-                : !string.IsNullOrEmpty(proof.ETag) && string.Equals(etag, proof.ETag, StringComparison.Ordinal);
+            : proof.UsesAttachmentLength
+                ? first.Ranged && first.Total == proof.Length
+                    && response.Content.Headers.ContentDisposition?.DispositionType.Equals("attachment", StringComparison.OrdinalIgnoreCase) == true
+                : proof.UsesMetadata
+                    ? proof.ETag is null || string.Equals(etag, proof.ETag, StringComparison.Ordinal)
+                    : !string.IsNullOrEmpty(proof.ETag) && string.Equals(etag, proof.ETag, StringComparison.Ordinal);
         if (!sameRepresentation || first.Decoded
             || proof.Length is long length && first.Total != length
             || proof.UsesMetadata && first.Total is null
@@ -276,7 +279,9 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             IfRangeDate: Job.Identity == IdentityLevel.LastModified ? Job.LastModified : null,
             Referer: Job.Referer, UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
             CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl,
-            ExpectedResourceIdentity: expectedResourceIdentity);
+            ExpectedResourceIdentity: expectedResourceIdentity,
+            HostCookies: credentials?.HostCookies,
+            OriginHeader: credentials?.OriginHeader);
     }
 
     private async Task<FirstResult> OpenFirstAsync(long start, CancellationToken ct)
@@ -458,7 +463,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
         var board = new SegmentBoard(pieceMode ? long.MaxValue / 4 :
             adaptiveSmall ? Math.Min(_o.MinSplitBytes, ConnectionAdvisor.SmallSplitMinimum) : _o.MinSplitBytes,
-            rateAware: segmented && !pieceMode);
+            rateAware: segmented && !pieceMode,
+            totalBytes: total);
         foreach (ByteRange gap in Job.Extents.Gaps(total)) AddSegments(board, gap, pieceMode);
 
         var advisor = new ConnectionAdvisor(segmented ? _o.MaxConnectionsPerJob : 1);
@@ -471,11 +477,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         async Task WorkerAsync(RangeWorker worker, bool primary, HttpResponseMessage? open, Segment? initial = null)
         {
             session.AddConnection();
+            double lastWorkerRate = 0;
             try
             {
                 while (!workersCts.IsCancellationRequested && !worker.Draining)
                 {
-                    Segment? segment = initial ?? board.Acquire();
+                    Segment? segment = initial ?? board.Acquire(lastWorkerRate);
                     initial = null;
                     if (segment is null) break;
                     try
@@ -483,7 +490,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                         if (open is not null && segment.Next != first.Start) { open.Dispose(); open = null; }
                         HttpResponseMessage? use = open;
                         open = null;
-                        await RunSegmentAsync(board, segment, use, pieceMode, total, worker, workersCts.Token).ConfigureAwait(false);
+                        await RunSegmentAsync(board, segment, use, pieceMode, segmented && !pieceMode, total, worker, workersCts.Token).ConfigureAwait(false);
+                        if (segment.Rate > 0) lastWorkerRate = segment.Rate;
                     }
                     finally { board.Release(segment); }
                 }
@@ -614,9 +622,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
     }
 
-    private async Task RunSegmentAsync(SegmentBoard board, Segment segment, HttpResponseMessage? first, bool pieceMode, long total, RangeWorker worker, CancellationToken ct)
+    private async Task RunSegmentAsync(SegmentBoard board, Segment segment, HttpResponseMessage? first, bool pieceMode, bool boundedWindows, long total, RangeWorker worker, CancellationToken ct)
     {
         HttpResponseMessage? response = first;
+        if (response?.Content.Headers.ContentRange?.To is long last && last < long.MaxValue)
+            segment.WireEnd = last + 1;
         int emptyReads = 0;
         int pieceFailures = 0;
         while (segment.Next < segment.End)
@@ -627,7 +637,14 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             if (pieceMode) { segment.Next = segment.Start; before = segment.Start; }
             try
             {
-                response ??= await OpenRangeAsync(segment, total, ct).ConfigureAwait(false);
+                if (response is null)
+                {
+                    long preferredWindow = segment.Rate >= 16 * 1024 * 1024 ? 16L * 1024 * 1024
+                        : segment.Rate >= 4 * 1024 * 1024 ? 8L * 1024 * 1024
+                        : 4L * 1024 * 1024;
+                    long wireEnd = board.PlanWireWindowEnd(segment, preferredWindow, boundedWindows);
+                    response = await OpenRangeAsync(segment.Next, wireEnd - 1, total, ct).ConfigureAwait(false);
+                }
                 await StreamSegmentAsync(board, segment, response, hash, report: !pieceMode, worker, ct).ConfigureAwait(false);
             }
             finally
@@ -636,6 +653,9 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 response = null;
                 if (pieceMode && segment.Next < segment.End) hash?.Dispose();
             }
+            // If this segment finished cleanly, immediately extend into any contiguous unowned span to preserve locality!
+            if (!pieceMode && segment.Next >= segment.End)
+                _ = board.TryExtend(segment, total);
 
             if (pieceMode && segment.Next >= segment.End)
             {
@@ -664,10 +684,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
     }
 
-    private async Task<HttpResponseMessage> OpenRangeAsync(Segment segment, long total, CancellationToken ct)
+    private async Task<HttpResponseMessage> OpenRangeAsync(long start, long end, long total, CancellationToken ct)
     {
-        long start = segment.Next;
-        long end = segment.End - 1;
         HttpResponseMessage response = await http.SendAsync(_url, BuildSpec(start, end), ct).ConfigureAwait(false);
         try
         {

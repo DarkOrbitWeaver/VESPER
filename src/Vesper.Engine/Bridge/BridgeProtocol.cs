@@ -8,6 +8,8 @@ public sealed record BridgeItem(string Url, string? FileName, string Kind, strin
     string? Cookie, string? Authorization, string? OriginalUrl = null,
     string? ReviewLabel = null, string? ReviewType = null, double? ReviewDurationSeconds = null);
 
+public sealed record BridgeHostCredential(string Url, string Cookie);
+
 public sealed record BridgeMediaHint(string Url, string? Kind, string? MimeType, bool MutedLoop = false,
     long? ObservedLength = null, string? ObservedETag = null, long? ObservedMinimumLength = null);
 
@@ -17,7 +19,8 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     string? TransferId = null, string? Operation = null, BrowserActivity? Activity = null,
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
     IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
-    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null, IReadOnlyList<string>? PlaybackFingerprints = null);
+    bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null,
+    IReadOnlyList<string>? PlaybackFingerprints = null, IReadOnlyList<BridgeHostCredential>? HostCredentials = null);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -26,15 +29,14 @@ public sealed record BridgeResult(string Url, string Status, string? JobId, stri
 public sealed record BridgeResponse(int V, string Id, bool Ok, string Code, string Message,
     IReadOnlyList<BridgeResult>? Results = null, object? Data = null, string? AppVersion = null)
 {
-    public static BridgeResponse Fail(string id, string code, string message) => new(1, id, false, code, message);
+    public static BridgeResponse Fail(string id, string code, string message) => new(BridgeProtocol.Version, id, false, code, message);
     public static BridgeResponse Success(string id, string message = "", IReadOnlyList<BridgeResult>? results = null, object? data = null, string? version = null)
-        => new(1, id, true, "ok", message, results, data, version);
+        => new(BridgeProtocol.Version, id, true, "ok", message, results, data, version);
 }
 
 /// <summary>
-/// Chrome native-messaging framing and strict validation of everything the browser may ask for.
-/// Handles browser connection, discovery, and download requests. The desktop resolves
-/// format selections from its own session and controls all destination paths.
+/// Chrome native-messaging framing and strict validation of everything the browser may ask for (Protocol v2).
+/// Supports per-host CDN credentials, streaming &amp; dual-track browser-body muxing, and attachment-length transfer proofs.
 /// </summary>
 public static class BridgeProtocol
 {
@@ -47,13 +49,9 @@ public static class BridgeProtocol
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    // framing: 4-byte little-endian length, then UTF-8 JSON
-
     public static Task<string?> ReadFrameAsync(Stream stream, CancellationToken ct) => SetupExitProtocol.ReadFrameAsync(stream, ct);
 
     public static Task WriteFrameAsync(Stream stream, string json, CancellationToken ct) => SetupExitProtocol.WriteFrameAsync(stream, json, ct);
-
-    // validation
 
     public static bool TryParse(string json, out BridgeRequest request, out string error)
     {
@@ -66,8 +64,8 @@ public static class BridgeProtocol
             using JsonDocument doc = JsonDocument.Parse(json);
             JsonElement root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object) { error = "Message must be an object."; return false; }
-            if (!root.TryGetProperty("v", out JsonElement v) || v.ValueKind != JsonValueKind.Number || v.GetInt32() != Version)
-            { error = "Unsupported protocol version."; return false; }
+            if (!root.TryGetProperty("v", out JsonElement v) || v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out int version) || version != Version)
+            { error = $"Unsupported protocol version (expected v{Version})."; return false; }
 
             string id = Str(root, "id") ?? "";
             if (!IsRequestId(id))
@@ -83,6 +81,7 @@ public static class BridgeProtocol
 
             var items = new List<BridgeItem>();
             var hints = new List<BridgeMediaHint>();
+            var hostCredentials = new List<BridgeHostCredential>();
             string? probeUrl = null;
             Guid? mediaSession = null;
             int? formatChoice = null;
@@ -117,17 +116,34 @@ public static class BridgeProtocol
             {
                 probeUrl = Str(root, "url");
                 if (!UrlPolicy.TryParse(probeUrl, out _, out error)) return false;
+                bool authorized = root.TryGetProperty("authorized", out var consent) && consent.ValueKind == JsonValueKind.True;
                 if (mediaLookup && root.TryGetProperty("mediaAuth", out var auth))
                 {
-                    bool authorized = root.TryGetProperty("authorized", out var consent) && consent.ValueKind == JsonValueKind.True;
                     if (!authorized || !TryItem(auth, authorized, false, out mediaAuth, out error)
                         || mediaAuth is null || mediaAuth.Url != probeUrl || mediaAuth.Kind != "http")
                     { error = "Invalid media authorization context."; return false; }
                 }
+                if (mediaLookup && root.TryGetProperty("hostCredentials", out JsonElement hostCreds))
+                {
+                    if (!authorized || hostCreds.ValueKind != JsonValueKind.Array || hostCreds.GetArrayLength() > 16)
+                    { error = "Invalid host credentials."; return false; }
+                    foreach (JsonElement hc in hostCreds.EnumerateArray())
+                    {
+                        if (hc.ValueKind != JsonValueKind.Object) { error = "Invalid host credential item."; return false; }
+                        string? rawCookie = Header(hc, "cookie", 8192);
+                        if (!UrlPolicy.TryParse(Str(hc, "url"), out Uri scope, out _) || scope.Scheme != "https"
+                            || scope.Query.Length != 0 || scope.Fragment.Length != 0 || rawCookie is null)
+                        { error = "Invalid host credential value."; return false; }
+                        string path = scope.GetLeftPart(UriPartial.Path);
+                        if (hostCredentials.Any(entry => entry.Url == path))
+                        { error = "Duplicate host credential scope."; return false; }
+                        hostCredentials.Add(new BridgeHostCredential(path, rawCookie));
+                    }
+                }
                 if (mediaLookup && root.TryGetProperty("candidates", out JsonElement candidates))
                 {
-                    if (candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 25)
-                    { error = "At most 25 media hints are accepted."; return false; }
+                    if (candidates.ValueKind != JsonValueKind.Array || candidates.GetArrayLength() > 32)
+                    { error = "At most 32 media hints are accepted."; return false; }
                     foreach (JsonElement hint in candidates.EnumerateArray())
                     {
                         if (hint.ValueKind != JsonValueKind.Object)
@@ -150,10 +166,12 @@ public static class BridgeProtocol
                             var extent = hasLength ? size : minimum;
                             if (kind != "direct" || hasLength == hasMinimum
                                 || extent.ValueKind != JsonValueKind.Number || !extent.TryGetInt64(out long length)
-                                || length is <= 0 or > 17_179_869_184 || observedTag is not { Length: > 2 and <= 256 }
+                                || length is <= 0 or > 17_179_869_184)
+                            { error = "A ranged media hint needs a positive total or minimum size."; return false; }
+                            if (observedTag is not null && (observedTag.Length is <= 2 or > 256
                                 || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
-                                || tag.IsWeak || tag.Tag == "*" || tag.ToString() != observedTag)
-                            { error = "A ranged media hint needs one total or minimum size and a strong ETag."; return false; }
+                                || tag.Tag == "*"))
+                            { error = "Invalid ranged media ETag."; return false; }
                             if (hasLength) observedLength = length;
                             else observedMinimumLength = length;
                         }
@@ -200,7 +218,6 @@ public static class BridgeProtocol
                 { error = "Choose at least one subtitle language before embedding."; return false; }
                 mediaSession = session;
                 formatChoice = index;
-                // "Download part": optional start/end in seconds, checked again by the planner.
                 if (root.TryGetProperty("range", out JsonElement range) && range.ValueKind != JsonValueKind.Null)
                 {
                     if (range.ValueKind != JsonValueKind.Object
@@ -243,9 +260,11 @@ public static class BridgeProtocol
                     { error = "Invalid browser download proof."; return false; }
                     bool? attachment = proof.TryGetProperty("attachment", out JsonElement disposition)
                         && disposition.ValueKind is JsonValueKind.True or JsonValueKind.False ? disposition.GetBoolean() : null;
+                    bool? acceptsRanges = proof.TryGetProperty("acceptsRanges", out JsonElement rangesProp)
+                        && rangesProp.ValueKind is JsonValueKind.True or JsonValueKind.False ? rangesProp.GetBoolean() : null;
                     browserProof = new BrowserTransferProof(length, Str(proof, "etag"), Str(proof, "contentType"),
                         LastModified: Str(proof, "lastModified"), FileName: Str(proof, "fileName"),
-                        Attachment: attachment, Basis: Str(proof, "basis"));
+                        Attachment: attachment, Basis: Str(proof, "basis"), AcceptsRanges: acceptsRanges);
                     if (!browserProof.IsValid)
                     { error = "Invalid browser download proof."; return false; }
                 }
@@ -295,7 +314,8 @@ public static class BridgeProtocol
             string? pageTitle = mediaLookup && Str(root, "pageTitle") is { Length: <= 300 } title ? title : null;
             request = new BridgeRequest(id, type, mode, probeUrl, items, hints, pageTitle,
                 confirmTransfer, mediaSession, formatChoice, browserProof, transferId, operation, activity, clip, mediaAuth,
-                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile, browserBody, playbackFingerprints);
+                audioTrack, subtitleLanguages, autoSubtitles, embedSubtitles, completedFile, browserBody, playbackFingerprints,
+                hostCredentials.Count > 0 ? hostCredentials : null);
             return true;
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
@@ -327,7 +347,8 @@ public static class BridgeProtocol
                     || page.AbsoluteUri != page.GetLeftPart(UriPartial.Authority) + "/"
                     || name is not { Length: > 0 and <= 255 } || name.Any(char.IsControl)
                     || name.IndexOfAny(['/', '\\', ':']) >= 0
-                    || !TryLength(root, "length", out long? length) || length is null or < 1 or > BrowserBodyReceiver.MaxBytes)
+                    || !TryLength(root, "length", out long? length)
+                    || length is < 1 or > BrowserBodyReceiver.MaxBytes)
                     return false;
                 bool verifyMp4 = root.TryGetProperty("mediaCheck", out JsonElement check);
                 if (verifyMp4 && (check.ValueKind != JsonValueKind.String || check.GetString() != "mp4")) return false;
@@ -337,8 +358,42 @@ public static class BridgeProtocol
                     if (intent.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) return false;
                     automatic = intent.GetBoolean();
                 }
+                string? pageUrl = Str(root, "pageUrl");
+                if (pageUrl is not null && (!UrlPolicy.TryParse(pageUrl, out Uri parsedPage, out _) || parsedPage.Scheme is not ("http" or "https")))
+                    pageUrl = null;
+                string? outputContainer = Str(root, "outputContainer")?.ToLowerInvariant();
+                if (outputContainer is not (null or "mp4" or "m4a" or "webm" or "mkv")) return false;
+
+                List<BrowserBodyTrackSpec>? tracks = null;
+                if (root.TryGetProperty("tracks", out JsonElement tracksElement))
+                {
+                    if (tracksElement.ValueKind != JsonValueKind.Array || tracksElement.GetArrayLength() is < 1 or > 2)
+                        return false;
+                    tracks = [];
+                    foreach (JsonElement trackEl in tracksElement.EnumerateArray())
+                    {
+                        if (trackEl.ValueKind != JsonValueKind.Object) return false;
+                        string? role = Str(trackEl, "role");
+                        string? container = Str(trackEl, "container")?.ToLowerInvariant();
+                        if (role is not ("video" or "audio" or "muxed") || container is not ("mp4" or "m4a" or "webm" or "ts"))
+                            return false;
+                        if (!TryLength(trackEl, "length", out long? trackLen) || trackLen is < 1 or > BrowserBodyReceiver.MaxBytes)
+                            return false;
+                        string? codec = Header(trackEl, "codec", 64);
+                        string? language = Header(trackEl, "language", 16);
+                        tracks.Add(new BrowserBodyTrackSpec(role, container, trackLen, codec, language));
+                    }
+                }
+
+                if (tracks is { Count: 2 } && (tracks.Count(track => track.Role == "audio") != 1
+                    || tracks.Any(track => track.Role == "muxed")))
+                    return false;
+                if (tracks?.All(track => track.Length is not null) == true && length is long total
+                    && tracks.Sum(track => track.Length!.Value) != total) return false;
+
                 request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length,
-                    Session: session, VerifyMp4: verifyMp4, Automatic: automatic);
+                    Session: session, VerifyMp4: verifyMp4, Automatic: automatic, Tracks: tracks,
+                    PageUrl: pageUrl, OutputContainer: outputContainer);
                 return true;
             }
             case "append":
@@ -348,10 +403,16 @@ public static class BridgeProtocol
                     || digest is not { Length: 64 } || !digest.All(Uri.IsHexDigit)
                     || !TryLength(root, "offset", out long? offset) || offset is null or > BrowserBodyReceiver.MaxBytes)
                     return false;
+                int trackIndex = 0;
+                if (root.TryGetProperty("trackIndex", out JsonElement ti))
+                {
+                    if (ti.ValueKind != JsonValueKind.Number || !ti.TryGetInt32(out trackIndex) || trackIndex is < 0 or > 1)
+                        return false;
+                }
                 byte[] bytes = Convert.FromBase64String(encoded);
                 if (bytes.Length is < 1 or > BrowserBodyReceiver.ChunkBytes
                     || offset.Value > BrowserBodyReceiver.MaxBytes - bytes.Length) return false;
-                request = new(operation, transferId!, Offset: offset, Bytes: bytes, Digest: digest, Session: session);
+                request = new(operation, transferId!, Offset: offset, Bytes: bytes, Digest: digest, Session: session, TrackIndex: trackIndex);
                 return true;
             }
             case "status":
@@ -396,7 +457,6 @@ public static class BridgeProtocol
         string? sha = Str(e, "sha256");
         if (sha is not null && !DownloadEngine.TryNormalizeSha256(sha, out sha)) { error = "Invalid SHA-256."; return false; }
 
-        // Credentials are accepted only with explicit user consent flagged by the extension, and stay in memory.
         string? cookie = authorized ? Header(e, "cookie", 8192) : null;
         string? authorization = authorized ? Header(e, "authorization", 4096) : null;
         if ((cookie ?? authorization) is null && authorized && (e.TryGetProperty("cookie", out _) || e.TryGetProperty("authorization", out _)))
@@ -496,13 +556,12 @@ public static class BridgeProtocol
     private static bool TryLength(JsonElement element, string name, out long? length)
     {
         length = null;
-        if (!element.TryGetProperty(name, out JsonElement value)) return true;
+        if (!element.TryGetProperty(name, out JsonElement value) || value.ValueKind == JsonValueKind.Null) return true;
         if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out long bytes) || bytes < 0) return false;
         length = bytes;
         return true;
     }
 
-    /// <summary>A header value: bounded, and never containing line breaks (header injection).</summary>
     private static string? Header(JsonElement e, string name, int max)
     {
         string? value = Str(e, name);

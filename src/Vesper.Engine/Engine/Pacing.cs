@@ -263,9 +263,13 @@ public sealed class ConnectionAdvisor
     }
 
     private int _ceiling;
-    private bool _settled;
+    private bool _throttled;
+    private bool _cruising;
+    private long _cruiseSinceTicks;
     private double _throughputAtLastChange;
     private int _countAtLastChange = 1;
+
+    private static readonly TimeSpan ReprobeInterval = TimeSpan.FromSeconds(10);
 
     public ConnectionAdvisor(int maximum)
     {
@@ -278,41 +282,63 @@ public sealed class ConnectionAdvisor
     public int Recommend(int current, double bytesPerSecond, TimeSpan sinceLastChange, TimeSpan rampInterval)
     {
         current = Math.Clamp(current, 1, Math.Max(1, _ceiling));
-        if (_settled || sinceLastChange < rampInterval || bytesPerSecond <= 0) return current;
+        if (_throttled || sinceLastChange < rampInterval || bytesPerSecond <= 0) return current;
+
+        if (_cruising)
+        {
+            if (current < _ceiling && System.Diagnostics.Stopwatch.GetElapsedTime(_cruiseSinceTicks) >= ReprobeInterval)
+            {
+                _cruising = false;
+                _throughputAtLastChange = bytesPerSecond;
+                _countAtLastChange = current + 1;
+                return Math.Clamp(current + 1, 1, Math.Max(1, _ceiling));
+            }
+            return current;
+        }
 
         int next = current;
         if (current == 1)
         {
-            next = 2;                                                   // always try one more once running
+            next = Math.Min(_ceiling, 2);
         }
-        else if (bytesPerSecond > _throughputAtLastChange * 1.15)
+        else if (bytesPerSecond > _throughputAtLastChange * 1.10)
         {
-            next = current + 1;                                         // the last connection paid for itself
+            // Fast double-step when bandwidth scales cleanly (>35% gain), single-step otherwise
+            int step = bytesPerSecond > _throughputAtLastChange * 1.35 && current < 4 ? 2 : 1;
+            next = Math.Min(_ceiling, current + step);
         }
-        else if (bytesPerSecond < _throughputAtLastChange * 0.9 && current > 1)
+        else if (bytesPerSecond < _throughputAtLastChange * 0.88 && current > 1)
         {
-            next = current - 1;                                         // the last connection hurt: stop growing
-            _ceiling = next;
-            _settled = true;
+            next = current - 1;
+            _cruising = true;
+            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         }
         else
         {
-            next = current - 1;                                         // retire a probe that did not pay for itself
-            _ceiling = next;
-            _settled = true;
+            _cruising = true;
+            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            return current;
         }
 
-        if (next > _ceiling && current == _ceiling) _settled = true;
+        if (next >= _ceiling && current >= _ceiling)
+        {
+            _cruising = true;
+            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
         next = Math.Clamp(next, 1, Math.Max(1, _ceiling));
-        if (next != current || next == _countAtLastChange) { _throughputAtLastChange = bytesPerSecond; _countAtLastChange = next; }
+        if (next != current || next == _countAtLastChange)
+        {
+            _throughputAtLastChange = bytesPerSecond;
+            _countAtLastChange = next;
+        }
         return next;
     }
 
-    /// <summary>The server answered 429/503: cut connections in half and stop probing upward.</summary>
+    /// <summary>The server answered 429/503: cut connections in half and lock the ceiling.</summary>
     public int OnThrottled(int current)
     {
         _ceiling = Math.Max(1, current / 2);
-        _settled = true;
+        _throttled = true;
         return _ceiling;
     }
 }

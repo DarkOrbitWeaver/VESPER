@@ -51,7 +51,7 @@ public sealed partial class DownloadEngine
                 || job.Kind is not (JobKind.Http or JobKind.Dash or JobKind.Hls)
                 || replacement.Kind is not (JobKind.Http or JobKind.Dash or JobKind.Hls))
                 return Rejected("The download cannot safely switch acquisition routes. Saved data was kept.");
-            if (string.IsNullOrWhiteSpace(job.MediaProvider) || job.MediaProvider == "generic"
+            if (string.IsNullOrWhiteSpace(job.MediaProvider) || job.MediaProvider is "generic" or "declarative-pack"
                 || string.IsNullOrWhiteSpace(job.MediaId) || string.IsNullOrWhiteSpace(job.MediaFormatId)
                 || string.IsNullOrWhiteSpace(job.MediaQuality)
                 || job.MediaProvider != source.Provider || job.MediaId != source.MediaId

@@ -1151,7 +1151,8 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     {
         RequestCredentials? credentials = credentialOverride ?? (useStoredCredentials ? engine.CredentialsFor(Job.Id) : null);
         return new RequestSpec(start, end, Referer: Job.Referer, UserAgent: Job.UserAgent,
-            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl);
+            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl,
+            HostCookies: credentials?.HostCookies, OriginHeader: credentials?.OriginHeader);
     }
 
     private static RunnerStop StatusStop(HttpResponseMessage response)

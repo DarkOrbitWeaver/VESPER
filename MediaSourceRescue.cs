@@ -34,7 +34,7 @@ internal static class MediaSourceRescue
             || job.Kind != JobKind.Merge && !job.IsLiveRecording && job.Output == MediaOutput.Original
                 && DownloadEngine.IsRecoverableDeliveryFailure(job.State, job.Reason))
             || job.IsUnacceptedBrowserCapture || string.IsNullOrWhiteSpace(job.MediaProvider)
-            || job.MediaProvider == "generic" || string.IsNullOrWhiteSpace(job.MediaId)
+            || job.MediaProvider is "generic" or "declarative-pack" || string.IsNullOrWhiteSpace(job.MediaId)
             || string.IsNullOrWhiteSpace(job.MediaFormatId)) return false;
         lock (AutomaticAttempts)
         {
@@ -225,8 +225,7 @@ internal static class MediaSourceRescue
     {
         secrets = null;
         error = null;
-        if (format.Context.Origin is not null || format.Context.AcceptLanguage is not null
-            || format.Context.SensitiveHeaders.Keys.Any(name => !name.Equals("Cookie", StringComparison.OrdinalIgnoreCase)
+        if (format.Context.SensitiveHeaders.Keys.Any(name => !name.Equals("Cookie", StringComparison.OrdinalIgnoreCase)
                 && !name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)))
         {
             error = "The exact format or its required request context is unavailable. Restart as a separate copy; saved data was kept.";

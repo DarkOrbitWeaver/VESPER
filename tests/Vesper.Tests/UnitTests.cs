@@ -394,11 +394,11 @@ public class PacingTests
         int n = advisor.Recommend(1, 1_000_000, enough, ramp);
         Assert.Equal(2, n);
         n = advisor.Recommend(n, 1_800_000, enough, ramp);
-        Assert.Equal(3, n);
-        n = advisor.Recommend(n, 1_850_000, enough, ramp);       // < 15 % gain: plateau
-        Assert.Equal(2, n);
-        Assert.Equal(2, advisor.Recommend(n, 1_900_000, enough, ramp));
-        Assert.Equal(1, advisor.OnThrottled(2));
+        Assert.Equal(4, n);
+        n = advisor.Recommend(n, 1_850_000, enough, ramp);
+        Assert.Equal(4, n);
+        Assert.Equal(4, advisor.Recommend(n, 1_900_000, enough, ramp));
+        Assert.Equal(2, advisor.OnThrottled(4));
     }
 
     [Fact]
@@ -708,7 +708,21 @@ public class PieceMapTests
 
 public class BridgeProtocolTests
 {
-    private static string Msg(string body) => "{\"v\":1,\"id\":\"req-12345678\"," + body + "}";
+    private static string Msg(string body) => "{\"v\":2,\"id\":\"req-12345678\"," + body + "}";
+
+    [Fact]
+    public void Host_cookie_scopes_require_consent_and_a_clean_https_path()
+    {
+        const string json = """
+            {"v":2,"id":"credential-fixture","type":"media-options","url":"https://page.example/watch",
+             "authorized":true,"hostCredentials":[{"url":"https://cdn.example/private/clip.mp4","cookie":"sid=123"}]}
+            """;
+        Assert.True(BridgeProtocol.TryParse(json, out var request, out string error), error);
+        Assert.Equal("https://cdn.example/private/clip.mp4", Assert.Single(request.HostCredentials!).Url);
+        Assert.False(BridgeProtocol.TryParse(json.Replace(":true", ":false"), out _, out _));
+        Assert.False(BridgeProtocol.TryParse(json.Replace("clip.mp4", "clip.mp4?token=x"), out _, out _));
+        Assert.False(BridgeProtocol.TryParse(json.Replace("https://cdn", "http://cdn"), out _, out _));
+    }
 
     [Fact] public void Hello_is_accepted() => Assert.True(BridgeProtocol.TryParse(Msg("\"type\":\"hello\""), out BridgeRequest r, out _) && r.Type == "hello");
 
@@ -724,9 +738,9 @@ public class BridgeProtocolTests
 
     [Theory]
     [InlineData("{\"id\":\"req-12345678\",\"type\":\"hello\"}")]                                  // no version
-    [InlineData("{\"v\":2,\"id\":\"req-12345678\",\"type\":\"hello\"}")]                          // wrong version
-    [InlineData("{\"v\":1,\"id\":\"x\",\"type\":\"hello\"}")]                                     // bad id
-    [InlineData("{\"v\":1,\"id\":\"req-12345678\",\"type\":\"format-disk\"}")]                    // unknown type
+    [InlineData("{\"v\":1,\"id\":\"req-12345678\",\"type\":\"hello\"}")]                          // wrong version
+    [InlineData("{\"v\":2,\"id\":\"x\",\"type\":\"hello\"}")]                                     // bad id
+    [InlineData("{\"v\":2,\"id\":\"req-12345678\",\"type\":\"format-disk\"}")]                    // unknown type
     [InlineData("[]")] [InlineData("garbage")]
     public void Malformed_requests_are_rejected(string json) => Assert.False(BridgeProtocol.TryParse(json, out _, out _));
 
@@ -895,9 +909,9 @@ public class BridgeProtocolTests
     public async Task Frames_round_trip_and_oversized_frames_are_refused()
     {
         using var stream = new MemoryStream();
-        await BridgeProtocol.WriteFrameAsync(stream, "{\"v\":1}", CancellationToken.None);
+        await BridgeProtocol.WriteFrameAsync(stream, "{\"v\":2}", CancellationToken.None);
         stream.Position = 0;
-        Assert.Equal("{\"v\":1}", await BridgeProtocol.ReadFrameAsync(stream, CancellationToken.None));
+        Assert.Equal("{\"v\":2}", await BridgeProtocol.ReadFrameAsync(stream, CancellationToken.None));
 
         using var hostile = new MemoryStream(BitConverter.GetBytes(BridgeProtocol.MaxMessageBytes + 1));
         await Assert.ThrowsAsync<InvalidDataException>(() => BridgeProtocol.ReadFrameAsync(hostile, CancellationToken.None));

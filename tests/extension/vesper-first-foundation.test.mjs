@@ -26,7 +26,7 @@ function witnessPage(videos) {
   };
   for (const video of videos) video._document = document;
   const ctx = vm.createContext({ document });
-  vm.runInContext(extension('youtube-player-witness.js'), ctx);
+  vm.runInContext(extension('media-source-witness.js'), ctx);
   return { document, refresh: () => videos.forEach(video => video.dispatchEvent(new Event(eventName))) };
 }
 
@@ -85,7 +85,9 @@ test('active media page uses only the exact witnessed YouTube ID', () => {
   video = fakeVideo(player);
   const { document } = witnessPage([video]);
   const hostname = { hostname: 'www.youtube.com', origin: 'https://www.youtube.com' };
-  const activeYouTubePage = contentFunction('activeYouTubePage', 'pageForPlayer', { document, location: hostname, Event, URL });
+  const inspectPlayerWitnessAttributes = contentFunction('inspectPlayerWitnessAttributes', 'activeYouTubePage', { Event });
+  const activeYouTubePage = contentFunction('activeYouTubePage', 'pageForPlayer',
+    { document, location: hostname, Event, URL, inspectPlayerWitnessAttributes });
   assert.equal(activeYouTubePage(video), 'https://www.youtube.com/watch?v=abcdefghijk');
   assert.equal(activeYouTubePage(video, 'https://www.youtube.com/watch?v=abcdefghijk&list=PLabc123456'),
     'https://www.youtube.com/watch?v=abcdefghijk&list=PLabc123456');

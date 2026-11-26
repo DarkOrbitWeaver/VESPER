@@ -4,19 +4,20 @@ using System.Text.Json;
 namespace Vesper.Engine;
 
 /// <summary>
-/// Bounded browser-byte transport. Receives only a user-selected complete file, not an HTTP replay or a Chrome
-/// download record. Each chunk is verified before its acknowledgement and written exactly once, straight into the
-/// destination's staging partial (preallocated, so a full disk fails at the start rather than at 90 %).
-/// <para>Crash consistency: a journal in the data directory names every partial before it is created. "receiving"
-/// entries are removed at startup only with proof that no job owns the same file; "committing" entries may be owned, so
-/// their files are kept. An incomplete transfer never becomes a published file or an engine job.</para>
+/// Bounded, crash-journaled browser-byte receiver supporting:
+/// 1. Known-length preallocated browser copies (blob:, data:, HTTP files),
+/// 2. Unknown-length browser transfers with bounded staging,
+/// 3. Multi-track (video + audio) browser-body transfers routed directly into VESPER's native lossless remuxer,
+/// 4. Up to <see cref="MaxConcurrentTransfers"/> concurrent streams without head-of-line blocking.
 /// </summary>
 internal sealed class BrowserBodyReceiver : IDisposable
 {
     internal const int ChunkBytes = 512 * 1024;
     internal const long MaxBytes = 16L * 1024 * 1024 * 1024;
+    internal const int MaxConcurrentTransfers = 4;
+    internal const long StreamingMinReserve = 64L * 1024 * 1024;
     internal const string JournalFileName = "browser-inbox.json";
-    private static readonly TimeSpan Idle = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan Idle = TimeSpan.FromMinutes(3);
     private readonly string _journal;
     private readonly Func<string, long, string?> _destination;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -24,7 +25,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
     private bool _disposed;
     private Timer? _expiry;
 
-    /// <param name="destination">Resolves (file name, length) to a ready destination folder with enough free space, or null.</param>
     internal BrowserBodyReceiver(string dataDirectory, Func<string, long, string?> destination)
     {
         _journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
@@ -35,21 +35,35 @@ internal sealed class BrowserBodyReceiver : IDisposable
 
     private sealed record JournalEntry(string Id, string Path, string State, string? Identity = null);
 
-    internal sealed class Transfer(string origin, string name, long length, string folder, PartialFile file, string? identity, bool verifyMp4) : IDisposable
+    internal sealed class Transfer(
+        string origin,
+        string name,
+        long? expectedLength,
+        string folder,
+        PartialFile file,
+        string? identity,
+        bool verifyMp4,
+        IReadOnlyList<BrowserBodyTrackSpec>? tracks = null,
+        string? pageUrl = null,
+        string? outputContainer = null) : IDisposable
     {
         internal string Origin { get; } = origin;
+        internal string? PageUrl { get; } = pageUrl;
         internal string Name { get; } = name;
-        internal long Length { get; } = length;
+        internal long? ExpectedLength { get; } = expectedLength;
         internal bool VerifyMp4 { get; } = verifyMp4;
         internal string Folder { get; } = folder;
         internal PartialFile File { get; } = file;
         internal string? Identity { get; } = identity;
+        internal IReadOnlyList<BrowserBodyTrackSpec>? Tracks { get; } = tracks;
+        internal string? OutputContainer { get; } = outputContainer;
+        internal long[] TrackLengths { get; } = new long[Math.Max(1, tracks?.Count ?? 1)];
+        internal int CurrentTrackIndex { get; set; }
         internal IncrementalHash Hash { get; } = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         internal long Offset { get; set; }
         internal int LastLength { get; set; }
         internal string? LastHash { get; set; }
         internal DateTimeOffset LastActivity { get; set; } = DateTimeOffset.UtcNow;
-        /// <summary>Set by the engine once durable state may own the partial. A claimed partial is never deleted here.</summary>
         internal bool Claimed { get; set; }
         public void Dispose() { try { File.Dispose(); } finally { Hash.Dispose(); } }
     }
@@ -62,7 +76,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
             {
                 if (!transfer.Claimed) transfer.File.DeleteUnclaimedNewFile();
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* The journal entry is kept below. */ }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             finally
             {
                 try { transfer.Dispose(); }
@@ -101,13 +115,22 @@ internal sealed class BrowserBodyReceiver : IDisposable
         _expiry.Change(Idle, Timeout.InfiniteTimeSpan);
     }
 
-    internal async Task<Reply> BeginAsync(string id, string origin, string name, long length, CancellationToken ct,
-        bool exclusiveSession = false, bool verifyMp4 = false)
+    internal async Task<Reply> BeginAsync(
+        string id,
+        string origin,
+        string name,
+        long? expectedLength,
+        CancellationToken ct,
+        bool exclusiveSession = false,
+        bool verifyMp4 = false,
+        IReadOnlyList<BrowserBodyTrackSpec>? tracks = null,
+        string? pageUrl = null,
+        string? outputContainer = null)
     {
         if (!BridgeProtocol.IsRequestId(id) || origin.Length > 512 || !Uri.TryCreate(origin, UriKind.Absolute, out Uri? uri)
             || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0
             || uri.AbsoluteUri != uri.GetLeftPart(UriPartial.Authority) + "/"
-            || length is < 1 or > MaxBytes || name.Length is < 1 or > 255)
+            || expectedLength is < 1 or > MaxBytes || name.Length is < 1 or > 255)
             return new(false, "invalid");
         name = FileNames.Sanitize(name);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -117,20 +140,20 @@ internal sealed class BrowserBodyReceiver : IDisposable
             Prune();
             if (_active.TryGetValue(id, out Transfer? existing))
             {
-                // A second persistent pipe must not attach to an active inbox:
-                // its disconnect cleanup could otherwise abort the first pipe.
                 if (exclusiveSession) return new(false, "busy");
-                if (existing.Origin != origin || existing.Name != name || existing.Length != length || existing.VerifyMp4 != verifyMp4)
+                if (existing.Origin != origin || existing.Name != name || existing.ExpectedLength != expectedLength || existing.VerifyMp4 != verifyMp4
+                    || existing.PageUrl != pageUrl || existing.OutputContainer != outputContainer
+                    || !(existing.Tracks ?? []).SequenceEqual(tracks ?? []))
                     return new(false, "conflict");
                 Renew(existing);
                 return new(true, "ok", existing.Offset);
             }
-            // One stream at a time limits memory, handles and disk usage even for hostile input.
-            if (_active.Count != 0) return new(false, "busy");
-            if (_destination(name, length) is not { } folder) return new(false, "storage");
+            if (_active.Count >= MaxConcurrentTransfers) return new(false, "busy");
+            long spaceNeeded = expectedLength ?? StreamingMinReserve;
+            if (tracks is { Count: 2 }) spaceNeeded = spaceNeeded * 2; // reserve staging + remux headroom
+            if (_destination(name, spaceNeeded) is not { } folder) return new(false, "storage");
             string staging = PartialFile.PrepareStagingFolder(folder);
             string path = Path.Combine(staging, name + "." + Guid.NewGuid().ToString("N")[..8] + ".vpart");
-            // Journal first: a crash after the file exists still leaves a record that names it.
             RememberJournal(new JournalEntry(id, path, "receiving"));
             PartialFile file;
             try { file = PartialFile.Open(path, FileMode.CreateNew, allowDelete: true); }
@@ -141,9 +164,8 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 identity = file.CaptureIdentity();
                 if (OperatingSystem.IsWindows() && identity is null)
                     throw new IOException("Cannot establish the browser file identity.");
-                // Record the actual file identity before its path becomes eligible for crash cleanup.
                 RememberJournal(new JournalEntry(id, path, "receiving", identity));
-                file.EnsureLength(length);
+                if (expectedLength is long knownLength) file.EnsureLength(knownLength);
             }
             catch
             {
@@ -151,7 +173,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 ForgetJournal(id);
                 throw;
             }
-            var transfer = new Transfer(origin, name, length, folder, file, identity, verifyMp4);
+            var transfer = new Transfer(origin, name, expectedLength, folder, file, identity, verifyMp4, tracks, pageUrl, outputContainer);
             _active.Add(id, transfer);
             Renew(transfer);
             return new(true, "ok");
@@ -161,7 +183,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
         finally { _gate.Release(); }
     }
 
-    internal async Task<Reply> AppendAsync(string id, long offset, byte[] bytes, string digest, CancellationToken ct)
+    internal async Task<Reply> AppendAsync(string id, long offset, byte[] bytes, string digest, CancellationToken ct, int trackIndex = 0)
     {
         if (offset < 0 || bytes.Length is < 1 or > ChunkBytes || digest.Length != 64
             || !digest.Equals(Convert.ToHexString(SHA256.HashData(bytes)), StringComparison.OrdinalIgnoreCase))
@@ -172,20 +194,33 @@ internal sealed class BrowserBodyReceiver : IDisposable
             if (_disposed) return new(false, "closed");
             Prune();
             if (!_active.TryGetValue(id, out Transfer? transfer)) return new(false, "expired");
-            // A lost ACK may retry exactly the last chunk; never append it twice.
-            if (offset == transfer.Offset - transfer.LastLength && bytes.Length == transfer.LastLength
+            if (trackIndex == transfer.CurrentTrackIndex && offset == transfer.Offset - transfer.LastLength && bytes.Length == transfer.LastLength
                 && digest.Equals(transfer.LastHash, StringComparison.OrdinalIgnoreCase))
             {
                 Renew(transfer);
                 return new(true, "ok", transfer.Offset);
             }
-            if (offset != transfer.Offset || bytes.Length > transfer.Length - transfer.Offset)
+            int maxTrack = (transfer.Tracks?.Count ?? 1) - 1;
+            if (trackIndex < transfer.CurrentTrackIndex || trackIndex > maxTrack || trackIndex > transfer.CurrentTrackIndex + 1)
+                return new(false, "invalid-track", transfer.Offset);
+            if (trackIndex == 1 && transfer.CurrentTrackIndex == 0
+                && (transfer.TrackLengths[0] <= 0 || transfer.Tracks?[0].Length is long firstLength
+                    && firstLength != transfer.TrackLengths[0]))
+                return new(false, "incomplete-track", transfer.Offset);
+            if (transfer.Tracks?[trackIndex].Length is long trackLength
+                && bytes.Length > trackLength - transfer.TrackLengths[trackIndex])
+                return new(false, "track-length", transfer.Offset);
+
+            long limit = transfer.ExpectedLength ?? MaxBytes;
+            if (offset != transfer.Offset || bytes.Length > limit - transfer.Offset)
                 return new(false, "offset", transfer.Offset);
             try
             {
                 await transfer.File.WriteAsync(bytes, offset, ct).ConfigureAwait(false);
                 transfer.Hash.AppendData(bytes);
                 transfer.Offset += bytes.Length;
+                transfer.CurrentTrackIndex = trackIndex;
+                transfer.TrackLengths[trackIndex] += bytes.Length;
                 transfer.LastLength = bytes.Length;
                 transfer.LastHash = digest;
                 Renew(transfer);
@@ -193,7 +228,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
             }
             catch
             {
-                // A write can be partial on cancellation or disk failure. Never guess its extent or resume this inbox.
                 Remove(id);
                 throw;
             }
@@ -203,7 +237,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
         finally { _gate.Release(); }
     }
 
-    /// <param name="accept">Creates the engine job over the finished partial and sets <see cref="Transfer.Claimed"/>.</param>
     internal async Task<Reply> FinishAsync(string id, Func<Transfer, string, CancellationToken, Task<AddResult>> accept,
         CancellationToken ct)
     {
@@ -213,11 +246,18 @@ internal sealed class BrowserBodyReceiver : IDisposable
             if (_disposed) return new(false, "closed");
             Prune();
             if (!_active.TryGetValue(id, out Transfer? transfer)) return new(false, "expired");
-            if (transfer.Offset != transfer.Length) return new(false, "incomplete", transfer.Offset);
+            if (transfer.Offset <= 0 || transfer.ExpectedLength is long expected && transfer.Offset != expected)
+                return new(false, "incomplete", transfer.Offset);
+            if (transfer.Tracks is { } tracks)
+                for (int index = 0; index < tracks.Count; index++)
+                    if (transfer.TrackLengths[index] <= 0
+                        || tracks[index].Length is long length && length != transfer.TrackLengths[index])
+                        return new(false, "incomplete", transfer.Offset);
             try
             {
+                if (transfer.File.Length != transfer.Offset) transfer.File.Truncate(transfer.Offset);
                 transfer.File.Flush();
-                if (transfer.VerifyMp4)
+                if (transfer.VerifyMp4 && (transfer.Tracks is null || transfer.Tracks.Count <= 1))
                 {
                     try { MediaTrackProbe.RequireMp4Media(transfer.File, ct); }
                     catch (MediaContainerException) { return new(false, "invalid-media"); }
@@ -240,8 +280,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
         try { Remove(id); }
         finally { _gate.Release(); }
     }
-
-    // journal
 
     private List<JournalEntry> ReadJournal() => ReadJournal(_journal);
 
@@ -286,7 +324,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { }
     }
 
-    /// <summary>Startup cleanup. Runs before any browser copy can begin.</summary>
     internal static void RecoverJournal(string dataDirectory, IReadOnlySet<string> ownedPaths, bool databaseRecovered)
     {
         string journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
@@ -299,7 +336,6 @@ internal sealed class BrowserBodyReceiver : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { }
     }
 
-    // Never delete a file based on its name alone, or if a job or recovery manifest may own it.
     private static void DeleteOrphan(JournalEntry entry, IReadOnlySet<string> ownedPaths)
     {
         string full = Path.GetFullPath(entry.Path);

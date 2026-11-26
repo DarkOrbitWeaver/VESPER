@@ -37,7 +37,9 @@ public sealed record AddRequest(
     MediaOutput Output = MediaOutput.Original,
     BrowserTransferProof? BrowserProof = null,
     string? MediaMetadataJson = null,
-    bool InitiallyPaused = false);
+    bool InitiallyPaused = false,
+    IReadOnlyDictionary<string, string>? HostCookies = null,
+    string? OriginHeader = null);
 
 public sealed record AddResult(AddStatus Status, Guid JobId, string Message, bool StartDeferred = false)
 {
@@ -156,8 +158,9 @@ public sealed partial class DownloadEngine
                 return new AddResult(AddStatus.Invalid, Guid.Empty, "MP3 output does not support audio clips.");
             if (!string.IsNullOrWhiteSpace(request.ExpectedSha256) || request.PieceMapJson is not null)
                 return new AddResult(AddStatus.Invalid, Guid.Empty, "A media merge plan cannot use a file checksum or piece map.");
-            if (request.Secrets is { Count: > 0 }
-                && !TryCreateMergeCredentials(plan, uri, request.Secrets, out mergeCredentials, out string credentialError, allowSegmented: true))
+            if ((request.Secrets is { Count: > 0 } || request.HostCookies is { Count: > 0 } || request.OriginHeader is not null)
+                && !TryCreateMergeCredentials(plan, uri, request.Secrets, out mergeCredentials, out string credentialError,
+                    allowSegmented: true, hostCookies: request.HostCookies, originHeader: request.OriginHeader))
                 return new AddResult(AddStatus.Invalid, Guid.Empty, credentialError);
         }
 
@@ -299,10 +302,14 @@ public sealed partial class DownloadEngine
             {
                 if (mergeCredentials is not null) _credentials[id] = mergeCredentials;
             }
-            else if (request.Secrets is { Count: > 0 })
+            else if (request.Secrets is { Count: > 0 } || request.HostCookies is { Count: > 0 } || request.OriginHeader is not null)
             {
                 Uri origin = new UriBuilder(uri) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
-                _credentials[id] = new RequestCredentials(origin, new Dictionary<string, string>(request.Secrets));
+                _credentials[id] = new RequestCredentials(
+                    origin,
+                    request.Secrets is { Count: > 0 } ? new Dictionary<string, string>(request.Secrets) : new Dictionary<string, string>(),
+                    request.HostCookies is { Count: > 0 } ? new Dictionary<string, string>(request.HostCookies, StringComparer.Ordinal) : null,
+                    request.OriginHeader);
             }
             // "Download" goes to the front of the queue and starts at once if a slot is free; otherwise it waits its turn.
             // Only the explicit "Start now" command may exceed the concurrency limit.

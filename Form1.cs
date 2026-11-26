@@ -811,16 +811,40 @@ public partial class Form1 : Form
     {
         if (_exiting || !_browserPresentation.ShouldPresent(receipt, explicitRequest, Environment.TickCount64))
             return;
-        if (Enabled && (!Visible || WindowState == FormWindowState.Minimized || Form.ActiveForm != this))
-            ShowFromTray();
+        // Background browser captures reveal the window only if hidden/minimized and never steal keyboard focus from Chrome!
+        if (explicitRequest)
+        {
+            if (Enabled && (!Visible || WindowState == FormWindowState.Minimized || Form.ActiveForm != this))
+                ShowFromTray(activate: true);
+        }
+        else if (Enabled && !Visible)
+        {
+            ShowFromTray(activate: false);
+        }
     });
 
-    internal void ShowFromTray()
+    protected override bool ShowWithoutActivation => !_activateOnShow;
+    private bool _activateOnShow = true;
+
+    internal void ShowFromTray() => ShowFromTray(activate: true);
+
+    internal void ShowFromTray(bool activate)
     {
         _allowVisible = true;
-        Show();
-        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-        Activate();
+        _activateOnShow = activate;
+        try
+        {
+            Show();
+            if (activate)
+            {
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Activate();
+            }
+        }
+        finally
+        {
+            _activateOnShow = true;
+        }
     }
 
     private bool HasActiveDownloads() => _hasActiveDownloads();
@@ -1492,7 +1516,8 @@ public partial class Form1 : Form
                 MediaProvider: media.Provider, MediaId: media.MediaId,
                 MediaQuality: media.Quality, MediaThumbnailUrl: media.ThumbnailUrl,
                 MediaExpiresAt: media.ExpiresAt, MediaPlanJson: media.MediaPlanJson, MediaFormatId: media.FormatId,
-                Output: media.Output, MediaMetadataJson: media.MediaMetadataJson, Secrets: media.Secrets));
+                Output: media.Output, MediaMetadataJson: media.MediaMetadataJson, Secrets: media.Secrets,
+                HostCookies: media.HostCookies, OriginHeader: media.OriginHeader));
             Record(result, media.Url);
         }
         foreach (string url in dialog.DownloadUrls)

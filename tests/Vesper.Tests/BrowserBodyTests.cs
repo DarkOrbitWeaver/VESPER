@@ -30,7 +30,7 @@ public sealed class BrowserBodyTests
     public void ProtocolRejectsPathsCredentialsOversizedAndMalformedChunks()
     {
         const string begin = """
-            {"v":1,"id":"test-request","type":"browser-body","operation":"begin","transferId":"copy-123456",
+            {"v":2,"id":"test-request","type":"browser-body","operation":"begin","transferId":"copy-123456",
              "origin":"https://example.test/","fileName":"clip.mp4","length":123}
             """;
         Assert.True(BridgeProtocol.TryParse(begin, out var request, out var error), error);
@@ -41,12 +41,33 @@ public sealed class BrowserBodyTests
         Assert.True(BridgeProtocol.TryParse(begin.Replace("123}", "1073741825}"), out _, out _));
         Assert.False(BridgeProtocol.TryParse(begin.Replace("123}", "17179869185}"), out _, out _));
         byte[] bytes = [1, 2, 3];
-        string append = JsonSerializer.Serialize(new { v = 1, id = "test-request", type = "browser-body", operation = "append",
+        string append = JsonSerializer.Serialize(new { v = BridgeProtocol.Version, id = "test-request", type = "browser-body", operation = "append",
             transferId = Transfer, offset = 0, chunk = Convert.ToBase64String(bytes), digest = Hash(bytes) });
         Assert.True(BridgeProtocol.TryParse(append, out request, out error), error);
         Assert.Equal(bytes, request.BrowserBody!.Bytes);
         Assert.False(BridgeProtocol.TryParse(append.Replace("AQID", "!!!!"), out _, out _));
         Assert.False(BridgeProtocol.TryParse(append.Replace("\"offset\":0", "\"offset\":-1"), out _, out _));
+    }
+
+    [Fact]
+    public async Task BrowserTracksAreLengthCheckedAndRemuxedFromStaging()
+    {
+        using var h = new Harness();
+        byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
+        byte[] video = Fixture("video-only.mp4");
+        byte[] audio = [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
+        var opened = await Send(h, new("begin", Transfer, Origin, "clip.mp4", null,
+            Tracks: [new("video", "mp4", video.Length), new("audio", "m4a", audio.Length)], OutputContainer: "mp4"));
+        Assert.True(opened.Ok, opened.Message);
+        Assert.False((await Send(h, Append(0, audio) with { TrackIndex = 1 })).Ok);
+        Assert.True((await Send(h, Append(0, video))).Ok);
+        Assert.False((await Send(h, Finish())).Ok);
+        Assert.True((await Send(h, Append(video.Length, audio) with { TrackIndex = 1 })).Ok);
+        var completed = await h.WaitForStateAsync(AcceptedId(await Send(h, Finish())), JobState.Completed);
+        Assert.Equal(JobKind.Merge, completed.Kind);
+        Assert.EndsWith(".mp4", completed.FinalPath);
+        using var staged = PartialFile.Open(completed.FinalPath!, create: false);
+        MediaTrackProbe.RequireMp4Media(staged, default);
     }
 
     [Fact]
@@ -174,7 +195,9 @@ public sealed class BrowserBodyTests
         using var h = new Harness();
         Assert.True((await Send(h, Begin(100))).Ok);
         Assert.True((await Send(h, Append(0, [1, 2, 3]))).Ok);
-        Assert.False((await Send(h, Begin(100) with { TransferId = "other-copy-12345" })).Ok);
+        for (int i = 1; i < BrowserBodyReceiver.MaxConcurrentTransfers; i++)
+            Assert.True((await Send(h, Begin(100) with { TransferId = $"other-copy-{i:00000}" })).Ok);
+        Assert.Equal("busy", (await Send(h, Begin(100) with { TransferId = "other-copy-extra" })).Code);
         h.Restart();
         Assert.Empty(h.Engine.Snapshots());
         Assert.Empty(Directory.GetFiles(h.Data, "browser-body-*.tmp"));
@@ -214,15 +237,15 @@ public sealed class BrowserBodyTests
             return JsonSerializer.Deserialize<BridgeResponse>(raw, BridgeProtocol.Json)!;
         }
         byte[] bytes = Payloads.Make(300_000, 88);
-        Assert.True((await Request(new { v = 1, id = "body-pipe-begin", type = "browser-body",
+        Assert.True((await Request(new { v = BridgeProtocol.Version, id = "body-pipe-begin", type = "browser-body",
             operation = "begin", transferId = Transfer, origin = Origin, fileName = "pipe.mp4", length = bytes.Length })).Ok);
         for (int offset = 0; offset < bytes.Length; offset += BrowserBodyReceiver.ChunkBytes)
         {
             byte[] part = bytes.AsSpan(offset, Math.Min(BrowserBodyReceiver.ChunkBytes, bytes.Length - offset)).ToArray();
-            Assert.True((await Request(new { v = 1, id = "body-pipe-append", type = "browser-body",
+            Assert.True((await Request(new { v = BridgeProtocol.Version, id = "body-pipe-append", type = "browser-body",
                 operation = "append", transferId = Transfer, offset, chunk = Convert.ToBase64String(part), digest = Hash(part) })).Ok);
         }
-        Guid id = AcceptedId(await Request(new { v = 1, id = "body-pipe-finish", type = "browser-body",
+        Guid id = AcceptedId(await Request(new { v = BridgeProtocol.Version, id = "body-pipe-finish", type = "browser-body",
             operation = "finish", transferId = Transfer }));
         JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
         Assert.Equal(bytes, await File.ReadAllBytesAsync(saved.FinalPath!));
@@ -244,7 +267,7 @@ public sealed class BrowserBodyTests
             string raw = await BridgePipe.ExchangeAsync(stream, JsonSerializer.Serialize(frame), TimeSpan.FromSeconds(10), default);
             return JsonSerializer.Deserialize<BridgeResponse>(raw, BridgeProtocol.Json)!;
         }
-        object Start(string id, long length) => new { v = 1, id = "session-begin", type = "browser-body",
+        object Start(string id, long length) => new { v = BridgeProtocol.Version, id = "session-begin", type = "browser-body",
             operation = "begin", transferId = id, session = true, origin = Origin, fileName = "session.mp4", length };
         Assert.True((await Exchange(abandoned, Start("abandoned-session-01", 1000))).Ok);
         await abandoned.DisposeAsync();
@@ -268,11 +291,11 @@ public sealed class BrowserBodyTests
         for (int offset = 0; offset < bytes.Length; offset += BrowserBodyReceiver.ChunkBytes)
         {
             byte[] part = bytes.AsSpan(offset, Math.Min(BrowserBodyReceiver.ChunkBytes, bytes.Length - offset)).ToArray();
-            Assert.True((await Exchange(client, new { v = 1, id = "session-append", type = "browser-body",
+            Assert.True((await Exchange(client, new { v = BridgeProtocol.Version, id = "session-append", type = "browser-body",
                 operation = "append", transferId = Transfer, session = true, offset,
                 chunk = Convert.ToBase64String(part), digest = Hash(part) })).Ok);
         }
-        Guid id = AcceptedId(await Exchange(client, new { v = 1, id = "session-finish", type = "browser-body",
+        Guid id = AcceptedId(await Exchange(client, new { v = BridgeProtocol.Version, id = "session-finish", type = "browser-body",
             operation = "finish", transferId = Transfer, session = true }));
         JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Completed);
         elapsed.Stop();
@@ -293,9 +316,9 @@ public sealed class BrowserBodyTests
         async Task<BridgeResponse> Exchange(object frame) => JsonSerializer.Deserialize<BridgeResponse>(
             await BridgePipe.ExchangeAsync(client, JsonSerializer.Serialize(frame), TimeSpan.FromSeconds(5), default),
             BridgeProtocol.Json)!;
-        Assert.True((await Exchange(new { v=1, id="test-begin", type="browser-body", operation="begin",
+        Assert.True((await Exchange(new { v = BridgeProtocol.Version, id="test-begin", type="browser-body", operation="begin",
             transferId=Transfer, session=true, origin=Origin, fileName="a.mp4", length=12 })).Ok);
-        Assert.False((await Exchange(new { v=1, id="test-finish", type="browser-body", operation="finish",
+        Assert.False((await Exchange(new { v = BridgeProtocol.Version, id="test-finish", type="browser-body", operation="finish",
             transferId="other-session-123", session=true })).Ok);
         for (int i = 0; i < 100 && Directory.GetFiles(h.Data, "browser-body-*.tmp").Length != 0; i++)
             await Task.Delay(10);

@@ -11,7 +11,7 @@ public sealed class BrowserDownloadTests
     public void ActivityCarriesOnlyBoundedDisplayFactsAndRejectsForeignIds()
     {
         const string sample = """
-            {"v":1,"id":"sample-command","type":"browser-activity","operation":"watch","profile":"demo-profile",
+            {"v":2,"id":"sample-command","type":"browser-activity","operation":"watch","profile":"demo-profile",
              "files":[{"id":"c-demo-profile-7-abc","name":"leaf.zip","received":128,"length":256,"start":1760000000000,
                        "paused":true,"canResume":true}]}
             """;
@@ -28,7 +28,7 @@ public sealed class BrowserDownloadTests
     public void ManagedActivityRequiresObservedHostsAndMarksTheOriginalTransferReadOnly()
     {
         const string sample = """
-            {"v":1,"id":"managed-connect-1","type":"browser-managed","operation":"connect","profile":"demo-profile",
+            {"v":2,"id":"managed-connect-1","type":"browser-managed","operation":"connect","profile":"demo-profile",
              "files":[{"id":"c-demo-profile-7-abc","name":"leaf.zip","received":128,"length":256,
                        "start":1760000000000,"hosts":["WWW.EXAMPLE.COM","www.example.com"]}]}
             """;
@@ -47,7 +47,7 @@ public sealed class BrowserDownloadTests
     public void ManagedCompletionRequiresAProfileBoundReceiptAndObservedHost()
     {
         const string sample = """
-            {"v":1,"id":"managed-complete-1","type":"browser-managed","operation":"complete",
+            {"v":2,"id":"managed-complete-1","type":"browser-managed","operation":"complete",
              "profile":"demo-profile","downloadId":"c-demo-profile-7-abc","path":"C:\\Users\\person\\Downloads\\VESPER\\leaf.zip",
              "length":256,"hosts":["example.com"]}
             """;

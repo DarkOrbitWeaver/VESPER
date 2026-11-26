@@ -79,6 +79,11 @@ internal sealed class GenericAdapter : IMediaSourceAdapter
                 {
                     meta = PageScanner.Scan(resp.Content, resp.FinalUrl, _svc.Options.MaxCandidatesPerPage);
                     candidates.AddRange(meta.Candidates);
+                    if (candidates.Count == 0 && _svc.Options.LocalSemanticEndpoint is not null)
+                    {
+                        var synthesized = await SemanticPageSynthesizer.TrySynthesizeAsync(resp.Content, resp.FinalUrl, _svc.Options, ct).ConfigureAwait(false);
+                        candidates.AddRange(synthesized);
+                    }
                     request.Publish(new DiscoveryProgress(meta.Title, meta.Thumbnail));
                 }
             }

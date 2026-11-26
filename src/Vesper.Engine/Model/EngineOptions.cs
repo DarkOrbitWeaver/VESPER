@@ -61,7 +61,8 @@ public sealed class EngineOptions
     public string? ProxyAddress { get; init; }
     internal Func<string, CancellationToken, Task<IPAddress[]>>? ResolveHost { get; init; }
     public OriginCooldown Cooldown { get; } = new();
-    // Opt-in protocol experiment only. Production remains on the verified H1 transport.
+    /// <summary>Smart HTTP/2 + HTTP/1.1 multiplexing with automatic per-CDN fallback and multi-connection scaling.</summary>
+    public bool EnableAdaptiveHttp2 { get; init; }
     internal bool Http2Experiment { get; init; }
 
     public RetryOptions Retry { get; init; } = new();
@@ -74,8 +75,8 @@ public sealed class EngineOptions
     public TimeSpan CheckpointInterval { get; init; } = TimeSpan.FromSeconds(2);
 
     public long MinSegmentedSize { get; init; } = 4L * 1024 * 1024;
-    public long MinSplitBytes { get; init; } = 2L * 1024 * 1024;
-    public TimeSpan RampInterval { get; init; } = TimeSpan.FromMilliseconds(1500);
+    public long MinSplitBytes { get; init; } = 1L * 1024 * 1024;
+    public TimeSpan RampInterval { get; init; } = TimeSpan.FromMilliseconds(850);
     public long FreeSpaceReserve { get; init; } = 64L * 1024 * 1024;
     public TimeSpan ProgressInterval { get; init; } = TimeSpan.FromMilliseconds(200);
 

@@ -22,7 +22,9 @@ internal sealed record MediaDownloadChoice(
     int EmbeddedSubtitleCount = 0, string? SubtitleNotice = null,
     [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? Secrets = null,
     [property: System.Text.Json.Serialization.JsonIgnore] bool CanUseFullFileClip = false,
-    [property: System.Text.Json.Serialization.JsonIgnore] bool IsSubtitle = false)
+    [property: System.Text.Json.Serialization.JsonIgnore] bool IsSubtitle = false,
+    [property: System.Text.Json.Serialization.JsonIgnore] IReadOnlyDictionary<string, string>? HostCookies = null,
+    [property: System.Text.Json.Serialization.JsonIgnore] string? OriginHeader = null)
 {
     public string DisplayContainer => Output switch
     {
@@ -35,10 +37,10 @@ internal sealed record MediaDownloadChoice(
     };
     public string DisplayDetail => Output switch
     {
-        MediaOutput.Opus => "Opus · copied without re-encoding",
-        MediaOutput.Wav => "WAV · decoded PCM (does not improve source quality)",
-        MediaOutput.Mp3 => $"MP3 · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
-        MediaOutput.M4a => $"M4A · re-encoded from {ConvertedAudioCodec} (can't exceed the source quality)",
+        MediaOutput.Opus => "Opus · Original audio stream",
+        MediaOutput.Wav => "WAV · Uncompressed PCM",
+        MediaOutput.Mp3 => "MP3 · Universal compatibility",
+        MediaOutput.M4a => "M4A · High compatibility",
         MediaOutput.Mp4 => $"MP4 · {ConvertedVideoQuality}H.264 + AAC",
         _ => MediaTransferBridge.DisplayQuality(Quality ?? "Available source")
     };
@@ -69,27 +71,20 @@ internal static class MediaTransferBridge
         && CanCarryContext(r.Context)
         && (r.Requirements & (ProcessingRequirement.MuxAudioVideo | ProcessingRequirement.ExtractAudio)) == 0;
 
-    private static bool CanCarryContext(MediaRequestContext context) =>
-        context.SensitiveHeaders.All(h => h.Key == "Authorization")
-        && context.Origin is null && context.AcceptLanguage is null;
+    private static bool CanCarryContext(MediaRequestContext context) => context.SupportsNativeTransfer;
 
-    // Only this destination's allowed credentials enter the engine. Its redirect walker narrows
-    // them further to the initial origin; secrets never enter a plan, database or recovery manifest.
-    private static IReadOnlyDictionary<string, string>? TransferSecrets(MediaRequestContext context, Uri target)
-    {
-        if (!context.MayForwardCredentialsTo(target)) return null;
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (context.CookieHeader is { } cookie) headers["Cookie"] = cookie;
-        foreach (var header in context.SensitiveHeaders) headers[header.Key] = header.Value;
-        return headers.Count == 0 ? null : headers;
-    }
+    private static IReadOnlyDictionary<string, string>? TransferSecrets(MediaRequestContext context, Uri target) =>
+        context.PrimaryCredentialsFor(target);
 
-    private static bool SameSecretHeaders(IReadOnlyDictionary<string, string>? first, IReadOnlyDictionary<string, string>? second)
+    private static IReadOnlyDictionary<string, string>? TransferHostCookies(IEnumerable<MediaRepresentation> tracks)
     {
-        if ((first?.Count ?? 0) != (second?.Count ?? 0)) return false;
-        if (first is null) return true;
-        return first.All(pair => second!.TryGetValue(pair.Key, out string? value)
-            && string.Equals(value, pair.Value, StringComparison.Ordinal));
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (MediaRepresentation track in tracks)
+        {
+            foreach (var kv in track.Context.HostCookies)
+                if (!string.IsNullOrEmpty(kv.Value)) map.TryAdd(kv.Key, kv.Value);
+        }
+        return map.Count == 0 ? null : map;
     }
 
     internal static MediaItem PlayableOnly(MediaItem item)
@@ -447,6 +442,7 @@ internal static class MediaTransferBridge
         // Audio with provider byte identity goes through the native job: bounded range requests, container validation,
         // a clean non-fragmented M4A/WebM output and identity-checked continuation after a link refresh.
         if (selection.Video is null && selection.Audio is { ContentIdentity: not null } only
+            && (prefs.Mode == QualityMode.AudioOnly || exact?.HasAudio == true || !item.Representations.Any(track => track.HasVideo))
             && MergeCapability.AudioContainer(only) is { } audioContainer
             && (!directAacClip || CanClipLocalMp4Tracks([only], audioContainer)))
             return BuildMerge(item, selection, plan, [only], audioContainer, clipStartSeconds, clipEndSeconds,
@@ -534,7 +530,9 @@ internal static class MediaTransferBridge
                     ? SerializeAudioMetadata(item) : null,
             CanUseFullFileClip: clipStartSeconds is null && step.Protocol == StreamProtocol.Http
                 && (silentWebm || directAacClip || selection.Video is { } localClipVideo && selection.Audio is null
-                    && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer))), null);
+                    && CanClipLocalMp4Tracks([localClipVideo], step.Container ?? selection.OutputContainer)),
+            HostCookies: TransferHostCookies(selection.Streams),
+            OriginHeader: step.Context.Origin), null);
     }
 
     /// <summary>Builds the engine's merge plan. Every track shares one request context; no credentials are persisted.</summary>
@@ -556,16 +554,21 @@ internal static class MediaTransferBridge
             return (null, LocalMp4ClipSubtitleError);
         MediaRequestContext ctx = tracks[0].Context;
         if (tracks.Any(t => !CanCarryContext(t.Context)
-            || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer
-            || t.Context.CookieHeader != ctx.CookieHeader
+            || t.Context.UserAgent != ctx.UserAgent || t.Context.Referer != ctx.Referer || t.Context.Origin != ctx.Origin
             || !t.Context.SensitiveHeaders.OrderBy(h => h.Key).SequenceEqual(ctx.SensitiveHeaders.OrderBy(h => h.Key))))
-            return (null, "These streams need different request contexts, which a single merge job cannot carry.");
+            return (null, "These streams need incompatible request contexts.");
 
+        IReadOnlyDictionary<string, string>? hostCookies = TransferHostCookies(tracks);
+        bool sameTrackOrigin = tracks.All(track => UrlPolicy.IsSameOrigin(tracks[0].Url, track.Url));
         IReadOnlyDictionary<string, string>? secrets = TransferSecrets(ctx, tracks[0].Url);
-        if (tracks.Any(track => !SameSecretHeaders(secrets, TransferSecrets(track.Context, track.Url))))
-            return (null, "These streams need different credential headers, which a single merge job cannot carry.");
-        if (secrets is not null && tracks.Any(track => !UrlPolicy.IsSameOrigin(tracks[0].Url, track.Url)))
-            return (null, "Credentialed merge tracks must share one exact origin.");
+        foreach (MediaRepresentation track in tracks.Skip(1))
+        {
+            var trackSecrets = TransferSecrets(track.Context, track.Url);
+            if (!sameTrackOrigin ? secrets is not null || trackSecrets is not null
+                : (secrets?.Count ?? 0) != (trackSecrets?.Count ?? 0)
+                  || secrets is not null && secrets.Any(pair => trackSecrets!.GetValueOrDefault(pair.Key) != pair.Value))
+                return (null, "These streams need incompatible primary credentials.");
+        }
         if (tracks.Any(t => t.Container is null || t.Protocol == StreamProtocol.Http && t.FileSize is not > 0
             || t.Protocol == StreamProtocol.Hls && t.Container is not ("mp4" or "m4a" or "ts")
             || t.Protocol == StreamProtocol.Dash && t.Segments is not { IsFragmentedMp4: true, InitializationUrl: not null, HasDiscontinuities: false }
@@ -646,7 +649,9 @@ internal static class MediaTransferBridge
             SubtitleNotice: SubtitleNotice(embedSubtitles, subtitles.Length, embeddedSubtitles.Length,
                 subtitleLimitReached, unsupportedSubtitleCount),
             Secrets: secrets,
-            CanUseFullFileClip: clipStartSeconds is null && CanClipLocalMp4Tracks(tracks, container)), null);
+            CanUseFullFileClip: clipStartSeconds is null && CanClipLocalMp4Tracks(tracks, container),
+            HostCookies: hostCookies,
+            OriginHeader: ctx.Origin), null);
     }
 
     private static MediaMergeMetadata? MergeMetadata(MediaItem item, bool includeChapters)
@@ -816,6 +821,8 @@ internal static class MediaTransferBridge
                 expanded.Add(choice with
                 {
                     Secrets = null, // A subtitle URL must never inherit the media origin's credentials.
+                    HostCookies = null,
+                    OriginHeader = null,
                     Url = subtitle.Url.AbsoluteUri,
                     FileName = fileName,
                     Kind = segmented ? JobKind.Hls : JobKind.Http,

@@ -18,9 +18,15 @@ public sealed record RequestSpec(
     string? UserAgent = null,
     IReadOnlyDictionary<string, string>? Secrets = null,
     string? CredentialOrigin = null,
-    string? ExpectedResourceIdentity = null);
+    string? ExpectedResourceIdentity = null,
+    IReadOnlyDictionary<string, string>? HostCookies = null,
+    string? OriginHeader = null);
 
-internal sealed record RequestCredentials(Uri Origin, IReadOnlyDictionary<string, string> Headers);
+internal sealed record RequestCredentials(
+    Uri Origin,
+    IReadOnlyDictionary<string, string> Headers,
+    IReadOnlyDictionary<string, string>? HostCookies = null,
+    string? OriginHeader = null);
 
 public sealed class RedirectException(string message) : Exception(message);
 
@@ -46,6 +52,7 @@ internal sealed class HttpTransport : IDisposable
     private readonly bool _validateProxyDns;
     private readonly string? _proxyError;
     private readonly StreamAdmission _streams = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _http1OnlyHosts = new(StringComparer.OrdinalIgnoreCase);
 
     public HttpTransport(EngineOptions options)
     {
@@ -55,9 +62,13 @@ internal sealed class HttpTransport : IDisposable
             AllowAutoRedirect = false,
             AutomaticDecompression = DecompressionMethods.None,   // stored bytes must stay stored bytes
             UseCookies = false,
+            EnableMultipleHttp2Connections = true,
+            KeepAlivePingDelay = TimeSpan.FromSeconds(25),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(10),
+            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.WithActiveRequests,
             ConnectTimeout = options.ConnectTimeout,
-            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-            PooledConnectionIdleTimeout = TimeSpan.FromSeconds(30),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(8),
+            PooledConnectionIdleTimeout = TimeSpan.FromSeconds(75),
             MaxConnectionsPerServer = Math.Max(options.MaxConnectionsPerHost, 1)
         };
 
@@ -149,7 +160,9 @@ internal sealed class HttpTransport : IDisposable
             // HTTP/2 multiplexes streams on one physical connection. A socket limit
             // is therefore not a request limit. Retain admission until disposal of
             // the response body, including on redirects and failed requests.
-            IDisposable? lease = _options.Http2Experiment
+            bool useHttp2 = (_options.EnableAdaptiveHttp2 || _options.Http2Experiment)
+                && !_http1OnlyHosts.ContainsKey(current.IdnHost);
+            IDisposable? lease = useHttp2
                 ? await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false)
                 : null;
             HttpResponseMessage response;
@@ -209,33 +222,55 @@ internal sealed class HttpTransport : IDisposable
         {
             return await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token).ConfigureAwait(false);
         }
+        catch (HttpProtocolException) when (request.Version >= HttpVersion.Version20 && request.RequestUri is { } targetUri)
+        {
+            // CDN / middlebox rejected HTTP/2 stream framing: remember host as HTTP/1.1 and retry immediately on H1.1
+            _http1OnlyHosts[targetUri.IdnHost] = 1;
+            using var fallbackRequest = CloneAsHttp11(request);
+            return await _client.SendAsync(fallbackRequest, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token).ConfigureAwait(false);
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new TransientNetworkException("The server took too long to respond.");
         }
     }
 
+    private static HttpRequestMessage CloneAsHttp11(HttpRequestMessage original)
+    {
+        var clone = new HttpRequestMessage(original.Method, original.RequestUri)
+        {
+            Version = HttpVersion.Version11,
+            VersionPolicy = HttpVersionPolicy.RequestVersionOrLower
+        };
+        foreach (var header in original.Headers)
+            clone.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        return clone;
+    }
+
     private HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameRequestOrigin, bool sameCredentialOrigin)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, url);
-        if (_options.Http2Experiment && url.Scheme == Uri.UriSchemeHttps)
+        bool allowH2 = (_options.EnableAdaptiveHttp2 || _options.Http2Experiment) && !_http1OnlyHosts.ContainsKey(url.IdnHost);
+        if (allowH2 && url.Scheme == Uri.UriSchemeHttps)
         {
             request.Version = HttpVersion.Version20;
             request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
         }
-        else if (_options.Http2Experiment && _options.AllowPrivateNetworks && url.IsLoopback)
+        else if (allowH2 && _options.Http2Experiment && _options.AllowPrivateNetworks && url.IsLoopback)
         {
-            // Prior-knowledge h2c is restricted to explicitly allowed loopback fixtures.
             request.Version = HttpVersion.Version20;
             request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
         }
         request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
         request.Headers.TryAddWithoutValidation("User-Agent", string.IsNullOrWhiteSpace(spec.UserAgent) ? DefaultUserAgent : spec.UserAgent);
-        // Page URLs can carry tokens. Keep the full referrer on the source origin only.
-        if (sameRequestOrigin && Uri.TryCreate(spec.Referer, UriKind.Absolute, out Uri? referer)
-            && referer.Scheme is "http" or "https")
+        if (sameRequestOrigin && spec.OriginHeader is not null && url.Scheme == Uri.UriSchemeHttps)
+            request.Headers.TryAddWithoutValidation("Origin", spec.OriginHeader);
+
+        if (Uri.TryCreate(spec.Referer, UriKind.Absolute, out Uri? referer)
+            && referer.Scheme is "http" or "https"
+            && !(referer.Scheme == Uri.UriSchemeHttps && url.Scheme != Uri.UriSchemeHttps))
         {
-            request.Headers.Referrer = sameCredentialOrigin && UrlPolicy.IsSameOrigin(referer, url)
+            request.Headers.Referrer = sameRequestOrigin && sameCredentialOrigin && UrlPolicy.IsSameOrigin(referer, url)
                 ? referer
                 : new UriBuilder(referer) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
         }
@@ -250,10 +285,17 @@ internal sealed class HttpTransport : IDisposable
                 request.Headers.IfRange = new RangeConditionHeaderValue(date);
         }
 
+        bool attachedHostCookie = url.Scheme == Uri.UriSchemeHttps
+            && spec.HostCookies?.TryGetValue(url.GetLeftPart(UriPartial.Path), out _) == true;
+        if (attachedHostCookie)
+            request.Headers.TryAddWithoutValidation("Cookie", spec.HostCookies![url.GetLeftPart(UriPartial.Path)]);
         if (sameCredentialOrigin && spec.Secrets is not null)
         {
             foreach ((string name, string value) in spec.Secrets)
+            {
+                if (name == "Cookie" && attachedHostCookie) continue;
                 if (name is "Cookie" or "Authorization") request.Headers.TryAddWithoutValidation(name, value);
+            }
         }
         return request;
     }

@@ -300,7 +300,8 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             RequestCredentials? credentials = useStoredCredentials ? engine.CredentialsFor(Job.Id) : refreshCredentials;
             using var response = await http.SendAsync(uri, new RequestSpec(part.Offset, end, Referer: Job.Referer,
                 UserAgent: Job.UserAgent, Secrets: credentials?.Headers,
-                CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl), ct).ConfigureAwait(false);
+                CredentialOrigin: credentials?.Origin.AbsoluteUri ?? Job.SourceUrl,
+                HostCookies: credentials?.HostCookies, OriginHeader: credentials?.OriginHeader), ct).ConfigureAwait(false);
             int status = (int)response.StatusCode;
             if (status is not (200 or 206)) throw new RunnerStop(status switch
             {

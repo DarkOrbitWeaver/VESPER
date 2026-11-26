@@ -1,0 +1,56 @@
+{
+  "schema": "vesper.extractor-pack/1",
+  "version": 1,
+  "publishedAt": "2026-04-01T00:00:00Z",
+  "rules": [
+    {
+      "id": "streamable",
+      "name": "Streamable",
+      "domains": ["streamable.com"],
+      "urlPattern": "^/(?:e/|o/)?(?<id>[a-z0-9]{4,16})(?:[/?#]|$)",
+      "apiTemplates": ["https://api.streamable.com/videos/{id}"],
+      "titleJsonPaths": ["title"],
+      "streamJsonPaths": ["files.mp4.url", "files.mp4-mobile.url"],
+      "htmlStreamRegexes": ["https://cdn-[a-z0-9-]+\\.streamable\\.com/video/mp4/[^\"'\\s<>]+"]
+    },
+    {
+      "id": "loom",
+      "name": "Loom",
+      "domains": ["loom.com"],
+      "urlPattern": "^/(?:share|embed)/(?<id>[a-f0-9]{24,40})(?:[/?#]|$)",
+      "titleJsonPaths": ["video.name"],
+      "manifestJsonPaths": ["hls.url"],
+      "streamJsonPaths": ["url"],
+      "htmlStreamRegexes": ["https://cdn\\.loom\\.com/sessions/[^\"'\\s<>]+\\.(?:mp4|m3u8)(?:\\?[^\"'\\s<>]*)?"]
+    },
+    {
+      "id": "cloudflare-stream",
+      "name": "Cloudflare Stream",
+      "domains": ["cloudflarestream.com", "videodelivery.net"],
+      "urlPattern": "^/(?<id>[a-f0-9]{32})(?:[/?#]|$)",
+      "apiTemplates": ["https://videodelivery.net/{id}/manifest/video.m3u8"],
+      "htmlStreamRegexes": ["https://[a-z0-9.-]*(?:cloudflarestream\\.com|videodelivery\\.net)/[a-f0-9]{32}/manifest/video\\.(?:m3u8|mpd)"]
+    },
+    {
+      "id": "mux-stream",
+      "name": "Mux Player",
+      "domains": ["stream.mux.com", "player.mux.com"],
+      "urlPattern": "^/(?<id>[A-Za-z0-9]{16,64})(?:\\.(?:m3u8|mp4))?(?:[/?#]|$)",
+      "htmlStreamRegexes": ["https://stream\\.mux\\.com/[A-Za-z0-9]+\\.m3u8(?:\\?[^\"'\\s<>]*)?"]
+    },
+    {
+      "id": "rumble",
+      "name": "Rumble",
+      "domains": ["rumble.com"],
+      "urlPattern": "^/(?:embed/)?(?<id>v[a-z0-9]+)[-_./]?",
+      "htmlStreamRegexes": ["https://[a-z0-9.-]+\\.rumble\\.cloud/video/[^\"'\\s<>]+\\.(?:mp4|m3u8)(?:\\?[^\"'\\s<>]*)?"]
+    },
+    {
+      "id": "twitch-clips",
+      "name": "Twitch Clips",
+      "domains": ["clips.twitch.tv", "twitch.tv"],
+      "urlPattern": "(?:^/(?<id>[A-Za-z0-9_-]{12,64})$|/clip/(?<id>[A-Za-z0-9_-]{12,64}))",
+      "htmlStreamRegexes": ["https://[a-z0-9.-]*twitchcdn\\.net/[^\"'\\s<>]+\\.mp4(?:\\?[^\"'\\s<>]*)?"]
+    }
+  ]
+}

@@ -1,9 +1,26 @@
+using System.Text.Json;
+
 namespace Vesper.Engine;
 
-/// <summary>Commands for the opt-in browser-byte receiver. No browser-provided paths or credentials.</summary>
-public sealed record BrowserBodyRequest(string Operation, string TransferId, string? Origin = null,
-    string? FileName = null, long? Length = null, long? Offset = null, byte[]? Bytes = null, string? Digest = null,
-    bool Session = false, bool VerifyMp4 = false, bool Automatic = true);
+public sealed record BrowserBodyTrackSpec(string Role, string Container, long? Length = null, string? Codec = null, string? Language = null);
+
+/// <summary>Commands for the browser-byte receiver, supporting single-stream, unknown-length streaming, and dual-track native remuxing.</summary>
+public sealed record BrowserBodyRequest(
+    string Operation,
+    string TransferId,
+    string? Origin = null,
+    string? FileName = null,
+    long? Length = null,
+    long? Offset = null,
+    byte[]? Bytes = null,
+    string? Digest = null,
+    bool Session = false,
+    bool VerifyMp4 = false,
+    bool Automatic = true,
+    int TrackIndex = 0,
+    IReadOnlyList<BrowserBodyTrackSpec>? Tracks = null,
+    string? PageUrl = null,
+    string? OutputContainer = null);
 
 public sealed partial class DownloadEngine
 {
@@ -21,14 +38,14 @@ public sealed partial class DownloadEngine
         {
             if (_disposed) return BridgeResponse.Fail(requestId, "closed", "VESPER is closing.");
             if (_store.TryGetSubmission(BrowserBodySubmission + request.TransferId, out Guid id)
-                && _jobs.TryGetValue(id, out DownloadJob? accepted) && accepted.Kind == JobKind.BrowserStream)
+                && _jobs.TryGetValue(id, out DownloadJob? accepted)
+                && accepted.Kind is JobKind.BrowserStream or JobKind.Merge)
             {
                 if (request.Operation == "status" && !string.Equals(request.Origin, accepted.SourceUrl, StringComparison.Ordinal))
                     return BridgeResponse.Fail(requestId, "missing", "No matching browser receipt.");
                 return BridgeResponse.Success(requestId, data: new { accepted = true, jobId = id, offset = accepted.TotalBytes,
                     state = accepted.State.ToString() });
             }
-            // Status is read-only and cannot open a receiver or restart a transfer.
             if (request.Operation == "status")
                 return BridgeResponse.Fail(requestId, "missing", "No durable browser receipt was found.");
             receiver = _browserBodies ??= new BrowserBodyReceiver(Options.DataDirectory, BrowserBodyDestination);
@@ -37,14 +54,16 @@ public sealed partial class DownloadEngine
         BrowserBodyReceiver.Reply reply;
         switch (request.Operation)
         {
-            case "begin" when request.Origin is not null && request.FileName is not null && request.Length is long length:
-                reply = await receiver.BeginAsync(request.TransferId, request.Origin, request.FileName, length, ct, request.Session, request.VerifyMp4)
+            case "begin" when request.Origin is not null && request.FileName is not null:
+                reply = await receiver.BeginAsync(
+                    request.TransferId, request.Origin, request.FileName, request.Length, ct,
+                    request.Session, request.VerifyMp4, request.Tracks, request.PageUrl, request.OutputContainer)
                     .ConfigureAwait(false);
                 if (reply.Code == "storage")
                     return BridgeResponse.Fail(requestId, "storage", "Not enough free space for the browser file, or its folder is unavailable.");
                 break;
             case "append" when request.Offset is long offset && request.Bytes is not null && request.Digest is not null:
-                reply = await receiver.AppendAsync(request.TransferId, offset, request.Bytes, request.Digest, ct).ConfigureAwait(false);
+                reply = await receiver.AppendAsync(request.TransferId, offset, request.Bytes, request.Digest, ct, request.TrackIndex).ConfigureAwait(false);
                 break;
             case "finish":
                 reply = await receiver.FinishAsync(request.TransferId,
@@ -57,15 +76,13 @@ public sealed partial class DownloadEngine
                 return BridgeResponse.Fail(requestId, "invalid", "Invalid browser transfer operation.");
         }
         if (reply.Code == "invalid-media")
-            return BridgeResponse.Fail(requestId, reply.Code, "The browser returned an invalid or incomplete MP4. No file was accepted.");
+            return BridgeResponse.Fail(requestId, reply.Code, "The browser returned an invalid or incomplete media container. No file was accepted.");
         if (!reply.Ok)
-            return BridgeResponse.Fail(requestId, reply.Code, "The browser copy could not be accepted. No completed file was claimed.");
+            return BridgeResponse.Fail(requestId, reply.Code, "The browser stream could not be accepted. No completed file was claimed.");
         return BridgeResponse.Success(requestId, data: new { offset = reply.Offset, accepted = reply.JobId is not null, jobId = reply.JobId,
             mediaCheck = request.Operation == "begin" && request.VerifyMp4 ? "mp4" : null });
     }
 
-    // The same destination rules as an ordinary download, checked once before any byte is written.
-    // Bytes land in this folder's staging area, so only one copy of the file ever needs space.
     private string? BrowserBodyDestination(string name, long length)
     {
         string category = FileNames.CategoryFor(FileNames.Sanitize(name));
@@ -82,22 +99,88 @@ public sealed partial class DownloadEngine
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
     }
 
-    // The partial is already complete and hashed. Only a byte-exact copy becomes a durable engine job,
-    // which then verifies the SHA-256 from disk and publishes through the ordinary owned-partial path.
     private AddResult AcceptBrowserBody(string transferId, BrowserBodyReceiver.Transfer body, string digest)
     {
         if (!TryNormalizeSha256(digest, out string expected))
             return new(AddStatus.Invalid, Guid.Empty, "Invalid browser copy integrity proof.");
         string category = FileNames.CategoryFor(body.Name);
         Guid id = Guid.NewGuid();
-        var job = new DownloadJob
+        DownloadJob job;
+
+        if (body.Tracks is { Count: 2 } specs && body.TrackLengths[0] > 0 && body.TrackLengths[1] > 0)
         {
-            Id = id, Kind = JobKind.BrowserStream, SourceUrl = body.Origin, OriginalPageUrl = body.Origin,
-            FileName = body.Name, NameLocked = true, DestinationFolder = body.Folder, PartialPath = body.File.Path,
-            PartialIdentity = body.Identity, TotalBytes = body.Length, ExpectedSha256 = expected,
-            State = JobState.Queued, Category = category, NonResumable = true
-        };
-        job.Extents.Add(new ByteRange(0, body.Length));
+            string outContainer = body.OutputContainer ?? Path.GetExtension(body.Name).TrimStart('.').ToLowerInvariant();
+            if (outContainer is not ("mp4" or "m4a" or "webm" or "mkv")) outContainer = "mp4";
+            string mergedName = Path.ChangeExtension(body.Name, outContainer);
+            var mergeTracks = new List<MergeTrack>(2);
+            for (int i = 0; i < 2; i++)
+            {
+                BrowserBodyTrackSpec spec = specs[i];
+                mergeTracks.Add(new MergeTrack(
+                    spec.Role,
+                    $"browser-track-{i}",
+                    body.Origin,
+                    body.TrackLengths[i],
+                    spec.Container,
+                    spec.Codec,
+                    $"browser-sha256:{expected}:{i}",
+                    spec.Language is { Length: 3 } lang ? lang : null));
+            }
+            var mergePlan = new MediaMergePlan
+            {
+                Version = mergeTracks.Any(t => t.Role == "muxed") ? 3 : 1,
+                Provider = "browser",
+                MediaId = transferId,
+                OutputContainer = outContainer,
+                RequireVideo = mergeTracks.Any(t => t.Role is "video" or "muxed"),
+                RequireAudio = mergeTracks.Any(t => t.Role is "audio" or "muxed"),
+                Tracks = mergeTracks
+            };
+            string cursorState = JsonSerializer.Serialize(new MergeTransfer.Cursor(1, mergePlan.Fingerprint, "download"));
+            job = new DownloadJob
+            {
+                Id = id,
+                Kind = JobKind.Merge,
+                SourceUrl = body.Origin,
+                OriginalPageUrl = body.Origin,
+                MediaProvider = "browser",
+                MediaId = transferId,
+                MediaQuality = "Browser authenticated stream",
+                FileName = mergedName,
+                NameLocked = true,
+                DestinationFolder = body.Folder,
+                PartialPath = body.File.Path,
+                PartialIdentity = body.Identity,
+                TotalBytes = body.Offset,
+                MediaPlanJson = mergePlan.ToJson(),
+                MediaState = cursorState,
+                State = JobState.Queued,
+                Category = FileNames.CategoryFor(mergedName),
+                NonResumable = true
+            };
+        }
+        else
+        {
+            job = new DownloadJob
+            {
+                Id = id,
+                Kind = JobKind.BrowserStream,
+                SourceUrl = body.Origin,
+                OriginalPageUrl = body.Origin,
+                FileName = body.Name,
+                NameLocked = true,
+                DestinationFolder = body.Folder,
+                PartialPath = body.File.Path,
+                PartialIdentity = body.Identity,
+                TotalBytes = body.Offset,
+                ExpectedSha256 = expected,
+                State = JobState.Queued,
+                Category = category,
+                NonResumable = true
+            };
+        }
+
+        job.Extents.Add(new ByteRange(0, body.Offset));
         lock (_lock)
         {
             if (_disposed) return new(AddStatus.Busy, Guid.Empty, "VESPER is closing.");
@@ -110,20 +193,18 @@ public sealed partial class DownloadEngine
             try { SaveLocked(job, submission); }
             catch
             {
-                // The outcome is uncertain: durable state may own this partial, so it is never deleted.
                 body.Claimed = true;
                 throw;
             }
             body.Claimed = true;
             body.File.MarkIdentitySaved();
             WriteManifest(job, body.File.Handle);
-            // Do not expose a queued job while its transfer handle is still held.
             body.File.Dispose();
             _jobs[id] = job;
             Changed(job);
         }
         FlushOutbox();
         ScheduleNext();
-        return new(AddStatus.Added, id, "The browser copy was accepted for verification and publication.");
+        return new(AddStatus.Added, id, "The browser stream was accepted for verification and publication.");
     }
 }

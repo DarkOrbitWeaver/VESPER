@@ -222,12 +222,12 @@ public sealed class BrowserBridgeTests
             using var session = multiplexed ? new NativeTestSession(executable, qaPipe) : null;
             if (session is not null)
             {
-                BridgeResponse opened = await session.SendAsync(new { v = 1, id = "native-session-0001", type = "session-open" }, ct);
+                BridgeResponse opened = await session.SendAsync(new { v = BridgeProtocol.Version, id = "native-session-0001", type = "session-open" }, ct);
                 Assert.True(opened.Ok, opened.Message);
                 Assert.True(Assert.IsType<JsonElement>(opened.Data).GetProperty("mux").GetBoolean());
                 // Multiple frames before any read: responses are correlated by id, not order.
-                await session.WriteAsync(new { v = 1, id = "native-invalid-0001", type = "unknown" }, ct);
-                await session.WriteAsync(new { v = 1, id = "native-invalid-0002", type = "unknown" }, ct);
+                await session.WriteAsync(new { v = BridgeProtocol.Version, id = "native-invalid-0001", type = "unknown" }, ct);
+                await session.WriteAsync(new { v = BridgeProtocol.Version, id = "native-invalid-0002", type = "unknown" }, ct);
                 var invalid = new[] { await session.ReadAsync(ct), await session.ReadAsync(ct) };
                 Assert.All(invalid, reply => Assert.False(reply.Ok));
                 Assert.Equal(new[] { "native-invalid-0001", "native-invalid-0002" }, invalid.Select(reply => reply.Id).Order().ToArray());
@@ -237,7 +237,7 @@ public sealed class BrowserBridgeTests
             const string transferId = "native-fixture-0001";
             BridgeResponse submit = await Send(new
             {
-                v = 1, id = transferId, type = multiplexed ? "browser-capture" : "browser-submit", mode = "download",
+                v = BridgeProtocol.Version, id = transferId, type = multiplexed ? "browser-capture" : "browser-submit", mode = "download",
                 items = new[] { new { url, fileName = "native-fixture.bin", kind = "http" } },
                 browserProof = new { length, etag = "\"native-fixture\"", contentType = "application/octet-stream" }
             });
@@ -248,7 +248,7 @@ public sealed class BrowserBridgeTests
                 Assert.False(result.TransferReady ?? true);
                 Assert.Empty(Directory.GetFiles(downloads, "*.bin"));
                 Assert.All(engine.Snapshots(), entry => Assert.Equal(0, entry.CommittedBytes));
-                await Send(new { v = 1, id = "native-abandon-0001", type = "browser-transfer", transferId, operation = "abandon" });
+                await Send(new { v = BridgeProtocol.Version, id = "native-abandon-0001", type = "browser-transfer", transferId, operation = "abandon" });
                 await response;
                 if (session is not null) await session.CloseAsync(ct);
                 return;
@@ -258,15 +258,15 @@ public sealed class BrowserBridgeTests
             Assert.Equal(0, staged.CommittedBytes);
             Assert.Null(staged.FinalPath);
             BridgeResponse status = await Send(
-                new { v = 1, id = "native-status-0001", type = "browser-transfer", transferId, operation = "status" });
+                new { v = BridgeProtocol.Version, id = "native-status-0001", type = "browser-transfer", transferId, operation = "status" });
             Assert.True(status.Ok, status.Message);
             Assert.Equal("staged", Assert.IsType<JsonElement>(status.Data).GetProperty("state").GetString());
 
             BridgeResponse accepted = await Send(
-                new { v = 1, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" });
+                new { v = BridgeProtocol.Version, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" });
             Assert.True(accepted.Ok, accepted.Message);
             BridgeResponse watched = await Send(
-                new { v = 1, id = "native-watch-0001", type = "browser-transfer", transferId, operation = "watch" });
+                new { v = BridgeProtocol.Version, id = "native-watch-0001", type = "browser-transfer", transferId, operation = "watch" });
             Assert.True(watched.Ok, watched.Message);
             Assert.Equal("complete", Assert.IsType<JsonElement>(watched.Data).GetProperty("state").GetString());
             string final = Assert.Single(Directory.GetFiles(downloads, "*.bin"));
@@ -293,11 +293,11 @@ public sealed class BrowserBridgeTests
         // before any pipe lookup. Never send a valid desktop command in this test.
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var session = new NativeTestSession(helper);
-        var opened = await session.SendAsync(new { v = 1, id = "native-session-0002", type = "session-open" }, deadline.Token);
+        var opened = await session.SendAsync(new { v = BridgeProtocol.Version, id = "native-session-0002", type = "session-open" }, deadline.Token);
         Assert.True(opened.Ok, opened.Message);
         Assert.True(Assert.IsType<JsonElement>(opened.Data).GetProperty("mux").GetBoolean());
         for (int i = 0; i < 12; i++)
-            await session.WriteAsync(new { v = 1, id = $"native-invalid-{i:0000}", type = "unknown" }, deadline.Token);
+            await session.WriteAsync(new { v = BridgeProtocol.Version, id = $"native-invalid-{i:0000}", type = "unknown" }, deadline.Token);
         var ids = new HashSet<string>();
         for (int i = 0; i < 12; i++)
         {
@@ -331,13 +331,13 @@ public sealed class BrowserBridgeTests
             using var desktop = new BridgeServer(pipe, bridge.HandleAsync);
             desktop.Start();
             const int length = 5 * 1024 * 1024, chunkSize = 512 * 1024;
-            object Begin(string id) => new { v = 1, id = "body-qa-begin", type = "browser-body", operation = "begin",
+            object Begin(string id) => new { v = BridgeProtocol.Version, id = "body-qa-begin", type = "browser-body", operation = "begin",
                 transferId = id, session = true, origin = "https://example.test/", fileName = "browser-qa.bin", length };
             byte[] chunk = new byte[chunkSize];
             new Random(731).NextBytes(chunk);
             string digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(chunk));
             string encoded = Convert.ToBase64String(chunk);
-            object Append(string id, int offset) => new { v = 1, id = $"body-qa-{offset}", type = "browser-body",
+            object Append(string id, int offset) => new { v = BridgeProtocol.Version, id = $"body-qa-{offset}", type = "browser-body",
                 operation = "append", transferId = id, session = true, offset, chunk = encoded, digest };
             const string abandoned = "body-qa-abandoned";
             using (var copy = new NativeTestSession(helper, pipe))
@@ -367,7 +367,7 @@ public sealed class BrowserBridgeTests
                 }
             }
             Assert.Empty(engine.Snapshots());
-            var finished = await session.SendAsync(new { v = 1, id = "body-qa-finish", type = "browser-body",
+            var finished = await session.SendAsync(new { v = BridgeProtocol.Version, id = "body-qa-finish", type = "browser-body",
                 operation = "finish", transferId, session = true }, ct);
             Assert.True(finished.Ok, finished.Message);
             Assert.True(Assert.IsType<JsonElement>(finished.Data).GetProperty("accepted").GetBoolean());
@@ -425,10 +425,10 @@ public sealed class BrowserBridgeTests
             {
                 using var session = new NativeTestSession(helper, pipe);
                 var clock = Stopwatch.StartNew();
-                Assert.True((await session.SendAsync(new { v = 1, id = "native-session-0003", type = "session-open" }, ct)).Ok);
+                Assert.True((await session.SendAsync(new { v = BridgeProtocol.Version, id = "native-session-0003", type = "session-open" }, ct)).Ok);
                 double handshakeMs = clock.Elapsed.TotalMilliseconds;
                 clock.Restart();
-                BridgeResponse options = await session.SendAsync(new { v = 1, id = "native-options-0001", type = "media-options", url }, ct);
+                BridgeResponse options = await session.SendAsync(new { v = BridgeProtocol.Version, id = "native-options-0001", type = "media-options", url }, ct);
                 double discoveryMs = clock.Elapsed.TotalMilliseconds;
                 Assert.True(options.Ok, options.Message);
                 JsonElement data = Assert.IsType<JsonElement>(options.Data);
@@ -438,13 +438,13 @@ public sealed class BrowserBridgeTests
                     .Concat(data.GetProperty("more").EnumerateArray())
                     .First(option => option.GetProperty("container").GetString() == "WEBM").GetProperty("index").GetInt32();
 
-                var invalid = await session.SendAsync(new { v = 1, id = "native-media-invalid", type = "media-select",
+                var invalid = await session.SendAsync(new { v = BridgeProtocol.Version, id = "native-media-invalid", type = "media-select",
                     mediaSession = Guid.NewGuid().ToString("N"), formatChoice = index, mode = "download" }, ct);
                 Assert.False(invalid.Ok);
                 Assert.Equal("expired-selection", invalid.Code);
                 Assert.Empty(engine.Snapshots());
 
-                var request = new { v = 1, id = "native-media-select", type = "media-select", mediaSession = token,
+                var request = new { v = BridgeProtocol.Version, id = "native-media-select", type = "media-select", mediaSession = token,
                     formatChoice = index, mode = "download" };
                 clock.Restart();
                 BridgeResponse accepted = await session.SendAsync(request, ct);
@@ -822,7 +822,7 @@ public sealed class BrowserBridgeTests
     public void BatchReviewShowsThePageTitleTypeAndDurationWithoutExposingTheSignedUrl()
     {
         const string json = """
-            {"v":1,"id":"smart-review-1","type":"batch-review","mode":"ask","items":[
+            {"v":2,"id":"smart-review-1","type":"batch-review","mode":"ask","items":[
               {"url":"https://media.example/clip.mp4?signature=private-value",
                "reviewLabel":"Launch demo","reviewType":"MP4 video","reviewDurationSeconds":95.5},
               {"url":"https://media.example/another.mp4","reviewType":"MP4 video","reviewDurationSeconds":1e100}

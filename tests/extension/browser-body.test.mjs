@@ -84,6 +84,48 @@ test('same-origin finite blob streams byte-exact chunks through both sides of th
   assert.equal(b.messages.some(message => 'cookie' in message || 'authorization' in message || 'path' in message), false);
 });
 
+test('worker copy accepts a complete CDN body and rejects a partial response', async () => {
+  for (const status of [200, 206]) {
+    const [native, host] = connection();
+    const chunks = [];
+    let count = 0, offset = 0;
+    host.onMessage.addListener(message => {
+      assert.equal(message.v, 2);
+      assert.equal(message.transferId, 'test-transfer-id');
+      if (message.operation === 'append') {
+        const bytes = Buffer.from(message.chunk, 'base64');
+        assert.equal(message.offset, offset);
+        assert.equal(message.digest, createHash('sha256').update(bytes).digest('hex'));
+        offset += bytes.length;
+        chunks.push(bytes);
+      }
+      host.postMessage({ ok: true, id: message.id, data: {
+        offset, ...(message.operation === 'finish' ? { accepted: true, jobId: 'worker-test' } : {})
+      } });
+    });
+    const url = 'https://cdn.test/clip.mp4';
+    const pending = body.streamFromWorker({
+      proof: { url, mime: 'video/mp4', minimumLength: 900, credentials: 'omit' },
+      title: 'CDN player', origin, nativeHost: 'test-helper', transferId: 'test-transfer-id',
+      connectNative: () => native, makeId: () => 'request-' + ++count,
+      signal: new AbortController().signal, onProgress: () => {},
+      fetcher: async (requested, options) => {
+        assert.equal(requested, url);
+        assert.equal(options.credentials, 'omit');
+        assert.equal(options.redirect, 'error');
+        return new Response(source, { status, headers: { 'Content-Type': 'video/mp4' } });
+      }
+    });
+    if (status === 206) {
+      await assert.rejects(pending, /complete media file/);
+      assert.equal(count, 0);
+    } else {
+      assert.equal((await pending).jobId, 'worker-test');
+      assert.deepEqual(Buffer.concat(chunks), Buffer.from(source));
+    }
+  }
+});
+
 test('foreign blobs and HTTP URLs cannot be opened by the finite-Blob route', async () => {
   for (const url of ['blob:https://other.test/one', origin + '/video.mp4', 'blob:null/id']) {
     let fetched = false;

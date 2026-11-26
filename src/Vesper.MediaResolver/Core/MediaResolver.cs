@@ -1,8 +1,10 @@
 using System.Text.Json;
 using System.Xml;
+using Vesper.Intelligence;
 using Vesper.MediaResolver.Discovery;
 using Vesper.MediaResolver.Extractors;
 using Vesper.MediaResolver.Models;
+using Vesper.MediaResolver.Rules;
 using Vesper.MediaResolver.Security;
 
 namespace Vesper.MediaResolver.Core;
@@ -16,6 +18,8 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
     private readonly ResolverOptions _options;
     private readonly HttpMessageHandler? _handler;
     private readonly IReadOnlyList<AdapterDescriptor> _descriptors;
+    private readonly RulePackStore _rulePacks;
+    private readonly OnlineLearner _routeLearner = new();
     private readonly object _gate = new();
     private readonly Dictionary<string, IMediaSourceAdapter> _adapters = new(StringComparer.Ordinal);
     private ResolverServices? _services;
@@ -26,8 +30,11 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
     {
         _options = options ?? new ResolverOptions();
         _handler = handler;
-        _descriptors = (adapters ?? AdapterRegistry.Default).ToList();
+        _rulePacks = new RulePackStore(_options.RulePackDirectory, _options.RulePackPublicKeySpki);
+        _descriptors = [DeclarativeExtractorAdapter.CreateDescriptor(_rulePacks), .. (adapters ?? AdapterRegistry.Default)];
     }
+
+    public RulePackStore RulePacks => _rulePacks;
 
     public IReadOnlyList<AdapterDescriptor> Adapters => _descriptors;
 
@@ -181,13 +188,25 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         }
 
         MediaDiscoveryResult? result = null;
-        foreach (var d in _descriptors)
+        var matches = _descriptors.Where(descriptor => descriptor.Matches(request.Url)).ToArray();
+        bool hasAlternative = matches.Length >= 2 && matches[0].Id == "declarative-pack";
+        if (hasAlternative)
         {
-            if (!d.Matches(request.Url)) continue;
-            var r = await GetAdapter(d, svc).ResolveAsync(request, ct).ConfigureAwait(false);
-            if (r.Error?.Code == MediaErrorCode.NotThisSite) continue;
-            result = r;
-            break;
+            string? preferred = _routeLearner.SelectBestRoute(request.Url.IdnHost, [matches[1].Id, matches[0].Id]);
+            if (preferred == matches[1].Id) (matches[0], matches[1]) = (matches[1], matches[0]);
+        }
+        for (int index = 0; index < matches.Length; index++)
+        {
+            AdapterDescriptor descriptor = matches[index];
+            var answer = await GetAdapter(descriptor, svc).ResolveAsync(request, ct).ConfigureAwait(false);
+            bool fallback = answer.Error?.Code == MediaErrorCode.NotThisSite
+                || answer.Error is { Code: MediaErrorCode.NoDownloadableMedia, BrowserMayHelp: true }
+                || answer.Error?.Code == MediaErrorCode.UnsupportedSite;
+            if (hasAlternative && index < 2 && (answer.IsSuccess || fallback))
+                _routeLearner.RecordRouteOutcome(request.Url.IdnHost, descriptor.Id, answer.IsSuccess);
+            if (answer.Error?.Code == MediaErrorCode.NotThisSite) continue;
+            if (answer.IsSuccess || result is null) result = answer;
+            if (!hasAlternative || index != 0 || !fallback) break;
         }
 
         if (result is null || (!result.IsSuccess && ShouldTryGeneric(result, request)))
@@ -204,17 +223,20 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
 
     private static bool ShouldTryGeneric(MediaDiscoveryResult failed, MediaDiscoveryRequest request)
     {
-        if (failed.Error?.Code == MediaErrorCode.SourceChanged) return false;
+        if (failed.Error?.Code == MediaErrorCode.SourceChanged)
+            return request.ValidatedBrowser is { Candidates.Count: > 0 };
         if (request.ValidatedBrowser is { Candidates.Count: > 0 }) return true;
         if (failed.Error is { Code: MediaErrorCode.NoDownloadableMedia, BrowserMayHelp: false }) return false;
-        return failed.Error?.Code is MediaErrorCode.NoDownloadableMedia or MediaErrorCode.UnsupportedSite;
+        return failed.Error?.Code is MediaErrorCode.NoDownloadableMedia
+            or MediaErrorCode.UnsupportedSite
+            or MediaErrorCode.BrowserContextRequired;
     }
 
-    /// <summary>Only players that a dedicated adapter understands are followed; arbitrary iframes (ads, widgets) are ignored.</summary>
+    /// <summary>Follows any legitimate player iframe one level deep while filtering ad and tracker domains.</summary>
     private Task<MediaDiscoveryResult> ResolveEmbeddedAsync(MediaDiscoveryRequest request, CancellationToken ct)
     {
-        if (!_descriptors.Any(d => d.Matches(request.Url)))
-            return Task.FromResult(MediaDiscoveryResult.Failure(MediaErrors.NotThisSite("No adapter for embedded URL")));
+        if (PlayerConfigDiscovery.IsAdOrTrackingHost(request.Url.Host))
+            return Task.FromResult(MediaDiscoveryResult.Failure(MediaErrors.NotThisSite("Ignored ad/tracker iframe")));
         return ResolveAsync(request, ct);
     }
 

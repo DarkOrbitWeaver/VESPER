@@ -25,14 +25,16 @@ internal sealed class RangeProblemException(string code, string message) : Excep
     public string Code { get; } = code;
 }
 
-/// <summary>A byte span owned by one connection. Start is fixed, End shrinks when the span is split.</summary>
+/// <summary>A byte span owned by one worker, with the end of its current HTTP range.</summary>
 internal sealed class Segment(long start, long end)
 {
     public long Start { get; } = start;
     public long Next { get; set; } = start;
     public long End { get; set; } = end;
-    /// <summary>End of the chunk the owner is about to write; a split may never cut below it.</summary>
+    /// <summary>End of the chunk currently being written to disk; a split may never cut below it.</summary>
     public long Claimed { get; set; } = start;
+    /// <summary>Exclusive end of the currently in-flight HTTP Range request window, so splits prefer cutting above the active wire window.</summary>
+    public long WireEnd { get; set; } = start;
     public bool Owned { get; set; }
     public long SampleAt { get; set; }
     public long SampleBytes { get; set; }
@@ -41,14 +43,26 @@ internal sealed class Segment(long start, long end)
 }
 
 /// <summary>
-/// Hands out non-overlapping spans to connections. When no free span is left, the largest running span is
-/// split in two, which adapts naturally to connections of different speed. All mutation happens under one lock.
+/// Dynamic adjacent-segment work-stealing scheduler.
+/// Splits straggling spans proportional to measured worker speed, prefers splitting beyond active HTTP wire windows
+/// so the current response can finish, and lowers split granularity during the
+/// final 10 % tail so idle workers close slow-tail stragglers immediately.
 /// </summary>
-internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
+internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, long totalBytes = 0)
 {
     private const long Alignment = 64 * 1024;
+    private const long TailMinSplitBytes = 256 * 1024;
     private readonly object _gate = new();
     private readonly LinkedList<Segment> _segments = new();
+
+    private long EffectiveMinSplitLocked()
+    {
+        if (!rateAware || totalBytes <= 0) return minSplitBytes;
+        long rem = _segments.Sum(s => Math.Max(0, s.End - s.Next));
+        if (rem <= totalBytes / 10)
+            return Math.Min(minSplitBytes, TailMinSplitBytes);
+        return minSplitBytes;
+    }
 
     public void Add(Segment segment) { lock (_gate) segment.Node = _segments.AddLast(segment); }
 
@@ -58,8 +72,12 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
     {
         get
         {
-            lock (_gate) return _segments.Any(s => !s.Owned && s.Next < s.End
-                || s.Owned && s.End - Math.Max(s.Next, s.Claimed) >= 2 * minSplitBytes);
+            lock (_gate)
+            {
+                long splitFloor = EffectiveMinSplitLocked();
+                return _segments.Any(s => !s.Owned && s.Next < s.End
+                    || s.Owned && s.End - Math.Max(s.Next, s.Claimed) >= 2 * splitFloor);
+            }
         }
     }
 
@@ -67,63 +85,113 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
 
     public long Remaining(Segment segment) { lock (_gate) return Math.Max(0, segment.End - segment.Next); }
 
-    public Segment? Acquire()
+    public long PlanWireWindowEnd(Segment segment, long preferredWindowBytes, bool boundedWindow)
     {
         lock (_gate)
         {
-            Segment? free = _segments.FirstOrDefault(s => !s.Owned && s.Next < s.End);
-            if (free is not null) { free.Owned = true; free.SampleAt = 0; free.SampleBytes = 0; free.Rate = 0; return free; }
+            if (!boundedWindow)
+            {
+                segment.WireEnd = segment.End;
+                return segment.End;
+            }
+            long window = Math.Max(Alignment * 4, preferredWindowBytes);
+            long wireEnd = Math.Min(segment.End, segment.Next + window);
+            // If remaining after this window is tiny (< 512 KiB), absorb it into one request to save a round-trip
+            if (segment.End - wireEnd < 512 * 1024) wireEnd = segment.End;
+            segment.WireEnd = wireEnd;
+            return wireEnd;
+        }
+    }
 
-            // Nothing free: split the span with the most bytes left, if it is worth a new connection.
-            double helperRate = 0;
-            if (rateAware)
+    public Segment? Acquire(double callerRateHint = 0)
+    {
+        lock (_gate)
+        {
+            // 1. Prefer an unowned free gap (in sequential file order for locality)
+            Segment? free = _segments.FirstOrDefault(s => !s.Owned && s.Next < s.End);
+            if (free is not null)
+            {
+                free.Owned = true;
+                free.SampleAt = 0;
+                free.SampleBytes = 0;
+                free.Rate = callerRateHint > 0 ? callerRateHint : 0;
+                return free;
+            }
+
+            long splitMin = EffectiveMinSplitLocked();
+            double helperRate = callerRateHint;
+            if (rateAware && helperRate <= 0)
             {
                 int samples = 0;
                 foreach (Segment segment in _segments)
                 {
-                    if (!segment.Owned || segment.Rate <= 0 || SplittableBytes(segment) < 2 * minSplitBytes) continue;
+                    if (!segment.Owned || segment.Rate <= 0) continue;
                     helperRate += segment.Rate;
                     samples++;
                 }
                 if (samples > 0) helperRate /= samples;
             }
-            Segment? largest = null;
-            double longest = 0;
+
+            // 2. Steal from the highest-ETA straggler (preferring clean splits above WireEnd so the victim's HTTP response drains cleanly!)
+            Segment? victim = null;
+            double highestEta = 0;
             foreach (Segment segment in _segments)
             {
                 long bytes = SplittableBytes(segment);
-                if (!segment.Owned || bytes < 2 * minSplitBytes) continue;
-                double cost = helperRate > 0 ? bytes / (segment.Rate > 0 ? segment.Rate : helperRate) : bytes;
-                if (cost <= longest) continue;
-                longest = cost;
-                largest = segment;
+                if (!segment.Owned || bytes < 2 * splitMin) continue;
+                double victimRate = segment.Rate > 0 ? segment.Rate : (helperRate > 0 ? helperRate : 1.0);
+                double eta = rateAware ? bytes / victimRate : bytes;
+                // Slight bonus if we can split cleanly past the victim's active HTTP wire window without truncating its in-flight stream
+                if (segment.WireEnd > segment.Next && segment.End - segment.WireEnd >= splitMin)
+                    eta *= 1.15;
+                if (eta > highestEta)
+                {
+                    highestEta = eta;
+                    victim = segment;
+                }
             }
-            if (largest is null) return null;
+            if (victim is null) return null;
 
-            long floor = Math.Max(largest.Next, largest.Claimed);
-            long remaining = largest.End - floor;
+            long floor = Math.Max(victim.Next, victim.Claimed);
+            long remaining = victim.End - floor;
             long stolen = remaining / 2;
-            if (helperRate > 0 && largest.Rate > 0)
-                stolen = (long)Math.Clamp(helperRate * (remaining - largest.Rate * 0.15) / (helperRate + largest.Rate), minSplitBytes, remaining - minSplitBytes);
-            long mid = (largest.End - stolen) / Alignment * Alignment;
-            mid = Math.Clamp(mid, floor + minSplitBytes, largest.End - minSplitBytes);
+            if (helperRate > 0 && victim.Rate > 0)
+            {
+                stolen = (long)Math.Clamp(
+                    helperRate * remaining / (helperRate + victim.Rate),
+                    splitMin,
+                    remaining - splitMin);
+            }
+            long mid = (victim.End - stolen) / Alignment * Alignment;
+            // Snap split point at or above victim.WireEnd when possible so victim's in-flight HTTP response finishes cleanly for keep-alive reuse!
+            if (victim.WireEnd > floor + splitMin && victim.WireEnd <= victim.End - splitMin && Math.Abs(mid - victim.WireEnd) <= 4 * 1024 * 1024)
+            {
+                mid = victim.WireEnd;
+            }
+            mid = Math.Clamp(mid, floor + splitMin, victim.End - splitMin);
 
-            var tail = new Segment(mid, largest.End) { Owned = true };
-            largest.End = mid;
-            tail.Node = _segments.AddAfter(largest.Node!, tail);
+            var tail = new Segment(mid, victim.End)
+            {
+                Owned = true,
+                Rate = callerRateHint > 0 ? callerRateHint : 0
+            };
+            victim.End = mid;
+            if (victim.WireEnd > mid) victim.WireEnd = mid;
+            tail.Node = _segments.AddAfter(victim.Node!, tail);
             return tail;
         }
     }
 
-    // A still-open validated response can cover an adjacent, untouched free span.
+    // Absorbs an immediately adjacent unowned span so a warm worker continues sequentially without fragmenting extents.
     public bool TryExtend(Segment segment, long responseEndExclusive)
     {
         lock (_gate)
         {
             if (!segment.Owned || segment.Next != segment.End) return false;
-            Segment? next = _segments.FirstOrDefault(s => !s.Owned && s.Start == segment.End
-                && s.Next == s.Start && s.Claimed <= s.Start && s.End <= responseEndExclusive);
-            if (next is null) return false;
+            Segment? next = segment.Node?.Next?.Value;
+            if (next is null || next.Owned || next.Start != segment.End
+                || next.Next != next.Start || next.Claimed > next.Start || next.End > responseEndExclusive)
+                return false;
             segment.End = next.End;
             Remove(next);
             return true;
@@ -135,6 +203,7 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
         lock (_gate)
         {
             segment.Owned = false;
+            segment.WireEnd = segment.Next;
             if (segment.Next == segment.End) Remove(segment);
         }
     }
@@ -148,7 +217,6 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
         segment.Node = null;
     }
 
-    /// <summary>Reserves up to <paramref name="want"/> bytes for the next write. Returns 0 if the span has shrunk away.</summary>
     public int ClaimChunk(Segment segment, int want)
     {
         lock (_gate)
@@ -169,9 +237,9 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
             if (segment.SampleAt == 0) segment.SampleAt = now;
             segment.SampleBytes += written;
             double elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(segment.SampleAt, now).TotalSeconds;
-            if (elapsed < 0.25) return;
+            if (elapsed < 0.2) return;
             double rate = segment.SampleBytes / elapsed;
-            segment.Rate = segment.Rate == 0 ? rate : segment.Rate * 0.5 + rate * 0.5;
+            segment.Rate = segment.Rate == 0 ? rate : segment.Rate * 0.55 + rate * 0.45;
             segment.SampleAt = now;
             segment.SampleBytes = 0;
         }

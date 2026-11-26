@@ -37,7 +37,7 @@ function setup({legacy=false,holdHandshake=false}={}) {
     get connections(){return connections;},get oneShots(){return oneShots;},
     stop(){context.VesperNativeSession.close();for(const timer of timers) clearTimeout(timer);}};
 }
-const message=id=>({v:1,id,type:'probe'});
+const message=id=>({v:2,id,type:'probe'});
 
 test('one handshake, out-of-order replies correctly correlated, no one-shot requests', async () => {
   const b=setup();
@@ -77,11 +77,11 @@ test('format discovery reserves slots for urgent transfer ownership and user act
   const b = setup();
   try {
     const lookups = Array.from({length:12}, (_,i) => b.session.request('host',
-      {v:1,id:'lookup'+i,type:'media-source-options'}, 1000));
+      {v:2,id:'lookup'+i,type:'media-source-options'}, 1000));
     await b.tick();
     assert.equal(b.requests.length,10);
-    const transfer = b.session.request('host',{v:1,id:'transfer',type:'browser-capture'},1000);
-    const selection = b.session.request('host',{v:1,id:'selection',type:'media-select'},1000);
+    const transfer = b.session.request('host',{v:2,id:'transfer',type:'browser-capture'},1000);
+    const selection = b.session.request('host',{v:2,id:'selection',type:'media-select'},1000);
     await b.tick();
     assert.equal(b.requests.length,12);
     assert.deepEqual(b.requests.slice(-2).map(x=>x.message.id),['transfer','selection']);

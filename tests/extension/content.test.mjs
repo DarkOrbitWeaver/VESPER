@@ -94,7 +94,7 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
     alive: () => true, observed: new Set([player]), nativeAudioPlayer: () => false,
     mediaLedger: { playback() {} }, evidenceKey: () => 'player-1',
     location: { origin: 'https://example.test' }, VesperPlayerSource: { identity: v => v },
-    pageForPlayer: () => page, pageAddress: () => page, playback: new Map(),
+    cardPage: () => null, pageForPlayer: () => page, pageAddress: () => page, playback: new Map(),
     isCurrentEndedPlayer: () => false, endedPlayer: null, activePreview: null,
     generation: 0, mediaChangedAt: 0, retainedPickerDraft: null, panelRequest: 3,
     panel: { classList: { contains: () => true } },
@@ -195,7 +195,7 @@ test('opening the popup shows the installed extension version without checking t
     assert.equal(getElementById('signin').checked, true);
     const allow = getElementById('signin-permission');
     assert.equal(allow.hidden, false);
-    assert.deepEqual(messages, []);
+    assert.deepEqual(messages.map(({ type, tabId }) => [type, tabId]), [['tab-state', 3]]);
     assert.deepEqual(permissionRequests, []);
     pause.checked = true;
     await pause.onchange();

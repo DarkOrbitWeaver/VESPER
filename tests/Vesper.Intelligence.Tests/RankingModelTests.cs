@@ -28,6 +28,22 @@ public class RankingModelTests
         Assert.StartsWith("2.", RankingModel.LoadEmbedded("player-intent").Version);
     }
 
+    [Fact]
+    public void ObservedFailuresChangeRouteChoiceAndOlderEvidenceDecays()
+    {
+        var learner = new OnlineLearner();
+        string site = "media.example";
+        string[] routes = ["adapter", "observed"];
+        var now = new DateTimeOffset(2026, 11, 26, 0, 0, 0, TimeSpan.Zero);
+        Assert.Equal("adapter", learner.SelectBestRoute(site, routes, now));
+        learner.RecordRouteOutcome(site, "adapter", false, now: now);
+        learner.RecordRouteOutcome(site, "observed", true, 2_000_000, now);
+        Assert.Equal("observed", learner.SelectBestRoute(site, routes, now));
+        Assert.Equal("adapter", learner.SelectBestRoute("other.example", routes, now));
+        learner.RecordRouteOutcome(site, "adapter", true, 3_000_000, now.AddDays(365));
+        Assert.Equal("adapter", learner.SelectBestRoute(site, routes, now.AddDays(365)));
+    }
+
     private static string Mutate(Action<JsonObject> change)
     {
         var node = JsonNode.Parse(File.ReadAllText(ModelPath("active/source-association.json")))!.AsObject();

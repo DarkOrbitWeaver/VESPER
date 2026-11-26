@@ -3,16 +3,31 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VESPER Settings</title>
+  <title>VESPER</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <header>
     <img src="icons/vesper-48.png" alt="" width="28" height="28">
-    <h1>VESPER <span>Settings</span></h1>
+    <h1>VESPER <span id="header-sub">Ready</span></h1>
   </header>
   <main>
-    <label class="check pause"><input type="checkbox" id="pause-vesper" disabled><span>Pause VESPER in Chrome<small>Hide the butterfly and leave new downloads in Chrome.</small></span></label>
+    <section class="tab-capture" id="tab-capture-box">
+      <div class="tab-capture-row">
+        <div>
+          <b id="tab-media-title">Current tab</b>
+          <small id="tab-media-detail">Checking page for playable media…</small>
+        </div>
+        <button id="capture-tab-media" class="action-btn primary" type="button">Find media</button>
+      </div>
+      <div class="tab-links">
+        <button id="open-transfers" class="text-action" type="button">Active &amp; recent transfers…</button>
+        <button id="site-butterfly" class="text-action" type="button" disabled>Hide butterfly on this site</button>
+      </div>
+      <small id="site-butterfly-host" class="site-host"></small>
+    </section>
+
+    <label class="check pause"><input type="checkbox" id="pause-vesper" disabled><span>Pause VESPER in Chrome<small>Hide the butterfly and keep new downloads in Chrome.</small></span></label>
     <label class="setting"><span>Appearance</span>
       <select id="theme">
         <option value="system">System</option>
@@ -27,9 +42,7 @@
       </select>
     </label>
     <label class="check"><input type="checkbox" id="signin" disabled><span>Use my Chrome sign-in<small id="signin-access" role="status"></small></span></label>
-    <button id="signin-permission" class="vesper-button" type="button" hidden>Allow Chrome sign-in access</button>
-    <button id="site-butterfly" class="text-action" type="button" disabled>Hide butterfly on this site</button>
-    <small id="site-butterfly-host" class="site-host"></small>
+    <button id="signin-permission" class="action-btn" type="button" hidden>Allow Chrome sign-in access</button>
     <small id="settings-status" class="result" role="status" hidden></small>
     <small id="version" class="version"></small>
   </main>

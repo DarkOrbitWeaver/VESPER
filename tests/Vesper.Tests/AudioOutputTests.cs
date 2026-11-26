@@ -100,7 +100,7 @@ public sealed class AudioOutputTests
             Assert.EndsWith(".webm", choice.FileName, StringComparison.OrdinalIgnoreCase);
             Assert.Equal("OPUS", choice.ConvertedAudioCodec);
             Assert.Equal("MP3", choice.DisplayContainer);
-            Assert.Contains("re-encoded", choice.DisplayDetail);
+            Assert.Contains("Universal compatibility", choice.DisplayDetail);
         }
         finally { CodecCapabilities.Override = previous; }
     }

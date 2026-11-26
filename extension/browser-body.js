@@ -1,43 +1,56 @@
-// A finite, explicitly selected browser file can be copied to the native engine.
-// This is not interception of an existing Chrome download and does not replay HTTP requests.
-//
-// Transport: content script -> extension port -> service worker relay -> native port -> host -> desktop pipe.
-// Chunks are pipelined (WINDOW in flight) because every hop preserves order and the desktop
-// handles them strictly sequentially. Memory stays bounded by WINDOW * CHUNK per transfer.
+// Universal Chrome-authenticated byte transport into VESPER's native engine & lossless remuxer.
+// Supports:
+//   1. Finite & streaming browser objects (blob:, data:, redirect-safe HTTP/HTTPS streams, ranged slices)
+//   2. Service worker fetch of an observed complete media file
+//   3. Direct MAIN-world MSE SourceBuffer track export when URLs use one-shot tokens.
 'use strict';
 globalThis.VesperBrowserBody = (() => {
-  // 512 KiB raw is 699,052 Base64 characters, which keeps every desktop pipe frame below its 1 MiB limit.
+  const PROTOCOL = 2;
   const CHUNK = 512 * 1024;
   const WINDOW = 4;
   const MAX_BYTES = 16 * 1024 * 1024 * 1024;
-  const PORT = 'vesper-browser-body-v1';
-  // Only uncertain finish receipts, scoped to this document's isolated world.
-  // Never evict a live ambiguity to make room for another copy.
+  const PORT = 'vesper-browser-body-v2';
   const pendingReceipts = new Map();
   const MAX_PENDING_RECEIPTS = 32;
+
   const EXTENSIONS = Object.freeze({
     'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
-    'video/x-matroska': 'mkv', 'audio/mp4': 'm4a', 'audio/mpeg': 'mp3',
-    'audio/webm': 'webm', 'audio/ogg': 'ogg', 'video/ogg': 'ogv',
-    'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac'
+    'video/x-matroska': 'mkv', 'video/mp2t': 'ts', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a',
+    'audio/mpeg': 'mp3', 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'video/ogg': 'ogv',
+    'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac', 'audio/aac': 'aac', 'audio/opus': 'opus'
   });
+
   const GENERATED_EXTENSIONS = Object.freeze({
-    'application/zip': 'zip', 'application/x-zip-compressed': 'zip',
-    'application/pdf': 'pdf', 'application/json': 'json', 'text/csv': 'csv',
-    'text/plain': 'txt', 'image/png': 'png', 'image/jpeg': 'jpg',
-    'image/webp': 'webp', 'application/gzip': 'gz',
+    'application/zip': 'zip', 'application/x-zip-compressed': 'zip', 'application/x-7z-compressed': '7z',
+    'application/pdf': 'pdf', 'application/json': 'json', 'text/csv': 'csv', 'text/markdown': 'md',
+    'text/plain': 'txt', 'text/vtt': 'vtt', 'application/x-subrip': 'srt',
+    'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'image/avif': 'avif',
+    'application/gzip': 'gz', 'application/epub+zip': 'epub',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx'
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx'
   });
+
   function safeName(value) {
     return String(value || '').replace(/[<>:"/\\|?*\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '_')
       .trim().replace(/[. ]+$/g, '').slice(0, 180).replace(/[. ]+$/g, '');
   }
 
-  // Match the explicit download link, not an arbitrary Blob found on the page.
-  // A reused object URL with contradictory names needs manual resolution.
+  function localBlob(url, origin) {
+    try {
+      const value = new URL(url);
+      return value.protocol === 'blob:' && value.origin === origin
+        && /^https?:\/\//.test(origin) && url.length <= 4096;
+    } catch { return false; }
+  }
+
+  function dataUrl(url) {
+    return typeof url === 'string' && /^data:[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+(?:;[^,]*)?,/i.test(url)
+      && url.length <= 64 * 1024 * 1024;
+  }
+
   function generatedLink(links, url, origin) {
-    if (!localBlob(url, origin)) return null;
+    if (!localBlob(url, origin) && !dataUrl(url)) return null;
     const names = new Set();
     for (const link of links) {
       if (!link.isConnected || !link.hasAttribute('download') || link.href !== url) continue;
@@ -47,24 +60,15 @@ globalThis.VesperBrowserBody = (() => {
     return names.size === 1 ? { url, fileName: [...names][0] } : null;
   }
 
-  // Automatic interception is limited to explicit data-file download names.
-  // Executable, script, HTML and PDF downloads remain under Chrome's policy.
   function automaticGeneratedFile(proposal, origin) {
     const { url, fileName, size, mime } = proposal || {};
-    if (!localBlob(url, origin) || !Number.isSafeInteger(size) || size <= 0 || size > MAX_BYTES
+    const validUrl = localBlob(url, origin) || dataUrl(url);
+    if (!validUrl || (size !== undefined && (!Number.isSafeInteger(size) || size <= 0 || size > MAX_BYTES))
         || typeof fileName !== 'string' || safeName(fileName) !== fileName || fileName.length > 180
-        || !/\.(?:zip|7z|rar|tar|gz|tgz|png|jpe?g|webp|gif|txt|md|csv|json|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|m4a|flac|mkv)$/i.test(fileName)
-        || typeof mime !== 'string' || /(?:html|javascript|executable|x-msdownload|x-sh|pdf)/i.test(mime))
+        || !/\.(?:zip|7z|rar|tar|gz|tgz|xz|zst|png|jpe?g|webp|avif|svg|gif|txt|md|csv|json|xml|yaml|yml|sql|srt|vtt|epub|pdf|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|opus|m4a|flac|mkv)$/i.test(fileName)
+        || typeof mime !== 'string' || /(?:javascript|executable|x-msdownload|x-msi|x-sh|x-bat)/i.test(mime))
       return null;
-    return { url, fileName, expectedLength: size, automatic: true };
-  }
-
-  function localBlob(url, origin) {
-    try {
-      const value = new URL(url);
-      return value.protocol === 'blob:' && value.origin === origin
-        && /^https?:\/\//.test(origin) && url.length <= 4096;
-    } catch { return false; }
+    return { url, fileName, expectedLength: Number.isSafeInteger(size) && size > 0 ? size : null, automatic: true };
   }
 
   function eligibleHttpMedia(url) {
@@ -88,6 +92,12 @@ globalThis.VesperBrowserBody = (() => {
       && typeof proof.etag === 'string' && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(proof.etag)
       && Object.hasOwn(EXTENSIONS, proof.mime)
       && Number.isSafeInteger(proof.length) && proof.length > 0 && proof.length <= MAX_BYTES;
+  }
+
+  function makeMediaFileName(title, extension) {
+    const stem = String(title || 'Video').replace(/[<>:"/\\|?*\u0000-\u001f]/g, ' ')
+      .replace(/\s+/g, ' ').replace(/[. ]+$/g, '').trim().slice(0, 140) || 'Video';
+    return stem + '.' + extension;
   }
 
   function fileFacts(response, title, generated = null, verifiedPart = null) {
@@ -164,10 +174,16 @@ globalThis.VesperBrowserBody = (() => {
     return btoa(binary);
   }
 
+  function decodeBase64(text) {
+    const bin = atob(text);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
   const hex = buffer => Array.from(new Uint8Array(buffer), value => value.toString(16).padStart(2, '0')).join('');
 
-  // Replies arrive in send order. Each call is matched to the oldest unanswered sequence.
-  function openChannel(connect, signal) {
+  function openChannel(connect, signal, onProgress = () => {}) {
     const port = connect({ name: PORT });
     const pending = [];
     let closed = false, sequence = 0;
@@ -179,7 +195,7 @@ globalThis.VesperBrowserBody = (() => {
         call.reject(new Error(message));
       }
       signal?.removeEventListener('abort', onAbort);
-      try { port.disconnect(); } catch { /* Already disconnected. */ }
+      try { port.disconnect(); } catch {}
     };
     const onAbort = () => fail('Browser copy cancelled.');
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -190,19 +206,24 @@ globalThis.VesperBrowserBody = (() => {
         fail('Unexpected browser copy response.');
         return;
       }
-      pending.shift();
       clearTimeout(call.timer);
+      if (reply.progress) {
+        call.timer = setTimeout(() => fail('VESPER browser copy timed out.'), 120_000);
+        onProgress(reply.received, reply.total);
+        return;
+      }
+      pending.shift();
       if (reply.ok) call.resolve(reply.data || {});
       else {
-        const error = new Error(reply.message || 'VESPER could not accept the browser copy.');
-        if (reply.code === 'invalid-media') error.code = reply.code;
+        const error = new Error(reply.message || 'VESPER could not accept the browser stream.');
+        error.code = reply.code;
         call.reject(error);
-        fail(reply.message || 'VESPER could not accept the browser copy.');
+        fail(reply.message || 'VESPER could not accept the browser stream.');
       }
     });
     return {
       send(message) {
-        if (closed || signal?.aborted || pending.length > WINDOW)
+        if (closed || signal?.aborted || pending.length >= WINDOW)
           return Promise.reject(new Error('Browser copy connection unavailable.'));
         return new Promise((resolve, reject) => {
           const id = ++sequence;
@@ -219,13 +240,15 @@ globalThis.VesperBrowserBody = (() => {
   async function resolveReceipt(queryReceipt, receipt) {
     try {
       const reply = await queryReceipt(receipt.transferId);
-      if (reply?.ok && reply.data?.accepted && reply.data.offset === receipt.length
-          && typeof reply.data.jobId === 'string') return reply.data;
-    } catch { /* A lost or missing receipt does not prove the file was rejected. */ }
+      if (reply?.ok && reply.data?.accepted && typeof reply.data.jobId === 'string'
+          && (!receipt.length || reply.data.offset === receipt.length))
+        return reply.data;
+    } catch {}
     return null;
   }
+
   function uncertainFinish() {
-    const error = new Error('VESPER could not confirm the final browser copy. Check the desktop before retrying.');
+    const error = new Error('VESPER could not confirm the final browser stream. Check the desktop queue before retrying.');
     error.code = 'uncertain-finish';
     return error;
   }
@@ -233,7 +256,7 @@ globalThis.VesperBrowserBody = (() => {
   async function copyBlob({ url, origin, title, generated = null, mediaProof = null, signal, onProgress = () => {},
     fetcher = globalThis.fetch, connect = options => chrome.runtime.connect(options),
     queryReceipt = transferId => chrome.runtime.sendMessage({ type: 'browser-body-status', transferId }) }) {
-    const isBlob = localBlob(url, origin);
+    const isBlob = localBlob(url, origin) || (generated && dataUrl(url));
     const httpMedia = !generated && validMediaProof(mediaProof, url, origin);
     if (!isBlob && !httpMedia) throw new Error('The file is not available in this browser document.');
     if (signal?.aborted) throw new Error('Browser copy cancelled.');
@@ -367,23 +390,234 @@ globalThis.VesperBrowserBody = (() => {
 
   // Runs in the extension worker, not the page. Only content-script ports from an
   // identified browser document are accepted. Native provenance is derived here.
-  function relay(port, { nativeHost, canBegin, connectNative, makeId, rememberReceipt = async () => {} }) {
+  // Export already-buffered MSE SourceBuffer tracks (1 or 2 tracks) directly from MAIN world into native remuxer!
+  async function exportMseBuffer({ player, tracks, title, pageUrl, signal, onProgress = () => {},
+    connect = options => chrome.runtime.connect(options) }) {
+    if (!player || !Array.isArray(tracks) || tracks.length < 1 || tracks.length > 2)
+      throw new Error('No buffered MSE tracks available.');
+    const isWebm = tracks.every(t => String(t.mimeType || '').toLowerCase().includes('webm'));
+    const outputContainer = tracks.length === 1 && String(tracks[0].mimeType || '').toLowerCase().startsWith('audio/')
+      ? (isWebm ? 'webm' : 'm4a') : (isWebm ? 'webm' : 'mp4');
+    const fileName = makeMediaFileName(title, outputContainer);
+    const totalEstimate = tracks.reduce((sum, t) => sum + (t.retainedBytes || 0), 0);
+    const trackSpecs = tracks.map(t => ({
+      role: t.role,
+      container: String(t.mimeType || '').toLowerCase().includes('webm') ? 'webm' : (t.role === 'audio' ? 'm4a' : 'mp4'),
+      length: t.retainedBytes
+    }));
+
+    const channel = openChannel(connect, signal);
+    let transferId = null, finishing = false, sent = 0;
+    const unanswered = [];
+    try {
+      const begin = await channel.send({
+        operation: 'begin',
+        fileName,
+        automatic: false,
+        pageUrl,
+        outputContainer,
+        length: totalEstimate,
+        tracks: trackSpecs,
+        ...(tracks.length === 1 && !isWebm ? { mediaCheck: 'mp4' } : {})
+      });
+      transferId = begin.transferId;
+      const buffer = new Uint8Array(CHUNK);
+      let used = 0, activeTrackIdx = 0;
+
+      async function flush(trackIdx) {
+        if (!used) return;
+        const bytes = buffer.subarray(0, used);
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        const chunk = encode(bytes);
+        const offset = sent, next = sent + used;
+        sent = next;
+        used = 0;
+        const call = channel.send({ operation: 'append', offset, chunk, digest: hex(digest), trackIndex: trackIdx }).then(reply => {
+          if (reply.offset !== next) throw new Error('Inconsistent MSE export offset.');
+          onProgress(next, Math.max(totalEstimate, next));
+        });
+        call.catch(() => {});
+        unanswered.push(call);
+        while (unanswered.length >= WINDOW) await unanswered.shift();
+      }
+
+      for (let ti = 0; ti < tracks.length; ti++) {
+        activeTrackIdx = ti;
+        let partIndex = 0, subOffset = 0;
+        while (true) {
+          if (signal?.aborted) throw new Error('MSE export cancelled.');
+          player.removeAttribute('data-vesper-mse-export-chunk');
+          player.setAttribute('data-vesper-mse-export-query', JSON.stringify({ trackId: tracks[ti].id, partIndex, subOffset }));
+          player.dispatchEvent(new Event('vesper-mse-export-request', { bubbles: true, composed: true }));
+          const raw = player.getAttribute('data-vesper-mse-export-chunk');
+          player.removeAttribute('data-vesper-mse-export-chunk');
+          if (!raw) throw new Error('MSE buffer is no longer available in the player.');
+          const parsed = JSON.parse(raw);
+          if (parsed.done || typeof parsed.chunk !== 'string' || parsed.chunk.length > 524288
+              || !Number.isSafeInteger(parsed.nextPartIndex) || !Number.isSafeInteger(parsed.nextSubOffset)
+              || parsed.nextPartIndex !== partIndex + 1 && (parsed.nextPartIndex !== partIndex || parsed.nextSubOffset <= subOffset))
+            throw new Error('The MSE buffer changed during the copy.');
+          const bytes = decodeBase64(parsed.chunk);
+          if (bytes.length < 1 || sent + used + bytes.length > totalEstimate)
+            throw new Error('The MSE buffer changed during the copy.');
+          for (let start = 0; start < bytes.length;) {
+            const count = Math.min(CHUNK - used, bytes.length - start);
+            buffer.set(bytes.subarray(start, start + count), used);
+            used += count;
+            start += count;
+            if (used === CHUNK) await flush(activeTrackIdx);
+          }
+          partIndex = parsed.nextPartIndex;
+          subOffset = parsed.nextSubOffset;
+          if (parsed.finishedAfterThis) break;
+        }
+        await flush(activeTrackIdx);
+      }
+
+      while (unanswered.length) await unanswered.shift();
+      finishing = true;
+      const done = await channel.send({ operation: 'finish' });
+      if (!done.accepted || typeof done.jobId !== 'string')
+        throw new Error('VESPER did not confirm the MSE stream.');
+      return done;
+    } catch (error) {
+      if (finishing && error.code !== 'invalid-media') throw uncertainFinish();
+      if (!finishing && transferId && !signal?.aborted) await channel.send({ operation: 'abort' }).catch(() => {});
+      throw error;
+    } finally {
+      for (const call of unanswered) call.catch(() => {});
+      channel.close();
+    }
+  }
+
+  async function streamFromWorker({ proof, title, origin, nativeHost, connectNative, makeId,
+    transferId, signal, onProgress, fetcher = globalThis.fetch }) {
+    if (signal.aborted) throw new Error('Browser copy cancelled.');
+    const { url, etag, mime, length, minimumLength, credentials } = proof;
+    const headers = etag ? { 'If-Match': etag } : undefined;
+    const response = await fetcher(url, { credentials, redirect: 'error', cache: 'no-store', signal, headers });
+    const type = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+    const encoding = response.headers.get('content-encoding');
+    const lengthHeader = response.headers.get('content-length');
+    const declared = /^\d+$/.test(lengthHeader || '') ? Number(lengthHeader) : null;
+    if (response.status !== 200 || !response.body || response.url && response.url !== url
+        || response.headers.get('content-range') || encoding && encoding !== 'identity'
+        || !EXTENSIONS[type] || mime && mime !== type
+        || etag && response.headers.get('etag') !== etag
+        || declared !== null && (!Number.isSafeInteger(declared) || declared < 1 || declared > MAX_BYTES
+            || length && declared !== length || minimumLength && declared < minimumLength)) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error('Chrome did not return the selected complete media file.');
+    }
+
+    let native, reader, sent = 0, finishing = false;
+    const pending = new Map();
+    const close = () => {
+      for (const call of pending.values()) call.reject(new Error('The native VESPER connection closed.'));
+      pending.clear();
+      try { native?.disconnect(); } catch {}
+    };
+    const sendNative = (operation, payload = {}) => new Promise((resolve, reject) => {
+      if (signal.aborted) return reject(new Error('Browser copy cancelled.'));
+      const id = makeId();
+      pending.set(id, { resolve, reject });
+      try { native.postMessage({ v: PROTOCOL, id, type: 'browser-body', transferId, operation, session: true, ...payload }); }
+      catch (error) { close(); }
+    });
+    signal.addEventListener('abort', close, { once: true });
+    try {
+      native = connectNative(nativeHost);
+      native.onDisconnect.addListener(close);
+      native.onMessage.addListener(reply => {
+        const call = pending.get(reply?.id);
+        if (!call) return close();
+        pending.delete(reply.id);
+        if (reply.ok) call.resolve(reply.data || {});
+        else {
+          const error = new Error(reply.message || 'Native receiver rejected the stream.');
+          error.code = reply.code;
+          call.reject(error);
+        }
+      });
+
+      const expected = declared ?? length;
+      const begin = await sendNative('begin', {
+        origin: origin + '/',
+        fileName: makeMediaFileName(title, EXTENSIONS[type]),
+        automatic: false,
+        ...(expected ? { length: expected } : {}),
+        ...(['video/mp4', 'audio/mp4', 'video/quicktime'].includes(type) ? { mediaCheck: 'mp4' } : {})
+      });
+      if (begin.offset !== 0 || begin.accepted) throw new Error('Invalid initial native copy state.');
+      reader = response.body.getReader();
+      const buffer = new Uint8Array(CHUNK);
+      let used = 0;
+      async function flush() {
+        if (!used) return;
+        const bytes = buffer.subarray(0, used);
+        const digest = hex(await crypto.subtle.digest('SHA-256', bytes));
+        const next = sent + used;
+        const reply = await sendNative('append', { offset: sent, chunk: encode(bytes), digest });
+        if (reply.offset !== next) throw new Error('Native copy offset mismatch.');
+        sent = next;
+        used = 0;
+        onProgress(sent, expected || 0);
+      }
+      while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (sent + used + value.length > (expected ?? MAX_BYTES)) throw new Error('Browser file length changed.');
+        for (let start = 0; start < value.length;) {
+          const count = Math.min(CHUNK - used, value.length - start);
+          buffer.set(value.subarray(start, start + count), used);
+          used += count;
+          start += count;
+          if (used === CHUNK) await flush();
+        }
+      }
+      if (signal.aborted) throw new Error('Browser copy cancelled.');
+      await flush();
+      if (sent <= 0 || expected && sent !== expected || minimumLength && sent < minimumLength)
+        throw new Error('Browser file ended before the selected media was complete.');
+      finishing = true;
+      const done = await sendNative('finish');
+      if (!done.accepted || done.offset !== sent || typeof done.jobId !== 'string') throw uncertainFinish();
+      return done;
+    } catch (error) {
+      if (finishing && error.code !== 'invalid-media') throw uncertainFinish();
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', close);
+      if (reader) await reader.cancel().catch(() => {});
+      else await response.body.cancel().catch(() => {});
+      close();
+    }
+  }
+
+  async function copyWorkerMedia({ player, title, signal, onProgress, connect = options => chrome.runtime.connect(options) }) {
+    const channel = openChannel(connect, signal, onProgress);
+    try { return await channel.send({ operation: 'worker', player, title }); }
+    finally { channel.close(); }
+  }
+
+  // Extension worker relay for content-script ports
+  function relay(port, { nativeHost, canBegin, connectNative, makeId, stream, rememberReceipt = async () => {} }) {
     const sender = port.sender;
     let origin;
-    try { origin = new URL(sender.url).origin; } catch { /* Invalid sender. */ }
+    try { origin = new URL(sender.url).origin; } catch {}
     if (port.name !== PORT || !sender || !Number.isSafeInteger(sender.tab?.id)
         || sender.tab.id < 0 || sender.tab.incognito
         || !globalThis.VesperIntelligence.safeScope({ tabId: sender.tab.id, frameId: sender.frameId ?? 0, documentId: sender.documentId })
         || !/^https?:\/\//.test(origin || '')) return false;
 
     const transferId = makeId();
-    const calls = [];                  // native calls awaiting their in-order reply
-    let native = null, phase = 'new', sequence = 0, forwarded = 0, length = 0, closed = false;
+    const calls = [];
+    let workerController;
+    let native = null, phase = 'new', sequence = 0, forwarded = 0, expectedLength = null, closed = false;
     const close = () => {
       if (closed) return;
       closed = true;
-      // A disconnected page cannot leave an unbounded native stream alive.
-      // The receiver also expires incomplete transfers independently.
+      workerController?.abort();
       try { native?.disconnect(); } catch {}
       try { port.disconnect(); } catch {}
     };
@@ -393,15 +627,15 @@ globalThis.VesperBrowserBody = (() => {
     };
     const forward = (call, data) => {
       calls.push(call);
-      try { native.postMessage({ v: 1, id: call.id, type: 'browser-body', transferId, operation: call.operation, session: true, ...data }); }
-      catch { refuse('The native VESPER helper could not receive the copy.'); }
+      try { native.postMessage({ v: PROTOCOL, id: call.id, type: 'browser-body', transferId, operation: call.operation, session: true, ...data }); }
+      catch { refuse('The native VESPER helper could not receive the stream.'); }
     };
     const onNativeReply = reply => {
       const call = calls[0];
       if (closed || !call || reply?.id !== call.id) return close();
       if (!reply.ok) {
         if (call.operation !== 'finish' || reply.code !== 'invalid-media')
-          return refuse(reply.message || 'The native VESPER receiver rejected the copy.');
+          return refuse(reply.message || 'The native VESPER receiver rejected the stream.');
         calls.shift();
         phase = 'finished';
         try { port.postMessage({ sequence: call.sequence, ok: false, code: reply.code, message: reply.message }); }
@@ -417,7 +651,7 @@ globalThis.VesperBrowserBody = (() => {
       } else if (call.operation === 'append') {
         if (result.offset !== call.next || result.accepted) return refuse('Native copy offset mismatch.');
       } else if (call.operation === 'finish') {
-        if (!result.accepted || result.offset !== length || typeof result.jobId !== 'string')
+        if (!result.accepted || (expectedLength !== null && result.offset !== expectedLength) || typeof result.jobId !== 'string')
           return refuse('Native copy acceptance was not confirmed.');
         phase = 'finished';
       } else phase = 'finished';
@@ -428,9 +662,27 @@ globalThis.VesperBrowserBody = (() => {
       if (closed || !Number.isSafeInteger(message?.sequence) || message.sequence !== sequence + 1) return close();
       sequence = message.sequence;
       const operation = message.operation;
-      if (operation === 'begin' && phase === 'new') {
+      if (operation === 'worker' && phase === 'new' && stream) {
+        phase = 'streaming';
+        workerController = new AbortController();
+        try {
+          await rememberReceipt(transferId, sender);
+          if (closed) return;
+          const data = await stream(message, sender, {
+            transferId, signal: workerController.signal,
+            onProgress(received, total) {
+              if (!closed) port.postMessage({ sequence, progress: true, received, total });
+            }
+          });
+          if (!closed) port.postMessage({ sequence, ok: true, data });
+        } catch (error) {
+          if (!closed) port.postMessage({ sequence, ok: false, code: error.code, message: error.message });
+        }
+        phase = 'finished';
+      } else if (operation === 'begin' && phase === 'new') {
+        const hasLen = message.length !== undefined && message.length !== null;
         if (message.mediaCheck !== undefined && message.mediaCheck !== 'mp4'
-            || !Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES
+            || (hasLen && (!Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES))
             || typeof message.fileName !== 'string' || !message.fileName || message.fileName.length > 255
             || /[\\/:\u0000-\u001f]/.test(message.fileName))
           return refuse('Invalid browser file metadata.');
@@ -438,15 +690,22 @@ globalThis.VesperBrowserBody = (() => {
         if (!(await canBegin(sender, message.automatic === true)) || closed) return refuse('VESPER is not accepting browser copies.');
         await rememberReceipt(transferId, sender);
         if (closed) return;
-        length = message.length;
+        expectedLength = hasLen ? message.length : null;
         try {
           native = connectNative(nativeHost);
           native.onDisconnect.addListener(() => { if (phase !== 'finished') refuse('The native VESPER connection closed.'); });
           native.onMessage.addListener(onNativeReply);
         } catch { return refuse('The native VESPER helper is unavailable.'); }
-        forward({ id: makeId(), sequence, operation }, { origin: origin + '/', fileName: message.fileName, length,
+        forward({ id: makeId(), sequence, operation }, {
+          origin: origin + '/',
+          fileName: message.fileName,
+          ...(expectedLength !== null ? { length: expectedLength } : {}),
+          ...(typeof message.pageUrl === 'string' ? { pageUrl: message.pageUrl } : {}),
+          ...(typeof message.outputContainer === 'string' ? { outputContainer: message.outputContainer } : {}),
+          ...(Array.isArray(message.tracks) ? { tracks: message.tracks } : {}),
           automatic: message.automatic === true,
-          ...(message.mediaCheck ? { mediaCheck: message.mediaCheck } : {}) });
+          ...(message.mediaCheck ? { mediaCheck: message.mediaCheck } : {})
+        });
       } else if (operation === 'append' && phase === 'receiving') {
         if (calls.length >= WINDOW) return refuse('Too many browser copy chunks are waiting.');
         if (message.offset !== forwarded || typeof message.chunk !== 'string'
@@ -454,11 +713,13 @@ globalThis.VesperBrowserBody = (() => {
             || !/^[A-Za-z0-9+/]+={0,2}$/.test(message.chunk) || message.chunk.length % 4 !== 0
             || !/^[a-f0-9]{64}$/i.test(message.digest || '')) return refuse('Invalid browser copy chunk.');
         const size = message.chunk.length / 4 * 3 - (message.chunk.endsWith('==') ? 2 : message.chunk.endsWith('=') ? 1 : 0);
-        if (size < 1 || size > CHUNK || size > length - forwarded) return refuse('Invalid browser copy length.');
+        const maxRemaining = (expectedLength ?? MAX_BYTES) - forwarded;
+        if (size < 1 || size > CHUNK || size > maxRemaining) return refuse('Invalid browser copy length.');
         const offset = forwarded;
         forwarded += size;
-        forward({ id: makeId(), sequence, operation, next: forwarded }, { offset, chunk: message.chunk, digest: message.digest });
-      } else if (operation === 'finish' && phase === 'receiving' && forwarded === length && calls.length === 0) {
+        const trackIndex = Number.isInteger(message.trackIndex) && message.trackIndex >= 0 && message.trackIndex <= 1 ? message.trackIndex : 0;
+        forward({ id: makeId(), sequence, operation, next: forwarded }, { offset, chunk: message.chunk, digest: message.digest, trackIndex });
+      } else if (operation === 'finish' && phase === 'receiving' && forwarded > 0 && (expectedLength === null || forwarded === expectedLength) && calls.length === 0) {
         phase = 'finishing';
         forward({ id: makeId(), sequence, operation }, {});
       } else if (operation === 'abort' && phase === 'receiving') {
@@ -470,5 +731,11 @@ globalThis.VesperBrowserBody = (() => {
     port.onMessage.addListener(message => void onPageMessage(message).catch(() => refuse('Browser copy failed.')));
     return true;
   }
-  return Object.freeze({ PORT, CHUNK, WINDOW, MAX_BYTES, localBlob, eligibleHttpMedia, sameOriginMedia, validMediaProof, generatedLink, automaticGeneratedFile, fileFacts, inspectLocalMedia, copyBlob, relay });
+
+  return Object.freeze({
+    PORT, CHUNK, WINDOW, MAX_BYTES,
+    localBlob, dataUrl, eligibleHttpMedia, sameOriginMedia, validMediaProof,
+    generatedLink, automaticGeneratedFile, fileFacts, inspectLocalMedia,
+    copyBlob, copyWorkerMedia, exportMseBuffer, streamFromWorker, relay
+  });
 })();

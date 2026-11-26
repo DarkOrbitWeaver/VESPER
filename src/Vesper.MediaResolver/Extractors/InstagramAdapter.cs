@@ -65,7 +65,7 @@ internal sealed class InstagramAdapter : AdapterBase
             return await ResolveCarouselAsync(request, target, page, embedded, ct).ConfigureAwait(false);
 
         List<MediaCandidate> candidates = embedded?.Videos.FirstOrDefault()?.Candidates ?? [];
-        MediaDiscoveryResult result = await _generic.ResolveAsync(request, candidates, ct, includeBrowserCandidates: false)
+        MediaDiscoveryResult result = await _generic.ResolveAsync(request, candidates, ct, includeBrowserCandidates: candidates.Count == 0)
             .ConfigureAwait(false);
         if (result.Item is { } item)
             return MediaDiscoveryResult.FromItem(item with

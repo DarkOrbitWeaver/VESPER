@@ -43,11 +43,11 @@ function installRaceBridge() {
   const simulate = (_host, message, callback) => {
     if (message.type === 'browser-managed') {
       smoke.managed.push(message);
-      callback({ v: 1, id: message.id, ok: true });
+      callback({ v: 2, id: message.id, ok: true });
       return;
     }
     smoke.raceCalls.push({ type: message.type, operation: message.operation, id: message.id });
-    const reply = fields => callback({ v: 1, id: message.id, ok: true, ...fields });
+    const reply = fields => callback({ v: 2, id: message.id, ok: true, ...fields });
     if (message.type === 'capture-preflight')
       return reply({ data: { ready: true, siteRules: { neverCaptureHosts: [] } } });
     if (message.type === 'hello')
@@ -630,7 +630,7 @@ async function main() {
 
       const hello = await evaluate('Call registered native host',
         "new Promise((resolve, reject) => chrome.runtime.sendNativeMessage('com.vesper.downloader',"
-        + "{ v: 1, id: 'chrome-native-host-smoke-hello', type: 'hello' }, response => {"
+        + "{ v: 2, id: 'chrome-native-host-smoke-hello', type: 'hello' }, response => {"
         + "const error = chrome.runtime.lastError; if (error) reject(new Error(error.message)); else resolve(response); }))");
       assert.equal(hello?.ok, true, 'The registered native host did not answer its hello request.');
       assert.equal(hello?.data?.app, 'VESPER');
@@ -891,7 +891,16 @@ async function main() {
       await waitFor(async () => (await evaluate('Check early verification', '__warmRequests.length')) === 1,
         7000, 'The active MSE player did not prepare the witnessed stream before opening the picker.');
       await clickWith('fly');
-      await findButton('primary', 'opt');
+      try { await findButton('primary', 'opt'); }
+      catch (error) {
+        const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+        const nodes = [root];
+        for (const node of nodes) nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+        const messages = nodes.filter(node => node.nodeName === '#text' && /VESPER|media|format|download|stream/i.test(node.nodeValue))
+          .map(node => node.nodeValue).filter(value => value.length <= 200);
+        const requests = await evaluate('Check prefetch requests after opening the picker', '__warmRequests');
+        throw new Error(error.message + ' ' + JSON.stringify({ messages, requests }));
+      }
       assert.deepEqual(await evaluate('Check verification was reused', '__warmRequests'),
         ['http://127.0.0.1:' + port + '/asset-100001/playlist.m3u8']);
       preparedBeforeClick = true;

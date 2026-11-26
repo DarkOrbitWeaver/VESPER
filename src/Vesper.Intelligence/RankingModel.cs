@@ -217,4 +217,21 @@ public sealed class RankingModel
         if (!Is(best, "exactPlayerUrl") && !Is(best, "resourceWitness") && !Is(best, "manifestParent")) return "unproven-association";
         return null;
     }
+    /// <summary>Applies sign-constrained online logistic weight deltas without mutating the immutable base model.</summary>
+    public RankingModel WithOnlineAdjustments(IReadOnlyDictionary<string, double>? deltas)
+    {
+        if (deltas is null || deltas.Count == 0) return this;
+        var adjusted = new Dictionary<string, double>(Weights, StringComparer.Ordinal);
+        foreach (var (name, delta) in deltas)
+        {
+            if (!adjusted.TryGetValue(name, out double baseWeight) || !double.IsFinite(delta)) continue;
+            double next = Math.Clamp(baseWeight + Math.Clamp(delta, -4.0, 4.0), -WeightLimit, WeightLimit);
+            adjusted[name] = Schema.Negative.Contains(name) ? Math.Min(0, next) : Math.Max(0, next);
+        }
+        string nextChecksum = ComputeChecksum(Schema, Version, adjusted, Temperature, Margin, MinConfidence);
+        return new RankingModel(Schema, Version, adjusted, Temperature, Margin, MinConfidence, nextChecksum)
+        {
+            IsFallback = IsFallback
+        };
+    }
 }

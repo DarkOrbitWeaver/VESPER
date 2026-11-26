@@ -79,6 +79,9 @@
   let generation = 0;
   const observed = new Set();
   let discoveryObserver = null, discoveryFrame = 0, scrollScanTimer = 0;
+  const discoveryOptions = { childList: true, subtree: true, attributes: true,
+    attributeFilter: ['src', 'href', 'controls', 'id', 'data-permalink', 'data-vesper-shadow-host'] };
+  const observedRoots = new WeakSet();
   const intersecting = new WeakMap();
   const resize = new ResizeObserver(schedule);
   const visibility = new IntersectionObserver((entries) => {
@@ -331,10 +334,12 @@
     if (!(node instanceof Element)) return null;
     const origin = new URL(pageAddress()).origin;
     for (let card = node, depth = 0; card && depth < 16 && card !== document.body; card = card.parentElement, depth++) {
-      const allVideos = [...card.querySelectorAll('video')];
-      // Never derive one video's post from a shared multi-player feed container; a single carousel article keeps at most one visible player.
-      if (allVideos.length > 1 && !(card.tagName === 'ARTICLE' && allVideos.filter(el => visiblePlayer(el)).length <= 1)) break;
-      const videos = includePlayer ? allVideos.filter(el => observed.has(el) && visiblePlayer(el)) : [];
+      const allVideos = queryMediaIn(card, 'video');
+      const visibleVideos = allVideos.filter(el => visiblePlayer(el));
+      // Allow carousels (Instagram/X/feeds) that pre-mount offscreen slide <video> elements inside one post card;
+      // stop climbing only when multiple distinct cards' visible players share a feed wrapper.
+      if (visibleVideos.length > 1 && card.tagName !== 'ARTICLE') break;
+      const videos = includePlayer ? visibleVideos.filter(el => observed.has(el)) : [];
       if (includePlayer && !videos.length) continue;
       const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
         permalink: !!(link.querySelector?.('time[datetime]') || link.hasAttribute?.('data-permalink')) }));
@@ -392,12 +397,37 @@
     selectPlayer();
   }
 
+  function queryMediaIn(rootNode, selector = 'video,audio[controls]') {
+    const found = [];
+    const seenNodes = new Set();
+    function scan(scope, depth) {
+      if (!scope || depth > 5) return;
+      try {
+        for (const el of scope.querySelectorAll(selector)) {
+          if (!seenNodes.has(el)) { seenNodes.add(el); found.push(el); }
+        }
+        for (const hostEl of scope.querySelectorAll('[data-vesper-shadow-host]')) {
+          if (!hostEl.shadowRoot) continue;
+          if (discoveryObserver && !observedRoots.has(hostEl.shadowRoot)) {
+            discoveryObserver.observe(hostEl.shadowRoot, discoveryOptions);
+            observedRoots.add(hostEl.shadowRoot);
+          }
+          scan(hostEl.shadowRoot, depth + 1);
+        }
+      } catch {}
+    }
+    scan(rootNode, 0);
+    return found;
+  }
+
+  function inspectPlayerWitnessAttributes(el) {
+    try { el?.dispatchEvent(new Event('vesper-youtube-identity-request', { bubbles: true, composed: true })); }
+    catch {}
+  }
+
   function activeYouTubePage(el, contextPage) {
     if (!/(?:^|\.)youtube\.com$/i.test(location.hostname || '')) return null;
-    // The page-world witness is invoked on demand for this exact video element.
-    // A DOM hint is never an authorization; the native resolver verifies the ID.
-    try { el?.dispatchEvent(new Event('vesper-youtube-identity-request', { bubbles: true })); }
-    catch { return null; }
+    inspectPlayerWitnessAttributes(el);
     const id = el?.getAttribute?.('data-vesper-youtube-video-id');
     if (!/^[A-Za-z0-9_-]{11}$/.test(id || '')) return null;
     const page = new URL('/watch', location.origin);
@@ -577,28 +607,26 @@
   }
   function playerFragmentWitness(player, binding) {
     if (!player || !binding || !/^blob:https?:/i.test(playerSource(player))
-        || player.mediaKeys || protectedVideos.has(player)) return { paths: [], fingerprints: [] };
+        || player.mediaKeys || protectedVideos.has(player))
+      return { paths: [], canonicalUrls: [], fingerprints: [], tracks: [] };
     const attribute = 'data-vesper-media-provenance';
     try {
       player.removeAttribute(attribute);
-      player.dispatchEvent(new Event('vesper-media-provenance-request', { bubbles: true }));
+      player.dispatchEvent(new Event('vesper-media-provenance-request', { bubbles: true, composed: true }));
       const value = player.getAttribute(attribute);
       player.removeAttribute(attribute);
-      if (!value || value.length > 32_768) return { paths: [], fingerprints: [] };
+      if (!value || value.length > 131_072) return { paths: [], canonicalUrls: [], fingerprints: [], tracks: [] };
       const data = JSON.parse(value);
-      if (!Array.isArray(data.paths)) return { paths: [], fingerprints: [] };
+      const rawPaths = Array.isArray(data.paths) ? data.paths : [];
       const now = Date.now();
-      // The witness belongs to the current Blob/MSE object, which may have been
-      // populated before loadedmetadata. It remains untrusted ranking evidence.
-      const witnesses = data.paths.slice(0, 12).filter(item => Number.isFinite(item?.seen)
-        && item.seen >= now - 120_000
-        && item.seen <= now + 1000)
-        .map(item => ({ url: VesperPlayerSource.http(item.path), fingerprint: item.fingerprint }))
-        .filter(item => item.url && !item.url.search);
-      return { paths: [...new Set(witnesses.map(item => item.url.href))],
-        fingerprints: [...new Set(witnesses.map(item => item.fingerprint)
-          .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))] };
-    } catch { return { paths: [], fingerprints: [] }; }
+      const valid = rawPaths.slice(0, 24).filter(item => Number.isFinite(item?.seen)
+        && item.seen >= now - 30 * 60_000 && item.seen <= now + 2000);
+      const paths = [...new Set(valid.map(item => VesperPlayerSource.http(item.path)?.href).filter(Boolean))];
+      const canonicalUrls = [...new Set(valid.map(item => VesperPlayerSource.http(item.canonicalUrl || item.url)?.href).filter(Boolean))];
+      const fingerprints = [...new Set(valid.map(item => item.fingerprint).filter(v => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v)))];
+      const tracks = Array.isArray(data.tracks) ? data.tracks.slice(0, 4) : [];
+      return { paths, canonicalUrls, fingerprints, tracks };
+    } catch { return { paths: [], canonicalUrls: [], fingerprints: [], tracks: [] }; }
   }
   function watchMediaResources() {
     if (resourceObserver || typeof PerformanceObserver === 'undefined') return;
@@ -649,8 +677,9 @@
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
+    const hasLazyPosterOrCard = el instanceof HTMLVideoElement && (el.poster || cardPage(el));
     if ((el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el)) && !observed.has(el) &&
-        (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]'))) {
+        (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]') || hasLazyPosterOrCard)) {
       observed.add(el);
       if (playerAnchor(el) === el) visibility.observe(el);
       announceVideoElement();
@@ -696,7 +725,7 @@
 
   function mediaTreeChanged(records) {
     if (!alive() || discoveryFrame) return;
-    const selector = 'video,audio[controls],source';
+    const selector = 'video,audio[controls],source,[data-vesper-shadow-host]';
     const relevant = (node) => node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector));
     // Feed virtualization can insert a ready, paused player or swap post
     // links inside a recycled card without firing a new media event.
@@ -710,7 +739,8 @@
     if (host && !host.isConnected || [...observed].some(el => !el.isConnected || audioControls.get(el)?.isConnected === false)
         || records.some(record => record.type === 'attributes'
           ? (record.attributeName === 'href' ? linkInObservedCard(record.target) : relevant(record.target) || touchesObserved(record.target))
-          : [...record.addedNodes].some(relevant) || touchesObserved(record.target))) {
+          : [...record.addedNodes].some(node => relevant(node) || node?.tagName === 'A' && touchesObserved(record.target))
+              || relevant(record.target) || touchesObserved(record.target))) {
       discoveryFrame = requestAnimationFrame(() => {
         discoveryFrame = 0;
         refreshPlayers();
@@ -725,7 +755,7 @@
     for (const el of observed) {
       if (!el.isConnected || !playerAnchor(el)) { visibility.unobserve(el); observed.delete(el); }
     }
-    document.querySelectorAll('video,audio[controls]').forEach(consider);
+    queryMediaIn(document).forEach(consider);
     selectPlayer();
   }
 
@@ -1651,7 +1681,12 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
     if (!isCurrentRequest(request)) return;
+    inspectPlayerWitnessAttributes(player);
+    const attachedManifest = player?.getAttribute?.('data-vesper-player-manifest') || '';
     const playerWitness = current ? playerFragmentWitness(player, binding) : null;
+    const bestManifest = current && !VesperPlayerSource.http(src)
+      ? (VesperPlayerSource.http(attachedManifest)?.href || declaredManifest(identity))
+      : undefined;
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, multiplePlayers: hasOtherPlayer(player),
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
       title, playerPlaying: current && !player.paused && !player.ended,
@@ -1660,12 +1695,12 @@
       mutedLoop: current && !isPreview && isMutedLoop(player, src),
       playerCrossOrigin: current ? player.crossOrigin : undefined,
       playerFacts: playerFacts && Object.keys(playerFacts).length ? playerFacts : undefined,
-      // Timing hints only reorder sources independently checked by the resolver.
       resourceUrls: current ? mediaLedger.matches(evidenceKey(player)).map(item => item.url).slice(0, 12) : undefined,
       fragmentUrls: current ? recentFragments(binding.changedAt) : undefined,
       playerFragmentUrls: playerWitness?.paths,
+      playerCanonicalUrls: playerWitness?.canonicalUrls,
       playerResourceFingerprints: playerWitness?.fingerprints,
-      manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined });
+      manifestUrl: bestManifest });
     if (!isCurrentRequest(request)) return;
     if (result?.ok && result.data?.hasRelatedCollection
         && !result.data?.choices?.length && !result.data?.sourceChoices?.length) {
@@ -1683,24 +1718,42 @@
     const missingFormats = !result?.ok || (!formats?.choices?.length && !formats?.sourceChoices?.length);
     // Acquisition is a delivery recipe, not a second download UI. Only fall
     // back to the exact current player and never offer a speculative Blob URL.
-    if ((missingFormats || formats?.browserChoice)
+    if ((missingFormats || formats?.browserChoice || formats?.browserBodyAvailable)
         && current && !activeBrowserCopy && !player.mediaKeys && !protectedVideos.has(player)
         && playerFacts?.live !== true) {
       let original = formats?.browserBodyAvailable === true ? formats.browserBodyFormat : null;
+      let mseExportTracks = null;
       if (!original && missingFormats && ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
-          'site-refused', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported'].includes(result?.code)) {
+          'site-refused', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
         original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
+        if (!original && playerWitness?.tracks?.length && playerWitness.tracks.length <= 2
+            && playerWitness.tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
+              && Number.isSafeInteger(t.retainedBytes) && t.retainedBytes > 0)
+            && (playerWitness.tracks.length === 1
+              || playerWitness.tracks.some(t => t.role === 'audio') && playerWitness.tracks.some(t => t.role === 'video'))) {
+          mseExportTracks = playerWitness.tracks;
+          const totalSize = mseExportTracks.reduce((s, t) => s + (t.retainedBytes || 0), 0);
+          const mime = mseExportTracks.find(track => track.role !== 'audio')?.mimeType || mseExportTracks[0].mimeType;
+          original = { mime, sizeBytes: totalSize, container: mseExportTracks.every(track => /\/webm/i.test(track.mimeType))
+            ? 'WebM' : mseExportTracks.length === 1 && /^audio\//i.test(mime) ? 'M4A' : 'MP4' };
+        }
       }
       if (!isCurrentRequest(request)) return;
       if (original && playerSource(player) === src && playback.get(player) === binding
           && !player.mediaKeys && !protectedVideos.has(player)) {
         const audio = original.mime.startsWith('audio/');
         const height = !audio && player.videoHeight > 0 ? player.videoHeight + 'p' : '';
-        formats = { browserBody: true, title: formats?.title || title, choices: [{
-          index: 0, label: audio ? 'Original audio' : 'Original quality',
-          detail: height || (audio ? 'Audio' : 'Video'), container: original.container,
-          sizeBytes: original.sizeBytes, canClip: false
-        }] };
+        formats = {
+          browserBody: true,
+          browserBodyProof: formats?.browserBodyProof || null,
+          mseExportTracks,
+          title: formats?.title || title,
+          choices: [{
+            index: 0, label: audio ? 'Original audio' : 'Original quality',
+            detail: height || (audio ? 'Audio' : 'Video'), container: original.container,
+            sizeBytes: original.sizeBytes, canClip: false
+          }]
+        };
       }
     }
     if (!formats?.browserBody && missingFormats) {
@@ -1746,7 +1799,7 @@
     renderShell(copy.title, copy.poster, copy.duration, status, footer);
   }
 
-  async function startBrowserCopy({ player, src, title, poster, duration }) {
+  async function startBrowserCopy({ player, src, title, poster, duration, formats }) {
     if (activeBrowserCopy || generatedCopy || !panelMedia || !isCurrentRequest(panelRequest)
         || player.mediaKeys || protectedVideos.has(player) || playerSource(player) !== src) return;
     const controller = new AbortController();
@@ -1757,29 +1810,43 @@
     // The copy can outlive the picker. Navigation, extension retirement and Cancel stop it.
     let lastUpdate = 0;
     try {
-      let mediaProof = null;
-      if (!VesperBrowserBody.localBlob(src, location.origin)) {
-        const binding = playback.get(player);
-        if (!binding || binding.src !== src || binding.generation !== copy.panelMedia.generation)
-          throw new Error('The selected player changed.');
-        const reply = await send({ type: 'browser-body-media-proof', playerUrl: src,
-          pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
-          generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
-        if (!reply?.ok || controller.signal.aborted || playback.get(player) !== binding
-            || !matchesPickerPlayer(copy.panelMedia))
-          throw new Error('No verified browser file is available.');
-        mediaProof = reply.data;
-      }
-      await VesperBrowserBody.copyBlob({ url: src, origin: location.origin, title, mediaProof, signal: controller.signal,
-        onProgress(received, total) {
-          if (player.mediaKeys || protectedVideos.has(player)) { controller.abort(); return; }
-          const now = Date.now();
-          if (received !== total && now - lastUpdate < 150) return;
-          lastUpdate = now;
-          copy.status = received === total ? 'Verifying download…'
-            : 'Downloading · ' + Math.floor(received * 100 / total) + '%';
-          if (copy.statusElement?.isConnected) copy.statusElement.textContent = copy.status;
+      const binding = playback.get(player);
+      if (!binding || binding.src !== src || binding.generation !== copy.panelMedia.generation)
+        throw new Error('The selected player changed.');
+      const onProgress = (received, total) => {
+        if (player.mediaKeys || protectedVideos.has(player) || playback.get(player) !== binding) {
+          controller.abort();
+          return;
+        }
+        const now = Date.now();
+        if (received !== total && now - lastUpdate < 150) return;
+        lastUpdate = now;
+        copy.status = !total ? 'Downloading…' : received === total ? 'Verifying download…'
+          : 'Downloading · ' + Math.floor(received * 100 / total) + '%';
+        if (copy.statusElement?.isConnected) copy.statusElement.textContent = copy.status;
+      };
+      const options = { title, signal: controller.signal, onProgress };
+      if (formats.mseExportTracks) {
+        await VesperBrowserBody.exportMseBuffer({ ...options, player, tracks: formats.mseExportTracks });
+      } else if (formats.browserBodyProof?.workerFetch) {
+        const witness = playerFragmentWitness(player, binding);
+        await VesperBrowserBody.copyWorkerMedia({ ...options, player: {
+          playerUrl: src, pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
+          generation: binding.generation, mediaChangedAt: binding.changedAt, playerCanonicalUrls: witness.canonicalUrls,
+          playerResourceFingerprints: witness.fingerprints
         } });
+      } else {
+        let mediaProof;
+        if (formats.browserBodyProof) {
+          const reply = await send({ type: 'browser-body-media-proof', playerUrl: src,
+            pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
+            generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
+          if (!reply?.ok || reply.data.workerFetch || playback.get(player) !== binding || controller.signal.aborted)
+            throw new Error('No verified browser file is available.');
+          mediaProof = reply.data;
+        }
+        await VesperBrowserBody.copyBlob({ ...options, url: src, origin: location.origin, mediaProof });
+      }
       if (copy.request === panelRequest && isCurrentRequest(copy.request))
         await confirmSend('Sent to VESPER', copy.request);
     } catch (error) {
@@ -2353,7 +2420,7 @@
     if (!isCurrentRequest(request)) return;
     if (formats.browserBody) {
       if (mode !== 'download' || intent.range || intent.audioTrack || intent.subtitles?.length) return;
-      return startBrowserCopy({ player: panelMedia.player, src: panelMedia.src, title, poster, duration: seconds });
+      return startBrowserCopy({ player: panelMedia.player, src: panelMedia.src, title, poster, duration: seconds, formats });
     }
     const sending = element('div', 'msg', formats.browserChoice ? 'Starting in Chrome…' : 'Sending to VESPER…');
     sending.setAttribute('role', 'status');
@@ -2633,7 +2700,7 @@
       sendResponse(copyGeneratedLink(message.url));
       return false;
     }
-    if (message?.type === 'vesper-open-picker' && alive())
+    if (['vesper-open-picker', 'vesper-popup-open-picker'].includes(message?.type) && alive())
       sendResponse(openContextPicker(message.playerUrl) ? { ok: true } : { ok: false, code: 'no-player' });
     return false;
   });
@@ -2658,8 +2725,7 @@
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {
     discoveryObserver = new MutationObserver(mediaTreeChanged);
-    discoveryObserver.observe(document.documentElement, { childList: true, subtree: true,
-      attributes: true, attributeFilter: ['src', 'href', 'controls', 'id', 'data-permalink'] });
+    discoveryObserver.observe(document.documentElement, discoveryOptions);
   }
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;

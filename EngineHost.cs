@@ -40,6 +40,10 @@ internal static class EngineHost
             UseSystemProxy = options?.Proxy == ProxyMode.System,
             ProxyAddress = proxy,
             MaxConcurrentRequests = maxConcurrent,
+            RulePackDirectory = Path.Combine(DataDirectory, "rules"),
+            RulePackPublicKeySpki = Environment.GetEnvironmentVariable("VESPER_RULE_PACK_PUBLIC_KEY"),
+            LocalSemanticEndpoint = Uri.TryCreate(Environment.GetEnvironmentVariable("VESPER_LOCAL_SEMANTIC_ENDPOINT"),
+                UriKind.Absolute, out Uri? semanticEndpoint) ? semanticEndpoint : null,
             OriginRetryAt = cooldown is null ? null : cooldown.RetryAt,
             OriginThrottled = cooldown is null ? null : cooldown.Remember,
             Diagnostics = options is null ? null : message => System.Diagnostics.Trace.WriteLine(message, $"Media discovery ({options.Proxy})")

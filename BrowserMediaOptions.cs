@@ -51,13 +51,29 @@ internal sealed partial class BrowserBridgeHandler
         }).ToList()
     };
 
-    private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page) =>
-        request.MediaAuth is not { } auth ? null : new BrowserAuthorization
+    private static BrowserAuthorization? MediaAuthorization(BridgeRequest request, Uri page)
+    {
+        if (request.MediaAuth is null && request.HostCredentials is not { Count: > 0 }) return null;
+        Dictionary<string, string>? hostCookies = null;
+        var allowedHosts = new List<string> { page.Host };
+        if (request.HostCredentials is { Count: > 0 } creds)
         {
-            Origin = page.GetLeftPart(UriPartial.Authority), ConsentGranted = true,
-            CookieHeader = auth.Cookie, AllowedHosts = [page.Host],
-            Headers = auth.Authorization is { } value ? new() { ["Authorization"] = value } : null
+            hostCookies = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (BridgeHostCredential hc in creds)
+            {
+                hostCookies.Add(hc.Url, hc.Cookie);
+            }
+        }
+        return new BrowserAuthorization
+        {
+            Origin = page.GetLeftPart(UriPartial.Authority),
+            ConsentGranted = true,
+            CookieHeader = request.MediaAuth?.Cookie,
+            HostCookies = hostCookies,
+            AllowedHosts = allowedHosts,
+            Headers = request.MediaAuth?.Authorization is { } value ? new() { ["Authorization"] = value } : null
         };
+    }
 
     private async Task<BridgeResponse> MediaOptionsAsync(BridgeRequest request, CancellationToken ct)
     {
@@ -248,9 +264,9 @@ internal sealed partial class BrowserBridgeHandler
         }
         AudioOutput(MediaOutputPreference.M4a, "M4A (compatible)");
         AudioOutput(MediaOutputPreference.Original, "Original audio");
-        AudioOutput(MediaOutputPreference.Opus, "Opus — copied, no re-encoding");
-        AudioOutput(MediaOutputPreference.Wav, "WAV — decoded PCM");
-        AudioOutput(MediaOutputPreference.Mp3, "MP3 — re-encode when needed");
+        AudioOutput(MediaOutputPreference.Opus, "Opus (original)");
+        AudioOutput(MediaOutputPreference.Wav, "WAV (uncompressed)");
+        AudioOutput(MediaOutputPreference.Mp3, "MP3 (universal)");
 
         foreach (var format in playable.Representations.OrderByDescending(r => r.Height ?? 0)
                      .ThenByDescending(r => r.FrameRate ?? 0).ThenByDescending(r => r.BitrateKbps ?? 0).Take(56))
@@ -428,7 +444,8 @@ internal sealed partial class BrowserBridgeHandler
             MediaProvider: job.Provider, MediaId: job.MediaId, MediaQuality: job.Quality,
             MediaThumbnailUrl: job.ThumbnailUrl, MediaExpiresAt: job.ExpiresAt,
             MediaPlanJson: job.MediaPlanJson, MediaFormatId: job.FormatId, Output: job.Output,
-            MediaMetadataJson: job.MediaMetadataJson, Secrets: job.Secrets));
+            MediaMetadataJson: job.MediaMetadataJson, Secrets: job.Secrets,
+            HostCookies: job.HostCookies, OriginHeader: job.OriginHeader));
         string status = added.Status switch
         {
             AddStatus.Added => queue || added.StartDeferred ? "queued" : "started",

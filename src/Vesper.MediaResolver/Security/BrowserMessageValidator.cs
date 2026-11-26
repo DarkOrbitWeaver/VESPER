@@ -17,12 +17,12 @@ internal sealed class ValidatedBrowserContext
 }
 
 /// <summary>
-/// Treats the browser message as hostile. Credentials are used only with explicit consent, only for the page's own
-/// origin (plus declared subdomains), only for allow-listed headers, and never with header-injection characters.
+/// Validates untrusted browser discovery messages, enforcing explicit consent, header-injection guards,
+/// exact credential scopes, and CDN cookie isolation.
 /// </summary>
 internal static class BrowserMessageValidator
 {
-    private const int MaxCandidates = 64, MaxSubtitles = 64, MaxAudioTracks = 32, MaxCookieChars = 8192, MaxHeaderChars = 4096, MaxExtraHosts = 5;
+    private const int MaxCandidates = 64, MaxSubtitles = 64, MaxAudioTracks = 32, MaxCookieChars = 8192, MaxHeaderChars = 4096, MaxExtraHosts = 16;
 
     public static ValidatedBrowserContext Validate(BrowserDiscoveryMessage m, DateTimeOffset now, ResolverOptions options)
     {
@@ -61,21 +61,23 @@ internal static class BrowserMessageValidator
                 "direct" => CandidateKind.Direct,
                 _ => MediaCandidate.Classify(u, c.MimeType)
             };
+            string? cleanObservedTag = null;
             if (c.ObservedLength is not null || c.ObservedMinimumLength is not null || c.ObservedETag is not null)
             {
                 long? length = c.ObservedLength ?? c.ObservedMinimumLength;
                 if (kind != CandidateKind.Direct || length is not (> 0 and <= MediaCandidate.MaxObservedLength)
-                    || c.ObservedLength is not null && c.ObservedMinimumLength is not null
-                    || c.ObservedETag is not { Length: > 2 and <= 256 } observedTag
-                    || !System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
-                    || tag.IsWeak || tag.Tag == "*" || tag.ToString() != observedTag)
+                    || c.ObservedLength is not null && c.ObservedMinimumLength is not null)
                     continue;
+                if (c.ObservedETag is { Length: > 2 and <= 256 } observedTag
+                    && System.Net.Http.Headers.EntityTagHeaderValue.TryParse(observedTag, out var tag)
+                    && !tag.IsWeak && tag.Tag != "*")
+                    cleanObservedTag = tag.ToString();
             }
             v.Candidates.Add(new MediaCandidate(
                 UrlUtil.WithoutFragment(u), kind, Short(c.MimeType, 80), Dim(c.Width), Dim(c.Height),
                 c.Bitrate is > 0 and < 10_000_000_000 ? c.Bitrate : null,
                 c.DurationSeconds is > 0 and < 8_640_000 ? c.DurationSeconds : null,
-                Short(c.Label, 80), c.MutedLoop, c.ObservedLength, c.ObservedETag, c.ObservedMinimumLength));
+                Short(c.Label, 80), c.MutedLoop, c.ObservedLength, cleanObservedTag, c.ObservedMinimumLength));
         }
         if (m.Candidates.Count > MaxCandidates) v.Warnings.Add($"Only the first {MaxCandidates} candidates were considered");
 
@@ -94,6 +96,7 @@ internal static class BrowserMessageValidator
     private static MediaRequestContext BuildContext(BrowserDiscoveryMessage m, Uri page, DateTimeOffset now, List<string> warnings)
     {
         string? ua = m.UserAgent is { Length: > 0 and <= 256 } u && IsPrintableAscii(u) ? u : null;
+        string pageOrigin = UrlUtil.Origin(page);
         var baseCtx = new MediaRequestContext
         {
             Referer = UrlUtil.WithoutFragment(page).AbsoluteUri,
@@ -108,7 +111,7 @@ internal static class BrowserMessageValidator
             warnings.Add("Authorization context ignored: user consent flag is not set");
             return baseCtx;
         }
-        if (!string.Equals(auth.Origin?.TrimEnd('/'), UrlUtil.Origin(page), StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(auth.Origin?.TrimEnd('/'), pageOrigin, StringComparison.OrdinalIgnoreCase))
             throw new MediaResolverException(MediaErrors.Blocked("Authorization origin does not match the page origin; credentials rejected"));
         if (auth.ExpiresAt is { } exp && exp <= now)
             throw new MediaResolverException(MediaErrors.Expired("Browser authorization context has expired"));
@@ -121,6 +124,18 @@ internal static class BrowserMessageValidator
             cookie = auth.CookieHeader;
         }
 
+        var hostCookies = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (auth.HostCookies is not null)
+        {
+            foreach (var kv in auth.HostCookies.Take(MaxExtraHosts))
+            {
+                if (!Uri.TryCreate(kv.Key, UriKind.Absolute, out Uri? scope) || scope.Scheme != "https"
+                    || scope.UserInfo.Length != 0 || scope.Query.Length != 0 || scope.Fragment.Length != 0) continue;
+                if (string.IsNullOrEmpty(kv.Value) || kv.Value.Length > MaxCookieChars || HasControl(kv.Value)) continue;
+                hostCookies[scope.GetLeftPart(UriPartial.Path)] = kv.Value;
+            }
+        }
+
         var sensitive = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string? acceptLanguage = null;
         foreach (var kv in auth.Headers ?? new())
@@ -129,26 +144,29 @@ internal static class BrowserMessageValidator
                 throw new MediaResolverException(MediaErrors.Invalid("Forwarded header contains control characters or is too long"));
             if (kv.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)) sensitive["Authorization"] = kv.Value;
             else if (kv.Key.Equals("Accept-Language", StringComparison.OrdinalIgnoreCase)) acceptLanguage = kv.Value;
+            else if (kv.Key.Equals("Origin", StringComparison.OrdinalIgnoreCase)) { /* already derived from verified pageOrigin */ }
             else warnings.Add($"Header '{TextUtil.Clip(kv.Key, 30)}' is not on the forward allow-list and was dropped");
         }
 
-        var hosts = new List<string> { page.Host };
+        var hosts = new List<string> { page.IdnHost };
         foreach (var h in (auth.AllowedHosts ?? new()).Take(MaxExtraHosts))
         {
             if (string.IsNullOrWhiteSpace(h)) continue;
             string host = h.Trim().ToLowerInvariant();
             bool ok = Uri.CheckHostName(host) == UriHostNameType.Dns &&
-                      (host == page.Host.ToLowerInvariant() || host.EndsWith("." + page.Host.ToLowerInvariant(), StringComparison.Ordinal));
+                      (host == page.IdnHost || host.EndsWith("." + page.IdnHost, StringComparison.Ordinal));
             if (ok) hosts.Add(host);
-            else warnings.Add($"Credential host '{TextUtil.Clip(host, 60)}' is not the page host or one of its subdomains and was dropped");
+            else warnings.Add($"Credential host '{TextUtil.Clip(host, 60)}' is outside the page host and was dropped");
         }
 
         return baseCtx with
         {
             AcceptLanguage = acceptLanguage,
+            Origin = pageOrigin,
             CookieHeader = cookie,
+            HostCookies = hostCookies,
             SensitiveHeaders = sensitive,
-            CredentialOrigin = new Uri(UrlUtil.Origin(page)),
+            CredentialOrigin = new Uri(pageOrigin),
             CredentialHosts = hosts.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
         };
     }

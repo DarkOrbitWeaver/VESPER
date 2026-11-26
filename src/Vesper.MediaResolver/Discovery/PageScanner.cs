@@ -164,19 +164,22 @@ internal static class PageScanner
             }
             foreach (var a in ogAudios) AddCandidate(a, metas.GetValueOrDefault("og:audio:type") ?? "audio/*", null, null, null);
 
-            // Structured player configuration is a fallback, not permission to mix
-            // several unrelated videos from a feed or recommendation section.
             if (_meta.Candidates.Count == 0)
-                foreach (MediaCandidate candidate in _configs.UniqueGroup)
+            {
+                foreach (MediaCandidate candidate in _configs.BestCandidates)
                     AddCandidate(candidate.Url.AbsoluteUri, candidate.MimeType, candidate.Width, candidate.Height, candidate.Label);
-            // Script fallbacks are weaker than explicit player markup and may
-            // be separate videos. Only use a unique candidate, not a feed's URLs.
+                foreach (SubtitleTrack sub in _configs.BestSubtitles)
+                    if (_meta.Subtitles.Count < 32 && !_meta.Subtitles.Any(s => s.Url == sub.Url))
+                        _meta.Subtitles.Add(sub);
+            }
             if (_meta.Candidates.Count == 0 && !_configs.HasEvidence
                 && _scriptFallbacks.Distinct(StringComparer.Ordinal).Take(2).Count() == 1)
                 AddCandidate(_scriptFallbacks[0], null, null, null, null);
-            _meta.Title = Clean(_ldTitle) ?? Clean(metas.GetValueOrDefault("og:title")) ?? Clean(metas.GetValueOrDefault("twitter:title")) ?? Clean(docTitle);
+            _meta.Title = Clean(_ldTitle) ?? Clean(_configs.BestTitle) ?? Clean(metas.GetValueOrDefault("og:title")) ?? Clean(metas.GetValueOrDefault("twitter:title")) ?? Clean(docTitle);
             _meta.Description ??= Clean(metas.GetValueOrDefault("og:description")) ?? Clean(metas.GetValueOrDefault("description"));
-            _meta.Thumbnail ??= UrlUtil.Resolve(_base, metas.GetValueOrDefault("og:image") ?? metas.GetValueOrDefault("twitter:image"));
+            _meta.Thumbnail ??= _configs.BestThumbnail ?? UrlUtil.Resolve(_base, metas.GetValueOrDefault("og:image") ?? metas.GetValueOrDefault("twitter:image"));
+            if (_meta.Duration is null && _configs.BestDurationSeconds is { } cfgDuration)
+                _meta.Duration = TimeSpan.FromSeconds(cfgDuration);
             return _meta;
         }
 
@@ -211,13 +214,14 @@ internal static class PageScanner
                 || id.Equals("video-config", StringComparison.OrdinalIgnoreCase)
                 || id.Equals("playerConfig", StringComparison.OrdinalIgnoreCase);
             string? json = type.Equals("application/json", StringComparison.OrdinalIgnoreCase)
-                || id is "__NEXT_DATA__" or "__NUXT_DATA__" ? body : null;
+                || tag.Attr("data-sjs") is not null
+                || id is "__NEXT_DATA__" or "__NUXT_DATA__" or "__UNIVERSAL_DATA_FOR_REHYDRATION__" or "SIGI_STATE" or "__INITIAL_STATE__" ? body : null;
             if (json is null)
             {
                 string trimmed = body.Trim();
-                foreach (string prefix in new[] { "window.playerConfig =", "window.videoConfig =", "const playerConfig =", "var playerConfig =" })
+                foreach (string prefix in new[] { "window.playerConfig =", "window.videoConfig =", "window.__INITIAL_STATE__ =", "window.__PRELOADED_STATE__ =", "window.__DATA__ =", "const playerConfig =", "var playerConfig =" })
                     if (trimmed.StartsWith(prefix, StringComparison.Ordinal))
-                    { json = trimmed[prefix.Length..].Trim().TrimEnd(';'); explicitPlayer = true; break; }
+                    { json = trimmed[prefix.Length..].Trim().TrimEnd(';'); explicitPlayer = prefix.Contains("Config", StringComparison.Ordinal); break; }
             }
             if (json is not null)
             {

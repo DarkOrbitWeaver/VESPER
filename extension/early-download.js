@@ -8,6 +8,14 @@
   const explicitFile = /\.(?:txt|md|csv|json|docx|xlsx|pptx|odt|ods|epub|torrent|wasm|map|log|sql|bak)$/i;
   const queryKeys = new Set(['id','file','filename','name','format','download','version','arch','platform','lang',
     'ref','tag','branch','commit','sha','rev','release','path']);
+  const signedKey = /^(?:x-amz-(?:algorithm|credential|date|expires|signedheaders|signature|security-token)|x-goog-(?:algorithm|credential|date|expires|signedheaders|signature)|response-content-(?:disposition|type)|sv|sp|st|se|sr|spr|sig|rscd)$/i;
+
+  function signedDownload(url) {
+    const keys = [...url.searchParams.keys()];
+    const signed = ['X-Amz-Signature', 'X-Goog-Signature', 'sig'].some(key => url.searchParams.has(key));
+    return url.protocol === 'https:' && signed && keys.every(key => queryKeys.has(key.toLowerCase()) || signedKey.test(key));
+  }
+
   function explicitName(address, page, name) {
     try {
       return typeof name === 'string' && name.length > 0 && name.length <= 255
@@ -24,7 +32,7 @@
       let name = '';
       try { name = decodeURIComponent(url.pathname.split('/').at(-1)); } catch { return null; }
       const explicit = explicitName(url.href, origin.href, downloadName);
-      if (url.search && [...url.searchParams.keys()].some(key => !queryKeys.has(key.toLowerCase()))) return null;
+      if (url.search && [...url.searchParams.keys()].some(key => !queryKeys.has(key.toLowerCase())) && !signedDownload(url)) return null;
       if (explicit) name = explicit;
       const isEligible = file.test(name) || (explicit && explicitFile.test(name)) || archivePath.test(url.pathname);
       return isEligible && !/[\\/\x00-\x1f\x7f]/.test(name) ? url.href : null;

@@ -124,7 +124,7 @@ globalThis.VesperNativeSession = (() => {
         failInFlight({ ok: false, code: missing ? 'host-missing' : 'host-error',
           message: 'The VESPER connection closed before it answered.' });
       });
-      try { connection.postMessage({ v: 1, id: handshakeId, type: 'session-open' }); }
+      try { connection.postMessage({ v: 2, id: handshakeId, type: 'session-open' }); }
       catch { unsupported(); }
     }).then(result => {
       if (!result.ok) opening = null;

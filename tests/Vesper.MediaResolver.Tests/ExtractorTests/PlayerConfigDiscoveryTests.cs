@@ -11,6 +11,54 @@ public class PlayerConfigDiscoveryTests
     private const string Target = "https://player-config.example/media-object";
     private const string Decoy = "https://player-config.example/ad.mp4";
 
+    [Fact]
+    public void SignedRulePackRejectsAnUntrustedKeyAndAnOlderVersion()
+    {
+        using var signer = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        using var stranger = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        var store = new Vesper.MediaResolver.Rules.RulePackStore(
+            pinnedPublicKeySpki: Convert.ToBase64String(signer.ExportSubjectPublicKeyInfo()));
+
+        static string Sign(int version, System.Security.Cryptography.ECDsa key)
+        {
+            byte[] payload = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                schema = "vesper.extractor-pack/1", version, publishedAt = "2026-11-26", rules = Array.Empty<object>()
+            });
+            return JsonSerializer.Serialize(new
+            {
+                payloadBase64 = Convert.ToBase64String(payload),
+                signatureBase64 = Convert.ToBase64String(key.SignData(payload, System.Security.Cryptography.HashAlgorithmName.SHA256))
+            });
+        }
+
+        Assert.False(store.TryInstallSignedPack(Sign(3, stranger)));
+        Assert.True(store.TryInstallSignedPack(Sign(3, signer)));
+        Assert.False(store.TryInstallSignedPack(Sign(2, signer)));
+        Assert.Equal(3, store.Current.Version);
+    }
+
+    [Fact]
+    public void CdnCookiesAreBoundToHttpsOriginAndExactCaseSensitivePath()
+    {
+        var page = new Uri(Page);
+        var context = new MediaRequestContext
+        {
+            CredentialOrigin = page, CredentialHosts = [page.Host],
+            CookieHeader = "page=private",
+            SensitiveHeaders = new Dictionary<string, string> { ["Authorization"] = "Bearer page-only" },
+            HostCookies = new Dictionary<string, string> { ["https://cdn.example/assets/clip.mp4"] = "cdn=private" }
+        };
+
+        var approved = new Uri("https://cdn.example/assets/clip.mp4?range=0-500");
+        Assert.Equal("cdn=private", context.CookieFor(approved));
+        Assert.DoesNotContain(context.HeadersFor(approved), header => header.Key == "Authorization");
+        Assert.Null(context.CookieFor(new Uri("https://cdn.example/assets/Clip.mp4")));
+        Assert.Null(context.CookieFor(new Uri("https://cdn.example:444/assets/clip.mp4")));
+        Assert.Null(context.CookieFor(new Uri("http://cdn.example/assets/clip.mp4")));
+        Assert.Null(context.CookieFor(new Uri("https://unrelated." + page.Host + "/watch")));
+    }
+
     public static IEnumerable<object[]> SourceListLayouts()
     {
         foreach (string player in new[] { "player", "player_config", "VIDEO_CONFIG", "playback" })
@@ -102,7 +150,7 @@ public class PlayerConfigDiscoveryTests
     public async Task BudgetExhaustionCannotProveAUniquePlayer()
     {
         var config = new Dictionary<string, object> { ["player"] = new { src = Target, type = "video/mp4" } };
-        for (int i = 0; i < 520; i++) config["irrelevant" + i] = i;
+        for (int i = 0; i < 33_000; i++) config["irrelevant" + i] = i;
         await AssertRefused(config);
     }
 

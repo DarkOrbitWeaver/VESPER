@@ -1,6 +1,12 @@
 'use strict';
 
 globalThis.VesperPlayerSource = (() => {
+  const TRACKING_PARAMS = new Set([
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid',
+    'igshid', 'igsh', 'si', 'feature', 'pp', 'ref_src', 'ref_url', 'spm_id_from', 'vd_source',
+    'is_from_webapp', 'sender_device', 'web_id'
+  ]);
+
   function http(value) {
     if (typeof value !== 'string' || !value || value.length > 4096 || /[\r\n\0]/.test(value)) return null;
     try {
@@ -9,6 +15,14 @@ globalThis.VesperPlayerSource = (() => {
       url.hash = '';
       return url;
     } catch { return null; }
+  }
+
+  function normalizedPageHref(url) {
+    const clean = new URL(url.href);
+    for (const key of [...clean.searchParams.keys()]) {
+      if (TRACKING_PARAMS.has(key.toLowerCase())) clean.searchParams.delete(key);
+    }
+    return clean.href;
   }
 
   function identity(value) {
@@ -97,7 +111,7 @@ globalThis.VesperPlayerSource = (() => {
         : parts.length === 3 && parts[0] === 'videos' && ['watch', 'embed'].includes(parts[1]) ? parts[2] : null;
       if (/^[a-z0-9_-]{6,40}$/i.test(peertubeId || '')) return `peertube:${url.origin}:${peertubeId}`;
     }
-    return url.href;
+    return normalizedPageHref(url);
   }
 
   // The page of the one post a feed card shows, from the card's own same-origin links. A site identity

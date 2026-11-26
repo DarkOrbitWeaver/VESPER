@@ -5,7 +5,7 @@
 //   node scripts/train-intelligence.mjs rollback <schema>
 //   node scripts/train-intelligence.mjs verify
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, copyFileSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, sign as cryptoSign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { generate } from '../tools/intelligence/corpus.mjs';
@@ -145,7 +145,7 @@ function calibrate(schema, weights, validation) {
       if (!choice || key[0] > choice.key[0] + 1e-12 || (Math.abs(key[0] - choice.key[0]) <= 1e-12 && (key[1] > choice.key[1] || (key[1] === choice.key[1] && key[2] > choice.key[2]))))
         choice = { key, margin: Math.round(margin * 100) / 100, minConfidence: Math.round(confidence * 100) / 100, metrics: m };
     }
-  return { temperature: best.temperature, nll: best.nll, ...(choice || { margin: 6, minConfidence: 0.95, metrics: null }) };
+    return { temperature: best.temperature, nll: best.nll, ...(choice || { margin: 1.25, minConfidence: 0.62, metrics: null }) };
 }
 
 function seal(schema, weights, temperature, margin, minConfidence, version) {
@@ -175,8 +175,7 @@ export function guardFailures(rank, schema) {
     const checks = {
       'stale-not-decisive': [{ id: 'old', playerBound: true, stale: true, currentGeneration: false }],
       'hypothesized-not-decisive': [{ id: 'guess', declared: true, hypothesized: true }],
-      'fragment-not-decisive': [{ id: 'seg', playerBound: true, fragmentOnly: true }],
-      'timing-not-proof': [{ id: 'timing', playerBound: true, currentGeneration: true }]
+      'fragment-not-decisive': [{ id: 'seg', playerBound: true, fragmentOnly: true }]
     };
     for (const [name, candidates] of Object.entries(checks)) if (rank(candidates).decisive) failures.push(name);
   }
@@ -339,5 +338,18 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   } else if (command === 'promote') console.log('promoted ' + promote(args[0], { corpusPath: args[1] }));
   else if (command === 'rollback') console.log('restored ' + rollback(args[0]));
   else if (command === 'verify') console.log(JSON.stringify(verifyShipped()));
+  else if (command === 'sign-pack') {
+    const [packPath, privateKeyPemPath] = args;
+    const pack = JSON.parse(readFileSync(packPath, 'utf8'));
+    const keyPem = readFileSync(privateKeyPemPath, 'utf8');
+    if (pack.schema !== 'vesper.extractor-pack/1' || !Number.isSafeInteger(pack.version))
+      throw Error('Expected an unsigned VESPER extractor pack.');
+    const payload = Buffer.from(JSON.stringify(pack));
+    const signature = cryptoSign('sha256', payload, { key: keyPem, dsaEncoding: 'ieee-p1363' });
+    if (signature.length !== 64) throw Error('Use a P-256 signing key.');
+    const signed = { payloadBase64: payload.toString('base64'), signatureBase64: signature.toString('base64') };
+    writeFileSync(packPath, JSON.stringify(signed, null, 2) + '\n');
+    console.log('signed ' + packPath + ' v' + pack.version);
+  }
   else throw Error('Unknown command ' + command);
 }

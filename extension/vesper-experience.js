@@ -91,5 +91,12 @@ const VesperExperience = (() => {
     await writes;
   }
 
-  return { note, promising, standing, clear };
+  async function score(site, strategy) {
+    const { verified, refused } = await standing(site, strategy);
+    const alpha = verified + 1, beta = refused + 1;
+    const total = alpha + beta;
+    return alpha / total + Math.sqrt(alpha * beta / (total * total * (total + 1)));
+  }
+
+  return { note, promising, standing, score, clear };
 })();

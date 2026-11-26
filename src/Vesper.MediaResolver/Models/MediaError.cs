@@ -83,7 +83,7 @@ public static class MediaErrors
         "A network problem prevented discovery.", diagnostic, retry, false, false);
 
     public static MediaError AuthRequired(string diagnostic) => new(MediaErrorCode.AuthorizationRequired,
-        "The site refused this request. Refresh formats from the page where the video plays. If it keeps failing, check that Chrome and VESPER use the same VPN or proxy.", diagnostic, false, true, false);
+        "The site refused this request. If the video plays in Chrome, open formats from the VESPER button on that player.", diagnostic, false, true, false);
 
     public static MediaError SourceChanged(string diagnostic) => new(MediaErrorCode.SourceChanged,
         "The website changed its format and this adapter could not read it.", diagnostic, false, true, false);

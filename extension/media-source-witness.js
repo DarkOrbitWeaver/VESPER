@@ -1,21 +1,35 @@
-// Page-world media provenance. No complete body is copied, intercepted or retained.
-// A response body object can sometimes be recognized when it becomes an object
-// URL or is appended to an MSE SourceBuffer. A player-scoped path hint is useful for
-// ranking, but is never authority to download or proof of the complete asset.
+// MAIN-world universal media provenance, MSE SourceBuffer reconstruction, byte-slice association,
+// shadow-DOM player discovery, and live player-config inspection across any website.
 (() => {
   'use strict';
-  if (typeof MediaSource !== 'function' || typeof SourceBuffer !== 'function'
-      || typeof WeakRef !== 'function' || typeof Response !== 'function') return;
-  const urls = new Map();
-  const owners = new WeakMap();
-  const buffers = new WeakMap();
-  const streams = new WeakMap();
-  const readers = new WeakMap();
-  const bufferSlots = [];
-  const MAX_SOURCES = 24, MAX_BUFFERS = 96, MAX_PATHS = 12, TTL = 120_000;
-  let observingResponses = false, pendingHashes = 0;
+  if (globalThis.__vesperMediaSourceWitnessV2) return;
+  globalThis.__vesperMediaSourceWitnessV2 = true;
+
+  if (typeof WeakRef !== 'function') return;
+
+  const MAX_SOURCES = 24;
+  const MAX_BUFFERS = 256;
+  const MAX_URLS_PER_TRACK = 64;
+  const MAX_INIT_BYTES = 256 * 1024;
+  const MAX_TRACK_BUFFER_BYTES = 24 * 1024 * 1024;
+  const MAX_TOTAL_MSE_BYTES = 64 * 1024 * 1024;
+  const TTL = 120_000;
   const apply = Reflect.apply;
   const now = Date.now.bind(Date);
+
+  const objectUrls = new Map();       // blobUrl -> { ref: WeakRef<MediaSource|Blob>, createdAt, tracks: Set<TrackState>, paths: Map }
+  const sourceOwners = new WeakMap(); // SourceBuffer -> TrackState
+  const mediaSources = new WeakMap(); // MediaSource -> tracks
+  const bufferProvenance = new WeakMap(); // ArrayBuffer | Blob -> ProvenanceRecord
+  const streamProvenance = new WeakMap(); // ReadableStream -> SourceDescriptor
+  const readerProvenance = new WeakMap(); // ReadableStreamDefaultReader -> SourceDescriptor
+  const requestMeta = new WeakMap();      // XMLHttpRequest -> { method, url, rangeHeader }
+  const bufferRing = [];
+  const retainedMseOrder = [];
+  let totalRetainedBytes = 0;
+  let pendingDigests = 0;
+
+  const SLICE_QUERY_KEYS = new Set(['bytestart', 'byteend', 'range', 'sq', 'segment', 'seg', 'chunk', 'frag', 'part']);
 
   function replace(object, name, wrapper) {
     try {
@@ -25,21 +39,148 @@
       return true;
     } catch { return false; }
   }
-  function pathOf(address, mime) {
+
+  function parseHttpUrl(address) {
+    if (typeof address !== 'string' || !address || address.length > 4096 || /[\r\n\0]/.test(address)) return null;
     try {
-      const url = new URL(address);
+      const url = new URL(address, globalThis.location?.href);
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
-      mime ||= '';
-      if (!/^(?:video\/|audio\/|application\/(?:octet-stream|mp4))/i.test(mime)
-          && !/\.(?:m4s|cmfv|cmfa|ts|aac|mp4|webm)$/i.test(url.pathname)) return null;
       url.hash = '';
-      const path = url.origin + url.pathname;
-      return path.length <= 2048 && url.href.length <= 4096 ? { path, address: url.href } : null;
+      return url;
     } catch { return null; }
   }
-  // Inspect only bytes the page already read. Keep two short, distinctive
-  // samples from an MP4 media-data box, not the body or any encryption keys.
-  // Equal-length, zero-filled or ambiguous matches never become provenance.
+
+  function extractSliceRange(url, contentRange, requestRange, byteLength) {
+    if (typeof contentRange === 'string') {
+      const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange.trim());
+      if (match) {
+        const start = Number(match[1]), end = Number(match[2]);
+        const total = match[3] === '*' ? null : Number(match[3]);
+        if (Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start)
+          return { start, end, total: Number.isSafeInteger(total) && total > 0 ? total : null, mode: 'http-range' };
+      }
+    }
+    const bs = url.searchParams.get('bytestart');
+    const be = url.searchParams.get('byteend');
+    if (bs !== null && /^\d+$/.test(bs)) {
+      const start = Number(bs);
+      const end = be !== null && /^\d+$/.test(be) ? Number(be) : (byteLength > 0 ? start + byteLength - 1 : start);
+      if (Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start)
+        return { start, end, total: null, mode: 'query-bytestart' };
+    }
+    const rangeParam = url.searchParams.get('range');
+    if (rangeParam && /^\d+-\d+$/.test(rangeParam)) {
+      const [s, e] = rangeParam.split('-').map(Number);
+      if (Number.isSafeInteger(s) && Number.isSafeInteger(e) && e >= s)
+        return { start: s, end: e, total: null, mode: 'query-range' };
+    }
+    if (typeof requestRange === 'string') {
+      const m = /^bytes=(\d+)-(\d*)$/i.exec(requestRange.trim());
+      if (m) {
+        const start = Number(m[1]);
+        const end = m[2] ? Number(m[2]) : (byteLength > 0 ? start + byteLength - 1 : start);
+        if (Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start)
+          return { start, end, total: null, mode: 'request-range' };
+      }
+    }
+    return null;
+  }
+
+  function canonicalizeSliceUrl(url) {
+    const copy = new URL(url.href);
+    const parts = copy.search.slice(1).split('&');
+    const kept = parts.filter(part => part && !/^(?:bytestart|byteend|range)=/i.test(part));
+    if (kept.length === parts.length || !copy.search) return null;
+    copy.search = kept.length ? '?' + kept.join('&') : '';
+    return copy.href;
+  }
+
+  function describeNetworkSource(address, mime = '', contentRange = '', requestRange = '', contentLength = null) {
+    const url = parseHttpUrl(address);
+    if (!url) return null;
+    const cleanMime = String(mime || '').split(';')[0].trim().toLowerCase();
+    const isManifest = /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url.href) || /(?:mpegurl|dash\+xml)/i.test(cleanMime);
+    const isMediaLike = isManifest
+      || /^(?:video\/|audio\/|application\/(?:octet-stream|mp4|ogg|vnd\.yt-ump))/i.test(cleanMime)
+      || /\.(?:m4s|cmfv|cmfa|ts|aac|mp4|m4v|m4a|webm|mp3|ogg|opus|flac)(?:[?#]|$)/i.test(url.pathname)
+      || [...url.searchParams.keys()].some(k => SLICE_QUERY_KEYS.has(k.toLowerCase()));
+    if (!isMediaLike) return null;
+    const declaredLen = /^\d+$/.test(String(contentLength ?? '')) ? Number(contentLength) : null;
+    const slice = extractSliceRange(url, contentRange, requestRange, declaredLen || 0);
+    return {
+      address: url.href,
+      path: url.origin + url.pathname,
+      canonicalUrl: slice ? canonicalizeSliceUrl(url) : null,
+      mime: cleanMime,
+      isManifest,
+      slice,
+      declaredLength: declaredLen,
+      at: now(),
+      fingerprint: null
+    };
+  }
+
+  function computeDigestAsync(record) {
+    if (record.fingerprint || pendingDigests >= 24 || typeof TextEncoder !== 'function' || !globalThis.crypto?.subtle) return;
+    pendingDigests++;
+    try {
+      globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(record.address))
+        .then(buf => {
+          record.fingerprint = Array.from(new Uint8Array(buf), b => b.toString(16).padStart(2, '0')).join('');
+        }, () => {})
+        .finally(() => { pendingDigests--; });
+    } catch { pendingDigests--; }
+  }
+
+  function inspectMediaBytes(input) {
+    try {
+      const bytes = ArrayBuffer.isView(input)
+        ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+        : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
+      if (!bytes || bytes.length < 8) return null;
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const firstWord = view.getUint32(0);
+
+      // WebM / Matroska EBML header (0x1A45DFA3) vs Cluster (0x1F43B675)
+      if (firstWord === 0x1a45dfa3) return { container: 'webm', hasInit: true, hasMedia: bytes.length > 4096 };
+      if (firstWord === 0x1f43b675) return { container: 'webm', hasInit: false, hasMedia: true };
+
+      // MPEG-TS 188-byte packets
+      if (bytes.length >= 376 && bytes[0] === 0x47 && bytes[188] === 0x47)
+        return { container: 'ts', hasInit: false, hasMedia: true };
+
+      // ISO BMFF / MP4 / fMP4 box scan
+      let offset = 0, hasFtyp = false, hasMoov = false, hasMoof = false, hasMdat = false, initEnd = 0;
+      for (let i = 0; i < 64 && offset + 8 <= bytes.length; i++) {
+        let size = view.getUint32(offset), header = 8;
+        const type = view.getUint32(offset + 4);
+        if (size === 1) {
+          if (offset + 16 > bytes.length) break;
+          size = view.getUint32(offset + 8) * 4294967296 + view.getUint32(offset + 12);
+          header = 16;
+        } else if (size === 0) {
+          size = bytes.length - offset;
+        }
+        if (size < header || offset + size > bytes.length) break;
+        if (type === 0x66747970) { hasFtyp = true; if (!hasMoof && !hasMdat) initEnd = offset + size; } // ftyp
+        else if (type === 0x6d6f6f76) { hasMoov = true; if (!hasMoof && !hasMdat) initEnd = offset + size; } // moov
+        else if (type === 0x73696478 && hasMoov && !hasMoof && !hasMdat) { initEnd = offset + size; } // sidx
+        else if (type === 0x6d6f6f66) hasMoof = true; // moof
+        else if (type === 0x6d646174) hasMdat = true; // mdat
+        offset += size;
+      }
+      if (hasFtyp || hasMoov || hasMoof || hasMdat) {
+        return {
+          container: 'mp4',
+          hasInit: hasMoov,
+          initEnd: hasMoov ? Math.min(initEnd || bytes.length, MAX_INIT_BYTES) : 0,
+          hasMedia: hasMdat || hasMoof
+        };
+      }
+      return bytes.length >= 128 ? { container: 'unknown', hasInit: false, hasMedia: true } : null;
+    } catch { return null; }
+  }
+
   function distinctiveSample(bytes, start, end, kind) {
     if (end - start < 128) return null;
     const first = bytes.slice(start, start + 32), last = bytes.slice(end - 32, end);
@@ -85,178 +226,457 @@
       return offset === bytes.length ? sample : null;
     } catch { return null; }
   }
-  function matchingSample(input) {
-    const sample = mediaSample(input);
-    if (!sample) return null;
-    const at = now();
-    let match = null;
-    for (const { evidence } of bufferSlots) {
-      const prior = evidence.sample;
-      if (at - evidence.at > TTL || !equalSample(sample, prior)) continue;
-      // Even two matching samples cannot distinguish different requests.
-      if (match && match !== evidence) return null;
-      match = evidence;
-    }
-    return match && (match.sampleHint ||= { path: match.path, at: match.at, sampleOnly: true });
-  }
-
-  function rememberBuffer(buffer, source) {
-    if (!source || !(buffer instanceof ArrayBuffer || typeof Blob === 'function' && buffer instanceof Blob)) return;
-    const { path, address } = source;
-    const previous = buffers.get(buffer);
-    if (previous?.path === path && now() - previous.at < TTL) return;
-    const evidence = { path, at: now(), fingerprint: null, sample: mediaSample(buffer) };
-    buffers.set(buffer, evidence);
-    // Hash the exact URL, including its query, without keeping or exporting it.
-    // The asynchronous digest never blocks playback, and outstanding work is capped.
-    if (pendingHashes < 16 && typeof TextEncoder === 'function' && globalThis.crypto?.subtle) {
-      try {
-        const pending = globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(address));
-        pendingHashes++;
-        pending.then(value => {
-          evidence.fingerprint = Array.from(new Uint8Array(value), byte => byte.toString(16).padStart(2, '0')).join('');
-        }, () => {}).finally(() => pendingHashes--).catch(() => {});
-      } catch { /* Nonsecure origins can still use path evidence. */ }
-    }
-    bufferSlots.push({ ref: new WeakRef(buffer), evidence });
-    while (bufferSlots.length > MAX_BUFFERS) {
-      const old = bufferSlots.shift(), key = old.ref.deref();
-      if (key && buffers.get(key) === old.evidence) buffers.delete(key);
+  function rememberBuffer(buffer, descriptor) {
+    if (!descriptor || !(buffer instanceof ArrayBuffer || (typeof Blob === 'function' && buffer instanceof Blob))) return;
+    const sample = buffer instanceof ArrayBuffer ? mediaSample(buffer) : null;
+    const existing = bufferProvenance.get(buffer);
+    if (existing?.address === descriptor.address && now() - existing.at <= TTL) return;
+    const record = { ...descriptor, at: now(), sample };
+    computeDigestAsync(record);
+    bufferProvenance.set(buffer, record);
+    bufferRing.push({ ref: new WeakRef(buffer), record });
+    while (bufferRing.length > MAX_BUFFERS) {
+      const evicted = bufferRing.shift();
+      const target = evicted?.ref.deref();
+      if (target && bufferProvenance.get(target) === evicted.record) bufferProvenance.delete(target);
     }
   }
 
-  function watchXhr() {
-    if (typeof XMLHttpRequest !== 'function') return;
+  // Propagate ArrayBuffer provenance across .slice() so players slicing ring buffers keep exact URL + byte offset!
+  replace(ArrayBuffer.prototype, 'slice', original => function (begin, end) {
+    const sliced = apply(original, this, [begin, end]);
     try {
-      const descriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
-      if (!descriptor?.get || !descriptor.configurable) return;
-      Object.defineProperty(XMLHttpRequest.prototype, 'response', {
-        ...descriptor,
-        get() {
-          // The page itself reads the response. No duplicate read or request.
-          const value = apply(descriptor.get, this, []);
-          try {
-            if (this.readyState === 4 && (this.responseType === 'arraybuffer' || this.responseType === 'blob')
-                && this.status >= 200 && this.status < 300)
-              rememberBuffer(value, pathOf(this.responseURL, this.getResponseHeader('content-type')));
-          } catch { /* Do not change the result of the native getter. */ }
-          return value;
-        }
-      });
-    } catch { /* Some environments prevent property replacement. */ }
-  }
+      const parent = bufferProvenance.get(this);
+      if (parent && now() - parent.at <= TTL) {
+        const offset = Math.max(0, Number(begin) || 0);
+        const childSlice = parent.slice ? {
+          ...parent.slice,
+          start: parent.slice.start + offset,
+          end: parent.slice.start + offset + Math.max(0, sliced.byteLength - 1)
+        } : null;
+        rememberBuffer(sliced, { ...parent, slice: childSlice });
+      }
+    } catch {}
+    return sliced;
+  });
 
-  function watchResponses() {
-    if (observingResponses) return;
-    observingResponses = true;
-    watchXhr();
-    for (const method of ['arrayBuffer', 'blob']) replace(Response.prototype, method, original => function (...args) {
-      // Preserve the original promise and its result. Only metadata survives.
-      const promise = apply(original, this, args);
+  function hookNetwork() {
+    // 1. Fetch hook (captures request Range headers + manifest URLs + response bodies)
+    if (typeof globalThis.fetch === 'function') {
+      replace(globalThis, 'fetch', original => function (input, init) {
+        let reqRange = '';
+        try {
+          const h = init?.headers || (typeof Request === 'function' && input instanceof Request ? input.headers : null);
+          if (h) {
+            if (typeof h.get === 'function') reqRange = h.get('range') || h.get('Range') || '';
+            else if (typeof h === 'object') reqRange = h.Range || h.range || '';
+          }
+        } catch {}
+        const promise = apply(original, this, [input, init]);
+        try {
+          promise.then(response => {
+            try {
+              if (response && reqRange) streamProvenance.set(response, { reqRange });
+            } catch {}
+          }, () => {});
+        } catch {}
+        return promise;
+      });
+    }
+
+    // 2. Response body readers
+    if (typeof Response === 'function') {
+      for (const method of ['arrayBuffer', 'blob']) {
+        replace(Response.prototype, method, original => function (...args) {
+          const promise = apply(original, this, args);
+          try {
+            const meta = streamProvenance.get(this);
+            const desc = describeNetworkSource(
+              this.url,
+              this.headers?.get('content-type'),
+              this.headers?.get('content-range'),
+              meta?.reqRange || '',
+              this.headers?.get('content-length')
+            );
+            if (desc) promise.then(buf => rememberBuffer(buf, desc), () => {});
+          } catch {}
+          return promise;
+        });
+      }
+      if (typeof ReadableStream === 'function' && typeof ReadableStreamDefaultReader === 'function') {
+        try {
+          const bodyDesc = Object.getOwnPropertyDescriptor(Response.prototype, 'body');
+          if (bodyDesc?.get && bodyDesc.configurable) {
+            Object.defineProperty(Response.prototype, 'body', {
+              ...bodyDesc,
+              get() {
+                const stream = apply(bodyDesc.get, this, []);
+                try {
+                  if (stream) {
+                    const meta = streamProvenance.get(this);
+                    const desc = describeNetworkSource(
+                      this.url,
+                      this.headers?.get('content-type'),
+                      this.headers?.get('content-range'),
+                      meta?.reqRange || '',
+                      this.headers?.get('content-length')
+                    );
+                    if (desc) streamProvenance.set(stream, desc);
+                  }
+                } catch {}
+                return stream;
+              }
+            });
+          }
+          replace(ReadableStream.prototype, 'getReader', original => function (...args) {
+            const reader = apply(original, this, args);
+            try {
+              const desc = streamProvenance.get(this);
+              if (reader && desc) readerProvenance.set(reader, desc);
+            } catch {}
+            return reader;
+          });
+          replace(ReadableStreamDefaultReader.prototype, 'read', original => function (...args) {
+            const promise = apply(original, this, args);
+            try {
+              const desc = readerProvenance.get(this);
+              if (desc) {
+                promise.then(chunk => {
+                  const val = chunk && !chunk.done ? chunk.value : null;
+                  if (val) rememberBuffer(val.buffer || val, desc);
+                }, () => {});
+              }
+            } catch {}
+            return promise;
+          });
+        } catch {}
+      }
+    }
+
+    // 3. XMLHttpRequest hook
+    if (typeof XMLHttpRequest === 'function') {
+      replace(XMLHttpRequest.prototype, 'open', original => function (method, url, ...rest) {
+        try { requestMeta.set(this, { method: String(method || 'GET'), url: String(url || ''), rangeHeader: '' }); } catch {}
+        return apply(original, this, [method, url, ...rest]);
+      });
+      replace(XMLHttpRequest.prototype, 'setRequestHeader', original => function (name, value) {
+        try {
+          if (String(name || '').toLowerCase() === 'range') {
+            const meta = requestMeta.get(this);
+            if (meta) meta.rangeHeader = String(value || '');
+          }
+        } catch {}
+        return apply(original, this, [name, value]);
+      });
       try {
-        const path = pathOf(this.url, this.headers.get('content-type'));
-        if (path) promise.then(buffer => rememberBuffer(buffer, path), () => {}).catch(() => {});
-      } catch { /* Optional observation. */ }
-      return promise;
-    });
-    if (typeof ReadableStream === 'function' && typeof ReadableStreamDefaultReader === 'function') {
-      try {
-        const bodyDesc = Object.getOwnPropertyDescriptor(Response.prototype, 'body');
-        if (bodyDesc?.get && bodyDesc.configurable) {
-          Object.defineProperty(Response.prototype, 'body', {
-            ...bodyDesc,
+        const respDesc = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+        if (respDesc?.get && respDesc.configurable) {
+          Object.defineProperty(XMLHttpRequest.prototype, 'response', {
+            ...respDesc,
             get() {
-              const stream = apply(bodyDesc.get, this, []);
+              const val = apply(respDesc.get, this, []);
               try {
-                const source = stream && pathOf(this.url, this.headers.get('content-type'));
-                if (source) streams.set(stream, source);
-              } catch { /* Optional observation. */ }
-              return stream;
+                if (this.readyState === 4 && this.status >= 200 && this.status < 300) {
+                  const ct = this.getResponseHeader('content-type') || '';
+                  if (this.responseType === 'arraybuffer' || this.responseType === 'blob') {
+                    const meta = requestMeta.get(this);
+                    const desc = describeNetworkSource(
+                      this.responseURL || meta?.url || '',
+                      ct,
+                      this.getResponseHeader('content-range') || '',
+                      meta?.rangeHeader || '',
+                      this.getResponseHeader('content-length')
+                    );
+                    if (desc) rememberBuffer(val, desc);
+                  }
+                }
+              } catch {}
+              return val;
             }
           });
         }
-        replace(ReadableStream.prototype, 'getReader', original => function (...args) {
-          const reader = apply(original, this, args);
-          try {
-            const source = streams.get(this);
-            if (reader && source) readers.set(reader, source);
-          } catch { /* Optional observation. */ }
-          return reader;
-        });
-        replace(ReadableStreamDefaultReader.prototype, 'read', original => function (...args) {
-          const promise = apply(original, this, args);
-          try {
-            const source = readers.get(this);
-            if (source) promise.then(chunk => {
-              const value = chunk && !chunk.done ? chunk.value : null;
-              if (value) rememberBuffer(value.buffer || value, source);
-            }, () => {}).catch(() => {});
-          } catch { /* Optional observation. */ }
-          return promise;
-        });
-      } catch { /* Optional observation. */ }
+      } catch {}
     }
   }
-  replace(URL, 'createObjectURL', original => function (...args) {
-    const url = apply(original, this, args);
+
+  function discardTrack(track) {
+    totalRetainedBytes -= track.retainedBytes;
+    track.initBytes = null;
+    track.chunks = [];
+    track.retainedBytes = 0;
+    track.evicted = true;
+  }
+
+  function reserveMseBytes(track, count) {
+    if (track.evicted || track.retainedBytes + count > MAX_TRACK_BUFFER_BYTES) {
+      if (!track.evicted) discardTrack(track);
+      return false;
+    }
+    while (totalRetainedBytes + count > MAX_TOTAL_MSE_BYTES) {
+      const oldest = retainedMseOrder.shift();
+      if (!oldest) return false;
+      if (!oldest.evicted) discardTrack(oldest);
+      if (oldest === track) return false;
+    }
+    totalRetainedBytes += count;
+    track.retainedBytes += count;
+    return true;
+  }
+
+  function inferRole(mimeType) {
+    const m = String(mimeType || '').toLowerCase();
+    if (m.startsWith('audio/')) return 'audio';
+    if (m.startsWith('video/')) {
+      const codecs = /codecs\s*=\s*"?([^";]+)/i.exec(m)?.[1] || '';
+      if (codecs.includes(',') && /(?:mp4a|opus|vorbis|ac-3|ec-3|flac)/i.test(codecs)) return 'muxed';
+      return 'video';
+    }
+    return 'muxed';
+  }
+
+  function matchBySample(sample) {
+    if (!sample) return null;
+    let match = null;
+    for (const { record } of bufferRing) {
+      if (now() - record.at > TTL || !equalSample(sample, record.sample)) continue;
+      if (match && match !== record) return null;
+      match = record;
+    }
+    return match && { path: match.path, at: match.at, address: match.path, sampleOnly: true };
+  }
+
+  if (typeof MediaSource === 'function' && typeof SourceBuffer === 'function') {
+    replace(URL, 'createObjectURL', original => function (...args) {
+      const url = apply(original, this, args);
+      try {
+        const obj = args[0];
+        if (obj instanceof MediaSource) {
+          let msState = mediaSources.get(obj);
+          if (!msState) {
+            msState = { tracks: new Set() };
+            mediaSources.set(obj, msState);
+          }
+          objectUrls.set(url, { kind: 'mse', ref: new WeakRef(obj), msState, paths: new Map(), createdAt: now() });
+          while (objectUrls.size > MAX_SOURCES) objectUrls.delete(objectUrls.keys().next().value);
+        } else if (typeof Blob === 'function' && obj instanceof Blob) {
+          const prov = bufferProvenance.get(obj);
+          const paths = new Map();
+          if (prov && now() - prov.at <= TTL) paths.set(prov.address, { evidence: prov, seen: prov.at });
+          objectUrls.set(url, { kind: 'blob', ref: new WeakRef(obj), blobType: obj.type, blobSize: obj.size, paths, createdAt: now() });
+          while (objectUrls.size > MAX_SOURCES) objectUrls.delete(objectUrls.keys().next().value);
+        }
+      } catch {}
+      return url;
+    });
+
+    let trackCounter = 0;
+    replace(MediaSource.prototype, 'addSourceBuffer', original => function (mimeType, ...rest) {
+      const sb = apply(original, this, [mimeType, ...rest]);
+      try {
+        let msState = mediaSources.get(this);
+        if (!msState) {
+          msState = { tracks: new Set() };
+          mediaSources.set(this, msState);
+        }
+        const track = {
+          id: 'sb-' + (++trackCounter),
+          mimeType: String(mimeType || ''),
+          role: inferRole(mimeType),
+          ownerRef: new WeakRef(this),
+          initBytes: null,
+          chunks: [],
+          retainedBytes: 0,
+          totalAppendedBytes: 0,
+          evicted: false
+        };
+        msState.tracks.add(track);
+        sourceOwners.set(sb, track);
+        if (retainedMseOrder.length >= 32) discardTrack(retainedMseOrder.shift());
+        retainedMseOrder.push(track);
+      } catch {}
+      return sb;
+    });
+
+    replace(SourceBuffer.prototype, 'appendBuffer', original => function (data, ...rest) {
+      const res = apply(original, this, [data, ...rest]);
+      try {
+        const track = sourceOwners.get(this);
+        if (!track) return res;
+        const rawBytes = ArrayBuffer.isView(data)
+          ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+          : data instanceof ArrayBuffer ? new Uint8Array(data) : null;
+        if (!rawBytes || rawBytes.byteLength === 0) return res;
+
+        const backing = ArrayBuffer.isView(data) ? data.buffer : data;
+        const sample = mediaSample(rawBytes);
+        const exact = bufferProvenance.get(backing);
+        const wholeBuffer = backing.byteLength === rawBytes.byteLength;
+        const prov = exact && wholeBuffer && (!exact.sample || equalSample(exact.sample, sample))
+          ? exact : matchBySample(sample);
+        const inspected = inspectMediaBytes(rawBytes);
+
+        if (!track.evicted && track.totalAppendedBytes === 0 && inspected?.hasInit) {
+          if (rawBytes.byteLength <= MAX_TRACK_BUFFER_BYTES && reserveMseBytes(track, rawBytes.byteLength))
+            track.initBytes = rawBytes.slice();
+          else discardTrack(track);
+        } else if (!track.evicted && track.initBytes) {
+          if (inspected?.hasInit) discardTrack(track);
+          else if (reserveMseBytes(track, rawBytes.byteLength)) track.chunks.push(rawBytes.slice());
+        }
+        track.totalAppendedBytes += rawBytes.byteLength;
+
+        if (prov && now() - prov.at <= TTL) {
+          const seenAt = now();
+          const ms = track.ownerRef.deref();
+          if (ms) {
+            for (const record of objectUrls.values()) {
+              if (record.ref.deref() !== ms) continue;
+              record.paths.delete(prov.address);
+              record.paths.set(prov.address, { evidence: prov, seen: seenAt });
+              while (record.paths.size > MAX_URLS_PER_TRACK) record.paths.delete(record.paths.keys().next().value);
+            }
+          }
+        }
+      } catch {}
+      return res;
+    });
+  }
+
+  // Shadow DOM discovery: mark elements that attach shadow roots so isolated content.js can find nested players
+  if (typeof Element === 'function' && Element.prototype.attachShadow) {
+    const shadowRoots = new WeakMap();
+    replace(Element.prototype, 'attachShadow', original => function (init) {
+      const root = apply(original, this, [init]);
+      try {
+        shadowRoots.set(this, root);
+        this.setAttribute?.('data-vesper-shadow-host', '');
+      } catch {}
+      return root;
+    });
+  }
+
+  hookNetwork();
+
+  function encodeBase64(bytes) {
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 8192)
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+    return btoa(binary);
+  }
+
+  // Universal player identity inspection (replaces single-site youtube-player-witness.js)
+  document.addEventListener('vesper-youtube-identity-request', event => {
+    const video = event.composedPath?.()[0] || event.target;
+    if (video?.tagName !== 'VIDEO') return;
+    video.removeAttribute('data-vesper-youtube-video-id');
+    video.removeAttribute('data-vesper-player-manifest');
+    if (video.readyState < 1) return;
     try {
-      if (args[0] instanceof MediaSource) {
-        urls.set(url, { ref: new WeakRef(args[0]), paths: new Map() });
-        while (urls.size > MAX_SOURCES) urls.delete(urls.keys().next().value);
-        watchResponses();
-      } else if (typeof Blob === 'function' && args[0] instanceof Blob) {
-        const evidence = buffers.get(args[0]);
-        if (evidence && now() - evidence.at <= TTL) {
-          urls.set(url, { ref: new WeakRef(args[0]), paths: new Map([[evidence, now()]]) });
-          while (urls.size > MAX_SOURCES) urls.delete(urls.keys().next().value);
+      const ytPlayer = video.closest?.('.html5-video-player');
+      if (ytPlayer && typeof ytPlayer.getVideoData === 'function' && ytPlayer.contains(video)) {
+        const id = ytPlayer.getVideoData()?.video_id;
+        if (/^[A-Za-z0-9_-]{11}$/.test(id || '')) video.setAttribute('data-vesper-youtube-video-id', id);
+      }
+      // Generic HLS.js / Dash.js / Shaka / Video.js attached instance manifest discovery
+      for (const key of Object.getOwnPropertyNames(video).slice(0, 40)) {
+        const val = Object.getOwnPropertyDescriptor(video, key)?.value;
+        if (!val || typeof val !== 'object') continue;
+        const manifestCandidate = val.url || val.manifestUri_ || val.src_ || val.currentSource?.src;
+        const parsed = typeof manifestCandidate === 'string' ? parseHttpUrl(manifestCandidate) : null;
+        if (parsed && /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(parsed.href)) {
+          video.setAttribute('data-vesper-player-manifest', parsed.href);
+          break;
         }
       }
-    } catch { /* Do not affect page playback. */ }
-    return url;
-  });
-  replace(MediaSource.prototype, 'addSourceBuffer', original => function (...args) {
-    const buffer = apply(original, this, args);
-    try { owners.set(buffer, new WeakRef(this)); watchResponses(); } catch {}
-    return buffer;
-  });
-  replace(SourceBuffer.prototype, 'appendBuffer', original => function (...args) {
-    const result = apply(original, this, args);
-    try {
-      const input = args[0];
-      const buffer = ArrayBuffer.isView(input) ? input.buffer : input;
-      const exact = buffers.get(buffer);
-      // A typed view over a larger response does not prove its whole contents.
-      const full = !ArrayBuffer.isView(input) || input.byteOffset === 0 && input.byteLength === buffer.byteLength;
-      const exactUnchanged = full && exact && (!exact.sample || equalSample(exact.sample, mediaSample(input)));
-      const evidence = exactUnchanged ? exact : matchingSample(input);
-      const owner = owners.get(this)?.deref();
-      if (owner && evidence && now() - evidence.at <= TTL) {
-        // Never retain the buffer. Exact-object and sample-only evidence stay distinct.
-        for (const record of urls.values()) {
-          if (record.ref.deref() !== owner) continue;
-          record.paths.delete(evidence);
-          record.paths.set(evidence, now());
-          while (record.paths.size > MAX_PATHS) record.paths.delete(record.paths.keys().next().value);
-        }
-      }
-    } catch { /* Observation is optional and never blocks append. */ }
-    return result;
-  });
-  // Players may fetch media before creating the MediaSource or Blob URL.
-  // Observe the original promise only; never read a response a second time.
-  watchResponses();
+    } catch {}
+  }, true);
+
+  // Rich provenance inspection for isolated content script
   document.addEventListener('vesper-media-provenance-request', event => {
-    const player = event.target;
+    const player = event.composedPath?.()[0] || event.target;
     if (!(player instanceof HTMLMediaElement)) return;
     try {
-      const url = player.currentSrc || player.src;
-      const record = urls.get(url);
+      const src = player.currentSrc || player.src;
+      const record = objectUrls.get(src);
       if (!record?.ref.deref() || player.mediaKeys) return;
       const at = now();
-      const paths = [...record.paths].filter(([, seen]) => at - seen <= TTL)
-        .map(([evidence, seen]) => ({ path: evidence.path, seen,
-          ...(evidence.fingerprint ? { fingerprint: evidence.fingerprint } : {}) }));
-      player.setAttribute('data-vesper-media-provenance', JSON.stringify({ paths }));
-    } catch { /* The isolated script can continue without this hint. */ }
+      const paths = [...record.paths.values()]
+        .filter(item => at - item.seen <= TTL)
+        .slice(-24)
+        .map(({ evidence, seen }) => ({
+          path: evidence.path,
+          seen,
+          ...(evidence.canonicalUrl ? { canonicalUrl: evidence.canonicalUrl } : {}),
+          ...(evidence.fingerprint ? { fingerprint: evidence.fingerprint } : {})
+        }));
+
+      const tracks = [];
+      if (record.kind === 'mse' && record.msState) {
+        for (const track of record.msState.tracks) {
+          const bufferedComplete = Boolean(
+            track.initBytes && !track.evicted && track.retainedBytes > 0
+            && record.ref.deref()?.readyState === 'ended'
+            && player.buffered?.length === 1 && player.buffered.start(0) <= 0.5
+            && Number.isFinite(player.duration) && player.duration > 0
+            && player.buffered.end(0) >= player.duration - 0.75
+          );
+          tracks.push({
+            id: track.id,
+            role: track.role,
+            mimeType: track.mimeType,
+            hasInit: Boolean(track.initBytes),
+            initLength: track.initBytes?.byteLength || 0,
+            retainedBytes: track.retainedBytes,
+            totalAppendedBytes: track.totalAppendedBytes,
+            bufferedComplete
+          });
+        }
+      }
+
+      player.setAttribute('data-vesper-media-provenance', JSON.stringify({
+        kind: record.kind,
+        paths,
+        tracks
+      }));
+    } catch {}
+  }, true);
+
+  // Export buffered MSE track chunks on demand (chunked by index so DOM attribute stays < 768 KiB)
+  document.addEventListener('vesper-mse-export-request', event => {
+    const player = event.composedPath?.()[0] || event.target;
+    if (!(player instanceof HTMLMediaElement) || player.mediaKeys) return;
+    try {
+      const reqText = player.getAttribute('data-vesper-mse-export-query');
+      player.removeAttribute('data-vesper-mse-export-query');
+      if (!reqText) return;
+      const req = JSON.parse(reqText);
+      const record = objectUrls.get(player.currentSrc || player.src);
+      if (record?.kind !== 'mse' || !record.msState) return;
+      const track = [...record.msState.tracks].find(t => t.id === req.trackId);
+      if (!track?.initBytes || track.evicted || record.ref.deref()?.readyState !== 'ended') return;
+
+      const partCount = 1 + track.chunks.length;
+      const index = req.partIndex;
+      if (!Number.isSafeInteger(index) || index < 0 || index >= partCount) {
+        player.setAttribute('data-vesper-mse-export-chunk', JSON.stringify({ done: true, totalParts: partCount }));
+        return;
+      }
+      const bytes = index === 0 ? track.initBytes : track.chunks[index - 1];
+      // Slice large single appends into <= 384 KiB pieces
+      const SLICE = 384 * 1024;
+      const subOffset = req.subOffset;
+      if (!Number.isSafeInteger(subOffset) || subOffset < 0 || subOffset >= bytes.byteLength) return;
+      const slice = bytes.subarray(subOffset, Math.min(bytes.byteLength, subOffset + SLICE));
+      const nextSubOffset = subOffset + slice.byteLength < bytes.byteLength ? subOffset + slice.byteLength : 0;
+      const nextPartIndex = nextSubOffset === 0 ? index + 1 : index;
+      player.setAttribute('data-vesper-mse-export-chunk', JSON.stringify({
+        done: false,
+        chunk: encodeBase64(slice),
+        byteLength: slice.byteLength,
+        nextPartIndex,
+        nextSubOffset,
+        finishedAfterThis: nextPartIndex >= partCount
+      }));
+    } catch {}
   }, true);
 })();

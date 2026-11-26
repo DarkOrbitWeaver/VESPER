@@ -299,7 +299,7 @@ test('unsupported sources and a missing connection are reported, not hidden', as
 test('requests carry the protocol version and a valid id', async () => {
   const { describe, sent } = load({ probe: { ok: true, data: { kind: 'hls-media' } } });
   await describe('https://x/a.m3u8', null);
-  assert.equal(sent[0].v, 1);
+  assert.equal(sent[0].v, 2);
   assert.match(sent[0].id, /^[A-Za-z0-9_-]{8,64}$/);
   assert.equal(sent[0].type, 'probe');
 });
@@ -1375,29 +1375,23 @@ test('Chrome keeps a download it is already more than halfway through', async ()
   assert.equal(app.sessionData.vesperCaptureDecisions[0].outcome, 'chrome-started');
 });
 
-test('after a worker restart a parked download with bytes stays parked only if its record says Chrome can resume it', async () => {
+test('worker recovery releases a stopped native handoff when Chrome already received bytes', async () => {
   const file = { ...activeDownload(), paused: true, bytesReceived: 300 };
-  const parked = {
-    startTime: file.startTime, transferId: 'legacy-parked-1', stage: 'parking',
-    attempts: 1, resumeChrome: true, chromeResumable: true, parkUntil: Date.now() + 10_000,
-    sourceHash: await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(file.url))
-      .then(b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, '0')).join(''))
-  };
-
-  // The new worker has no response evidence left. The record's own fact keeps the handoff valid.
-  const resumed = load({ 'browser-transfer': transfer('active') }, { download: file,
-    localData: { browserDownloads: { [file.id]: parked } } });
-  await resumed.recover();
-  assert.equal(file.paused, true);
-  assert.equal(resumed.localData.browserDownloads[file.id].stage, 'parked');
-  resumed.stopWorker();
-
-  const unsafe = load({ 'browser-transfer': transfer('failed') }, { download: file,
-    localData: { browserDownloads: { [file.id]: { ...parked, chromeResumable: false } } } });
-  await unsafe.recover();
-  assert.equal(unsafe.sent.some(message => message.operation === 'accept'), false);
-  assert.equal(file.paused, false);
-  assert.equal(unsafe.actions.includes('cancel'), false);
+  const sourceHash = Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(file.url))).toString('hex');
+  for (const chromeResumable of [true, false]) {
+    const app = load({ 'browser-transfer': transfer('failed') }, { download: file,
+      localData: { browserDownloads: { [file.id]: {
+        startTime: file.startTime, transferId: 'legacy-parked-1', stage: 'parking', sourceHash,
+        attempts: 1, resumeChrome: true, chromeResumable, parkUntil: Date.now() + 10_000
+      } } } });
+    file.paused = true;
+    await app.recover();
+    assert.ok(app.sent.some(message => message.operation === 'abandon'));
+    assert.equal(app.sent.some(message => message.operation === 'accept'), false);
+    assert.equal(file.paused, false);
+    assert.equal(app.actions.includes('cancel'), false);
+    app.stopWorker();
+  }
 });
 
 // ---- Last-Modified as the strong validator (RFC 9110 8.8.2.2), for helpers that accept it
@@ -1515,7 +1509,7 @@ test('a signed address too long to name a site is still handed off, and still re
   assert.ok(!declined.sessionData.vesperCaptureDecisions.some(entry => entry.outcome === 'capture-error'));
 });
 
-test('an extension update forgets what the previous version learned about sites', async () => {
+test('an extension update preserves local outcome history', async () => {
   const app = load();
   const promising = () => app.evaluate(`VesperExperience.promising('files.example', 'takeover')`);
   for (let count = 0; count < 2; count++)
@@ -1526,8 +1520,8 @@ test('an extension update forgets what the previous version learned about sites'
   assert.equal(await promising(), false, 'a browser update changes nothing VESPER learned');
 
   await app.install({ reason: 'update' });
-  assert.equal(await promising(), true);
-  assert.equal(app.localData.vesperExperience, undefined);
+  assert.equal(await promising(), false);
+  assert.doesNotMatch(JSON.stringify(app.localData.vesperExperience), /files\.example|takeover/);
 });
 
 test('a timeout or a busy helper teaches nothing about the site', async () => {
@@ -2592,7 +2586,7 @@ for (const mime of ['video/mp4', 'video/webm', 'audio/webm', 'audio/mp4']) {
   });
 }
 
-test('two independently witnessed query-addressed ranges can propose a verified full resource, not automatically select it',async()=>{
+test('a single witnessed slice can propose a full resource while contradictory ranges stay blocked',async()=>{
   const page='https://www.instagram.com/reel/ranged/', base='https://cdn.example.com/asset.mp4?signature=abc%2Fdef';
   const sender={url:page,tab:{id:81},frameId:0,documentId:'query-range-document'};
   const changedAt=Date.now(), urls=[base+'&bytestart=0&byteend=999',base+'&bytestart=1000&byteend=1999'];
@@ -2616,7 +2610,7 @@ test('two independently witnessed query-addressed ranges can propose a verified 
         playerResourceFingerprints:await Promise.all((scenario==='one-witness'?urls.slice(0,1):urls).map(hash))};
       const result=await app.message(request,sender);
       const checks=app.sent.filter(m=>m.type==='media-range-options');
-      if(!['verified','changed-after-picker','query-200','query-200-replaced'].includes(scenario)){
+      if(!['verified','one-witness','other-document','changed-after-picker','query-200','query-200-incorrect-length','query-200-replaced'].includes(scenario)){
         assert.equal(checks.length,0,scenario);
         assert.equal(result.ok,false,scenario);
         continue;
@@ -2626,11 +2620,12 @@ test('two independently witnessed query-addressed ranges can propose a verified 
       assert.equal(checks[0].candidates[0].observedETag,'"v1"');
       const querySlice = scenario.startsWith('query-200');
       assert.equal(checks[0].candidates[0].observedLength,querySlice ? undefined : 700000);
-      assert.equal(checks[0].candidates[0].observedMinimumLength,querySlice ? 2000 : undefined);
+      assert.equal(checks[0].candidates[0].observedMinimumLength,
+        querySlice ? (scenario === 'query-200-incorrect-length' ? 1000 : 2000) : undefined);
       assert.equal(result.data.sourceChoices.length,1);
       if(['changed-after-picker','query-200-replaced'].includes(scenario))await report(1,'"changed"',changedAt+1);
       const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
-      assert.equal(selected.ok,['verified','query-200'].includes(scenario),scenario);
+      assert.equal(selected.ok,!['changed-after-picker','query-200-replaced'].includes(scenario),scenario);
     }finally{app.stopWorker()}
   }
 });
@@ -2939,7 +2934,9 @@ test('known fragments never reach the native picker as complete direct files', a
     type: 'media', timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' },
       { name: 'Content-Range', value: 'bytes 50-99/120' }] });
   await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: url }, sender);
-  assert.equal(app.sent.find(r => r.type === 'media-options').candidates[0].url, url);
+  const check = app.sent.find(r => r.type === 'media-range-options');
+  assert.equal(check.candidates[0].url, url);
+  assert.equal(check.candidates[0].observedLength, 120);
   app.stopWorker();
 });
 

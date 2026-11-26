@@ -27,7 +27,17 @@ public sealed class ResolverOptions
     public IReadOnlyList<string> YouTubeClients { get; init; } = ["visionos"];
     public int MaxSegmentsPerRepresentation { get; init; } = 50_000;
     public int MaxCandidatesPerPage { get; init; } = 24;
-    public int MaxManifestsPerPage { get; init; } = 3;
+    public int MaxManifestsPerPage { get; init; } = 4;
+
+    /// <summary>Directory containing hot-updated signed declarative extractor packs (%LOCALAPPDATA%\VESPER\rules).</summary>
+    public string? RulePackDirectory { get; init; }
+
+    /// <summary>Optional trusted P-256 public key for signed extractor packs.</summary>
+    public string? RulePackPublicKeySpki { get; init; }
+
+    /// <summary>Optional loopback-only local LLM endpoint (e.g. http://127.0.0.1:11434/api/generate) for obfuscated script synthesis.</summary>
+    public Uri? LocalSemanticEndpoint { get; init; }
+    public string LocalSemanticModel { get; init; } = "qwen2.5-coder:1.5b";
 
     /// <summary>Disables the private-network (SSRF) guard. Only for tests/loopback fixtures.</summary>
     public bool AllowPrivateNetworks { get; init; }

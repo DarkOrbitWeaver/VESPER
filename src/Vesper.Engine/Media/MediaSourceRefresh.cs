@@ -89,44 +89,60 @@ public sealed partial class DownloadEngine
 
     private static bool TryCreateMergeCredentials(MediaMergePlan plan, Uri requestUrl,
         IReadOnlyDictionary<string, string>? supplied, out RequestCredentials? credentials, out string error,
-        bool allowSegmented = false)
+        bool allowSegmented = false, IReadOnlyDictionary<string, string>? hostCookies = null, string? originHeader = null)
     {
         credentials = null;
         error = "";
-        if (supplied is not { Count: > 0 }) return true;
+        if (supplied is not { Count: > 0 } && hostCookies is not { Count: > 0 } && string.IsNullOrWhiteSpace(originHeader))
+            return true;
         if ((!allowSegmented && plan.IsSegmented) || plan.Tracks.Count == 0
-            || !UrlPolicy.TryParse(plan.Tracks[0].Url, out Uri first, out _)
-            || !UrlPolicy.IsSameOrigin(requestUrl, first))
+            || !UrlPolicy.TryParse(plan.Tracks[0].Url, out Uri first, out _))
         {
-            error = "The merge credentials require compatible tracks on one source origin.";
+            error = "The merge credentials require valid track addresses.";
             return false;
-        }
-        foreach (MergeTrack track in plan.Tracks)
-        {
-            if ((!allowSegmented && track.Source is not null) || !UrlPolicy.TryParse(track.Url, out Uri target, out _)
-                || !UrlPolicy.IsSameOrigin(first, target))
-            {
-                error = "The requested credential scope is not supported for these merge tracks.";
-                return false;
-            }
         }
 
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach ((string name, string value) in supplied)
+        if (supplied is { Count: > 0 })
         {
-            string canonical = name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ? "Cookie"
-                : name.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ? "Authorization" : "";
-            if (canonical.Length == 0 || headers.ContainsKey(canonical) || string.IsNullOrEmpty(value)
-                || value.Length > 8192 || value.Any(char.IsControl))
+            // Direct origin-wide Cookie/Authorization still require same-origin tracks unless scoped via hostCookies
+            bool sameOrigin = plan.Tracks.All(t => UrlPolicy.TryParse(t.Url, out Uri target, out _) && UrlPolicy.IsSameOrigin(first, target));
+            if (!sameOrigin && hostCookies is not { Count: > 0 })
             {
-                error = "The merge refresh contains credentials VESPER cannot safely use.";
+                error = "Cross-CDN merge tracks require per-host scoped cookies.";
                 return false;
             }
-            headers.Add(canonical, value);
+            foreach ((string name, string value) in supplied)
+            {
+                string canonical = name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ? "Cookie"
+                    : name.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ? "Authorization" : "";
+                if (canonical.Length == 0 || headers.ContainsKey(canonical) || string.IsNullOrEmpty(value)
+                    || value.Length > 8192 || value.Any(char.IsControl))
+                {
+                    error = "The merge contains credentials VESPER cannot safely use.";
+                    return false;
+                }
+                headers.Add(canonical, value);
+            }
         }
 
+        Dictionary<string, string>? cleanHostCookies = null;
+        if (hostCookies is { Count: > 0 })
+        {
+            cleanHostCookies = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach ((string scope, string cookieVal) in hostCookies)
+            {
+                if (!UrlPolicy.TryParse(scope, out Uri target, out _) || target.Scheme != "https"
+                    || target.Query.Length != 0 || target.Fragment.Length != 0 || string.IsNullOrEmpty(cookieVal)
+                    || cookieVal.Length > 8192 || cookieVal.Any(char.IsControl))
+                    continue;
+                cleanHostCookies[target.GetLeftPart(UriPartial.Path)] = cookieVal;
+            }
+        }
+
+        string? cleanOrigin = originHeader is { Length: > 0 and <= 512 } && !originHeader.Any(char.IsControl) ? originHeader : null;
         var origin = new UriBuilder(first) { Path = "/", Query = "", Fragment = "", UserName = "", Password = "" }.Uri;
-        credentials = new RequestCredentials(origin, headers);
+        credentials = new RequestCredentials(origin, headers, cleanHostCookies, cleanOrigin);
         return true;
     }
 

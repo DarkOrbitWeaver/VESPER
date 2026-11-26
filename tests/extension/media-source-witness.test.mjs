@@ -255,6 +255,6 @@ test('streaming ReadableStream reader chunks associate with the SourceBuffer tha
   buf.appendBuffer(res.value);
   listeners.get('vesper-media-provenance-request')({ target: el });
   assert.deepEqual(JSON.parse(el.attributes.get('data-vesper-media-provenance')).paths,
-    [{ path: 'https://cdninstagram.com/v/clip.mp4', seen: 100_000 }]);
+    [{ path: 'https://cdninstagram.com/v/clip.mp4', seen: 100_000, canonicalUrl: 'https://cdninstagram.com/v/clip.mp4' }]);
   assert.ok(a && neighbour && b);
 });

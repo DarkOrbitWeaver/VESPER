@@ -14,6 +14,7 @@ let pauseState = { ready: false, paused: true };
 function showPause() {
   pause.checked = pauseState.paused;
   pause.disabled = savingPause || !pauseState.ready;
+  $('header-sub').textContent = pauseState.paused ? 'Paused' : 'Active';
 }
 VesperBrowserPreferences.watchPause(state => { pauseState = state; showPause(); });
 pause.onchange = async () => {
@@ -38,26 +39,77 @@ async function init() {
   const prefs = await chrome.storage.sync.get({ theme: 'system', motion: 'animate', useSignIn: true });
   $('theme').value = prefs.theme;
   $('motion').value = prefs.motion === 'still' ? 'still' : 'animate';
+
+  $('open-transfers').onclick = () => {
+    void chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
+    window.close();
+  };
+
   async function readHiddenHosts() {
     const { vesperHiddenButterflyHosts: hosts } = await chrome.storage.local.get('vesperHiddenButterflyHosts');
     return new Set(Array.isArray(hosts) ? hosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()).slice(0, 100) : []);
   }
+
   const [siteTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   let butterflyHost = '';
+  let isWebTab = false;
   try {
     const site = new URL(siteTab?.url || '');
-    if (site.protocol === 'http:' || site.protocol === 'https:') butterflyHost = site.hostname.toLowerCase();
-  } catch { /* Browser pages have no site butterfly. */ }
+    if (site.protocol === 'http:' || site.protocol === 'https:') {
+      butterflyHost = site.hostname.toLowerCase();
+      isWebTab = true;
+    }
+  } catch {}
+
+  const captureBtn = $('capture-tab-media');
+  const mediaTitle = $('tab-media-title');
+  const mediaDetail = $('tab-media-detail');
+  captureBtn.disabled = !isWebTab;
+
+  if (!isWebTab) {
+    mediaTitle.textContent = 'Browser page';
+    mediaDetail.textContent = 'Open any website to capture media or files.';
+  } else {
+    mediaTitle.textContent = siteTab?.title || butterflyHost;
+    try {
+      const tabInfo = await chrome.runtime.sendMessage({ type: 'tab-state', tabId: siteTab.id });
+      const count = tabInfo?.state?.sources?.length || 0;
+      mediaDetail.textContent = count > 0
+        ? `${count} playable stream${count === 1 ? '' : 's'} observed on ${butterflyHost}`
+        : `Ready to inspect media on ${butterflyHost}`;
+    } catch {
+      mediaDetail.textContent = `Ready on ${butterflyHost}`;
+    }
+  }
+
+  captureBtn.onclick = async () => {
+    if (!isWebTab || !Number.isSafeInteger(siteTab?.id)) return;
+    captureBtn.disabled = true;
+    mediaDetail.textContent = 'Opening media options…';
+    try {
+      const reply = await chrome.runtime.sendMessage({ type: 'popup-capture-tab', tabId: siteTab.id });
+      if (reply?.ok) {
+        window.close();
+        return;
+      }
+      mediaDetail.textContent = reply?.message || 'No downloadable media found on this page.';
+    } catch {
+      mediaDetail.textContent = 'Could not inspect this tab.';
+    } finally {
+      captureBtn.disabled = false;
+    }
+  };
+
   const siteButterfly = $('site-butterfly');
   let hiddenHosts = await readHiddenHosts();
   function showSiteButterfly() {
     const full = hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost);
     siteButterfly.disabled = !butterflyHost || full;
-    siteButterfly.title = full ? 'Show the butterfly on another hidden site before adding one.' : '';
     siteButterfly.textContent = hiddenHosts.has(butterflyHost) ? 'Show butterfly on this site' : 'Hide butterfly on this site';
     $('site-butterfly-host').textContent = butterflyHost;
   }
   showSiteButterfly();
+
   for (const key of ['theme', 'motion']) {
     const control = $(key);
     control.onchange = async () => {
@@ -72,6 +124,7 @@ async function init() {
       } finally { control.disabled = false; }
     };
   }
+
   siteButterfly.onclick = async () => {
     if (!butterflyHost || (hiddenHosts.size >= 100 && !hiddenHosts.has(butterflyHost))) return;
     siteButterfly.disabled = true;
@@ -88,6 +141,7 @@ async function init() {
       settingsStatus('Couldn’t save this setting.');
     } finally { showSiteButterfly(); }
   };
+
   const signIn = $('signin');
   const access = $('signin-access');
   const permit = $('signin-permission');

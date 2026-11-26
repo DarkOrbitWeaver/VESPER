@@ -64,12 +64,14 @@ public sealed class BrowserAuthorization
     public required string Origin { get; init; }
     public bool ConsentGranted { get; init; }
     public string? CookieHeader { get; init; }
-    /// <summary>Only Authorization and Accept-Language are honoured.</summary>
+    /// <summary>Per-host Cookie headers queried from Chrome's cookie store for observed media/CDN hosts.</summary>
+    public Dictionary<string, string>? HostCookies { get; init; }
+    /// <summary>Allow-listed request headers (Authorization, Accept-Language, Origin).</summary>
     public Dictionary<string, string>? Headers { get; init; }
-    /// <summary>Extra hosts for credentials; each must equal or be a subdomain of the page host.</summary>
+    /// <summary>Extra hosts authorized to receive credentials for this media session.</summary>
     public List<string>? AllowedHosts { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
 
     public override string ToString() =>
-        $"BrowserAuthorization(Origin={Origin}, Consent={ConsentGranted}, Cookie={(CookieHeader is null ? "none" : "[redacted]")}, Headers={Headers?.Count ?? 0})";
+        $"BrowserAuthorization(Origin={Origin}, Consent={ConsentGranted}, Cookie={(CookieHeader is null ? "none" : "[redacted]")}, HostCookies={HostCookies?.Count ?? 0}, Headers={Headers?.Count ?? 0})";
 }
