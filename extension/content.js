@@ -755,7 +755,7 @@
       playerPlaying: !el.paused && !el.ended, playerHasMedia: current && (el.readyState >= 1 || el.ended || ended), playerPageUrl: targetPage,
       playerUrl: current ? src : '', playerKey: evidenceKey(el), generation: current ? binding.generation : 0,
       mutedLoop: current && activePreview?.player !== el && isMutedLoop(el, src),
-      playerResourceFingerprints: witness?.fingerprints,
+      playerResourceFingerprints: witness?.fingerprints, playerFragmentUrls: witness?.paths,
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
     }).then(reply => {
       if (!reply?.data?.prefetchSkipped || prefetchedPlayers.get(el) !== key) return;
@@ -1678,7 +1678,7 @@
       }
     }
     if (!formats?.browserBody && missingFormats) {
-      const message = errorMessage(result);
+      const message = errorMessage(result, current && player.readyState >= 2);
       if (!['protected', 'blocked'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
       return renderShell(title, poster, duration, message);
@@ -2348,7 +2348,7 @@
     message.append(' ', retry);
   }
 
-  function errorMessage(reply) {
+  function errorMessage(reply, playbackReady = false) {
     const text = {
       'host-missing': 'Open VESPER Settings, then use Repair helper under Browser.',
       'app-unavailable': 'Could not connect to the desktop helper.',
@@ -2359,13 +2359,14 @@
       timeout: 'VESPER didn’t answer in time.',
       'no-media': 'VESPER couldn’t find a video to download. Play the video, then try again.',
       'no-reusable-source': 'This player’s video isn’t available as a file or stream VESPER can reuse.',
-      'site-refused': 'The site refused the request. Try again from the video page.',
+      'site-refused': reply?.message || 'The site refused the request. Try again from the video page.',
       unavailable: 'VESPER couldn’t open this video. Refresh the page and try again.',
       'source-expired': 'The video link expired. Try again to look for a fresh link.',
       'source-changed': 'The source no longer matches this media. Refresh the formats.',
       'expired-selection': 'Those choices expired. Try again to refresh them.',
       'sign-in': 'Sign in on this site, then try again.',
-      'browser-context': 'Open and play the video in Chrome, then try again.',
+      'browser-context': playbackReady ? 'VESPER couldn’t verify a downloadable stream from this playback.'
+        : 'Start playback in Chrome, then try again.',
       blocked: 'The site blocked the request or restricted its region.',
       network: 'The media link could not be reached. Check your connection and retry.',
       'resolver-error': 'VESPER couldn’t load the video choices. Try again in a moment.',

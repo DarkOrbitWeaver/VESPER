@@ -198,11 +198,12 @@ async function main() {
       setTimeout(() => response.end(bytes), 600);
       return;
     }
-    if (request.url === '/mse-feed') {
+    if (request.url === '/mse-feed' || request.url === '/mse-prefetch') {
+      const prefetch = request.url === '/mse-prefetch';
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end(`<!doctype html><title>MSE feed fixture</title>
         <video id="first" width="320" height="180" muted controls></video>
-        <video id="second" width="320" height="180" muted controls></video>
+        ${prefetch ? '' : '<video id="second" width="320" height="180" muted controls></video>'}
         <script>
         window.fixture = { ready: false, errors: [] };
         function xhrBuffer(path) {
@@ -226,13 +227,19 @@ async function main() {
           });
           media.endOfStream();
         }
-        Promise.all([load(first,'/asset-100001/clip.mp4?session=fixture-one'),
-          load(second,'/asset-200002/clip.mp4?session=fixture-two',true)])
+        ${prefetch ? "fetch('/asset-100001/playlist.m3u8').then(response => response.text()).then(() => load(first,'/asset-100001/clip.m4s'))"
+          : "Promise.all([load(first,'/asset-100001/clip.mp4?session=fixture-one'), load(second,'/asset-200002/clip.mp4?session=fixture-two',true)])"}
           .then(() => fixture.ready = true, e => fixture.errors.push(String(e)));
         </script>`);
       return;
     }
-    if (/^\/asset-(?:100001|200002)\/clip\.mp4\?session=fixture-(?:one|two)$/.test(request.url)) {
+    if (request.url === '/asset-100001/playlist.m3u8') {
+      response.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      response.end('#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nclip.m4s\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (request.url === '/asset-100001/clip.m4s'
+        || /^\/asset-(?:100001|200002)\/clip\.mp4\?session=fixture-(?:one|two)$/.test(request.url)) {
       response.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': mseClip.length, 'Cache-Control': 'no-store' });
       response.end(mseClip);
       return;
@@ -444,6 +451,19 @@ async function main() {
       }) + '\n');
       return;
     }
+
+    const popupTarget = (await browser.send('Target.createTarget', {
+      url: 'chrome-extension://' + extensionId + '/popup.html'
+    })).targetId;
+    const popupSession = (await browser.send('Target.attachToTarget', { targetId: popupTarget, flatten: true })).sessionId;
+    const toggleStyles = await waitFor(async () => {
+      const { result } = await browser.send('Runtime.evaluate', { expression: `
+        [...document.querySelectorAll('label.check')].map(label => getComputedStyle(label).userSelect)`,
+        returnByValue: true }, popupSession);
+      return result.value?.length ? result.value : null;
+    }, 5000, 'Extension settings did not open.');
+    assert.deepEqual(toggleStyles, ['none', 'none']);
+    await browser.send('Target.closeTarget', { targetId: popupTarget });
 
     // Trigger the unpacked extension without asking native messaging to launch an installed VESPER.
     await browser.send('Target.createTarget', { url: 'chrome-extension://' + extensionId + '/transfers.html' });
@@ -836,8 +856,46 @@ async function main() {
     await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
     await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
-    let recycledPlayer = null;
+    let recycledPlayer = null, preparedBeforeClick = null;
     if (playerRaceTest) {
+      function findButton(...classNames) {
+        return waitFor(async () => {
+          const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+          const nodes = [root];
+          for (const node of nodes) {
+            nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+            const classes = node.attributes?.[node.attributes.indexOf('class') + 1]?.split(' ') || [];
+            if (node.nodeName === 'BUTTON' && classNames.some(name => classes.includes(name))) return node;
+          }
+        }, 5000, 'Could not find fixture button: ' + classNames.join(' or '));
+      }
+      async function clickWith(className, before = '') {
+        const target = await findButton(className);
+        const { object } = await browser.send('DOM.resolveNode', { nodeId: target.nodeId }, tab);
+        const result = await browser.send('Runtime.callFunctionOn', {
+          objectId: object.objectId, functionDeclaration: `function () { ${before}; this.click(); }`, userGesture: true
+        }, tab);
+        assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
+      }
+      await evaluate('Observe native verification for the prefetch fixture', `(() => {
+        globalThis.__warmRequests = [];
+        const request = nativeRequest;
+        nativeRequest = async (...args) => {
+          if (args[0]?.type !== 'media-source-options' || !args[0].url.endsWith('/mse-prefetch')) return request(...args);
+          __warmRequests.push(args[0].candidates[0].url);
+          return { ok: true, data: { playbackMatches: 1, mediaSession: crypto.randomUUID().replaceAll('-', ''),
+            choices: [{ index: 0, label: 'Original quality', container: 'MP4' }] } };
+        };
+      })()`);
+      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/mse-prefetch' }, tab);
+      await waitFor(async () => (await evaluate('Check early verification', '__warmRequests.length')) === 1,
+        7000, 'The active MSE player did not prepare the witnessed stream before opening the picker.');
+      await clickWith('fly');
+      await findButton('primary', 'opt');
+      assert.deepEqual(await evaluate('Check verification was reused', '__warmRequests'),
+        ['http://127.0.0.1:' + port + '/asset-100001/playlist.m3u8']);
+      preparedBeforeClick = true;
+
       await evaluate('Stub only the picker lookup and native enqueue', `(() => {
         globalThis.__recycled = { lookedUp: [], submitted: [] };
         playerOptions = async message => {
@@ -857,22 +915,6 @@ async function main() {
       })()`);
       await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/recycled-player' }, tab);
       await waitFor(() => flyShown(), 5000, 'Recycled player did not get a butterfly.');
-      async function clickWith(className, before = '') {
-        const target = await waitFor(async () => {
-          const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
-          const nodes = [root];
-          for (const node of nodes) {
-            nodes.push(...(node.children || []), ...(node.shadowRoots || []));
-            const classes = node.attributes?.[node.attributes.indexOf('class') + 1]?.split(' ') || [];
-            if (node.nodeName === 'BUTTON' && classes.includes(className)) return node;
-          }
-        }, 5000, 'Could not find fixture button: ' + className);
-        const { object } = await browser.send('DOM.resolveNode', { nodeId: target.nodeId }, tab);
-        const result = await browser.send('Runtime.callFunctionOn', {
-          objectId: object.objectId, functionDeclaration: `function () { ${before}; this.click(); }`, userGesture: true
-        }, tab);
-        assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
-      }
       const identity = () => browser.send('Runtime.evaluate', {
         expression: '[location.href, document.querySelector("video").currentSrc]', returnByValue: true
       }, tab).then(reply => reply.result.value);
@@ -906,6 +948,8 @@ async function main() {
       keptInChrome: true,
       pageMadeKeptInChrome: true,
       pausedContextPicker: true,
+      toggleLabelsNonSelectable: true,
+      preparedBeforeClick,
       fullscreenButterfly: true,
       customAudioButterfly: true,
       intentScenarios,

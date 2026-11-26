@@ -179,6 +179,15 @@ public class HlsParserTests
     }
 
     [Fact]
+    public async Task OpaquePlaylistDoesNotOfferFormats()
+    {
+        var ex = await Assert.ThrowsAsync<MediaResolverException>(() => Manifests().ResolveTextAsync(
+            "g1ifpR9Pk79g4MVYlAMFQBYLj2sl1DVbHXaU5smx8bs=", MasterUrl, MediaRequestContext.Empty, CancellationToken.None));
+        Assert.Equal(MediaErrorCode.UnsupportedManifest, ex.Error.Code);
+        Assert.Contains("did not send a readable", ex.Error.UserMessage);
+    }
+
+    [Fact]
     public void MissingHeader_AndHostileUris_AreRejected()
     {
         var a = Assert.Throws<MediaResolverException>(() => HlsParser.Parse("<html>nope</html>", MasterUrl));

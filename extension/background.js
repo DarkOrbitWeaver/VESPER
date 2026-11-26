@@ -486,7 +486,7 @@ const MEDIA_PREFETCH_TTL = 120_000;
 const MEDIA_PREFETCH_LIMIT = 12;
 // Early format lookups: per-tab and per-site cooldowns, two concurrent lookups, Retry-After and refusal backoff.
 const prefetchGovernor = VesperPlanner.createPrefetchGovernor();
-const pageLookups = new Map();
+const formatLookups = new Map();
 let sourceExpiryScheduled = false;
 let sourceStorageReady = null;
 let sourceBudgetWrites = Promise.resolve();
@@ -504,8 +504,8 @@ function clearMediaPrefetch(tabId) {
     if (entry.tab === tabId) mediaPrefetchCache.delete(key);
   for (const key of mediaLookups.keys())
     if (key.startsWith(String(tabId) + '|')) mediaLookups.delete(key);
-  for (const key of pageLookups.keys())
-    if (key.startsWith(String(tabId) + '|')) pageLookups.delete(key);
+  for (const key of formatLookups.keys())
+    if (key.startsWith(String(tabId) + '|')) formatLookups.delete(key);
 }
 
 function cachedMediaOptions(key) {
@@ -636,17 +636,38 @@ function exactSourceRequest(source, auth, pageUrl, title, playbackFingerprints) 
   });
 }
 
-async function verifyObservedSources(sources, { auth, pageUrl, title, playbackFingerprints, deadline = Date.now() + VERIFY_DEADLINE_MS }) {
+async function verifyObservedSource(source, { auth, pageUrl, title, playbackFingerprints, tab, verificationScope,
+  deadline = Date.now() + VERIFY_DEADLINE_MS }) {
+  const request = exactSourceRequest(source, auth, pageUrl, title, playbackFingerprints);
+  const verify = async () => explainMediaProtocol(await nativeRequest(request, Math.max(1000, deadline - Date.now())));
+  if (!verificationScope) return verify();
+  const observed = (source.group || [source]).map(item => [item.validator, item.bytes, item.conflictingValidator]);
+  const key = `${verificationScope}|verified-source|${JSON.stringify([request.type, request.candidates, request.playbackFingerprints, observed, title])}`;
+  const cached = cachedMediaOptions(key);
+  if (cached) return cached;
+  const inFlight = formatLookups.get(key);
+  if (inFlight) return inFlight;
+  const generation = captureGeneration;
+  const work = verify();
+  formatLookups.set(key, work);
+  try {
+    const reply = await work;
+    if (formatLookups.get(key) === work && captureAllowed(generation)) rememberMediaOptions(key, tab, reply);
+    return reply;
+  } finally { if (formatLookups.get(key) === work) formatLookups.delete(key); }
+}
+
+async function verifyObservedSources(sources, options) {
+  const deadline = options.deadline ?? Date.now() + VERIFY_DEADLINE_MS;
+  const verify = source => verifyObservedSource(source, { ...options, deadline });
   const groups = await Promise.all(sources.map(async source => {
-    const reply = explainMediaProtocol(await nativeRequest(exactSourceRequest(source, auth, pageUrl, title, playbackFingerprints),
-      Math.max(1000, deadline - Date.now())));
+    const reply = await verify(source);
     // If a grouped manifest refers outside the known asset namespace, retain
     // the original independent verification route. Never try unchecked URLs.
     if (source.group?.length > 1 && !reply?.ok && reply.code === 'invalid' && Date.now() < deadline) {
       return Promise.all(source.group.map(async member => ({
         source: member,
-        reply: explainMediaProtocol(await nativeRequest(exactSourceRequest(member, auth, pageUrl, title, playbackFingerprints),
-          Math.max(1000, deadline - Date.now())))
+        reply: await verify(member)
       })));
     }
     return [{ source, reply }];
@@ -852,6 +873,19 @@ function supportsMediaPrefetch(page) {
   return ['youtube.com', 'youtube-nocookie.com', 'youtu.be', 'tiktok.com', 'instagram.com',
     'vimeo.com', 'dailymotion.com', 'bilibili.com', 'reddit.com', 'redd.it']
     .some(domain => host === domain || host.endsWith('.' + domain));
+}
+
+async function prepareMediaFormats(tab, site, verify) {
+  if (!captureAllowed()) return { ok: true, data: { prefetchSkipped: true } };
+  const admission = prefetchGovernor.admit({ tab, site });
+  if (!admission.allow) return { ok: true, data: { prefetchSkipped: true,
+    ...(admission.retryAfterMs ? { retryAfterMs: admission.retryAfterMs } : {}) } };
+  let reply;
+  try { reply = await verify(); return reply; }
+  finally {
+    prefetchGovernor.settle({ ticket: admission.ticket, code: reply?.ok ? 'ok' : reply?.code,
+      retryAt: Date.parse(reply?.data?.retryAt || '') });
+  }
 }
 
 function isPartialMediaUrl(url) {
@@ -1255,8 +1289,11 @@ async function playerOptions(message, sender) {
     && sender.documentId && Array.isArray(message.playerResourceFingerprints)
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
-  const lookupKey = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
-    mutedLoop, message.multiplePlayers === true, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
+  const playerScope = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
+    mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
+  const lookupKey = [playerScope, playbackFingerprints.join(',')].join('|');
+  const verificationScope = !auth.authorized && !message.refresh && binding && sender.documentId
+    && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
@@ -1264,8 +1301,6 @@ async function playerOptions(message, sender) {
   const pendingKey = [lookupKey, prefetch ? 'prefetch' : auth.authorized ? 'signed' : '', JSON.stringify(player)].join('|');
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   const task = (async () => {
-    if (prefetch) {
-    }
     const state = await tabState(tab);
     const now = Date.now();
     const changedAt = Number.isFinite(message.mediaChangedAt) ? message.mediaChangedAt : 0;
@@ -1302,8 +1337,8 @@ async function playerOptions(message, sender) {
       // Preloaded media can precede loadedmetadata by many seconds. Only a
       // current object's exact URL fingerprint may widen the timing window.
       // It admits a candidate for independent verification, not auto-selection.
-      if (fingerprints.size && !prefetch) {
-        await Promise.all(scoped.filter(item => item.seen >= now - 120_000).slice(0, MAX_SOURCES).map(async item => {
+      if (fingerprints.size) {
+        await Promise.all(scoped.slice(0, MAX_SOURCES).map(async item => {
           try {
             if (fingerprints.has(await sourceIdentity(item.url))) exactResources.add(item.url);
           } catch { /* Missing crypto leaves the ordinary timing window intact. */ }
@@ -1326,6 +1361,18 @@ async function playerOptions(message, sender) {
     const singleVideo = binding && identity && (identity.startsWith('tiktok:')
       || identity.startsWith('dailymotion:')
       || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
+    if (prefetch && fingerprints.size && possibleSources.length === 1) {
+      const observed = possibleSources[0];
+      const witnessed = exactResources.has(observed.url)
+        || ['hls', 'dash'].includes(observed.kind) && fragmentAffinity(observed.url, playerFragments) > 0;
+      if (witnessed) {
+        const reply = await prepareMediaFormats(tab, page.hostname, () => verifyObservedSource(observed, {
+          auth, pageUrl: page.href, title: message.title, playbackFingerprints, tab, verificationScope
+        }));
+        // The foreground picker still associates sources and binds the selection to this player.
+        return reply.ok && reply.data?.choices?.length ? { ok: true, data: { prepared: true } } : reply;
+      }
+    }
     if (prefetch && possibleSources.length > 0 && !singleVideo)
       return { ok: true, data: { prefetchSkipped: true } };
     if (prefetch && !(supportsMediaPrefetch(page) && identity && !/^https?:/.test(identity)) && !matching && !matchedManifest)
@@ -1382,29 +1429,14 @@ async function playerOptions(message, sender) {
     const pageLookup = async () => {
       if (auth.authorized || message.refresh === true)
         return nativeRequest(envelope('media-options', pageInput), 60000);
-      const existing = pageLookups.get(pageKey);
+      const existing = formatLookups.get(pageKey);
       // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
       if (existing) return existing;
-      let prefetchTicket;
-      if (prefetch) {
-        const admission = prefetchGovernor.admit({ tab, site: page.hostname });
-        if (!admission.allow) return { ok: true, data: { prefetchSkipped: true,
-          ...(admission.retryAfterMs ? { retryAfterMs: admission.retryAfterMs } : {}) } };
-        prefetchTicket = admission.ticket;
-      }
-      const work = (async () => {
-        let reply;
-        try {
-          reply = await nativeRequest(envelope('media-options', pageInput), 60000);
-          return reply;
-        } finally {
-          if (prefetch) prefetchGovernor.settle({ ticket: prefetchTicket, code: reply?.ok ? 'ok' : reply?.code,
-            retryAt: Date.parse(reply?.data?.retryAt || '') });
-        }
-      })();
-      pageLookups.set(pageKey, work);
+      const lookup = () => nativeRequest(envelope('media-options', pageInput), 60000);
+      const work = prefetch ? prepareMediaFormats(tab, page.hostname, lookup) : lookup();
+      formatLookups.set(pageKey, work);
       try { return await work; }
-      finally { if (pageLookups.get(pageKey) === work) pageLookups.delete(pageKey); }
+      finally { if (formatLookups.get(pageKey) === work) formatLookups.delete(pageKey); }
     };
     // Both routes can answer for this player. Where the page lookup keeps being refused, the player's own
     // traffic is asked first and the page lookup becomes the fallback, instead of failing slowly on every click.
@@ -1439,7 +1471,7 @@ async function playerOptions(message, sender) {
           // Resource witnesses must influence the verification budget, not only the display order.
           const ranked = groupObservedAssets(rankObservedSources(possibleSources, changedAt, resourceWitness, rankingFragments, exactResources)
             .slice(0, VERIFY_LIMIT + 4), identity);
-          const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints],
+          const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints], tab, verificationScope,
             deadline: Date.now() + VERIFY_DEADLINE_MS };
           const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options);
           return { pickerTitle, context, fingerprints, exactResources, ranked, options, checked };
@@ -1453,7 +1485,7 @@ async function playerOptions(message, sender) {
     if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
       // Preserve the page's policy/identity verdict. If it is slow, overlap a
       // bounded exact-source check so a refusal does not cost two serial waits.
-      const hedge = bothRoutes && !pageLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+      const hedge = bothRoutes && !formatLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
       let reply;
       try { reply = await pageLookup(); }
       finally { if (hedge !== null) clearTimeout(hedge); }

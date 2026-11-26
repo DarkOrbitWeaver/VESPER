@@ -35,7 +35,8 @@ public sealed class ManifestResolver
             return await ResolveHlsAsync(text, url, ctx, ct).ConfigureAwait(false);
         if (text.Contains("<MPD", StringComparison.Ordinal))
             return ResolveDash(text, url, ctx);
-        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Content is neither an HLS playlist nor a DASH manifest"));
+        throw new MediaResolverException(MediaErrors.UnsupportedManifest("Content is neither an HLS playlist nor a DASH manifest")
+            with { UserMessage = "The site did not send a readable HLS or DASH playlist." });
     }
 
     private static bool LooksLikeHls(string text)

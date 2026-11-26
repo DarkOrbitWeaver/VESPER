@@ -3343,6 +3343,38 @@ test('generic player prefetch requires a media URL observed by Chrome', async ()
   assert.equal(request.candidates[0].url, mediaUrl);
 });
 
+test('verified playback evidence prepares an unfamiliar stream and reuses the check on click', async () => {
+  const page = 'https://example.com/watch/current';
+  const manifest = 'https://media.example/asset-481562/master.m3u8';
+  const fragment = 'https://media.example/asset-481562/segment.m4s';
+  const digest = Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(fragment))).toString('hex');
+  const sender = { tab: { id: 22, url: page }, url: page, frameId: 0, documentId: 'stream-doc' };
+  const app = load({ 'media-source-options': { ...mediaOptionsReply, data: { ...mediaOptionsReply.data, playbackMatches: 1 } } });
+  const message = videoOptionsMessage(page, { playerUrl: 'blob:https://example.com/current', playerHasMedia: true,
+    playerKey: 'media-1', mediaChangedAt: Date.now(), title: 'Current stream',
+    playerResourceFingerprints: [digest], playerFragmentUrls: [fragment] });
+  try {
+    await app.onMedia({ url: manifest, method: 'GET', type: 'xmlhttprequest', statusCode: 200, tabId: 22,
+      frameId: 0, documentId: sender.documentId, timeStamp: Date.now(),
+      responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+
+    const skipped = await app.message({ ...message, prefetch: true, playerResourceFingerprints: [] }, sender);
+    assert.equal(skipped.data?.prefetchSkipped, true);
+    assert.equal(app.sent.length, 0);
+
+    const prepared = await app.message({ ...message, prefetch: true }, sender);
+    assert.deepEqual(structuredClone(prepared.data), { prepared: true });
+    assert.deepEqual(app.sent.map(request => request.type), ['media-source-options']);
+    assert.equal(app.sent[0].candidates[0].url, manifest);
+    const opened = await app.message(message, sender);
+    assert.equal(opened.ok, true);
+    assert.equal(app.sent.length, 1, 'The click reuses the successful verification.');
+
+    assert.equal((await app.message({ ...message, generation: 2 }, sender)).ok, true);
+    assert.equal(app.sent.length, 2, 'A new player generation gets its own check.');
+  } finally { app.stopWorker(); }
+});
+
 test('unconfirmed signed submissions stay in session storage and expire', async () => {
   const url = 'https://cdn.example/video.mp4?sig=short-lived-token';
   const app = load({ submit: { ok: false, code: 'host-error', message: 'VESPER did not answer.' } });
@@ -4477,7 +4509,7 @@ test('preloaded blob media is admitted only by a recent exact witness in the sam
   try {
     for (const [url, documentId] of [[actual, sender.documentId], [other, sender.documentId], ['https://cdn.example.com/wrong.mp4', 'other-doc']]) {
       await app.onMedia({ url, tabId: 81, frameId: 0, documentId, method: 'GET', statusCode: 200, type: 'media',
-        timeStamp: now - 30_000, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }, { name: 'Content-Length', value: '300000' }] });
+        timeStamp: now - 180_000, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }, { name: 'Content-Length', value: '300000' }] });
     }
     const hash = async url => Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(url))).toString('hex');
     const message = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: 'blob:https://video.example/active',
