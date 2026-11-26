@@ -10,7 +10,7 @@ internal sealed class MediaDeliveryHistory
     private const int Capacity = 256;
     private static readonly TimeSpan Lifetime = TimeSpan.FromDays(30);
     private readonly Dictionary<Guid, Observation> _observations = [];
-    private readonly record struct Observation(string Provider, JobKind Kind, bool Completed, DateTime At);
+    private readonly record struct Observation(string Provider, JobKind Kind, bool Completed, DateTime At, long Bytes = 0, double BytesPerSecond = 0);
     private readonly record struct Route(JobKind Kind, int Total, int Completed)
     {
         public double Rate => (double)Completed / Total;
@@ -45,12 +45,24 @@ internal sealed class MediaDeliveryHistory
             if (oldest.Value.At >= at) return;
             _observations.Remove(oldest.Key);
         }
+        if (_observations.TryGetValue(job.Id, out var previous)
+            && previous.Provider == provider && previous.Kind == job.Kind && previous.Completed == complete && previous.At == at)
+            return;
         _observations[job.Id] = new(provider, job.Kind, complete, at);
+    }
+
+    // An active, unrestricted native run is a performance observation, not a media identity label.
+    internal void ObserveTiming(DownloadJob job, TimeSpan elapsed)
+    {
+        if (!_observations.TryGetValue(job.Id, out var observation) || !observation.Completed
+            || observation.At != job.CompletedUtc || job.TotalBytes is not long bytes || bytes < 1024 * 1024
+            || elapsed.TotalMilliseconds < 250 || observation.BytesPerSecond > 0) return;
+        _observations[job.Id] = observation with { Bytes = bytes, BytesPerSecond = bytes / elapsed.TotalSeconds };
     }
 
     internal void Forget(Guid id) => _observations.Remove(id);
 
-    internal JobKind? Preferred(string provider, IReadOnlyCollection<JobKind> available, DateTime now)
+    internal JobKind? Preferred(string provider, IReadOnlyCollection<JobKind> available, DateTime now, long? expectedBytes = null)
     {
         var kinds = available.Distinct().Where(kind => kind is JobKind.Http or JobKind.Hls or JobKind.Dash).ToArray();
         if (kinds.Length < 2) return null;
@@ -61,10 +73,30 @@ internal sealed class MediaDeliveryHistory
         // when each compared route was observed across multiple named adapter families.
         if (!string.IsNullOrEmpty(provider) && provider != "generic")
         {
-            var local = Compare(recent.Where(value => value.Provider == provider).ToArray(), kinds, false);
-            if (local.Enough) return local.Preferred;
+            var localRows = recent.Where(value => value.Provider == provider).ToArray();
+            var local = Compare(localRows, kinds, false);
+            if (local.Enough) return local.Preferred ?? CompareSpeed(localRows, kinds, expectedBytes);
         }
         return Compare(recent.Where(value => value.Provider != "generic").ToArray(), kinds, true).Preferred;
+    }
+
+    private static JobKind? CompareSpeed(Observation[] observations, JobKind[] kinds, long? expectedBytes)
+    {
+        if (expectedBytes is not long size || size < 1024 * 1024) return null;
+        var speeds = new List<(JobKind Kind, double Median)>(kinds.Length);
+        foreach (JobKind kind in kinds)
+        {
+            var rows = observations.Where(row => row.Kind == kind).ToArray();
+            // Reliability must already be high. Compare only similar-sized files on this adapter.
+            if (rows.Length < 6 || rows.Count(row => row.Completed) < rows.Length * 0.9) return null;
+            var samples = rows.Where(row => row.BytesPerSecond > 0 && row.Bytes >= size / 2
+                && row.Bytes / 2 <= size).Select(row => row.BytesPerSecond).Order().ToArray();
+            if (samples.Length < 6) return null;
+            speeds.Add((kind, samples[samples.Length / 2]));
+        }
+        var winner = speeds.MaxBy(row => row.Median);
+        return speeds.Where(row => row.Kind != winner.Kind).All(row => winner.Median >= row.Median * 1.5)
+            ? winner.Kind : null;
     }
 
     private static (bool Enough, JobKind? Preferred) Compare(Observation[] observations, JobKind[] kinds, bool diverse)

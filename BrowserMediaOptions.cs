@@ -109,7 +109,13 @@ internal sealed partial class BrowserBridgeHandler
                 StreamProtocol.Dash => JobKind.Dash,
                 _ => JobKind.Merge
             }).Distinct().ToArray();
-        StreamProtocol? preferredDelivery = (deliveries.Length < 2 ? null : engine.PreferredMediaDelivery(item.Provider, deliveries)) switch
+        var knownSizes = playable.Representations.Where(r => r.Content == StreamContent.VideoAndAudio
+            && r.Protocol is StreamProtocol.Http or StreamProtocol.Hls or StreamProtocol.Dash).ToArray();
+        // Only a comparable known size can qualify a speed-based preference.
+        long? expectedBytes = knownSizes.Length > 0 && knownSizes.All(r => r.FileSize is > 0 && !r.FileSizeIsEstimate)
+            && knownSizes.Max(r => r.FileSize!.Value) / 2 <= knownSizes.Min(r => r.FileSize!.Value)
+            ? knownSizes.Max(r => r.FileSize!.Value) : null;
+        StreamProtocol? preferredDelivery = (deliveries.Length < 2 ? null : engine.PreferredMediaDelivery(item.Provider, deliveries, expectedBytes)) switch
         {
             JobKind.Http => StreamProtocol.Http,
             JobKind.Hls => StreamProtocol.Hls,

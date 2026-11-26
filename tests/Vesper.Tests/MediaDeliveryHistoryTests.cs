@@ -66,6 +66,32 @@ public sealed class MediaDeliveryHistoryTests
     }
 
     [Fact]
+    public void SpeedPreferenceRequiresComparableIndependentSuccessfulRuns()
+    {
+        var history = new MediaDeliveryHistory();
+        const long size = 4 * 1024 * 1024;
+        for (int i = 0; i < 6; i++)
+        {
+            var fast = Job("adapter", JobKind.Http, true);
+            var slow = Job("adapter", JobKind.Hls, true);
+            fast.TotalBytes = slow.TotalBytes = size;
+            history.Observe(fast);
+            history.Observe(slow);
+            history.ObserveTiming(fast, TimeSpan.FromSeconds(2));
+            history.ObserveTiming(slow, TimeSpan.FromSeconds(5));
+            history.Observe(fast);
+            history.Observe(slow);
+            Assert.Equal(i == 5 ? JobKind.Http : (JobKind?)null,
+                history.Preferred("adapter", Both, Now, size));
+        }
+        Assert.Null(history.Preferred("adapter", Both, Now));
+        Assert.Null(history.Preferred("adapter", Both, Now, size * 8));
+        Assert.Null(history.Preferred("unseen", Both, Now, size));
+        history.Observe(Job("adapter", JobKind.Http, false));
+        Assert.Null(history.Preferred("adapter", Both, Now, size));
+    }
+
+    [Fact]
     public void BoundedHistoryForgetsRemovedRecordsAndIgnoresOldObservations()
     {
         var history = new MediaDeliveryHistory();

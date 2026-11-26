@@ -177,9 +177,9 @@ public sealed partial class DownloadEngine : IDisposable
     }
 
     /// <summary>Advisory route preference from recent native outcomes; never evidence of media identity.</summary>
-    public JobKind? PreferredMediaDelivery(string provider, IReadOnlyCollection<JobKind> available)
+    public JobKind? PreferredMediaDelivery(string provider, IReadOnlyCollection<JobKind> available, long? expectedBytes = null)
     {
-        lock (_lock) return _mediaDeliveryHistory.Preferred(provider, available, DateTime.UtcNow);
+        lock (_lock) return _mediaDeliveryHistory.Preferred(provider, available, DateTime.UtcNow, expectedBytes);
     }
 
     private static bool IsDuplicateCandidate(DownloadJob job) =>
@@ -424,6 +424,11 @@ public sealed partial class DownloadEngine : IDisposable
     private async Task RunSessionAsync(JobSession session)
     {
         RunOutcome outcome;
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        long localRevision = session.Limiter.Revision, globalRevision = GlobalLimiter.Revision;
+        bool timingEligible = session.CommittedAtStart == 0 && session.Job.RetryCount == 0
+            && string.IsNullOrEmpty(session.Job.PreviousUrls) && session.Limiter.BytesPerSecond == 0
+            && GlobalLimiter.BytesPerSecond == 0;
         try
         {
             outcome = await new JobRunner(this, session, _http).RunAsync().ConfigureAwait(false);
@@ -439,10 +444,12 @@ public sealed partial class DownloadEngine : IDisposable
         {
             outcome = RunOutcome.NeedsAttention("unexpected", "Unexpected error: " + ex.Message);
         }
-        OnRunFinished(session, outcome);
+        TimeSpan? elapsed = timingEligible && session.Limiter.Revision == localRevision
+            && GlobalLimiter.Revision == globalRevision ? System.Diagnostics.Stopwatch.GetElapsedTime(started) : null;
+        OnRunFinished(session, outcome, elapsed);
     }
 
-    private void OnRunFinished(JobSession session, RunOutcome outcome)
+    private void OnRunFinished(JobSession session, RunOutcome outcome, TimeSpan? elapsed)
     {
         DownloadJob job = session.Job;
         try
@@ -468,6 +475,8 @@ public sealed partial class DownloadEngine : IDisposable
                     job.ApplyPersistedState(updated);
                     ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
                     Changed(job);
+                    if (elapsed is { } duration && outcome.State == JobState.Completed)
+                        _mediaDeliveryHistory.ObserveTiming(job, duration);
                     Log(job.Id, "run-ended", $"{job.State} {job.Reason} {outcome.Message}");
                 }
                 catch (LocalStorageException ex)
