@@ -1382,3 +1382,78 @@ void captureSettingsReady.then(async () => {
   await recoverChromeDownloads();
   if (!captureEnabled) await clearInactiveBrowserRecords();
 }).catch(() => {});
+
+
+// Early route for a trusted, unmodified click on a concrete file link.
+// No browser download item exists yet. Stage a native GET against a read-only
+// response proof, then commit ownership. Never replay an uncertain acceptance.
+const earlyDirectInFlight = new Set();
+async function earlyDirectDownload(message, sender) {
+  const fallback = { ok: false, fallback: true };
+  const uncertain = { ok: false, fallback: false, message: 'VESPER could not confirm ownership. Check VESPER before retrying.' };
+  const page = VesperPlayerSource.http(sender.url);
+  const url = page && VesperEarlyDownload.candidate(message.url, page.href, message.downloadName);
+  if (!url || !sender.tab || sender.tab.incognito || !Number.isSafeInteger(sender.tab.id)) return fallback;
+  const key = sender.tab.id + ':' + (sender.frameId ?? 0);
+  if (earlyDirectInFlight.has(key) || earlyDirectInFlight.size >= 8) return fallback;
+  earlyDirectInFlight.add(key);
+  const generation = captureGeneration, admission = captureAdmissionGeneration;
+  let transferId, accepting = false;
+  const enabled = async () => await captureCanBegin(generation, admission) && (await settings()).handoff === 'download';
+  try {
+    try {
+      await siteRulesLoaded;
+      if (!await enabled() || matchesNeverCaptureHost({ url, referrer: page.href })) return fallback;
+      // HEAD never fetches the body or supplies browser credentials. A signed or
+      // query-based original link is left to the normal browser route.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2500);
+      let response;
+      try {
+        response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
+          cache: 'no-store', signal: controller.signal });
+      } finally { clearTimeout(timeout); }
+      const final = VesperPlayerSource.http(response.url);
+      const mime = mimeType(response.headers.get('content-type'));
+      const attachment = /^attachment\b/i.test(response.headers.get('content-disposition') || '');
+      const binary = /^(?:application\/(?:octet-stream|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-msdownload|x-msi|x-msdos-program|vnd\.android\.package-archive|x-iso9660-image|x-apple-diskimage|vnd\.debian\.binary-package|x-rpm|x-tar|x-xz|x-bzip2))$/.test(mime || '');
+      const lengthText = response.headers.get('content-length') || '';
+      const length = /^\d+$/.test(lengthText) ? Number(lengthText) : 0;
+      const etag = response.headers.get('etag')?.trim();
+      const encoding = response.headers.get('content-encoding');
+      if (response.status !== 200 || !final || final.username || final.password
+          || final.protocol !== 'https:' && final.origin !== page.origin
+          || !mime || mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json'
+          || (!attachment && !binary) || !Number.isSafeInteger(length) || length <= 0
+          || !etag || !/^"[^"\x00-\x20\x7f]{0,254}"$/.test(etag)
+          || encoding && encoding.toLowerCase() !== 'identity'
+          || matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !await enabled()) return fallback;
+      const proof = { length, etag, contentType: mime, attachment, basis: 'etag' };
+      const request = envelope('browser-capture', { mode: 'download', authorized: false, browserProof: proof,
+        items: [{ url: final.href, originalUrl: url, referer: page.href, userAgent: navigator.userAgent }] });
+      transferId = request.id;
+      const staged = await nativeRequest(request, 10000);
+      if (!staged.ok || staged.results?.[0]?.transferReady !== true || !await enabled()) {
+        // No accept has been dispatched, so a late staged job cannot publish.
+        await transferCommand(transferId, 'abandon', 3000).catch(() => {});
+        return fallback;
+      }
+      accepting = true;
+      const result = await transferCommand(transferId, 'accept', 5000);
+      if (result.ok && ['active', 'complete'].includes(result.data?.state))
+        return { ok: true };
+    } catch { /* ambiguous acceptance must be reconciled below */ }
+    if (!transferId) return fallback;
+    if (!accepting) {
+      await transferCommand(transferId, 'abandon', 3000).catch(() => {});
+      return fallback;
+    }
+    // Ask native to stop before starting any duplicate Chrome transfer.
+    try {
+      const stopped = await transferCommand(transferId, 'abandon', 5000);
+      if (stopped.ok && stopped.data?.state === 'complete') return { ok: true };
+      if (stopped.ok && stopped.data?.state === 'failed') return fallback;
+    } catch {}
+    return uncertain;
+  } finally { earlyDirectInFlight.delete(key); }
+}

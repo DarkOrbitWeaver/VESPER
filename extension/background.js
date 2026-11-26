@@ -3,7 +3,7 @@
 'use strict';
 
 importScripts('native-session.js', 'vesper-experience.js', 'player-source.js', 'media-evidence.js', 'vesper-intelligence.js',
-  'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js', 'browser-body.js');
+  'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js', 'browser-body.js', 'early-download.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
@@ -1625,9 +1625,9 @@ async function describe(url, durationSeconds) {
 // Content scripts run inside web pages, and a page that breaks out of its sandbox can forge their messages.
 // They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
-const CONTENT_COMMANDS = new Set(['smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker',
+const CONTENT_COMMANDS = new Set(['early-download', 'smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker',
   'batch-arm', 'batch-status', 'batch-clear', 'batch-disarm', 'batch-journal-read', 'batch-journal-write', 'batch-journal-ack', 'browser-body-status', 'browser-body-media-proof']);
-const PAUSE_BLOCKED_COMMANDS = new Set(['smart-submit', 'batch-arm', 'media-options', 'media-select', 'media-source-select',
+const PAUSE_BLOCKED_COMMANDS = new Set(['early-download', 'smart-submit', 'batch-arm', 'media-options', 'media-select', 'media-source-select',
   'browser-media-select', 'native-picker', 'retry', 'submit']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed']);
@@ -1648,6 +1648,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     if (PAUSE_BLOCKED_COMMANDS.has(message.type) && await extensionPaused())
       return { ok: false, code: 'paused', message: 'VESPER is paused in Chrome.' };
+    if (message.type === 'early-download') return earlyDirectDownload(message, sender);
     if (message.type === 'browser-body-status') return bodyReceiptStatus(message, sender);
     if (message.type === 'browser-body-media-proof') return browserBodyMediaProof(message, sender);
     if (message.type.startsWith('batch-journal-') || message.type === 'batch-arm' || message.type === 'batch-status'

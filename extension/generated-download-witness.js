@@ -45,6 +45,20 @@
         || (!event.isTrusted && !navigator.userActivation?.isActive && !recentIntent())) return;
     if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download')) return;
     const name = anchor.getAttribute('download');
+    // Programmatic file-link clicks caused by a recent real gesture can use the
+    // same isolated early route. Ordinary scripted navigation is never trapped.
+    if (!event.isTrusted && name && /^https?:\/\//i.test(anchor.href)
+        && !anchor.hasAttribute('ping') && !anchor.hasAttribute('attributionsrc')
+        && (!anchor.target || anchor.target.toLowerCase() === '_self')
+        && !anchor.rel?.split(/\s+/).includes('noreferrer')) {
+      try {
+        const proposal = new CustomEvent('vesper-early-download-request', {
+          detail: JSON.stringify({ url: anchor.href, downloadName: name }), cancelable: true
+        });
+        if (!apply(dispatch, document, [proposal])) { intentAt = 0; event.preventDefault(); }
+      } catch { /* Original site action remains available. */ }
+      return;
+    }
     if (!name || name.length > 180 || !/\.(?:zip|7z|rar|tar|gz|tgz|png|jpe?g|webp|gif|txt|md|csv|json|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|m4a|flac|mkv)$/i.test(name)) return;
     const blob = known.get(anchor.href)?.deref();
     if (!blob || !anchor.href.startsWith('blob:' + location.origin + '/')) return;

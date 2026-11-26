@@ -507,7 +507,9 @@ public sealed class BrowserBridgeTests
             }
             using var engine = DownloadEngine.Start(new EngineOptions
             {
-                DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads
+                DataDirectory = Path.Combine(root, "data"), DefaultFolder = downloads,
+                // Only the explicitly selected isolated local HTTP fixture may use loopback.
+                AllowPrivateNetworks = generatedReference && Environment.GetEnvironmentVariable("VESPER_QA_EARLY_DIRECT") == "1"
             });
             var bridge = new BrowserBridgeHandler(null!, engine, () => new VesperPreferences());
             using var desktop = new BridgeServer(pipe, bridge.HandleAsync);

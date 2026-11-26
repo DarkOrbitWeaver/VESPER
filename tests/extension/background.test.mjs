@@ -10,7 +10,7 @@ const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].inc
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, deferDownloadCancel = false,
   localData = {}, cookies = [{ name: 'session', value: 'test-value', path: '/' }],
-  preflightReady = false, preflightDelay = 0, playerPicker = false, helperProofs } = {}) {
+  preflightReady = false, preflightDelay = 0, playerPicker = false, helperProofs, earlyFetch } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -202,7 +202,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
       await new Promise(resolve => { finishDigest = resolve; });
     return webcrypto.subtle.digest(...args);
   } };
-  const context = { chrome, URL, Date: TestDate, TextEncoder, Uint8Array, crypto: { subtle, randomUUID: () => `test-uuid-${++sequence}-aaaa` }, navigator: { userAgent: 'test' }, setTimeout: testSetTimeout, clearTimeout: testClearTimeout, console };
+  const context = { chrome, URL, AbortController, fetch: earlyFetch, Date: TestDate, TextEncoder, Uint8Array, crypto: { subtle, randomUUID: () => `test-uuid-${++sequence}-aaaa` }, navigator: { userAgent: 'test' }, setTimeout: testSetTimeout, clearTimeout: testClearTimeout, console };
   vm.createContext(context);
   context.importScripts = (...files) => {
     for (const file of files) {
@@ -4452,4 +4452,49 @@ test('preloaded blob media is admitted only by a recent exact witness in the sam
     assert.equal(checks[0].candidates[0].url, actual);
     assert.equal(result.data.sourceChoices.length, 1, 'witness ranks verified media but does not auto-select');
   } finally { app.stopWorker(); }
+});
+const earlySender = {tab:{id:81,url:'https://example.com/releases'},frameId:0,documentId:'early-document',url:'https://example.com/releases'};
+const earlyUrl = 'https://example.com/files/setup.msi';
+function earlyHeaders(url=earlyUrl, changes={}) {
+  return {status:200,url,headers:new Headers({'Content-Type':'application/octet-stream','Content-Length':'500000','ETag':'"v1"','Content-Disposition':'attachment',...changes})};
+}
+test('trusted direct intent stages and accepts before any Chrome download exists', async()=>{
+  const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{earlyFetch:async(url,opts)=>{
+    assert.equal(url,earlyUrl);assert.equal(opts.method,'HEAD');assert.equal(opts.credentials,'omit');return earlyHeaders();
+  }});
+  try{
+    const reply=await app.message({type:'early-download',url:earlyUrl},earlySender);
+    assert.equal(reply.ok,true);
+    assert.deepEqual(app.sent.map(m=>m.type),['browser-capture','browser-transfer']);
+    assert.equal(app.sent[0].browserProof.etag,'"v1"');
+    assert.equal(app.sent[1].operation,'accept');
+    assert.equal(app.downloadHistory.length,0);
+  }finally{app.stopWorker()}
+});
+test('ambiguous links, HTML, missing validators, private mode and explicit queue preferences remain browser-owned',async()=>{
+  for(const [url,changes,prefs,sender] of [
+    [earlyUrl+'?token=x',{}, {},earlySender],
+    ['https://example.com/article.pdf',{}, {},earlySender],
+    [earlyUrl,{'Content-Type':'text/html'}, {},earlySender],
+    [earlyUrl,{'ETag':'W/"v1"'}, {},earlySender],
+    [earlyUrl,{}, {handoff:'queue'},earlySender],
+    [earlyUrl,{}, {},{...earlySender,tab:{...earlySender.tab,incognito:true}}]
+  ]){
+    const app=load({}, {prefs,earlyFetch:async()=>earlyHeaders(url,changes)});
+    try{assert.equal((await app.message({type:'early-download',url},sender)).fallback,true);assert.equal(app.sent.length,0)}
+    finally{app.stopWorker()}
+  }
+});
+test('refused native stage permits replay but uncertain acceptance never starts a duplicate',async()=>{
+  for(const uncertain of [false,true]){
+    const app=load({'browser-capture':uncertain?started:{ok:false,code:'site-refused'},
+      'browser-transfer':()=>uncertain?{ok:false,code:'host-unavailable'}:transfer('failed')},
+      {earlyFetch:async()=>earlyHeaders()});
+    try{
+      const reply=await app.message({type:'early-download',url:earlyUrl},earlySender);
+      assert.equal(reply.fallback,!uncertain);
+      assert.equal(app.sent.some(m=>m.operation==='accept'),uncertain);
+      assert.equal(app.sent.at(-1).operation,'abandon');
+    }finally{app.stopWorker()}
+  }
 });
