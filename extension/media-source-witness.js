@@ -38,6 +38,18 @@
   // Inspect only bytes the page already read. Keep two short, distinctive
   // samples from an MP4 media-data box, not the body or any encryption keys.
   // Equal-length, zero-filled or ambiguous matches never become provenance.
+  function distinctiveSample(bytes, start, end, kind) {
+    if (end - start < 128) return null;
+    const first = bytes.slice(start, start + 32), last = bytes.slice(end - 32, end);
+    return new Set(first).size >= 12 && new Set(last).size >= 12
+      && first.some((value, j) => value !== last[j])
+      ? {kind, length: end - start, first, last} : null;
+  }
+  function equalSample(a, b) {
+    return !!a && !!b && a.kind === b.kind && a.length === b.length
+      && a.first.every((value, i) => value === b.first[i])
+      && a.last.every((value, i) => value === b.last[i]);
+  }
   function mediaSample(input) {
     try {
       const bytes = ArrayBuffer.isView(input)
@@ -45,6 +57,15 @@
         : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
       if (!bytes || bytes.length < 136) return null;
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      // Whole copied WebM clusters and MPEG-TS packet sequences can provide
+      // the same non-authoritative hint as a copied MP4 mdat. No decoder or
+      // whole-body hash; require recognizable framing and distinctive samples.
+      const signature = view.getUint32(0);
+      if (signature === 0x1f43b675 || signature === 0x1a45dfa3)
+        return distinctiveSample(bytes, 0, bytes.length, 'webm');
+      if (bytes.length >= 188 * 4 && bytes.length % 188 === 0
+          && [0,188,376,564,bytes.length-188].every(i => bytes[i] === 0x47 && (bytes[i+3] & 0x30) !== 0))
+        return distinctiveSample(bytes, 0, bytes.length, 'ts');
       let offset = 0, sample = null;
       for (let i = 0; i < 128 && offset + 8 <= bytes.length; i++) {
         let size = view.getUint32(offset), header = 8;
@@ -55,11 +76,7 @@
         } else if (size === 0) size = bytes.length - offset;
         if (size < header || size > bytes.length - offset) return null;
         if (type === 0x6d646174 && size - header >= 128) {
-          const first = bytes.slice(offset + header, offset + header + 32);
-          const last = bytes.slice(offset + size - 32, offset + size);
-          if (new Set(first).size >= 12 && new Set(last).size >= 12
-              && first.some((value, j) => value !== last[j]))
-            sample = { length: size - header, first, last };
+          sample = distinctiveSample(bytes, offset + header, offset + size, 'mp4');
         }
         offset += size;
       }
@@ -73,9 +90,7 @@
     let match = null;
     for (const { evidence } of bufferSlots) {
       const prior = evidence.sample;
-      if (!prior || at - evidence.at > TTL || sample.length !== prior.length
-          || !sample.first.every((value, i) => value === prior.first[i])
-          || !sample.last.every((value, i) => value === prior.last[i])) continue;
+      if (at - evidence.at > TTL || !equalSample(sample, prior)) continue;
       // Even two matching samples cannot distinguish different requests.
       if (match && match !== evidence) return null;
       match = evidence;
@@ -173,7 +188,8 @@
       const exact = buffers.get(buffer);
       // A typed view over a larger response does not prove its whole contents.
       const full = !ArrayBuffer.isView(input) || input.byteOffset === 0 && input.byteLength === buffer.byteLength;
-      const evidence = full && exact || matchingSample(input);
+      const exactUnchanged = full && exact && (!exact.sample || equalSample(exact.sample, mediaSample(input)));
+      const evidence = exactUnchanged ? exact : matchingSample(input);
       const owner = owners.get(this)?.deref();
       if (owner && evidence && now() - evidence.at <= TTL) {
         // Never retain the buffer. Exact-object and sample-only evidence stay distinct.

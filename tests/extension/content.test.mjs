@@ -1050,3 +1050,20 @@ test('TikTok feed identity comes from the exact live player wrapper, not the hom
   wrapper.id='xgwrapper-0-7608248907960814879';
   assert.equal(identify(player,root),null);
 });
+test('prefetch and picker share exact-post metadata and never borrow a social feed title',()=>{
+  const content=source('content'), start=content.indexOf('  function titleForPlayer('), end=content.indexOf('  function activeTikTokPage(',start);
+  let page='https://x.com/outer/status/123456789';
+  const location={hostname:'x.com'};
+  const context=vm.createContext({URL,location,pageAddress:()=>page,
+    document:{title:'Outer quoted post',querySelectorAll:()=>[{}]},nativeAudioPlayer:()=>false});
+  vm.runInContext(source('player-source'),context);
+  const title=vm.runInContext(content.slice(start,end)+'\ntitleForPlayer;',context);
+  const player={getAttribute:()=>null};
+  assert.equal(title(player,'https://x.com/inner/status/987654321',true),'This video');
+  assert.equal(title(player,page,true),'Outer quoted post');
+  page='https://x.com/home';
+  assert.equal(title(player,page,true),'This video');
+  assert.equal(title({getAttribute:()=> 'Clip label'},page,true),'Clip label');
+  page='https://example.com/watch';location.hostname='example.com';
+  assert.equal(title(player,page,true),'Outer quoted post');
+});

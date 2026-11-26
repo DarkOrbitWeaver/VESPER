@@ -190,3 +190,24 @@ test('header-only transformations retain the media sample but flat payloads do n
   const other=b.player();other.buffer.appendBuffer(flat.slice());
   assert.deepEqual(b.request(other.el),[]);
 });
+
+test('copied WebM and TS observations are scoped hints, not exact fingerprints', async () => {
+  for (const kind of ['webm','ts']) {
+    const b=setup(), a=b.player(), other=b.player();
+    const bytes=new Uint8Array(kind==='ts'?188*5:512);
+    for(let i=0;i<bytes.length;i++) bytes[i]=(i*i+37*i)%251;
+    if(kind==='ts') for(let i=0;i<bytes.length;i+=188){bytes[i]=0x47;bytes[i+3]=0x10}
+    else new DataView(bytes.buffer).setUint32(0,0x1f43b675);
+    await new b.FetchResponse('https://cdn.test/clip.'+kind,'video/'+(kind==='ts'?'mp2t':'webm'),bytes.buffer).arrayBuffer();
+    a.buffer.appendBuffer(bytes.slice());
+    assert.deepEqual(b.request(a.el),[{path:'https://cdn.test/clip.'+kind,seen:100000}]);
+    assert.deepEqual(b.request(other.el),[]);
+  }
+});
+test('mutated sampled buffers lose exact provenance instead of certifying altered media',async()=>{
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/clip.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  bytes[8]^=0xff;
+  a.buffer.appendBuffer(bytes);
+  assert.deepEqual(b.request(a.el),[]);
+});

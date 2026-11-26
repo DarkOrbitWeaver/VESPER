@@ -405,6 +405,18 @@
     return activeYouTubePage(el, contextPage) || activeTikTokPage(el, contextPage) || contextPage;
   }
 
+  function titleForPlayer(player, targetPage, useDocumentTitle) {
+    const identity = VesperPlayerSource.identity(targetPage);
+    const documentIdentity = VesperPlayerSource.identity(pageAddress());
+    // Timeline titles may describe the outer quoted post or the site itself.
+    // Only use page metadata when it identifies this exact media page.
+    const social = /(?:^|\.)(?:x\.com|twitter\.com|facebook\.com|instagram\.com|tiktok\.com)$/i.test(location.hostname || '');
+    const specific = identity && (!/^https?:/.test(identity)
+      || !social && document.querySelectorAll('video,audio').length === 1);
+    return (useDocumentTitle && specific && identity === documentIdentity && document.title.replace(/\s+- YouTube$/, ''))
+      || player.getAttribute?.('aria-label')?.trim().slice(0, 300)
+      || (nativeAudioPlayer(player) ? 'This audio' : 'This video');
+  }
   function activeTikTokPage(el, contextPage) {
     if (!/(?:^|\.)tiktok\.com$/i.test(location.hostname || '') || el?.tagName !== 'VIDEO') return null;
     // The feed keeps its address at /, but its player wrapper carries the
@@ -722,7 +734,7 @@
     if (prefetchedPlayers.get(el) === key) return;
     prefetchedPlayers.set(el, key);
     const witness = playerFragmentWitness(el, binding);
-    const title = current ? document.title.replace(/\s+- YouTube$/, '') || 'This video' : 'This video';
+    const title = titleForPlayer(el, targetPage, current && activePreview?.player !== el);
     void send({ type: 'media-options', prefetch: true, pageUrl: targetPage,
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt, title,
       playerPlaying: !el.paused && !el.ended, playerHasMedia: current && (el.readyState >= 1 || el.ended || ended), playerPageUrl: targetPage,
@@ -1574,10 +1586,8 @@
     companion.setPickerOpen(true, false, true);
     updateFlyVisibility();
     const isPreview = !!preview;
-    const fallbackTitle = nativeAudioPlayer(player) ? 'This audio' : 'This video';
     const onPlayerPage = current && !isPreview && identity === panelMedia.documentIdentity;
-    const title = (onPlayerPage && document.title.replace(/\s+- YouTube$/, ''))
-      || (current && player.getAttribute?.('aria-label')?.trim().slice(0, 300)) || fallbackTitle;
+    const title = titleForPlayer(player, targetPage, onPlayerPage);
     // A feed's page-wide Open Graph image often belongs to the site rather than this player.
     const playerPageIsSpecific = identity && !/^https?:/.test(identity);
     const poster = current ? player.poster || (onPlayerPage && playerPageIsSpecific && document.querySelector('meta[property="og:image"]')?.content) || '' : '';
