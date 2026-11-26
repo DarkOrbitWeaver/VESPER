@@ -21,6 +21,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private string? _runResourceIdentity;
     private PieceMap? _pieces;
     private bool _singleConnection;
+    private bool _forceLinear;
 
     private sealed record FirstResult(HttpResponseMessage Response, long Start, bool Ranged, bool Replay, bool Decoded, long? Total);
 
@@ -160,6 +161,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             {
                 // Segmentation is no longer defensible. Committed bytes are untouched; go on with one connection.
                 _singleConnection = true;
+                _forceLinear = problem.Code is "range-ignored" or "range-rejected";
+                await session.CheckpointAsync(force: true, ct).ConfigureAwait(false);
                 engine.Log(Job.Id, "single-connection", problem.Message);
                 continue;
             }
@@ -280,7 +283,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             throw Stop(NoValidatorStop());
 
         session.SetPhase(JobState.Resolving);
-        long? rangeStart = Job.NonResumable ? null : start;
+        long? rangeStart = Job.NonResumable || _forceLinear ? null : start;
         HttpResponseMessage response = await http.SendAsync(_url, BuildSpec(rangeStart, null), ct).ConfigureAwait(false);
         if (fresh && response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
         {
@@ -319,8 +322,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
             // We asked to resume and received the whole body: the server ignores ranges or the file changed.
             RequireSameRepresentation(r, length, fresh: false);
-            if (Job.Extents.Ranges.Count != 1 || Job.Extents.Ranges[0].Start != 0)
-                throw Stop(RunOutcome.NeedsAttention("range-ignored", "The server no longer supports resuming and the saved data is not a single block. Saved data was kept."));
+            if ((Job.Extents.Ranges.Count != 1 || Job.Extents.Ranges[0].Start != 0)
+                && (Job.Identity != IdentityLevel.StrongEtag || decoded || length is null || length != Job.TotalBytes
+                    || _pieces is not null))
+                throw Stop(RunOutcome.NeedsAttention("range-ignored", "The server no longer supports resuming and the saved data cannot be safely replayed. Saved data was kept."));
             return new FirstResult(r, 0, Ranged: false, Replay: true, decoded, length);
         }
 
@@ -424,6 +429,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     }
 
     // ranged transfer (sequential first, segmented when defensible)
+    private sealed class RangeWorker
+    {
+        internal volatile bool Draining;
+        internal Task Task = Task.CompletedTask;
+    }
+
     private async Task RunRangedAsync(FirstResult first, CancellationToken ct)
     {
         long total = first.Total!.Value;
@@ -440,24 +451,25 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0;
 
         var board = new SegmentBoard(pieceMode ? long.MaxValue / 4 :
-            adaptiveSmall ? Math.Min(_o.MinSplitBytes, ConnectionAdvisor.SmallSplitMinimum) : _o.MinSplitBytes);
+            adaptiveSmall ? Math.Min(_o.MinSplitBytes, ConnectionAdvisor.SmallSplitMinimum) : _o.MinSplitBytes,
+            rateAware: segmented && !pieceMode);
         foreach (ByteRange gap in Job.Extents.Gaps(total)) AddSegments(board, gap, pieceMode);
 
         var advisor = new ConnectionAdvisor(segmented ? _o.MaxConnectionsPerJob : 1);
         if (segmented && recentlyThrottled)
             advisor.OnThrottled(_o.MaxConnectionsPerJob);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var workers = new List<Task>();
+        var workers = new List<RangeWorker>();
         HttpResponseMessage? firstResponse = first.Response;
         SemaphoreSlim hostGate = engine.HostGate(session.Host);
 
-        async Task WorkerAsync(bool takesFirst)
+        async Task WorkerAsync(RangeWorker worker, bool takesFirst)
         {
             session.AddConnection();
             HttpResponseMessage? open = takesFirst ? firstResponse : null;
             try
             {
-                while (!workersCts.IsCancellationRequested)
+                while (!workersCts.IsCancellationRequested && !worker.Draining)
                 {
                     Segment? segment = board.Acquire();
                     if (segment is null) break;
@@ -466,7 +478,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                         if (open is not null && segment.Next != first.Start) { open.Dispose(); open = null; }
                         HttpResponseMessage? use = open;
                         open = null;
-                        await RunSegmentAsync(board, segment, use, pieceMode, total, workersCts.Token).ConfigureAwait(false);
+                        await RunSegmentAsync(board, segment, use, pieceMode, total, worker, workersCts.Token).ConfigureAwait(false);
                     }
                     finally { board.Release(segment); }
                 }
@@ -479,6 +491,13 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             }
         }
 
+        void StartWorker(bool takesFirst = false)
+        {
+            var worker = new RangeWorker();
+            worker.Task = Task.Run(() => WorkerAsync(worker, takesFirst), CancellationToken.None);
+            workers.Add(worker);
+        }
+
         // The first connection may wait for a free host slot; extra ones are only opened if a slot is free right now.
         if (!hostGate.Wait(0))
         {
@@ -486,27 +505,60 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             firstResponse = null;
             await hostGate.WaitAsync(ct).ConfigureAwait(false);
         }
-        workers.Add(Task.Run(() => WorkerAsync(takesFirst: true), CancellationToken.None));
+        StartWorker(takesFirst: true);
 
         long lastChange = Stopwatch.GetTimestamp();
         long startingBytes = session.RunBytes;
+        long sampleBytes = startingBytes;
         bool smallProbeStarted = false;
         int target = 1;
         try
         {
             while (true)
             {
-                workers.RemoveAll(t => t.IsCompletedSuccessfully);
-                if (workers.Count == 0 || workers.Any(t => t.IsFaulted || t.IsCanceled)) break;
+                workers.RemoveAll(w => w.Task.IsCompletedSuccessfully);
+                if (workers.Any(w => w.Task.IsFaulted || w.Task.IsCanceled)) break;
+                if (workers.Count == 0)
+                {
+                    if (!board.HasWork || ct.IsCancellationRequested) break;
+                    await hostGate.WaitAsync(ct).ConfigureAwait(false);
+                    StartWorker();
+                    target = 1;
+                    lastChange = Stopwatch.GetTimestamp();
+                    sampleBytes = session.RunBytes;
+                }
 
                 if (segmented && board.HasWork)
                 {
-                    int recommended = advisor.Recommend(session.Connections, session.SpeedBytesPerSecond,
-                        Stopwatch.GetElapsedTime(lastChange), _o.RampInterval);
-                    if (recommended != target) { target = recommended; lastChange = Stopwatch.GetTimestamp(); }
-                    while (workers.Count(t => !t.IsCompleted) < target && hostGate.Wait(0))
-                        workers.Add(Task.Run(() => WorkerAsync(takesFirst: false), CancellationToken.None));
+                    int active = workers.Count(w => !w.Task.IsCompleted && !w.Draining);
+                    TimeSpan interval = Job.Identity == IdentityLevel.StrongEtag && !pieceMode
+                        ? TimeSpan.FromMilliseconds(Math.Min(_o.RampInterval.TotalMilliseconds, 1500)) : _o.RampInterval;
+                    TimeSpan elapsed = Stopwatch.GetElapsedTime(lastChange);
+                    long bytes = session.RunBytes - sampleBytes;
+                    double rate = elapsed.TotalSeconds > 0 ? bytes / elapsed.TotalSeconds : 0;
+                    bool limited = session.Limiter.BytesPerSecond > 0 || engine.GlobalLimiter.BytesPerSecond > 0;
+                    if (limited) target = 1;
+                    else if (active == target && elapsed >= interval && bytes > 0
+                        && board.RemainingBytes / rate > 2 && bytes >= 64 * 1024)
+                    {
+                        target = advisor.Recommend(active, rate, elapsed, interval);
+                        lastChange = Stopwatch.GetTimestamp();
+                        sampleBytes = session.RunBytes;
+                    }
+                    // Drain only after a completed write (or a verified piece). Never cancel a claimed chunk.
+                    foreach (var worker in workers.Where(w => !w.Task.IsCompleted && !w.Draining).Reverse().Take(Math.Max(0, active - target)))
+                        worker.Draining = true;
+                    int missing = target - workers.Count(w => !w.Task.IsCompleted);
+                    for (int i = 0; i < missing && board.HasAssignableWork && hostGate.Wait(0); i++)
+                    {
+                        StartWorker();
+                        lastChange = Stopwatch.GetTimestamp();
+                        sampleBytes = session.RunBytes;
+                    }
                 }
+                if (adaptiveSmall && (session.Limiter.BytesPerSecond > 0 || engine.GlobalLimiter.BytesPerSecond > 0))
+                    foreach (var worker in workers.Where(w => !w.Task.IsCompleted && !w.Draining).Skip(1))
+                        worker.Draining = true;
                 if (adaptiveSmall && !smallProbeStarted
                     && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0
                     && ConnectionAdvisor.WorthSmallFileSplit(session.RunBytes - startingBytes, board.RemainingBytes,
@@ -514,10 +566,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     && hostGate.Wait(0))
                 {
                     smallProbeStarted = true;
-                    workers.Add(Task.Run(() => WorkerAsync(takesFirst: false), CancellationToken.None));
+                    StartWorker();
                 }
                 int pollMs = adaptiveSmall && !smallProbeStarted ? 250 : 1000;
-                await Task.WhenAny(Task.WhenAny(workers), Task.Delay(pollMs, CancellationToken.None)).ConfigureAwait(false);
+                await Task.WhenAny(Task.WhenAny(workers.Select(w => w.Task)), Task.Delay(pollMs, CancellationToken.None)).ConfigureAwait(false);
             }
         }
         finally
@@ -527,9 +579,9 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
 
         Exception? error = null;
-        foreach (Task worker in workers)
+        foreach (RangeWorker worker in workers)
         {
-            try { await worker.ConfigureAwait(false); }
+            try { await worker.Task.ConfigureAwait(false); }
             catch (OperationCanceledException) { /* a sibling failed or the user paused */ }
             catch (Exception ex) { error = Prefer(error, ex); }
         }
@@ -553,20 +605,21 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         }
     }
 
-    private async Task RunSegmentAsync(SegmentBoard board, Segment segment, HttpResponseMessage? first, bool pieceMode, long total, CancellationToken ct)
+    private async Task RunSegmentAsync(SegmentBoard board, Segment segment, HttpResponseMessage? first, bool pieceMode, long total, RangeWorker worker, CancellationToken ct)
     {
         HttpResponseMessage? response = first;
         int emptyReads = 0;
         int pieceFailures = 0;
         while (segment.Next < segment.End)
         {
+            if (worker.Draining && !pieceMode) { response?.Dispose(); return; }
             long before = segment.Next;
             IncrementalHash? hash = pieceMode ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
             if (pieceMode) { segment.Next = segment.Start; before = segment.Start; }
             try
             {
                 response ??= await OpenRangeAsync(segment, total, ct).ConfigureAwait(false);
-                await StreamSegmentAsync(board, segment, response, hash, report: !pieceMode, ct).ConfigureAwait(false);
+                await StreamSegmentAsync(board, segment, response, hash, report: !pieceMode, worker, ct).ConfigureAwait(false);
             }
             finally
             {
@@ -619,6 +672,14 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 RequireSameRepresentation(response, total, fresh: false);
                 return response;
             }
+            if (code == 200 && !_singleConnection && _pieces is null && Job.Identity == IdentityLevel.StrongEtag
+                && HttpFacts.IsIdentityEncoded(response) && response.Content.Headers.ContentLength == total)
+            {
+                RequireSameRepresentation(response, total, fresh: false);
+                throw new RangeProblemException("range-ignored", "Range support changed; checking a full response against saved bytes.");
+            }
+            if (code == 416 && !_singleConnection && _pieces is null && Job.Identity == IdentityLevel.StrongEtag)
+                throw new RangeProblemException("range-rejected", "A range was rejected; checking a full response against saved bytes.");
             if (code == 200) throw Stop(RunOutcome.NeedsAttention("range-ignored", "The server stopped honouring range requests or the file changed. Saved data was kept."));
             if (code == 416) throw Stop(RunOutcome.NeedsAttention("range-rejected", "The server rejected a range request. Saved data was kept."));
             throw StatusStop(response);
@@ -631,7 +692,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     }
 
     private async Task StreamSegmentAsync(SegmentBoard board, Segment segment, HttpResponseMessage response,
-        IncrementalHash? hash, bool report, CancellationToken ct)
+        IncrementalHash? hash, bool report, RangeWorker worker, CancellationToken ct)
     {
         byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
         try
@@ -641,8 +702,14 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             bool checkedBody = segment.Next != 0;
             while (true)
             {
+                if (report && worker.Draining) return;
                 long remaining = board.Remaining(segment);
-                if (remaining <= 0) return;
+                if (remaining <= 0)
+                {
+                    if (!report || response.Content.Headers.ContentRange?.To is not long last
+                        || last == long.MaxValue || !board.TryExtend(segment, last + 1)) return;
+                    continue;
+                }
                 int read = await ReadAsync(body, buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), stall, ct).ConfigureAwait(false);
                 if (read == 0) return;                                    // server ended early; the caller reconnects
 
@@ -658,6 +725,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 await session.WriteAsync(buffer.AsMemory(0, n), segment.Next, report, ct).ConfigureAwait(false);
                 hash?.AppendData(buffer, 0, n);
                 board.Advance(segment, n);
+                if (n < read) return; // discarded response bytes must never be reused
             }
         }
         finally
@@ -669,6 +737,11 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     // linear transfer: unknown length, server without ranges, or replay-and-verify
     private async Task RunLinearAsync(FirstResult first, PartialFile file, CancellationToken ct)
     {
+        if (first.Replay && Job.Extents.TotalBytes != Job.Extents.ContiguousFromZero())
+        {
+            await ReplaySparseAsync(first, file, ct).ConfigureAwait(false);
+            return;
+        }
         long prefix = first.Replay ? Job.Extents.ContiguousFromZero() : 0;
         long offset = 0;
         byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
@@ -721,6 +794,60 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     await VerifyUnknownLengthAsync(offset, ct).ConfigureAwait(false);
                 engine.UpdateJob(Job, j => j.TotalBytes = offset);
             }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            ArrayPool<byte>.Shared.Return(local);
+        }
+    }
+
+    // A server can stop honoring ranges after parallel workers have written sparse extents.
+    // Compare every saved interval; stage missing bytes without reporting them until the
+    // whole identity-proven response has been checked. A crash or mismatch retains only
+    // the old extents, never a partially verified mixture.
+    private async Task ReplaySparseAsync(FirstResult first, PartialFile file, CancellationToken ct)
+    {
+        if (Job.Identity != IdentityLevel.StrongEtag || first.Decoded || first.Total is not long total
+            || total != Job.TotalBytes || _pieces is not null)
+            throw Stop(RunOutcome.NeedsAttention("range-ignored", "The saved ranges cannot be safely replayed."));
+        var saved = Job.Extents.Clone();
+        var ranges = saved.Ranges;
+        int index = 0;
+        long offset = 0;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
+        byte[] local = ArrayPool<byte>.Shared.Rent(BufferSize);
+        try
+        {
+            await using Stream body = await first.Response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var stall = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            while (offset < total)
+            {
+                int read = await ReadAsync(body, buffer.AsMemory(0, (int)Math.Min(buffer.Length, total - offset)), stall, ct).ConfigureAwait(false);
+                if (read == 0) throw new TransientNetworkException("The full replay ended early.");
+                if (offset == 0) RejectHtmlBody(buffer.AsSpan(0, read), first.Response);
+                await session.Limiter.AcquireAsync(read, ct).ConfigureAwait(false);
+                await engine.GlobalLimiter.AcquireAsync(read, ct).ConfigureAwait(false);
+                int used = 0;
+                while (used < read)
+                {
+                    while (index < ranges.Count && ranges[index].End <= offset) index++;
+                    bool covered = index < ranges.Count && ranges[index].Start <= offset;
+                    long boundary = index >= ranges.Count ? total : covered ? ranges[index].End : ranges[index].Start;
+                    int n = (int)Math.Min(read - used, boundary - offset);
+                    if (covered)
+                    {
+                        if (file.Read(local.AsSpan(0, n), offset) != n || !buffer.AsSpan(used, n).SequenceEqual(local.AsSpan(0, n)))
+                            throw Changed("a saved range differs from the full response");
+                    }
+                    else await session.WriteAsync(buffer.AsMemory(used, n), offset, report: false, ct).ConfigureAwait(false);
+                    offset += n;
+                    used += n;
+                }
+            }
+            if (await ReadAsync(body, buffer.AsMemory(0, 1), stall, ct).ConfigureAwait(false) != 0)
+                throw Changed("the full response exceeds the known length");
+            foreach (ByteRange gap in saved.Gaps(total)) session.Report(gap);
         }
         finally
         {

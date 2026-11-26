@@ -321,8 +321,8 @@ public class PacingTests
         n = advisor.Recommend(n, 1_800_000, enough, ramp);
         Assert.Equal(3, n);
         n = advisor.Recommend(n, 1_850_000, enough, ramp);       // < 15 % gain: plateau
-        Assert.Equal(3, n);
-        Assert.Equal(3, advisor.Recommend(n, 1_900_000, enough, ramp));
+        Assert.Equal(2, n);
+        Assert.Equal(2, advisor.Recommend(n, 1_900_000, enough, ramp));
         Assert.Equal(1, advisor.OnThrottled(2));
     }
 
@@ -357,6 +357,44 @@ public class SegmentBoardTests
         Assert.Equal(second.Start, first.End);
         Assert.Equal(10_000_000, second.End);
         Assert.Equal(0, second.Start % 65536);
+    }
+
+    [Fact]
+    public void Rate_aware_stealing_prefers_the_longest_estimated_tail()
+    {
+        var board = new SegmentBoard(128 * 1024, rateAware: true);
+        board.Add(new Segment(0, 4 * 1024 * 1024));
+        board.Add(new Segment(4 * 1024 * 1024, 12 * 1024 * 1024));
+        Segment slow = board.Acquire()!, fast = board.Acquire()!;
+        slow.Rate = 100_000;
+        fast.Rate = 4_000_000;
+        board.ClaimChunk(slow, 65536);
+        Segment stolen = board.Acquire()!;
+        Assert.Equal(slow.End, stolen.Start);
+        Assert.Equal(4 * 1024 * 1024, stolen.End);
+        Assert.True(stolen.Start >= slow.Claimed);
+        Assert.True(stolen.End - stolen.Start > 2 * 1024 * 1024);
+        Assert.Equal(12 * 1024 * 1024, fast.End);
+    }
+
+    [Fact]
+    public void Adjacent_range_reuse_requires_free_untouched_bytes_inside_response()
+    {
+        var board = new SegmentBoard(1000);
+        board.Add(new Segment(0, 1000));
+        board.Add(new Segment(1000, 2000));
+        Segment first = board.Acquire()!;
+        Segment second = board.Acquire()!;
+        board.Advance(first, 1000);
+        Assert.False(board.TryExtend(first, 2000));
+        board.Release(second);
+        Assert.False(board.TryExtend(first, 1999));
+        Assert.True(board.TryExtend(first, 2000));
+        Assert.Equal(1000, first.Next);
+        Assert.Equal(2000, first.End);
+        Assert.Equal(1000, board.RemainingBytes);
+        board.Advance(first, 1000);
+        Assert.False(board.HasWork);
     }
 
     [Fact]

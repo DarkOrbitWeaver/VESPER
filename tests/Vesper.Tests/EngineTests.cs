@@ -91,6 +91,52 @@ public class SequentialAndResumeTests
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Sparse_replay_checks_every_saved_interval_before_admitting_new_bytes(bool changed)
+    {
+        await using var server = new FaultServer(1024 * 1024); await server.StartAsync();
+        using var h = new Harness();
+        string url = server.Url(changed ? "/norange-same-tag-changed" : "/norange");
+        Guid id = h.Add(url, "sparse.bin", startNow: false);
+        var job = ((Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
+            .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(h.Engine)!)[id];
+        var extents = new ExtentSet();
+        extents.Add(new ByteRange(0, 65536));
+        extents.Add(new ByteRange(server.V1.Length - 65536, server.V1.Length));
+        Directory.CreateDirectory(Path.GetDirectoryName(job.PartialPath)!);
+        byte[] partial = new byte[server.V1.Length];
+        foreach (var range in extents.Ranges)
+            server.V1.AsSpan((int)range.Start, (int)range.Length).CopyTo(partial.AsSpan((int)range.Start));
+        File.WriteAllBytes(job.PartialPath, partial);
+        h.OwnFixturePartial(id);
+        h.Engine.UpdateJob(job, j =>
+        {
+            j.TotalBytes = partial.Length;
+            j.ETag = "\"p1\"";
+            j.Identity = IdentityLevel.StrongEtag;
+            j.FinalResourceIdentity = HttpTransport.ResourceIdentity(new Uri(url));
+            j.Extents = extents;
+        });
+        h.Engine.Resume(id);
+        JobSnapshot result = await h.WaitAsync(id, j => j.State is JobState.Completed or JobState.NeedsAttention);
+        if (!changed)
+        {
+            Assert.Equal(JobState.Completed, result.State);
+            Assert.Equal(server.V1, await File.ReadAllBytesAsync(result.FinalPath!));
+        }
+        else
+        {
+            Assert.Equal("changed", result.Reason);
+            Assert.Equal(extents.TotalBytes, result.CommittedBytes);
+            byte[] kept = await File.ReadAllBytesAsync(result.PartialPath);
+            foreach (var range in extents.Ranges)
+                Assert.Equal(partial.AsSpan((int)range.Start, (int)range.Length).ToArray(), kept.AsSpan((int)range.Start, (int)range.Length).ToArray());
+        }
+    }
+
     [Fact]
     public async Task A_changed_remote_file_never_gets_mixed_into_saved_data()
     {

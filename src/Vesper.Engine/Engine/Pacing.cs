@@ -11,11 +11,19 @@ public sealed class RateLimiter
 {
     private readonly object _gate = new();
     private long _bytesPerSecond;
+    private long _revision;
     private long _nextFree;   // Stopwatch ticks
 
     public long BytesPerSecond => Interlocked.Read(ref _bytesPerSecond);
 
-    public void SetRate(long bytesPerSecond) => Interlocked.Exchange(ref _bytesPerSecond, Math.Max(0, bytesPerSecond));
+    internal long Revision => Interlocked.Read(ref _revision);
+
+    public void SetRate(long bytesPerSecond)
+    {
+        long value = Math.Max(0, bytesPerSecond);
+        if (Interlocked.Exchange(ref _bytesPerSecond, value) != value)
+            Interlocked.Increment(ref _revision);
+    }
 
     public async ValueTask AcquireAsync(int bytes, CancellationToken ct)
     {
@@ -74,6 +82,7 @@ public sealed class ConnectionAdvisor
     }
 
     private int _ceiling;
+    private bool _settled;
     private double _throughputAtLastChange;
     private int _countAtLastChange = 1;
 
@@ -88,7 +97,7 @@ public sealed class ConnectionAdvisor
     public int Recommend(int current, double bytesPerSecond, TimeSpan sinceLastChange, TimeSpan rampInterval)
     {
         current = Math.Clamp(current, 1, Math.Max(1, _ceiling));
-        if (sinceLastChange < rampInterval) return current;
+        if (_settled || sinceLastChange < rampInterval || bytesPerSecond <= 0) return current;
 
         int next = current;
         if (current == 1)
@@ -103,12 +112,16 @@ public sealed class ConnectionAdvisor
         {
             next = current - 1;                                         // the last connection hurt: stop growing
             _ceiling = next;
+            _settled = true;
         }
         else
         {
-            _ceiling = current;                                         // plateau
+            next = current - 1;                                         // retire a probe that did not pay for itself
+            _ceiling = next;
+            _settled = true;
         }
 
+        if (next > _ceiling && current == _ceiling) _settled = true;
         next = Math.Clamp(next, 1, Math.Max(1, _ceiling));
         if (next != current || next == _countAtLastChange) { _throughputAtLastChange = bytesPerSecond; _countAtLastChange = next; }
         return next;
@@ -118,6 +131,7 @@ public sealed class ConnectionAdvisor
     public int OnThrottled(int current)
     {
         _ceiling = Math.Max(1, current / 2);
+        _settled = true;
         return _ceiling;
     }
 }

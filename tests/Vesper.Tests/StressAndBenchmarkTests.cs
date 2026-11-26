@@ -71,6 +71,20 @@ public class StressTests
     }
 
     [Fact]
+    public async Task Active_range_workers_drain_when_the_user_applies_a_speed_limit()
+    {
+        await using var server = new FaultServer(8 * 1024 * 1024); await server.StartAsync();
+        using var h = new Harness(tweak: o => o.MaxConnectionsPerJob = 4);
+        Guid id = h.Add(server.Url("/small-slow"), "drain.bin");
+        await h.WaitAsync(id, s => s.State == JobState.Downloading && s.Connections >= 2);
+        h.Engine.SetSpeedLimit(id, 8 * 1024 * 1024);
+        await h.WaitAsync(id, s => s.State == JobState.Downloading && s.Connections == 1);
+        h.Engine.SetSpeedLimit(id, 0);
+        JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed, 90);
+        Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
+    }
+
+    [Fact]
     public async Task Pausing_and_resuming_repeatedly_never_corrupts_the_result()
     {
         await using var server = new FaultServer(3 * 1024 * 1024); await server.StartAsync();

@@ -125,6 +125,7 @@ internal sealed class FaultServer : IAsyncDisposable
             case "/noetag": await Serve(ctx, V1, null, null); break;
             case "/lmonly": await Serve(ctx, V1, null, Modified); break;
             case "/norange": await Serve(ctx, V1, "\"p1\"", Modified, ranges: false); break;
+            case "/norange-same-tag-changed": await Serve(ctx, V2, "\"p1\"", Modified, ranges: false); break;
             case "/truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, truncate: hit == 1 ? 0.6 : null); break;
             case "/norange-truncate-once": await Serve(ctx, V1, "\"p1\"", Modified, ranges: false, truncate: hit == 1 ? 0.6 : null); break;
             case "/expires-after-truncate":

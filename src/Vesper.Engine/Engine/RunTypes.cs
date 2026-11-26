@@ -34,13 +34,16 @@ internal sealed class Segment(long start, long end)
     /// <summary>End of the chunk the owner is about to write; a split may never cut below it.</summary>
     public long Claimed { get; set; } = start;
     public bool Owned { get; set; }
+    public long SampleAt { get; set; }
+    public long SampleBytes { get; set; }
+    public double Rate { get; set; }
 }
 
 /// <summary>
 /// Hands out non-overlapping spans to connections. When no free span is left, the largest running span is
 /// split in two, which adapts naturally to connections of different speed. All mutation happens under one lock.
 /// </summary>
-internal sealed class SegmentBoard(long minSplitBytes)
+internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false)
 {
     private const long Alignment = 64 * 1024;
     private readonly object _gate = new();
@@ -49,6 +52,15 @@ internal sealed class SegmentBoard(long minSplitBytes)
     public void Add(Segment segment) { lock (_gate) _segments.Add(segment); }
 
     public bool HasWork { get { lock (_gate) return _segments.Any(s => s.Next < s.End); } }
+
+    public bool HasAssignableWork
+    {
+        get
+        {
+            lock (_gate) return _segments.Any(s => !s.Owned && s.Next < s.End
+                || s.Owned && s.End - Math.Max(s.Next, s.Claimed) >= 2 * minSplitBytes);
+        }
+    }
 
     public long RemainingBytes { get { lock (_gate) return _segments.Sum(s => Math.Max(0, s.End - s.Next)); } }
 
@@ -59,23 +71,46 @@ internal sealed class SegmentBoard(long minSplitBytes)
         lock (_gate)
         {
             Segment? free = _segments.FirstOrDefault(s => !s.Owned && s.Next < s.End);
-            if (free is not null) { free.Owned = true; return free; }
+            if (free is not null) { free.Owned = true; free.SampleAt = 0; free.SampleBytes = 0; free.Rate = 0; return free; }
 
             // Nothing free: split the span with the most bytes left, if it is worth a new connection.
-            Segment? largest = _segments.Where(s => s.Owned && s.Next < s.End).MaxBy(s => s.End - Math.Max(s.Next, s.Claimed));
+            var eligible = _segments.Where(s => s.Owned && s.End - Math.Max(s.Next, s.Claimed) >= 2 * minSplitBytes).ToArray();
+            double[] rates = eligible.Where(s => s.Rate > 0).Select(s => s.Rate).ToArray();
+            double helperRate = rateAware && rates.Length > 0 ? rates.Average() : 0;
+            Segment? largest = eligible.MaxBy(s => helperRate > 0 && s.Rate > 0
+                ? (s.End - Math.Max(s.Next, s.Claimed)) / s.Rate
+                : helperRate > 0 ? (s.End - Math.Max(s.Next, s.Claimed)) / helperRate : s.End - Math.Max(s.Next, s.Claimed));
             if (largest is null) return null;
 
             long floor = Math.Max(largest.Next, largest.Claimed);
             long remaining = largest.End - floor;
             if (remaining < 2 * minSplitBytes) return null;
 
-            long mid = (floor + remaining / 2) / Alignment * Alignment;
+            long stolen = remaining / 2;
+            if (helperRate > 0 && largest.Rate > 0)
+                stolen = (long)Math.Clamp(helperRate * (remaining - largest.Rate * 0.15) / (helperRate + largest.Rate), minSplitBytes, remaining - minSplitBytes);
+            long mid = (largest.End - stolen) / Alignment * Alignment;
             if (mid <= floor || mid >= largest.End) return null;
 
             var tail = new Segment(mid, largest.End) { Owned = true };
             largest.End = mid;
             _segments.Add(tail);
             return tail;
+        }
+    }
+
+    // A still-open validated response can cover an adjacent, untouched free span.
+    public bool TryExtend(Segment segment, long responseEndExclusive)
+    {
+        lock (_gate)
+        {
+            if (!segment.Owned || segment.Next != segment.End) return false;
+            Segment? next = _segments.FirstOrDefault(s => !s.Owned && s.Start == segment.End
+                && s.Next == s.Start && s.Claimed <= s.Start && s.End <= responseEndExclusive);
+            if (next is null) return false;
+            segment.End = next.End;
+            _segments.Remove(next);
+            return true;
         }
     }
 
@@ -92,5 +127,21 @@ internal sealed class SegmentBoard(long minSplitBytes)
         }
     }
 
-    public void Advance(Segment segment, int written) { lock (_gate) segment.Next += written; }
+    public void Advance(Segment segment, int written)
+    {
+        lock (_gate)
+        {
+            segment.Next += written;
+            if (!rateAware) return;
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (segment.SampleAt == 0) segment.SampleAt = now;
+            segment.SampleBytes += written;
+            double elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(segment.SampleAt, now).TotalSeconds;
+            if (elapsed < 0.25) return;
+            double rate = segment.SampleBytes / elapsed;
+            segment.Rate = segment.Rate == 0 ? rate : segment.Rate * 0.5 + rate * 0.5;
+            segment.SampleAt = now;
+            segment.SampleBytes = 0;
+        }
+    }
 }
