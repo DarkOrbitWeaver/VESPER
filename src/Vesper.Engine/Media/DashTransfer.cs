@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -86,11 +87,12 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             session.SetPhase(JobState.Downloading);
             using var prefetch = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var pending = new Queue<Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)>>();
+            var window = new SegmentLookahead(engine.Options, session.Limiter, engine.GlobalLimiter);
             int fetchNext = next;
             DateTime lastMessage = DateTime.MinValue;
             void Fill()
             {
-                while (pending.Count < 3 && fetchNext < fragments.Count)
+                while (fetchNext < fragments.Count && pending.Count < window.Limit(fragments[fetchNext].Url))
                     pending.Enqueue(FetchBufferedAsync(fragments[fetchNext++], MaxObjectBytes, prefetch.Token));
             }
             try
@@ -100,7 +102,9 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
                 ct.ThrowIfCancellationRequested();
                 Fill();
                 Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> fetchTask = pending.Dequeue();
+                long waitStart = Stopwatch.GetTimestamp();
                 var fetched = await fetchTask.ConfigureAwait(false);
+                window.ObserveWait(Stopwatch.GetElapsedTime(waitStart));
                 fetchTask = null!;
                 ReadOnlyMemory<byte> fragment = fetched.Data;
                 SegmentBufferLease lease = fetched.Lease;

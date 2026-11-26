@@ -121,3 +121,34 @@ public sealed class ConnectionAdvisor
         return _ceiling;
     }
 }
+
+internal sealed class SegmentLookahead(EngineOptions options, RateLimiter local, RateLimiter global)
+{
+    private int _window = 3;
+    private int _samples, _slow, _ready;
+
+    // The buffer limiter independently bounds total memory, even across jobs.
+    internal int Limit(string url)
+    {
+        if (local.BytesPerSecond > 0 || global.BytesPerSecond > 0
+            || Uri.TryCreate(url, UriKind.Absolute, out var uri) && options.Cooldown.WasRecentlyThrottled(uri))
+            return 1;
+        return Math.Clamp(_window, 1, Math.Max(1, Math.Min(SegmentBufferLimiter.MaxRetainedSegments,
+            Math.Min(options.MaxConnectionsPerJob, options.MaxConnectionsPerHost))));
+    }
+
+    // Measure time the ordered writer actually waited for its next object.
+    // Ready objects mean lookahead is already hiding the network latency.
+    internal void ObserveWait(TimeSpan wait)
+    {
+        if (wait >= TimeSpan.FromMilliseconds(125)) _slow++;
+        else if (wait <= TimeSpan.FromMilliseconds(10)) _ready++;
+        if (++_samples < 6) return;
+
+        // A burst of ready objects between stalls is normal with parallel requests.
+        // Evaluate the whole window, rather than requiring consecutive slow objects.
+        if (_slow >= 2) _window = Math.Min(SegmentBufferLimiter.MaxRetainedSegments, _window + 1);
+        else if (_ready >= 5 && _slow == 0) _window = Math.Max(2, _window - 1);
+        _samples = _slow = _ready = 0;
+    }
+}

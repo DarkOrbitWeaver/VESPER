@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text.Json;
@@ -18,7 +19,6 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
     private const long MaxPlaylistBytes = 4 * 1024 * 1024;
     private const int MaxInitializationBytes = 8 * 1024 * 1024;
     private const long MaxSegmentBytes = 64L * 1024 * 1024; // Bound buffering until streaming decryption is available.
-    private const int PrefetchSegments = 3;                   // segments in flight ahead of the one being committed
     private const string LiveMode = "live-hls";
     private sealed record Cursor(string Playlist, int Next, string? PlanHash = null, long Offset = 0,
         string? PrefixHash = null, int InitLength = 0, Mp4Progress? Progress = null,
@@ -178,10 +178,11 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             // the checkpoint cursor stays a contiguous prefix exactly as before.
             using var prefetchLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var prefetched = new Queue<(int Index, Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> Data)>();
+            var window = new SegmentLookahead(engine.Options, session.Limiter, engine.GlobalLimiter);
             int fetchNext = next;
             void Prefetch()
             {
-                while (prefetched.Count < PrefetchSegments && fetchNext < segments.Count)
+                while (fetchNext < segments.Count && prefetched.Count < window.Limit(segments[fetchNext].Uri))
                 {
                     HlsSegment ahead = segments[fetchNext];
                     prefetched.Enqueue((fetchNext, FetchBufferedSegmentAsync(ahead.Uri, ahead.RangeOffset, ahead.RangeLength,
@@ -207,7 +208,9 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
                 int fetchedIndex = queued.fetchedIndex;
                 Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> fetched = queued.Data;
                 if (fetchedIndex != i) throw new InvalidOperationException("HLS prefetch order was lost.");
+                long waitStart = Stopwatch.GetTimestamp();
                 var fetchedData = await fetched.ConfigureAwait(false);
+                window.ObserveWait(Stopwatch.GetElapsedTime(waitStart));
                 fetched = null!;
                 ReadOnlyMemory<byte> data = fetchedData.Data;
                 SegmentBufferLease lease = fetchedData.Lease;
@@ -1005,24 +1008,29 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
         if (offset is not null && (length is not long count || count <= 0 || offset.Value < 0 || count > limit || offset.Value > long.MaxValue - count))
             throw new RunnerStop(RunOutcome.NeedsAttention("invalid-range", "The playlist contains an invalid or oversized byte range."));
         long? end = offset is long start && length is long size ? start + size - 1 : null;
-        using HttpResponseMessage response = await http.SendAsync(uri, Spec(offset, end), ct).ConfigureAwait(false);
-        int code = (int)response.StatusCode;
-        if (code is not (200 or 206)) throw StatusStop(response);
-        if (offset is long requestedStart)
+        session.AddConnection();
+        try
         {
-            RangeCheck check = HttpFacts.CheckRangeResponse(response, requestedStart, end);
-            if (!check.IsValid || check.EndInclusive != end)
-                throw new RunnerStop(RunOutcome.NeedsAttention("invalid-range", "The server returned a different byte range than the playlist requested. Saved data was kept."));
-            if (!HttpFacts.IsIdentityEncoded(response))
-                throw new RunnerStop(RunOutcome.NeedsAttention("encoded-range", "The server compressed a byte-range response; it cannot be assembled safely."));
+            using HttpResponseMessage response = await http.SendAsync(uri, Spec(offset, end), ct).ConfigureAwait(false);
+            int code = (int)response.StatusCode;
+            if (code is not (200 or 206)) throw StatusStop(response);
+            if (offset is long requestedStart)
+            {
+                RangeCheck check = HttpFacts.CheckRangeResponse(response, requestedStart, end);
+                if (!check.IsValid || check.EndInclusive != end)
+                    throw new RunnerStop(RunOutcome.NeedsAttention("invalid-range", "The server returned a different byte range than the playlist requested. Saved data was kept."));
+                if (!HttpFacts.IsIdentityEncoded(response))
+                    throw new RunnerStop(RunOutcome.NeedsAttention("encoded-range", "The server compressed a byte-range response; it cannot be assembled safely."));
+            }
+            else if (code == 206)
+                throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
+            if (HttpFacts.IsHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
+            ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies).ConfigureAwait(false);
+            if (length is long expected && bytes.Length != expected)
+                throw new TransientNetworkException("The HLS byte-range response was incomplete.");
+            return bytes;
         }
-        else if (code == 206)
-            throw new RunnerStop(RunOutcome.NeedsAttention("unexpected-range", "The server unexpectedly returned only part of a full segment."));
-        if (HttpFacts.IsHtml(response)) throw new RunnerStop(RunOutcome.NeedsAttention("html", "The server sent a web page instead of video data."));
-        ReadOnlyMemory<byte> bytes = await ReadBoundedAsync(response, length ?? limit, ct, lease, copies).ConfigureAwait(false);
-        if (length is long expected && bytes.Length != expected)
-            throw new TransientNetworkException("The HLS byte-range response was incomplete.");
-        return bytes;
+        finally { session.RemoveConnection(); }
     }
 
     private async Task<(ReadOnlyMemory<byte> Data, SegmentBufferLease Lease)> FetchBufferedSegmentAsync(

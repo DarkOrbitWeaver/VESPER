@@ -101,6 +101,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (!keys.Valid) return Stop("The saved HLS key identities are invalid.");
         using var fetchStop = CancellationTokenSource.CreateLinkedTokenSource(ct);
         Task<BufferedPart>? prefetched = null;
+        var window = new SegmentLookahead(engine.Options, session.Limiter, engine.GlobalLimiter);
         try
         {
             session.SetPhase(JobState.Downloading);
@@ -118,7 +119,8 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     // One lookahead, using the existing global memory/connection budget.
                     // Initialize and decrypt in order; only independent clear media GETs
                     // are eligible. Never advance the durable cursor until this part commits.
-                    if (pi + 1 < prepared.Parts.Count && CanPrefetch(part, prepared.Parts[pi + 1]))
+                    if (pi + 1 < prepared.Parts.Count && window.Limit(prepared.Parts[pi + 1].Url) > 1
+                        && CanPrefetch(part, prepared.Parts[pi + 1]))
                         prefetched = FetchBufferedPartAsync(prepared.Parts[pi + 1], fetchStop.Token);
                     using BufferedPart received = await current.ConfigureAwait(false);
                     ReadOnlyMemory<byte> data = received.Data;

@@ -3,6 +3,7 @@ namespace Vesper.Engine;
 /// <summary>Bounds retained whole-segment buffers across concurrent media jobs.</summary>
 internal sealed class SegmentBufferLimiter
 {
+    internal const int MaxRetainedSegments = 6;
     private const long DefaultBufferCapacity = 64 * 1024;
     private readonly int _maxSlots;
     private readonly long _maxBytes;
@@ -11,7 +12,7 @@ internal sealed class SegmentBufferLimiter
     private int _activeSlots;
     private long _activeBytes;
 
-    internal SegmentBufferLimiter(int maxSlots = 3, long maxBytes = 256L * 1024 * 1024)
+    internal SegmentBufferLimiter(int maxSlots = MaxRetainedSegments, long maxBytes = 256L * 1024 * 1024)
     {
         if (maxSlots < 1) throw new ArgumentOutOfRangeException(nameof(maxSlots));
         if (maxBytes < 1) throw new ArgumentOutOfRangeException(nameof(maxBytes));

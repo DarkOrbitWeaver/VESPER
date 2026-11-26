@@ -780,8 +780,33 @@ public sealed class DashTransferTests
         Assert.Equal(Expected, await File.ReadAllBytesAsync(completed.FinalPath!));
     }
 
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(false, 3)]
+    [InlineData(true, 1)]
+    [InlineData(true, 3)]
+    public async Task SegmentedTransfersHonorConnectionLimits(bool hls, int limit)
+    {
+        await using var server = await FixtureServer.StartAsync();
+        server.FragmentDelayMs = 250;
+        using var h = new Harness(tweak: options => options.MaxConnectionsPerJob = limit);
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        Guid id;
+        if (hls)
+        {
+            var added = h.Engine.Add(new AddRequest(server.Url("/hls.m3u8"), FileName: "fixture.mp4", Kind: JobKind.Hls));
+            Assert.True(added.Ok, added.Message);
+            id = added.JobId;
+        }
+        else id = Add(h, server);
+        var completed = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(Expected, await File.ReadAllBytesAsync(completed.FinalPath!));
+        Assert.Equal(limit, server.MaxActiveFragmentRequests);
+        Console.WriteLine($"SEGMENT_PACING { (hls ? "HLS" : "DASH") } limit={limit} elapsedMs={started.Elapsed.TotalMilliseconds:F1} peak={server.MaxActiveFragmentRequests}");
+    }
+
     [Fact]
-    public async Task ConcurrentDashJobsShareThreePrefetchBuffers()
+    public async Task ConcurrentDashJobsShareBoundedPrefetchBuffers()
     {
         await using var server = await FixtureServer.StartAsync();
         server.FragmentDelayMs = 60;
@@ -794,7 +819,7 @@ public sealed class DashTransferTests
 
         var completed = await Task.WhenAll(ids.Select(id => h.WaitForStateAsync(id, JobState.Completed)));
 
-        Assert.InRange(server.MaxActiveFragmentRequests, 2, 3);
+        Assert.InRange(server.MaxActiveFragmentRequests, 2, SegmentBufferLimiter.MaxRetainedSegments);
         foreach (var job in completed) Assert.Equal(Expected, await File.ReadAllBytesAsync(job.FinalPath!));
     }
 

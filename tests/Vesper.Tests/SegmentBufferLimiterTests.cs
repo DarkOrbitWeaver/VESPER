@@ -56,6 +56,37 @@ public sealed class SegmentBufferLimiterTests
     }
 
     [Fact]
+    public void LookaheadAdaptsToIntermittentStarvationAndHonorsLimits()
+    {
+        var options = new EngineOptions { DataDirectory = "unused", MaxConnectionsPerJob = 6, MaxConnectionsPerHost = 8 };
+        var local = new RateLimiter();
+        var global = new RateLimiter();
+        var advisor = new SegmentLookahead(options, local, global);
+        const string url = "https://example.test/segment";
+        Assert.Equal(3, advisor.Limit(url));
+        foreach (int delay in new[] { 150, 0, 0, 150, 0, 0 })
+            advisor.ObserveWait(TimeSpan.FromMilliseconds(delay));
+        Assert.Equal(4, advisor.Limit(url));
+        for (int i = 0; i < 6; i++) advisor.ObserveWait(TimeSpan.Zero);
+        Assert.Equal(3, advisor.Limit(url));
+        options.MaxConnectionsPerHost = 2;
+        Assert.Equal(2, advisor.Limit(url));
+        options.MaxConnectionsPerJob = 1;
+        Assert.Equal(1, advisor.Limit(url));
+        options.MaxConnectionsPerJob = 6;
+        options.MaxConnectionsPerHost = 8;
+        global.SetRate(1000);
+        Assert.Equal(1, advisor.Limit(url));
+        global.SetRate(0);
+        local.SetRate(1000);
+        Assert.Equal(1, advisor.Limit(url));
+        local.SetRate(0);
+        options.Cooldown.Remember(new Uri(url), DateTimeOffset.UtcNow.AddMinutes(1));
+        Assert.Equal(1, advisor.Limit(url));
+        Assert.Equal(3, advisor.Limit("https://another.test/segment"));
+    }
+
+    [Fact]
     public void ReservationsCoverGrowthAndDecryptionCopies()
     {
         Assert.Equal(128L * 1024 * 1024, SegmentBufferLimiter.Reservation(64L * 1024 * 1024, null, copies: 2));
