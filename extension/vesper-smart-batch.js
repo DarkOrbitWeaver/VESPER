@@ -422,8 +422,8 @@
       write('Choose the control through the VESPER overlay. The site button is not clicked.');
     }
     function outcomeText(state) {
-      return state.completed ? 'Chrome completed (VESPER interception miss)'
-        : state.nativeCompleted ? 'VESPER completed; Chrome copy stayed empty'
+      return state.completed ? 'Finished in Chrome'
+        : state.nativeCompleted ? 'Finished in VESPER'
         : state.ambiguous ? 'More than one download started; ownership uncertain'
         : state.status === 'download-observed' ? 'Download started; final owner pending'
         : state.status === 'ownership-unresolved' ? 'Ownership uncertain; inspect downloads'
@@ -561,8 +561,8 @@
             if (status?.ok && status.matched && status.downloadId !== null) {
               if (!['safe', 'deepScannedSafe'].includes(status.danger))
                 return { detail: 'Chrome safety review needed; ownership unresolved' };
-              if (status.completed) return { ownership: 'chrome', verified: true, detail: 'Chrome finished (VESPER interception miss)' };
-              if (status.nativeCompleted) return { ownership: 'native', verified: true, detail: 'VESPER completed; Chrome copy stayed empty' };
+              if (status.completed) return { ownership: 'chrome', verified: true, detail: 'Finished in Chrome' };
+              if (status.nativeCompleted) return { ownership: 'native', verified: true, detail: 'Finished in VESPER' };
               if (status.status === 'download-observed') {
                 // A temporal match needs the full window to rule out a second download before continuing.
                 if (status.mode === 'next') await sleep(1500);

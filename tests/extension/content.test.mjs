@@ -5,10 +5,16 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 function runContent(context, content = source('content')) {
+  const storage = context.chrome.storage ??= {};
+  const local = storage.local ??= { get: async () => ({}) };
+  const get = local.get;
+  local.get = async keys => ({ vesperPauseMigrated: true, ...await get(keys) });
+  storage.onChanged ??= { addListener() {}, removeListener() {} };
   vm.runInContext(source('player-source'), context);
   vm.runInContext(source('vesper-intelligence'), context);
   vm.runInContext(source('vesper-model'), context);
   vm.runInContext(source('vesper-inference'), context);
+  vm.runInContext(source('browser-preferences'), context);
   vm.runInContext(source('browser-body'), context);
   vm.runInContext(content, context);
 }
@@ -140,12 +146,19 @@ test('browser sign-in is global, with only the browser permission gate', () => {
   assert.doesNotMatch(popup, /id="signin-site"|id="signin-host"|id="file-sign-in"/);
 });
 
+test('Pause is the only browser download setting', () => {
+  const popup = readFileSync(new URL('../../extension/popup.html', import.meta.url), 'utf8');
+  assert.match(popup, /id="pause-vesper"/);
+  assert.doesNotMatch(popup, /Browser downloads|After sending a file|Find video formats early/);
+});
+
 test('opening the popup shows the installed extension version without checking the app', async () => {
   for (const versionName of [undefined, '1.0.2-firstflight.3']) {
     const elements = new Map();
     const messages = [];
     const preferences = [];
     const permissionRequests = [];
+    const local = { vesperPauseMigrated: true, vesperPaused: false };
     const getElementById = id => {
       if (!elements.has(id)) elements.set(id, {});
       return elements.get(id);
@@ -157,11 +170,11 @@ test('opening the popup shows the installed extension version without checking t
       },
       storage: {
         sync: {
-          get: async defaults => ({ ...defaults, route: 'chrome', handoff: 'default', motion: 'system' }),
+          get: async defaults => ({ ...defaults, motion: 'system' }),
           set: async value => preferences.push(structuredClone(value))
         },
-        local: { get: async () => ({ vesperSeen: true, prefetchFormats: true }) },
-        session: { get: async () => ({}) }
+        local: { get: async () => ({ ...local }), set: async values => Object.assign(local, values) },
+        onChanged: { addListener() {} }
       },
       permissions: {
         contains: async () => permissionRequests.length > 0,
@@ -170,36 +183,27 @@ test('opening the popup shows the installed extension version without checking t
       },
       tabs: { query: async () => [{ id: 3, url: 'https://example.com/download' }] }
     };
-    vm.runInNewContext(source('popup'), { chrome, URL, document: { getElementById }, VesperTheme: { install() {} } });
+    vm.runInNewContext(source('browser-preferences') + '\n' + source('popup'),
+      { chrome, URL, document: { getElementById }, VesperTheme: { install() {} } });
     await new Promise(resolve => setImmediate(resolve));
 
     assert.equal(getElementById('version').textContent, `Extension ${versionName || '1.0.2'}`);
-    const browserDownloads = getElementById('browser-downloads');
-    assert.equal(browserDownloads.value, 'chrome');
-    assert.equal(getElementById('handoff-setting').hidden, true);
-    assert.equal(getElementById('manual-downloads').hidden, true);
-    assert.equal(getElementById('handoff').value, 'download');
-    assert.equal(getElementById('prefetch').checked, true);
+    const pause = getElementById('pause-vesper');
+    assert.equal(pause.disabled, false);
+    assert.equal(pause.checked, false);
     assert.equal(getElementById('motion').value, 'animate');
     assert.equal(getElementById('signin').checked, true);
     const allow = getElementById('signin-permission');
     assert.equal(allow.hidden, false);
     assert.deepEqual(messages, []);
     assert.deepEqual(permissionRequests, []);
-    browserDownloads.value = 'manual';
-    await browserDownloads.onchange();
-    assert.equal(getElementById('handoff-setting').hidden, false);
-    assert.equal(getElementById('manual-downloads').hidden, false);
-    browserDownloads.value = 'automatic';
-    await browserDownloads.onchange();
-    assert.equal(getElementById('manual-downloads').hidden, true);
+    pause.checked = true;
+    await pause.onchange();
+    assert.equal(local.vesperPaused, true);
     await allow.onclick();
     assert.deepEqual(permissionRequests, [{ permissions: ['cookies'] }]);
     assert.equal(allow.hidden, true);
-    assert.match(getElementById('signin-access').textContent, /Used automatically for downloads and videos/);
-    assert.deepEqual(preferences, [
-      { route: 'auto', intercept: false }, { route: 'auto', intercept: true }, { useSignIn: true }
-    ]);
+    assert.deepEqual(preferences, [{ useSignIn: true }]);
   }
 });
 
@@ -327,7 +331,7 @@ test('collection controls render an icon and a hidden status and forward the res
   assert.equal(sent.at(-1).pageUrl, url);
 });
 
-test('butterfly motion responds to Animate and Off', () => {
+test('butterfly motion responds to Animate and Off', async () => {
   const document = new EventTarget();
   document.querySelectorAll = () => [];
   const window = new EventTarget();
@@ -355,6 +359,7 @@ test('butterfly motion responds to Animate and Off', () => {
 
   const attributes = new Set();
   const stillModes = [];
+  await new Promise(resolve => setImmediate(resolve));
   window.__testMotion.setTargets({
     toggleAttribute(name, value) { if (value) attributes.add(name); else attributes.delete(name); }
   }, { setStill: value => stillModes.push(value) });
@@ -404,7 +409,7 @@ test('the context-menu picker reports when its frame has no video player', async
   assert.equal(reply.code, 'no-player');
 });
 
-test('dragging can perch outside the player and fullscreen modes wake again after idle', () => {
+test('dragging can perch outside the player and fullscreen modes wake again after idle', async () => {
   const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
   const window = new EventTarget();
   let now = 10000, nextTimer = 0;
@@ -433,6 +438,7 @@ test('dragging can perch outside the player and fullscreen modes wake again afte
   runContent(context, content);
 
   const calls = [];
+  await new Promise(resolve => setImmediate(resolve));
   const classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
   const player = { isConnected: true, getBoundingClientRect: () => ({ left: 160, top: 120, right: 640, bottom: 420 }) };
   let focused = false;
@@ -494,7 +500,8 @@ test('opening the picker pins the chosen feed player despite a larger autoplayin
     chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
   });
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.testPin = (selected, neighbour, overlay) => {
-    extensionPreferencesReady = true;
+    extensionPaused = false;
+    hiddenButterflyHosts = new Set();
     video = selected;
     host = overlay;
     panelMedia = { player: selected };
@@ -611,9 +618,40 @@ test('an orphaned content script disconnects observers and storage listeners on 
   document.dispatchEvent(new Event('fullscreenchange'));
   assert.equal(window.__vesperContent, undefined);
   assert.equal(disconnected, 2);
-  assert.equal(unsubscribed, 2);
+  assert.equal(unsubscribed, 3);
   document.dispatchEvent(new Event('fullscreenchange'));
-  assert.equal(unsubscribed, 2);
+  assert.equal(unsubscribed, 3);
+});
+
+test('Pause keeps browser copies running and page departure still stops them', async () => {
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => [] });
+  const window = new EventTarget();
+  const changes = new Set();
+  const context = vm.createContext({
+    window, document, AbortController, URL, location: { href: 'https://example.test/file' },
+    ResizeObserver: class {}, IntersectionObserver: class {},
+    VesperTheme: { available: () => true, watchPreference: () => () => {} },
+    chrome: {
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} } },
+      storage: { onChanged: { addListener: listener => changes.add(listener), removeListener: listener => changes.delete(listener) } }
+    }
+  });
+  const content = source('content').replace(/\}\)\(\);\s*$/, `window.startCopies = () => {
+    activeBrowserCopy = { controller: new AbortController() };
+    generatedCopy = { controller: new AbortController() };
+    return [activeBrowserCopy.controller.signal, generatedCopy.controller.signal];
+  };
+  window.isPaused = () => extensionPaused;
+  })();`);
+  runContent(context, content);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(window.isPaused(), false);
+  const copies = window.startCopies();
+  for (const listener of changes) listener({ vesperPaused: { newValue: true } }, 'local');
+  assert.equal(window.isPaused(), true);
+  assert.ok(copies.every(copy => !copy.aborted));
+  window.dispatchEvent(Object.assign(new Event('pagehide'), { persisted: true }));
+  assert.ok(copies.every(copy => copy.aborted));
 });
 
 test('a feed player uses the unique page linked from its card', async () => {
@@ -661,7 +699,7 @@ test('a feed player uses the unique page linked from its card', async () => {
   assert.equal(window.__testPageForPlayer(new FakeElement()), home);
 });
 
-test('an in-page navigation finds an already loaded reel without waiting for playback', () => {
+test('an in-page navigation finds an already loaded reel without waiting for playback', async () => {
   class Video {
     isConnected = true;
     src = 'blob:https://www.instagram.com/reel';
@@ -690,6 +728,7 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
   runContent(context, content);
 
   const reel = new Video();
+  await new Promise(resolve => setImmediate(resolve));
   videos.push(reel);
   location.href = 'https://www.instagram.com/reels/';
   window.navigation.dispatchEvent(new Event('currententrychange'));

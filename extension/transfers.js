@@ -12,12 +12,13 @@ function row(list, name, label, message) {
   action.textContent = label;
   action.onclick = async () => {
     action.disabled = true;
-    $('result').textContent = 'Sending to VESPER…';
+    const following = message.type === 'continue-managed';
+    $('result').textContent = following ? 'Connecting to VESPER…' : 'Sending to VESPER…';
     try {
       const reply = await chrome.runtime.sendMessage(message);
       if (reply?.ok) {
-        action.textContent = 'Sent';
-        $('result').textContent = reply.message || 'Downloading with VESPER.';
+        action.textContent = following ? 'Following' : 'Sent';
+        $('result').textContent = reply.message || (following ? 'Chrome is downloading this file.' : 'Sent to VESPER.');
         return;
       }
       $('result').textContent = reply?.message || 'VESPER could not accept this file.';
@@ -37,7 +38,7 @@ async function load() {
   const files = chromeDownloads?.files || [];
   $('chrome-active').hidden = files.length === 0;
   for (const file of files)
-    row('chrome-files', file.name, 'Continue in VESPER', { type: 'continue-managed', id: file.id, startTime: file.startTime });
+    row('chrome-files', file.name, 'Follow in VESPER', { type: 'continue-managed', id: file.id, startTime: file.startTime });
   $('unconfirmed').hidden = pending.length === 0;
   for (const entry of pending)
     row('pending', new Date(entry.at).toLocaleString(), 'Send again', { type: 'retry', id: entry.id });

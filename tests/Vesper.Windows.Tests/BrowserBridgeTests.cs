@@ -257,6 +257,10 @@ public sealed class BrowserBridgeTests
             JobSnapshot staged = Assert.IsType<JobSnapshot>(engine.Snapshot(Guid.Parse(result.JobId!)));
             Assert.Equal(0, staged.CommittedBytes);
             Assert.Null(staged.FinalPath);
+            BridgeResponse status = await Send(
+                new { v = 1, id = "native-status-0001", type = "browser-transfer", transferId, operation = "status" });
+            Assert.True(status.Ok, status.Message);
+            Assert.Equal("staged", Assert.IsType<JsonElement>(status.Data).GetProperty("state").GetString());
 
             BridgeResponse accepted = await Send(
                 new { v = 1, id = "native-accept-0001", type = "browser-transfer", transferId, operation = "accept" });

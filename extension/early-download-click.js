@@ -3,28 +3,14 @@
 (() => {
   'use strict';
   if (chrome.extension?.inIncognitoContext) return;
-  let ready = false, enabled = false, pendingUrl = null, revision = 0, intentAt = 0;
-  async function refresh() {
-    const current = ++revision;
-    ready = false;
-    try {
-      const [prefs, local] = await Promise.all([
-        chrome.storage.sync.get({intercept:true, route:'auto', handoff:'download'}),
-        chrome.storage.local.get({vesperPaused:false})
-      ]);
-      if (current !== revision) return;
-      enabled = prefs.intercept !== false && prefs.route !== 'chrome' && prefs.handoff !== 'queue' && local.vesperPaused !== true;
-      ready = true;
-    } catch {}
-  }
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'sync' && ('intercept' in changes || 'route' in changes || 'handoff' in changes)
-        || area === 'local' && 'vesperPaused' in changes) void refresh();
+  let paused = true, pendingUrl = null, intentAt = 0;
+  VesperBrowserPreferences.watchPause(state => {
+    paused = state.paused;
+    if (paused) intentAt = 0;
   });
-  void refresh();
-  const canIntercept = () => ready && enabled && !!chrome.runtime.id;
+  const canIntercept = () => !paused && !!chrome.runtime.id;
   window.addEventListener('click', event => {
-    if (event.isTrusted && navigator.userActivation?.isActive
+    if (canIntercept() && event.isTrusted && navigator.userActivation?.isActive
         && event.composedPath().some(node => node?.matches?.('button,a,input[type=button],input[type=submit],[role=button]')))
       intentAt = Date.now();
   }, true);
@@ -70,7 +56,7 @@
       try {
         const reply = await chrome.runtime.sendMessage({type:'early-download', url, downloadName:original.getAttribute('download')});
         if (reply?.ok) return;
-        if (reply?.fallback === true || reply?.code === 'paused') {
+        if (reply?.fallback === true) {
           original.click();
           return;
         }

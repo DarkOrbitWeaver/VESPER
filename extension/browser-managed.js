@@ -73,12 +73,10 @@ function managedProgress(item, profile) {
   };
 }
 
-async function rememberManaged(item, automatic) {
-  const entry = { id: item.id, startTime: item.startTime, automatic };
+async function rememberManaged(item, generation) {
   await updateManagedItems(items => {
-    const same = items.find(row => row.id === item.id && sameDownload(item, row));
-    if (same) entry.automatic = automatic && same.automatic;
-    return [...items.filter(row => row.id !== item.id), entry].slice(-MAX_BROWSER_RECORDS);
+    if (generation !== undefined && !captureAllowed(generation)) return items;
+    return [...items.filter(row => row.id !== item.id), { id: item.id, startTime: item.startTime }].slice(-MAX_BROWSER_RECORDS);
   });
 }
 
@@ -88,8 +86,7 @@ async function forgetManaged(entries) {
 }
 
 async function listManagedCandidates() {
-  const prefs = await settings();
-  if (!managesChromeDownloads() || prefs.route === 'chrome' || await extensionPaused()) return [];
+  if (!managesChromeDownloads()) return [];
   const [items, enrolled, records] = await Promise.all([
     chrome.downloads.search({ state: 'in_progress', orderBy: ['-startTime'], limit: 32 }),
     managedItems(), readBrowserRecords(), siteRulesLoaded
@@ -122,7 +119,7 @@ async function continueManagedDownload(id, startTime) {
     if (!reply?.ok) return reply;
     if (reply.data?.blocked?.includes(managedId(item, profile)))
       return { ok: false, message: 'This site is set to keep downloads in Chrome.' };
-    await rememberManaged(item, false);
+    await rememberManaged(item);
     void refreshManagedDownloads();
     return { ok: true, message: 'Chrome is still downloading this file. You can follow it in VESPER.' };
   } finally {
@@ -138,10 +135,8 @@ function refreshManagedDownloads() {
 }
 
 async function refreshManaged() {
-  const [entries, prefs, paused, records] = await Promise.all([
-    managedItems(), settings(), extensionPaused(), readBrowserRecords()
-  ]);
-  if (!entries.length || paused || prefs.route === 'chrome') {
+  const [entries, records] = await Promise.all([managedItems(), readBrowserRecords()]);
+  if (!entries.length) {
     managedSitePolicy = null;
     const port = managedPort;
     managedPort = null;
@@ -154,7 +149,6 @@ async function refreshManaged() {
   const files = [];
   const forget = [];
   for (const entry of entries) {
-    if (entry.automatic && !prefs.intercept) { forget.push(entry); continue; }
     const item = await getChromeDownload(entry.id);
     if (!item || !sameDownload(item, entry) || ['USER_CANCELED', 'USER_SHUTDOWN'].includes(item.error)) {
       forget.push(entry);
@@ -217,15 +211,15 @@ async function refreshManaged() {
   managedPort.postMessage(envelope('browser-managed', { operation: 'watch', profile, files }));
 }
 
-async function enrollAutomaticChromeDownload(item) {
-  if (!managesChromeDownloads() || !captureEnabled || capturePaused || !managedCandidate(item)) return;
+async function enrollAutomaticChromeDownload(item, generation) {
+  if (!managesChromeDownloads() || !managedCandidate(item) || !await captureCanBegin(generation)) return;
   await siteRulesLoaded;
-  if (captureEnabled && !capturePaused && !matchesNeverCaptureHost(item)) await rememberManaged(item, true);
+  if (!matchesNeverCaptureHost(item)) await rememberManaged(item, generation);
 }
 
 chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {
   const policy = managedSitePolicy;
-  if (!captureEnabled || capturePaused || !policy || Date.now() - policy.at > 5000 || !managedCandidate(item)
+  if (!captureAllowed() || !policy || Date.now() - policy.at > 5000 || !managedCandidate(item)
       || managedHosts(item).some(host => policy.hosts.includes(host))) return suggest();
   const url = item.finalUrl || item.url || '';
   const response = recentResponse(browserUrl(item));

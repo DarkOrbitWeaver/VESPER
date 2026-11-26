@@ -493,7 +493,7 @@ async function main() {
       : "const guard = () => { __ownershipSmoke.nativeCalls++; throw new Error('Native calls are disabled in this test'); };"
         + "chrome.runtime.sendNativeMessage = guard;"
         + "if (chrome.runtime.sendNativeMessage !== guard || chrome.runtime.connectNative !== undefined) throw new Error('Could not guard the installed native host');";
-    await evaluate("Configure Chrome ownership", "(async () => { await chrome.storage.sync.set({ intercept: false, route: 'chrome' });"
+    await evaluate("Pause automatic capture", "(async () => { await browserPreferencesReady; await chrome.storage.local.set({ vesperPaused: true });"
       + "globalThis.__ownershipSmoke = { created: [], changed: [], nativeCalls: 0, nativeMessages: [] };"
       + (captureRaceTest ? '' : 'chrome.runtime.connectNative = undefined;')
       + messagingHook
@@ -529,7 +529,7 @@ async function main() {
       'A Chrome-owned file was falsely marked as a VESPER download.');
 
     // With interception enabled, a page-generated download must still stay in Chrome.
-    await evaluate('Enable automatic capture', "chrome.storage.sync.set({ intercept: true, route: 'auto' })");
+    await evaluate('Resume automatic capture', "chrome.storage.local.set({ vesperPaused: false })");
     const blobName = 'vesper-page-made-fixture.bin';
     await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/page' }, tab);
     await waitFor(async () => {
@@ -732,6 +732,10 @@ async function main() {
       return null;
     }
     await waitFor(() => flyShown(), 5000, 'The butterfly did not appear on the regular player.');
+    await evaluate('Pause on a page with a player', 'chrome.storage.local.set({ vesperPaused: true })');
+    await waitFor(async () => !(await flyShown()), 5000, 'The butterfly stayed visible during Pause.');
+    await evaluate('Resume on the same page', 'chrome.storage.local.set({ vesperPaused: false })');
+    await waitFor(() => flyShown(), 5000, 'The butterfly did not return after resuming.');
     for (const [mode, enter, leave, pointerX] of [
       ['native fullscreen', "player.requestFullscreen()", 'document.exitFullscreen()', 400],
       ['expanded player', "player.classList.add('expanded')", "player.classList.remove('expanded')", 440]
@@ -769,6 +773,16 @@ async function main() {
     assert.deepEqual(mse.map(x => x.fingerprints), ['one','two'].map((session,index) => [createHash('sha256')
       .update('http://127.0.0.1:' + port + '/asset-' + (index ? '200002' : '100001') + '/clip.mp4?session=fixture-' + session).digest('hex')]),
       'Exact source fingerprints did not match the observed requests.');
+    await evaluate('Pause automatic capture on the MediaSource fixture', 'chrome.storage.local.set({ vesperPaused: true })');
+    const { result: source } = await browser.send('Runtime.evaluate', { expression: 'first.currentSrc', returnByValue: true }, tab);
+    assert.match(source.value, /^blob:/);
+    const picker = await evaluate('Open the MediaSource player from the right-click action', `(async () => {
+      const active = (await chrome.tabs.query({})).find(tab => tab.url === 'http://127.0.0.1:${port}/mse-feed');
+      return chrome.tabs.sendMessage(active.id, { type: 'vesper-open-picker', playerUrl: ${JSON.stringify(source.value)} }, { frameId: 0 });
+    })()`);
+    assert.equal(picker?.ok, true, 'Pause prevented the explicit player picker from opening.');
+    assert.equal(await flyShown(), false, 'Opening the picker during Pause revealed the butterfly.');
+    await evaluate('Resume before the intent checks', 'chrome.storage.local.set({ vesperPaused: false })');
     // Test placement through the real closed shadow DOM, without modifying the
     // content script or asking its private ranking function which player won.
     const intentScenarios = [];
@@ -891,6 +905,7 @@ async function main() {
       completedBytes: saved.length,
       keptInChrome: true,
       pageMadeKeptInChrome: true,
+      pausedContextPicker: true,
       fullscreenButterfly: true,
       customAudioButterfly: true,
       intentScenarios,

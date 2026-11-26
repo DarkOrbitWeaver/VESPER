@@ -12,6 +12,7 @@
     <h1>VESPER <span>Settings</span></h1>
   </header>
   <main>
+    <label class="check pause"><input type="checkbox" id="pause-vesper" disabled><span>Pause VESPER in Chrome<small>Hide the butterfly and leave new downloads in Chrome.</small></span></label>
     <label class="setting"><span>Appearance</span>
       <select id="theme">
         <option value="system">System</option>
@@ -25,36 +26,14 @@
         <option value="still">Off</option>
       </select>
     </label>
-    <label class="setting"><span>Browser downloads</span>
-      <select id="browser-downloads">
-        <option value="automatic">Send to VESPER automatically</option>
-        <option value="manual">Send from right-click menu</option>
-        <option value="chrome">Save with Chrome</option>
-      </select>
-    </label>
-    <small id="manual-downloads" hidden>Right-click a link and choose <strong>Download with VESPER</strong>.</small>
-    <label class="setting" id="handoff-setting"><span>After sending a file</span>
-      <select id="handoff">
-        <option value="download">Download now</option>
-        <option value="queue">Queue</option>
-      </select>
-    </label>
-    <p id="first-run" class="hint" hidden>Chrome keeps downloads it has already started.</p>
-    <details id="site-sign-in">
-      <summary>Site sign-in</summary>
-      <label class="check"><input type="checkbox" id="signin" disabled><span>Use my Chrome sign-in<small id="signin-access"></small></span></label>
-      <button id="signin-permission" class="vesper-button" type="button" hidden>Allow Chrome sign-in access</button>
-    </details>
-    <details>
-      <summary>Video picker</summary>
-      <label class="check"><input type="checkbox" id="prefetch"><span>Find video formats early<small>Prepare formats for the video you are watching.</small></span></label>
-    </details>
+    <label class="check"><input type="checkbox" id="signin" disabled><span>Use my Chrome sign-in<small id="signin-access" role="status"></small></span></label>
+    <button id="signin-permission" class="vesper-button" type="button" hidden>Allow Chrome sign-in access</button>
     <button id="site-butterfly" class="text-action" type="button" disabled>Hide butterfly on this site</button>
     <small id="site-butterfly-host" class="site-host"></small>
-    <label class="check pause"><input type="checkbox" id="pause-vesper"><span>Pause VESPER in Chrome<small>Hide the butterfly and leave new downloads in Chrome.</small></span></label>
     <small id="version" class="version"></small>
   </main>
   <script src="theme.js"></script>
+  <script src="browser-preferences.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

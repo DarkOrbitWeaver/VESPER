@@ -3,7 +3,8 @@
 'use strict';
 
 importScripts('native-session.js', 'vesper-experience.js', 'player-source.js', 'media-evidence.js', 'vesper-intelligence.js',
-  'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js', 'browser-body.js', 'early-download.js');
+  'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js',
+  'browser-preferences.js', 'browser-body.js', 'early-download.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 1;
@@ -23,12 +24,7 @@ const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'no-media
 const MANIFEST_WATCH_MS = 3 * 60_000;
 const MAX_WATCHED_TABS = 6;
 const SOURCE_EXPIRY_ALARM = 'vesper-media-sources';
-const DEFAULTS = {
-  handoff: 'download',
-  route: 'auto',
-  intercept: true,             // enabled by default when the user explicitly installs the extension; can be disabled
-  useSignIn: true              // Chrome must grant cookie access before VESPER can use it.
-};
+const browserPreferencesReady = VesperBrowserPreferences.migrate().catch(() => {});
 
 // native messaging
 
@@ -40,15 +36,9 @@ function nativeRequest(message, timeoutMs = 330000) {
 
 const envelope = (type, extra = {}) => ({ v: PROTOCOL, id: crypto.randomUUID(), type, ...extra });
 
-async function settings() {
-  const prefs = { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
-  prefs.handoff = prefs.handoff === 'queue' ? 'queue' : 'download';
-  return prefs;
-}
-
-async function extensionPaused() {
-  const { vesperPaused = false } = await chrome.storage.local.get('vesperPaused').catch(() => ({}));
-  return vesperPaused === true;
+async function useBrowserSignIn() {
+  const { useSignIn } = await chrome.storage.sync.get({ useSignIn: true });
+  return useSignIn === true;
 }
 
 // Keep only opaque receipt capabilities, not file names, URLs or body bytes.
@@ -94,12 +84,10 @@ chrome.runtime.onConnect?.addListener(port => {
     connectNative: host => chrome.runtime.connectNative(host),
     rememberReceipt: rememberBodyReceipt,
     canBegin: async (sender, automatic) => {
-      const prefs = await settings();
-      if (await extensionPaused() || prefs.route === 'chrome') return false;
       if (!automatic) return true;
-      if (!prefs.intercept || !(await refreshNeverCaptureHosts())) return false;
-      return !(await extensionPaused()) && (await settings()).intercept !== false
-        && (await settings()).route !== 'chrome' && !matchesNeverCaptureHost({ url: sender.url });
+      const generation = captureGeneration;
+      return await captureCanBegin(generation) && await refreshNeverCaptureHosts()
+        && await captureCanBegin(generation) && !matchesNeverCaptureHost({ url: sender.url });
     }
   })) port.disconnect();
 });
@@ -264,7 +252,7 @@ async function retryPending(id) {
   if (!entry) return { ok: false, code: 'gone', message: 'That request is no longer pending.' };
   if (entry.chromeDownloadId !== undefined) {
     await changePending(entries => { delete entries[id]; });
-    return moveChromeDownload(entry.chromeDownloadId, 'download');
+    return { ok: false, code: 'gone', message: 'Chrome kept this download. Check Chrome for the file.' };
   }
   const enriched = await withSignIn(entry.request.items);
   return sendSubmission({ ...entry.request, ...enriched });
@@ -319,8 +307,7 @@ async function signInCookies(url, initiatorUrl, { frame, userGesture = true } = 
 }
 
 async function signInEnabled() {
-  const prefs = await settings();
-  return prefs.useSignIn === true && await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false);
+  return await useBrowserSignIn() && await chrome.permissions.contains({ permissions: ['cookies'] }).catch(() => false);
 }
 
 async function withSignIn(items, context = {}) {
@@ -1201,12 +1188,10 @@ function observedBrowserBodyProof(state, message, sender, useSignIn = false) {
 }
 
 async function browserBodyMediaProof(message, sender) {
-  const prefs = await settings();
-  if (await extensionPaused() || prefs.route === 'chrome')
-    return { ok: false, code: 'paused' };
   if (!Number.isSafeInteger(sender.tab?.id)) return { ok: false, code: 'missing' };
-  const proof = observedBrowserBodyProof(await tabState(sender.tab.id), message, sender, prefs.useSignIn === true);
-  if (proof?.credentials === 'include' && prefs.useSignIn !== true)
+  const useSignIn = await useBrowserSignIn();
+  const proof = observedBrowserBodyProof(await tabState(sender.tab.id), message, sender, useSignIn);
+  if (proof?.credentials === 'include' && !useSignIn)
     return { ok: false, code: 'sign-in', message: 'Browser sign-in is disabled.' };
   if (!proof) return { ok: false, code: 'missing', message: 'No current verified browser file is available.' };
   // Fetch only after current site rules are confirmed. Nothing from the browser's
@@ -1259,21 +1244,19 @@ async function playerOptions(message, sender) {
   const source = binding && VesperPlayerSource.http(message.playerUrl);
   const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
   const mutedLoop = message.mutedLoop === true && !!source && (sender.frameId ?? 0) === 0;
-  const { route } = await settings();
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
-  if (prefetch && (route === 'chrome' || message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
+  if (prefetch && (message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
       || !sender.documentId || !binding || !Number.isInteger(message.generation) || message.generation < 1))
     return { ok: true, data: { prefetchSkipped: true } };
-  const auth = route !== 'chrome' && !prefetch
-    ? await mediaAuthorization(page.href, sender, { userGesture: true }) : {};
+  const auth = prefetch ? {} : await mediaAuthorization(page.href, sender, { userGesture: true });
   const playbackFingerprints = binding && Number.isInteger(message.generation) && message.generation > 0
     && sender.documentId && Array.isArray(message.playerResourceFingerprints)
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
   const lookupKey = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
-    route, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
+    mutedLoop, message.multiplePlayers === true, message.mediaChangedAt, playbackFingerprints.join(',')].join('|');
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
@@ -1282,8 +1265,6 @@ async function playerOptions(message, sender) {
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   const task = (async () => {
     if (prefetch) {
-      const { prefetchFormats = true } = await chrome.storage.local.get('prefetchFormats');
-      if (!prefetchFormats) return { ok: true, data: { prefetchSkipped: true } };
     }
     const state = await tabState(tab);
     const now = Date.now();
@@ -1367,205 +1348,205 @@ async function playerOptions(message, sender) {
     const wholeRepresentation = usableSource && matching && isWholeDirectSource(matching)
       && /^(?:audio|video)\//.test(matching.mime);
     const title = binding || !youTube ? message.title : undefined;
+    async function browserFallback(failure) {
+      if (!wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network',
+        'sign-in', 'no-media', 'unavailable', 'timeout'].includes(failure?.code)) return failure;
+      await browserChoicesReady;
+      const token = crypto.randomUUID();
+      for (const [key, choice] of browserChoices)
+        if (choice.expires <= Date.now()) browserChoices.delete(key);
+      while (browserChoices.size >= 32) browserChoices.delete(browserChoices.keys().next().value);
+      browserChoices.set(token, { url: source.href, generation: message.generation ?? 0,
+        identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
+      await saveBrowserChoices();
+      return { ok: true, data: { browserChoice: token, title, choices: [{ index: 0,
+        label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
+        detail: 'Saves with Chrome', container: typeName(matching.mime) }] } };
+    }
 
-    if (route !== 'chrome') {
-      // A page-wide result could describe a different player on an unfamiliar page.
-      if (binding && message.multiplePlayers === true && /^https?:/.test(identity) && !possibleSources.length) {
-        if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
-        const exact = usableSource ? candidate(usableSource) : matchedManifest;
-        if (exact) return explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
-        return { ok: false, code: 'no-reusable-source',
-          message: 'VESPER couldn’t verify a source for this player. Start playback and refresh formats.' };
+    // A page-wide result could describe a different player on an unfamiliar page.
+    if (binding && message.multiplePlayers === true && /^https?:/.test(identity) && !possibleSources.length) {
+      if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
+      const exact = usableSource ? candidate(usableSource) : matchedManifest;
+      if (exact) return browserFallback(explainMediaProtocol(await nativeRequest(
+        exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000)));
+      return { ok: false, code: 'no-reusable-source',
+        message: 'VESPER couldn’t verify a source for this player. Start playback and refresh formats.' };
+    }
+    // A single-video page can give the resolver a better identity than nearby network traffic.
+    const pageInput = { ...auth, url: page.href, pageTitle: title,
+      candidates: !youTube || candidates.length ? candidates : undefined,
+      ...(playbackFingerprints.length ? { playbackFingerprints } : {}) };
+    // Only anonymous, exact-input requests share a flight. Signed-in clicks retain their own authorization.
+    const pageKey = lookupKey + '|' + JSON.stringify([pageInput.candidates, pageInput.pageTitle]);
+    const pageLookup = async () => {
+      if (auth.authorized || message.refresh === true)
+        return nativeRequest(envelope('media-options', pageInput), 60000);
+      const existing = pageLookups.get(pageKey);
+      // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
+      if (existing) return existing;
+      let prefetchTicket;
+      if (prefetch) {
+        const admission = prefetchGovernor.admit({ tab, site: page.hostname });
+        if (!admission.allow) return { ok: true, data: { prefetchSkipped: true,
+          ...(admission.retryAfterMs ? { retryAfterMs: admission.retryAfterMs } : {}) } };
+        prefetchTicket = admission.ticket;
       }
-      // A single-video page can give the resolver a better identity than nearby network traffic.
-      const pageInput = { ...auth, url: page.href, pageTitle: title,
-        candidates: !youTube || candidates.length ? candidates : undefined,
-        ...(playbackFingerprints.length ? { playbackFingerprints } : {}) };
-      // Only anonymous, exact-input requests share a flight. Signed-in clicks retain their own authorization.
-      const pageKey = lookupKey + '|' + JSON.stringify([pageInput.candidates, pageInput.pageTitle]);
-      const pageLookup = async () => {
-        if (auth.authorized || message.refresh === true)
-          return nativeRequest(envelope('media-options', pageInput), 60000);
-        const existing = pageLookups.get(pageKey);
-        // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
-        if (existing) return existing;
-        let prefetchTicket;
-        if (prefetch) {
-          const admission = prefetchGovernor.admit({ tab, site: page.hostname });
-          if (!admission.allow) return { ok: true, data: { prefetchSkipped: true,
-            ...(admission.retryAfterMs ? { retryAfterMs: admission.retryAfterMs } : {}) } };
-          prefetchTicket = admission.ticket;
-        }
-        const work = (async () => {
-          let reply;
-          try {
-            reply = await nativeRequest(envelope('media-options', pageInput), 60000);
-            return reply;
-          } finally {
-            if (prefetch) prefetchGovernor.settle({ ticket: prefetchTicket, code: reply?.ok ? 'ok' : reply?.code,
-              retryAt: Date.parse(reply?.data?.retryAt || '') });
-          }
-        })();
-        pageLookups.set(pageKey, work);
-        try { return await work; }
-        finally { if (pageLookups.get(pageKey) === work) pageLookups.delete(pageKey); }
-      };
-      // Both routes can answer for this player. Where the page lookup keeps being refused, the player's own
-      // traffic is asked first and the page lookup becomes the fallback, instead of failing slowly on every click.
-      const lookupStrategy = auth.authorized ? 'page-lookup-signed' : 'page-lookup';
-      if (prefetch) return pageLookup();
-      const bothRoutes = !!singleVideo && possibleSources.length > 0;
-      const lookupRun = bothRoutes ? lookupPlan({ scope: [tab, frame, sender.documentId].join(':'), message, source,
-        possibleSources, changedAt, adapterPromising: await VesperExperience.promising(page.hostname, lookupStrategy) }) : null;
-      const trafficFirst = lookupRun?.next().next?.route === 'verify-observed';
-      const learnLookup = reply => {
-        lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
-        const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
-          : LOOKUP_REFUSALS.includes(reply.code) ? 'refused' : null;
-        return bothRoutes && outcome ? VesperExperience.note(page.hostname, lookupStrategy, outcome).catch(() => {}) : undefined;
-      };
-      let trafficWork;
-      const startTraffic = () => {
-        if (!trafficWork) {
-          trafficWork = (async () => {
-            const pickerTitle = binding ? message.title : undefined;
-            const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
-              generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl, title: pickerTitle };
-            // Include exact witnesses for recently observed direct/range candidates
-            // too; the earlier scoped pass already covered blob-backed players.
-            if (fingerprints.size && !prefetch && source !== null) {
-              await Promise.all(possibleSources.slice(0, MAX_SOURCES).map(async item => {
-                try {
-                  if (fingerprints.has(await sourceIdentity(item.url))) exactResources.add(item.url);
-                } catch { /* Missing crypto is a ranking miss, not a download failure. */ }
-              }));
-            }
-            // Resource witnesses must influence the verification budget, not only the display order.
-            const ranked = groupObservedAssets(rankObservedSources(possibleSources, changedAt, resourceWitness, rankingFragments, exactResources)
-              .slice(0, VERIFY_LIMIT + 4), identity);
-            const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints],
-              deadline: Date.now() + VERIFY_DEADLINE_MS };
-            const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options);
-            return { pickerTitle, context, fingerprints, exactResources, ranked, options, checked };
-          })();
-          // A quick successful page answer may win before a speculative check finishes.
-          // The speculative route only asks for formats; it never dispatches a download.
-          void trafficWork.catch(() => {});
-        }
-        return trafficWork;
-      };
-      if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
-        // Preserve the page's policy/identity verdict. If it is slow, overlap a
-        // bounded exact-source check so a refusal does not cost two serial waits.
-        const hedge = bothRoutes && !pageLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+      const work = (async () => {
         let reply;
-        try { reply = await pageLookup(); }
-        finally { if (hedge !== null) clearTimeout(hedge); }
-        await learnLookup(reply);
-        if (possibleSources.length === 0) {
-          if (reply.ok) return reply;
-          // An exact observed player resource can be checked without the page
-          // adapter. Do not retry policy/protection or uncertain identity failures.
-          const exact = wholeRepresentation ? matching : matchedManifest;
-          if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
-            const checked = explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
-            if (checked.ok && checked.data?.choices?.length) return checked;
-            if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
-          }
-          if (!wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network', 'sign-in', 'no-media', 'unavailable', 'timeout'].includes(reply.code)) return reply;
-        } else if (reply.ok || !LOOKUP_REFUSALS.includes(reply.code)) {
+        try {
+          reply = await nativeRequest(envelope('media-options', pageInput), 60000);
           return reply;
+        } finally {
+          if (prefetch) prefetchGovernor.settle({ ticket: prefetchTicket, code: reply?.ok ? 'ok' : reply?.code,
+            retryAt: Date.parse(reply?.data?.retryAt || '') });
         }
+      })();
+      pageLookups.set(pageKey, work);
+      try { return await work; }
+      finally { if (pageLookups.get(pageKey) === work) pageLookups.delete(pageKey); }
+    };
+    // Both routes can answer for this player. Where the page lookup keeps being refused, the player's own
+    // traffic is asked first and the page lookup becomes the fallback, instead of failing slowly on every click.
+    const lookupStrategy = auth.authorized ? 'page-lookup-signed' : 'page-lookup';
+    if (prefetch) return pageLookup();
+    const bothRoutes = !!singleVideo && possibleSources.length > 0;
+    const lookupRun = bothRoutes ? lookupPlan({ scope: [tab, frame, sender.documentId].join(':'), message, source,
+      possibleSources, changedAt, adapterPromising: await VesperExperience.promising(page.hostname, lookupStrategy) }) : null;
+    const trafficFirst = lookupRun?.next().next?.route === 'verify-observed';
+    const learnLookup = reply => {
+      lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
+      const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
+        : LOOKUP_REFUSALS.includes(reply.code) ? 'refused' : null;
+      return bothRoutes && outcome ? VesperExperience.note(page.hostname, lookupStrategy, outcome).catch(() => {}) : undefined;
+    };
+    let trafficWork;
+    const startTraffic = () => {
+      if (!trafficWork) {
+        trafficWork = (async () => {
+          const pickerTitle = binding ? message.title : undefined;
+          const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
+            generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl, title: pickerTitle };
+          // Include exact witnesses for recently observed direct/range candidates
+          // too; the earlier scoped pass already covered blob-backed players.
+          if (fingerprints.size && !prefetch && source !== null) {
+            await Promise.all(possibleSources.slice(0, MAX_SOURCES).map(async item => {
+              try {
+                if (fingerprints.has(await sourceIdentity(item.url))) exactResources.add(item.url);
+              } catch { /* Missing crypto is a ranking miss, not a download failure. */ }
+            }));
+          }
+          // Resource witnesses must influence the verification budget, not only the display order.
+          const ranked = groupObservedAssets(rankObservedSources(possibleSources, changedAt, resourceWitness, rankingFragments, exactResources)
+            .slice(0, VERIFY_LIMIT + 4), identity);
+          const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints],
+            deadline: Date.now() + VERIFY_DEADLINE_MS };
+          const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options);
+          return { pickerTitle, context, fingerprints, exactResources, ranked, options, checked };
+        })();
+        // A quick successful page answer may win before a speculative check finishes.
+        // The speculative route only asks for formats; it never dispatches a download.
+        void trafficWork.catch(() => {});
       }
-      if (possibleSources.length > 0) {
-        const { pickerTitle, context, fingerprints, exactResources, ranked, options, checked } = await startTraffic();
-        const usableReply = result => result.reply?.ok && result.reply.data?.choices?.length;
-        // A global failure is not a reason to ask the user to retry every URL.
-        const incompatible = checked.find(result => result.reply?.code === 'desktop-version-mismatch');
-        if (incompatible && !checked.some(usableReply)) return incompatible.reply;
-        // An unrelated usable stream must not exhaust the search when real playback evidence exists.
-        // One additional bounded wave is allowed if no verified source matches it.
-        const boundMatch = result => usableReply(result) && (exactResources.has(result.source.url)
-          || result.source.group?.some(member => exactResources.has(member.url))
-          || result.source.sliceEvidence?.every(member => exactResources.has(member.url))
-          || Number.isInteger(result.reply.data?.playbackMatches) && result.reply.data.playbackMatches > 0
-            && result.reply.data.playbackMatches <= fingerprints.size);
-        const needsMore = !checked.some(usableReply) || fingerprints.size > 0 && !checked.some(boundMatch);
-        if (needsMore && ranked.length > VERIFY_LIMIT && options.deadline - Date.now() >= 1000
-            && !checked.some(result => ['protected', 'blocked', 'rate-limited', 'host-missing',
-              'app-unavailable', 'host-error'].includes(result.reply?.code))) {
-          checked.push(...await verifyObservedSources(ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4), options));
+      return trafficWork;
+    };
+    if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
+      // Preserve the page's policy/identity verdict. If it is slow, overlap a
+      // bounded exact-source check so a refusal does not cost two serial waits.
+      const hedge = bothRoutes && !pageLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+      let reply;
+      try { reply = await pageLookup(); }
+      finally { if (hedge !== null) clearTimeout(hedge); }
+      await learnLookup(reply);
+      if (possibleSources.length === 0) {
+        if (reply.ok) return reply;
+        // An exact observed player resource can be checked without the page
+        // adapter. Do not retry policy/protection or uncertain identity failures.
+        const exact = wholeRepresentation ? matching : matchedManifest;
+        if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
+          const checked = explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
+          if (checked.ok && checked.data?.choices?.length) return checked;
+          if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
-        const association = VesperMediaEvidence.associate({
-          sources: checked, player, currentUrl: source?.href || '',
-          resources: [...resourceWitness], exactResources: [...exactResources], fragments: rankingFragments.map(fragment =>
-            fragment.origin + '/' + fragment.parts.join('/'))
-        });
-        const ordered = association.nodes.map(node => node.entry);
-        const usable = distinctVerifiedDeliveries(association.nodes.filter(node => node.compatible).map(node => node.entry),
-          auth.authorized === true);
-        if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) return association.selected.reply;
-        // Timing found these, so the user confirms which one is this player, even when only one
-        // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
-        // A matching duration or label does not prove two URLs are the same source.
-        if (usable.length > 0) {
-          const sourceChoices = rememberSourceSelections(usable.map(result =>
-            ({ ...result.source, verified: result.reply })), context);
-          const labels = new Map();
-          for (const choice of sourceChoices) {
-            const key = choice.displayLabel;
-            labels.set(key, (labels.get(key) || 0) + 1);
-          }
-          const ordinal = new Map();
-          for (const choice of sourceChoices) {
-            const key = choice.displayLabel;
-            if (labels.get(key) > 1) {
-              const index = (ordinal.get(key) || 0) + 1;
-              ordinal.set(key, index);
-              choice.displayLabel = key + ' · Source ' + index;
-            }
-          }
-          return { ok: true, data: { title: pickerTitle, sourceChoices, verifiedSources: true } };
-        }
-        const refusal = bestRefusal(ordered);
-        lookupRun?.report({ route: 'verify-observed', outcome: 'failed' });
-        // Learning changes route order, not the protection or security policy.
-        if (trafficFirst && lookupRun?.next().next?.route === 'adapter-lookup'
-            && !['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(refusal?.code)) {
-          const reply = await pageLookup();
-          await learnLookup(reply);
-          if (reply.ok || ['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(reply.code)) return reply;
-        }
-        if (refusal) return refusal;
-        return { ok: false, code: 'no-reusable-source',
-          message: 'This player’s video isn’t available as a file or stream VESPER can reuse.' };
+        return browserFallback(reply);
+      } else if (reply.ok || !LOOKUP_REFUSALS.includes(reply.code)) {
+        return reply;
       }
     }
-    if (!wholeRepresentation) return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
-    await browserChoicesReady;
-    const token = crypto.randomUUID();
-    const container = typeName(matching.mime);
-    for (const [key, choice] of browserChoices)
-      if (choice.expires <= Date.now()) browserChoices.delete(key);
-    while (browserChoices.size >= 32) browserChoices.delete(browserChoices.keys().next().value);
-    browserChoices.set(token, { url: source.href, generation: message.generation ?? 0,
-      identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
-    await saveBrowserChoices();
-    return { ok: true, data: { browserChoice: token, title, choices: [{ index: 0,
-      label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
-      detail: 'Saves with Chrome', container }] } };
+    if (possibleSources.length > 0) {
+      const { pickerTitle, context, fingerprints, exactResources, ranked, options, checked } = await startTraffic();
+      const usableReply = result => result.reply?.ok && result.reply.data?.choices?.length;
+      // A global failure is not a reason to ask the user to retry every URL.
+      const incompatible = checked.find(result => result.reply?.code === 'desktop-version-mismatch');
+      if (incompatible && !checked.some(usableReply)) return incompatible.reply;
+      // An unrelated usable stream must not exhaust the search when real playback evidence exists.
+      // One additional bounded wave is allowed if no verified source matches it.
+      const boundMatch = result => usableReply(result) && (exactResources.has(result.source.url)
+        || result.source.group?.some(member => exactResources.has(member.url))
+        || result.source.sliceEvidence?.every(member => exactResources.has(member.url))
+        || Number.isInteger(result.reply.data?.playbackMatches) && result.reply.data.playbackMatches > 0
+          && result.reply.data.playbackMatches <= fingerprints.size);
+      const needsMore = !checked.some(usableReply) || fingerprints.size > 0 && !checked.some(boundMatch);
+      if (needsMore && ranked.length > VERIFY_LIMIT && options.deadline - Date.now() >= 1000
+          && !checked.some(result => ['protected', 'blocked', 'rate-limited', 'host-missing',
+            'app-unavailable', 'host-error'].includes(result.reply?.code))) {
+        checked.push(...await verifyObservedSources(ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4), options));
+      }
+      const association = VesperMediaEvidence.associate({
+        sources: checked, player, currentUrl: source?.href || '',
+        resources: [...resourceWitness], exactResources: [...exactResources], fragments: rankingFragments.map(fragment =>
+          fragment.origin + '/' + fragment.parts.join('/'))
+      });
+      const ordered = association.nodes.map(node => node.entry);
+      const usable = distinctVerifiedDeliveries(association.nodes.filter(node => node.compatible).map(node => node.entry),
+        auth.authorized === true);
+      if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) return association.selected.reply;
+      // Timing found these, so the user confirms which one is this player, even when only one
+      // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
+      // A matching duration or label does not prove two URLs are the same source.
+      if (usable.length > 0) {
+        const sourceChoices = rememberSourceSelections(usable.map(result =>
+          ({ ...result.source, verified: result.reply })), context);
+        const labels = new Map();
+        for (const choice of sourceChoices) {
+          const key = choice.displayLabel;
+          labels.set(key, (labels.get(key) || 0) + 1);
+        }
+        const ordinal = new Map();
+        for (const choice of sourceChoices) {
+          const key = choice.displayLabel;
+          if (labels.get(key) > 1) {
+            const index = (ordinal.get(key) || 0) + 1;
+            ordinal.set(key, index);
+            choice.displayLabel = key + ' · Source ' + index;
+          }
+        }
+        return { ok: true, data: { title: pickerTitle, sourceChoices, verifiedSources: true } };
+      }
+      const refusal = bestRefusal(ordered);
+      lookupRun?.report({ route: 'verify-observed', outcome: 'failed' });
+      // Learning changes route order, not the protection or security policy.
+      if (trafficFirst && lookupRun?.next().next?.route === 'adapter-lookup'
+          && !['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(refusal?.code)) {
+        const reply = await pageLookup();
+        await learnLookup(reply);
+        if (reply.ok || ['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(reply.code)) return reply;
+      }
+      if (refusal) return browserFallback(refusal);
+    }
+    return { ok: false, code: 'no-reusable-source',
+      message: 'This player’s video isn’t available as a file or stream VESPER can reuse.' };
   })();
   // Share the fully decorated answer (including browser-body availability), not
   // the raw native reply. Otherwise concurrent opens can render different formats.
   const result = (async () => {
     const reply = explainMediaProtocol(await task);
-    // The failed native resolver or explicit Chrome fallback may be accompanied
-    // by a verified same-origin conditional GET option. Never offer it in Chrome-only mode.
-    if (!prefetch && route !== 'chrome' && (reply.data?.browserChoice
+    // A native resolver failure may also allow a verified browser copy.
+    if (!prefetch && (reply.data?.browserChoice
         || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-expired','sign-in','unsupported'].includes(reply.code)))) {
-      const bodyPrefs = await settings();
-      const proof = observedBrowserBodyProof(await tabState(tab), message, sender, bodyPrefs.useSignIn === true);
-      if (proof && (proof.credentials !== 'include' || bodyPrefs.useSignIn === true)) {
+      const useSignIn = await useBrowserSignIn();
+      const proof = observedBrowserBodyProof(await tabState(tab), message, sender, useSignIn);
+      if (proof && (proof.credentials !== 'include' || useSignIn)) {
         return { ...reply, data: { ...reply.data, browserBodyAvailable: true,
           browserBodyFormat: { mime: proof.mime, sizeBytes: proof.length, container: typeName(proof.mime) } } };
       }
@@ -1622,9 +1603,6 @@ async function selectMediaSource(message, sender) {
   const selectedEvidence = selection.sliceEvidence?.map(source => ({...source, sliceWitness:true})) || selection.group || [selection];
   if (!selectedEvidence.every(current))
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
-  const { route } = await settings();
-  if (route === 'chrome')
-    return { ok: false, code: 'chrome-format', message: 'Chrome hasn’t exposed a full-file URL for this player.' };
   const auth = await mediaAuthorization(page.href, sender, { userGesture: true });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
   const expiry = Date.parse(selection.verified?.data?.formatsExpireAt || '');
@@ -1705,8 +1683,6 @@ async function describe(url, durationSeconds) {
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
 const CONTENT_COMMANDS = new Set(['early-download', 'smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker',
   'batch-arm', 'batch-status', 'batch-clear', 'batch-disarm', 'batch-journal-read', 'batch-journal-write', 'batch-journal-ack', 'browser-body-status', 'browser-body-media-proof']);
-const PAUSE_BLOCKED_COMMANDS = new Set(['early-download', 'smart-submit', 'batch-arm', 'media-options', 'media-select', 'media-source-select',
-  'browser-media-select', 'native-picker', 'retry', 'submit']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed']);
 
@@ -1724,9 +1700,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   (async () => {
-    if (PAUSE_BLOCKED_COMMANDS.has(message.type) && await extensionPaused())
-      return { ok: false, code: 'paused', message: 'VESPER is paused in Chrome.' };
     if (message.type === 'early-download') return earlyDirectDownload(message, sender);
+    if (message.type === 'media-options' && message.prefetch === true && !await captureCanBegin())
+      return { ok: true, data: { prefetchSkipped: true } };
     if (message.type === 'browser-body-status') return bodyReceiptStatus(message, sender);
     if (message.type === 'browser-body-media-proof') return browserBodyMediaProof(message, sender);
     if (message.type.startsWith('batch-journal-') || message.type === 'batch-arm' || message.type === 'batch-status'
@@ -1763,7 +1739,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'media-element': {
         // Renew the bounded media response observer for a tab with a video.
-        if (message.watching === true && !(await extensionPaused())) watchTabForManifests(sender.tab?.id);
+        if (message.watching === true && await captureCanBegin()) watchTabForManifests(sender.tab?.id);
         return { ok: true };
       }
       case 'tab-state': {
@@ -1835,9 +1811,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'retry': return retryPending(message.id);
       case 'submit': {
         const { items, authorized } = await withSignIn(message.items.map((i) => ({ referer: message.pageUrl, userAgent: navigator.userAgent, ...i })));
-        const prefs = await settings();
-        const mode = message.mode || prefs.handoff;
-        return submit(items, mode, { authorized });
+        return submit(items, message.mode || 'download', { authorized });
       }
       default: return { ok: false, code: 'unknown', message: 'Unknown message.' };
     }
@@ -1873,29 +1847,19 @@ async function openContextMedia(pageUrl, info, tab) {
   await flash(tab?.id, reply, info.frameId);
 }
 
-async function updateVesperContextMenus(paused) {
-  for (const id of ['vesper-smart', 'vesper-download'])
-    await chrome.contextMenus.remove(id).catch(() => {});
-  if (paused) return;
-  chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER', contexts: ['page'] });
-  chrome.contextMenus.create({ id: 'vesper-download', title: 'Download with VESPER', contexts: ['link', 'video', 'audio'] });
-}
-
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== 'local') return;
-  if (changes.prefetchFormats?.newValue === false || changes.vesperPaused?.newValue === true) {
-    mediaPrefetchCache.clear();
-    // Forget pending cache ownership, but retain the in-flight budget until the requests settle.
-    for (const key of mediaLookups.keys()) if (key.includes('|prefetch|')) mediaLookups.delete(key);
-  }
-  if (changes.vesperPaused) return updateVesperContextMenus(changes.vesperPaused.newValue === true);
+  if (areaName !== 'local' || changes.vesperPaused?.newValue !== true) return;
+  mediaPrefetchCache.clear();
+  // Forget pending cache ownership, but retain the in-flight budget until the requests settle.
+  for (const key of mediaLookups.keys()) if (key.includes('|prefetch|')) mediaLookups.delete(key);
 });
 
 chrome.runtime.onInstalled.addListener(async details => {
   // A new version may resolve what the previous one could not, so what that one learned no longer applies.
   if (details?.reason === 'update') await VesperExperience.clear().catch(() => {});
   await chrome.contextMenus.removeAll();
-  await updateVesperContextMenus(await extensionPaused());
+  chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER', contexts: ['page'] });
+  chrome.contextMenus.create({ id: 'vesper-download', title: 'Download with VESPER', contexts: ['link', 'video', 'audio'] });
   chrome.contextMenus.create({ id: 'vesper-transfers', title: 'VESPER transfers…', contexts: ['action'] });
   await updateBadge();
   await recoverChromeDownloads();
@@ -1917,12 +1881,10 @@ async function openFramePicker(info, tab, playerUrl) {
 }
 
 async function runContextAction(info, tab) {
-  await recoverChromeCaptures();
   if (info.menuItemId === 'vesper-transfers') {
     await chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
     return;
   }
-  if (await extensionPaused()) return;
   if (info.menuItemId === 'vesper-smart') {
     try { await chrome.tabs.sendMessage(tab.id, { type: 'vesper-smart-select' }, { frameId: info.frameId ?? 0 }); }
     catch { await flash(tab?.id, { ok: false, message: 'Smart Select is unavailable on this page.' }, info.frameId); }
@@ -1942,8 +1904,7 @@ async function runContextAction(info, tab) {
     return;
   }
   if (!mediaAction && typeof url === 'string' && url.startsWith('blob:')) {
-    const prefs = await settings();
-    if (prefs.route === 'chrome' || tab?.incognito || !Number.isSafeInteger(tab?.id)) {
+    if (tab?.incognito || !Number.isSafeInteger(tab?.id)) {
       await flash(tab?.id, { ok: false, message: 'Use Chrome to save this browser file.' }, info.frameId);
       return;
     }
@@ -1959,22 +1920,10 @@ async function runContextAction(info, tab) {
     await flash(tab?.id, { ok: false, message: 'VESPER needs a web address for this item.' }, info.frameId);
     return;
   }
-  const prefs = await settings();
-  if (prefs.route === 'chrome') {
-    if (mediaAction && VesperPlayerSource.kind(url) !== 'direct') {
-      await flash(tab?.id, { ok: false, message: 'Chrome can only save a direct media file here.' }, info.frameId);
-      return;
-    }
-    try {
-      await chrome.downloads.download({ url, saveAs: false, conflictAction: 'uniquify' });
-      await flash(tab?.id, { ok: true }, info.frameId);
-    } catch { await flash(tab?.id, { ok: false, message: 'Chrome could not start the download.' }, info.frameId); }
-    return;
-  }
   // The frame that holds the link is the real initiator; an embedded frame can be another site than the tab.
   const { items, authorized } = await withSignIn([{ url, referer: info.frameUrl || info.pageUrl || tab?.url, userAgent: navigator.userAgent }],
     { frame: Number.isInteger(tab?.id) ? { tabId: tab.id, frameId: info.frameId ?? 0 } : undefined, incognito: tab?.incognito });
-  const reply = await submit(items, prefs.handoff, { authorized });
+  const reply = await submit(items, 'download', { authorized });
   await flash(tab?.id, reply, info.frameId);
 }
 

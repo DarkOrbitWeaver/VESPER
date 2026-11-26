@@ -223,7 +223,8 @@ async function main() {
     await browser.send('Runtime.enable', {}, workerSession);
 
     const expression = `(async () => {
-      await chrome.storage.sync.set({ intercept: false, route: 'chrome' });
+      await browserPreferencesReady;
+      await chrome.storage.local.set({ vesperPaused: true });
       globalThis.__filenameTiming ||= [];
       chrome.downloads.onCreated.addListener(item => {
         const testId = (() => { try { return new URL(item.url).searchParams.get('id'); } catch { return null; } })();
