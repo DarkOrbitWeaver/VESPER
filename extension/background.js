@@ -879,6 +879,41 @@ function isRangedMediaCandidate(source) {
     && source.mime === 'video/mp4' && !!url && !isPartialMediaUrl(url);
 }
 
+// Two actual playback-witnessed URL slices can suggest a full MP4 endpoint.
+// The native range probe must confirm its validator, total and playable layout.
+// The derived endpoint is never automatically selected.
+function observedSliceCandidates(sources, witnessed) {
+  const groups = new Map();
+  for (const source of sources) {
+    if (!witnessed.has(source.url) || source.conflictingValidator || !source.rangeResource
+        || source.mime !== 'video/mp4' || !Number.isSafeInteger(source.bytes) || source.bytes <= 0
+        || !source.validator || !Number.isSafeInteger(source.rangeStart) || !Number.isSafeInteger(source.rangeEnd)) continue;
+    const url = VesperPlayerSource.http(source.url);
+    if (!url || url.protocol !== 'https:' || url.hash || url.username || url.password) continue;
+    const starts = url.searchParams.getAll('bytestart'), ends = url.searchParams.getAll('byteend');
+    if (starts.length !== 1 || ends.length !== 1 || !/^\d+$/.test(starts[0]) || !/^\d+$/.test(ends[0])
+        || Number(starts[0]) !== source.rangeStart || Number(ends[0]) !== source.rangeEnd) continue;
+    const raw = url.search.slice(1).split('&').filter(part => !/^(?:bytestart|byteend)=/.test(part));
+    url.search = raw.length ? '?' + raw.join('&') : '';
+    if (isPartialMediaUrl(url) || url.href === source.url) continue;
+    const key = JSON.stringify([url.href, source.validator, source.bytes]);
+    const group = groups.get(key) || {url: url.href, members: []};
+    group.members.push(source);
+    groups.set(key, group);
+  }
+  const candidates = [];
+  for (const group of groups.values()) {
+    const members = group.members.sort((a,b) => a.rangeStart - b.rangeStart);
+    const other = members.find((member,i) => i > 0 && member.rangeStart > members[0].rangeEnd);
+    if (!other) continue;
+    const first = members[0];
+    const candidate = {...first, url:group.url, seen:Math.max(first.seen, other.seen),
+      wholeRepresentation:false, sliceEvidence:[first,other]};
+    if (isRangedMediaCandidate(candidate)) candidates.push(candidate);
+  }
+  return candidates.slice(0, 4);
+}
+
 function isWholeDirectSource(source) {
   if (!source.wholeRepresentation || source.kind !== 'direct') return false;
   const url = VesperPlayerSource.http(source.url);
@@ -1007,6 +1042,7 @@ function rememberSourceSelections(sources, context) {
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
       seen: source.seen, validator: source.validator, bytes: source.bytes,
       rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
+      sliceEvidence: source.sliceEvidence,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
     return source.verified
       ? verifiedSourceLabel({ ...source, token }, source.verified)
@@ -1057,6 +1093,7 @@ const observeMediaResponse = (details) => {
     // This means headers describe the whole representation; VESPER still fetches and validates the URL itself.
     wholeRepresentation: !isPlaylist && (details.statusCode === 200 && !range || fullRange),
     rangeResource: !isPlaylist && !!validRange && !!validator,
+    rangeStart: validRange ? rangeStart : null, rangeEnd: validRange ? rangeEnd : null,
     unexpectedRange: details.statusCode === 200 && !!range,
     requestType: details.type, ...(details.typedManifest ? { typedManifest: true } : {}),
     documentId: details.documentId, frameId: details.frameId, seen: details.timeStamp
@@ -1267,6 +1304,8 @@ async function playerOptions(message, sender) {
           } catch { /* Missing crypto leaves the ordinary timing window intact. */ }
         }));
       }
+      if (exactResources.size && !prefetch)
+        possibleSources.push(...observedSliceCandidates(scoped, exactResources));
       for (const evidence of scoped) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
         const witnessed = exactResources.has(evidence.url);
@@ -1431,7 +1470,7 @@ async function playerOptions(message, sender) {
         });
         const ordered = association.nodes.map(node => node.entry);
         const usable = distinctVerifiedDeliveries(ordered, auth.authorized === true);
-        if (association.selected && usable.includes(association.selected)) return association.selected.reply;
+        if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) return association.selected.reply;
         // Timing found these, so the user confirms which one is this player, even when only one
         // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
         // A matching duration or label does not prove two URLs are the same source.
@@ -1541,9 +1580,12 @@ async function selectMediaSource(message, sender) {
   const current = selected => state.sources.some(source => source.url === selected.url && source.documentId === selection.documentId
     && (source.frameId ?? 0) === selection.frame && source.seen >= selected.seen && source.kind === selected.kind
     && source.seen >= now - (selected.kind === 'direct' ? 120_000 : sourceLifetime(selected)) && source.seen <= now + 1000
-    && (source.kind !== 'direct' || (isWholeDirectSource(source) || isRangedMediaCandidate(source)) && !source.conflictingValidator
+    && (source.kind !== 'direct' || (isWholeDirectSource(source) || isRangedMediaCandidate(source)
+      || selected.sliceWitness === true && source.rangeResource === true
+        && source.rangeStart === selected.rangeStart && source.rangeEnd === selected.rangeEnd) && !source.conflictingValidator
       && source.validator === selected.validator && source.bytes === selected.bytes && source.mime === selected.mime));
-  if (!(selection.group || [selection]).every(current))
+  const selectedEvidence = selection.sliceEvidence?.map(source => ({...source, sliceWitness:true})) || selection.group || [selection];
+  if (!selectedEvidence.every(current))
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   const { route } = await settings();
   if (route === 'chrome')

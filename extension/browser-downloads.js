@@ -1404,33 +1404,53 @@ async function earlyDirectDownload(message, sender) {
     try {
       await siteRulesLoaded;
       if (!await enabled() || matchesNeverCaptureHost({ url, referrer: page.href })) return fallback;
-      // HEAD never fetches the body or supplies browser credentials. A signed or
-      // query-based original link is left to the normal browser route.
+      // Anonymous first. Only an explicitly enabled sign-in and a concrete
+      // same-origin link may retry a 401/403 with credentials; never follow
+      // a credentialed redirect or transfer cookies to another origin.
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 2500);
-      let response;
+      let response, signedItems = null;
       try {
         response = await fetch(url, { method: 'HEAD', credentials: 'omit', redirect: 'follow',
           cache: 'no-store', signal: controller.signal });
+        if ([401,403].includes(response.status) && new URL(url).origin === page.origin
+            && page.protocol === 'https:' && await enabled() && await signInEnabled()) {
+          const enriched = await withSignIn([{url, originalUrl:url, referer:page.href, userAgent:navigator.userAgent}],
+            {frame:{tabId:sender.tab.id, frameId:sender.frameId ?? 0,
+              ...(sender.documentId ? {documentId:sender.documentId} : {})}, userGesture:true});
+          if (enriched.authorized && await enabled()) {
+            response = await fetch(url, {method:'HEAD', credentials:'include', redirect:'error',
+              cache:'no-store', signal:controller.signal});
+            signedItems = enriched.items;
+          }
+        }
       } finally { clearTimeout(timeout); }
       const final = VesperPlayerSource.http(response.url);
       const mime = mimeType(response.headers.get('content-type'));
       const attachment = /^attachment\b/i.test(response.headers.get('content-disposition') || '');
+      const explicitName = VesperEarlyDownload.explicitName(url, page.href, message.downloadName);
+      const explicitlyNamed = !!explicitName;
+      const documentAttachment = explicitlyNamed && attachment
+        && /^(?:text\/(?:plain|markdown|csv)|application\/(?:json|vnd\.openxmlformats-officedocument\.[a-z.]+|vnd\.oasis\.opendocument\.[a-z-]+|epub\+zip|x-bittorrent))$/.test(mime || '');
       const binary = /^(?:application\/(?:octet-stream|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-msdownload|x-msi|x-msdos-program|vnd\.android\.package-archive|x-iso9660-image|x-apple-diskimage|vnd\.debian\.binary-package|x-rpm|x-tar|x-xz|x-bzip2))$/.test(mime || '');
       const lengthText = response.headers.get('content-length') || '';
       const length = /^\d+$/.test(lengthText) ? Number(lengthText) : 0;
       const etag = response.headers.get('etag')?.trim();
       const encoding = response.headers.get('content-encoding');
       if (response.status !== 200 || !final || final.username || final.password
+          || signedItems && (final.href !== url || response.redirected)
           || final.protocol !== 'https:' && final.origin !== page.origin
-          || !mime || mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json'
+          || !mime || !documentAttachment && (mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json')
           || (!attachment && !binary) || !Number.isSafeInteger(length) || length <= 0
           || !etag || !/^"[^"\x00-\x20\x7f]{0,254}"$/.test(etag)
           || encoding && encoding.toLowerCase() !== 'identity'
           || matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !await enabled()) return fallback;
       const proof = { length, etag, contentType: mime, attachment, basis: 'etag' };
-      const request = envelope('browser-capture', { mode: 'download', authorized: false, browserProof: proof,
-        items: [{ url: final.href, originalUrl: url, referer: page.href, userAgent: navigator.userAgent }] });
+      const items = signedItems || [{ url: final.href, originalUrl: url, referer: page.href, userAgent: navigator.userAgent }];
+      // A server-specified attachment filename wins over the HTML download name.
+      const disposition = response.headers.get('content-disposition') || '';
+      if (explicitName && !/;\s*filename\*?\s*=/i.test(disposition)) items[0].fileName = explicitName;
+      const request = envelope(signedItems ? 'browser-submit' : 'browser-capture', { mode: 'download', authorized: !!signedItems, browserProof: proof, items });
       transferId = request.id;
       const staged = await nativeRequest(request, 10000);
       if (!staged.ok || staged.results?.[0]?.transferReady !== true || !await enabled()) {

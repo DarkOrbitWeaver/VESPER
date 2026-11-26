@@ -2570,6 +2570,43 @@ test('a strongly validated partial media response gets a separate full-file veri
   } finally {app.stopWorker();}
 });
 
+test('two independently witnessed query-addressed ranges can propose a verified full resource, not automatically select it',async()=>{
+  const page='https://www.instagram.com/reel/ranged/', base='https://cdn.example.com/asset.mp4?signature=abc%2Fdef';
+  const sender={url:page,tab:{id:81},frameId:0,documentId:'query-range-document'};
+  const changedAt=Date.now(), urls=[base+'&bytestart=0&byteend=999',base+'&bytestart=1000&byteend=1999'];
+  const hash=async url=>Buffer.from(await webcrypto.subtle.digest('SHA-256',new TextEncoder().encode(url))).toString('hex');
+  for(const scenario of ['verified','one-witness','changed-tag','wrong-offset','other-document','changed-after-picker']){
+    const app=load({'media-options':{ok:false,code:'no-media'},'media-range-options':checkedSource(15)});
+    try {
+      async function report(i,tag,at=changedAt){
+        await app.onMedia({url:urls[i],tabId:81,frameId:0,documentId:scenario==='other-document'&&i===1?'other':sender.documentId,
+          method:'GET',statusCode:206,type:'xmlhttprequest',timeStamp:at,responseHeaders:[
+            {name:'Content-Type',value:'video/mp4'},
+            {name:'Content-Range',value:scenario==='wrong-offset'&&i===1?'bytes 2000-2999/700000':'bytes '+(i*1000)+'-'+(i*1000+999)+'/700000'},
+            {name:'Content-Length',value:'1000'},{name:'ETag',value:tag}]});
+      }
+      await report(0,'"v1"');await report(1,scenario==='changed-tag'?'"v2"':'"v1"');
+      const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
+        generation:5,playerKey:'p',playerPlaying:true,mediaChangedAt:changedAt,
+        playerResourceFingerprints:await Promise.all((scenario==='one-witness'?urls.slice(0,1):urls).map(hash))};
+      const result=await app.message(request,sender);
+      const checks=app.sent.filter(m=>m.type==='media-range-options');
+      if(!['verified','changed-after-picker'].includes(scenario)){
+        assert.equal(checks.length,0,scenario);
+        assert.equal(result.ok,false,scenario);
+        continue;
+      }
+      assert.equal(checks.length,1);
+      assert.equal(checks[0].candidates[0].url,base);
+      assert.equal(checks[0].candidates[0].observedETag,'"v1"');
+      assert.equal(checks[0].candidates[0].observedLength,700000);
+      assert.equal(result.data.sourceChoices.length,1);
+      if(scenario==='changed-after-picker')await report(1,'"changed"',changedAt+1);
+      const selected=await app.message({...request,type:'media-source-select',sourceChoice:result.data.sourceChoices[0].token},sender);
+      assert.equal(selected.ok,scenario==='verified',scenario);
+    }finally{app.stopWorker()}
+  }
+});
 test('signed media response URLs are removed from session storage after their TTL', async () => {
   const sessionData = {};
   const app = load({}, { sessionData });
@@ -4471,6 +4508,31 @@ test('trusted direct intent stages and accepts before any Chrome download exists
     assert.equal(app.downloadHistory.length,0);
   }finally{app.stopWorker()}
 });
+test('explicit same-origin named exports admit extensionless URLs and safe query parameters',async()=>{
+  for(const [url,name,mime] of [
+    ['https://example.com/export','archive.zip','application/zip'],
+    ['https://example.com/export?id=45&format=csv','report.csv','text/csv'],
+    ['https://example.com/export?format=md','notes.md','text/markdown']
+  ]){
+    const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{earlyFetch:async()=>earlyHeaders(url,{'Content-Type':mime})});
+    try{
+      assert.equal((await app.message({type:'early-download',url,downloadName:name},earlySender)).ok,true);
+      assert.equal(app.sent[0].items[0].url,url);
+    }finally{app.stopWorker()}
+  }
+});
+test('explicit names cannot turn opaque tokens, HTML or unrelated origins into verified downloads',async()=>{
+  for(const [url,name,mime] of [
+    ['https://example.com/export?token=single-use','archive.zip','application/zip'],
+    ['https://example.com/export','report.csv','text/html'],
+    ['https://other.example/export','archive.zip','application/zip'],
+    ['https://example.com/export','paper.pdf','application/pdf']
+  ]){
+    const app=load({}, {earlyFetch:async()=>earlyHeaders(url,{'Content-Type':mime})});
+    try{assert.equal((await app.message({type:'early-download',url,downloadName:name},earlySender)).fallback,true);assert.equal(app.sent.length,0)}
+    finally{app.stopWorker()}
+  }
+});
 test('ambiguous links, HTML, missing validators, private mode and explicit queue preferences remain browser-owned',async()=>{
   for(const [url,changes,prefs,sender] of [
     [earlyUrl+'?token=x',{}, {},earlySender],
@@ -4483,6 +4545,30 @@ test('ambiguous links, HTML, missing validators, private mode and explicit queue
     const app=load({}, {prefs,earlyFetch:async()=>earlyHeaders(url,changes)});
     try{assert.equal((await app.message({type:'early-download',url},sender)).fallback,true);assert.equal(app.sent.length,0)}
     finally{app.stopWorker()}
+  }
+});
+test('same-origin signed-in early download requires permission and never follows a credentialed redirect',async()=>{
+  for(const scenario of ['approved','disabled','no-permission','other-origin','redirect']){
+    const url=scenario==='other-origin'?'https://other.example/setup.msi':earlyUrl;
+    const requests=[];
+    const app=load({'browser-submit':started,'browser-transfer':transfer('active')},{
+      prefs:{useSignIn:scenario!=='disabled'},signInPermission:scenario!=='no-permission',
+      earlyFetch:async(address,options)=>{
+        requests.push(options);
+        if(options.credentials==='omit')return {status:403,url:address,headers:new Headers()};
+        assert.equal(options.redirect,'error');
+        return scenario==='redirect'?{...earlyHeaders('https://other.example/setup.msi'),redirected:true}:earlyHeaders(address);
+      }});
+    try{
+      const reply=await app.message({type:'early-download',url},earlySender);
+      assert.equal(reply.ok,scenario==='approved',scenario);
+      assert.equal(requests.length,['approved','redirect'].includes(scenario)?2:1,scenario);
+      if(scenario==='approved'){
+        assert.equal(app.sent[0].type,'browser-submit');
+        assert.equal(app.sent[0].authorized,true);
+        assert.equal(app.sent[0].items[0].cookie,'session=test-value');
+      }else assert.equal(app.sent.length,0);
+    }finally{app.stopWorker()}
   }
 });
 test('refused native stage permits replay but uncertain acceptance never starts a duplicate',async()=>{
