@@ -383,7 +383,11 @@ function isPreflightCandidate(details) {
 
   const disposition = details.responseHeaders?.find(header =>
     header.name.toLowerCase() === 'content-disposition')?.value;
-  if (!/^attachment\b/i.test(disposition?.trim() || '')) return false;
+  const mime = mimeType(details.responseHeaders?.find(header =>
+    header.name.toLowerCase() === 'content-type')?.value);
+  const binary = ['application/octet-stream', 'application/zip', 'application/x-zip-compressed',
+    'application/x-7z-compressed', 'application/x-rar-compressed', 'application/gzip'].includes(mime);
+  if (!/^attachment\b/i.test(disposition?.trim() || '') && !binary) return false;
 
   const initiator = details.initiator || details.documentUrl || details.originUrl;
   return !matchesNeverCaptureHost({ url: details.url, referrer: initiator });
@@ -478,7 +482,7 @@ function canPauseBeforeNative(item, proof) {
     && now - capturePreflightAt <= EARLY_CAPTURE_WINDOW;
   // A known resumable, fresh attachment need not race a cold native handshake.
   // The durable parking deadline and Chrome recovery still apply.
-  return (warm || warming) && response?.attachment === true && chromeCanResume(response)
+  return (warm || warming) && response && chromeCanResume(response)
     && response.length === proof?.length && now >= response.seen && now - response.seen <= EARLY_CAPTURE_WINDOW;
 }
 
@@ -703,7 +707,7 @@ function moveChromeDownload(id, mode, automatic = false, admissionGeneration = c
     // A fresh attachment with matching response proof deserves its own attempt.
     // Host-wide refusal history is advisory for less explicit downloads.
     const strategy = takeoverStrategy(signedIn);
-    if (!previous && !response?.attachment && !(await VesperExperience.promising(siteOf(item), strategy))) {
+    if (!previous && !response?.attachment && !chromeCanResume(response) && !(await VesperExperience.promising(siteOf(item), strategy))) {
       await note('site-declines');
       return chromeKeeps('This site declined VESPER\'s own request before. Chrome is continuing this download.');
     }

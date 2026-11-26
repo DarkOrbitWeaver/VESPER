@@ -14,7 +14,10 @@
   const listen = EventTarget.prototype.addEventListener;
   const unlisten = EventTarget.prototype.removeEventListener;
   const apply = Reflect.apply;
-  let pending = null;
+  let pending = null, intentAt = 0;
+  const intentWindow = 15_000;
+  const clock = Date.now.bind(Date);
+  function recentIntent() { return intentAt > 0 && clock() - intentAt <= intentWindow; }
   function replace(owner, name, value) {
     const descriptor = Object.getOwnPropertyDescriptor(owner, name);
     if (!descriptor || typeof descriptor.value !== 'function') return false;
@@ -39,7 +42,7 @@
   });
   function consider(event, anchor) {
     if (pending || event.defaultPrevented || !event.cancelable
-        || (!event.isTrusted && !navigator.userActivation?.isActive)) return;
+        || (!event.isTrusted && !navigator.userActivation?.isActive && !recentIntent())) return;
     if (!(anchor instanceof HTMLAnchorElement) || !anchor.hasAttribute('download')) return;
     const name = anchor.getAttribute('download');
     if (!name || name.length > 180 || !/\.(?:zip|7z|rar|tar|gz|tgz|png|jpe?g|webp|gif|txt|md|csv|json|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|m4a|flac|mkv)$/i.test(name)) return;
@@ -58,12 +61,18 @@
         apply(revoke, URL, [alias]);
         return; // Extension unavailable, disabled or unwilling: Chrome proceeds normally.
       }
+      intentAt = 0;
       event.preventDefault();
     } catch {
       pending = null;
       if (alias) apply(revoke, URL, [alias]);
     }
   }
+  apply(listen, window, ['click', event => {
+    if (event.isTrusted && navigator.userActivation?.isActive
+        && event.composedPath().some(node => node instanceof Element && node.matches('button,a,input[type=button],input[type=submit],[role=button]')))
+      intentAt = clock();
+  }, true]);
   apply(listen, window, ['click', event => {
     const anchor = event.composedPath().find(node => node instanceof HTMLAnchorElement);
     consider(event, anchor);
@@ -72,7 +81,7 @@
   // Keep the real click and all existing handlers; add a final local listener.
   replace(HTMLElement.prototype, 'click', function (...args) {
     if (!(this instanceof HTMLAnchorElement) || this.isConnected
-        || !navigator.userActivation?.isActive) return apply(click, this, args);
+        || (!navigator.userActivation?.isActive && !recentIntent())) return apply(click, this, args);
     const handle = event => consider(event, this);
     apply(listen, this, ['click', handle]);
     try { return apply(click, this, args); }
@@ -93,6 +102,7 @@
   }]);
   apply(listen, window, ['pagehide', () => {
     if (pending) { apply(revoke, URL, [pending.url]); pending = null; }
+    intentAt = 0;
     known.clear();
   }]);
 })();

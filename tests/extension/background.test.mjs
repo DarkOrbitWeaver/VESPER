@@ -350,6 +350,19 @@ test('a warm preflight pauses a validated attachment before starting native stag
   assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
 });
 
+test('a validated binary browser download without Content-Disposition gets early takeover', async () => {
+  const file = activeDownload();
+  const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
+    { download: file, preflightReady: true });
+  try {
+    await observe(app, file, { attachment: false, contentType: 'application/octet-stream' });
+    await waitFor(() => app.preflights.length === 1);
+    await app.onCreated(file);
+    assert.equal(app.actions[0], 'pause');
+    assert.equal(app.actions[1], 'native');
+    assert.equal(app.localData.browserDownloads[file.id].stage, 'parked');
+  } finally { app.stopWorker(); }
+});
 test('an in-flight cold preflight does not leave a verified attachment racing Chrome', async () => {
   const file = activeDownload();
   const app = load({ 'browser-submit': started, 'browser-transfer': transfer('active') },
