@@ -164,6 +164,20 @@ public sealed class DashTransferTests
     }
 
     [Fact]
+    public void OneTrackFragmentCanUseAnImplicitMoofBase()
+    {
+        byte[] audio = Fixture("audio-1.m4s");
+        audio[Tag(audio, "tfhd") + 5] &= 0xfd;
+        var mp4 = FragmentedMp4.Open(Fixture("audio-init.mp4"));
+        mp4.ValidateFragment(audio);
+        mp4.Finish(requireAudio: true, requireVideo: false);
+
+        byte[] muxed = Fixture("av-1.m4s");
+        muxed[Tag(muxed, "tfhd") + 5] &= 0xfd;
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(Fixture("av-init.mp4")).ValidateFragment(muxed));
+    }
+
+    [Fact]
     public void SampleOffsetsOutsideMdat_AreRejected()
     {
         byte[] fragment = Fixture("av-1.m4s");
@@ -189,6 +203,24 @@ public sealed class DashTransferTests
         var mp4 = FragmentedMp4.Open(Fixture("av-init.mp4"));
         mp4.ValidateFragment(Fixture("av-1.m4s"));
         Assert.Throws<MediaContainerException>(() => mp4.ValidateFragment(Fixture("av-1.m4s")));
+    }
+
+    [Fact]
+    public void UnnumberedFragmentsRequireAnUnbrokenDecodeTimelineWhenRemuxing()
+    {
+        byte[] init = Fixture("av-init.mp4");
+        byte[] first = Fixture("av-1.m4s");
+        byte[] second = Fixture("av-2.m4s");
+        BinaryPrimitives.WriteUInt32BigEndian(first.AsSpan(Tag(first, "mfhd") + 8), 0);
+        BinaryPrimitives.WriteUInt32BigEndian(second.AsSpan(Tag(second, "mfhd") + 8), 0);
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(init).ValidateFragment(first));
+
+        var mp4 = FragmentedMp4.Open(init, captureSamples: true, allowUnnumberedFragments: true);
+        mp4.ValidateFragment(first);
+        mp4.ValidateFragment(second);
+        mp4.Finish(requireAudio: true, requireVideo: true);
+        var repeat = Assert.Throws<MediaContainerException>(() => mp4.ValidateFragment(second));
+        Assert.Contains("timeline", repeat.Message);
     }
 
     [Fact]
@@ -366,10 +398,13 @@ public sealed class DashTransferTests
         Assert.Equal(3, server.Hits("/av-2.m4s")); // uncommitted lookahead is fetched again
     }
 
-    [Fact]
-    public async Task SegmentedMerge_ResumesSeparateDashRenditionsAndRemuxesThem()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SegmentedMerge_ResumesSeparateDashRenditionsAndRemuxesThem(bool unnumbered)
     {
         await using var server = await FixtureServer.StartAsync();
+        if (unnumbered) server.ClearFragmentSequenceNumbers();
         server.ExpireSecond = true;
         using var h = new Harness();
         MediaMergePlan plan = SegmentedPlan(server);
@@ -891,6 +926,16 @@ public sealed class DashTransferTests
         internal TaskCompletionSource FirstFragmentStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal string Url(string path) => _base + path;
         internal int Hits(string path) => _hits.GetValueOrDefault(path);
+
+        internal void ClearFragmentSequenceNumbers()
+        {
+            foreach (string name in new[] { "/av-1.m4s", "/av-2.m4s", "/av-3.m4s", "/audio-1.m4s" })
+            {
+                byte[] fragment = _objects[name];
+                BinaryPrimitives.WriteUInt32BigEndian(fragment.AsSpan(Tag(fragment, "mfhd") + 8), 0);
+            }
+        }
+
         private FixtureServer()
         {
             foreach (string name in new[] { "av-init.mp4", "av-1.m4s", "av-2.m4s", "av-3.m4s", "audio-init.mp4", "audio-1.m4s" }) _objects["/" + name] = Fixture(name);

@@ -146,7 +146,11 @@ async Task<Dictionary<string, object?>> RunAsync(string platform, string scenari
     row["bytes"] = new FileInfo(path).Length;
     row["mbPerSecond"] = Math.Round(new FileInfo(path).Length / 1048576.0 / Math.Max(0.1, sw.Elapsed.TotalSeconds), 1);
     string extension = Path.GetExtension(path).ToLowerInvariant();
-    if (extension is ".mp3" or ".flac" or ".ogg" or ".opus")
+    if (extension == ".ts" && choice.Kind == JobKind.Hls)
+    {
+        row["vesperValidation"] = "transport stream checked during HLS transfer";
+    }
+    else if (extension is ".mp3" or ".flac" or ".ogg" or ".opus")
     {
         row["tracks"] = "native container inspection is not implemented";
         row["audio"] = "not parsed by VESPER";

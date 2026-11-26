@@ -30,13 +30,18 @@ internal sealed class FragmentedMp4
     }
     private readonly Dictionary<uint, Track> _tracks = [];
     private bool _captureSamples;
+    private bool _allowUnnumberedFragments;
     private uint _sequence;
     internal bool HasAudio => _tracks.Values.Any(t => t.Handler == "soun");
     internal bool HasVideo => _tracks.Values.Any(t => t.Handler == "vide");
 
-    internal static FragmentedMp4 Open(ReadOnlySpan<byte> data, bool captureSamples = false)
+    internal static FragmentedMp4 Open(ReadOnlySpan<byte> data, bool captureSamples = false, bool allowUnnumberedFragments = false)
     {
-        var result = new FragmentedMp4 { _captureSamples = captureSamples };
+        var result = new FragmentedMp4
+        {
+            _captureSamples = captureSamples,
+            _allowUnnumberedFragments = allowUnnumberedFragments
+        };
         var top = Boxes(data, 0, data.Length);
         if (top.Count(b => b.Type == "ftyp") != 1 || top.Count(b => b.Type == "moov") != 1
             || top.Any(b => b.Type is not ("ftyp" or "moov" or "free" or "skip")))
@@ -228,7 +233,12 @@ internal sealed class FragmentedMp4
         if (children.Any(b => b.Type is not ("mfhd" or "traf"))) throw Bad("Unsupported movie-fragment box.");
         var mfhd = One(children, "mfhd"); Need(mfhd, 8);
         uint sequence = U32(data, mfhd.Payload + 4);
-        if (U32(data, mfhd.Payload) != 0 || sequence <= _sequence) throw Bad("Duplicate or unordered fragment sequence.");
+        // Some DASH renditions leave every sequence at zero. When remuxing,
+        // the checked decode timeline still rejects repeated or missing samples.
+        bool unnumbered = _allowUnnumberedFragments && sequence == 0 && _sequence == 0;
+        if (U32(data, mfhd.Payload) != 0 || sequence <= _sequence && !unnumbered)
+            throw Bad("Duplicate or unordered fragment sequence.");
+        bool singleTrackFragment = children.Count(box => box.Type == "traf") == 1;
         var ranges = new List<(long Start, long End)>();
         var seen = new HashSet<uint>();
         foreach (var traf in children.Where(b => b.Type == "traf"))
@@ -239,8 +249,9 @@ internal sealed class FragmentedMp4
                 throw Bad("Encrypted or unsupported track-fragment metadata.");
             var tfhd = One(tb, "tfhd"); Need(tfhd, 8);
             uint flags = U32(data, tfhd.Payload);
-            if ((flags & 0x020000) == 0 || (flags & ~0x02003au) != 0)
-                throw Bad("Only moof-relative track fragments are supported; absolute offsets require remuxing.");
+            // Without an explicit base, the only track fragment starts at its moof.
+            if ((flags & ~0x02003au) != 0 || !singleTrackFragment && (flags & 0x020000) == 0)
+                throw Bad("Track fragments require moof-relative offsets.");
             uint id = U32(data, tfhd.Payload + 4);
             if (!_tracks.TryGetValue(id, out var track) || !seen.Add(id)) throw Bad("Unknown or duplicate fragment track.");
             int p = tfhd.Payload + 8;

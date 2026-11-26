@@ -762,7 +762,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
         if (partLengths.Length < 2 || partLengths[0] is < 8 or > MaxInitializationBytes)
             throw new MediaContainerException("A fragmented rendition has no bounded initialization and media parts.");
         byte[] initialization = ReadAt(source, trackOffset, checked((int)partLengths[0]));
-        FragmentedMp4 mp4 = FragmentedMp4.Open(initialization, captureSamples: true);
+        FragmentedMp4 mp4 = FragmentedMp4.Open(initialization, captureSamples: true, allowUnnumberedFragments: true);
         if (requiredKind == TrackKind.Video && !mp4.HasVideo || requiredKind == TrackKind.Audio && !mp4.HasAudio)
             throw new MediaContainerException("A selected rendition initialization is missing its declared track.");
         if (expectedCodec is not null && !mp4.GetTracks().Any(track => track.Kind == requiredKind
