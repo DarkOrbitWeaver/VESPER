@@ -100,15 +100,16 @@ globalThis.VesperBrowserBody = (() => {
     return stem + '.' + extension;
   }
 
-  function fileFacts(response, title, generated = null, verifiedPart = null) {
+  function fileFacts(response, title, generated = null, verifiedPart = null, allowUnknownLength = false) {
     const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     const lengthText = response.headers.get('content-length');
-    const length = /^\d+$/.test(lengthText || '') ? Number(lengthText) : NaN;
+    const length = lengthText === null && allowUnknownLength ? null
+      : /^\d+$/.test(lengthText || '') ? Number(lengthText) : NaN;
     const encoding = response.headers.get('content-encoding');
     if ((!verifiedPart && response.status !== 200 || verifiedPart && response.status !== 206) || !response.body || response.type === 'opaque'
         || response.redirected || encoding && encoding.toLowerCase() !== 'identity'
         || (!verifiedPart && response.headers.has('content-range')) || (!generated && !Object.hasOwn(EXTENSIONS, mime))
-        || !Number.isSafeInteger(length) || length <= 0 || length > MAX_BYTES)
+        || length !== null && (!Number.isSafeInteger(length) || length <= 0 || length > MAX_BYTES))
       throw new Error('This browser object is not a complete, finite file.');
     if (generated) {
       const name = safeName(generated.fileName);
@@ -256,7 +257,8 @@ globalThis.VesperBrowserBody = (() => {
   async function copyBlob({ url, origin, title, generated = null, mediaProof = null, signal, onProgress = () => {},
     fetcher = globalThis.fetch, connect = options => chrome.runtime.connect(options),
     queryReceipt = transferId => chrome.runtime.sendMessage({ type: 'browser-body-status', transferId }) }) {
-    const isBlob = localBlob(url, origin) || (generated && dataUrl(url));
+    const generatedData = Boolean(generated && dataUrl(url));
+    const isBlob = localBlob(url, origin) || generatedData;
     const httpMedia = !generated && validMediaProof(mediaProof, url, origin);
     if (!isBlob && !httpMedia) throw new Error('The file is not available in this browser document.');
     if (signal?.aborted) throw new Error('Browser copy cancelled.');
@@ -287,8 +289,9 @@ globalThis.VesperBrowserBody = (() => {
     try {
       if (response.url && response.url !== url) throw new Error('Browser file identity changed.');
       if (httpMedia) part = verifiedHttpPart(response, mediaProof, 0);
-      facts = fileFacts(response, title, generated, part);
-      if (generated?.automatic && facts.length !== generated.expectedLength)
+      facts = fileFacts(response, title, generated, part, generatedData);
+      if (generated?.automatic && (!generatedData || generated.expectedLength != null)
+          && facts.length !== generated.expectedLength)
         throw new Error('The generated file length changed.');
       if (httpMedia && (response.headers.get('etag') !== mediaProof.etag
           || facts.length !== mediaProof.length
@@ -298,6 +301,7 @@ globalThis.VesperBrowserBody = (() => {
     catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
     let channel, reader, transferId = null, finishing = false;
     const unanswered = [];
+    let sent = 0;
     try {
       channel = openChannel(connect, signal);
       const mime = mediaProof?.mime ?? (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
@@ -312,7 +316,7 @@ globalThis.VesperBrowserBody = (() => {
       // Aggregate small stream reads into one fixed buffer. SubtleCrypto copies its input
       // when digest() is called and Base64 encoding copies it too, so the buffer is reused at once.
       const buffer = new Uint8Array(CHUNK);
-      let used = 0, sent = 0;
+      let used = 0;
       async function flush() {
         if (!used) return;
         if (signal?.aborted) throw new Error('Browser copy cancelled.');
@@ -347,8 +351,9 @@ globalThis.VesperBrowserBody = (() => {
           reader = response.body.getReader();
           continue;
         }
-        if (!(value instanceof Uint8Array) || value.length > (part?.end ?? facts.length) - sent - used)
-          throw new Error('The browser returned more bytes than declared.');
+        const limit = part?.end ?? facts.length ?? Math.min(MAX_BYTES, url.length * 4);
+        if (!(value instanceof Uint8Array) || value.length > limit - sent - used)
+          throw new Error('The browser returned more bytes than allowed.');
         for (let start = 0; start < value.length;) {
           const count = Math.min(CHUNK - used, value.length - start);
           buffer.set(value.subarray(start, start + count), used);
@@ -357,19 +362,20 @@ globalThis.VesperBrowserBody = (() => {
           if (used === CHUNK) await flush();
         }
       }
-      if (sent + used !== facts.length) throw new Error('The browser file ended before its declared length.');
+      if (sent + used === 0 || facts.length !== null && sent + used !== facts.length)
+        throw new Error('The browser file ended before its declared length.');
       await flush();
       while (unanswered.length) await unanswered.shift();
       finishing = true;
       const done = await channel.send({ operation: 'finish' });
-      if (!done.accepted || done.offset !== facts.length || typeof done.jobId !== 'string')
+      if (!done.accepted || done.offset !== sent || typeof done.jobId !== 'string')
         throw new Error('VESPER did not confirm acceptance of the browser file.');
       return done;
     } catch (error) {
       if (finishing && transferId && error?.code !== 'invalid-media') {
         // Even explicit cancellation can race the durable native commit. A
         // receipt query is read-only and must never start a second transfer.
-        const receipt = { transferId, length: facts.length };
+        const receipt = { transferId, length: sent };
         pendingReceipts.set(receiptKey, receipt);
         const accepted = await resolveReceipt(queryReceipt, receipt);
         if (accepted) {

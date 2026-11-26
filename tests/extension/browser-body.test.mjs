@@ -48,7 +48,7 @@ function bridge({ deny = false, wrongOffset = false, loseFinish = false, oldHelp
       data = { offset: wrongOffset ? offset - 1 : offset, accepted: false };
     }
     if (message.operation === 'finish') {
-      assert.equal(offset, length);
+      if (length !== undefined) assert.equal(offset, length);
       data = { offset, accepted: true, jobId: 'native-job-12345' };
     }
     if (message.operation === 'abort') data = {};
@@ -124,6 +124,16 @@ test('worker copy accepts a complete CDN body and rejects a partial response', a
       assert.deepEqual(Buffer.concat(chunks), Buffer.from(source));
     }
   }
+});
+
+test('an explicit data URL is copied without a response Content-Length', async () => {
+  const b = bridge();
+  const url = 'data:text/plain;base64,SGVsbG8=';
+  const generated = body.automaticGeneratedFile({ url, fileName: 'message.txt', mime: 'text/plain' }, origin);
+  const result = await copy(b, { url, generated, fetcher: (address, options) => fetch(address, options) });
+  assert.equal(result.offset, 5);
+  assert.equal(b.messages[0].length, undefined);
+  assert.equal(Buffer.concat(b.chunks).toString(), 'Hello');
 });
 
 test('foreign blobs and HTTP URLs cannot be opened by the finite-Blob route', async () => {
