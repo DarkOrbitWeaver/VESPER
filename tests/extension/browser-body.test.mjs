@@ -84,8 +84,8 @@ test('same-origin finite blob streams byte-exact chunks through both sides of th
   assert.equal(b.messages.some(message => 'cookie' in message || 'authorization' in message || 'path' in message), false);
 });
 
-test('worker copy accepts a complete CDN body and rejects a partial response', async () => {
-  for (const status of [200, 206]) {
+test('worker copy accepts a complete CDN body and rejects an unverified partial response', async () => {
+  for (const mode of ['complete', 'partial', 'verified-ranges']) {
     const [native, host] = connection();
     const chunks = [];
     let count = 0, offset = 0;
@@ -104,8 +104,11 @@ test('worker copy accepts a complete CDN body and rejects a partial response', a
       } });
     });
     const url = 'https://cdn.test/clip.mp4';
+    let requests = 0;
+    const verified = mode === 'verified-ranges';
     const pending = body.streamFromWorker({
-      proof: { url, mime: 'video/mp4', minimumLength: 900, credentials: 'omit' },
+      proof: { url, mime: 'video/mp4', minimumLength: 900, credentials: 'omit',
+        ...(verified ? { etag: '"test-etag"', length: source.length } : {}) },
       title: 'CDN player', origin, nativeHost: 'test-helper', transferId: 'test-transfer-id',
       connectNative: () => native, makeId: () => 'request-' + ++count,
       signal: new AbortController().signal, onProgress: () => {},
@@ -113,15 +116,26 @@ test('worker copy accepts a complete CDN body and rejects a partial response', a
         assert.equal(requested, url);
         assert.equal(options.credentials, 'omit');
         assert.equal(options.redirect, 'error');
-        return new Response(source, { status, headers: { 'Content-Type': 'video/mp4' } });
+        requests++;
+        if (verified) {
+          const start = requests === 1 ? 0 : 130_000;
+          const end = requests === 1 ? 130_000 : source.length;
+          assert.equal(options.headers.Range, requests === 1 ? undefined : `bytes=${start}-`);
+          return new Response(source.slice(start, end), { status: 206, headers: {
+            'Content-Type': 'video/mp4', 'Content-Range': `bytes ${start}-${end - 1}/${source.length}`,
+            'Content-Length': String(end - start), ETag: '"test-etag"'
+          } });
+        }
+        return new Response(source, { status: mode === 'partial' ? 206 : 200, headers: { 'Content-Type': 'video/mp4' } });
       }
     });
-    if (status === 206) {
+    if (mode === 'partial') {
       await assert.rejects(pending, /complete media file/);
       assert.equal(count, 0);
     } else {
       assert.equal((await pending).jobId, 'worker-test');
       assert.deepEqual(Buffer.concat(chunks), Buffer.from(source));
+      assert.equal(requests, verified ? 2 : 1);
     }
   }
 });

@@ -4878,3 +4878,35 @@ test('TikTok lookup returning source-changed falls back to observed CDN stream',
     assert.equal(app.sent[1].candidates[0].url, cdnUrl);
   } finally { app.stopWorker(); }
 });
+
+test('Instagram and TikTok do not start automatic format lookups', async () => {
+  for (const page of ['https://www.instagram.com/reels/VesperFixture/', 'https://www.tiktok.com/@owner/video/7849240376246100000']) {
+    const app = load({ 'media-options': mediaOptionsReply });
+    try {
+      const request = videoOptionsMessage(page, { prefetch: true, playerPlaying: true });
+      const reply = await app.message(request, { tab: { id: 8, active: true }, url: page, documentId: 'social-fixture' });
+      assert.equal(reply.data.prefetchSkipped, true);
+      assert.equal(app.sent.length, 0);
+    } finally { app.stopWorker(); }
+  }
+});
+
+test('an Instagram picker can use the current Chrome file after a source-changed refusal', async () => {
+  const page = 'https://www.instagram.com/reels/VesperFixture/';
+  const url = 'https://video.cdninstagram.com/reel.mp4';
+  const now = Date.now();
+  const sender = { url: page, tab: { id: 44 }, documentId: 'reel-document', frameId: 0 };
+  const failure = { ok: false, code: 'source-changed' };
+  const app = load({ 'media-options': failure, 'media-source-options': failure });
+  try {
+    await app.onMedia({ url, tabId: 44, documentId: sender.documentId, frameId: 0,
+      method: 'GET', type: 'media', statusCode: 200, timeStamp: now,
+      responseHeaders: responseHeaders({ 'Content-Type': 'video/mp4', 'Content-Length': '800000' }) });
+    const request = videoOptionsMessage(page, { playerUrl: url, playerPlaying: true, mediaChangedAt: now });
+    const result = await app.message(request, sender);
+    assert.equal(result.data.browserBodyProof.url, url);
+    assert.equal(result.data.browserBodyProof.length, 800000);
+    assert.equal(result.data.browserBodyProof.workerFetch, true);
+    assert.equal((await app.message(request, { ...sender, documentId: 'other-document' })).data?.browserBodyAvailable, undefined);
+  } finally { app.stopWorker(); }
+});

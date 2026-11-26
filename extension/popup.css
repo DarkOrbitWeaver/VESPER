@@ -5,13 +5,7 @@ header { display:flex; gap:10px; align-items:center; padding:13px 15px; backgrou
 h1 { margin:0; font:600 18px Georgia,serif; }
 h1 span { margin-left:7px; color:var(--muted); font:12px "Segoe UI",system-ui,sans-serif; }
 main { padding:10px 15px 14px; }
-.tab-capture { padding:10px 11px; margin-bottom:10px; border:1px solid var(--border); border-radius:8px; background:var(--paper); }
-.tab-capture-row { display:flex; gap:10px; align-items:center; justify-content:space-between; }
-.tab-capture-row > div { min-width:0; flex:1 1 auto; }
-.tab-capture-row b { display:block; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.tab-links { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; }
 .action-btn { flex:none; padding:6px 11px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font:600 12px "Segoe UI",system-ui,sans-serif; cursor:pointer; }
-.action-btn.primary { background:var(--green,#2f5d3e); border-color:var(--green,#2f5d3e); color:#fffbee; }
 .action-btn:disabled { opacity:.55; cursor:default; }
 .setting { display:flex; gap:12px; justify-content:space-between; align-items:center; padding:7px 0; }
 .setting select { flex:0 0 176px; min-width:0; padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font:inherit; }

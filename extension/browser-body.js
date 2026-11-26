@@ -453,7 +453,9 @@ globalThis.VesperBrowserBody = (() => {
         while (true) {
           if (signal?.aborted) throw new Error('MSE export cancelled.');
           player.removeAttribute('data-vesper-mse-export-chunk');
-          player.setAttribute('data-vesper-mse-export-query', JSON.stringify({ trackId: tracks[ti].id, partIndex, subOffset }));
+          player.setAttribute('data-vesper-mse-export-query', JSON.stringify({
+            trackId: tracks[ti].id, length: tracks[ti].retainedBytes, partIndex, subOffset
+          }));
           player.dispatchEvent(new Event('vesper-mse-export-request', { bubbles: true, composed: true }));
           const raw = player.getAttribute('data-vesper-mse-export-chunk');
           player.removeAttribute('data-vesper-mse-export-chunk');
@@ -501,19 +503,27 @@ globalThis.VesperBrowserBody = (() => {
     if (signal.aborted) throw new Error('Browser copy cancelled.');
     const { url, etag, mime, length, minimumLength, credentials } = proof;
     const headers = etag ? { 'If-Match': etag } : undefined;
-    const response = await fetcher(url, { credentials, redirect: 'error', cache: 'no-store', signal, headers });
+    const fetchOptions = { credentials, redirect: 'error', cache: 'no-store', signal, headers };
+    let response = await fetcher(url, fetchOptions);
     const type = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
     const encoding = response.headers.get('content-encoding');
     const lengthHeader = response.headers.get('content-length');
     const declared = /^\d+$/.test(lengthHeader || '') ? Number(lengthHeader) : null;
-    if (response.status !== 200 || !response.body || response.url && response.url !== url
-        || response.headers.get('content-range') || encoding && encoding !== 'identity'
-        || !EXTENSIONS[type] || mime && mime !== type
-        || etag && response.headers.get('etag') !== etag
-        || declared !== null && (!Number.isSafeInteger(declared) || declared < 1 || declared > MAX_BYTES
-            || length && declared !== length || minimumLength && declared < minimumLength)) {
+    let part = null;
+    try {
+      if (response.status === 206 && etag && length) {
+        part = verifiedHttpPart(response, proof, 0);
+      } else if (response.status !== 200 || !response.body || response.url && response.url !== url
+          || response.headers.get('content-range') || encoding && encoding.toLowerCase() !== 'identity'
+          || !Object.hasOwn(EXTENSIONS, type) || mime && mime !== type
+          || etag && response.headers.get('etag') !== etag
+          || declared !== null && (!Number.isSafeInteger(declared) || declared < 1 || declared > MAX_BYTES
+              || length && declared !== length || minimumLength && declared < minimumLength)) {
+        throw new Error('Chrome did not return the selected complete media file.');
+      }
+    } catch (error) {
       await response.body?.cancel().catch(() => {});
-      throw new Error('Chrome did not return the selected complete media file.');
+      throw error;
     }
 
     let native, reader, sent = 0, finishing = false;
@@ -546,7 +556,7 @@ globalThis.VesperBrowserBody = (() => {
         }
       });
 
-      const expected = declared ?? length;
+      const expected = part?.total ?? declared ?? length;
       const begin = await sendNative('begin', {
         origin: origin + '/',
         fileName: makeMediaFileName(title, EXTENSIONS[type]),
@@ -569,10 +579,23 @@ globalThis.VesperBrowserBody = (() => {
         used = 0;
         onProgress(sent, expected || 0);
       }
+      let parts = 1;
       while (!signal.aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
-        if (sent + used + value.length > (expected ?? MAX_BYTES)) throw new Error('Browser file length changed.');
+        if (done) {
+          if (!part) break;
+          if (sent + used !== part.end) throw new Error('The browser range ended before its declared length.');
+          if (part.end === expected) break;
+          if (++parts > 256) throw new Error('The browser returned too many small ranges.');
+          const offset = part.end;
+          reader.releaseLock();
+          reader = null;
+          response = await fetcher(url, { ...fetchOptions, headers: { ...headers, Range: `bytes=${offset}-` } });
+          part = verifiedHttpPart(response, proof, offset);
+          reader = response.body.getReader();
+          continue;
+        }
+        if (sent + used + value.length > (part?.end ?? expected ?? MAX_BYTES)) throw new Error('Browser file length changed.');
         for (let start = 0; start < value.length;) {
           const count = Math.min(CHUNK - used, value.length - start);
           buffer.set(value.subarray(start, start + count), used);

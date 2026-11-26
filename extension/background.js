@@ -1305,13 +1305,17 @@ async function observedBrowserBodyProof(state, message, sender, useSignIn) {
   const canonical = new Set((Array.isArray(message.playerCanonicalUrls) ? message.playerCanonicalUrls : [])
     .slice(0, 12).map(raw => VesperPlayerSource.http(raw)?.href).filter(Boolean));
   const witnessedUrls = await matchPlaybackFingerprints(scoped, message.playerResourceFingerprints);
+  if (playerUrl && isPartialMediaUrl(playerUrl)) witnessedUrls.add(playerUrl.href);
+  const slices = observedSliceCandidates(scoped, witnessedUrls).filter(s =>
+    (s.seen >= changedAt - 15_000 && canonical.has(s.url))
+    || s.sliceEvidence.some(member => witnessedUrls.has(member.url)));
   const options = playerUrl
-    ? scoped.filter(s => s.url === playerUrl.href && s.validator && isWholeDirectSource(s)
-        && s.seen >= changedAt - 15_000)
+    ? isPartialMediaUrl(playerUrl) ? slices : scoped.filter(s => s.url === playerUrl.href
+        && !s.conflictingValidator && (isWholeDirectSource(s) || s.validator && isRangedMediaCandidate(s))
+        && (s.validator || s.bytes > 0 && /^(?:video|audio)\/mp4$/.test(s.mime)))
     : [
         ...scoped.filter(s => (canonical.has(s.url) || witnessedUrls.has(s.url)) && isWholeDirectSource(s)),
-        ...observedSliceCandidates(scoped, witnessedUrls).filter(s => s.seen >= changedAt - 15_000
-          && (canonical.has(s.url) || s.sliceEvidence.some(member => witnessedUrls.has(member.url))))
+        ...slices
       ];
 
   // A single file can replace the player only when its identity is unambiguous.
@@ -1392,6 +1396,8 @@ async function playerOptions(message, sender) {
   const identity = VesperPlayerSource.identity(page.href);
   const youTube = isYouTubePage(page);
   const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
+  const socialSite = VesperPlayerSource.isSocialFeedSite(page.href);
+  const socialFeed = socialSite && binding && /^https?:/.test(identity);
   const player = binding ? VesperMediaEvidence.playerFacts(message.playerFacts) : {};
   const source = binding && VesperPlayerSource.http(message.playerUrl);
   const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
@@ -1399,7 +1405,7 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
-  if (prefetch && (message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
+  if (prefetch && (socialSite || message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
       || !sender.documentId || !binding || !Number.isInteger(message.generation) || message.generation < 1))
     return { ok: true, data: { prefetchSkipped: true } };
   const preState = prefetch ? null : await tabState(tab);
@@ -1460,7 +1466,8 @@ async function playerOptions(message, sender) {
     const exactResources = new Set();
     const fingerprints = new Set(playbackFingerprints);
     const playerActiveOrLoaded = playerActiveForWatch(message);
-    if (!matchedManifest && source === null && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
+    const slicedPlayer = source && isPartialMediaUrl(source);
+    if (!matchedManifest && (source === null || slicedPlayer) && playerActiveOrLoaded && Number.isInteger(message.generation) && message.generation > 0
         && changedAt > 0 && sender.documentId && Number.isInteger(tab)) {
       const scoped = state.sources.filter(currentEvidence);
       // Preloaded media can precede loadedmetadata by many seconds. Only a
@@ -1469,12 +1476,14 @@ async function playerOptions(message, sender) {
       if (fingerprints.size) {
         for (const url of await matchPlaybackFingerprints(scoped, playbackFingerprints)) exactResources.add(url);
       }
+      if (slicedPlayer) exactResources.add(source.href);
       if (exactResources.size && !prefetch)
         possibleSources.push(...observedSliceCandidates(scoped, exactResources));
       for (const evidence of scoped) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
         const witnessed = exactResources.has(evidence.url);
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
+        if (slicedPlayer || socialFeed && !witnessed && !(isManifest && fragmentAffinity(evidence.url, playerFragments) > 0)) continue;
         if ((witnessed || evidence.seen >= sourceCutoff)
             && (isManifest || (witnessed || evidence.seen >= directCutoff)
               && (isWholeDirectSource(evidence) || isRangedMediaCandidate(evidence)))
@@ -1535,13 +1544,12 @@ async function playerOptions(message, sender) {
     }
 
     // A page-wide result could describe a different player on an unfamiliar page.
-    if (binding && message.multiplePlayers === true && /^https?:/.test(identity) && !possibleSources.length) {
+    if ((socialFeed || binding && message.multiplePlayers === true && /^https?:/.test(identity)) && !possibleSources.length) {
       if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
       const exact = usableSource ? candidate(usableSource) : matchedManifest;
       if (exact) return browserFallback(explainMediaProtocol(await nativeRequest(
         exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000)));
-      return { ok: false, code: 'no-reusable-source',
-        message: 'VESPER couldn’t verify a source for this player. Start playback and refresh formats.' };
+      return { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
     }
     // A single-video page can give the resolver a better identity than nearby network traffic.
     const pageInput = { ...auth, url: page.href, pageTitle: title,
@@ -1578,7 +1586,8 @@ async function playerOptions(message, sender) {
     }
     const lookupRun = bothRoutes ? lookupPlan({ scope: [tab, frame, sender.documentId].join(':'), message, source,
       possibleSources, changedAt, adapterPromising }) : null;
-    const trafficFirst = lookupRun?.next().next?.route === 'verify-observed';
+    const witnessedPlayback = possibleSources.some(candidate => exactResources.has(candidate.url) || candidate.sliceEvidence?.length);
+    const trafficFirst = socialSite && witnessedPlayback || lookupRun?.next().next?.route === 'verify-observed';
     const learnLookup = reply => {
       lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
       const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
@@ -1688,7 +1697,7 @@ async function playerOptions(message, sender) {
       const refusal = bestRefusal(ordered);
       lookupRun?.report({ route: 'verify-observed', outcome: 'failed' });
       // Learning changes route order, not the protection or security policy.
-      if (trafficFirst && lookupRun?.next().next?.route === 'adapter-lookup'
+      if (!socialFeed && trafficFirst && lookupRun?.next().next?.route === 'adapter-lookup'
           && !['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(refusal?.code)) {
         const reply = await pageLookup();
         await learnLookup(reply);
@@ -1705,7 +1714,7 @@ async function playerOptions(message, sender) {
     const reply = explainMediaProtocol(await task);
     // A native resolver failure may also allow a verified browser copy.
     if (!prefetch && (reply.data?.browserChoice
-        || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-expired','sign-in','unsupported','network','timeout'].includes(reply.code)))) {
+        || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-changed','source-expired','sign-in','unsupported','network','timeout'].includes(reply.code)))) {
       const useSignIn = await useBrowserSignIn();
       const proof = await observedBrowserBodyProof(await tabState(tab), message, sender, useSignIn);
       if (proof && (proof.credentials !== 'include' || useSignIn)) {
@@ -1766,7 +1775,8 @@ async function selectMediaSource(message, sender) {
   const selectedEvidence = selection.sliceEvidence?.map(source => ({...source, sliceWitness:true})) || selection.group || [selection];
   if (!selectedEvidence.every(current))
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
-  const auth = await mediaAuthorization(page.href, sender, { userGesture: true });
+  const auth = await mediaAuthorization(page.href, sender, { userGesture: true,
+    candidateUrls: (selection.group || [selection]).map(source => source.url) });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
   const expiry = Date.parse(selection.verified?.data?.formatsExpireAt || '');
   if (!auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)) return selection.verified;
@@ -1847,7 +1857,7 @@ const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
 const CONTENT_COMMANDS = new Set(['early-download', 'smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker',
   'batch-arm', 'batch-status', 'batch-clear', 'batch-disarm', 'batch-journal-read', 'batch-journal-write', 'batch-journal-ack', 'browser-body-status', 'browser-body-media-proof']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
-  'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed', 'popup-capture-tab']);
+  'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed']);
 
 function commandsFor(sender) {
   if (!sender || sender.id !== chrome.runtime.id) return null;
@@ -1864,29 +1874,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   (async () => {
     if (message.type === 'early-download') return earlyDirectDownload(message, sender);
-    if (message.type === 'media-options' && message.prefetch === true && !await captureCanBegin())
+    if (message.type === 'media-options' && message.prefetch === true
+        && (VesperPlayerSource.isSocialFeedSite(sender.url) || !await captureCanBegin()))
       return { ok: true, data: { prefetchSkipped: true } };
     if (message.type === 'browser-body-status') return bodyReceiptStatus(message, sender);
     if (message.type === 'browser-body-media-proof') return browserBodyMediaProof(message, sender);
-    if (message.type === 'popup-capture-tab') {
-      const tabId = Number(message.tabId);
-      if (!Number.isSafeInteger(tabId)) return { ok: false, code: 'invalid', message: 'No active tab.' };
-      try {
-        const opened = await chrome.tabs.sendMessage(tabId, { type: 'vesper-popup-open-picker' }, { frameId: 0 });
-        if (opened?.ok) return { ok: true, mode: 'in-page' };
-      } catch {}
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      const pageUrl = VesperPlayerSource.http(tab?.url)?.href;
-      if (!pageUrl) return { ok: false, code: 'invalid', message: 'Open a web page with media first.' };
-      const state = await tabState(tabId);
-      const auth = await mediaAuthorization(pageUrl, { tab, url: pageUrl, frameId: 0 }, { userGesture: true });
-      return nativeRequest(envelope('media-picker', {
-        ...auth,
-        url: pageUrl,
-        pageTitle: tab?.title || state.title || '',
-        candidates: (state.sources || []).slice(-12).map(s => ({ url: s.url, kind: s.kind, mimeType: s.mime || undefined }))
-      }));
-    }
     if (message.type.startsWith('batch-journal-') || message.type === 'batch-arm' || message.type === 'batch-status'
         || message.type === 'batch-clear' || message.type === 'batch-disarm')
       return VesperBatchEvents.handle(message.type, message, sender);

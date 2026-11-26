@@ -12,3 +12,7 @@ Site compatibility and available Windows codecs vary by device and source.
 - Copied MP4, WebM and MPEG-TS samples can inform player/source association without retaining media payloads. Independently witnessed byte-addressed MP4 slices may suggest a full resource, but only matching range headers, length and validators permit a native probe; the derived resource requires explicit selection. This is not arbitrary fragment reconstruction.
 - Compatible HTTP, HLS and DASH delivery changes can retain independently verified completed bytes. Direct audio/video track work is interleaved and bounded. HTTP/2 stream admission is experimental; production transport remains unchanged until real TLS, proxy and throughput qualification.
 - Native remux copies existing audio and video. Changing codecs requires decoding and encoding, which can take longer.
+
+## Future work
+
+- Add a page-level media picker for pages with several videos and for playlists. Show one entry per item with its title and thumbnail when available, and let the user choose items before resolving formats.

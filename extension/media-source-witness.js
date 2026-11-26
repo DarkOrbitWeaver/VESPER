@@ -226,12 +226,14 @@
       return offset === bytes.length ? sample : null;
     } catch { return null; }
   }
-  function rememberBuffer(buffer, descriptor) {
+  function rememberBuffer(buffer, descriptor, view) {
     if (!descriptor || !(buffer instanceof ArrayBuffer || (typeof Blob === 'function' && buffer instanceof Blob))) return;
-    const sample = buffer instanceof ArrayBuffer ? mediaSample(buffer) : null;
+    const start = view?.byteOffset ?? 0;
+    const end = start + (view?.byteLength ?? buffer.byteLength ?? buffer.size);
     const existing = bufferProvenance.get(buffer);
-    if (existing?.address === descriptor.address && now() - existing.at <= TTL) return;
-    const record = { ...descriptor, at: now(), sample };
+    if (existing?.address === descriptor.address && existing.start === start && existing.end === end && now() - existing.at <= TTL) return;
+    const sample = buffer instanceof ArrayBuffer ? mediaSample(buffer) : null;
+    const record = { ...descriptor, at: now(), sample, start, end };
     computeDigestAsync(record);
     bufferProvenance.set(buffer, record);
     bufferRing.push({ ref: new WeakRef(buffer), record });
@@ -248,7 +250,9 @@
     try {
       const parent = bufferProvenance.get(this);
       if (parent && now() - parent.at <= TTL) {
-        const offset = Math.max(0, Number(begin) || 0);
+        const index = Math.trunc(Number(begin) || 0);
+        const offset = index < 0 ? Math.max(0, this.byteLength + index) : Math.min(this.byteLength, index);
+        if (offset < parent.start || offset + sliced.byteLength > parent.end) return sliced;
         const childSlice = parent.slice ? {
           ...parent.slice,
           start: parent.slice.start + offset,
@@ -343,7 +347,7 @@
               if (desc) {
                 promise.then(chunk => {
                   const val = chunk && !chunk.done ? chunk.value : null;
-                  if (val) rememberBuffer(val.buffer || val, desc);
+                  if (val) rememberBuffer(val.buffer || val, desc, val);
                 }, () => {});
               }
             } catch {}
@@ -510,8 +514,9 @@
         const backing = ArrayBuffer.isView(data) ? data.buffer : data;
         const sample = mediaSample(rawBytes);
         const exact = bufferProvenance.get(backing);
-        const wholeBuffer = backing.byteLength === rawBytes.byteLength;
-        const prov = exact && wholeBuffer && (!exact.sample || equalSample(exact.sample, sample))
+        const backingSample = backing.byteLength === rawBytes.byteLength ? sample : exact?.sample && mediaSample(backing);
+        const prov = exact && rawBytes.byteOffset >= exact.start && rawBytes.byteOffset + rawBytes.byteLength <= exact.end
+          && (!exact.sample || equalSample(exact.sample, backingSample))
           ? exact : matchBySample(sample);
         const inspected = inspectMediaBytes(rawBytes);
 
@@ -591,6 +596,13 @@
     } catch {}
   }, true);
 
+  function completeTrack(player, track) {
+    return track.initBytes && !track.evicted && track.retainedBytes > 0
+      && Number.isFinite(player.duration) && player.duration > 0
+      && player.buffered?.length === 1 && player.buffered.start(0) <= 0.15
+      && player.buffered.end(0) >= player.duration - 0.15;
+  }
+
   // Rich provenance inspection for isolated content script
   document.addEventListener('vesper-media-provenance-request', event => {
     const player = event.composedPath?.()[0] || event.target;
@@ -613,13 +625,7 @@
       const tracks = [];
       if (record.kind === 'mse' && record.msState) {
         for (const track of record.msState.tracks) {
-          const bufferedComplete = Boolean(
-            track.initBytes && !track.evicted && track.retainedBytes > 0
-            && record.ref.deref()?.readyState === 'ended'
-            && player.buffered?.length === 1 && player.buffered.start(0) <= 0.5
-            && Number.isFinite(player.duration) && player.duration > 0
-            && player.buffered.end(0) >= player.duration - 0.75
-          );
+          const bufferedComplete = Boolean(completeTrack(player, track));
           tracks.push({
             id: track.id,
             role: track.role,
@@ -653,7 +659,7 @@
       const record = objectUrls.get(player.currentSrc || player.src);
       if (record?.kind !== 'mse' || !record.msState) return;
       const track = [...record.msState.tracks].find(t => t.id === req.trackId);
-      if (!track?.initBytes || track.evicted || record.ref.deref()?.readyState !== 'ended') return;
+      if (!track || req.length !== track.retainedBytes || !completeTrack(player, track)) return;
 
       const partCount = 1 + track.chunks.length;
       const index = req.partIndex;

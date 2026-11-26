@@ -71,14 +71,17 @@ internal sealed class TikTokAdapter : AdapterBase
                 // CookieContainer preserves the server's Domain/Path/Secure/expiry rules. Anonymous
                 // .tiktok.com sessions work on its media subdomains; host-only cookies stay host-only.
                 string issued = page.SessionCookies.GetCookieHeader(target);
-                bool signedIn = auth.MayForwardCredentialsTo(target);
-                string? cookie = signedIn && auth.CookieHeader is not null ? auth.CookieHeader : issued.Length > 0 ? issued : null;
+                var primary = auth.PrimaryCredentialsFor(target);
+                string? cookie = auth.CookieFor(target) ?? (issued.Length > 0 ? issued : null);
                 return new MediaRequestContext
                 {
                     Referer = page.FinalUrl.AbsoluteUri,
+                    Origin = auth.Origin,
                     UserAgent = auth.UserAgent ?? Options.UserAgent,
                     CookieHeader = cookie is { Length: <= 8192 } ? cookie : null,
-                    SensitiveHeaders = signedIn ? auth.SensitiveHeaders : MediaRequestContext.Empty.SensitiveHeaders,
+                    SensitiveHeaders = primary?.GetValueOrDefault("Authorization") is { } authorization
+                        ? new Dictionary<string, string> { ["Authorization"] = authorization }
+                        : MediaRequestContext.Empty.SensitiveHeaders,
                     CredentialOrigin = new Uri(target.GetLeftPart(UriPartial.Authority)), CredentialHosts = [target.Host]
                 };
             }

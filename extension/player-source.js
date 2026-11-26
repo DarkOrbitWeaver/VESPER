@@ -138,5 +138,9 @@ globalThis.VesperPlayerSource = (() => {
     return 'direct';
   }
 
-  return { http, identity, cardPage, kind };
+  function isSocialFeedSite(pageUrl) {
+    return /(?:^|\.)(?:instagram|tiktok)\.com$/i.test(http(pageUrl)?.hostname || '');
+  }
+
+  return { http, identity, cardPage, kind, isSocialFeedSite };
 })();

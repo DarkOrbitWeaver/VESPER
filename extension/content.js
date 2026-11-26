@@ -246,7 +246,7 @@
     // Unlike getBoundingClientRect, this detects opacity and content visibility
     // inherited through containers (including virtualized feed cards).
     if (typeof el.checkVisibility === 'function')
-      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true });
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
     const style = getComputedStyle(el);
     if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
     return !hiddenPlayerContainer(el);
@@ -266,14 +266,11 @@
       minWidth = anchor === el ? 160 : 20;
       minHeight = anchor === el ? 24 : 20;
     }
-    const ended = isCurrentEndedPlayer(el);
-    if (!el?.isConnected || !anchor || anchor === el && intersecting.get(el) === false && !ended) return null;
+    if (!el?.isConnected || !anchor) return null;
     const r = anchor.getBoundingClientRect();
-    if (renderedPlayerBox(anchor)) {
-      const rect = clippedPlayerRect(r, minWidth, minHeight);
-      if (rect) return rect;
-    }
-    if (anchor !== el || !ended || hiddenPlayerContainer(el)) return null;
+    const rect = clippedPlayerRect(r, minWidth, minHeight);
+    if (rect && renderedPlayerBox(anchor)) return rect;
+    if (anchor !== el || !isCurrentEndedPlayer(el) || hiddenPlayerContainer(el)) return null;
 
     for (let parent = el.parentElement, depth = 0; parent && parent !== document.body && depth < 5; parent = parent.parentElement, depth++) {
       if (!renderedPlayerBox(parent)) continue;
@@ -335,7 +332,8 @@
     const origin = new URL(pageAddress()).origin;
     for (let card = node, depth = 0; card && depth < 16 && card !== document.body; card = card.parentElement, depth++) {
       const allVideos = queryMediaIn(card, 'video');
-      const visibleVideos = allVideos.filter(el => visiblePlayer(el));
+      // Ended-player visibility also looks up the card. Use geometry here to avoid a recursive lookup.
+      const visibleVideos = allVideos.filter(el => clippedPlayerRect(el.getBoundingClientRect()) && renderedPlayerBox(el));
       // Allow carousels (Instagram/X/feeds) that pre-mount offscreen slide <video> elements inside one post card;
       // stop climbing only when multiple distinct cards' visible players share a feed wrapper.
       if (visibleVideos.length > 1 && card.tagName !== 'ARTICLE') break;
@@ -677,22 +675,23 @@
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
-    const hasLazyPosterOrCard = el instanceof HTMLVideoElement && (el.poster || cardPage(el));
-    if ((el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el)) && !observed.has(el) &&
-        (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]') || hasLazyPosterOrCard)) {
+    const page = pageForPlayer(el);
+    if (!observed.has(el) && (el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el)) &&
+        (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]')
+          || el instanceof HTMLVideoElement && (el.poster || page !== pageAddress()))) {
       observed.add(el);
       if (playerAnchor(el) === el) visibility.observe(el);
       announceVideoElement();
     }
-    const page = pageForPlayer(el);
     mediaLedger.playback({ key: evidenceKey(el), scope: location.origin, pageUrl: page,
       mediaUrl: src, stableId: VesperPlayerSource.identity(page) || '', duration: el.duration });
     const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
-    if (el.readyState >= 1 && (previous?.src !== src || previous?.page !== page)
+    const samePage = previous?.page === page || previous && VesperPlayerSource.identity(previous.page) === VesperPlayerSource.identity(page);
+    if (el.readyState >= 1 && (previous?.src !== src || previous?.srcObject !== el.srcObject || !samePage)
         && !(isCurrentEndedPlayer(el) && !src)) {
       const adoptInitial = canAdoptInitialBinding(el, previous, src, page);
       const changedAt = Date.now();
-      const binding = { src, page, generation: ++generation, changedAt };
+      const binding = { src, srcObject: el.srcObject, page, generation: ++generation, changedAt };
       playback.set(el, binding);
       if (endedPlayer?.player === el && binding.generation !== endedPlayer.binding.generation) {
         endedPlayer = null;
@@ -766,7 +765,8 @@
   }
 
   function schedulePrefetch(el, delay = 250) {
-    if (!intentCertain || !el || butterflyHidden() || document.hidden || panelMedia || el !== video) return;
+    if (!intentCertain || !el || butterflyHidden() || document.hidden || panelMedia || el !== video
+        || VesperPlayerSource.isSocialFeedSite(pageAddress())) return;
     if (prefetchTimer && prefetchTarget === el) return;
     cancelPrefetch();
     prefetchTarget = el;
@@ -779,7 +779,7 @@
 
   function prefetchPlayer(el) {
     if (!alive() || !intentCertain || document.hidden || butterflyHidden() || panelMedia || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
-        || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el)) return;
+        || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el) || VesperPlayerSource.isSocialFeedSite(pageAddress())) return;
     const ended = isCurrentEndedPlayer(el);
     const src = playerSource(el) || (ended ? endedPlayer.binding.src : '');
     const targetPage = pageForPlayer(el);
@@ -835,7 +835,11 @@
     refreshPlayer(e.target);
   }, { capture: true, passive: true, signal });
   for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
-    if (!alive()) return;
+    if (!alive() || !(e.target instanceof HTMLMediaElement)) return;
+    if (type === 'loadstart' && panelMedia?.player === e.target && panelMedia.generation && matchesPickerPlayer(panelMedia)) {
+      announceVideoElement();
+      return;
+    }
     if (e.target instanceof HTMLMediaElement) {
       const page = pageForPlayer(e.target);
       mediaLedger.playback({ key: evidenceKey(e.target), scope: location.origin,
@@ -1235,19 +1239,8 @@
     const fillsHeight = rect.top <= 8 && rect.bottom >= innerHeight - 8;
     const display = window.screen;
     // The parent can fullscreen a cross-origin iframe without setting fullscreenElement inside it.
-    if (fillsWidth && fillsHeight && display && Math.abs(display.width - innerWidth) <= 8
-        && Math.abs(display.height - innerHeight) <= 8) return true;
-    // A feed may fill one axis inside a fixed, viewport-sized app shell.
-    // That is not fullscreen playback: keep the butterfly visible there.
-    if (!fillsWidth || !fillsHeight) return false;
-    // Some players expand a fixed container over the whole tab instead of using the Fullscreen API.
-    for (let parent = video, depth = 0; parent && depth < 6; parent = parent.parentElement, depth++) {
-      if (getComputedStyle(parent).position !== 'fixed') continue;
-      const box = parent.getBoundingClientRect();
-      if (box.left <= 8 && box.top <= 8 && box.right >= innerWidth - 8 && box.bottom >= innerHeight - 8)
-        return true;
-    }
-    return false;
+    return Boolean(fillsWidth && fillsHeight && display && Math.abs(display.width - innerWidth) <= 8
+      && Math.abs(display.height - innerHeight) <= 8);
   }
 
   function playerPerch(rect, fullscreen) {
@@ -1724,7 +1717,7 @@
       let original = formats?.browserBodyAvailable === true ? formats.browserBodyFormat : null;
       let mseExportTracks = null;
       if (!original && missingFormats && ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
-          'site-refused', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
+          'site-refused', 'source-changed', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
         original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
         if (!original && playerWitness?.tracks?.length && playerWitness.tracks.length <= 2
             && playerWitness.tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
@@ -1757,7 +1750,7 @@
       }
     }
     if (!formats?.browserBody && missingFormats) {
-      const message = errorMessage(result, current && player.readyState >= 2);
+      const message = errorMessage(result, current && player.readyState >= 1);
       if (!['protected', 'blocked'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
       return renderShell(title, poster, duration, message);
@@ -2506,7 +2499,8 @@
       duplicate: 'This link is already in VESPER.',
       cancelled: 'Cancelled in VESPER.',
       timeout: 'VESPER didn’t answer in time.',
-      'no-media': 'VESPER couldn’t find a video to download. Play the video, then try again.',
+      'no-media': playbackReady ? 'VESPER couldn’t verify a downloadable stream from this playback.'
+        : 'Play the video in Chrome, then try again.',
       'no-reusable-source': 'This player’s video isn’t available as a file or stream VESPER can reuse.',
       'site-refused': reply?.message || 'The site refused the request. Try again from the video page.',
       unavailable: 'VESPER couldn’t open this video. Refresh the page and try again.',
@@ -2700,7 +2694,7 @@
       sendResponse(copyGeneratedLink(message.url));
       return false;
     }
-    if (['vesper-open-picker', 'vesper-popup-open-picker'].includes(message?.type) && alive())
+    if (message?.type === 'vesper-open-picker' && alive())
       sendResponse(openContextPicker(message.playerUrl) ? { ok: true } : { ok: false, code: 'no-player' });
     return false;
   });

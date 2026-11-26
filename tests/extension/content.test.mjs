@@ -195,7 +195,12 @@ test('opening the popup shows the installed extension version without checking t
     assert.equal(getElementById('signin').checked, true);
     const allow = getElementById('signin-permission');
     assert.equal(allow.hidden, false);
-    assert.deepEqual(messages.map(({ type, tabId }) => [type, tabId]), [['tab-state', 3]]);
+    assert.deepEqual(messages, []);
+    const siteToggle = getElementById('site-butterfly');
+    assert.equal(siteToggle.textContent, 'Hide butterfly on this site');
+    await siteToggle.onclick();
+    assert.deepEqual(Array.from(local.vesperHiddenButterflyHosts), ['example.com']);
+    assert.equal(siteToggle.textContent, 'Show butterfly on this site');
     assert.deepEqual(permissionRequests, []);
     pause.checked = true;
     await pause.onchange();
@@ -1061,6 +1066,21 @@ test('scroll re-ranks a competing visible feed player instead of merely moving t
   context.observed = new Set([player]);
   schedule(); callback();
   assert.equal(placed,1);
+});
+
+test('a feed player can become visible before its intersection notification arrives', () => {
+  const content = source('content');
+  const start = content.indexOf('  function visiblePlayer(');
+  const end = content.indexOf('  function isCurrentEndedPlayer(', start);
+  const bounds = { left: 250, right: 650, top: 56, bottom: 576 };
+  const player = { tagName: 'VIDEO', isConnected: true, getBoundingClientRect: () => bounds };
+  const context = vm.createContext({ MIN_WIDTH: 220, MIN_HEIGHT: 120, innerWidth: 900, innerHeight: 650,
+    intersecting: new Map([[player, false]]), playerAnchor: value => value,
+    renderedPlayerBox: () => true, isCurrentEndedPlayer: () => false });
+  const visible = vm.runInContext(content.slice(start, end) + '\nvisiblePlayer;', context);
+  assert.deepEqual({ ...visible(player) }, bounds);
+  bounds.right = 300;
+  assert.equal(visible(player), null);
 });
 
 test('TikTok feed identity comes from the exact live player wrapper, not the home page or adjacent card', () => {

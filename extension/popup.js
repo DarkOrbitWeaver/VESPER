@@ -40,11 +40,6 @@ async function init() {
   $('theme').value = prefs.theme;
   $('motion').value = prefs.motion === 'still' ? 'still' : 'animate';
 
-  $('open-transfers').onclick = () => {
-    void chrome.tabs.create({ url: chrome.runtime.getURL('transfers.html') });
-    window.close();
-  };
-
   async function readHiddenHosts() {
     const { vesperHiddenButterflyHosts: hosts } = await chrome.storage.local.get('vesperHiddenButterflyHosts');
     return new Set(Array.isArray(hosts) ? hosts.filter(host => typeof host === 'string').map(host => host.toLowerCase()).slice(0, 100) : []);
@@ -52,53 +47,11 @@ async function init() {
 
   const [siteTab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   let butterflyHost = '';
-  let isWebTab = false;
   try {
     const site = new URL(siteTab?.url || '');
-    if (site.protocol === 'http:' || site.protocol === 'https:') {
+    if (site.protocol === 'http:' || site.protocol === 'https:')
       butterflyHost = site.hostname.toLowerCase();
-      isWebTab = true;
-    }
   } catch {}
-
-  const captureBtn = $('capture-tab-media');
-  const mediaTitle = $('tab-media-title');
-  const mediaDetail = $('tab-media-detail');
-  captureBtn.disabled = !isWebTab;
-
-  if (!isWebTab) {
-    mediaTitle.textContent = 'Browser page';
-    mediaDetail.textContent = 'Open any website to capture media or files.';
-  } else {
-    mediaTitle.textContent = siteTab?.title || butterflyHost;
-    try {
-      const tabInfo = await chrome.runtime.sendMessage({ type: 'tab-state', tabId: siteTab.id });
-      const count = tabInfo?.state?.sources?.length || 0;
-      mediaDetail.textContent = count > 0
-        ? `${count} playable stream${count === 1 ? '' : 's'} observed on ${butterflyHost}`
-        : `Ready to inspect media on ${butterflyHost}`;
-    } catch {
-      mediaDetail.textContent = `Ready on ${butterflyHost}`;
-    }
-  }
-
-  captureBtn.onclick = async () => {
-    if (!isWebTab || !Number.isSafeInteger(siteTab?.id)) return;
-    captureBtn.disabled = true;
-    mediaDetail.textContent = 'Opening media options…';
-    try {
-      const reply = await chrome.runtime.sendMessage({ type: 'popup-capture-tab', tabId: siteTab.id });
-      if (reply?.ok) {
-        window.close();
-        return;
-      }
-      mediaDetail.textContent = reply?.message || 'No downloadable media found on this page.';
-    } catch {
-      mediaDetail.textContent = 'Could not inspect this tab.';
-    } finally {
-      captureBtn.disabled = false;
-    }
-  };
 
   const siteButterfly = $('site-butterfly');
   let hiddenHosts = await readHiddenHosts();
