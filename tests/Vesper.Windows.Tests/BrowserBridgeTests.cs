@@ -930,6 +930,58 @@ public sealed class BrowserBridgeTests
         Assert.Equal(expected, BrowserBridgeHandler.MapResolverError(code));
     }
 
+    [Fact]
+    public void BrowserPresetsStayConciseAndDeduplicateIdenticalRecipes()
+    {
+        var standalone = new MediaRepresentation
+        {
+            Id = "solo-1080", Url = new Uri("https://cdn.example.test/solo.webm"),
+            Content = StreamContent.VideoOnly, StandaloneVideo = true, Container = "webm",
+            VideoCodec = "vp9", Height = 1080, FileSize = 5_557_452
+        };
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/solo"), Provider = "test", Title = "Solo",
+            Duration = TimeSpan.FromSeconds(29), Representations = [standalone]
+        };
+        var bridge = new BrowserBridgeHandler(null!, null!, () => new VesperPreferences());
+        var createOptions = typeof(BrowserBridgeHandler).GetMethod("CreateBrowserOptions",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+
+        var soloResponse = (BridgeResponse)createOptions.Invoke(bridge,
+            ["solo", item, item.SourceUrl.AbsoluteUri, CancellationToken.None, null])!;
+        using var soloJson = JsonDocument.Parse(JsonSerializer.Serialize(soloResponse.Data, BridgeProtocol.Json));
+        var soloChoices = soloJson.RootElement.GetProperty("choices");
+        Assert.Equal(1, soloChoices.GetArrayLength());
+        Assert.Equal("1080p · no audio", soloChoices[0].GetProperty("detail").GetString());
+
+        var h264 = new MediaRepresentation
+        {
+            Id = "137", Url = new Uri("https://cdn.example.test/v1080.mp4"),
+            Content = StreamContent.VideoOnly, Container = "mp4", VideoCodec = "h264",
+            Height = 1080, FileSize = 1_500_000_000
+        };
+        var aac = new MediaRepresentation
+        {
+            Id = "140", Url = new Uri("https://cdn.example.test/a.m4a"),
+            Content = StreamContent.AudioOnly, Container = "m4a", AudioCodec = "aac",
+            BitrateKbps = 129, FileSize = 114_500_000
+        };
+        var richItem = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/rich"), Provider = "youtube", Title = "Rich",
+            Duration = TimeSpan.FromMinutes(117), Representations = [h264, aac]
+        };
+        var richResponse = (BridgeResponse)createOptions.Invoke(bridge,
+            ["rich", richItem, richItem.SourceUrl.AbsoluteUri, CancellationToken.None, null])!;
+        using var richJson = JsonDocument.Parse(JsonSerializer.Serialize(richResponse.Data, BridgeProtocol.Json));
+        var richChoices = richJson.RootElement.GetProperty("choices");
+        Assert.Equal("1080p", richChoices[0].GetProperty("detail").GetString());
+        Assert.Equal("129 kbps", richChoices[1].GetProperty("detail").GetString());
+        var moreFirst = richJson.RootElement.GetProperty("more")[0].GetProperty("detail").GetString();
+        Assert.Contains("file layout not confirmed", moreFirst, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void OnSta(Action action)
     {
         ExceptionDispatchInfo? error = null;

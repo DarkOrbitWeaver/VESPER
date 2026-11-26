@@ -1981,7 +1981,7 @@
       labels.append(element('b', '', c.label),
         element('small', '', [c.detail, size].filter(Boolean).join(' · ')));
       const [icon, tone] = { 'Best quality': ['♕', 'best'], Balanced: ['▣', 'balanced'],
-        Smallest: ['⌁', ''], 'Audio only': ['♫', 'audio'] }[c.label] || ['›', ''];
+        Smallest: ['▪', ''], 'Audio only': ['♫', 'audio'] }[c.label] || ['›', ''];
       const mark = element('span', 'icon ' + tone, icon);
       mark.setAttribute('aria-hidden', 'true');
       option.append(mark, labels);

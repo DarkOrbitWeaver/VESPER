@@ -144,10 +144,33 @@ internal sealed partial class BrowserBridgeHandler
         var exact = new List<BrowserOption>();
         long cacheBytes = 0;
         DateTimeOffset now = DateTimeOffset.UtcNow;
-        BrowserOption? OptionFor(MediaDownloadChoice? job, string label)
+        static bool SameRecipe(MediaDownloadChoice a, MediaDownloadChoice b) =>
+            a.Url == b.Url && a.Kind == b.Kind && a.Output == b.Output
+            && a.FormatId == b.FormatId && a.MediaPlanJson == b.MediaPlanJson
+            && a.ConvertedVideoQuality == b.ConvertedVideoQuality && a.ConvertedAudioCodec == b.ConvertedAudioCodec
+            && a.Referer == b.Referer && a.UserAgent == b.UserAgent;
+
+        static string PresetDetail(MediaDownloadChoice job, MediaRepresentation[] tracks, MediaRepresentation? video, bool? hasVideo, bool? hasAudio)
+        {
+            if (job.Output is MediaOutput.M4a or MediaOutput.Mp3 or MediaOutput.Opus or MediaOutput.Wav || hasVideo == false)
+            {
+                var audio = tracks.FirstOrDefault(rep => rep.HasAudio) ?? tracks.FirstOrDefault();
+                return audio?.BitrateKbps is int kbps ? $"{kbps} kbps" : job.DisplayContainer is { Length: > 0 } c ? c : "Audio";
+            }
+            if (hasVideo == true)
+            {
+                var parts = new List<string>(3) { video?.Height is int h ? $"{h}p" : "Video" };
+                if (video?.FrameRate is > 30.5) parts.Add($"{Math.Round(video.FrameRate.Value)} fps");
+                if (hasAudio == false) parts.Add("no audio");
+                return string.Join(" · ", parts);
+            }
+            return job.DisplayDetail;
+        }
+
+        BrowserOption? OptionFor(MediaDownloadChoice? job, string label, bool preset = false)
         {
             if (job is null || job.ExpiresAt is { } expires && expires <= now) return null;
-            int index = jobs.IndexOf(job);
+            int index = jobs.FindIndex(existing => SameRecipe(existing, job));
             if (index < 0)
             {
                 long bytes = 2L * ((job.MediaPlanJson?.Length ?? 0) + (job.MediaMetadataJson?.Length ?? 0) + job.Url.Length + 1024);
@@ -185,13 +208,14 @@ internal sealed partial class BrowserBridgeHandler
             }
             string container = job.Kind == JobKind.Hls && job.Output == MediaOutput.Original
                 ? (tracks.FirstOrDefault()?.Container ?? "Video").ToUpperInvariant() : job.DisplayContainer;
-            return new BrowserOption(index, label, job.DisplayDetail, container,
+            string detail = preset ? PresetDetail(job, tracks, video, hasVideo, hasAudio) : job.DisplayDetail;
+            return new BrowserOption(index, label, detail, container,
                 clipMode != ClipMode.None, clipMode is ClipMode.FullFile or ClipMode.Keyframes,
                 video?.Height, hasVideo, hasAudio, size, estimate);
         }
-        void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options)
+        void Offer(MediaDownloadChoice? job, string label, List<BrowserOption> options, bool preset = false)
         {
-            if (OptionFor(job, label) is { } option && !options.Any(previous => previous.Index == option.Index))
+            if (OptionFor(job, label, preset) is { } option && !options.Any(previous => previous.Index == option.Index))
                 options.Add(option);
         }
 
@@ -204,16 +228,16 @@ internal sealed partial class BrowserBridgeHandler
         {
             foreach (var (label, preference) in quality)
             {
-                Offer(Plan(preference, output: MediaOutputPreference.CompatibleVideo).Choice, label, presets);
-                Offer(Plan(preference).Choice, label, originalPresets);
+                Offer(Plan(preference, output: MediaOutputPreference.CompatibleVideo).Choice, label, presets, preset: true);
+                Offer(Plan(preference).Choice, label, originalPresets, preset: true);
             }
         }
         MediaDownloadChoice? sourceAudio = Plan(FormatPreferences.AudioOnly).Choice;
-        Offer(sourceAudio, "Audio only", presets);
-        Offer(sourceAudio, "Audio only", originalPresets);
+        Offer(sourceAudio, "Audio only", presets, preset: true);
+        Offer(sourceAudio, "Audio only", originalPresets, preset: true);
         MediaDownloadChoice? alternate = Plan(FormatPreferences.AudioOnly, output: MediaOutputPreference.M4a).Choice;
         BrowserOption? audioM4a = alternate != sourceAudio && presets.Any(c => c.Label == "Audio only")
-            ? OptionFor(alternate, "Audio only") : null;
+            ? OptionFor(alternate, "Audio only", preset: true) : null;
 
         var audioOutputs = new List<object>();
         void AudioOutput(MediaOutputPreference output, string label)
