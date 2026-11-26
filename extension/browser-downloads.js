@@ -1135,6 +1135,9 @@ async function finishBrowserHandoff(id, record) {
           // after our cancellation is confirmed for the exact parked item.
           if (captureEnabled && !record.preserveChrome && sameDownload(cancelled, record)
               && cancelled.state === 'interrupted' && cancelled.error === 'USER_CANCELED') {
+            // Only our confirmed cancellation after native publication is eligible.
+            // Keep Chrome's real downloads, independent cancellations and opt-outs visible.
+            await chrome.downloads.erase({ id, startTime: record.startTime, state: 'interrupted', error: 'USER_CANCELED' }).catch(() => {});
             await noteDecision(cancelled, 'moved', undefined, parkFacts(record));
             await VesperExperience.note(siteOf(cancelled), takeoverStrategy(record.signedIn === true), 'verified')
               .catch(() => {});
@@ -1147,9 +1150,8 @@ async function finishBrowserHandoff(id, record) {
               : null);
             return;
           }
-          // Only erase after Chrome confirms cancellation. A completed copy remains in Chrome.
-          if (!cancelled || sameDownload(cancelled, record) && cancelled.state === 'interrupted') {
-            if (cancelled && captureEnabled) await chrome.downloads.erase({ id }).catch(() => {});
+          // Unknown or unrelated interruption reasons must remain visible.
+          if (!cancelled) {
             if (!captureEnabled) {
               await releaseChromeAfterOptOut(id, record);
               return;

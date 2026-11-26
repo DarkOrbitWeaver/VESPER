@@ -1813,7 +1813,7 @@ test('recovery resumes Chrome after an accepted capture fails, but never takes a
   assert.equal(paused.paused, true);
 });
 
-test('after VESPER completes, Chrome keeps its USER_CANCELED history entry visible', async () => {
+test('after VESPER completes, only its confirmed Chrome cancellation is erased', async () => {
   const file = activeDownload();
   let state = 'active';
   const app = load({ 'browser-submit': started, 'browser-transfer': () => transfer(state) }, { download: file });
@@ -1826,7 +1826,7 @@ test('after VESPER completes, Chrome keeps its USER_CANCELED history entry visib
   await app.recover();
   assert.equal(app.actions.includes('cancel'), true);
   assert.equal(app.sessionData.vesperCaptureDecisions?.[0]?.outcome, 'moved');
-  assert.equal(app.actions.includes('erase'), false);
+  assert.equal(app.actions.includes('erase'), true);
   assert.equal(file.state, 'interrupted');
   assert.equal(file.error, 'USER_CANCELED');
   const record = app.localData.browserDownloads[file.id];
