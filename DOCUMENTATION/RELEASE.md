@@ -20,7 +20,7 @@ Use the .NET 10 SDK and Node.js on Windows.
 
 ```powershell
 .\scripts\Run-Tests.ps1
-.\scripts\Build-Release.ps1 -InstallerOnly -AllowUnsigned
+.\scripts\Build-Release.ps1 -AllowUnsigned
 ```
 
 The build writes the offline installer and its SHA-256 checksum to `release/setup-<version>/`. Unsigned builds are for local testing. Use Authenticode signing for public distribution.
