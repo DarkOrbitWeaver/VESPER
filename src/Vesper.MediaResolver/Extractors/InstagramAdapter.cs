@@ -318,11 +318,14 @@ internal sealed class InstagramAdapter : AdapterBase
                 && !host.EndsWith(".instagram.com", StringComparison.OrdinalIgnoreCase)) return false;
 
             string[] parts = url.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2 && parts[0] is "p" or "reel" or "reels" or "tv"
-                && parts[1] is not "audio")
+            int kind = parts.Length == 3 && parts[0] is not ("stories" or "p" or "reel" or "reels" or "tv") && parts[0].Length <= 30
+                && parts[0].All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.') ? 1 : 0;
+            if (parts.Length == kind + 2 && parts[kind] is "p" or "reel" or "reels" or "tv"
+                && parts[kind + 1] is { Length: <= 128 } code && code != "audio"
+                && code.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
             {
-                target = new InstagramTarget(parts[1], parts[1]);
-                return parts[1].Length is > 0 and <= 128;
+                target = new InstagramTarget(code, code);
+                return true;
             }
 
             if (parts.Length >= 2 && parts[0] == "stories")

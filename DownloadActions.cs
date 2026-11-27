@@ -259,7 +259,7 @@ internal sealed class DownloadActions(IWin32Window owner, DownloadEngine engine,
         int partial = items.Count(i => i.State != JobState.Completed && i.CommittedBytes > 0);
         string text = (items.Count == 1 ? "Remove this download from the list?" : $"Remove {items.Count} downloads from the list?")
             + "\n\nYour files stay in their folders."
-            + (partial > 0 ? $"\nPartially downloaded data ({partial}) stays in the destination folder." : "");
+            + (partial > 0 ? $"\nSaved partial files ({partial}) will be kept." : "");
         if (!Confirm(text, "Remove from list", action: "Remove", symbol: VesperIcon.RemoveList)) return;
 
         var blocked = new List<string>();

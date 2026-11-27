@@ -286,7 +286,9 @@ public sealed class BrowserBodyTests
         Assert.True((await Send(h, Begin(bytes.Length))).Ok);
         Assert.True((await Send(h, Append(0, bytes))).Ok);
         Guid id = AcceptedId(await Send(h, Finish()));
-        string partial = Assert.Single(h.Files(), path => path.EndsWith(".vpart", StringComparison.Ordinal));
+        string partial = h.Engine.Snapshot(id)!.PartialPath;
+        Assert.Equal(h.Engine.PartialsFolder, Path.GetDirectoryName(partial));
+        Assert.Empty(h.Files());
         await File.WriteAllBytesAsync(partial, Payloads.WithChangedTail(bytes));
         h.Restart();
         JobSnapshot saved = await h.WaitForStateAsync(id, JobState.Suspect);
@@ -407,11 +409,12 @@ public sealed class BrowserBodyTests
     [InlineData("database-lost", true)]
     [InlineData("manifest", true)]
     [InlineData("unclaimed", false)]
+    [InlineData("old-folder", false)]
     public void JournalRecoveryRequiresProvenUnownedFile(string scenario, bool retained)
     {
         if (!OperatingSystem.IsWindows()) return;
         string root = Path.Combine(Path.GetTempPath(), "vesper-body-recovery-" + Guid.NewGuid().ToString("N"));
-        string staging = Path.Combine(root, PartialFile.StagingFolderName);
+        string staging = scenario == "old-folder" ? PartialFile.StagingFolder(root) : PartialFile.PrivateFolder(root);
         Directory.CreateDirectory(staging);
         try
         {

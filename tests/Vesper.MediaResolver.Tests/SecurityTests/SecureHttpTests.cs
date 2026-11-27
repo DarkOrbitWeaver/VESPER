@@ -210,6 +210,27 @@ public class SecureHttpTests
         Assert.False(missing.IsSuccess);
     }
 
+    [Theory]
+    [InlineData(401)]
+    [InlineData(403)]
+    [InlineData(404)]
+    [InlineData(429)]
+    [InlineData(503)]
+    public async Task Probe_does_not_follow_a_refused_head_with_a_get(int status)
+    {
+        var url = new Uri("https://a.example.com/v.mp4");
+        var handler = new FakeHttpHandler().Add(url.AbsoluteUri, "denied", "text/plain", status);
+        using var client = Client(handler);
+
+        if (status == 429)
+        {
+            MediaError error = await Error(async () => { await client.ProbeAsync(url, null, default); });
+            Assert.Equal(MediaErrorCode.RateLimited, error.Code);
+        }
+        else Assert.Equal(status, (await client.ProbeAsync(url, null, default)).StatusCode);
+        Assert.Equal(HttpMethod.Head, Assert.Single(handler.Requests).Method);
+    }
+
     [Fact]
     public async Task ExactRangeProbe_RequiresMatchingContentRangeAndOneReadableByte()
     {

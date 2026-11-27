@@ -426,7 +426,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
 
     private void EnsureSpace(PartialFile file, long total)
     {
-        string? root = Path.GetPathRoot(Path.GetFullPath(Job.DestinationFolder));
+        string? root = Path.GetPathRoot(file.Path);
         if (root is null) return;
         try
         {

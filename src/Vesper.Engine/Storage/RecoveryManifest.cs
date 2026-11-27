@@ -103,7 +103,8 @@ internal static class RecoveryManifest
             if (!TryReadBody(priorHandle, out Body priorBody)
                 || !ManifestMatchesJob(priorBody, path, job)
                 || (!TryRecover(path, out DownloadJob prior, out _, publishedPath: null, publishedIdentity: null,
-                    livePartialHandle: livePartialHandle, manifestHandle: priorHandle)
+                    livePartialHandle: livePartialHandle, manifestHandle: priorHandle,
+                    trustedPartialFolder: Path.GetDirectoryName(job.PartialPath))
                     && !MatchesMuxedMergeIdentity(job, priorBody.PartialIdentity)))
                 throw new IOException("An existing recovery file could not be verified and was left unchanged.");
             hasPrior = true;
@@ -304,7 +305,7 @@ internal static class RecoveryManifest
     }
 
     internal static void RecoverInterruptedReplacements(string folder, Action<string>? report = null,
-        Action<string>? beforeRestore = null)
+        Action<string>? beforeRestore = null, string? trustedPartialFolder = null)
     {
         string[] backups;
         try { backups = Directory.GetFiles(folder, "*.vpart" + Extension + PreviousSuffix, SearchOption.TopDirectoryOnly); }
@@ -326,12 +327,12 @@ internal static class RecoveryManifest
                     using SafeFileHandle currentHandle = PathSafety.OpenTemporaryHandle(primary, FileMode.Open,
                         FileAccess.Read, FileShare.Read);
                     if (!TryRecover(primary, out DownloadJob current, out _, publishedPath: null, publishedIdentity: null,
-                        manifestHandle: currentHandle)) continue;
+                        manifestHandle: currentHandle, trustedPartialFolder: trustedPartialFolder)) continue;
 
                     using SafeFileHandle previousHandle = PathSafety.OpenTemporaryHandle(backup, FileMode.Open,
                         FileAccess.Read, FileShare.Read, allowDelete: true);
                     if (TryRecover(backup, out DownloadJob previous, out _, publishedPath: null, publishedIdentity: null,
-                        manifestHandle: previousHandle)
+                        manifestHandle: previousHandle, trustedPartialFolder: trustedPartialFolder)
                         && current.Id == previous.Id && (current.Kind == previous.Kind
                             || current.Generation > previous.Generation && SwitchableKind(current.Kind) && SwitchableKind(previous.Kind)
                                 && current.PartialIdentity is { Length: 64 })
@@ -353,7 +354,7 @@ internal static class RecoveryManifest
                 using SafeFileHandle previousHandle = PathSafety.OpenTemporaryHandle(backup, FileMode.Open,
                     FileAccess.Read, FileShare.Read | FileShare.Delete);
                 if (!TryRecover(backup, out _, out string problem, publishedPath: null, publishedIdentity: null,
-                    manifestHandle: previousHandle))
+                    manifestHandle: previousHandle, trustedPartialFolder: trustedPartialFolder))
                 {
                     report?.Invoke("A previous recovery file was kept because it could not be verified: " + problem);
                     continue;
@@ -446,10 +447,8 @@ internal static class RecoveryManifest
             return false;
 
         string partial = manifestPath[..^Extension.Length];
-        string folder = Path.GetDirectoryName(Path.GetFullPath(manifestPath)) ?? "";
         string jobDestination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.DestinationFolder));
         if (!SamePath(partial, job.PartialPath)
-            || (!SamePath(folder, jobDestination) && !PartialFile.IsStagingFolder(folder, jobDestination))
             || body.Destination is not { Length: > 0 } destination
             || !SamePath(Path.TrimEndingDirectorySeparator(destination), jobDestination))
             return false;
@@ -488,13 +487,13 @@ internal static class RecoveryManifest
     private static bool IsSha256(string? value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
 
     /// <summary>Returns a job in NeedsLink state: the manifest knows the identity but not the secret link.</summary>
-    public static bool TryRecover(string manifestPath, out DownloadJob job, out string problem)
+    public static bool TryRecover(string manifestPath, out DownloadJob job, out string problem, string? trustedPartialFolder = null)
         => TryRecover(manifestPath, out job, out problem, publishedPath: null, publishedIdentity: null,
-            livePartialHandle: null);
+            trustedPartialFolder: trustedPartialFolder);
 
     private static bool TryRecover(string manifestPath, out DownloadJob job, out string problem,
         string? publishedPath, string? publishedIdentity, SafeFileHandle? livePartialHandle = null,
-        SafeFileHandle? manifestHandle = null)
+        SafeFileHandle? manifestHandle = null, string? trustedPartialFolder = null)
     {
         job = null!;
         problem = "";
@@ -550,13 +549,14 @@ internal static class RecoveryManifest
             // The checksum is unkeyed, so a planted manifest could name another folder or file.
             // Only import one that describes the partial sitting next to it.
             string here = Path.GetDirectoryName(Path.GetFullPath(manifestPath)) ?? "";
-            if (string.IsNullOrWhiteSpace(body.Destination))
+            if (string.IsNullOrWhiteSpace(body.Destination) || !Path.IsPathFullyQualified(body.Destination))
             { problem = "the recovery file names an invalid folder"; return false; }
             string destination;
             try { destination = Path.TrimEndingDirectorySeparator(Path.GetFullPath(body.Destination)); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
             { problem = "the recovery file names an invalid folder"; return false; }
             if (!string.Equals(destination, here, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(trustedPartialFolder, here, StringComparison.OrdinalIgnoreCase)
                 && !PartialFile.IsStagingFolder(here, destination))
             { problem = "the recovery file names a different folder"; return false; }
 

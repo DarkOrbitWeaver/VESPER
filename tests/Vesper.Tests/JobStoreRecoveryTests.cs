@@ -19,7 +19,7 @@ public sealed class JobStoreRecoveryTests
             {
                 connection.Open();
                 using var command = connection.CreateCommand();
-                command.CommandText = $"PRAGMA user_version = {JobStore.SchemaVersion - 2}; PRAGMA wal_checkpoint(TRUNCATE);";
+                command.CommandText = "PRAGMA user_version = 8; PRAGMA wal_checkpoint(TRUNCATE);";
                 command.ExecuteNonQuery();
             }
 
@@ -188,6 +188,7 @@ public sealed class JobStoreRecoveryTests
             ALTER TABLE jobs DROP COLUMN published_file_identity;
             ALTER TABLE jobs DROP COLUMN final_resource_identity;
             ALTER TABLE jobs DROP COLUMN pending_conversion_identity;
+            ALTER TABLE jobs DROP COLUMN publication_copy_identity;
             ALTER TABLE jobs DROP COLUMN partial_identity;
             ALTER TABLE jobs DROP COLUMN published_sha256;
             ALTER TABLE jobs DROP COLUMN media_metadata_json;

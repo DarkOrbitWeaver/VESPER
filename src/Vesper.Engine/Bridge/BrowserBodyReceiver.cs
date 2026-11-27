@@ -19,6 +19,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
     internal const string JournalFileName = "browser-inbox.json";
     private static readonly TimeSpan Idle = TimeSpan.FromMinutes(3);
     private readonly string _journal;
+    private readonly string _partialsFolder;
     private readonly Func<string, long, string?> _destination;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, Transfer> _active = new(StringComparer.Ordinal);
@@ -28,6 +29,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
     internal BrowserBodyReceiver(string dataDirectory, Func<string, long, string?> destination)
     {
         _journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
+        _partialsFolder = PartialFile.PrivateFolder(dataDirectory);
         _destination = destination;
     }
 
@@ -154,9 +156,9 @@ internal sealed class BrowserBodyReceiver : IDisposable
             long spaceNeeded = expectedLength ?? StreamingMinReserve;
             if (tracks is { Count: 2 }) spaceNeeded = spaceNeeded * 2; // reserve staging + remux headroom
             if (_destination(name, spaceNeeded) is not { } folder) return new(false, "storage");
-            string staging = PartialFile.PrepareStagingFolder(folder);
+            PartialFile.PreparePrivateFolder(_partialsFolder);
             Guid jobId = Guid.NewGuid();
-            string path = Path.Combine(staging, name + "." + jobId.ToString("N")[..8] + ".vpart");
+            string path = Path.Combine(_partialsFolder, name + "." + jobId.ToString("N")[..8] + ".vpart");
             RememberJournal(new JournalEntry(id, path, "receiving"));
             PartialFile file;
             try { file = PartialFile.Open(path, FileMode.CreateNew, allowDelete: true); }
@@ -330,20 +332,23 @@ internal sealed class BrowserBodyReceiver : IDisposable
     internal static void RecoverJournal(string dataDirectory, IReadOnlySet<string> ownedPaths, bool databaseRecovered)
     {
         string journal = Path.Combine(Path.GetFullPath(dataDirectory), JournalFileName);
+        string partialsFolder = PartialFile.PrivateFolder(dataDirectory);
         try
         {
             foreach (JournalEntry entry in ReadJournal(journal))
-                if (!databaseRecovered && entry.State == "receiving") DeleteOrphan(entry, ownedPaths);
+                if (!databaseRecovered && entry.State == "receiving") DeleteOrphan(entry, ownedPaths, partialsFolder);
             System.IO.File.Delete(journal);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { }
     }
 
-    private static void DeleteOrphan(JournalEntry entry, IReadOnlySet<string> ownedPaths)
+    private static void DeleteOrphan(JournalEntry entry, IReadOnlySet<string> ownedPaths, string partialsFolder)
     {
         string full = Path.GetFullPath(entry.Path);
+        string? folder = Path.GetDirectoryName(full);
         if (!full.EndsWith(".vpart", StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(Path.GetFileName(Path.GetDirectoryName(full)), PartialFile.StagingFolderName, StringComparison.OrdinalIgnoreCase))
+            || (!string.Equals(folder, partialsFolder, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(Path.GetFileName(folder), PartialFile.StagingFolderName, StringComparison.OrdinalIgnoreCase)))
             return;
         string manifest = RecoveryManifest.PathFor(full);
         if (ownedPaths.Contains(full) || System.IO.File.Exists(manifest)

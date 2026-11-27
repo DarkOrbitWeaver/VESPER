@@ -14,6 +14,40 @@ namespace Vesper.Tests;
 public sealed class FinalProductionAuditTests
 {
     [Theory]
+    [InlineData(JobKind.Http)]
+    [InlineData(JobKind.Hls)]
+    [InlineData(JobKind.Dash)]
+    [InlineData(JobKind.BrowserStream)]
+    public async Task Finalization_never_pads_missing_committed_bytes_with_zeroes(JobKind kind)
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        string partial = Path.Combine(harness.Data, "short.vpart");
+        string? identity;
+        using (var file = PartialFile.Open(partial, FileMode.CreateNew))
+        {
+            await file.WriteAsync(new byte[64], 0, default);
+            file.Flush();
+            identity = file.CaptureIdentity();
+        }
+        var extents = new ExtentSet();
+        extents.Add(new Vesper.Engine.ByteRange(0, 128));
+        var job = new DownloadJob
+        {
+            Kind = kind, SourceUrl = "https://example.com/file.bin", DestinationFolder = harness.Data,
+            PartialPath = partial, PartialIdentity = identity, FileName = "file.bin",
+            TotalBytes = 128, Extents = extents
+        };
+        using var session = new JobSession(harness.Engine, job);
+
+        RunOutcome result = await harness.Engine.FinalizeAsync(session, default);
+
+        Assert.Equal(JobState.NeedsAttention, result.State);
+        Assert.Equal("incomplete", result.Reason);
+        Assert.Equal(64, session.OpenFile(create: false).Length);
+        Assert.Null(job.FinalPath);
+    }
+
+    [Theory]
     [InlineData("W/\"revision\"", IdentityLevel.None)]
     [InlineData(null, IdentityLevel.LastModified)]
     [InlineData("\"revision\"", IdentityLevel.StrongEtag)]

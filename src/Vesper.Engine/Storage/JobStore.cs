@@ -70,6 +70,9 @@ public sealed class JobStore : IDisposable
         """,
         """
         ALTER TABLE jobs ADD COLUMN pending_conversion_identity TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN publication_copy_identity TEXT;
         """
     ];
 
@@ -297,7 +300,7 @@ public sealed class JobStore : IDisposable
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
         "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
         "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json", "published_sha256",
-        "partial_identity", "final_resource_identity", "published_file_identity", "pending_conversion_identity"
+        "partial_identity", "final_resource_identity", "published_file_identity", "pending_conversion_identity", "publication_copy_identity"
     ];
 
     private static readonly string UpsertSql =
@@ -437,6 +440,7 @@ public sealed class JobStore : IDisposable
         yield return ("pending_conversion_bytes", j.PendingConversionBytes);
         yield return ("pending_conversion_digest", j.PendingConversionDigest);
         yield return ("pending_conversion_identity", j.PendingConversionIdentity);
+        yield return ("publication_copy_identity", j.PublicationCopyIdentity);
         yield return ("published_sha256", j.PublishedSha256);
         yield return ("partial_identity", j.PartialIdentity);
         yield return ("final_resource_identity", j.FinalResourceIdentity);
@@ -476,6 +480,7 @@ public sealed class JobStore : IDisposable
             PendingConversionBytes = NInt("pending_conversion_bytes"),
             PendingConversionDigest = NStr("pending_conversion_digest"),
             PendingConversionIdentity = NStr("pending_conversion_identity"),
+            PublicationCopyIdentity = NStr("publication_copy_identity"),
             PublishedSha256 = NStr("published_sha256"),
             PartialIdentity = NStr("partial_identity"),
             FinalResourceIdentity = NStr("final_resource_identity"),

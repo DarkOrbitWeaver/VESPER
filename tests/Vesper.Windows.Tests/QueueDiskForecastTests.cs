@@ -39,6 +39,23 @@ public sealed class QueueDiskForecastTests
     }
 
     [Fact]
+    public void A_different_destination_drive_needs_space_for_the_whole_file()
+    {
+        JobSnapshot[] jobs = [new()
+        {
+            Kind = JobKind.Http, Output = MediaOutput.Original, State = JobState.Downloading,
+            PartialPath = "C:\\appdata\\partials\\file.vpart", Destination = "D:\\downloads",
+            TotalBytes = 1000, CommittedBytes = 600
+        }];
+
+        var volumes = QueueDiskForecast.Calculate(jobs, new Dictionary<string, long?>(), safetyReserveBytes: 100);
+
+        Assert.Equal(new[] { "C:\\", "D:\\" }, QueueDiskForecast.VolumeRoots(jobs));
+        Assert.Equal(500, Assert.Single(volumes, volume => volume.Root == "C:\\").RequiredBytes);
+        Assert.Equal(1100, Assert.Single(volumes, volume => volume.Root == "D:\\").RequiredBytes);
+    }
+
+    [Fact]
     public void Forecast_marks_only_volumes_below_the_known_requirement()
     {
         JobSnapshot[] jobs = [Job("C:\\downloads", 1000)];

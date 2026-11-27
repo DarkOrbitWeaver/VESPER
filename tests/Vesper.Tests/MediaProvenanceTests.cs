@@ -149,6 +149,7 @@ public sealed class MediaProvenanceTests
                     ALTER TABLE jobs DROP COLUMN published_file_identity;
                     ALTER TABLE jobs DROP COLUMN final_resource_identity;
                     ALTER TABLE jobs DROP COLUMN pending_conversion_identity;
+                    ALTER TABLE jobs DROP COLUMN publication_copy_identity;
                     ALTER TABLE jobs DROP COLUMN partial_identity;
                     ALTER TABLE jobs DROP COLUMN published_sha256;
                     ALTER TABLE jobs DROP COLUMN media_metadata_json;
@@ -173,7 +174,7 @@ public sealed class MediaProvenanceTests
             Assert.Equal(retained.PartialIdentity, roundTrip.PartialIdentity);
             Assert.Equal(retained.FinalResourceIdentity, roundTrip.FinalResourceIdentity);
             Assert.Equal(retained.PublishedFileIdentity, roundTrip.PublishedFileIdentity);
-            Assert.Equal(10, JobStore.SchemaVersion);
+            Assert.Equal(11, JobStore.SchemaVersion);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

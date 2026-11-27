@@ -93,6 +93,8 @@ public sealed partial class DownloadEngine
         folder = Path.TrimEndingDirectorySeparator(folder);
         try
         {
+            var staging = new DriveInfo(Path.GetPathRoot(PartialsFolder)!);
+            if (!staging.IsReady || staging.AvailableFreeSpace - Math.Max(0, Options.FreeSpaceReserve) < length) return null;
             var drive = new DriveInfo(Path.GetPathRoot(folder)!);
             return drive.IsReady && drive.AvailableFreeSpace - Math.Max(0, Options.FreeSpaceReserve) >= length ? folder : null;
         }

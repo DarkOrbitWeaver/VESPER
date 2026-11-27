@@ -17,7 +17,6 @@
   let pending = null, intentAt = 0;
   const intentWindow = 15_000;
   const clock = Date.now.bind(Date);
-  const SAFE_GENERATED_EXT = /\.(?:zip|7z|rar|tar|gz|tgz|xz|zst|png|jpe?g|webp|avif|svg|gif|txt|md|csv|json|xml|yaml|yml|sql|srt|vtt|epub|pdf|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|opus|m4a|flac|mkv)$/i;
 
   function recentIntent() { return intentAt > 0 && clock() - intentAt <= intentWindow; }
 
@@ -66,7 +65,7 @@
       return;
     }
 
-    if (!hasDownload || !name || name.length > 180 || !SAFE_GENERATED_EXT.test(name)) return;
+    if (!hasDownload || !name || name.length > 180) return;
 
     // Support data: URLs with explicit download filenames
     if (anchor.href.startsWith('data:') && anchor.href.length <= 5200) {

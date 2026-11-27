@@ -141,13 +141,14 @@ test('worker copy accepts a complete CDN body and rejects an unverified partial 
   }
 });
 
-test('an explicit data URL is copied without a response Content-Length', async () => {
+test('an explicit generated patch is copied without a response Content-Length', async () => {
   const b = bridge();
-  const url = 'data:text/plain;base64,SGVsbG8=';
-  const generated = body.automaticGeneratedFile({ url, fileName: 'message.txt', mime: 'text/plain' }, origin);
+  const url = 'data:text/x-diff;base64,SGVsbG8=';
+  const generated = body.automaticGeneratedFile({ url, fileName: 'fix.patch', mime: 'text/x-diff' }, origin);
   const result = await copy(b, { url, generated, fetcher: (address, options) => fetch(address, options) });
   assert.equal(result.offset, 5);
   assert.equal(b.messages[0].length, undefined);
+  assert.equal(b.messages[0].fileName, 'fix.patch');
   assert.equal(Buffer.concat(b.chunks).toString(), 'Hello');
 });
 

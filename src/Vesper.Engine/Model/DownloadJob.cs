@@ -95,6 +95,7 @@ public sealed class DownloadJob
     // The existing digest also records publication proof for original files.
     public string? PendingConversionDigest { get; set; }
     public string? PendingConversionIdentity { get; set; }
+    public string? PublicationCopyIdentity { get; set; }
     public string? PublishedSha256 { get; set; }
     /// <summary>Windows file identity captured when the published output was verified.</summary>
     public string? PublishedFileIdentity { get; set; }
@@ -197,6 +198,7 @@ public sealed class DownloadJob
         PendingConversionBytes = saved.PendingConversionBytes;
         PendingConversionDigest = saved.PendingConversionDigest;
         PendingConversionIdentity = saved.PendingConversionIdentity;
+        PublicationCopyIdentity = saved.PublicationCopyIdentity;
         PublishedSha256 = saved.PublishedSha256;
         PublishedFileIdentity = saved.PublishedFileIdentity;
         PartialIdentity = saved.PartialIdentity;

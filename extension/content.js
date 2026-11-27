@@ -382,7 +382,10 @@
         if (own) links.push({ href: new URL(own, origin).href, permalink: true });
       } catch { /* A malformed permalink attribute names nothing. */ }
       const page = VesperPlayerSource.cardPage(links, origin);
-      if (!page) continue;
+      if (!page) {
+        if (card.matches?.('article,[role="article"],[data-permalink]')) return null;
+        continue;
+      }
       visibleVideos.sort((a, b) => {
         const area = el => { const r = el.getBoundingClientRect(); return r.width * r.height * (el.paused ? 1 : 1.15); };
         return area(b) - area(a);
@@ -420,6 +423,9 @@
 
   function activatePreview(preview) {
     if (!preview || (preview.player === activePreview?.player && preview.key === activePreview?.key)) return false;
+    // The attached main player is not a hover preview of itself. Latching one
+    // moves the perch and arms the preview-exit timer on ordinary mouse moves.
+    if (!preview.watchLink && preview.player === video && video.readyState >= 1 && !previewMissing()) return false;
     if (activePreview && activePreview.key !== preview.key || panelMedia && panelMedia.targetKey !== preview.key)
       retainedPickerDraft = null;
     activePreview = preview;
@@ -565,7 +571,7 @@
     // Opening the picker is an explicit selection. Do not switch to a
     // larger or newly autoplaying neighbour until the picker closes.
     // Source-generation and navigation handlers still invalidate stale media.
-    if (panelMedia?.preview) isCurrentRequest(panelRequest);
+    if (panelMedia && (panelMedia.preview || !panelMedia.player?.isConnected)) isCurrentRequest(panelRequest);
     if (activePreview?.watchLink && !watchPreviewCurrent(activePreview)) activePreview = null;
     if (panelMedia && video === panelMedia.player) {
       place(continuous);
@@ -599,6 +605,8 @@
     if (best) setIntentCertainty(true);
     else {
       const candidates = [], players = new Map();
+      const socialFeed = VesperPlayerSource.isSocialFeedSite(pageAddress())
+        || /(?:^|\.)(?:x|twitter)\.com$/i.test(location.hostname || '');
       const now = Date.now();
       for (const el of nearby) {
         if (fullscreen && !containsPlayer(fullscreen, el)) continue;
@@ -611,7 +619,7 @@
         const id = evidenceKey(el);
         const binding = playback.get(el);
         const post = binding && VesperPlayerSource.identity(binding.page);
-        const feedPost = /^(?:tiktok|instagram|x):/.test(post || '');
+        const feedPost = socialFeed || /^(?:tiktok|instagram|x):/.test(post || '');
         candidates.push({ id, area, visibleFraction: fullArea > 0 ? area / fullArea : 0,
           playing: !el.paused && !el.ended, ready: el.readyState >= 1,
           progressed: el.currentTime > 1, controls: el.controls || anchor !== el, muted: el.muted,
@@ -1014,7 +1022,9 @@
     }
     protectedVideos.delete(player);
     if (!nearby.has(player) && player !== video && playback.get(player) === undefined) {
-      if (type === 'loadstart') consider(player);
+      // The first loadstart can be the only event before steady playback; the
+      // newly observed player must reach selection without waiting for scroll.
+      if (type === 'loadstart') { consider(player); refreshPlayer(player); }
       return;
     }
     const page = pageForPlayer(player);
@@ -1391,6 +1401,7 @@
         stopFullscreenIdle();
         perch = null;
         closePanel();
+        updateFlyVisibility();
         return;
       }
       const watchingFullscreen = Boolean(fullscreen) || fillsFullscreen(rect);

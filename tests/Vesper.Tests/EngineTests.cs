@@ -686,7 +686,47 @@ public class CrashRecoveryTests
         JobSnapshot done = await h.WaitForStateAsync(id, JobState.Completed, 30);
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.Single(h.Files(), f => f.EndsWith(".bin"));             // exactly one published copy
-        Assert.DoesNotContain(h.Files(), f => f.EndsWith(".vpart"));
+        Assert.False(File.Exists(done.PartialPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_crash_while_publishing_a_destination_copy_recovers_the_right_file(bool renamed)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var h = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        Guid id = h.Add("https://example.com/file.bin", "file.bin");
+        h.Engine.Dispose();
+
+        byte[] bytes = [1, 2, 3, 4];
+        string target = Path.Combine(h.Downloads, "file.bin");
+        string copy = Path.Combine(h.Downloads, $".vesper-{id:N}.tmp");
+        string partial;
+        using (var store = JobStore.Open(Path.Combine(h.Data, "vesper.db")))
+        {
+            DownloadJob job = Assert.Single(store.LoadAll());
+            partial = job.PartialPath;
+            File.WriteAllBytes(partial, bytes);
+            File.WriteAllBytes(copy, bytes);
+            using (var file = File.OpenRead(partial)) job.PartialIdentity = PathSafety.TemporaryFileIdentity(file.SafeFileHandle);
+            using (var file = File.OpenRead(copy)) job.PublicationCopyIdentity = PathSafety.TemporaryFileIdentity(file.SafeFileHandle);
+            job.Extents.Add(new ByteRange(0, bytes.Length));
+            job.State = JobState.Finalizing;
+            job.TotalBytes = bytes.Length;
+            job.PendingFinalPath = target;
+            job.PendingConversionDigest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
+            store.Save(job);
+        }
+        if (renamed) File.Move(copy, target);
+
+        h.Restart(tweak: options => options.MaxConcurrentJobs = 0);
+
+        Assert.Equal(renamed ? JobState.Completed : JobState.Queued, h.Engine.Snapshot(id)!.State);
+        Assert.False(File.Exists(copy));
+        Assert.Equal(renamed, File.Exists(target));
+        Assert.Equal(!renamed, File.Exists(partial));
+        Assert.Equal(bytes, File.ReadAllBytes(renamed ? target : partial));
     }
 
     [Fact]
@@ -827,8 +867,11 @@ public class CrashRecoveryTests
         Guid id = h.Add(server.Url("/expires-after-truncate"), "lost.bin");
         JobSnapshot stalled = await h.WaitForStateAsync(id, JobState.NeedsLink);
         Assert.Empty(Directory.GetFiles(h.Downloads));
+        Assert.Empty(Directory.GetDirectories(h.Downloads));
+        Assert.Equal(PartialFile.PrivateFolder(h.Data), Path.GetDirectoryName(stalled.PartialPath));
         h.Engine.Dispose();
-        Assert.True(RecoveryManifest.TryRecover(RecoveryManifest.PathFor(stalled.PartialPath), out DownloadJob manifest, out string problem), problem);
+        Assert.True(RecoveryManifest.TryRecover(RecoveryManifest.PathFor(stalled.PartialPath), out DownloadJob manifest, out string problem,
+            PartialFile.PrivateFolder(h.Data)), problem);
         Assert.Equal(h.Downloads, manifest.DestinationFolder);
 
         string database = Path.Combine(h.Data, "vesper.db");

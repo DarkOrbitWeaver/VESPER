@@ -16,6 +16,7 @@ const VERIFY_LIMIT = 5;
 const VERIFY_DEADLINE_MS = 20_000;
 const LOOKUP_HEDGE_MS = 450;
 const LOOKUP_REFUSALS = ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-expired', 'blocked', 'rate-limited', 'network'];
+const SOCIAL_LOOKUP_STOPS = new Set(['site-refused', 'sign-in', 'browser-context', 'blocked', 'protected', 'rate-limited', 'desktop-version-mismatch']);
 const MEDIA_BODY_REFUSALS = ['no-media', 'no-reusable-source', 'source-unavailable', 'browser-context', 'unavailable',
   'site-refused', 'source-changed', 'source-expired', 'sign-in', 'unsupported', 'network', 'timeout'];
 const mediaLookupOutcome = reply => reply?.ok ? 'ok' : [...MEDIA_BODY_REFUSALS, 'protected', 'blocked', 'rate-limited',
@@ -1517,7 +1518,7 @@ async function playerOptions(message, sender) {
       || identity.startsWith('dailymotion:')
       || identity.startsWith('youtube:')
       || identity.startsWith('bilibili:')
-      || identity.startsWith('instagram:') && /^\/reels?\//.test(page.pathname));
+      || identity.startsWith('instagram:') && ['reel', 'reels'].includes(VesperPlayerSource.instagramPost(page.pathname.split('/').filter(Boolean))?.kind));
     postBound = Boolean(singleVideo);
     const observedRange = matching && isRangedMediaCandidate(matching) && !isWholeDirectSource(matching);
     if (observedRange) possibleSources.unshift(matching);
@@ -1647,7 +1648,15 @@ async function playerOptions(message, sender) {
             .slice(0, VERIFY_LIMIT + 4), identity);
           const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints], tab, verificationScope,
             deadline: Date.now() + VERIFY_DEADLINE_MS };
-          const checked = await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options);
+          const checked = [];
+          if (socialSite) {
+            for (const candidate of ranked.slice(0, VERIFY_LIMIT)) {
+              if (Date.now() >= options.deadline) break;
+              const reply = await verifyObservedSource(candidate, options);
+              checked.push({ source: candidate, reply });
+              if (SOCIAL_LOOKUP_STOPS.has(reply?.code)) break;
+            }
+          } else checked.push(...await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options));
           return { pickerTitle, context, fingerprints, exactResources, ranked, options, checked };
         })();
         // A quick successful page answer may win before a speculative check finishes.
@@ -1659,7 +1668,7 @@ async function playerOptions(message, sender) {
     if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
       // Preserve the page's policy/identity verdict. If it is slow, overlap a
       // bounded exact-source check so a refusal does not cost two serial waits.
-      const hedge = bothRoutes && !formatLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+      const hedge = bothRoutes && !socialSite && !formatLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
       let reply;
       try { reply = await pageLookup(); }
       finally { if (hedge !== null) clearTimeout(hedge); }
@@ -1669,14 +1678,16 @@ async function playerOptions(message, sender) {
         // An exact observed player resource can be checked without the page
         // adapter. Do not retry policy/protection or uncertain identity failures.
         const exact = wholeRepresentation ? matching : matchedManifest;
-        if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
+        if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0
+            && !(socialSite && SOCIAL_LOOKUP_STOPS.has(reply.code))
+            && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
           const checked = forCurrentPlayer(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
           observedOutcomes = [mediaLookupOutcome(checked)];
           if (checked.ok && checked.data?.choices?.length) return checked;
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
         return browserFallback(reply);
-      } else if (reply.ok || !LOOKUP_REFUSALS.includes(reply.code)) {
+      } else if (reply.ok || socialSite && SOCIAL_LOOKUP_STOPS.has(reply.code) || !LOOKUP_REFUSALS.includes(reply.code)) {
         return reply;
       }
     }
@@ -1694,12 +1705,14 @@ async function playerOptions(message, sender) {
         || Number.isInteger(result.reply.data?.playbackMatches) && result.reply.data.playbackMatches > 0
           && result.reply.data.playbackMatches <= fingerprints.size);
       const needsMore = !checked.some(usableReply) || fingerprints.size > 0 && !checked.some(boundMatch);
-      if (needsMore && ranked.length > VERIFY_LIMIT && options.deadline - Date.now() >= 1000
+      if (!socialSite && needsMore && ranked.length > VERIFY_LIMIT && options.deadline - Date.now() >= 1000
           && !checked.some(result => ['protected', 'blocked', 'rate-limited', 'host-missing',
             'app-unavailable', 'host-error'].includes(result.reply?.code))) {
         checked.push(...await verifyObservedSources(ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4), options));
       }
       observedOutcomes = checked.slice(0, 8).map(result => mediaLookupOutcome(result.reply));
+      const socialRefusal = socialSite && checked.find(result => SOCIAL_LOOKUP_STOPS.has(result.reply?.code));
+      if (socialRefusal && !checked.some(usableReply)) return browserFallback(socialRefusal.reply);
       const association = VesperMediaEvidence.associate({
         sources: checked, player, currentUrl: source?.href || '',
         resources: [...resourceWitness], exactResources: [...exactResources], fragments: rankingFragments.map(fragment =>
@@ -1737,7 +1750,7 @@ async function playerOptions(message, sender) {
       lookupRun?.report({ route: 'verify-observed', outcome: 'failed' });
       // A witnessed stream can fail even when the exact post remains usable.
       const retryPost = socialSite ? singleVideo && !pageOutcome : lookupRun?.next().next?.route === 'adapter-lookup';
-      if (!socialFeed && trafficFirst && retryPost
+      if (!socialFeed && trafficFirst && retryPost && !socialRefusal
           && !checked.some(result => ['protected', 'blocked', 'rate-limited', 'desktop-version-mismatch'].includes(result.reply?.code))) {
         const reply = await pageLookup();
         await learnLookup(reply);

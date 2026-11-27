@@ -445,9 +445,18 @@
   function discardTrack(track) {
     totalRetainedBytes -= track.retainedBytes;
     track.initBytes = null;
+    track.initHasMedia = false;
     track.chunks = [];
     track.retainedBytes = 0;
     track.evicted = true;
+    track.awaitingEmpty = false;
+  }
+
+  function retainTrack(track) {
+    const previous = retainedMseOrder.indexOf(track);
+    if (previous >= 0) retainedMseOrder.splice(previous, 1);
+    if (retainedMseOrder.length >= 32) discardTrack(retainedMseOrder.shift());
+    retainedMseOrder.push(track);
   }
 
   function reserveMseBytes(track, count) {
@@ -537,20 +546,33 @@
         msState.tracks.add(track);
         sourceOwners.set(sb, track);
         for (const event of ['error', 'abort']) sb.addEventListener?.(event, () => discardTrack(track));
-        if (retainedMseOrder.length >= 32) discardTrack(retainedMseOrder.shift());
-        retainedMseOrder.push(track);
+        retainTrack(track);
       } catch {}
       return sb;
     });
 
-    for (const method of ['remove', 'changeType']) {
-      replace(SourceBuffer.prototype, method, original => function (...args) {
-        const result = apply(original, this, args);
-        const track = sourceOwners.get(this);
-        if (track) discardTrack(track);
-        return result;
-      });
-    }
+    replace(SourceBuffer.prototype, 'remove', original => function (start, end, ...rest) {
+      const result = apply(original, this, [start, end, ...rest]);
+      const track = sourceOwners.get(this);
+      if (track) {
+        discardTrack(track);
+        track.awaitingEmpty = start === 0 && end === Infinity;
+      }
+      return result;
+    });
+    replace(SourceBuffer.prototype, 'changeType', original => function (mimeType, ...rest) {
+      const result = apply(original, this, [mimeType, ...rest]);
+      const track = sourceOwners.get(this);
+      if (track) {
+        discardTrack(track);
+        track.awaitingEmpty = true;
+        if (typeof mimeType === 'string') {
+          track.mimeType = mimeType;
+          track.role = inferRole(mimeType);
+        }
+      }
+      return result;
+    });
     replace(MediaSource.prototype, 'removeSourceBuffer', original => function (buffer) {
       const result = apply(original, this, [buffer]);
       const track = sourceOwners.get(buffer);
@@ -563,9 +585,12 @@
     });
 
     replace(SourceBuffer.prototype, 'appendBuffer', original => function (data, ...rest) {
+      const track = sourceOwners.get(this);
+      let empty = false;
+      // changeType can leave old frames buffered. Those frames cannot prove a new copy is complete.
+      try { empty = track?.awaitingEmpty && this.buffered.length === 0; } catch {}
       const res = apply(original, this, [data, ...rest]);
       try {
-        const track = sourceOwners.get(this);
         if (!track) return res;
         const rawBytes = ArrayBuffer.isView(data)
           ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
@@ -582,6 +607,12 @@
           ? exact : matchBySample(sample);
         const inspected = inspectMediaBytes(rawBytes);
 
+        if (empty && inspected?.hasInit) {
+          track.awaitingEmpty = false;
+          track.evicted = false;
+          track.totalAppendedBytes = 0;
+          retainTrack(track);
+        }
         if (!track.evicted && track.totalAppendedBytes === 0 && inspected?.hasInit) {
           if (reserveMseBytes(track, rawBytes.byteLength)) {
             track.initBytes = rawBytes.slice();
@@ -659,8 +690,8 @@
     } catch {}
   }, true);
 
-  function coversPlayback(buffered, duration) {
-    return buffered?.length === 1 && buffered.start(0) <= 0.15 && buffered.end(0) >= duration - 0.15;
+  function coversPlayback(buffered, duration, tolerance = 0.15) {
+    return buffered?.length === 1 && buffered.start(0) <= 0.15 && buffered.end(0) >= duration - tolerance;
   }
 
   function activeBuffer(track) {
@@ -673,7 +704,9 @@
     const buffer = activeBuffer(track);
     return track.initBytes && !track.evicted && (track.initHasMedia || track.chunks.length > 0) && buffer && !buffer.updating
       && Number.isFinite(player.duration) && player.duration > 0
-      && coversPlayback(player.buffered, player.duration) && coversPlayback(buffer.buffered, player.duration);
+      && coversPlayback(player.buffered, player.duration)
+      // AAC audio tails end up to one priming/frame group short of the video.
+      && coversPlayback(buffer.buffered, player.duration, track.role === 'audio' ? 0.35 : 0.15);
   }
 
   // Rich provenance inspection for isolated content script

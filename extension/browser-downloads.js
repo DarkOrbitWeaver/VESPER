@@ -270,9 +270,10 @@ async function earlyDirectDownload(message, sender) {
       // With permission, check the same signed-in representation the click would see.
       // A guest file can look valid while containing different data.
       const archiveTarget = githubArchiveTarget(url);
+      const address = new URL(url);
       // Public source archives have a known CDN destination. Keep GitHub cookies out of this request.
       const allowCreds = !archiveTarget && page.protocol === 'https:' && await signInEnabled();
-      const credMode = allowCreds && new URL(url).origin === page.origin ? 'include' : 'omit';
+      const credMode = allowCreds && address.origin === page.origin ? 'include' : 'omit';
       const redirect = credMode === 'include' ? 'error' : 'follow';
       if (credMode === 'include' && await captureSiteDecision({ url, referrer: page.href }, true) !== 'allowed')
         return fallback('site-policy');
@@ -281,11 +282,13 @@ async function earlyDirectDownload(message, sender) {
       const timeout = setTimeout(() => controller.abort(), 3500);
       let response, signedItems = null;
       try {
-        response = await fetch(url, { method: 'HEAD', credentials: credMode, redirect,
-          cache: 'no-store', signal: controller.signal });
-        // Presigned S3 / R2 / GCS GET-only URLs return 403/400 on HEAD; many servers return 405/501.
-        if ([400, 401, 403, 404, 405, 501].includes(response.status)) {
-          await response.body?.cancel?.().catch(() => {});
+        // Presigned file links can be valid only for GET.
+        if (!VesperEarlyDownload.signedDownload(address)) {
+          response = await fetch(url, { method: 'HEAD', credentials: credMode, redirect,
+            cache: 'no-store', signal: controller.signal });
+        }
+        if (!response || [405, 501].includes(response.status)) {
+          await response?.body?.cancel?.().catch(() => {});
           response = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, credentials: credMode, redirect,
             cache: 'no-store', signal: controller.signal });
         }
@@ -301,11 +304,11 @@ async function earlyDirectDownload(message, sender) {
         if (enriched.authorized) signedItems = enriched.items;
       }
       const mime = mimeType(response.headers.get('content-type'));
-      const attachment = /^attachment\b/i.test(response.headers.get('content-disposition') || '');
-      const explicitName = VesperEarlyDownload.explicitName(url, page.href, message.downloadName);
-      const explicitlyNamed = !!explicitName;
-      const documentAttachment = (explicitlyNamed || attachment)
-        && /^(?:application\/pdf|text\/(?:plain|markdown|csv)|application\/(?:json|vnd\.openxmlformats-officedocument\.[a-z.]+|vnd\.oasis\.opendocument\.[a-z-]+|epub\+zip|x-bittorrent))$/.test(mime || '');
+      const disposition = response.headers.get('content-disposition') || '';
+      const attachment = /^\s*attachment\s*(?:;|$)/i.test(disposition);
+      const explicitName = VesperEarlyDownload.explicitName(address, page, message.downloadName);
+      const html = mime === 'text/html' || mime === 'application/xhtml+xml';
+      const namedHtml = /\.(?:html?|xhtml)$/i.test(explicitName || '') && attachment;
       const binary = /^(?:video\/|audio\/|application\/(?:octet-stream|zip|x-zip-compressed|x-7z-compressed|x-rar-compressed|vnd\.rar|gzip|x-gzip|x-msdownload|x-msi|x-msdos-program|vnd\.android\.package-archive|x-iso9660-image|x-apple-diskimage|vnd\.debian\.binary-package|x-rpm|x-tar|x-xz|x-bzip2|zstd))/.test(mime || '');
       const lengthText = rangeTotal || response.headers.get('content-length') || '';
       const length = /^\d+$/.test(lengthText) ? Number(lengthText) : undefined;
@@ -320,8 +323,7 @@ async function earlyDirectDownload(message, sender) {
       if (!statusOk || !final || final.username || final.password
           || credMode === 'include' && (response.redirected || final.origin !== page.origin)
           || final.protocol !== 'https:' && final.origin !== page.origin
-          || !mime || !documentAttachment && (mime.startsWith('text/') || mime === 'application/xhtml+xml' || mime === 'application/json')
-          || (!attachment && !binary && !documentAttachment)
+          || html && !namedHtml || (!attachment && explicitName === null && !binary)
           || (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0)
           || (!strongEtag && !lastModified && !useAttachmentLength)
           || encoding && encoding.toLowerCase() !== 'identity') return fallback('response-unverified');
@@ -329,7 +331,7 @@ async function earlyDirectDownload(message, sender) {
         return chromeFallback;
       const proof = {
         ...(length === undefined ? {} : { length }),
-        contentType: mime,
+        ...(mime ? { contentType: mime } : {}),
         attachment,
         ...(acceptsRanges ? { acceptsRanges: true } : {}),
         ...(strongEtag ? { etag: strongEtag, basis: 'etag' }
@@ -339,7 +341,6 @@ async function earlyDirectDownload(message, sender) {
       const items = signedItems || [{ url: final.href, originalUrl: url,
         ...(message.omitReferrer ? {} : { referer: page.href }), userAgent: navigator.userAgent }];
       // A server-specified attachment filename wins over the HTML download name.
-      const disposition = response.headers.get('content-disposition') || '';
       if (explicitName && !/;\s*filename\*?\s*=/i.test(disposition)) items[0].fileName = explicitName;
       const request = envelope(signedItems ? 'browser-submit' : 'browser-capture', { mode: 'download', authorized: !!signedItems, browserProof: proof, items });
       transferId = request.id;

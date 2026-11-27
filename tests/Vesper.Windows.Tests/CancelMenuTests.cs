@@ -60,14 +60,15 @@ public sealed class CancelMenuTests
         failure?.Throw();
     }
     [Fact]
-    public void SelectionToolbarUsesCancelForUnfinishedAndRemoveForCompleted()
+    public void SelectionToolbarCanRemoveCompletedRowsFromAMixedSelection()
     {
         ExceptionDispatchInfo? failure = null;
         var thread = new Thread(() =>
         {
             try
             {
-                using var form = new Form1();
+                var preferences = new VesperPreferences();
+                using var form = new Form1(preferences, null, false);
                 var grid = (DownloadGrid)typeof(Form1)
                     .GetField("_grid", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
                 var remove = (Control)typeof(Form1)
@@ -81,6 +82,16 @@ public sealed class CancelMenuTests
                 {
                     Id = Guid.NewGuid(), FileName = "done.zip", State = JobState.Completed
                 });
+                DownloadItem missing = DownloadItem.From(new JobSnapshot
+                {
+                    Id = Guid.NewGuid(), FileName = "missing.zip", State = JobState.Completed, FileMissing = true
+                });
+                form.LoadPreviewRows([unfinished, completed, missing]);
+                Assert.Equal(2, grid.VisibleItems.Count);
+                Assert.DoesNotContain(missing, grid.VisibleItems);
+                preferences.ShowMissingCompleted = true;
+                form.LoadPreviewRows([unfinished, completed, missing]);
+                Assert.Contains(missing, grid.VisibleItems);
 
                 grid.SetItems([unfinished]);
                 grid.CheckAllVisible();
@@ -96,7 +107,8 @@ public sealed class CancelMenuTests
                 grid.ClearChecks();
                 grid.SetItems([unfinished, completed]);
                 grid.CheckAllVisible();
-                Assert.False(remove.Enabled);
+                Assert.True(remove.Enabled);
+                Assert.Equal("Remove", remove.Text);
             }
             catch (Exception error) { failure = ExceptionDispatchInfo.Capture(error); }
         }) { IsBackground = true };

@@ -14,6 +14,7 @@ namespace Vesper.Engine;
 public sealed partial class DownloadEngine : IDisposable
 {
     public EngineOptions Options { get; }
+    internal string PartialsFolder { get; }
     internal RateLimiter GlobalLimiter { get; } = new();
     private readonly SegmentBufferLimiter _segmentBuffers = new();
 
@@ -58,6 +59,7 @@ public sealed partial class DownloadEngine : IDisposable
     {
         Options = options;
         Directory.CreateDirectory(options.DataDirectory);
+        PartialsFolder = PartialFile.PrivateFolder(options.DataDirectory);
         JobStore store = JobStore.Open(Path.Combine(options.DataDirectory, "vesper.db"));
         HttpTransport? http = null;
         try
@@ -659,6 +661,7 @@ public sealed partial class DownloadEngine : IDisposable
         && current.PendingConversionBytes == expected.PendingConversionBytes
         && current.PendingConversionDigest == expected.PendingConversionDigest
         && current.PendingConversionIdentity == expected.PendingConversionIdentity
+        && current.PublicationCopyIdentity == expected.PublicationCopyIdentity
         && current.RetryCount == expected.RetryCount && current.NextRetryUtc == expected.NextRetryUtc;
 
     private void OnNetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs e)

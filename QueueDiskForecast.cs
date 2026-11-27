@@ -25,7 +25,7 @@ internal static class QueueDiskForecast
 
     public static string[] VolumeRoots(IEnumerable<JobSnapshot> jobs) => jobs
         .Where(IsPending)
-        .Select(job => Root(job.Destination))
+        .SelectMany(job => new[] { Root(job.PartialPath), Root(job.Destination) })
         .Where(root => root is not null)
         .Select(root => root!)
         .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -57,17 +57,13 @@ internal static class QueueDiskForecast
         var totals = new Dictionary<string, Totals>(StringComparer.OrdinalIgnoreCase);
         foreach (JobSnapshot job in jobs.Where(IsPending))
         {
-            string root = Root(job.Destination) ?? "Unknown location";
-            if (!totals.TryGetValue(root, out Totals? total)) totals[root] = total = new Totals();
-
-            if (CanEstimate(job))
-            {
-                long totalBytes = job.TotalBytes!.Value;
-                long committedBytes = Math.Clamp(job.CommittedBytes, 0, totalBytes);
-                long remaining = totalBytes - committedBytes;
-                total.KnownRemainingBytes = AddSaturated(total.KnownRemainingBytes, remaining);
-            }
-            else total.UnknownJobs++;
+            string? destination = Root(job.Destination);
+            string staging = Root(job.PartialPath) ?? destination ?? "Unknown location";
+            long? size = CanEstimate(job) ? job.TotalBytes : null;
+            long? remaining = size is long length ? length - Math.Clamp(job.CommittedBytes, 0, length) : null;
+            AddEstimate(totals, staging, remaining);
+            if (destination is not null && !destination.Equals(staging, StringComparison.OrdinalIgnoreCase))
+                AddEstimate(totals, destination, size);
         }
 
         var result = new List<DiskForecastVolume>(totals.Count);
@@ -79,6 +75,13 @@ internal static class QueueDiskForecast
             result.Add(new DiskForecastVolume(root, total.KnownRemainingBytes, reserve, required, total.UnknownJobs, free));
         }
         return result;
+    }
+
+    private static void AddEstimate(Dictionary<string, Totals> totals, string root, long? bytes)
+    {
+        if (!totals.TryGetValue(root, out Totals? total)) totals[root] = total = new Totals();
+        if (bytes is long known) total.KnownRemainingBytes = AddSaturated(total.KnownRemainingBytes, known);
+        else total.UnknownJobs++;
     }
 
     public static string Summary(IReadOnlyList<DiskForecastVolume> volumes)

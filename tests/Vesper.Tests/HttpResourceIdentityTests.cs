@@ -74,7 +74,7 @@ public sealed class HttpResourceIdentityTests
                 connection.Open();
                 using SqliteCommand command = connection.CreateCommand();
                 command.CommandText = $"ALTER TABLE jobs DROP COLUMN pending_conversion_identity; " +
-                    $"PRAGMA user_version = {JobStore.SchemaVersion - 1};";
+                    $"ALTER TABLE jobs DROP COLUMN publication_copy_identity; PRAGMA user_version = {JobStore.SchemaVersion - 2};";
                 command.ExecuteNonQuery();
             }
 
@@ -83,6 +83,7 @@ public sealed class HttpResourceIdentityTests
             Assert.Equal(job.FinalResourceIdentity, restored.FinalResourceIdentity);
             Assert.Equal(job.PublishedFileIdentity, restored.PublishedFileIdentity);
             Assert.Null(restored.PendingConversionIdentity);
+            Assert.Null(restored.PublicationCopyIdentity);
             Assert.Equal(job.Id, restored.Id);
             Assert.Equal(job.SourceUrl, restored.SourceUrl);
             Assert.Equal(job.Extents.Serialize(), restored.Extents.Serialize());

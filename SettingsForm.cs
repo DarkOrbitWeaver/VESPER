@@ -293,8 +293,8 @@ internal sealed class SettingsForm : VesperPopupForm
         templateInput.TextChanged += (_, _) => UpdateTemplatePreview();
         UpdateTemplatePreview();
         var separator3 = Divider(444);
-        var missing = Check("Hide missing completed files", 25, 461, _draft.HideMissingCompleted, v => _draft.HideMissingCompleted = v);
-        var missingNote = Label("Only completed records are hidden. Paused and recoverable entries stay visible.", 8, muted: true);
+        var missing = Check("Show completed downloads whose files are missing", 25, 461, _draft.ShowMissingCompleted, v => _draft.ShowMissingCompleted = v);
+        var missingNote = Label("Paused and recoverable downloads are always shown.", 8, muted: true);
         missingNote.SetBounds(45, 490, 470, 37);
         var separator4 = Divider(535);
         var notify = Check("Notify me when downloads finish or need attention", 25, 547, _draft.NotifyOnFinish, v => _draft.NotifyOnFinish = v);

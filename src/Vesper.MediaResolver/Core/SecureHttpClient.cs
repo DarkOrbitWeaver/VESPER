@@ -235,6 +235,9 @@ public sealed class SecureHttpClient : IDisposable
             using var head = await SendAsync(HttpMethod.Head, url, ctx, ct, null).ConfigureAwait(false);
             var r = ToProbe(head, url);
             if (r.IsSuccess && r.ContentType is not null) return r;
+            // Only a missing HEAD implementation (or incomplete successful
+            // metadata) justifies a second request. A refusal is the verdict.
+            if (!r.IsSuccess && r.StatusCode is not (405 or 501)) return r;
         }
         catch (MediaResolverException ex) when (ex.Error.Code == MediaErrorCode.NetworkFailure) { /* fall back to ranged GET */ }
 

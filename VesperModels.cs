@@ -203,7 +203,7 @@ internal sealed class VesperPreferences
     public Density Density { get; set; } = Density.Compact;
     public MotionChoice Motion { get; set; } = MotionChoice.Subtle;
     public bool Botanical { get; set; } = true; // New installs start with the illustrated header.
-    public bool HideMissingCompleted { get; set; }
+    public bool ShowMissingCompleted { get; set; }
     public bool CategoryFolders { get; set; }
     public string DefaultFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
     public string FileNameTemplate { get; set; } = "";

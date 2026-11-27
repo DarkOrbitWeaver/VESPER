@@ -64,8 +64,7 @@ globalThis.VesperBrowserBody = (() => {
     const { url, fileName, size, mime } = proposal || {};
     const validUrl = localBlob(url, origin) || dataUrl(url);
     if (!validUrl || (size !== undefined && (!Number.isSafeInteger(size) || size <= 0 || size > MAX_BYTES))
-        || typeof fileName !== 'string' || safeName(fileName) !== fileName || fileName.length > 180
-        || !/\.(?:zip|7z|rar|tar|gz|tgz|xz|zst|png|jpe?g|webp|avif|svg|gif|txt|md|csv|json|xml|yaml|yml|sql|srt|vtt|epub|pdf|docx|xlsx|pptx|mp4|webm|mp3|wav|ogg|opus|m4a|flac|mkv)$/i.test(fileName)
+        || typeof fileName !== 'string' || !fileName || safeName(fileName) !== fileName || fileName.length > 180
         || typeof mime !== 'string' || /(?:javascript|executable|x-msdownload|x-msi|x-sh|x-bat)/i.test(mime))
       return null;
     return { url, fileName, expectedLength: Number.isSafeInteger(size) && size > 0 ? size : null, automatic: true };

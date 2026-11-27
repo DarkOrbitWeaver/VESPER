@@ -291,11 +291,12 @@ public static class PathSafety
     internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity, out string error)
         => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null);
 
-    internal static bool TryPublishTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity, out string error)
-        => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null, publish: true);
+    internal static bool TryPublishTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity,
+        string stagingFolder, out string error)
+        => TryMoveTemporaryFile(sourcePath, targetPath, expectedSourceIdentity, out error, duringMove: null, stagingFolder: stagingFolder);
 
     internal static bool TryMoveTemporaryFile(string sourcePath, string targetPath, string? expectedSourceIdentity,
-        out string error, Action? duringMove, bool publish = false)
+        out string error, Action? duringMove, string? stagingFolder = null)
     {
         error = "";
         if (!OperatingSystem.IsWindows())
@@ -317,7 +318,9 @@ public static class PathSafety
         string targetName = Path.GetFileName(target);
         bool sameDirectory = string.Equals(sourceDirectory, targetDirectory, StringComparison.OrdinalIgnoreCase);
         if (sourceDirectory is null || targetDirectory is null
-            || (!sameDirectory && (!publish || !PartialFile.IsStagingFolder(sourceDirectory, targetDirectory)))
+            || (!sameDirectory && (stagingFolder is null
+                || (!string.Equals(sourceDirectory, stagingFolder, StringComparison.OrdinalIgnoreCase)
+                    && !PartialFile.IsStagingFolder(sourceDirectory, targetDirectory))))
             || sourceName.Length == 0 || targetName.Length == 0
             || sourceName.Contains(':') || targetName.Contains(':'))
         {
@@ -475,6 +478,17 @@ public static class PathSafety
             throw new IOException("This drive did not provide a stable temporary file ID.");
         long created = File.GetCreationTimeUtc(handle).Ticks;
         return $"{id.Volume:X16}{id.IdHigh:X16}{id.IdLow:X16}{created:X16}";
+    }
+
+    internal static bool IsOnSameVolume(SafeFileHandle file, string folder)
+    {
+        using SafeFileHandle directory = OpenTemporaryDirectoryHandle(folder);
+        const int fileIdInfo = 18;
+        int size = Marshal.SizeOf<FileIdentity>();
+        if (!GetFileInformationByHandleEx(file, fileIdInfo, out FileIdentity source, size)
+            || !GetFileInformationByHandleEx(directory, fileIdInfo, out FileIdentity target, size))
+            throw new IOException("The download volume could not be identified.");
+        return source.Volume == target.Volume;
     }
 
     internal static bool SameFileId(string? expected, string? actual) =>

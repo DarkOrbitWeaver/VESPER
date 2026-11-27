@@ -34,7 +34,7 @@
 
   document.addEventListener('vesper-early-download-request', event => {
     // Page-authored events are only proposals. Independently verify a recent,
-    // one-shot trusted gesture and an explicit downloadable binary filename.
+    // one-shot trusted gesture and a supported download link.
     if (!canIntercept() || pendingUrl || !event.cancelable || !intentAt || Date.now() - intentAt > 15_000
         || typeof event.detail !== 'string' || event.detail.length > 6000) return;
     let proposal;

@@ -96,17 +96,19 @@ public class SiteAdapterTests
             + JsonSerializer.Serialize(data) + "</script></html>";
     }
 
-    [Fact]
-    public async Task Instagram_UsesEmbeddedWholeObjectChoicesThroughSharedValidation()
+    [Theory]
+    [InlineData(InstagramPage)]
+    [InlineData("https://www.instagram.com/fixture.user/reel/FixtureCode/")]
+    public async Task Instagram_UsesEmbeddedWholeObjectChoicesThroughSharedValidation(string page)
     {
         const string first = "https://scontent.cdninstagram.com/video-720.mp4?token=short";
         const string second = "https://scontent.cdninstagram.com/video-1080.mp4?token=short";
         var h = new FakeHttpHandler()
-            .Add(InstagramPage, InstagramEmbeddedPage(first, second))
+            .Add(page, InstagramEmbeddedPage(first, second))
             .AddMedia(first, "video/mp4", 7200)
             .AddMedia(second, "video/mp4", 10800);
 
-        MediaDiscoveryResult result = await Resolve(h, InstagramPage);
+        MediaDiscoveryResult result = await Resolve(h, page);
 
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal("instagram", result.Item!.Provider);

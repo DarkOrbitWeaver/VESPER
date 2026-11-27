@@ -48,6 +48,53 @@ test('player visibility checks rendered containers and falls back safely on olde
   assert.equal(rendered({ style: { visibility: 'hidden' } }), false);
 });
 
+test('a photo sibling cannot lend its post identity to a video with no own permalink', () => {
+  const content = source('content');
+  const start = content.indexOf('  function cardLinks(');
+  const end = content.indexOf('  function cardPreview(', start);
+  assert.ok(start >= 0 && end > start);
+  class Node {
+    constructor(tagName, parent = null, href = null) {
+      this.tagName = tagName;
+      this.nodeType = 1;
+      this.parentElement = parent;
+      this.children = [];
+      this.href = href;
+      this.isConnected = true;
+      parent?.children.push(this);
+    }
+    contains(node) { for (; node; node = node.parentElement) if (node === this) return true; return false; }
+    getRootNode() { return { host: null }; }
+    getAttribute() { return null; }
+    hasAttribute() { return false; }
+    matches(selector) { return selector.includes('article') && this.tagName === 'ARTICLE'; }
+    getBoundingClientRect() { return { left: 0, top: 0, right: 300, bottom: 300, width: 300, height: 300 }; }
+  }
+  const body = new Node('BODY'), feed = new Node('MAIN', body);
+  const videoCard = new Node('ARTICLE', feed), video = new Node('VIDEO', videoCard);
+  const photoCard = new Node('ARTICLE', feed);
+  new Node('A', photoCard, 'https://www.instagram.com/reel/photo-post/');
+  const context = vm.createContext({
+    URL,
+    Element: Node, nearby: new Set([video]), location: { origin: 'https://www.instagram.com' },
+    document: { body, documentElement: body, createTreeWalker(root) {
+      const nodes = [];
+      const visit = node => { for (const child of node.children) { nodes.push(child); visit(child); } };
+      visit(root);
+      return { nextNode: () => nodes.shift() || null };
+    } },
+    composedParent: node => node.parentElement, containsPlayer: (parent, child) => parent.contains(child),
+    clippedPlayerRect: rect => rect, renderedPlayerBox: () => true
+  });
+  vm.runInContext(source('player-source'), context);
+  const cardPage = vm.runInContext(content.slice(start, end) + '\ncardPage;', context);
+  assert.equal(cardPage(video), null, 'a photo post outside the video card cannot bind its player');
+  const own = new Node('A', videoCard, 'https://www.instagram.com/reel/video-post/');
+  assert.equal(cardPage(video), own.href);
+  own.href = 'https://www.instagram.com/reel/next-video/';
+  assert.equal(cardPage(video), own.href, 'a recycled card must use its current post');
+});
+
 test('only an explicit current picker survives a video opacity transition', () => {
   const content = source('content');
   const start = content.indexOf('  function pickerTransitionRect(');
@@ -526,6 +573,7 @@ test('opening the picker pins the chosen feed player despite a larger autoplayin
     visiblePlayer = player => player === selected ? {left:0,top:0,right:300,bottom:300} : {left:0,top:0,right:800,bottom:800};
     cardPreview = () => { throw Error('Overlay interaction searched a different card'); };
     updateFlyVisibility = () => {};
+    isCurrentRequest = () => true;
     selectPlayer();
     onPointer({target:overlay,clientX:10,clientY:10,composedPath:()=>[overlay]});
     panelMedia = null;
@@ -562,7 +610,7 @@ test('a temporary layout gap keeps the live overlay and rearms only after the pl
   const timers = [];
   const player = { isConnected: true, getBoundingClientRect: () => rect };
   const context = vm.createContext({
-    alive: () => true, video: player, manualPlayer: null, host: { isConnected: false },
+    alive: () => true, video: player, manualPlayer: null, panelMedia: null, host: { isConnected: false },
     mount() { context.host.isConnected = true; }, fullscreenTarget: () => null, fullscreenPlayer: false,
     holdMissingPreview: () => false, visiblePlayer: () => rendered ? rect : null, pickerTransitionRect: () => null,
     clippedPlayerRect: () => onScreen ? rect : null, playerAnchor: p => p,

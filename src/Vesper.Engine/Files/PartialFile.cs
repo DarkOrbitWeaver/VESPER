@@ -21,23 +21,12 @@ internal sealed class PartialFile : IDisposable
     internal static bool IsStagingFolder(string folder, string destination) =>
         string.Equals(folder, StagingFolder(destination), StringComparison.OrdinalIgnoreCase);
 
-    internal static string PrepareStagingFolder(string destination)
+    internal static string PrivateFolder(string dataDirectory) => System.IO.Path.Combine(System.IO.Path.GetFullPath(dataDirectory), "partials");
+
+    internal static void PreparePrivateFolder(string folder)
     {
-        string folder = StagingFolder(destination);
-        try
-        {
-            bool existed = Directory.Exists(folder);
-            DirectoryInfo staging = Directory.CreateDirectory(folder);
-            if (!PathSafety.TryCheckUnlinkedDirectory(folder, out _)) return destination;
-            if (!existed && OperatingSystem.IsWindows())
-                staging.Attributes |= FileAttributes.Hidden;
-            return folder;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // Some folders let users write files but not create subfolders.
-            return destination;
-        }
+        Directory.CreateDirectory(folder);
+        if (!PathSafety.TryCheckUnlinkedDirectory(folder, out string error)) throw new IOException(error);
     }
 
     private readonly SafeFileHandle _handle;

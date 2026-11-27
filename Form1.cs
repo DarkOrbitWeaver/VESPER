@@ -193,7 +193,7 @@ public partial class Form1 : Form
     private bool _diskProbeRunning;
 
     // Engine events arrive on worker threads. They are coalesced into one posted UI callback at a time.
-    private readonly Dictionary<Guid, JobSnapshot> _inbox = [];
+    private readonly Dictionary<Guid, JobSnapshot?> _inbox = [];
     private readonly object _inboxLock = new();
     private bool _inboxQueued;
 
@@ -298,12 +298,7 @@ public partial class Form1 : Form
         engine.JobRemoved += id =>
         {
             MediaSourceRescue.ForgetAutomaticAttempt(id);
-            PostToUi(() =>
-            {
-                if (_items.Remove(id)) InvalidateSortedFilterItems();
-                _grid.PruneChecks(_items.Keys);
-                RefreshList();
-            });
+            EnqueueUpdate(id, null);
         };
         engine.ActivityChanged += active => PostToUi(() => EngineHost.HoldAwake(active && _prefs.PreventSleep));
 
@@ -409,13 +404,16 @@ public partial class Form1 : Form
             _browserHandler?.SendBrowserCommand(profile, file.Id, action);
     }
 
-    private void Enqueue(JobSnapshot snapshot)
+    private void Enqueue(JobSnapshot snapshot) => EnqueueUpdate(snapshot.Id, snapshot);
+
+    private void EnqueueUpdate(Guid id, JobSnapshot? snapshot)
     {
         bool post;
         lock (_inboxLock)
         {
-            if (IsUnfinishedQueueWork(snapshot)) _unfinishedWorkArrived = true;
-            _inbox[snapshot.Id] = snapshot;
+            if (snapshot is not null && IsUnfinishedQueueWork(snapshot)) _unfinishedWorkArrived = true;
+            if (snapshot is null || !_inbox.TryGetValue(id, out JobSnapshot? pending) || pending is not null)
+                _inbox[id] = snapshot;
             post = !_inboxQueued;
             _inboxQueued = true;
         }
@@ -424,11 +422,11 @@ public partial class Form1 : Form
 
     private void DrainInbox()
     {
-        List<JobSnapshot> batch;
+        KeyValuePair<Guid, JobSnapshot?>[] batch;
         bool unfinishedWorkArrived;
         lock (_inboxLock)
         {
-            batch = [.. _inbox.Values];
+            batch = [.. _inbox];
             _inbox.Clear();
             _inboxQueued = false;
             unfinishedWorkArrived = _unfinishedWorkArrived;
@@ -441,16 +439,16 @@ public partial class Form1 : Form
         string searchTerm = _search.Text.Trim();
         bool sortBySize = _sort.SelectedText == "Size";
         bool structural = false;
+        bool removedRows = false;
         var queueTerminations = new List<JobSnapshot>();
-        foreach (JobSnapshot snapshot in batch)
+        foreach (var (id, snapshot) in batch)
         {
-            if (snapshot.IsUnacceptedBrowserCapture)
+            if (snapshot is null || snapshot.IsUnacceptedBrowserCapture)
             {
-                if (_items.Remove(snapshot.Id))
+                if (_items.Remove(id))
                 {
                     InvalidateSortedFilterItems();
-                    _grid.PruneChecks(_items.Keys);
-                    structural = true;
+                    removedRows = true;
                 }
                 continue;
             }
@@ -481,8 +479,9 @@ public partial class Form1 : Form
                 structural = true;
             }
         }
-        if (structural) RefreshList();
-        else { _grid.RefreshRows(batch, static row => row.Id); UpdateFooter(); }
+        if (removedRows) _grid.PruneChecks(_items.Keys);
+        if (structural || removedRows) RefreshList();
+        else { _grid.RefreshRows(batch, static row => row.Key); UpdateFooter(); }
         if (!cancelledCompletionPrompt && queueTerminations.Count > 0) HandleQueueFinished(queueTerminations);
     }
 
@@ -1190,15 +1189,15 @@ public partial class Form1 : Form
         List<JobSnapshot> selected = CheckedSnapshots();
         if (selected.Count == 0) return;
 
-        if (selected.All(CanCancel))
+        List<JobSnapshot> completed = selected.FindAll(s => s.State == JobState.Completed);
+        if (completed.Count > 0)
+        {
+            _actions.Remove(completed);
+        }
+        else if (selected.Count == _grid.CheckedCount && selected.All(CanCancel))
         {
             await _actions.CancelAsync(selected);
         }
-        else if (selected.All(s => s.State == JobState.Completed))
-        {
-            _actions.Remove(selected);
-        }
-        // Mixed selections never combine data deletion with history-only removal.
     }
 
     private void LayoutMast()
@@ -1352,7 +1351,7 @@ public partial class Form1 : Form
     {
         string order = _sort.SelectedText;
         string filter = _filter.SelectedText;
-        bool hideMissing = _prefs.HideMissingCompleted;
+        bool hideMissing = !_prefs.ShowMissingCompleted;
         if (_sortedFilterItems is not null && _sortedFilterOrder == order
             && _sortedFilterMode == filter && _sortedFilterHidesMissing == hideMissing)
             return _sortedFilterItems;
@@ -1394,7 +1393,11 @@ public partial class Form1 : Form
         if (active > 0) parts.Add($"{active} downloading");
         if (queued > 0) parts.Add($"{queued} queued");
         if (attention > 0) parts.Add($"{attention} need attention");
-        if (parts.Count == 0 && _items.Count > 0) parts.Add($"{_items.Count} download{(_items.Count == 1 ? "" : "s")}");
+        if (parts.Count == 0)
+        {
+            int count = _prefs.ShowMissingCompleted ? _items.Count : _items.Values.Count(r => r.Status != JobStatus.Missing);
+            if (count > 0) parts.Add($"{count} download{(count == 1 ? "" : "s")}");
+        }
         if (speed > 0) parts.Add("↓ " + Formatting.Rate(speed));
 
         JobSnapshot[] pending = _items.Values.Select(item => item.Snapshot).OfType<JobSnapshot>()
@@ -1473,10 +1476,9 @@ public partial class Form1 : Form
         JobSnapshot[] native = [.. selected.Where(r => r.Snapshot is not null).Select(r => r.Snapshot!)];
         bool allNative = native.Length == count && count > 0;
         bool onlyUnfinished = allNative && native.All(CanCancel);
-        bool onlyCompleted = allNative && native.All(s => s.State == JobState.Completed);
         _remove.Text = onlyUnfinished ? "Cancel" : "Remove";
         _remove.Symbol = onlyUnfinished ? VesperIcon.Close : VesperIcon.RemoveList;
-        _remove.Enabled = onlyUnfinished || onlyCompleted;
+        _remove.Enabled = onlyUnfinished || native.Any(s => s.State == JobState.Completed);
         LayoutSelectionToolbar();
     }
 
@@ -1817,7 +1819,7 @@ public partial class Form1 : Form
     internal static void CopyPreferences(VesperPreferences from, VesperPreferences to)
     {
         to.Theme = from.Theme; to.Density = from.Density; to.Motion = from.Motion; to.Botanical = from.Botanical;
-        to.HideMissingCompleted = from.HideMissingCompleted; to.CategoryFolders = from.CategoryFolders; to.DefaultFolder = from.DefaultFolder;
+        to.ShowMissingCompleted = from.ShowMissingCompleted; to.CategoryFolders = from.CategoryFolders; to.DefaultFolder = from.DefaultFolder;
         to.FileNameTemplate = from.FileNameTemplate;
         to.SiteRules = SiteRule.Normalize(from.SiteRules);
         to.ConcurrentTransfers = from.ConcurrentTransfers; to.GlobalRateLimitKbs = from.GlobalRateLimitKbs;

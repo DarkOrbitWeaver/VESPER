@@ -627,30 +627,28 @@ function singleVideoPlayer(app, page) {
   };
 }
 
-test('slow page refusal overlaps exact-source verification but retains the page policy verdict', async () => {
+test('a slow social page verdict is read before any CDN lookup', async () => {
   for (const code of ['no-media', 'protected']) {
-    let finishPage, observedStarted;
-    const started = new Promise(resolve => { observedStarted = resolve; });
+    let finishPage;
     const app = load({
       'media-options': () => new Promise(resolve => { finishPage = resolve; }),
-      'media-source-options': () => { observedStarted(); return checkedSource(15); }
+      'media-source-options': () => checkedSource(15)
     });
     try {
       const play = singleVideoPlayer(app, 'https://www.tiktok.com/@example/video/1234567');
       const result = play(4);
-      let returned = false;
-      void result.then(() => { returned = true; });
-      await Promise.race([started, new Promise((_,reject) => {
-        const timer = setTimeout(() => reject(new Error('Traffic verification was not started while the page waited')), 1500);
-        void started.then(() => clearTimeout(timer));
-      })]);
-      assert.equal(returned, false);
-      assert.equal(app.sent[0].type, 'media-options');
-      assert.equal(app.sent[1].type, 'media-source-options');
+      for (let i = 0; !finishPage && i < 20; i++) await new Promise(resolve => setImmediate(resolve));
+      assert.ok(finishPage);
+      assert.deepEqual(app.sent.map(request => request.type), ['media-options']);
       finishPage({ok:false,code});
       const { reply } = await result;
-      if (code === 'protected') assert.equal(reply.code, 'protected');
-      else assert.ok(reply.ok && reply.data.sourceChoices.length === 1);
+      if (code === 'protected') {
+        assert.equal(reply.code, 'protected');
+        assert.equal(app.sent.length, 1);
+      } else {
+        assert.ok(reply.ok && reply.data.sourceChoices.length === 1);
+        assert.deepEqual(app.sent.map(request => request.type), ['media-options', 'media-source-options']);
+      }
     } finally { app.stopWorker(); }
   }
 });
@@ -721,6 +719,59 @@ test('TikTok and reels show resolved formats before offering recently observed s
     assert.equal(app.sent[0].url, page);
     assert.equal(app.sent[0].candidates.length, 0);
   }
+});
+
+test('social feed playback and prefetch never initiate format probes', async () => {
+  for (const page of ['https://www.tiktok.com/foryou', 'https://www.instagram.com/']) {
+    const app = load({ 'media-options': checkedSource() });
+    const sender = { url: page, tab: { id: 41 }, frameId: 0, documentId: 'feed-document' };
+    try {
+      await app.onMedia({ url: 'https://cdn.example.com/playing.mp4', tabId: 41, frameId: 0,
+        documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'media',
+        timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+      await app.message({ type: 'media-element', watching: true }, sender);
+      const reply = await app.message({ type: 'media-options', prefetch: true, pageUrl: page,
+        playerPageUrl: page, playerUrl: 'blob:' + page, generation: 1 }, sender);
+      assert.equal(reply.data.prefetchSkipped, true);
+      assert.equal(app.sent.length, 0, page);
+    } finally { app.stopWorker(); }
+  }
+});
+
+test('social page refusal ends the click without probing observed CDN neighbours', async () => {
+  for (const code of ['blocked', 'rate-limited', 'site-refused', 'sign-in', 'browser-context']) {
+    const app = load({ 'media-options': { ok: false, code }, 'media-source-options': checkedSource() });
+    const page = 'https://www.tiktok.com/@example/video/1234567890';
+    const sender = { url: page, tab: { id: 42 }, frameId: 0, documentId: 'refusal-document' };
+    try {
+      const changedAt = Date.now();
+      await app.onMedia({ url: 'https://cdn.example.com/neighbor.mp4', tabId: 42, frameId: 0,
+        documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'media',
+        timeStamp: changedAt, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+      const reply = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+        playerUrl: 'blob:' + page, generation: 2, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+      assert.equal(reply.code, code);
+      assert.deepEqual(app.sent.map(request => request.type), ['media-options'], code);
+    } finally { app.stopWorker(); }
+  }
+});
+
+test('a social CDN refusal stops the remaining observed-source checks after one click', async () => {
+  const app = load({ 'media-options': { ok: false, code: 'no-media' },
+    'media-source-options': { ok: false, code: 'site-refused' } });
+  const page = 'https://www.instagram.com/reel/example/';
+  const sender = { url: page, tab: { id: 43 }, frameId: 0, documentId: 'cdn-refusal-document' };
+  try {
+    const changedAt = Date.now();
+    for (const name of ['first.mp4', 'second.mp4'])
+      await app.onMedia({ url: `https://cdn.example.com/${name}`, tabId: 43, frameId: 0,
+        documentId: sender.documentId, method: 'GET', statusCode: 200, type: 'media',
+        timeStamp: changedAt, responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+    const reply = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
+      playerUrl: 'blob:' + page, generation: 2, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+    assert.equal(reply.code, 'site-refused');
+    assert.deepEqual(app.sent.map(request => request.type), ['media-options', 'media-source-options']);
+  } finally { app.stopWorker(); }
 });
 
 test('a paused or ended blob player can use its recent manifest after a late click', async () => {
@@ -2866,7 +2917,10 @@ test('explicit same-origin named exports admit extensionless URLs and safe query
   for(const [url,name,mime] of [
     ['https://example.com/export','archive.zip','application/zip'],
     ['https://example.com/export?id=45&format=csv','report.csv','text/csv'],
-    ['https://example.com/export?format=md','notes.md','text/markdown']
+    ['https://example.com/export?format=md','notes.md','text/markdown'],
+    ['https://example.com/export?format=patch','fix.patch','text/x-diff'],
+    ['https://example.com/export','unknown-format','application/x-custom'],
+    ['https://example.com/export','', 'application/x-custom']
   ]){
     const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{earlyFetch:async()=>earlyHeaders(url,{'Content-Type':mime})});
     try{
@@ -2880,7 +2934,7 @@ test('explicit names cannot turn opaque tokens, HTML or unrelated origins into v
     ['https://example.com/export?token=single-use','archive.zip','application/zip'],
     ['https://example.com/export','report.csv','text/html'],
     ['https://other.example/export','archive.zip','application/zip'],
-    ['https://example.com/export','paper.pdf','application/pdf']
+    ['https://example.com/export','../paper.pdf','application/pdf']
   ]){
     const app=load({}, {earlyFetch:async()=>earlyHeaders(url,{'Content-Type':mime})});
     try{assert.equal((await app.message({type:'early-download',url,downloadName:name},earlySender)).fallback,true);assert.equal(app.sent.length,0)}
@@ -3084,6 +3138,22 @@ test('early-download catches target=_blank, noreferrer privacy, and 405 HEAD -> 
   } finally { app.stopWorker(); }
 });
 
+test('an early file HEAD refusal leaves Chrome as owner without a second site request', async () => {
+  for (const status of [401, 403, 404, 429]) {
+    const methods = [];
+    const app = load({}, { earlyFetch: async (url, options) => {
+      methods.push(options.method);
+      return { status, url, headers: new Headers() };
+    } });
+    try {
+      const reply = await app.message({ type: 'early-download', url: earlyUrl }, earlySender);
+      assert.equal(reply.fallback, true);
+      assert.deepEqual(methods, ['HEAD'], `HTTP ${status}`);
+      assert.deepEqual(app.sent, []);
+    } finally { app.stopWorker(); }
+  }
+});
+
 test('TikTok lookup returning source-changed falls back to observed CDN stream', async () => {
   const pageUrl = 'https://www.tiktok.com/@creator/video/7608248907960814879';
   const cdnUrl = 'https://v16-webapp-prime.tiktokcdn.com/video/tos/clip.mp4';
@@ -3121,7 +3191,7 @@ test('Instagram and TikTok do not start automatic format lookups', async () => {
   }
 });
 
-test('a refused witnessed social stream can still use its exact post, and failures omit private source details', async () => {
+test('social source access refusals stop, while no-media may try the post without leaking private details', async () => {
   for (const [page, code] of [
     ['https://www.instagram.com/reel/sample/', 'site-refused'],
     ['https://www.tiktok.com/@sample/video/7849240376246100000', 'no-media'],
@@ -3141,13 +3211,17 @@ test('a refused witnessed social stream can still use its exact post, and failur
         playerPlaying: true, mediaChangedAt: now, playerResourceFingerprints: [fingerprint]
       }), sender);
       assert.equal(app.sent[0].type, 'media-source-options');
-      if (code === 'blocked') {
+      if (code === 'site-refused') {
+        assert.equal(app.sent.length, 1, 'a browser-only option makes no second native site request');
+        assert.equal(reply.data.browserBodyAvailable, true);
+        assert.equal(reply.data.browserBodyProof.url, url);
+      } else if (code === 'blocked') {
         assert.equal(app.sent.length, 1);
         assert.equal(reply.code, code);
         const report = reply.data.mediaFailure;
         assert.equal(report.boundPost, true);
         assert.equal(report.exactMatches, 1);
-        assert.deepEqual([...report.observedLookups], ['blocked']);
+        assert.deepEqual([...report.observedLookups], [code]);
         assert.equal(report.postLookup, null);
         assert.doesNotMatch(JSON.stringify(report), /https:|private-source|private-document|media-id/);
       } else {

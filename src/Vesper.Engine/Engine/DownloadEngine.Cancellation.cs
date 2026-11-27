@@ -25,7 +25,7 @@ public sealed partial class DownloadEngine
     private static bool CanDiscardPartial(DownloadJob job) =>
         job.Kind != JobKind.BrowserFile
         && job.State is not (JobState.Completed or JobState.Verifying or JobState.Finalizing or JobState.Converting)
-        && job.FinalPath is null && job.PendingFinalPath is null;
+        && job.FinalPath is null && job.PendingFinalPath is null && job.PublicationCopyIdentity is null;
 
     private sealed record MergeSwapProof(int Version, string Fingerprint, string Phase, long MuxLength,
         string? MuxSha256, long TracksLength, string? TracksSha256, string? MuxIdentity, string? TracksIdentity);
@@ -160,7 +160,8 @@ public sealed partial class DownloadEngine
             && name.Length > suffix.Length && name.EndsWith(".vpart", StringComparison.OrdinalIgnoreCase)
             && name[^suffix.Length] == '.' && name.AsSpan(name.Length - suffix.Length + 1, 8).ToString().All(Uri.IsHexDigit);
         if ((!legacyBrowserPart && (!name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) || name.Length <= suffix.Length))
-            || (!staged && !string.Equals(partialFolder, folder, StringComparison.OrdinalIgnoreCase)))
+            || (!staged && !string.Equals(partialFolder, folder, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(partialFolder, PartialsFolder, StringComparison.OrdinalIgnoreCase)))
         {
             error = "The temporary file no longer matches this download.";
             return false;
@@ -325,7 +326,7 @@ public sealed partial class DownloadEngine
     private static bool RecoveryManifestBelongsToJob(SafeFileHandle handle, string path, string partial, string folder,
         DownloadJob job, MergeSwapProof? swap)
     {
-        if (RecoveryManifest.TryRecover(path, out DownloadJob recovered, out _))
+        if (RecoveryManifest.TryRecover(path, out DownloadJob recovered, out _, Path.GetDirectoryName(partial)))
         {
             return recovered.Id == job.Id && recovered.Kind == job.Kind
                 && string.Equals(Path.GetFullPath(recovered.PartialPath), partial, StringComparison.OrdinalIgnoreCase)

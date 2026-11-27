@@ -271,13 +271,15 @@ public sealed partial class DownloadEngine
 
             var id = Guid.NewGuid();
             string partialName = FileNames.Sanitize(name) + "." + id.ToString("N")[..8] + ".vpart";
-            string stagingFolder = PartialFile.PrepareStagingFolder(folder);
+            try { PartialFile.PreparePrivateFolder(PartialsFolder); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { return new AddResult(AddStatus.Invalid, Guid.Empty, "The partials folder is unavailable. " + ex.Message); }
             long order = _jobs.Count == 0 ? 0 : request.StartNow ? _jobs.Values.Min(j => j.QueueOrder) - 1 : _jobs.Values.Max(j => j.QueueOrder) + 1;
 
             var job = new DownloadJob
             {
                 Id = id, Kind = request.Kind, SourceUrl = uri.AbsoluteUri, FileName = name, NameLocked = request.FileName is { Length: > 0 },
-                DestinationFolder = folder, PartialPath = Path.Combine(stagingFolder, partialName),
+                DestinationFolder = folder, PartialPath = Path.Combine(PartialsFolder, partialName),
                 State = request.InitiallyPaused ? JobState.Paused : JobState.Queued,
                 Priority = request.Priority, QueueOrder = order, Category = category, Referer = request.Referer, UserAgent = request.UserAgent,
                 ExpectedSha256 = expected, PieceMapJson = request.PieceMapJson, MediaState = request.MediaState,
@@ -435,7 +437,7 @@ public sealed partial class DownloadEngine
             if (job.BrowserProof is { AwaitingConfirmation: true } || IsCleanupPending(job)
                 || job.Reason == "recovery-integrity-missing") return;
 
-            if (job.PendingFinalPath is not null)
+            if (job.PendingFinalPath is not null || job.State != JobState.Completed && job.PublicationCopyIdentity is not null)
             {
                 ReconcileFinalizing(job);
             }
@@ -639,7 +641,8 @@ public sealed partial class DownloadEngine
             if (_sessions.ContainsKey(id) || _cancelling.Contains(id)) return new RemoveResult(false, "This download is still stopping.", null);
             if (_completedFileActions.Contains(id)) return new RemoveResult(false, "Wait for the file action to finish.", null);
             if (IsCleanupPending(job)) return new RemoveResult(false, "Finish cleaning up this download before removing it.", null);
-            if (job.PendingFinalPath is not null) return new RemoveResult(false, "This download is still being saved.", null);
+            if (job.PendingFinalPath is not null || job.State != JobState.Completed && job.PublicationCopyIdentity is not null)
+                return new RemoveResult(false, "This download is still being saved.", null);
 
             string? retained = job.State != JobState.Completed && File.Exists(job.PartialPath) ? job.PartialPath : null;
             _store.Delete(id);

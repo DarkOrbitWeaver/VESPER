@@ -22,7 +22,9 @@ public sealed partial class DownloadEngine
         if (!job.Extents.Covers(0, total))
             return RunOutcome.NeedsAttention("incomplete", "Some data is missing even though the transfer ended. Saved data was kept; resume to fetch the rest.");
 
-        if (file.Length != total) file.Truncate(total);     // stale tail from an older, longer file never ships
+        if (file.Length < total)
+            return RunOutcome.NeedsAttention("incomplete", "The saved file is shorter than its committed data. Saved bytes were kept; resume or recover this download.");
+        if (file.Length > total) file.Truncate(total);     // stale tail from an older, longer file never ships
         using (ProcessingTiming.Measure(job.Id, ProcessingPhase.DiskFlush, total)) file.Flush();
         if (!HttpFacts.IsHtmlFileName(job.FileName) && LooksLikeHtmlFile(file, total))
             return RunOutcome.NeedsAttention("html", "The server sent a web page instead of the selected file. Saved data was kept; nothing was published.");
@@ -193,6 +195,7 @@ public sealed partial class DownloadEngine
         FileStream file = verifiedMerge?.File ?? preparedProof ?? (prepared is null
             ? PartialFile.OpenOwnedRead(job, share, options)
             : PathSafety.OpenTemporaryStream(source, FileMode.Open, FileAccess.Read, share, 1 << 16, options));
+        FileStream? copy = null;
         try
         {
             if (file.Length != expectedLength)
@@ -241,6 +244,25 @@ public sealed partial class DownloadEngine
             if (!PathSafety.PathStillNamesFile(source, file, digest))
                 return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
 
+            if (job.PublicationCopyIdentity is { } oldCopy)
+            {
+                if (!PathSafety.TryDeleteTemporaryFile(PublicationCopyPath(job), oldCopy, out string cleanupError))
+                    return RunOutcome.NeedsAttention("publication-copy", "A previous publication copy could not be removed. " + cleanupError);
+                UpdateJob(job, j => j.PublicationCopyIdentity = null);
+            }
+            try
+            {
+                if (OperatingSystem.IsWindows() && !PathSafety.IsOnSameVolume(file.SafeFileHandle, job.DestinationFolder))
+                {
+                    source = PublicationCopyPath(job);
+                    copy = await CopyForPublicationAsync(job, source, file, digest, ct).ConfigureAwait(false);
+                    sourceIdentity = expectedSourceIdentity = job.PublicationCopyIdentity;
+                }
+            }
+            catch (Exception ex) when (ex is (IOException or UnauthorizedAccessException) and not LocalStorageException)
+            { throw new LocalStorageException("Could not prepare the saved file for its destination. " + ex.Message, ex); }
+            FileStream delivery = copy ?? file;
+
             // Hold the verified stream without write sharing through publication.
             WriteMarkOfTheWeb(job, source, expectedSourceIdentity);
 
@@ -257,14 +279,14 @@ public sealed partial class DownloadEngine
                     j.PendingConversionIdentity = prepared?.Identity;
                 });
                 Failpoint("finalize.beforeMove");
-                if (!PathSafety.PathStillNamesFile(source, file, digest))
+                if (!PathSafety.PathStillNamesFile(source, delivery, digest))
                     return RunOutcome.NeedsAttention("publication-pending", "The path to the file waiting to be published changed.");
 
                 if (OperatingSystem.IsWindows())
                 {
-                    if (!PathSafety.TryPublishTemporaryFile(source, target, expectedSourceIdentity, out string moveError))
+                    if (!PathSafety.TryPublishTemporaryFile(source, target, expectedSourceIdentity, PartialsFolder, out string moveError))
                     {
-                        bool sourceStillMatches = PathSafety.PathStillNamesFile(source, file, digest);
+                        bool sourceStillMatches = PathSafety.PathStillNamesFile(source, delivery, digest);
                         if (File.Exists(target) && sourceStillMatches) continue;
                         if (!sourceStillMatches)
                             return RunOutcome.NeedsAttention("publication-file", "The file waiting to be published changed before it could be moved.");
@@ -288,9 +310,9 @@ public sealed partial class DownloadEngine
                 }
 
                 Failpoint("finalize.afterMove");
-                if (!PathSafety.PathStillNamesFile(target, file, digest))
+                if (!PathSafety.PathStillNamesFile(target, delivery, digest))
                     return RunOutcome.NeedsAttention("publication-pending", "The path to the saved file changed. Check it in File Explorer.");
-                long publishedLength = file.Length;
+                long publishedLength = delivery.Length;
                 try
                 {
                     // The transfer handle allows rename/delete. Reopen the final path with sharing
@@ -337,7 +359,56 @@ public sealed partial class DownloadEngine
             }
             return RunOutcome.NeedsAttention("name", "No free file name could be found in the destination folder.");
         }
-        finally { file.Dispose(); }
+        finally
+        {
+            copy?.Dispose();
+            file.Dispose();
+        }
+    }
+
+    private static string PublicationCopyPath(DownloadJob job) =>
+        Path.Combine(job.DestinationFolder, $".vesper-{job.Id:N}.tmp");
+
+    private async Task<FileStream> CopyForPublicationAsync(DownloadJob job, string path, FileStream source, string digest, CancellationToken ct)
+    {
+        using SafeFileHandle directory = PathSafety.OpenTemporaryDirectoryHandle(job.DestinationFolder);
+        using (SafeFileHandle handle = PathSafety.OpenTemporaryHandle(path, FileMode.CreateNew, FileAccess.ReadWrite,
+            FileShare.Read, FileOptions.Asynchronous | FileOptions.SequentialScan, allowDelete: true))
+        using (var output = new FileStream(handle, FileAccess.Write, 1 << 16, isAsync: true))
+        {
+            try
+            {
+                string identity = PathSafety.TemporaryFileIdentity(handle) ?? throw new IOException("The publication copy has no file identity.");
+                UpdateJob(job, j => { j.State = JobState.Finalizing; j.PublicationCopyIdentity = identity; });
+                source.Position = 0;
+                await source.CopyToAsync(output, ct).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
+                if (output.Length != source.Length) throw new IOException("The publication copy is incomplete.");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
+            {
+                try { PathSafety.DeleteOpenTemporaryFile(handle, path); }
+                catch (Exception cleanupError) when (cleanupError is IOException or UnauthorizedAccessException)
+                { Log(job.Id, "publication-copy", cleanupError.Message); }
+                throw;
+            }
+        }
+
+        FileStream verified = PathSafety.OpenTemporaryStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.Read | FileShare.Delete, 1 << 16, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        try
+        {
+            PathSafety.RequireTemporaryIdentity(verified.SafeFileHandle, job.PublicationCopyIdentity);
+            if (verified.Length != source.Length
+                || !Convert.ToHexString(await SHA256.HashDataAsync(verified, ct).ConfigureAwait(false)).Equals(digest, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("The publication copy could not be verified.");
+            return verified;
+        }
+        catch
+        {
+            verified.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Marks the file as downloaded from the internet so Windows applies SmartScreen/Office protections.</summary>
@@ -375,7 +446,7 @@ public sealed partial class DownloadEngine
         string[] manifestFolders = RecoveryFolders();
         foreach (string folder in manifestFolders)
             RecoveryManifest.RecoverInterruptedReplacements(folder,
-                message => Log(null, "manifest-replacement", message));
+                message => Log(null, "manifest-replacement", message), trustedPartialFolder: PartialsFolder);
 
         lock (_lock)
         {
@@ -389,7 +460,8 @@ public sealed partial class DownloadEngine
             foreach (DownloadJob job in _jobs.Values.ToList())
             {
                 if (IsCleanupPending(job)) continue;
-                if (job.PendingFinalPath is not null || job.State == JobState.Finalizing)
+                if (job.PendingFinalPath is not null || job.State == JobState.Finalizing
+                    || job.PublicationCopyIdentity is not null && job.State != JobState.Completed)
                 {
                     ReconcileFinalizing(job);
                     continue;
@@ -423,7 +495,8 @@ public sealed partial class DownloadEngine
                         job.NextRetryUtc = null;
                         SaveLocked(job);
                         break;
-                    case JobState.Completed when job.PendingConversionBytes is not null && job.FinalPath is { } final:
+                    case JobState.Completed when (job.PendingConversionBytes is not null || job.PublicationCopyIdentity is not null)
+                        && job.FinalPath is { } final:
                         using (FileStream? published = OpenPublicationFile(job, final, out bool matches))
                         {
                             if (matches && published is not null)
@@ -449,12 +522,13 @@ public sealed partial class DownloadEngine
     private void ReconcileFinalizing(DownloadJob job)
     {
         string stage = job.PendingConversionBytes is null ? job.PartialPath : PublicationStagePath(job);
+        string movedStage = job.PublicationCopyIdentity is null ? stage : PublicationCopyPath(job);
         string? target = job.PendingFinalPath;
         DownloadJob saved = job.CopyForUpdate();
 
         bool targetMatches = false;
         using FileStream? published = target is null ? null : OpenPublicationFile(job, target, out targetMatches);
-        if (target is not null && targetMatches && PublicationPathIsMissing(job, stage, staged: true))
+        if (target is not null && targetMatches && PublicationPathIsMissing(job, movedStage, staged: true))
         {
             string? fileIdentity = published is null ? null : TryGetPublishedFileIdentity(published.SafeFileHandle);
             MarkPublished(saved, target, fileIdentity);
@@ -462,6 +536,19 @@ public sealed partial class DownloadEngine
             FinishPublication(job, recovering: true);
             Log(job.Id, "reconciled", "Rename had completed before the interruption.");
             return;
+        }
+
+        if (job.PublicationCopyIdentity is { } copyIdentity)
+        {
+            if (!PathSafety.TryDeleteTemporaryFile(movedStage, copyIdentity, out string error))
+            {
+                saved.State = JobState.NeedsAttention;
+                saved.Reason = "publication-copy";
+                saved.Message = "An interrupted publication copy could not be removed. " + error;
+                SaveRecoveredJob(job, saved);
+                return;
+            }
+            saved.PublicationCopyIdentity = null;
         }
 
         long? expectedLength = job.PendingConversionBytes ?? job.TotalBytes;
@@ -502,7 +589,7 @@ public sealed partial class DownloadEngine
         ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
     }
 
-    private static bool IsPublicationPath(DownloadJob job, string path, bool staged)
+    private bool IsPublicationPath(DownloadJob job, string path, bool staged)
     {
         if (!Path.IsPathFullyQualified(path) || !Path.IsPathFullyQualified(job.DestinationFolder)) return false;
         try
@@ -510,13 +597,14 @@ public sealed partial class DownloadEngine
             string folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(job.DestinationFolder));
             string? parent = Path.GetDirectoryName(Path.GetFullPath(path));
             StringComparison comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            return parent is not null && (string.Equals(folder, parent, comparison) || staged && PartialFile.IsStagingFolder(parent, folder))
+            return parent is not null && (string.Equals(folder, parent, comparison)
+                || staged && (string.Equals(PartialsFolder, parent, comparison) || PartialFile.IsStagingFolder(parent, folder)))
                 && PathSafety.TryCheckUnlinkedDirectory(parent, out _);
         }
         catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException) { return false; }
     }
 
-    private static bool IsPublicationFile(DownloadJob job, string path, long? length = null, bool staged = false) =>
+    private bool IsPublicationFile(DownloadJob job, string path, long? length = null, bool staged = false) =>
         IsPublicationPath(job, path, staged)
         && PathSafety.Inspect(path) is { Exists: true, IsReparsePoint: false, IsCloudPlaceholder: false, IsDirectory: false } file
         && (length is null || file.Length == length);
@@ -532,7 +620,7 @@ public sealed partial class DownloadEngine
         { return false; }
     }
 
-    private static bool PublicationPathIsMissing(DownloadJob job, string path, bool staged = false)
+    private bool PublicationPathIsMissing(DownloadJob job, string path, bool staged = false)
     {
         if (!IsPublicationPath(job, path, staged)) return false;
         try { File.GetAttributes(path); }
@@ -542,7 +630,7 @@ public sealed partial class DownloadEngine
     }
 
     private static string? PublicationDigest(DownloadJob job) =>
-        job.PendingConversionDigest ?? (job.PendingConversionBytes is null && job.Sha256Verified ? job.ExpectedSha256 : null);
+        job.PendingConversionDigest ?? job.PublishedSha256 ?? (job.PendingConversionBytes is null && job.Sha256Verified ? job.ExpectedSha256 : null);
 
     private static string? TryGetPublishedFileIdentity(Microsoft.Win32.SafeHandles.SafeFileHandle handle)
     {
@@ -552,7 +640,7 @@ public sealed partial class DownloadEngine
     }
 
     // Keep the verified output open until the completion row commits.
-    private static FileStream? OpenPublicationFile(DownloadJob job, string path, out bool matches, bool staged = false)
+    private FileStream? OpenPublicationFile(DownloadJob job, string path, out bool matches, bool staged = false)
     {
         matches = false;
         string? digest = PublicationDigest(job);
@@ -572,8 +660,8 @@ public sealed partial class DownloadEngine
         }
         else if (isPendingTarget)
         {
-            expectedIdentity = job.PendingConversionBytes is not null
-                ? job.PendingConversionIdentity : job.PartialIdentity;
+            expectedIdentity = job.PublicationCopyIdentity ?? (job.PendingConversionBytes is not null
+                ? job.PendingConversionIdentity : job.PartialIdentity);
         }
         else if (isCompletedTarget)
         {
@@ -682,16 +770,21 @@ public sealed partial class DownloadEngine
             Log(job.Id, "publication-cleanup", "A recovery file was kept because it did not match this download.");
         if (recovering && job.Kind == JobKind.Merge && !MergeTransfer.DeleteSidecars(job))
             Log(job.Id, "publication-cleanup", "A merge sidecar was kept because it could not be verified or removed.");
-        if (job.PendingConversionBytes is null || !DeleteTemporaryFile(job, job.PartialPath)) return;
+        bool copied = job.PublicationCopyIdentity is not null;
+        if (!copied && job.PendingConversionBytes is null) return;
+        if (copied && job.PendingConversionBytes is not null
+            && !DeleteTemporaryFile(job, PublicationStagePath(job), job.PendingConversionIdentity)) return;
+        if (!DeleteTemporaryFile(job, job.PartialPath)) return;
         try
         {
             if (recovering)
             {
                 DownloadJob saved = job.CopyForUpdate();
                 ClearPendingPublication(saved);
+                saved.PublicationCopyIdentity = null;
                 SaveRecoveredJob(job, saved);
             }
-            else UpdateJob(job, ClearPendingPublication);
+            else UpdateJob(job, j => { ClearPendingPublication(j); j.PublicationCopyIdentity = null; });
         }
         catch (LocalStorageException ex)
         {
@@ -723,7 +816,7 @@ public sealed partial class DownloadEngine
         foreach (DownloadJob job in _jobs.Values)
             if (PathSafety.TryGetFullPath(job.DestinationFolder, out string destination, out _)) folders.Add(destination);
 
-        return folders.SelectMany(folder => new[] { folder, PartialFile.StagingFolder(folder) })
+        return folders.SelectMany(folder => new[] { folder, PartialFile.StagingFolder(folder) }).Append(PartialsFolder)
             .Where(folder => Directory.Exists(folder) && PathSafety.TryCheckUnlinkedDirectory(folder, out _))
             .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
@@ -736,7 +829,7 @@ public sealed partial class DownloadEngine
         {
             foreach (string manifest in Directory.EnumerateFiles(folder, "*.vpart" + RecoveryManifest.Extension))
             {
-                if (!RecoveryManifest.TryRecover(manifest, out DownloadJob job, out string reason))
+                if (!RecoveryManifest.TryRecover(manifest, out DownloadJob job, out string reason, PartialsFolder))
                 {
                     Log(null, "manifest-skipped", $"{Path.GetFileName(manifest)}: {reason}");
                     continue;
