@@ -2658,7 +2658,8 @@
       'no-media': playbackReady ? 'VESPER couldn’t verify a downloadable stream from this playback.'
         : 'Play the video in Chrome, then try again.',
       'no-reusable-source': 'This player’s video isn’t available as a file or stream VESPER can reuse.',
-      'site-refused': reply?.message || 'The site refused the request. Try again from the video page.',
+      'site-refused': playbackReady ? 'The site refused access to this video source.'
+        : reply?.message || 'The site refused the video request.',
       unavailable: 'VESPER couldn’t open this video. Refresh the page and try again.',
       'source-expired': 'The video link expired. Try again to look for a fresh link.',
       'source-changed': 'The source no longer matches this media. Refresh the formats.',
