@@ -15,7 +15,7 @@ globalThis.VesperBrowserBody = (() => {
 
   const EXTENSIONS = Object.freeze({
     'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
-    'video/x-matroska': 'mkv', 'video/mp2t': 'ts', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a',
+    'video/x-matroska': 'mkv', 'video/mp2t': 'ts', 'audio/mp4': 'm4a', 'audio/m4a': 'm4a', 'audio/x-m4a': 'm4a',
     'audio/mpeg': 'mp3', 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'video/ogg': 'ogv',
     'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/flac': 'flac', 'audio/aac': 'aac', 'audio/opus': 'opus'
   });

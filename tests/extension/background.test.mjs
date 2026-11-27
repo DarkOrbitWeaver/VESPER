@@ -1160,7 +1160,7 @@ test('a single witnessed slice can propose a full resource while contradictory r
   const changedAt=Date.now(), urls=[base+'&bytestart=0&byteend=999',base+'&bytestart=1000&byteend=1999'];
   const hash=async url=>Buffer.from(await webcrypto.subtle.digest('SHA-256',new TextEncoder().encode(url))).toString('hex');
   for(const scenario of ['verified','one-witness','changed-tag','wrong-offset','other-document','changed-after-picker',
-    'query-200','query-200-incorrect-length','query-200-replaced']){
+    'query-200','query-200-different-tags','query-200-incorrect-length','query-200-replaced']){
     const app=load({'media-options':{ok:false,code:'no-media'},'media-range-options':checkedSource(15)});
     try {
       async function report(i,tag,at=changedAt){
@@ -1172,21 +1172,21 @@ test('a single witnessed slice can propose a full resource while contradictory r
               :'bytes '+(i*1000)+'-'+(i*1000+999)+'/700000'}] : []),
             {name:'Content-Length',value:scenario==='query-200-incorrect-length'&&i===1?'999':'1000'},{name:'ETag',value:tag}]});
       }
-      await report(0,'"v1"');await report(1,scenario==='changed-tag'?'"v2"':'"v1"');
+      await report(0,'"v1"');await report(1,['changed-tag','query-200-different-tags'].includes(scenario)?'"v2"':'"v1"');
       const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/current',
         generation:5,playerKey:'p',playerPlaying:true,mediaChangedAt:changedAt,
         playerResourceFingerprints:await Promise.all((scenario==='one-witness'?urls.slice(0,1):urls).map(hash))};
       const result=await app.message(request,sender);
       const checks=app.sent.filter(m=>m.type==='media-range-options');
-      if(!['verified','one-witness','other-document','changed-after-picker','query-200','query-200-incorrect-length','query-200-replaced'].includes(scenario)){
+      if(['changed-tag','wrong-offset'].includes(scenario)){
         assert.equal(checks.length,0,scenario);
         assert.equal(result.ok,false,scenario);
         continue;
       }
       assert.equal(checks.length,1);
       assert.equal(checks[0].candidates[0].url,base);
-      assert.equal(checks[0].candidates[0].observedETag,'"v1"');
       const querySlice = scenario.startsWith('query-200');
+      assert.equal(checks[0].candidates[0].observedETag, querySlice ? undefined : '"v1"');
       assert.equal(checks[0].candidates[0].observedLength,querySlice ? undefined : 700000);
       assert.equal(checks[0].candidates[0].observedMinimumLength,
         querySlice ? (scenario === 'query-200-incorrect-length' ? 1000 : 2000) : undefined);
@@ -1527,7 +1527,9 @@ test('a rate-limited lookup does not start a new request using Chrome', async ()
     type: 'media', timeStamp: Date.now(), responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
   const reply = await app.message({ type: 'media-options', pageUrl, playerPageUrl: pageUrl, playerUrl },
     { url: pageUrl, tab: { id: 3 }, documentId: 'current' });
-  assert.deepEqual(reply, rateLimit);
+  assert.equal(reply.code, rateLimit.code);
+  assert.equal(reply.data.retryAt, rateLimit.data.retryAt);
+  assert.equal(reply.data.mediaFailure.postLookup, rateLimit.code);
   assert.deepEqual(app.actions, ['native']);
 });
 
@@ -3115,6 +3117,44 @@ test('Instagram and TikTok do not start automatic format lookups', async () => {
       const reply = await app.message(request, { tab: { id: 8, active: true }, url: page, documentId: 'social-fixture' });
       assert.equal(reply.data.prefetchSkipped, true);
       assert.equal(app.sent.length, 0);
+    } finally { app.stopWorker(); }
+  }
+});
+
+test('a refused witnessed social stream can still use its exact post, and failures omit private source details', async () => {
+  for (const [page, code] of [
+    ['https://www.instagram.com/reel/sample/', 'site-refused'],
+    ['https://www.tiktok.com/@sample/video/7849240376246100000', 'no-media'],
+    ['https://www.instagram.com/reel/sample/', 'blocked']
+  ]) {
+    const url = 'https://media.example/clip.mp4?token=private-source';
+    const fingerprint = Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(url))).toString('hex');
+    const sender = { url: page, tab: { id: 73 }, frameId: 0, documentId: 'private-document' };
+    const now = Date.now();
+    const app = load({ 'media-options': checkedSource(18), 'media-source-options': { ok: false, code } });
+    try {
+      await app.onMedia({ url, tabId: 73, frameId: 0, documentId: sender.documentId,
+        method: 'GET', statusCode: 200, type: 'media', timeStamp: now,
+        responseHeaders: responseHeaders({ 'Content-Type': 'video/mp4' }) });
+      const reply = await app.message(videoOptionsMessage(page, {
+        playerUrl: 'blob:' + new URL(page).origin + '/media-id',
+        playerPlaying: true, mediaChangedAt: now, playerResourceFingerprints: [fingerprint]
+      }), sender);
+      assert.equal(app.sent[0].type, 'media-source-options');
+      if (code === 'blocked') {
+        assert.equal(app.sent.length, 1);
+        assert.equal(reply.code, code);
+        const report = reply.data.mediaFailure;
+        assert.equal(report.boundPost, true);
+        assert.equal(report.exactMatches, 1);
+        assert.deepEqual([...report.observedLookups], ['blocked']);
+        assert.equal(report.postLookup, null);
+        assert.doesNotMatch(JSON.stringify(report), /https:|private-source|private-document|media-id/);
+      } else {
+        assert.equal(app.sent[1].type, 'media-options');
+        assert.equal(app.sent[1].url, page);
+        assert.equal(reply.ok, true);
+      }
     } finally { app.stopWorker(); }
   }
 });

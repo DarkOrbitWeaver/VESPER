@@ -1924,6 +1924,7 @@
         element('div', 'msg', note), controls.status, footer);
     }
     let formats = result?.data;
+    let currentWitness = playerWitness;
     const missingFormats = !result?.ok || (!formats?.choices?.length && !formats?.sourceChoices?.length);
     // Acquisition is a delivery recipe, not a second download UI. Only fall
     // back to the exact current player and never offer a speculative Blob URL.
@@ -1936,7 +1937,8 @@
           'site-refused', 'source-changed', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
         original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
         if (!isCurrentRequest(request)) return;
-        const tracks = !original && playerFragmentWitness(player, binding).tracks;
+        if (!original) currentWitness = playerFragmentWitness(player, binding);
+        const tracks = !original && currentWitness?.tracks;
         if (tracks?.length && tracks.length <= 2
             && tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
               && Number.isSafeInteger(t.retainedBytes) && t.retainedBytes > 0)
@@ -1971,6 +1973,22 @@
       const message = errorMessage(result, current && player.readyState >= 1);
       if (!['protected', 'blocked'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
+      if (result?.data?.mediaFailure) {
+        const build = chrome.runtime.getManifest();
+        appendMediaFailureDetails(message, {
+          version: build.version_name || build.version,
+          site: /(?:^|\.)instagram\.com$/i.test(location.hostname) ? 'instagram' : 'tiktok',
+          ...result.data.mediaFailure,
+          player: {
+            source: /^blob:/i.test(src) ? 'blob' : VesperPlayerSource.http(src) ? 'http' : player.srcObject ? 'object' : 'none',
+            ready: player.readyState, witnesses: currentWitness?.fingerprints?.length || 0,
+            tracks: (currentWitness?.tracks || []).map(track => ({
+              init: track.hasInit === true, complete: track.bufferedComplete === true,
+              bytes: Number.isSafeInteger(track.retainedBytes) ? track.retainedBytes : 0
+            }))
+          }
+        });
+      }
       return renderShell(title, poster, duration, message);
     }
     formats.playerLive = playerFacts?.live === true || formats.isLive === true;
@@ -2706,6 +2724,22 @@
       retryTimer = setTimeout(() => { retry.hidden = false; }, retryAt - Date.now());
     }
     message.append(' ', retry);
+  }
+
+  function appendMediaFailureDetails(message, details) {
+    const copy = element('button', 'link', 'Copy details');
+    copy.onclick = async () => {
+      const text = JSON.stringify(details, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        copy.textContent = 'Copied';
+      } catch {
+        const report = element('pre', '', text);
+        report.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;user-select:text';
+        copy.replaceWith(report);
+      }
+    };
+    message.append(' ', copy);
   }
 
   function errorMessage(reply, playbackReady = false) {
