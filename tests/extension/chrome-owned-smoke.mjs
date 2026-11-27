@@ -787,7 +787,6 @@ async function main() {
     await waitFor(() => flyShown(), 5000, 'The butterfly did not return after resuming.');
     for (const [mode, enter, leave, pointerX] of [
       ['wrapper fullscreen', "player.requestFullscreen()", 'document.exitFullscreen()', 400],
-      ['native video fullscreen', 'player.querySelector("video").requestFullscreen()', 'document.exitFullscreen()', 420],
       ['expanded player', "player.classList.add('expanded')", "player.classList.remove('expanded')", 440]
     ]) {
       const result = await browser.send('Runtime.evaluate', { expression: enter, awaitPromise: true, userGesture: true }, tab);
@@ -795,17 +794,25 @@ async function main() {
       await waitFor(async () => (await flyShown()) === false, 5000, 'The butterfly stayed visible in ' + mode);
       await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pointerX, y: 220 }, tab);
       await waitFor(() => flyShown(), 2500, 'The butterfly did not wake in ' + mode);
-      if (mode === 'native video fullscreen') {
-        await waitFor(async () => {
-          const fly = await findButterfly();
-          const { model } = await browser.send('DOM.getBoxModel', { nodeId: fly.nodeId }, tab);
-          const [x, y] = [(model.border[0] + model.border[4]) / 2, (model.border[1] + model.border[5]) / 2];
-          const hit = await browser.send('Runtime.evaluate', { expression: `document.elementFromPoint(${x}, ${y})?.hasAttribute('data-vesper-player')`, returnByValue: true }, tab);
-          return hit.result.value;
-        }, 2500, 'The butterfly was behind the native fullscreen video.');
-      }
       await browser.send('Runtime.evaluate', { expression: leave, awaitPromise: true }, tab);
     }
+    const enterVideo = await browser.send('Runtime.evaluate', {
+      expression: 'player.querySelector("video").requestFullscreen()', awaitPromise: true, userGesture: true
+    }, tab);
+    assert.ok(!enterVideo.exceptionDetails, 'Could not enter native video fullscreen.');
+    await waitFor(async () => (await flyShown()) === false, 2500, 'Native video fullscreen did not hide the page overlay.');
+    await browser.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'V', code: 'KeyV', modifiers: 9, windowsVirtualKeyCode: 86 }, tab);
+    await browser.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'V', code: 'KeyV', modifiers: 9, windowsVirtualKeyCode: 86 }, tab);
+    await waitFor(async () => {
+      const reply = await browser.send('Runtime.evaluate', { expression: '!document.fullscreenElement', returnByValue: true }, tab);
+      const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
+      const nodes = [root];
+      for (const node of nodes) {
+        nodes.push(...(node.children || []), ...(node.shadowRoots || []));
+        if (node.attributes?.includes('panel show')) return reply.result.value;
+      }
+      return false;
+    }, 3000, 'The shortcut did not leave native fullscreen and open the same player.');
     // Actual MSE append calls in two simultaneous players, not a VM mock.
     await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/mse-feed' }, tab);
     const mse = await waitFor(async () => {
@@ -917,9 +924,14 @@ async function main() {
         assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
       }
       async function clickButton(className) {
-        const target = await findButton(className);
-        const { model } = await browser.send('DOM.getBoxModel', { nodeId: target.nodeId }, tab);
-        const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
+        const { x, y } = await waitFor(async () => {
+          const target = await findButton(className);
+          try {
+            const { model } = await browser.send('DOM.getBoxModel', { nodeId: target.nodeId }, tab);
+            const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
+            return x > 0 && y > 0 ? { x, y } : null;
+          } catch { return null; }
+        }, 2500, 'No visible button bounds for ' + className);
         await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tab);
         await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
         await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
@@ -1028,9 +1040,11 @@ async function main() {
           const player = await playerBounds('post-' + post);
           const fly = await findButterfly();
           if (!player || !fly?.shown) return false;
-          const { model } = await browser.send('DOM.getBoxModel', { nodeId: fly.nodeId }, tab);
-          const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
-          return Math.abs(x - (player.right - 32)) < 56 && Math.abs(y - player.top) < 64;
+          try {
+            const { model } = await browser.send('DOM.getBoxModel', { nodeId: fly.nodeId }, tab);
+            const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
+            return Math.abs(x - (player.right - 32)) < 56 && Math.abs(y - player.top) < 64;
+          } catch { return false; }
         }, 1500, 'Butterfly did not follow the visible post after scrolling to ' + post);
         scrollHandoffs.push({ post, elapsedMs: Date.now() - started });
       }
@@ -1060,6 +1074,7 @@ async function main() {
       toggleLabelsNonSelectable: true,
       preparedBeforeClick,
       fullscreenButterfly: true,
+      nativeFullscreenShortcut: true,
       customAudioButterfly: true,
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },

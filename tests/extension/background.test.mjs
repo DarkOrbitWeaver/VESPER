@@ -2358,7 +2358,7 @@ test('an observed manifest from another document or frame is not reused for this
   assert.equal(app.sent.some(message => message.type === 'media-source-options'), false);
 });
 
-test('verified duration, height and track facts rank source choices and make labels distinct', async () => {
+test('verified playback facts exclude a trailer and label the remaining source choices', async () => {
   const page = 'https://video.example/watch/movie';
   const sender = { url: page, tab: { id: 37 }, frameId: 0, documentId: 'movie-doc' };
   const changedAt = Date.now();
@@ -2386,8 +2386,7 @@ test('verified duration, height and track facts rank source choices and make lab
 
   assert.deepEqual([...result.data.sourceChoices.map(choice => choice.label)], [
     '12:00 · 1080p · audio + video · HLS · 1 format',
-    '12:00 · 720p · video only · HLS · 1 format',
-    '0:30 · 1080p · audio + video · HLS · 1 format'
+    '12:00 · 720p · video only · HLS · 1 format'
   ]);
   assert.equal(result.data.verifiedSources, true);
   assert.equal(result.data.choices, undefined, 'the player facts rank choices but do not select a stream');
@@ -2405,6 +2404,30 @@ test('verified duration, height and track facts rank source choices and make lab
   assert.equal(live.live, true);
   assert.equal(live.hasAudio, true);
   assert.equal(live.hasVideo, true);
+});
+
+test('WebM initialization fragments and numbered chunks do not become source choices', async () => {
+  const page = 'https://video.example/watch/movie';
+  const sender = { url: page, tab: { id: 37 }, frameId: 0, documentId: 'webm-doc' };
+  const app = load({ 'media-options': { ok: false, code: 'no-media' }, 'media-source-options': checkedSource() });
+  const urls = ['init-0.1080p.vp9.webm', 'chunk-0-00001.1080p.vp9.webm']
+    .map(file => 'https://cdn.video.example/movie.webm/' + file);
+  for (const url of urls) {
+    await app.onMedia({ url, tabId: 37, frameId: 0, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'xmlhttprequest',
+      responseHeaders: responseHeaders({ 'Content-Type': 'video/webm', 'Content-Length': '47000' }) });
+  }
+  const reply = await app.message(videoOptionsMessage(page, { playerUrl: 'blob:https://video.example/player',
+    playerHasMedia: true, playerFacts: { durationSeconds: 634, kind: 'video' } }), sender);
+  assert.equal(reply.ok, false);
+  assert.equal(app.sent.some(request => request.candidates?.some(candidate => urls.includes(candidate.url))), false);
+});
+
+test('a page lookup cannot offer a two-second preview for a long current player', async () => {
+  const app = load({ 'media-options': { ok: true, data: { duration: 2, choices: [{ index: 0, label: 'MP4' }] } } });
+  const result = await app.message(videoOptionsMessage(videoPage, { playerFacts: { durationSeconds: 86, kind: 'video' } }), videoSender);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'source-changed');
 });
 
 test('source verification checks at most five exact URLs', async () => {

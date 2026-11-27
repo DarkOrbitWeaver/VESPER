@@ -922,8 +922,12 @@ async function prepareMediaFormats(tab, site, verify) {
 }
 
 function isPartialMediaUrl(url) {
-  return SEGMENT.test(url.pathname) || [...url.searchParams.keys()]
+  return isMediaSegment(url.pathname) || [...url.searchParams.keys()]
     .some(key => /^(?:range|sq|segment|chunk|frag|bytestart|byteend)$/i.test(key));
+}
+
+function isMediaSegment(path) {
+  return SEGMENT.test(path) || /\/(?:init-\d+|chunk-\d+-\d+)\.[^/]+\.(?:webm|mp4)$/i.test(path);
 }
 
 const MAX_MEDIA_RANGE_LENGTH = 17_179_869_184;
@@ -1045,8 +1049,9 @@ function isYouTubePage(page) {
 }
 
 async function addSource(tabId, source) {
-  if (!Number.isSafeInteger(tabId) || tabId < 0 || !source.documentId || !VesperPlayerSource.http(source.url)
-      || SEGMENT.test(source.url) || !Number.isFinite(source.seen ?? Date.now())) return;
+  const url = VesperPlayerSource.http(source.url);
+  if (!Number.isSafeInteger(tabId) || tabId < 0 || !source.documentId || !url
+      || isMediaSegment(url.pathname) || !Number.isFinite(source.seen ?? Date.now())) return;
   await ensureObservedSourcesLoaded();
   await inTabOrder(tabId, async () => {
     const state = await tabState(tabId);
@@ -1399,6 +1404,13 @@ async function playerOptions(message, sender) {
   const socialSite = VesperPlayerSource.isSocialFeedSite(page.href);
   const socialFeed = socialSite && binding && /^https?:/.test(identity);
   const player = binding ? VesperMediaEvidence.playerFacts(message.playerFacts) : {};
+  const mismatchedUrls = new Set();
+  function forCurrentPlayer(reply, url) {
+    reply = explainMediaProtocol(reply);
+    if (!reply?.ok || !reply.data?.choices?.length || VesperMediaEvidence.matchesPlayback(player, VesperMediaEvidence.mediaFacts(reply))) return reply;
+    if (url) mismatchedUrls.add(url);
+    return { ok: false, code: 'source-changed', message: 'The available format does not match this playback.' };
+  }
   const source = binding && VesperPlayerSource.http(message.playerUrl);
   const manifest = binding && VesperPlayerSource.http(message.manifestUrl);
   const mutedLoop = message.mutedLoop === true && !!source && (sender.frameId ?? 0) === 0;
@@ -1431,11 +1443,11 @@ async function playerOptions(message, sender) {
     && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
-  if (cached) return cached;
+  if (cached) return forCurrentPlayer(cached);
   // Page lookups and exact-source checks can share work. The picker must still
   // run its own selection path because prefetch can return only a status.
   const pendingKey = [lookupKey, prefetch ? 'prefetch' : 'picker', auth.authorized ? 'signed' : ''].join('|');
-  if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
+  if (mediaLookups.has(pendingKey)) return forCurrentPlayer(await mediaLookups.get(pendingKey));
   const task = (async () => {
     const state = await tabState(tab);
     const now = Date.now();
@@ -1548,8 +1560,8 @@ async function playerOptions(message, sender) {
     if ((socialFeed || binding && message.multiplePlayers === true && /^https?:/.test(identity)) && !possibleSources.length) {
       if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
       const exact = usableSource ? candidate(usableSource) : matchedManifest;
-      if (exact) return browserFallback(explainMediaProtocol(await nativeRequest(
-        exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000)));
+      if (exact) return browserFallback(forCurrentPlayer(await nativeRequest(
+        exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url));
       return { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
     }
     // A single-video page can give the resolver a better identity than nearby network traffic.
@@ -1559,16 +1571,20 @@ async function playerOptions(message, sender) {
     // Only anonymous, exact-input requests share a flight. Signed-in clicks retain their own authorization.
     const pageKey = lookupKey + '|' + JSON.stringify([pageInput.candidates, pageInput.pageTitle]);
     const pageLookup = async () => {
-      if (auth.authorized || message.refresh === true)
-        return nativeRequest(envelope('media-options', pageInput), 60000);
-      const existing = formatLookups.get(pageKey);
-      // Reuse even a refusal; the foreground path can still apply its usual verified fallbacks.
-      if (existing) return existing;
       const lookup = () => nativeRequest(envelope('media-options', pageInput), 60000);
-      const work = prefetch ? prepareMediaFormats(tab, page.hostname, lookup) : lookup();
-      formatLookups.set(pageKey, work);
-      try { return await work; }
-      finally { if (formatLookups.get(pageKey) === work) formatLookups.delete(pageKey); }
+      if (auth.authorized || message.refresh === true)
+        return forCurrentPlayer(await lookup());
+      const shareLookup = async () => {
+        const existing = formatLookups.get(pageKey);
+        if (existing) return existing;
+        const work = lookup();
+        formatLookups.set(pageKey, work);
+        try { return await work; }
+        finally { if (formatLookups.get(pageKey) === work) formatLookups.delete(pageKey); }
+      };
+      // Skipped prefetch is a local decision and must never become a shared reply.
+      const reply = prefetch ? await prepareMediaFormats(tab, page.hostname, shareLookup) : await shareLookup();
+      return forCurrentPlayer(reply);
     };
     // Both routes can answer for this player. Where the page lookup keeps being refused, the player's own
     // traffic is asked first and the page lookup becomes the fallback, instead of failing slowly on every click.
@@ -1635,7 +1651,7 @@ async function playerOptions(message, sender) {
         // adapter. Do not retry policy/protection or uncertain identity failures.
         const exact = wholeRepresentation ? matching : matchedManifest;
         if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0 && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
-          const checked = explainMediaProtocol(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000));
+          const checked = forCurrentPlayer(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
           if (checked.ok && checked.data?.choices?.length) return checked;
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
@@ -1668,6 +1684,7 @@ async function playerOptions(message, sender) {
         resources: [...resourceWitness], exactResources: [...exactResources], fragments: rankingFragments.map(fragment =>
           fragment.origin + '/' + fragment.parts.join('/'))
       });
+      for (const node of association.nodes) if (!node.compatible) mismatchedUrls.add(node.entry.source.url);
       const ordered = association.nodes.map(node => node.entry);
       const usable = distinctVerifiedDeliveries(association.nodes.filter(node => node.compatible).map(node => node.entry),
         auth.authorized === true);
@@ -1718,7 +1735,7 @@ async function playerOptions(message, sender) {
         || (!reply.ok && ['no-media','no-reusable-source','source-unavailable','browser-context','unavailable','site-refused','source-changed','source-expired','sign-in','unsupported','network','timeout'].includes(reply.code)))) {
       const useSignIn = await useBrowserSignIn();
       const proof = await observedBrowserBodyProof(await tabState(tab), message, sender, useSignIn);
-      if (proof && (proof.credentials !== 'include' || useSignIn)) {
+      if (proof && !mismatchedUrls.has(proof.url) && (proof.credentials !== 'include' || useSignIn)) {
         return { ok: true, code: 'ok', data: { ...reply.data, browserBodyAvailable: true,
           browserBodyProof: proof,
           browserBodyFormat: { mime: proof.mime, sizeBytes: proof.length, container: typeName(proof.mime), url: proof.url } } };

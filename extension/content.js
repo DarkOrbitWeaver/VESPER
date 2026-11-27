@@ -1196,16 +1196,8 @@
 
   function mount() {
     const fullscreen = fullscreenTarget();
-    const nativeVideo = fullscreen instanceof HTMLVideoElement;
-    const parent = fullscreen && !nativeVideo ? fullscreen : document.documentElement;
+    const parent = fullscreen && !(fullscreen instanceof HTMLVideoElement) ? fullscreen : document.documentElement;
     if (host.parentElement !== parent) parent.appendChild(host);
-    if (nativeVideo && typeof host.showPopover === 'function') {
-      host.setAttribute('popover', 'manual');
-      // Video is a replaced element. Its children cannot paint over it.
-      if (!host.matches(':popover-open')) host.showPopover();
-    } else if (host.hasAttribute('popover')) {
-      host.removeAttribute('popover');
-    }
   }
   document.addEventListener('fullscreenchange', () => {
     if (!alive()) return;
@@ -1224,7 +1216,22 @@
     updateFlyVisibility();
   }, { signal });
   document.addEventListener('keydown', e => {
-    if (!alive() || !e.altKey || !e.shiftKey || e.key.toLowerCase() !== 'v' || !perch || button?.hidden) return;
+    if (!alive() || !e.altKey || !e.shiftKey || e.key.toLowerCase() !== 'v' || e.repeat || butterflyHidden()) return;
+    const fullscreen = fullscreenTarget();
+    if (fullscreen instanceof HTMLVideoElement && fullscreen === video) {
+      // Chrome sends pointer input to the native fullscreen video. Open the
+      // picker on the same player after an explicit shortcut leaves fullscreen.
+      e.preventDefault();
+      const media = { player: video, playerState: pickerPlayerState(video) };
+      void document.exitFullscreen().then(() => {
+        if (!alive() || video !== media.player || !matchesPickerPlayer(media)) return;
+        mount();
+        place();
+        if (!button.hidden) void loadFormats();
+      }).catch(() => {});
+      return;
+    }
+    if (!perch || button?.hidden) return;
     e.preventDefault();
     button?.focus({ preventScroll: true });
   }, { signal });
@@ -1321,7 +1328,8 @@
       const rect = (manualPlayer === video ? visiblePlayer(video, 110, 70)
         : visiblePlayer(video) || (perch && !switching && visiblePlayer(video, 88, 64)))
         || pickerTransitionRect(video);
-      button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLIFrameElement || !containsPlayer(fullscreen, video));
+      button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement
+        || fullscreen instanceof HTMLIFrameElement || !containsPlayer(fullscreen, video));
       if (button.hidden) {
         fullscreenPlayer = false;
         stopFullscreenIdle();
@@ -1541,7 +1549,11 @@
 
   function updateFlyVisibility() {
     if (!button || !companion) return;
-    if (!perch || button.hidden) { companion.setVisible(false); return; }
+    if (!perch || button.hidden) {
+      button.classList.remove('show');
+      companion.setVisible(false);
+      return;
+    }
     const awake = Date.now() - pointerMovedAt < FULLSCREEN_IDLE;
     const show = !butterflyHidden() && !document.hidden && (!fullscreenPlayer || awake || drag
       || panel.classList.contains('show') || !!receiptTimer || button.matches(':focus-visible'));

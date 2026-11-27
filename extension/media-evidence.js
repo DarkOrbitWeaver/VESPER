@@ -103,6 +103,14 @@ globalThis.VesperMediaEvidence = (() => {
     return '';
   }
 
+  function matchesPlayback(player, facts) {
+    if ((player.height || player.kind === 'video') && facts.hasVideo === false) return false;
+    if (player.kind === 'audio' && facts.hasAudio === false) return false;
+    if (!player.durationSeconds || !facts.durationSeconds) return true;
+    const tolerance = Math.max(2, player.durationSeconds * 0.08);
+    return Math.abs(player.durationSeconds - facts.durationSeconds) <= tolerance;
+  }
+
   // A graph is constructed for one picker request, never persisted across
   // documents. Edges are evidence, not download authority.
   function associate({ sources, player = {}, currentUrl = '', resources = [], exactResources = [], fragments = [] } = {}) {
@@ -129,8 +137,7 @@ globalThis.VesperMediaEvidence = (() => {
       const facts = entry.reply?.ok ? mediaFacts(entry.reply) : {};
       const durationAgreement = player.durationSeconds && facts.durationSeconds
         ? Math.abs(player.durationSeconds - facts.durationSeconds) <= Math.max(1, player.durationSeconds * 0.03) : null;
-      const compatible = !((player.height || player.kind === 'video') && facts.hasVideo === false)
-        && !(player.kind === 'audio' && facts.hasAudio === false)
+      const compatible = matchesPlayback(player, facts)
         && !(entry.source?.sliceEvidence && durationAgreement === false);
       const edges = [];
       const direct = !!exact && url?.href === exact && !entry.source?.group;
@@ -178,5 +185,5 @@ globalThis.VesperMediaEvidence = (() => {
     return { nodes, selected: direct.length === 1 ? direct[0].entry : null };
   }
 
-  return { mediaFacts, playerFacts, score, trackLabel, associate };
+  return { mediaFacts, playerFacts, score, trackLabel, matchesPlayback, associate };
 })();
