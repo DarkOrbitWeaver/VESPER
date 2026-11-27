@@ -8,7 +8,7 @@ public sealed record VerifyResult(bool Ran, string? Sha256, bool? Matches, strin
 
 public sealed partial class DownloadEngine
 {
-    public IReadOnlyList<string> ReadLog() => _store.ReadEvents();
+    public IReadOnlyList<string> ReadLog(int max = 1000) => _store.ReadEvents(Math.Clamp(max, 1, 5200));
 
     // finalization: verify (only against a TRUSTED digest) and publish
     internal async Task<RunOutcome> FinalizeAsync(JobSession session, CancellationToken ct)

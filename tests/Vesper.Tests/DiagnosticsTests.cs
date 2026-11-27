@@ -7,6 +7,30 @@ namespace Vesper.Tests;
 public sealed class DiagnosticsTests
 {
     [Fact]
+    public void Browser_failures_keep_the_original_build_and_time_without_duplicate_rows()
+    {
+        const string message = """
+            {"v":2,"type":"browser-diagnostics","id":"diagnostics-flush",
+             "entries":[{"id":"29414d50-bf70-4cb8-bdfa-f9be14bb3cbf","utc":1704067200000,
+              "build":"2.0.0-aaa.7","kind":"media-failed","code":"site-refused",
+              "page":"https://www.instagram.com/reel/*","resource":"https://cdn.test/*.mp4",
+              "facts":{"stage":"formats","native":"site-refused","status":403,"bodyProof":"mse","observedLookups":"source-changed,site-refused"}}]}
+            """;
+        Assert.True(BridgeProtocol.TryParse(message, out var request, out string error), error);
+        Assert.False(BridgeProtocol.TryParse(message.Replace("/reel/*", "/reel/*?token=SECRET"), out _, out _));
+        Assert.False(BridgeProtocol.TryParse(message.Replace("\"bodyProof\"", "\"authorization\""), out _, out _));
+        using var harness = new Harness();
+        Assert.True(harness.Engine.RecordBrowserDiagnostics(request.Diagnostics!));
+        Assert.True(harness.Engine.RecordBrowserDiagnostics(request.Diagnostics!));
+        harness.Restart();
+
+        string line = Assert.Single(harness.Engine.ReadLog(), line => line.Contains("media-failed", StringComparison.Ordinal));
+        Assert.StartsWith("2024-01-01T00:00:00", line);
+        Assert.Contains("2.0.0-aaa.7", line);
+        Assert.Contains("\"status\":403", line);
+    }
+
+    [Fact]
     public void Scrub_redacts_urls_headers_assignments_and_profile_paths()
     {
         string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);

@@ -474,7 +474,8 @@ public sealed class SecureHttpClient : IDisposable
                     string origin = url.GetLeftPart(UriPartial.Authority);
                     _o.Diagnostics?.Invoke($"HTTP {(int)status} from {origin}. Retry at {until:O}.");
                     resp.Dispose();
-                    throw new MediaResolverException(MediaErrors.RateLimited($"HTTP {(int)status} from {origin}") with { RetryAt = until });
+                    throw new MediaResolverException(MediaErrors.RateLimited($"HTTP {(int)status} from {origin}")
+                        with { RetryAt = until, HttpStatus = (int)status });
                 }
                 if (status is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.SeeOther
                     or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect

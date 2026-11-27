@@ -552,12 +552,14 @@ public sealed class JobStore : IDisposable
     }
 
     // bounded event log (privacy: callers pass redacted text)
-    public void LogEvent(Guid? jobId, string kind, string detail)
+    public void LogEvent(Guid? jobId, string kind, string detail, DateTime? utc = null, bool once = false)
     {
         lock (_gate)
         {
-            Execute("INSERT INTO events(job_id, utc, kind, detail) VALUES($j,$t,$k,$d);",
-                ("$j", jobId?.ToString("D")), ("$t", Iso(DateTime.UtcNow)), ("$k", kind), ("$d", detail));
+            const string insert = "INSERT INTO events(job_id, utc, kind, detail) SELECT $j,$t,$k,$d";
+            const string onceOnly = " WHERE NOT EXISTS (SELECT 1 FROM events WHERE job_id=$j AND kind=$k)";
+            Execute(insert + (once ? onceOnly : ""), ("$j", jobId?.ToString("D")), ("$t", Iso(utc ?? DateTime.UtcNow)),
+                ("$k", kind), ("$d", detail));
             if (++_eventsSinceTrim >= 200)
             {
                 _eventsSinceTrim = 0;

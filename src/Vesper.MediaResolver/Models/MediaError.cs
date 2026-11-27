@@ -39,6 +39,7 @@ public sealed record MediaError(
 {
     public string? EntryId { get; init; }
     public DateTimeOffset? RetryAt { get; init; }
+    public int? HttpStatus { get; init; }
 
     public override string ToString() => $"{Code}: {UserMessage}";
 }
@@ -119,7 +120,7 @@ public static class MediaErrors
     public static MediaError FromHttpStatus(int status, Uri url)
     {
         string diag = $"HTTP {status} from {UrlRedactor.Redact(url)}";
-        return status switch
+        MediaError error = status switch
         {
             401 => LoginRequired(diag),
             403 => AuthRequired(diag),
@@ -129,5 +130,6 @@ public static class MediaErrors
             >= 500 => Network(diag),
             _ => Network(diag, false)
         };
+        return error with { HttpStatus = status };
     }
 }

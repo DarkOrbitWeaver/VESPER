@@ -55,6 +55,7 @@ internal static class EngineHost
         var options = new EngineOptions
         {
             DataDirectory = DataDirectory,
+            DiagnosticBuild = Vesper.Shared.BuildInfo.Version(typeof(EngineHost).Assembly),
             BrowserDownloadsFolder = WindowsDownloadsFolder(),
             AllowPrivateNetworks = p.AllowPrivateNetworks,
             PauseOnMeteredNetwork = p.PauseOnMeteredNetwork,

@@ -255,6 +255,7 @@ internal static class Program
         if (request is { Type: "browser-activity", Operation: "watch" }
             || request is { Type: "browser-managed", Operation: "watch" or "complete" }
             || request is { Type: "browser-body", BrowserBody.Operation: not "begin" }
+            || request.Type == "browser-diagnostics"
             || !TryStartApp())
             return Serialize(BridgeResponse.Fail(request.Id, "app-unavailable", "The desktop connection is unavailable."));
 

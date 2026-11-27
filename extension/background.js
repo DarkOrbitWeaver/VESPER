@@ -4,7 +4,7 @@
 
 importScripts('native-session.js', 'vesper-experience.js', 'player-source.js', 'media-evidence.js', 'vesper-intelligence.js',
   'vesper-model.js', 'vesper-inference.js', 'vesper-evidence-graph.js', 'vesper-planner.js', 'vesper-batch-events.js',
-  'browser-preferences.js', 'browser-body.js', 'early-download.js');
+  'browser-preferences.js', 'browser-body.js', 'early-download.js', 'diagnostics.js');
 
 const HOST = 'com.vesper.downloader';
 const PROTOCOL = 2;
@@ -21,6 +21,8 @@ const MEDIA_BODY_REFUSALS = ['no-media', 'no-reusable-source', 'source-unavailab
   'site-refused', 'source-changed', 'source-expired', 'sign-in', 'unsupported', 'network', 'timeout'];
 const mediaLookupOutcome = reply => reply?.ok ? 'ok' : [...MEDIA_BODY_REFUSALS, 'protected', 'blocked', 'rate-limited',
   'desktop-version-mismatch', 'host-missing', 'app-unavailable', 'host-error'].includes(reply?.code) ? reply.code : 'other';
+const mediaLookupTrace = reply => Number.isInteger(reply?.data?.status)
+  ? mediaLookupOutcome(reply) + ':' + reply.data.status : mediaLookupOutcome(reply);
 const MANIFEST_WATCH_MS = 15 * 60_000;
 const MAX_WATCHED_TABS = 16;
 const SOURCE_EXPIRY_ALARM = 'vesper-media-sources';
@@ -31,7 +33,13 @@ const browserPreferencesReady = VesperBrowserPreferences.migrate().catch(() => {
 // Requests share one multiplexed native connection (native-session.js). Older hosts that do not
 // understand sessions are detected by the handshake and get one process per message, as before.
 function nativeRequest(message, timeoutMs = 330000) {
-  return VesperNativeSession.request(HOST, message, timeoutMs);
+  return VesperNativeSession.request(HOST, message, timeoutMs).then(reply => {
+    if (message.type === 'hello' && reply?.ok) {
+      logRetryAfter = 0;
+      scheduleFailureExport();
+    }
+    return reply;
+  });
 }
 
 const envelope = (type, extra = {}) => ({ v: PROTOCOL, id: crypto.randomUUID(), type, ...extra });
@@ -490,6 +498,9 @@ async function startBrowserChoice(choice) {
   try {
     choice.downloadId = await chrome.downloads.download({ url: choice.url, saveAs: false, conflictAction: 'uniquify' });
     await saveBrowserChoices().catch(() => {});
+    void recordFailure('handoff', 'chrome-browser-choice', choice.page, choice.url, {
+      browserId: choice.downloadId, chromeStarted: true, native: choice.nativeFailure
+    });
     return true;
   } catch {
     choice.started = false;
@@ -1560,7 +1571,8 @@ async function playerOptions(message, sender) {
         if (choice.expires <= Date.now()) browserChoices.delete(key);
       while (browserChoices.size >= 32) browserChoices.delete(browserChoices.keys().next().value);
       browserChoices.set(token, { url: source.href, generation: message.generation ?? 0,
-        identity, tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
+        identity, page: page.origin, nativeFailure: mediaLookupTrace(failure),
+        tab, frame, documentId: sender.documentId, expires: Date.now() + 120_000 });
       await saveBrowserChoices();
       return { ok: true, data: { browserChoice: token, title, choices: [{ index: 0,
         label: matching.mime.startsWith('audio/') ? 'Original audio' : 'Original file',
@@ -1574,7 +1586,7 @@ async function playerOptions(message, sender) {
       if (exact) {
         const reply = forCurrentPlayer(await nativeRequest(
           exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
-        observedOutcomes = [mediaLookupOutcome(reply)];
+        observedOutcomes = [mediaLookupTrace(reply)];
         return browserFallback(reply);
       }
       return { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
@@ -1589,7 +1601,7 @@ async function playerOptions(message, sender) {
       const lookup = () => nativeRequest(envelope('media-options', pageInput), 60000);
       const checkedPage = result => {
         const reply = forCurrentPlayer(result);
-        pageOutcome = mediaLookupOutcome(reply);
+        pageOutcome = mediaLookupTrace(reply);
         return reply;
       };
       if (auth.authorized || message.refresh === true)
@@ -1682,7 +1694,7 @@ async function playerOptions(message, sender) {
             && !(socialSite && SOCIAL_LOOKUP_STOPS.has(reply.code))
             && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
           const checked = forCurrentPlayer(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
-          observedOutcomes = [mediaLookupOutcome(checked)];
+          observedOutcomes = [mediaLookupTrace(checked)];
           if (checked.ok && checked.data?.choices?.length) return checked;
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
@@ -1710,7 +1722,7 @@ async function playerOptions(message, sender) {
             'app-unavailable', 'host-error'].includes(result.reply?.code))) {
         checked.push(...await verifyObservedSources(ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4), options));
       }
-      observedOutcomes = checked.slice(0, 8).map(result => mediaLookupOutcome(result.reply));
+      observedOutcomes = checked.slice(0, 8).map(result => mediaLookupTrace(result.reply));
       const socialRefusal = socialSite && checked.find(result => SOCIAL_LOOKUP_STOPS.has(result.reply?.code));
       if (socialRefusal && !checked.some(usableReply)) return browserFallback(socialRefusal.reply);
       const association = VesperMediaEvidence.associate({
@@ -1775,7 +1787,7 @@ async function playerOptions(message, sender) {
           browserBodyFormat: { mime: proof.mime, sizeBytes: proof.length, container: typeName(proof.mime), url: proof.url } } };
       }
     }
-    if (socialSite && !prefetch && !reply.ok) {
+    if (!prefetch && !reply.ok) {
       return { ...reply, data: { ...reply.data, mediaFailure: {
         code: mediaLookupOutcome(reply), boundPlayer: binding, boundPost: postBound, signedIn: auth.authorized === true,
         responses: scoped.length, exactMatches: observedUrls.size, candidates: candidateCount,
@@ -1914,6 +1926,7 @@ async function describe(url, durationSeconds) {
 // They get only what the in-page picker needs. Link submissions and settings stay with extension pages.
 const EXTENSION_PAGES = `chrome-extension://${chrome.runtime.id}/`;
 const CONTENT_COMMANDS = new Set(['early-download', 'smart-submit', 'media-element', 'media-options', 'media-select', 'media-source-select', 'browser-media-select', 'native-picker',
+  'diagnostic-failure',
   'batch-arm', 'batch-status', 'batch-clear', 'batch-disarm', 'batch-journal-read', 'batch-journal-write', 'batch-journal-ack', 'browser-body-status', 'browser-body-media-proof']);
 const PAGE_COMMANDS = new Set([...CONTENT_COMMANDS, 'tab-state', 'hello',
   'native-picker', 'describe', 'retry', 'submit', 'managed-downloads', 'continue-managed']);
@@ -1933,6 +1946,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   (async () => {
     if (message.type === 'early-download') return earlyDirectDownload(message, sender);
+    if (message.type === 'diagnostic-failure') {
+      const page = VesperPlayerSource.http(sender.url);
+      if (!page || sender.tab?.incognito) return { ok: false };
+      await siteRulesLoaded;
+      if (matchesNeverCaptureHost({ url: page.href })) return { ok: false };
+      const kind = message.category === 'download' ? 'download-failed' : 'media-failed';
+      const entry = await recordFailure(kind, message.code, page.href, message.resource, message.facts);
+      return { ok: !!entry, data: entry };
+    }
     if (message.type === 'media-options' && message.prefetch === true
         && (VesperPlayerSource.isSocialFeedSite(sender.url) || !await captureCanBegin()))
       return { ok: true, data: { prefetchSkipped: true } };
@@ -2095,7 +2117,11 @@ chrome.runtime.onInstalled.addListener(async () => {
   await recoverChromeDownloads();
 });
 
-chrome.runtime.onStartup.addListener(async () => { await updateBadge(); await recoverChromeDownloads(); });
+chrome.runtime.onStartup.addListener(async () => {
+  scheduleFailureExport();
+  await updateBadge();
+  await recoverChromeDownloads();
+});
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   try { await runContextAction(info, tab); }

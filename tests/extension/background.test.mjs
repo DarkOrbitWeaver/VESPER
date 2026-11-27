@@ -10,7 +10,7 @@ const isBrowserSubmission = message => ['browser-capture', 'browser-submit'].inc
 function load(nativeReplies = {}, { download, downloadHistory = [], signInPermission = false, prefs = {}, activity = false, sessionData = {},
   failDownloadSearch = false, failDownloadCancel = false, failDownloadResume = false, deferDownloadCancel = false,
   localData = {}, syncData = { ...prefs }, cookies = [{ name: 'session', value: 'test-value', path: '/' }],
-  preflightReady = false, preflightDelay = 0, playerPicker = false, helperProofs, earlyFetch } = {}) {
+  preflightReady = false, preflightDelay = 0, playerPicker = false, helperProofs, earlyFetch, diagnosticBuild } = {}) {
   const listeners = [];
   const event = { addListener: (fn) => listeners.push(fn) };
   const storage = (data = {}) => {
@@ -70,6 +70,7 @@ function load(nativeReplies = {}, { download, downloadHistory = [], signInPermis
   const chrome = {
     runtime: {
       id: 'vesper-test',
+      ...(diagnosticBuild ? { getManifest: () => ({ version_name: diagnosticBuild }) } : {}),
       onMessage: { addListener: fn => { onMessage = fn; } }, onInstalled: { addListener: fn => { onInstalled = fn; } }, onStartup: event, lastError: undefined,
       sendNativeMessage: (host, message, cb) => {
         if (message.type === 'capture-preflight') {
@@ -379,6 +380,49 @@ test('Chrome misses omit private windows, deliberately excluded sites, and pause
     assert.equal(app.sessionData.vesperCaptureDecisions, undefined);
     assert.deepEqual(app.actions, []);
   }
+});
+
+test('browser failure diagnostics survive a worker restart and export once when the helper is back', async () => {
+  const file = { ...activeDownload(), url: 'https://cdn.test/download/private-name.patch?token=URL-SECRET', bytesReceived: 7 };
+  const first = load({}, { download: file, diagnosticBuild: '2.0.0-old' });
+  const failure = { type: 'diagnostic-failure', code: 'site-refused',
+    resource: 'https://media.test/video/user-name.mp4?sig=MEDIA-SECRET',
+    facts: { stage: 'formats', ready: 4, responses: 12, postLookup: 'site-refused',
+      cookie: 'COOKIE-SECRET', observedLookups: ['source-changed'] } };
+  const sender = { ...earlySender, url: 'https://www.tiktok.com/@PRIVATE_USER/video/123456789/' };
+  try {
+    await first.onCreated(file);
+    file.state = 'interrupted';
+    file.error = 'NETWORK_FAILED';
+    await first.onChanged({ id: file.id, state: { current: 'interrupted' } });
+    assert.equal((await first.message(failure, sender)).ok, true);
+    assert.equal((await first.message(failure, { ...sender, tab: { ...sender.tab, incognito: true } })).ok, false);
+    await first.evaluate('exportPendingFailures()');
+    assert.equal(first.localData.vesperFailureLog.length, 3);
+    assert.ok(first.localData.vesperFailureLog.every(entry => !entry.exported));
+  } finally { first.stopWorker(); }
+
+  const second = load({ 'browser-diagnostics': { ok: true } }, {
+    diagnosticBuild: '2.0.0-new', localData: first.localData
+  });
+  try {
+    await second.evaluate('exportPendingFailures()');
+    await second.evaluate('exportPendingFailures()');
+    const batch = second.sent.filter(message => message.type === 'browser-diagnostics');
+    assert.equal(batch.length, 1);
+    const [miss, stopped, media] = batch[0].entries;
+    assert.equal(miss.kind, 'chrome-miss');
+    assert.equal(miss.facts.bytes, 7);
+    assert.equal(stopped.facts.chromeError, 'NETWORK_FAILED');
+    assert.equal(media.kind, 'media-failed');
+    assert.equal(media.build, '2.0.0-old');
+    assert.equal(typeof media.utc, 'number');
+    assert.equal(media.page, 'https://www.tiktok.com/*/video/*');
+    assert.equal(media.resource, 'https://media.test/video/*.mp4');
+    assert.equal(media.facts.responses, 12);
+    assert.doesNotMatch(JSON.stringify(batch), /SECRET|PRIVATE_USER|123456789|private-name|user-name/);
+    assert.ok(second.localData.vesperFailureLog.every(entry => entry.exported));
+  } finally { second.stopWorker(); }
 });
 
 test('upgrade releases only a legacy zero-byte pause after its native transfer stops', async () => {
@@ -2841,6 +2885,25 @@ test('preloaded blob media is admitted only by a recent exact witness in the sam
 });
 const earlySender = {tab:{id:81,url:'https://example.com/releases'},frameId:0,documentId:'early-document',url:'https://example.com/releases'};
 const earlyUrl = 'https://example.com/files/setup.msi';
+
+test('two early requests for the same click never send the second download to Chrome', async () => {
+  let finishProbe, enteredProbe;
+  const probeStarted = new Promise(resolve => { enteredProbe = resolve; });
+  const probe = new Promise(resolve => { finishProbe = resolve; });
+  const app = load({ 'browser-capture': started, 'browser-transfer': transfer('active') }, {
+    earlyFetch: () => { enteredProbe(); return probe; }
+  });
+  try {
+    const request = { type: 'early-download', url: earlyUrl };
+    const first = app.message(request, earlySender);
+    await probeStarted;
+    assert.equal((await app.message(request, earlySender)).ok, true);
+    finishProbe(earlyHeaders());
+    assert.equal((await first).ok, true);
+    assert.equal(app.sent.filter(message => message.type === 'browser-capture').length, 1);
+    assert.deepEqual(app.downloadHistory, []);
+  } finally { app.stopWorker(); }
+});
 function earlyHeaders(url=earlyUrl, changes={}) {
   return {status:200,url,headers:new Headers({'Content-Type':'application/octet-stream','Content-Length':'500000','ETag':'"v1"','Content-Disposition':'attachment',...changes})};
 }

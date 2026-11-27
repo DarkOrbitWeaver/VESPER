@@ -108,11 +108,12 @@ internal sealed partial class BrowserBridgeHandler
         if (resolved.Item is not { } item)
         {
             var error = resolved.Error;
+            object data = new { retryAt = error?.RetryAt, status = error?.HttpStatus, resolver = error?.Code.ToString() };
             if (request.Type is "media-source-options" or "media-range-options" or "media-group-options" && error?.Code == MediaErrorCode.NoDownloadableMedia)
-                return BridgeResponse.Fail(request.Id, "source-unavailable", "VESPER couldn't verify this source. Go back to try another source.");
+                return BridgeResponse.Fail(request.Id, "source-unavailable", "VESPER couldn't verify this source. Go back to try another source.") with { Data = data };
             string code = MapResolverError(error?.Code);
             var failure = BridgeResponse.Fail(request.Id, code, error?.UserMessage ?? "No downloadable media was found.");
-            return error?.RetryAt is { } retryAt ? failure with { Data = new { retryAt } } : failure;
+            return failure with { Data = data };
         }
 
         return CreateBrowserOptions(request.Id, item, page.AbsoluteUri, discovery.Token, request.PlaybackFingerprints);

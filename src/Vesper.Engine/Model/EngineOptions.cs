@@ -39,6 +39,7 @@ public sealed record SchedulePolicy(bool Enabled, TimeOnly Start, TimeOnly End)
 public sealed class EngineOptions
 {
     public required string DataDirectory { get; init; }
+    public string? DiagnosticBuild { get; init; }
     public string DefaultFolder { get; set; } =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
     public string? BrowserDownloadsFolder { get; init; }

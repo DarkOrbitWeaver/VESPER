@@ -35,13 +35,20 @@
   document.addEventListener('vesper-early-download-request', event => {
     // Page-authored events are only proposals. Independently verify a recent,
     // one-shot trusted gesture and a supported download link.
-    if (!canIntercept() || pendingUrl || !event.cancelable || !intentAt || Date.now() - intentAt > 15_000
+    if (!canIntercept() || !event.cancelable || !intentAt || Date.now() - intentAt > 15_000
         || typeof event.detail !== 'string' || event.detail.length > 6000) return;
     let proposal;
     try { proposal = JSON.parse(event.detail); } catch { return; }
     if (!proposal || typeof proposal.downloadName !== 'string' || !proposal.downloadName) return;
     const url = VesperEarlyDownload.candidate(proposal.url, location.href, proposal.downloadName);
     if (!url) return;
+    if (pendingUrl) {
+      if (pendingUrl === url) {
+        event.preventDefault();
+        intentAt = 0;
+      }
+      return;
+    }
     const original = document.createElement('a');
     original.href = url;
     original.download = proposal.downloadName;

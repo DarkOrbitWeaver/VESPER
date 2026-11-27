@@ -108,6 +108,11 @@ public sealed partial class DownloadEngine
                 }
             }
         }
+        else if (!result.Ok && result.Status != AddStatus.Duplicate)
+        {
+            string? host = Uri.TryCreate(request.Url, UriKind.Absolute, out Uri? uri) ? uri.Host : null;
+            Log(null, "add-rejected", $"{result.Status} kind={request.Kind} host={host} {result.Message}");
+        }
         return result;
     }
 
@@ -1073,7 +1078,7 @@ public static class Diagnostics
                     $"Exported UTC: {DateTimeOffset.UtcNow:O}"
                 ];
                 AddText(archive, "system.txt", string.Join(Environment.NewLine, system));
-                AddText(archive, "events.txt", string.Join(Environment.NewLine, engine.ReadLog().Select(Scrub)));
+                AddText(archive, "events.txt", string.Join(Environment.NewLine, engine.ReadLog(5200).Select(Scrub)));
                 AddText(archive, "contents.txt", "This archive contains system details and the scrubbed event log only. It excludes download files, settings, databases, cookies and authorization headers. Event details may include filenames; review before sharing.");
             }
             File.Move(temporary, target, overwrite: true);

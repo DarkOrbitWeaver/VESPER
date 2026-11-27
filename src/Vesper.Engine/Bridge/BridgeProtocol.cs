@@ -20,7 +20,11 @@ public sealed record BridgeRequest(string Id, string Type, string Mode, string? 
     MediaTimeRange? Clip = null, BridgeItem? MediaAuth = null, string? AudioTrackId = null,
     IReadOnlyList<string>? SubtitleLanguages = null, bool IncludeAutoSubtitles = false,
     bool EmbedSubtitles = false, BrowserCompletedFile? CompletedFile = null, BrowserBodyRequest? BrowserBody = null,
-    IReadOnlyList<string>? PlaybackFingerprints = null, IReadOnlyList<BridgeHostCredential>? HostCredentials = null);
+    IReadOnlyList<string>? PlaybackFingerprints = null, IReadOnlyList<BridgeHostCredential>? HostCredentials = null,
+    IReadOnlyList<BrowserDiagnostic>? Diagnostics = null);
+
+public sealed record BrowserDiagnostic(Guid Id, DateTimeOffset Utc, string Build, string Kind, string Code,
+    string? Page, string? Resource, JsonElement Facts);
 
 /// <param name="TransferReason">Why a Chrome handoff was not ready ("auth", "queued", "slow", ...). The extension turns it into plain words.</param>
 public sealed record BridgeResult(string Url, string Status, string? JobId, string Message, bool? TransferReady = null,
@@ -73,8 +77,16 @@ public static class BridgeProtocol
 
             string type = Str(root, "type") ?? "";
             if (type is not ("hello" or "capture-preflight" or "probe" or "submit" or "batch-review" or "media-picker" or "media-options" or "media-source-options" or "media-range-options" or "media-group-options" or "media-select"
-                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed" or "browser-body"))
+                or "browser-submit" or "browser-capture" or "browser-transfer" or "browser-activity" or "browser-managed" or "browser-body" or "browser-diagnostics"))
             { error = "Unknown request type."; return false; }
+
+            if (type == "browser-diagnostics")
+            {
+                if (!TryBrowserDiagnostics(root, out List<BrowserDiagnostic> diagnostics))
+                { error = "Invalid browser diagnostics."; return false; }
+                request = new BridgeRequest(id, type, "ask", null, [], Diagnostics: diagnostics);
+                return true;
+            }
 
             string mode = Str(root, "mode") ?? "ask";
             if (mode is not ("ask" or "download" or "queue")) { error = "Unknown mode."; return false; }
@@ -546,6 +558,63 @@ public static class BridgeProtocol
         host = value;
         return true;
     }
+
+    private static readonly HashSet<string> DiagnosticFields =
+    [
+        "stage", "attempt", "job", "browserId", "state", "method", "status", "mime", "bytes", "total",
+        "proof", "attachment", "ranges", "redirected", "query", "named", "signedIn", "reuse", "native", "finalRoute",
+        "chromeError", "chromeStarted", "routeMatch", "elapsedMs", "nativeMs",
+        "source", "ready", "generation", "playing", "height", "durationMs", "preview", "refresh", "quick",
+        "boundPlayer", "boundPost", "responses", "exactMatches", "candidates", "postLookup", "observedLookups",
+        "witnesses", "tracks", "completeTracks", "retainedBytes", "bodyProof", "attemptedBody", "subtitleFailures"
+    ];
+
+    private static bool TryBrowserDiagnostics(JsonElement root, out List<BrowserDiagnostic> entries)
+    {
+        entries = [];
+        if (!root.TryGetProperty("entries", out JsonElement list) || list.ValueKind != JsonValueKind.Array
+            || list.GetArrayLength() is < 1 or > 16) return false;
+        foreach (JsonElement entry in list.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object || !Guid.TryParseExact(Str(entry, "id"), "D", out Guid id)
+                || !entry.TryGetProperty("utc", out JsonElement utc) || utc.ValueKind != JsonValueKind.Number
+                || !utc.TryGetInt64(out long milliseconds) || milliseconds is < 1 or > 253402300799999) return false;
+            string? build = Str(entry, "build"), kind = Str(entry, "kind"), code = Str(entry, "code");
+            string? page = Str(entry, "page"), resource = Str(entry, "resource");
+            if (!DiagnosticToken(build) || !DiagnosticToken(code)
+                || kind is not ("chrome-miss" or "chrome-result" or "handoff" or "media-failed" or "download-failed")
+                || !DiagnosticRoute(page) || !DiagnosticRoute(resource)
+                || !entry.TryGetProperty("facts", out JsonElement facts) || facts.ValueKind != JsonValueKind.Object
+                || facts.GetRawText().Length > 2500) return false;
+            foreach (JsonProperty fact in facts.EnumerateObject())
+            {
+                if (!DiagnosticFields.Contains(fact.Name)) return false;
+                if (fact.Value.ValueKind is JsonValueKind.True or JsonValueKind.False) continue;
+                if (fact.Value.ValueKind == JsonValueKind.Number && fact.Value.TryGetInt64(out long number) && number >= 0) continue;
+                if (fact.Value.ValueKind != JsonValueKind.String) return false;
+                string value = fact.Value.GetString()!;
+                bool valid = fact.Name switch
+                {
+                    "finalRoute" => DiagnosticRoute(value),
+                    "mime" => value.Length <= 97 && value.Count(c => c == '/') == 1
+                        && value.All(c => char.IsAsciiLetterOrDigit(c) || "!#$&^_.+-/".Contains(c)),
+                    "observedLookups" => value.Length <= 400 && value.Split(',').All(DiagnosticToken),
+                    _ => DiagnosticToken(value)
+                };
+                if (!valid) return false;
+            }
+            entries.Add(new BrowserDiagnostic(id, DateTimeOffset.FromUnixTimeMilliseconds(milliseconds), build!, kind, code!, page, resource, facts.Clone()));
+        }
+        return true;
+    }
+
+    private static bool DiagnosticToken(string? value) => value is { Length: > 0 and <= 96 }
+        && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '.' or '+' or ':' or '-');
+
+    private static bool DiagnosticRoute(string? value) => value is null or "blob" or "data"
+        || value.Length <= 400 && Uri.TryCreate(value, UriKind.Absolute, out Uri? uri)
+        && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0 && uri.Query.Length == 0 && uri.Fragment.Length == 0
+        && uri.AbsolutePath.All(c => char.IsAsciiLetterOrDigit(c) || c is '/' or '*' or '.');
 
     private static string? Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out JsonElement p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null;

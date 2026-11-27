@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net.NetworkInformation;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Microsoft.Win32.SafeHandles;
 
@@ -274,8 +275,34 @@ public sealed partial class DownloadEngine : IDisposable
 
     internal void Log(Guid? jobId, string kind, string detail)
     {
-        try { _store.LogEvent(jobId, kind, Diagnostics.Scrub(detail)); }
+        try { _store.LogEvent(jobId, kind, LogDetail(detail)); }
         catch (SqliteException) { /* logging must never take a download down */ }
+    }
+
+    private string LogDetail(string detail) =>
+        Diagnostics.Scrub(Options.DiagnosticBuild is { Length: > 0 } build ? $"build={build} {detail}" : detail);
+
+    public bool RecordBrowserDiagnostics(IReadOnlyList<BrowserDiagnostic> entries)
+    {
+        try
+        {
+            foreach (BrowserDiagnostic entry in entries)
+            {
+                string detail = JsonSerializer.Serialize(new
+                {
+                    entry.Id, extension = entry.Build, entry.Code, entry.Page, entry.Resource, entry.Facts
+                }, BridgeProtocol.Json);
+                _store.LogEvent(entry.Id, entry.Kind, LogDetail(detail), entry.Utc.UtcDateTime, once: true);
+            }
+            return true;
+        }
+        catch (SqliteException) { return false; }
+    }
+
+    private void LogRunEnd(DownloadJob job, string message)
+    {
+        string? host = Uri.TryCreate(job.SourceUrl, UriKind.Absolute, out Uri? uri) ? uri.Host : null;
+        Log(job.Id, "run-ended", $"{job.State} {job.Reason} kind={job.Kind} host={host} saved={job.Extents.TotalBytes} total={job.TotalBytes} retry={job.RetryCount} identity={job.Identity} {message}");
     }
 
     /// <summary>
@@ -480,7 +507,7 @@ public sealed partial class DownloadEngine : IDisposable
                     Changed(job);
                     if (elapsed is { } duration && outcome.State == JobState.Completed)
                         _mediaDeliveryHistory.ObserveTiming(job, duration);
-                    Log(job.Id, "run-ended", $"{job.State} {job.Reason} {outcome.Message}");
+                    LogRunEnd(job, outcome.Message);
                 }
                 catch (LocalStorageException ex)
                 {
@@ -645,7 +672,7 @@ public sealed partial class DownloadEngine : IDisposable
             job.ApplyPersistedState(updated);
             ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
             Changed(job);
-            Log(id, "run-ended", $"{job.State} {job.Reason} {pending.Outcome.Message}");
+            LogRunEnd(job, pending.Outcome.Message);
         }
     }
 

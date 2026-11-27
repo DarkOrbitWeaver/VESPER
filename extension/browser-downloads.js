@@ -6,6 +6,8 @@ const MAX_DECISIONS = 20;
 const EVIDENCE_AGE = 30_000;
 const responseFacts = new Map();
 const earlyFailures = new Map();
+const nativeAttempts = new Map();
+const chromeStarts = new Map();
 const observedDownloads = new Map();
 const browserOperations = new Map();
 let decisionWrites = Promise.resolve();
@@ -29,6 +31,8 @@ const capturePreferencesReady = browserPreferencesReady.then(() => new Promise(r
       if (paused) {
         responseFacts.clear();
         earlyFailures.clear();
+        nativeAttempts.clear();
+        chromeStarts.clear();
         observedDownloads.clear();
         captureClear = decisionWrites.then(() => chrome.storage.session.remove(DECISIONS_KEY)).catch(() => {});
       }
@@ -46,18 +50,6 @@ async function captureCanBegin(generation = captureGeneration) {
   await capturePreferencesReady;
   await captureClear;
   return captureAllowed(generation);
-}
-
-// Keep full URLs only in the short-lived lookup. Logs contain route shapes, not private path values.
-function diagnosticRoute(value) {
-  const url = VesperPlayerSource.http(value);
-  if (!url) return undefined;
-  const parts = url.pathname.split('/').slice(1, 9).map(part => {
-    if (/^(archive|attachments?|downloads?|exports?|files?|refs|heads|tags|releases?|zip|tar\.gz)$/i.test(part)) return part;
-    const suffix = /\.(?:zip|gz|7z|rar|msi|exe|mp4|pdf|csv|xlsx|docx)$/i.exec(part);
-    return part ? '*' + (suffix?.[0] || '') : '';
-  });
-  return url.origin + '/' + parts.join('/');
 }
 
 function rememberDownloadFact(map, key, facts) {
@@ -104,7 +96,9 @@ async function logChromeMiss(item, generation, useEarlyFailure = true) {
   const evidence = recentDownloadFact(responseFacts, final);
   const observed = evidence?.ambiguous ? undefined : evidence;
   const failure = useEarlyFailure && recentDownloadFact(earlyFailures, original);
+  const native = recentDownloadFact(nativeAttempts, original) || recentDownloadFact(nativeAttempts, final);
   const received = byteCount(item.bytesReceived);
+  if (useEarlyFailure) rememberDownloadFact(chromeStarts, original, { id: item.id });
   const entry = {
     id: item.id, startTime: item.startTime, at: Date.now(), outcome: 'failed',
     reason: failure?.reason || (/^(blob:|data:)/i.test(original) ? 'browser-generated'
@@ -131,6 +125,15 @@ async function logChromeMiss(item, generation, useEarlyFailure = true) {
   });
   decisionWrites = write.catch(() => {});
   await decisionWrites;
+  if (useEarlyFailure) {
+    await recordFailure('chrome-miss', entry.reason, item.referrer, original, {
+      attempt: failure?.attempt || native?.attempt, job: native?.job, native: native?.state,
+      browserId: item.id, chromeStarted: true, state: item.state,
+      finalRoute: final, redirected: entry.redirected, query: entry.hasQuery, bytes: received, total: entry.size,
+      method: observed?.method, status: observed?.status, mime: observed?.type,
+      attachment: observed?.attachment, ranges: observed?.ranges, proof: observed?.strongEtag ? 'etag' : undefined
+    });
+  }
 }
 
 // RFC 9110 permits a one-second difference with trusted clocks. Use 60 seconds here.
@@ -217,11 +220,22 @@ chrome.downloads.onCreated.addListener(async item => {
 chrome.downloads.onChanged.addListener(async change => {
   const generation = captureGeneration;
   try {
-    if (change.state || change.finalUrl || change.totalBytes || change.bytesReceived) {
+    if (change.state || change.error || change.finalUrl || change.totalBytes || change.bytesReceived) {
       const seen = recentDownloadFact(observedDownloads, change.id);
-      if (seen || change.state?.current === 'complete') {
+      if (seen || ['complete', 'interrupted'].includes(change.state?.current) || change.error?.current) {
         const item = await getChromeDownload(change.id);
         if (seen && item?.startTime === seen.startTime) await logChromeMiss(item, generation, false);
+        if (item && !item.incognito && (!item.byExtensionId || startedByVesper(item))
+            && (['complete', 'interrupted'].includes(change.state?.current) || change.error?.current)
+            && await captureCanBegin(generation)) {
+          await siteRulesLoaded;
+          if (captureAllowed(generation) && !matchesNeverCaptureHost(item)
+              && /^(https?:|blob:|data:)/i.test(item.url || ''))
+            await recordFailure('chrome-result', item.state, item.referrer, item.url, {
+              browserId: item.id, bytes: byteCount(item.bytesReceived), total: byteCount(item.totalBytes),
+              chromeError: item.error || change.error?.current, finalRoute: item.finalUrl, state: item.state
+            });
+        }
         if (item?.state === 'complete') await enrollAutomaticChromeDownload(item, generation);
         if (change.state?.current === 'complete' || change.state?.current === 'interrupted')
           observedDownloads.delete(change.id);
@@ -247,22 +261,42 @@ function githubArchiveTarget(address) {
   return new URL('/' + repo + '/' + (format === 'zip' ? 'zip' : 'tar.gz') + '/' + ref, 'https://codeload.github.com');
 }
 
-const earlyDirectInFlight = new Set();
+const earlyDirectInFlight = new Map();
 async function earlyDirectDownload(message, sender) {
   const chromeFallback = { ok: false, fallback: true };
   const uncertain = { ok: false, fallback: false, message: 'VESPER could not confirm ownership. Check VESPER before retrying.' };
   const page = VesperPlayerSource.http(sender.url);
   const url = page && VesperEarlyDownload.candidate(message.url, page.href, message.downloadName);
   if (!url || !sender.tab || sender.tab.incognito || !Number.isSafeInteger(sender.tab.id)) return chromeFallback;
+  const attempt = crypto.randomUUID();
+  const started = Date.now();
+  const facts = { attempt, stage: 'click', named: typeof message.downloadName === 'string', query: url.includes('?') };
   const fallback = reason => {
-    if (reason && captureAllowed()) rememberDownloadFact(earlyFailures, url, { reason });
+    if (reason && captureAllowed()) {
+      rememberDownloadFact(earlyFailures, url, { reason, attempt });
+      if (nativeAttempts.get(url)?.attempt === attempt) nativeAttempts.delete(url);
+      void recordFailure('download-failed', reason, page.href, url, { ...facts, elapsedMs: Date.now() - started });
+    }
     return chromeFallback;
   };
   const key = sender.tab.id + ':' + (sender.frameId ?? 0);
+  if (earlyDirectInFlight.get(key) === url) {
+    if (captureAllowed()) void recordFailure('handoff', 'repeat-suppressed', page.href, url, facts);
+    return { ok: true };
+  }
   if (earlyDirectInFlight.has(key) || earlyDirectInFlight.size >= 8) return fallback('early-busy');
-  earlyDirectInFlight.add(key);
+  earlyDirectInFlight.set(key, url);
   const generation = captureGeneration;
   let transferId, accepting = false;
+  const accepted = () => {
+    rememberDownloadFact(nativeAttempts, url, { attempt, job: facts.job, state: 'accepted' });
+    const chrome = recentDownloadFact(chromeStarts, url);
+    if (chrome?.seen >= started && captureAllowed(generation))
+      void recordFailure('handoff', 'possible-dual-ownership', page.href, url, {
+        attempt, job: facts.job, native: 'accepted', browserId: chrome.id, chromeStarted: true, routeMatch: true
+      });
+    return { ok: true };
+  };
   try {
     try {
       await siteRulesLoaded;
@@ -281,13 +315,16 @@ async function earlyDirectDownload(message, sender) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3500);
       let response, signedItems = null;
+      facts.stage = 'probe';
       try {
         // Presigned file links can be valid only for GET.
         if (!VesperEarlyDownload.signedDownload(address)) {
+          facts.method = 'HEAD';
           response = await fetch(url, { method: 'HEAD', credentials: credMode, redirect,
             cache: 'no-store', signal: controller.signal });
         }
         if (!response || [405, 501].includes(response.status)) {
+          facts.method = 'GET';
           await response?.body?.cancel?.().catch(() => {});
           response = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, credentials: credMode, redirect,
             cache: 'no-store', signal: controller.signal });
@@ -317,16 +354,22 @@ async function earlyDirectDownload(message, sender) {
       const lastModified = !rawEtag ? strongLastModified(response.headers.get('last-modified'), response.headers.get('date')) : undefined;
       const useAttachmentLength = !rawEtag && !lastModified && acceptsRanges && length >= 262_144 && attachment;
       const encoding = response.headers.get('content-encoding');
+      Object.assign(facts, {
+        status: response.status, mime, total: byteCount(length), attachment, ranges: acceptsRanges,
+        redirected: !!response.redirected, signedIn: !!signedItems, finalRoute: final?.href,
+        proof: strongEtag ? 'etag' : lastModified ? 'last-modified' : useAttachmentLength ? 'attachment-length' : 'none'
+      });
       if (archiveTarget && (final?.href !== archiveTarget.href || !attachment
           || !['application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-gzip'].includes(mime)))
         return fallback('archive-response');
-      if (!statusOk || !final || final.username || final.password
-          || credMode === 'include' && (response.redirected || final.origin !== page.origin)
-          || final.protocol !== 'https:' && final.origin !== page.origin
-          || html && !namedHtml || (!attachment && explicitName === null && !binary)
-          || (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0)
-          || (!strongEtag && !lastModified && !useAttachmentLength)
-          || encoding && encoding.toLowerCase() !== 'identity') return fallback('response-unverified');
+      if (!statusOk) return fallback('probe-status');
+      if (!final || credMode === 'include' && (response.redirected || final.origin !== page.origin)
+          || final.protocol !== 'https:' && final.origin !== page.origin) return fallback('redirect-unverified');
+      if (html && !namedHtml || !attachment && explicitName === null && !binary) return fallback('file-intent-unverified');
+      if (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0)
+        return fallback('length-unverified');
+      if (!strongEtag && !lastModified && !useAttachmentLength) return fallback('validator-unverified');
+      if (encoding && encoding.toLowerCase() !== 'identity') return fallback('encoding-unverified');
       if (matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !captureAllowed(generation))
         return chromeFallback;
       const proof = {
@@ -344,16 +387,23 @@ async function earlyDirectDownload(message, sender) {
       if (explicitName && !/;\s*filename\*?\s*=/i.test(disposition)) items[0].fileName = explicitName;
       const request = envelope(signedItems ? 'browser-submit' : 'browser-capture', { mode: 'download', authorized: !!signedItems, browserProof: proof, items });
       transferId = request.id;
+      facts.stage = 'native-stage';
+      rememberDownloadFact(nativeAttempts, url, { attempt, state: 'pending' });
+      const nativeStarted = Date.now();
       const staged = await nativeRequest(request, 10000);
+      facts.nativeMs = Date.now() - nativeStarted;
+      facts.job = staged.results?.[0]?.jobId;
+      facts.native = staged.results?.[0]?.transferReason || staged.code;
       if (!staged.ok || staged.results?.[0]?.transferReady !== true || !captureAllowed(generation)) {
         // No accept has been dispatched, so a late staged job cannot publish.
         await transferCommand(transferId, 'abandon', 3000).catch(() => {});
         return fallback(staged.code === 'site-capture-disabled' ? undefined : 'native-declined');
       }
       accepting = true;
+      facts.stage = 'native-accept';
       const result = await transferCommand(transferId, 'accept', 5000);
       if (result.ok && ['active', 'complete'].includes(result.data?.state))
-        return { ok: true };
+        return accepted();
     } catch { /* ambiguous acceptance must be reconciled below */ }
     if (!transferId) return fallback('probe-failed');
     if (!accepting) {
@@ -363,11 +413,12 @@ async function earlyDirectDownload(message, sender) {
     // A lost acceptance can still own the file. Query it before deciding whether Chrome may start.
     try {
       const status = await transferCommand(transferId, 'status', 5000);
-      if (status.ok && ['active', 'complete'].includes(status.data?.state)) return { ok: true };
+      if (status.ok && ['active', 'complete'].includes(status.data?.state)) return accepted();
       const stopped = await transferCommand(transferId, 'abandon', 5000);
-      if (stopped.ok && stopped.data?.state === 'complete') return { ok: true };
+      if (stopped.ok && stopped.data?.state === 'complete') return accepted();
       if (stopped.ok && stopped.data?.state === 'failed') return fallback('native-accept-failed');
     } catch {}
+    void recordFailure('download-failed', 'ownership-uncertain', page.href, url, { ...facts, elapsedMs: Date.now() - started });
     return uncertain;
   } finally { earlyDirectInFlight.delete(key); }
 }

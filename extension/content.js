@@ -1850,23 +1850,26 @@
   async function quickDownload() {
     if (!alive() || butterflyHidden()) return;
     syncPage();
-    if (!panel) return;
-    if (panel.classList.contains('show')) closePanel();
+    if (panel?.classList.contains('show')) closePanel();
     await loadFormats(false, true, true);
   }
 
   async function togglePanel() {
     if (!alive() || butterflyHidden()) return;
     syncPage();
-    if (!panel) return;
-    if (panel.classList.contains('show')) return closePanel();
+    if (panel?.classList.contains('show')) return closePanel();
     await loadFormats();
   }
 
   async function loadFormats(refresh = false, keepSource = true, quick = false) {
     syncPage();
-    if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
+    const started = Date.now(), attempt = globalThis.crypto?.randomUUID?.();
+    if (!video || (!video.isConnected && activePreview?.player !== video) || !panel) {
+      void reportMediaFailure('player', 'player-missing', { player: video, started, attempt }, { refresh, quick });
+      return;
+    }
     if (activePreview?.watchLink && !watchPreviewCurrent(activePreview)) {
+      void reportMediaFailure('player', 'source-changed', { player: video, started, attempt }, { preview: true, refresh, quick });
       activePreview = null;
       selectPlayer();
       return;
@@ -1907,7 +1910,9 @@
     refresh = refresh || savedDraft;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), documentPage: pageAddress(), targetKey,
       player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player),
-      preview: watchPreview, playerState: watchPreview ? null : pickerPlayerState(player), generation: current ? binding.generation : 0 };
+      preview: watchPreview, playerState: watchPreview ? null : pickerPlayerState(player), generation: current ? binding.generation : 0,
+      attempt, started };
+    const lookup = panelMedia;
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
     companion.setPickerOpen(true, false, true);
@@ -1926,13 +1931,19 @@
       playerFacts.kind = player.tagName === 'AUDIO' ? 'audio' : 'video';
       if (player.duration === Infinity) playerFacts.live = true;
     }
-    if (player.mediaKeys || protectedVideos.has(player))
-      return renderShell(title, poster, duration, element('div', 'msg bad', 'This video is protected by DRM.'));
+    if (player.mediaKeys || protectedVideos.has(player)) {
+      const message = element('div', 'msg bad', 'This video is protected by DRM.');
+      appendMediaFailureDetails(message, reportMediaFailure('player', 'protected', lookup, { refresh, quick }));
+      return renderShell(title, poster, duration, message);
+    }
 
     const loading = element('div', 'msg', 'Loading formats…');
     loading.setAttribute('role', 'status');
     renderShell(title, poster, duration, loading);
-    if (!isCurrentRequest(request)) return;
+    if (!isCurrentRequest(request)) {
+      void reportMediaFailure('binding', 'source-changed', lookup, { refresh, quick });
+      return;
+    }
     inspectPlayerWitnessAttributes(player);
     const attachedManifest = player?.getAttribute?.('data-vesper-player-manifest') || '';
     const playerWitness = current ? playerFragmentWitness(player, binding) : null;
@@ -1953,7 +1964,12 @@
       playerCanonicalUrls: playerWitness?.canonicalUrls,
       playerResourceFingerprints: playerWitness?.fingerprints,
       manifestUrl: bestManifest });
-    if (!isCurrentRequest(request)) return;
+    if (!isCurrentRequest(request)) {
+      const stale = lookup.preview ? !watchPreviewCurrent(lookup.preview) : !matchesPickerPlayer(lookup);
+      if (stale || !result?.ok)
+        void reportMediaFailure('binding', stale ? 'source-changed' : result?.code, lookup, { refresh, quick });
+      return;
+    }
     if (result?.ok && result.data?.hasRelatedCollection
         && !result.data?.choices?.length && !result.data?.sourceChoices?.length) {
       const name = collectionName(result.data.collectionKind);
@@ -1968,6 +1984,7 @@
     }
     let formats = result?.data;
     let currentWitness = playerWitness;
+    let attemptedBody = false;
     const missingFormats = !result?.ok || (!formats?.choices?.length && !formats?.sourceChoices?.length);
     // Acquisition is a delivery recipe, not a second download UI. Only fall
     // back to the exact current player and never offer a speculative Blob URL.
@@ -1978,8 +1995,12 @@
       let mseExportTracks = null;
       if (!original && missingFormats && ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
           'site-refused', 'source-changed', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
+        attemptedBody = true;
         original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
-        if (!isCurrentRequest(request)) return;
+        if (!isCurrentRequest(request)) {
+          void reportMediaFailure('binding', result?.code || 'source-changed', lookup, { refresh, quick, attemptedBody }, currentWitness);
+          return;
+        }
         if (!original) currentWitness = playerFragmentWitness(player, binding);
         const tracks = !original && currentWitness?.tracks;
         if (tracks?.length && tracks.length <= 2
@@ -2016,22 +2037,9 @@
       const message = errorMessage(result, current && player.readyState >= 1);
       if (!['protected', 'blocked'].includes(result?.code))
         appendRetry(message, () => loadFormats(true), result?.data?.retryAt);
-      if (result?.data?.mediaFailure) {
-        const build = chrome.runtime.getManifest();
-        appendMediaFailureDetails(message, {
-          version: build.version_name || build.version,
-          site: /(?:^|\.)instagram\.com$/i.test(location.hostname) ? 'instagram' : 'tiktok',
-          ...result.data.mediaFailure,
-          player: {
-            source: /^blob:/i.test(src) ? 'blob' : VesperPlayerSource.http(src) ? 'http' : player.srcObject ? 'object' : 'none',
-            ready: player.readyState, witnesses: currentWitness?.fingerprints?.length || 0,
-            tracks: (currentWitness?.tracks || []).map(track => ({
-              init: track.hasInit === true, complete: track.bufferedComplete === true,
-              bytes: Number.isSafeInteger(track.retainedBytes) ? track.retainedBytes : 0
-            }))
-          }
-        });
-      }
+      appendMediaFailureDetails(message, reportMediaFailure('formats', result?.ok ? 'no-choices' : result?.code,
+        lookup, { ...result?.data?.mediaFailure, refresh, quick, attemptedBody,
+          status: result?.data?.status, native: result?.data?.resolver }, currentWitness));
       return renderShell(title, poster, duration, message);
     }
     formats.playerLive = playerFacts?.live === true || formats.isLive === true;
@@ -2063,6 +2071,7 @@
     const footer = element('div', 'foot');
     const cancel = element('button', 'vesper-button', 'Cancel');
     cancel.onclick = () => {
+      copy.cancelledByUser = true;
       copy.controller.abort();
       cancel.disabled = true;
       status.textContent = 'Cancelling…';
@@ -2086,6 +2095,8 @@
       if (!binding || binding.src !== src || binding.generation !== copy.panelMedia.generation)
         throw new Error('The selected player changed.');
       const onProgress = (received, total) => {
+        copy.received = received;
+        copy.total = total;
         if (player.mediaKeys || protectedVideos.has(player) || playback.get(player) !== binding) {
           controller.abort();
           return;
@@ -2114,7 +2125,7 @@
             pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
             generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
           if (!reply?.ok || reply.data.workerFetch || playback.get(player) !== binding || controller.signal.aborted)
-            throw new Error('No verified browser file is available.');
+            throw Object.assign(new Error('No verified browser file is available.'), { code: reply?.code || 'proof-unavailable' });
           mediaProof = reply.data;
         }
         await VesperBrowserBody.copyBlob({ ...options, url: src, origin: location.origin, mediaProof });
@@ -2122,6 +2133,11 @@
       if (copy.request === panelRequest && isCurrentRequest(copy.request))
         await confirmSend('Sent to VESPER', copy.request);
     } catch (error) {
+      const report = !copy.cancelledByUser && reportMediaFailure('browser-copy',
+        error?.code || (controller.signal.aborted ? 'source-changed' : 'copy-failed'), copy.panelMedia, {
+          bytes: copy.received, total: copy.total, native: error?.name, status: error?.status,
+          bodyProof: formats.mseExportTracks ? 'mse' : formats.browserBodyProof ? 'http' : 'blob'
+        });
       if (copy.request === panelRequest && isCurrentRequest(copy.request)) {
         const uncertain = error?.code === 'uncertain-finish';
         const message = element('div', 'msg bad', uncertain
@@ -2129,6 +2145,7 @@
           : controller.signal.aborted ? 'Browser copy stopped. No completion was confirmed.'
           : 'Could not download this format.');
         if (!uncertain) appendRetry(message, () => loadFormats(true));
+        if (report) appendMediaFailureDetails(message, report);
         renderShell(title, poster, duration, message);
       }
     } finally {
@@ -2653,13 +2670,17 @@
   async function inspectSource(source, title, poster, seconds, playerLive, remembered = false) {
     if (!panelMedia || !isCurrentRequest(panelRequest)) return;
     const request = panelRequest;
-    const { player, targetKey } = panelMedia;
+    const lookup = panelMedia;
+    const { player, targetKey } = lookup;
     const loading = element('div', 'msg', 'Checking selected stream…');
     loading.setAttribute('role', 'status');
     renderShell(title, poster, seconds, loading);
     const result = await send({ type: 'media-source-select', sourceChoice: source.token,
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
-    if (!isCurrentRequest(request)) return;
+    if (!isCurrentRequest(request)) {
+      if (!result?.ok) void reportMediaFailure('source', result?.code, lookup);
+      return;
+    }
     if (result?.ok && result.data?.choices?.length) {
       const formats = result.data;
       const fingerprint = /^[a-f0-9]{64}$/i.test(formats.deliveryFingerprint || '') ? formats.deliveryFingerprint : null;
@@ -2683,6 +2704,8 @@
       ? element('div', 'msg bad', 'This source couldn’t be opened.')
       : errorMessage(result);
     appendRetry(message, () => loadFormats(true, false), result?.data?.retryAt, 'Back to sources');
+    appendMediaFailureDetails(message, reportMediaFailure('source', result?.ok ? 'no-choices' : result?.code, lookup,
+      { status: result?.data?.status, native: result?.data?.resolver }));
     renderShell(title, poster, seconds, message);
   }
 
@@ -2699,11 +2722,15 @@
     const hadFocus = panel.contains(root.activeElement);
     const close = renderShell(title, poster, seconds, sending);
     if (hadFocus) close.focus({ preventScroll: true });
+    const lookup = panelMedia;
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src }
       : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent,
         pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
-    if (!isCurrentRequest(request)) return;
+    if (!isCurrentRequest(request)) {
+      if (!reply?.ok) void reportMediaFailure('submit', reply?.code, lookup);
+      return;
+    }
     if (reply?.ok) {
       if (formats.browserChoice) return confirmSend('Downloading in Chrome', request);
       const [main, ...subtitles] = reply.results || [];
@@ -2712,6 +2739,7 @@
         const status = main.status === 'queued' ? 'Queued in VESPER' :
           main.status === 'already-submitted' ? 'Already in VESPER' : 'Sent to VESPER';
         if (!failed) return confirmSend(status, request);
+        void reportMediaFailure('submit', 'subtitles-failed', lookup, { subtitleFailures: failed, job: main.jobId });
         const summary = element('div', 'msg', `${status}. ${failed} ${failed === 1 ? 'subtitle' : 'subtitles'} couldn’t be added.`);
         summary.setAttribute('role', 'status');
         const close = renderShell(title, poster, seconds, summary);
@@ -2719,6 +2747,7 @@
         return;
       }
       if (subtitles.some(acceptedMediaResult)) {
+        void reportMediaFailure('submit', main?.status || 'rejected', lookup, { subtitleFailures: failed });
         const summary = element('div', 'msg', 'Media wasn’t added. Check VESPER for the accepted subtitles.');
         summary.setAttribute('role', 'status');
         const close = renderShell(title, poster, seconds, summary);
@@ -2727,6 +2756,7 @@
       }
     }
     const error = errorMessage(reply);
+    appendMediaFailureDetails(error, reportMediaFailure('submit', reply?.ok ? 'rejected' : reply?.code, lookup));
     const refresh = ['expired-selection', 'source-expired', 'source-changed'].includes(reply?.code);
     appendRetry(error, refresh ? () => loadFormats(true)
       : () => deliver(title, poster, seconds, formats, formatChoice, mode, request, intent), reply?.data?.retryAt);
@@ -2769,10 +2799,29 @@
     message.append(' ', retry);
   }
 
+  async function reportMediaFailure(stage, code, lookup, extra = {}, witness) {
+    const player = lookup?.player, src = lookup?.src || (player ? playerSource(player) : '');
+    const tracks = witness?.tracks?.slice(0, 4);
+    const facts = {
+      ...extra, stage, attempt: lookup?.attempt, elapsedMs: lookup?.started ? Date.now() - lookup.started : undefined,
+      source: /^blob:/i.test(src) ? 'blob' : VesperPlayerSource.http(src) ? 'http' : player?.srcObject ? 'object' : 'none',
+      ready: player?.readyState, generation: lookup?.generation, playing: player && !player.paused && !player.ended,
+      height: player?.videoHeight, durationMs: Number.isFinite(player?.duration) ? Math.round(player.duration * 1000) : undefined,
+      preview: !!lookup?.preview || extra.preview, witnesses: witness?.fingerprints?.length,
+      tracks: tracks?.length, completeTracks: tracks?.filter(track => track.bufferedComplete).length,
+      retainedBytes: tracks?.reduce((sum, track) => sum + (Number.isSafeInteger(track.retainedBytes) ? track.retainedBytes : 0), 0)
+    };
+    const category = stage === 'browser-copy' || stage === 'submit' ? 'download' : 'media';
+    const reply = await send({ type: 'diagnostic-failure', category, code, resource: src, facts });
+    return reply?.data || { utc: new Date().toISOString(), code: code || 'unknown', stage, source: facts.source };
+  }
+
   function appendMediaFailureDetails(message, details) {
     const copy = element('button', 'link', 'Copy details');
     copy.onclick = async () => {
-      const text = JSON.stringify(details, null, 2);
+      const entry = await details;
+      const utc = typeof entry.utc === 'number' ? new Date(entry.utc).toISOString() : entry.utc;
+      const text = JSON.stringify({ ...entry, utc }, null, 2);
       try {
         await navigator.clipboard.writeText(text);
         copy.textContent = 'Copied';
@@ -2871,6 +2920,9 @@
         outcome = 'accepted';
         notify('Browser file accepted by VESPER.');
       } catch (error) {
+        if (!controller.signal.aborted)
+          void send({ type: 'diagnostic-failure', category: 'download', code: error?.code || 'generated-copy-failed',
+            resource: link.url, facts: { stage: 'generated-copy', native: error?.name, status: error?.status, total: link.expectedLength } });
         if (error?.code === 'uncertain-finish') {
           outcome = 'uncertain';
           notify('Browser file outcome is uncertain. Check VESPER before retrying.');

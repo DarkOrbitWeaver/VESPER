@@ -31,7 +31,10 @@
     <label class="check"><input type="checkbox" id="signin" disabled><span>Use my Chrome sign-in<small id="signin-access" role="status"></small></span></label>
     <button id="signin-permission" class="action-btn" type="button" hidden>Allow Chrome sign-in access</button>
     <small id="settings-status" class="result" role="status" hidden></small>
-    <small id="version" class="version"></small>
+    <footer class="version">
+      <button id="copy-diagnostics" class="text-action" type="button">Copy failure log</button>
+      <small id="version"></small>
+    </footer>
   </main>
   <script src="theme.js"></script>
   <script src="browser-preferences.js"></script>

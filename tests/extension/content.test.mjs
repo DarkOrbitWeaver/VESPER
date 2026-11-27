@@ -879,7 +879,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const sent = [];
   const timers = [];
   const node = () => ({
-    setAttribute() {}, matches: () => false,
+    setAttribute() {}, append() {}, matches: () => false,
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false }
   });
   let videos = [];
@@ -981,11 +981,16 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   video.duration = 95;
   video.videoHeight = 720;
   await window.__testContent.loadFormats();
-  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { durationSeconds: 95, height: 720, kind: 'video' });
+  const boundRequest = sent.findLast(message => message.type === 'media-options');
+  assert.deepEqual(JSON.parse(JSON.stringify(boundRequest.playerFacts)), { durationSeconds: 95, height: 720, kind: 'video' });
+  const failure = sent.findLast(message => message.type === 'diagnostic-failure');
+  assert.equal(failure.code, 'protected');
+  assert.equal(failure.facts.height, 720);
 
   video.duration = Infinity;
   await window.__testContent.loadFormats();
-  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { height: 720, kind: 'video', live: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.findLast(message => message.type === 'media-options').playerFacts)),
+    { height: 720, kind: 'video', live: true });
 
   const trim = window.__testContent.clipAvailability;
   const audioAac = trim({ canClip: true, clipUsesWholeFile: true, container: 'M4A' }, 95);
@@ -1066,7 +1071,7 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   const scheduled = [];
   const sent = [];
   const node = () => ({
-    setAttribute() {}, matches: selector => hovering && selector.includes(':hover'),
+    setAttribute() {}, append() {}, matches: selector => hovering && selector.includes(':hover'),
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false }
   });
   card.parentElement = body;

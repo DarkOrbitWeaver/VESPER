@@ -222,6 +222,7 @@ globalThis.VesperBrowserBody = (() => {
       else {
         const error = new Error(reply.message || 'VESPER could not accept the browser stream.');
         error.code = reply.code;
+        error.status = reply.status;
         call.reject(error);
         fail(reply.message || 'VESPER could not accept the browser stream.');
       }
@@ -315,7 +316,12 @@ globalThis.VesperBrowserBody = (() => {
           || (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== mediaProof.mime))
         throw new Error('The media representation changed. No copy was accepted.');
     }
-    catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
+    catch (error) {
+      await response.body?.cancel().catch(() => {});
+      error.code = 'browser-response';
+      error.status = response.status;
+      throw error;
+    }
     let channel, reader, transferId = null, finishing = false;
     const unanswered = [];
     let sent = 0;
@@ -540,6 +546,8 @@ globalThis.VesperBrowserBody = (() => {
       }
     } catch (error) {
       await response.body?.cancel().catch(() => {});
+      error.code = 'browser-response';
+      error.status = response.status;
       throw error;
     }
 
@@ -747,7 +755,7 @@ globalThis.VesperBrowserBody = (() => {
           });
           if (!closed) port.postMessage({ sequence, ok: true, data });
         } catch (error) {
-          if (!closed) port.postMessage({ sequence, ok: false, code: error.code, message: error.message });
+          if (!closed) port.postMessage({ sequence, ok: false, code: error.code, status: error.status, message: error.message });
         }
         phase = 'finished';
       } else if (operation === 'begin' && phase === 'new') {

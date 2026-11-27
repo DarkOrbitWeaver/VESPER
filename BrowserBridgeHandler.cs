@@ -86,6 +86,11 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "browser-transfer":
                 return await BrowserTransferAsync(request, ct);
 
+            case "browser-diagnostics":
+                return engine.RecordBrowserDiagnostics(request.Diagnostics!)
+                    ? BridgeResponse.Success(request.Id)
+                    : BridgeResponse.Fail(request.Id, "diagnostic-storage", "Could not save the browser diagnostics.");
+
             case "browser-managed":
                 return await ManageChromeDownloadAsync(request, ct);
 

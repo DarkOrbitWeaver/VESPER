@@ -8,6 +8,18 @@ function settingsStatus(message = '') {
   status.hidden = !message;
 }
 
+$('copy-diagnostics').onclick = async () => {
+  try {
+    const { vesperFailureLog: entries = [] } = await chrome.storage.local.get('vesperFailureLog');
+    if (!entries.length) return settingsStatus('No browser failures recorded yet.');
+    const lines = entries.map(({ exported, ...entry }) => JSON.stringify({ ...entry, utc: new Date(entry.utc).toISOString() }));
+    await navigator.clipboard.writeText(lines.join('\n'));
+    settingsStatus('Failure log copied.');
+  } catch {
+    settingsStatus('Could not copy the failure log.');
+  }
+};
+
 const pause = $('pause-vesper');
 let savingPause = false;
 let pauseState = { ready: false, paused: true };

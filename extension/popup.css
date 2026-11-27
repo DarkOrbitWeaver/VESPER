@@ -19,7 +19,7 @@ small { display:block; color:var(--muted); font-size:11px; margin-top:2px; }
 .text-action:disabled { color:var(--muted); cursor:default; text-decoration:none; }
 .site-host { margin-top:4px; }
 .pause { border-bottom:1px solid var(--border); padding-bottom:11px; margin-bottom:4px; }
-.version { margin-top:8px; text-align:right; }
+.version { display:flex; justify-content:space-between; align-items:center; margin-top:8px; gap:10px; }
 .transfers { width:min(620px,100%); margin:auto; }
 h2 { margin:14px 0 6px; font:600 16px Georgia,serif; }
 .hint { color:var(--muted); }
