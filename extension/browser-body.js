@@ -184,7 +184,7 @@ globalThis.VesperBrowserBody = (() => {
 
   const hex = buffer => Array.from(new Uint8Array(buffer), value => value.toString(16).padStart(2, '0')).join('');
 
-  function openChannel(connect, signal, onProgress = () => {}) {
+  function openChannel(connect, signal, onProgress = () => {}, onFinalizing = () => {}) {
     const port = connect({ name: PORT });
     const pending = [];
     let closed = false, sequence = 0;
@@ -208,6 +208,11 @@ globalThis.VesperBrowserBody = (() => {
         return;
       }
       clearTimeout(call.timer);
+      if (reply.finalizing) {
+        call.timer = setTimeout(() => fail('VESPER browser copy timed out.'), 620_000);
+        onFinalizing(reply.transferId, reply.received);
+        return;
+      }
       if (reply.progress) {
         call.timer = setTimeout(() => fail('VESPER browser copy timed out.'), 120_000);
         onProgress(reply.received, reply.total);
@@ -252,6 +257,19 @@ globalThis.VesperBrowserBody = (() => {
     const error = new Error('VESPER could not confirm the final browser stream. Check the desktop queue before retrying.');
     error.code = 'uncertain-finish';
     return error;
+  }
+
+  function requireNativeBegin(begin, mediaCheck) {
+    if (begin.offset !== 0 || begin.accepted) throw new Error('Unexpected initial browser copy state.');
+    if (mediaCheck && begin.mediaCheck !== mediaCheck) {
+      const error = new Error('Update the desktop helper to verify this browser media.');
+      error.code = 'desktop-version-mismatch';
+      throw error;
+    }
+  }
+
+  function mediaCheckFor(mime) {
+    return ['mp4', 'm4a', 'mov'].includes(EXTENSIONS[mime]) ? 'mp4' : undefined;
   }
 
   async function copyBlob({ url, origin, title, generated = null, mediaProof = null, signal, onProgress = () => {},
@@ -305,12 +323,10 @@ globalThis.VesperBrowserBody = (() => {
     try {
       channel = openChannel(connect, signal);
       const mime = mediaProof?.mime ?? (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-      const mediaCheck = !generated && ['video/mp4', 'audio/mp4', 'video/quicktime'].includes(mime) ? 'mp4' : undefined;
+      const mediaCheck = generated ? undefined : mediaCheckFor(mime);
       const begin = await channel.send({ operation: 'begin', ...facts, ...(generated?.automatic ? { automatic: true } : {}), ...(mediaCheck ? { mediaCheck } : {}) });
-      if (begin.offset !== 0 || begin.accepted) throw new Error('Unexpected initial browser copy state.');
       transferId = begin.transferId;
-      if (mediaCheck && begin.mediaCheck !== mediaCheck)
-        throw new Error('Update the desktop helper to verify this browser media.');
+      requireNativeBegin(begin, mediaCheck);
       reader = response.body.getReader();
       onProgress(0, facts.length);
       // Aggregate small stream reads into one fixed buffer. SubtleCrypto copies its input
@@ -416,6 +432,7 @@ globalThis.VesperBrowserBody = (() => {
     let transferId = null, finishing = false, sent = 0;
     const unanswered = [];
     try {
+      const mediaCheck = tracks.length === 1 && !isWebm ? 'mp4' : undefined;
       const begin = await channel.send({
         operation: 'begin',
         fileName,
@@ -424,9 +441,10 @@ globalThis.VesperBrowserBody = (() => {
         outputContainer,
         length: totalEstimate,
         tracks: trackSpecs,
-        ...(tracks.length === 1 && !isWebm ? { mediaCheck: 'mp4' } : {})
+        ...(mediaCheck ? { mediaCheck } : {})
       });
       transferId = begin.transferId;
+      requireNativeBegin(begin, mediaCheck);
       const buffer = new Uint8Array(CHUNK);
       let used = 0, activeTrackIdx = 0;
 
@@ -439,7 +457,7 @@ globalThis.VesperBrowserBody = (() => {
         sent = next;
         used = 0;
         const call = channel.send({ operation: 'append', offset, chunk, digest: hex(digest), trackIndex: trackIdx }).then(reply => {
-          if (reply.offset !== next) throw new Error('Inconsistent MSE export offset.');
+          if (reply.offset !== next || reply.accepted) throw new Error('Inconsistent MSE export offset.');
           onProgress(next, Math.max(totalEstimate, next));
         });
         call.catch(() => {});
@@ -485,7 +503,7 @@ globalThis.VesperBrowserBody = (() => {
       while (unanswered.length) await unanswered.shift();
       finishing = true;
       const done = await channel.send({ operation: 'finish' });
-      if (!done.accepted || typeof done.jobId !== 'string')
+      if (!done.accepted || done.offset !== totalEstimate || sent !== totalEstimate || typeof done.jobId !== 'string')
         throw new Error('VESPER did not confirm the MSE stream.');
       return done;
     } catch (error) {
@@ -499,7 +517,7 @@ globalThis.VesperBrowserBody = (() => {
   }
 
   async function streamFromWorker({ proof, title, origin, nativeHost, connectNative, makeId,
-    transferId, signal, onProgress, fetcher = globalThis.fetch }) {
+    transferId, signal, onProgress, onFinalizing = () => {}, fetcher = globalThis.fetch }) {
     if (signal.aborted) throw new Error('Browser copy cancelled.');
     const { url, etag, mime, length, minimumLength, credentials } = proof;
     const headers = etag ? { 'If-Match': etag } : undefined;
@@ -557,14 +575,15 @@ globalThis.VesperBrowserBody = (() => {
       });
 
       const expected = part?.total ?? declared ?? length;
+      const mediaCheck = mediaCheckFor(type);
       const begin = await sendNative('begin', {
         origin: origin + '/',
         fileName: makeMediaFileName(title, EXTENSIONS[type]),
         automatic: false,
         ...(expected ? { length: expected } : {}),
-        ...(['video/mp4', 'audio/mp4', 'video/quicktime'].includes(type) ? { mediaCheck: 'mp4' } : {})
+        ...(mediaCheck ? { mediaCheck } : {})
       });
-      if (begin.offset !== 0 || begin.accepted) throw new Error('Invalid initial native copy state.');
+      requireNativeBegin(begin, mediaCheck);
       reader = response.body.getReader();
       const buffer = new Uint8Array(CHUNK);
       let used = 0;
@@ -574,7 +593,7 @@ globalThis.VesperBrowserBody = (() => {
         const digest = hex(await crypto.subtle.digest('SHA-256', bytes));
         const next = sent + used;
         const reply = await sendNative('append', { offset: sent, chunk: encode(bytes), digest });
-        if (reply.offset !== next) throw new Error('Native copy offset mismatch.');
+        if (reply.offset !== next || reply.accepted) throw new Error('Native copy offset mismatch.');
         sent = next;
         used = 0;
         onProgress(sent, expected || 0);
@@ -608,6 +627,7 @@ globalThis.VesperBrowserBody = (() => {
       await flush();
       if (sent <= 0 || expected && sent !== expected || minimumLength && sent < minimumLength)
         throw new Error('Browser file ended before the selected media was complete.');
+      onFinalizing(sent);
       finishing = true;
       const done = await sendNative('finish');
       if (!done.accepted || done.offset !== sent || typeof done.jobId !== 'string') throw uncertainFinish();
@@ -623,10 +643,30 @@ globalThis.VesperBrowserBody = (() => {
     }
   }
 
-  async function copyWorkerMedia({ player, title, signal, onProgress, connect = options => chrome.runtime.connect(options) }) {
-    const channel = openChannel(connect, signal, onProgress);
+  async function copyWorkerMedia({ player, title, signal, onProgress, connect = options => chrome.runtime.connect(options),
+    queryReceipt = transferId => chrome.runtime.sendMessage({ type: 'browser-body-status', transferId }) }) {
+    const key = JSON.stringify(['worker', player.pageUrl, player.playerKey, player.playerUrl, player.generation, player.mediaChangedAt]);
+    const prior = pendingReceipts.get(key);
+    if (prior) {
+      const accepted = await resolveReceipt(queryReceipt, prior);
+      if (!accepted) throw uncertainFinish();
+      pendingReceipts.delete(key);
+      return accepted;
+    }
+    if (pendingReceipts.size >= MAX_PENDING_RECEIPTS) throw uncertainFinish();
+    let receipt;
+    const channel = openChannel(connect, signal, onProgress, (transferId, length) => {
+      if (typeof transferId === 'string' && Number.isSafeInteger(length) && length > 0) receipt = { transferId, length };
+    });
     try { return await channel.send({ operation: 'worker', player, title }); }
-    finally { channel.close(); }
+    catch (error) {
+      if (!receipt || error?.code === 'invalid-media') throw error;
+      pendingReceipts.set(key, receipt);
+      const accepted = await resolveReceipt(queryReceipt, receipt);
+      if (!accepted) throw uncertainFinish();
+      pendingReceipts.delete(key);
+      return accepted;
+    } finally { channel.close(); }
   }
 
   // Extension worker relay for content-script ports
@@ -701,6 +741,9 @@ globalThis.VesperBrowserBody = (() => {
             transferId, signal: workerController.signal,
             onProgress(received, total) {
               if (!closed) port.postMessage({ sequence, progress: true, received, total });
+            },
+            onFinalizing(received) {
+              if (!closed) port.postMessage({ sequence, finalizing: true, transferId, received });
             }
           });
           if (!closed) port.postMessage({ sequence, ok: true, data });

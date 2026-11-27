@@ -123,6 +123,28 @@ public sealed class BrowserBodyTests
     }
 
     [Fact]
+    public async Task SingleCapturedMp4TrackIsRemuxedWithoutRepeatedFragments()
+    {
+        using var h = new Harness();
+        string fixtures = Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media");
+        byte[] init = File.ReadAllBytes(Path.Combine(fixtures, "audio-init.mp4"));
+        byte[] fragment = File.ReadAllBytes(Path.Combine(fixtures, "audio-1.m4s"));
+        byte[] audio = [.. init, .. fragment, 0, 0, 0, 8, (byte)'f', (byte)'r', (byte)'e', (byte)'e', .. fragment];
+        Assert.True((await Send(h, new("begin", Transfer, Origin, "clip.m4a", audio.Length,
+            VerifyMp4: true, Tracks: [new("audio", "m4a", audio.Length)], OutputContainer: "m4a"))).Ok);
+        Assert.True((await Send(h, Append(0, audio))).Ok);
+        Guid id = AcceptedId(await Send(h, Finish()));
+        JobSnapshot completed = await h.WaitForStateAsync(id, JobState.Completed);
+        Assert.Equal(JobKind.Merge, completed.Kind);
+        using var original = new MemoryStream([.. init, .. fragment]);
+        using var output = File.OpenRead(completed.FinalPath!);
+        var expected = Assert.Single(Mp4Demuxer.Read(original, original.Length, default));
+        var actual = Assert.Single(Mp4Demuxer.Read(output, output.Length, default));
+        Assert.Equal(expected.Samples.Count, actual.Samples.Count);
+        Assert.Equal(expected.DurationTicks, actual.DurationTicks);
+    }
+
+    [Fact]
     public async Task InsufficientSpaceRefusesBeforeCreatingPrivateInbox()
     {
         using var h = new Harness(freeSpaceReserve: long.MaxValue / 2);

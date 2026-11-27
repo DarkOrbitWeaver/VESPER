@@ -128,6 +128,11 @@ globalThis.VesperPlayerSource = (() => {
       else if (link.permalink === true && url.pathname.length > 1) permalinks.set(url.href, url.href);
     }
     if (known.size === 1) return known.values().next().value;
+    if (known.size === 2) {
+      const post = [...known.keys()].find(key => /^x:\d{5,24}$/.test(key));
+      if (post) for (const [key, href] of known)
+        if (key.startsWith(post + ':video:')) return href;
+    }
     if (known.size === 0 && permalinks.size === 1) return permalinks.values().next().value;
     return null;
   }

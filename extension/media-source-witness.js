@@ -23,6 +23,9 @@
   const bufferProvenance = new WeakMap(); // ArrayBuffer | Blob -> ProvenanceRecord
   const streamProvenance = new WeakMap(); // ReadableStream -> SourceDescriptor
   const readerProvenance = new WeakMap(); // ReadableStreamDefaultReader -> SourceDescriptor
+  const readerAssemblies = new Map();
+  const MAX_READER_BYTES = 2 * 1024 * 1024;
+  let nextReader = 0;
   const requestMeta = new WeakMap();      // XMLHttpRequest -> { method, url, rangeHeader }
   const bufferRing = [];
   const retainedMseOrder = [];
@@ -232,7 +235,7 @@
     const end = start + (view?.byteLength ?? buffer.byteLength ?? buffer.size);
     const existing = bufferProvenance.get(buffer);
     if (existing?.address === descriptor.address && existing.start === start && existing.end === end && now() - existing.at <= TTL) return;
-    const sample = buffer instanceof ArrayBuffer ? mediaSample(buffer) : null;
+    const sample = buffer instanceof ArrayBuffer ? mediaSample(view || buffer) : null;
     const record = { ...descriptor, at: now(), sample, start, end };
     computeDigestAsync(record);
     bufferProvenance.set(buffer, record);
@@ -255,8 +258,8 @@
         if (offset < parent.start || offset + sliced.byteLength > parent.end) return sliced;
         const childSlice = parent.slice ? {
           ...parent.slice,
-          start: parent.slice.start + offset,
-          end: parent.slice.start + offset + Math.max(0, sliced.byteLength - 1)
+          start: parent.slice.start + offset - parent.start,
+          end: parent.slice.start + offset - parent.start + Math.max(0, sliced.byteLength - 1)
         } : null;
         rememberBuffer(sliced, { ...parent, slice: childSlice });
       }
@@ -290,7 +293,7 @@
 
     // 2. Response body readers
     if (typeof Response === 'function') {
-      for (const method of ['arrayBuffer', 'blob']) {
+      for (const method of ['arrayBuffer', 'blob', 'bytes']) {
         replace(Response.prototype, method, original => function (...args) {
           const promise = apply(original, this, args);
           try {
@@ -302,7 +305,8 @@
               meta?.reqRange || '',
               this.headers?.get('content-length')
             );
-            if (desc) promise.then(buf => rememberBuffer(buf, desc), () => {});
+            if (desc) promise.then(buf => ArrayBuffer.isView(buf)
+              ? rememberBuffer(buf.buffer, desc, buf) : rememberBuffer(buf, desc), () => {});
           } catch {}
           return promise;
         });
@@ -336,19 +340,54 @@
             const reader = apply(original, this, args);
             try {
               const desc = streamProvenance.get(this);
-              if (reader && desc) readerProvenance.set(reader, desc);
+              if (reader && desc) {
+                const id = ++nextReader;
+                readerProvenance.set(reader, { id, desc, bytes: 0 });
+                if (desc.declaredLength === null || desc.declaredLength <= MAX_READER_BYTES) {
+                  if (readerAssemblies.size >= 8) readerAssemblies.delete(readerAssemblies.keys().next().value);
+                  readerAssemblies.set(id, { bytes: 0, chunks: [] });
+                }
+              }
             } catch {}
             return reader;
           });
+          for (const method of ['cancel', 'releaseLock']) {
+            replace(ReadableStreamDefaultReader.prototype, method, original => function (...args) {
+              readerAssemblies.delete(readerProvenance.get(this)?.id);
+              return apply(original, this, args);
+            });
+          }
           replace(ReadableStreamDefaultReader.prototype, 'read', original => function (...args) {
             const promise = apply(original, this, args);
             try {
-              const desc = readerProvenance.get(this);
-              if (desc) {
+              const reader = readerProvenance.get(this);
+              if (reader) {
                 promise.then(chunk => {
-                  const val = chunk && !chunk.done ? chunk.value : null;
-                  if (val) rememberBuffer(val.buffer || val, desc, val);
-                }, () => {});
+                  const { desc, id } = reader;
+                  const assembly = readerAssemblies.get(id);
+                  if (chunk?.done) {
+                    readerAssemblies.delete(id);
+                    if (!assembly || assembly.chunks.length < 2) return;
+                    const whole = new Uint8Array(assembly.bytes);
+                    let offset = 0;
+                    for (const bytes of assembly.chunks) { whole.set(bytes, offset); offset += bytes.byteLength; }
+                    if (mediaSample(whole)) rememberBuffer(whole.buffer, desc, whole);
+                    return;
+                  }
+                  const val = chunk?.value;
+                  if (!ArrayBuffer.isView(val) || !val.byteLength) return;
+                  const start = desc.slice && desc.slice.start + reader.bytes;
+                  const slice = desc.slice && { ...desc.slice, start, end: start + val.byteLength - 1 };
+                  rememberBuffer(val.buffer, { ...desc, slice }, val);
+                  reader.bytes += val.byteLength;
+                  if (!assembly) return;
+                  if (assembly.bytes + val.byteLength > MAX_READER_BYTES || assembly.chunks.length >= 128) {
+                    readerAssemblies.delete(id);
+                    return;
+                  }
+                  assembly.chunks.push(new Uint8Array(val.buffer, val.byteOffset, val.byteLength).slice());
+                  assembly.bytes += val.byteLength;
+                }, () => readerAssemblies.delete(reader.id)).catch(() => readerAssemblies.delete(reader.id));
               }
             } catch {}
             return promise;
@@ -443,7 +482,7 @@
     let match = null;
     for (const { record } of bufferRing) {
       if (now() - record.at > TTL || !equalSample(sample, record.sample)) continue;
-      if (match && match !== record) return null;
+      if (match && match.address !== record.address) return null;
       match = record;
     }
     return match && { path: match.path, at: match.at, address: match.path, sampleOnly: true };
@@ -487,7 +526,9 @@
           mimeType: String(mimeType || ''),
           role: inferRole(mimeType),
           ownerRef: new WeakRef(this),
+          bufferRef: new WeakRef(sb),
           initBytes: null,
+          initHasMedia: false,
           chunks: [],
           retainedBytes: 0,
           totalAppendedBytes: 0,
@@ -495,10 +536,30 @@
         };
         msState.tracks.add(track);
         sourceOwners.set(sb, track);
+        for (const event of ['error', 'abort']) sb.addEventListener?.(event, () => discardTrack(track));
         if (retainedMseOrder.length >= 32) discardTrack(retainedMseOrder.shift());
         retainedMseOrder.push(track);
       } catch {}
       return sb;
+    });
+
+    for (const method of ['remove', 'changeType']) {
+      replace(SourceBuffer.prototype, method, original => function (...args) {
+        const result = apply(original, this, args);
+        const track = sourceOwners.get(this);
+        if (track) discardTrack(track);
+        return result;
+      });
+    }
+    replace(MediaSource.prototype, 'removeSourceBuffer', original => function (buffer) {
+      const result = apply(original, this, [buffer]);
+      const track = sourceOwners.get(buffer);
+      if (track) {
+        discardTrack(track);
+        mediaSources.get(this)?.tracks.delete(track);
+        sourceOwners.delete(buffer);
+      }
+      return result;
     });
 
     replace(SourceBuffer.prototype, 'appendBuffer', original => function (data, ...rest) {
@@ -514,18 +575,24 @@
         const backing = ArrayBuffer.isView(data) ? data.buffer : data;
         const sample = mediaSample(rawBytes);
         const exact = bufferProvenance.get(backing);
-        const backingSample = backing.byteLength === rawBytes.byteLength ? sample : exact?.sample && mediaSample(backing);
+        const backingSample = exact?.sample && (exact.start === rawBytes.byteOffset && exact.end === rawBytes.byteOffset + rawBytes.byteLength
+          ? sample : mediaSample(new Uint8Array(backing, exact.start, exact.end - exact.start)));
         const prov = exact && rawBytes.byteOffset >= exact.start && rawBytes.byteOffset + rawBytes.byteLength <= exact.end
           && (!exact.sample || equalSample(exact.sample, backingSample))
           ? exact : matchBySample(sample);
         const inspected = inspectMediaBytes(rawBytes);
 
         if (!track.evicted && track.totalAppendedBytes === 0 && inspected?.hasInit) {
-          if (rawBytes.byteLength <= MAX_TRACK_BUFFER_BYTES && reserveMseBytes(track, rawBytes.byteLength))
+          if (reserveMseBytes(track, rawBytes.byteLength)) {
             track.initBytes = rawBytes.slice();
-          else discardTrack(track);
+            track.initHasMedia = inspected.hasMedia;
+          }
         } else if (!track.evicted && track.initBytes) {
-          if (inspected?.hasInit) discardTrack(track);
+          if (inspected?.hasInit) {
+            const repeated = !inspected.hasMedia && track.initBytes.byteLength === rawBytes.byteLength
+              && track.initBytes.every((byte, index) => byte === rawBytes[index]);
+            if (!repeated) discardTrack(track);
+          }
           else if (reserveMseBytes(track, rawBytes.byteLength)) track.chunks.push(rawBytes.slice());
         }
         track.totalAppendedBytes += rawBytes.byteLength;
@@ -592,11 +659,21 @@
     } catch {}
   }, true);
 
+  function coversPlayback(buffered, duration) {
+    return buffered?.length === 1 && buffered.start(0) <= 0.15 && buffered.end(0) >= duration - 0.15;
+  }
+
+  function activeBuffer(track) {
+    const buffer = track.bufferRef.deref();
+    const active = track.ownerRef.deref()?.activeSourceBuffers;
+    return buffer && active && Array.prototype.includes.call(active, buffer) ? buffer : null;
+  }
+
   function completeTrack(player, track) {
-    return track.initBytes && !track.evicted && track.retainedBytes > 0
+    const buffer = activeBuffer(track);
+    return track.initBytes && !track.evicted && (track.initHasMedia || track.chunks.length > 0) && buffer && !buffer.updating
       && Number.isFinite(player.duration) && player.duration > 0
-      && player.buffered?.length === 1 && player.buffered.start(0) <= 0.15
-      && player.buffered.end(0) >= player.duration - 0.15;
+      && coversPlayback(player.buffered, player.duration) && coversPlayback(buffer.buffered, player.duration);
   }
 
   // Rich provenance inspection for isolated content script
@@ -621,6 +698,7 @@
       const tracks = [];
       if (record.kind === 'mse' && record.msState) {
         for (const track of record.msState.tracks) {
+          if (!activeBuffer(track)) continue;
           const bufferedComplete = Boolean(completeTrack(player, track));
           tracks.push({
             id: track.id,

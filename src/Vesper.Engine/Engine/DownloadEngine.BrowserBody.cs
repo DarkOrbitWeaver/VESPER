@@ -104,20 +104,21 @@ public sealed partial class DownloadEngine
         if (!TryNormalizeSha256(digest, out string expected))
             return new(AddStatus.Invalid, Guid.Empty, "Invalid browser copy integrity proof.");
         string category = FileNames.CategoryFor(body.Name);
-        Guid id = Guid.NewGuid();
+        Guid id = body.JobId;
         DownloadJob job;
 
-        if (body.Tracks is { Count: 2 } specs && body.TrackLengths[0] > 0 && body.TrackLengths[1] > 0)
+        if (body.Tracks is { Count: > 0 } specs
+            && (specs.Count == 2 || specs[0].Container is "mp4" or "m4a"))
         {
             string outContainer = body.OutputContainer ?? Path.GetExtension(body.Name).TrimStart('.').ToLowerInvariant();
             if (outContainer is not ("mp4" or "m4a" or "webm" or "mkv")) outContainer = "mp4";
             string mergedName = Path.ChangeExtension(body.Name, outContainer);
-            var mergeTracks = new List<MergeTrack>(2);
-            for (int i = 0; i < 2; i++)
+            var mergeTracks = new List<MergeTrack>(specs.Count);
+            for (int i = 0; i < specs.Count; i++)
             {
                 BrowserBodyTrackSpec spec = specs[i];
                 mergeTracks.Add(new MergeTrack(
-                    spec.Role,
+                    specs.Count == 1 && spec.Role == "video" ? "muxed" : spec.Role,
                     $"browser-track-{i}",
                     body.Origin,
                     body.TrackLengths[i],
@@ -132,8 +133,8 @@ public sealed partial class DownloadEngine
                 Provider = "browser",
                 MediaId = transferId,
                 OutputContainer = outContainer,
-                RequireVideo = mergeTracks.Any(t => t.Role is "video" or "muxed"),
-                RequireAudio = mergeTracks.Any(t => t.Role is "audio" or "muxed"),
+                RequireVideo = specs.Any(t => t.Role is "video" or "muxed"),
+                RequireAudio = specs.Any(t => t.Role is "audio" or "muxed"),
                 Tracks = mergeTracks
             };
             string cursorState = JsonSerializer.Serialize(new MergeTransfer.Cursor(1, mergePlan.Fingerprint, "download"));

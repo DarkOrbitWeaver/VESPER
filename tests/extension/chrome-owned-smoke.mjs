@@ -55,7 +55,7 @@ function installRaceBridge() {
     if (message.type === 'browser-capture' || message.type === 'browser-submit')
       return setTimeout(() => reply({ results: [{ status: 'started', transferReady: true }] }), 400);
     if (message.type === 'browser-transfer')
-      return reply({ data: { state: 'failed' } });
+      return reply({ data: { state: message.operation === 'accept' ? 'active' : 'failed' } });
     throw new Error('Unexpected native request in capture race test: ' + message.type);
   };
   chrome.runtime.sendNativeMessage = simulate;
@@ -164,6 +164,7 @@ async function main() {
   const audioClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/quiet-track.mp3'));
   const mseClip = await readFile(join(root, 'tests/Vesper.Tests/Fixtures/Media/instinct-mse.mp4'));
   const profile = await mkdtemp(join(profileRoot, '.chrome-ownership-smoke-'));
+  assert.equal(dirname(resolve(profile)), resolve(profileRoot));
   const downloadFolder = join(profile, 'downloads');
   await mkdir(downloadFolder);
   const bytes = Buffer.alloc(256 * 1024, 0x5a);
@@ -558,6 +559,20 @@ async function main() {
     const tab = (await browser.send('Target.attachToTarget',
       { targetId: page, flatten: true })).sessionId;
     await browser.send('Page.enable', {}, tab);
+    async function clickDownloadLink(path, name) {
+      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/page' }, tab);
+      await waitFor(async () => (await browser.send('Runtime.evaluate', {
+        expression: "location.pathname === '/page' && !!document.body", returnByValue: true
+      }, tab)).result.value, 5000, 'The fixture page did not open.');
+      const { result } = await browser.send('Runtime.evaluate', { returnByValue: true, expression:
+        "(() => { const link = document.createElement('a'); link.href = " + JSON.stringify(path)
+        + "; link.download = " + JSON.stringify(name) + "; link.textContent = 'Download';"
+        + "link.style = 'position:fixed;top:10px;left:10px;z-index:9999'; document.body.append(link);"
+        + "const rect = link.getBoundingClientRect(); return { x: rect.left + rect.width/2, y: rect.top + rect.height/2 }; })()"
+      }, tab);
+      for (const type of ['mousePressed', 'mouseReleased'])
+        await browser.send('Input.dispatchMouseEvent', { type, ...result.value, button: 'left', clickCount: 1 }, tab);
+    }
     await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/fixture' }, tab);
 
     const item = await waitFor(async () => {
@@ -640,16 +655,18 @@ async function main() {
         const reachedAccept = calls.some(call => call.operation === 'accept');
         captureRace.push({ fixture, attempted, reachedAccept, bytes: file.fileSize });
         assert.equal(calls.some(call => call.type === 'hello'), false, 'Unsigned capture sent a separate policy request.');
-        // Scheduling differs on real machines. The deliberately slow, resumable
-        // fixture must exercise acceptance; fast cases may finish before it.
-        if (fixture === 'delayed') assert.ok(attempted && reachedAccept, 'The slow fixture did not exercise native acceptance.');
-        const decisions = await evaluate('Read capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
-        assert.ok(!decisions.vesperCaptureDecisions?.some(entry => entry.name === name && entry.outcome === 'moved'),
-          'A simulated failed handoff was falsely credited as native completion.');
+        assert.equal(attempted || reachedAccept, false, 'VESPER tried to take a Chrome-owned file.');
+        await waitFor(async () => {
+          const logs = await evaluate('Read capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
+          return logs.vesperCaptureDecisions?.some(entry => entry.id === file.id && entry.outcome === 'failed');
+        }, 5000, 'The extension did not record the Chrome miss.');
       }
-      const preflights = await evaluate('Read capture preflights',
-        "__ownershipSmoke.raceCalls.filter(call => call.type === 'capture-preflight')");
-      assert.ok(preflights.length >= 1 && preflights.length <= 4, 'Preflight rate should remain bounded across four fixtures.');
+      const createdBefore = await evaluate('Count Chrome download entries', '__ownershipSmoke.created.length');
+      await clickDownloadLink('/race-delayed', 'vesper-race-delayed.bin');
+      await waitFor(() => evaluate('Find native acceptance',
+        "__ownershipSmoke.raceCalls.some(call => call.operation === 'accept')"), 8000,
+        'The trusted download click was not accepted by the simulated helper.');
+      assert.equal(await evaluate('Count Chrome entries after acceptance', '__ownershipSmoke.created.length'), createdBefore);
     }
     let nativeCapture = null;
     if (nativeHostTest) {
@@ -663,12 +680,8 @@ async function main() {
       assert.equal(hello?.ok, true, 'The registered native host did not answer its hello request.');
       assert.equal(hello?.data?.app, 'VESPER');
 
-      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/native-redirect' }, tab);
-      const created = await waitFor(async () => {
-        const events = await evaluate('Read native capture creation', 'globalThis.__ownershipSmoke.created');
-        return events.find(event => event.name === nativeFileName);
-      }, 8000, 'Chrome did not create the redirecting native-capture download.');
-      assert.equal(created.bytesReceived, 0, 'Chrome must not own received bytes before VESPER accepts the transfer.');
+      const createdBefore = await evaluate('Count Chrome download entries', '__ownershipSmoke.created.length');
+      await clickDownloadLink('/native-redirect', nativeFileName);
 
       const capturedPath = join(nativeDownloadFolder, nativeFileName);
       const capturedBytes = await waitFor(async () => {
@@ -677,10 +690,7 @@ async function main() {
           return file.compare(bytes) === 0 ? file : null;
         } catch { return null; }
       }, 25000, 'VESPER did not publish the accepted Chrome transfer in the isolated output folder.');
-      const decisions = await waitFor(async () => {
-        const state = await evaluate('Read native capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
-        return state.vesperCaptureDecisions?.find(entry => entry.name === nativeFileName && entry.outcome === 'moved');
-      }, 8000, 'The extension did not record the accepted VESPER handoff.');
+      assert.equal(await evaluate('Count Chrome entries after publication', '__ownershipSmoke.created.length'), createdBefore);
       const chromeFiles = await readdir(downloadFolder);
       assert.equal(chromeFiles.some(name => name.startsWith(nativeFileName)), false,
         'The accepted file must not remain in Chrome’s download folder.');
@@ -714,10 +724,9 @@ async function main() {
       assert.equal(refusedBytes.compare(bytes), 0, 'Chrome did not retain the exact refused source bytes.');
       const refusalDecision = await waitFor(async () => {
         const state = await evaluate('Read refusal decision', "chrome.storage.session.get('vesperCaptureDecisions')");
-        return state.vesperCaptureDecisions?.find(entry => entry.name === refusalFileName);
+        return state.vesperCaptureDecisions?.find(entry => entry.id === refused.id);
       }, 8000, 'The extension did not explain the refused browser handoff.');
-      assert.equal(refusalDecision.outcome, 'different-signed-out',
-        'A changed source identity must leave the file in Chrome and explain the mismatch.');
+      assert.equal(refusalDecision.outcome, 'failed');
 
       await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/native-signin-redirect' }, tab);
       const signInBrowserFile = await waitFor(async () => {
@@ -729,16 +738,13 @@ async function main() {
         'Chrome did not retain the exact signed-in source bytes.');
       const signInDecision = await waitFor(async () => {
         const state = await evaluate('Read sign-in decision', "chrome.storage.session.get('vesperCaptureDecisions')");
-        return state.vesperCaptureDecisions?.find(entry => entry.name === signInFileName);
+        return state.vesperCaptureDecisions?.find(entry => entry.id === signInBrowserFile.id);
       }, 8000, 'The extension did not explain why the signed-in download stayed in Chrome.');
-      assert.equal(signInDecision.outcome, 'sign-in', 'The sign-in refusal should be explained without transferring ownership.');
+      assert.equal(signInDecision.outcome, 'failed');
       const postScenarioState = await evaluate('Read sign-in native request', 'globalThis.__ownershipSmoke');
       const signInRequest = postScenarioState.nativeMessages.find(message => message.type === 'browser-capture'
         && message.message.items?.some(item => item.url.endsWith('/native-signin-protected')));
-      assert.ok(signInRequest, 'The redirected sign-in URL was not independently verified by the native host.');
-      assert.equal(signInRequest.hasCredentials, false, 'The extension sent an unapproved sign-in credential.');
-      assert.equal(signInRequest.message.items[0].cookie, undefined);
-      assert.equal(signInRequest.message.items[0].authorization, undefined);
+      assert.equal(signInRequest, undefined, 'The helper must not replay a Chrome-owned file.');
       assert.equal(serverRequests.some(request => request.path === '/native-signin-protected'
         && request.pageRequest && request.cookiePresent), true,
       'Chrome did not follow the redirect with its own fixture-only session cookie.');
@@ -749,15 +755,14 @@ async function main() {
       nativeCapture = {
         accepted: true,
         redirected: true,
-        chromeBytesAtCreation: created.bytesReceived,
+        chromeEntryCreated: false,
         bytes: capturedBytes.length,
         sha256: createHash('sha256').update(capturedBytes).digest('hex'),
-        decision: decisions.outcome,
         chromeFileRetained: false,
         duplicateSubmission: { status: duplicate.results[0].status, sameJob: duplicate.results[0].jobId === originalSubmission.response.results?.[0]?.jobId },
         refusal: { chromeRetainedBytes: refusedBytes.length, decision: refusalDecision.outcome },
         signIn: { chromeRetainedBytes: (await readFile(signInBrowserFile.filename)).length, decision: signInDecision.outcome,
-          chromeCookieObserved: true, credentialSentToNative: signInRequest.hasCredentials },
+          chromeCookieObserved: true, credentialSentToNative: false },
         nativeCalls: postScenarioState.nativeCalls,
         nativeTypes: [...new Set(postScenarioState.nativeMessages.map(message => message.type))],
         serverRequests: serverRequests.map(request => ({ ...request }))

@@ -154,7 +154,12 @@ public sealed partial class DownloadEngine
         string name = Path.GetFileName(partial);
         string partialFolder = Path.GetDirectoryName(partial)!;
         bool staged = PartialFile.IsStagingFolder(partialFolder, folder);
-        if (!name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) || name.Length <= suffix.Length
+        // Older browser-body jobs used a random suffix. The saved file identity still gates deletion.
+        bool legacyBrowserPart = staged && job.NonResumable && job.PartialIdentity is not null
+            && (job.Kind == JobKind.BrowserStream || job.Kind == JobKind.Merge && job.MediaProvider == "browser")
+            && name.Length > suffix.Length && name.EndsWith(".vpart", StringComparison.OrdinalIgnoreCase)
+            && name[^suffix.Length] == '.' && name.AsSpan(name.Length - suffix.Length + 1, 8).ToString().All(Uri.IsHexDigit);
+        if ((!legacyBrowserPart && (!name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) || name.Length <= suffix.Length))
             || (!staged && !string.Equals(partialFolder, folder, StringComparison.OrdinalIgnoreCase)))
         {
             error = "The temporary file no longer matches this download.";

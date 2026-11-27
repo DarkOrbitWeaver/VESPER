@@ -461,7 +461,8 @@ internal static class MediaTransferBridge
                 JobKind.Http, step.Context.Referer, step.Context.UserAgent, item.SourceUrl.AbsoluteUri,
                 item.Provider, item.MediaId, selection.Summary, item.Thumbnail?.AbsoluteUri, plan.ExpiresAt,
                 JsonSerializer.Serialize(new MediaTimeRange(audioStart, clipEndSeconds!.Value)), selection.Audio!.Id,
-                Output: MediaOutput.M4a, Secrets: TransferSecrets(step.Context, step.Url)), null);
+                Output: MediaOutput.M4a, Secrets: TransferSecrets(step.Context, step.Url),
+                HostCookies: TransferHostCookies(selection.Streams), OriginHeader: step.Context.Origin), null);
         }
         bool silentWebm = item.Provider == "generic" && selection.Audio is null
             && selection.Video is { Protocol: StreamProtocol.Http, Container: "webm", StandaloneVideo: true,

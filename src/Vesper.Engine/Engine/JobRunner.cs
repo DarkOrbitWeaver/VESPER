@@ -184,10 +184,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         return await engine.FinalizeAsync(session, ct).ConfigureAwait(false);
     }
 
-    // The validator ladder for a parked Chrome download (see BrowserTransferProof). A strong ETag must match exactly.
+    // A strong ETag must match exactly.
     // A Last-Modified proof needs a response with no ETag at all, the identical date, a Date that keeps that date
     // strong, and the exact length. Every other fact Chrome observed must be reproduced before a single body byte
-    // is read. Any difference stops this job with "browser-fallback" so the extension resumes Chrome's own copy.
+    // is read. Any difference stops the staged job before acceptance.
     private void CheckBrowserResponse(FirstResult first)
     {
         // An adopted download resumes saved bytes under its own validators, which the resume path checks itself.
@@ -225,7 +225,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             if (j.BrowserProof is { AwaitingConfirmation: true })
             {
                 j.Reason = "browser-ready";
-                j.Message = "Waiting for Chrome to hand over this download.";
+                j.Message = "Verifying this download.";
             }
         });
         try

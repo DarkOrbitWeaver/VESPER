@@ -4,6 +4,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
+function cardWalker(card) {
+  const links = card.querySelectorAll('a[href]').map(link => ({ tagName: 'A', hasAttribute: () => false, ...link }));
+  return { nextNode: () => links.shift() || null };
+}
+
 function runContent(context, content = source('content')) {
   context.requestAnimationFrame ??= () => 1;
   context.location.origin ??= new URL(context.location.href).origin;
@@ -674,6 +679,7 @@ test('a feed player uses the unique page linked from its card', async () => {
   const document = Object.assign(new EventTarget(), {
     body: {},
     documentElement: {},
+    createTreeWalker: cardWalker,
     querySelectorAll: () => []
   });
   const link = { href: item };
@@ -719,7 +725,8 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
   const window = Object.assign(new EventTarget(), { navigation: new EventTarget() });
   const location = { href: 'https://www.instagram.com/' };
   const frames = [];
-  const document = Object.assign(new EventTarget(), { querySelectorAll: () => { throw Error('unexpected document scan'); } });
+  const document = Object.assign(new EventTarget(), { createTreeWalker: cardWalker,
+    querySelectorAll: () => { throw Error('unexpected document scan'); } });
   const context = vm.createContext({
     window, document, location, URL, AbortController, innerWidth: 1200, innerHeight: 800,
     Element: Video, HTMLMediaElement: Video, HTMLVideoElement: Video,
@@ -786,6 +793,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   const document = Object.assign(new EventTarget(), {
     body,
     documentElement: {},
+    createTreeWalker: cardWalker,
     createElement: node,
     querySelectorAll: () => [],
     elementFromPoint: () => hoverTarget
@@ -966,7 +974,7 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   video.parentElement = card;
   let hoverTarget = card;
   const document = Object.assign(new EventTarget(), {
-    body, documentElement: {}, createElement: node, querySelectorAll: () => [], elementFromPoint: () => hoverTarget
+    body, documentElement: {}, createTreeWalker: cardWalker, createElement: node, querySelectorAll: () => [], elementFromPoint: () => hoverTarget
   });
   const window = new EventTarget();
   const context = vm.createContext({

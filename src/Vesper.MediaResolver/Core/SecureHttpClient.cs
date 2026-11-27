@@ -399,6 +399,7 @@ public sealed class SecureHttpClient : IDisposable
     {
         ctx ??= MediaRequestContext.Empty;
         var visited = new HashSet<string>(StringComparer.Ordinal);
+        bool crossedOrigin = false;
 
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         bool leased = false;
@@ -431,6 +432,7 @@ public sealed class SecureHttpClient : IDisposable
                 req.Headers.TryAddWithoutValidation("User-Agent", ctx.UserAgent ?? _o.UserAgent);
                 foreach (var kv in ctx.HeadersFor(url))
                 {
+                    if (crossedOrigin && kv.Key.Equals("Origin", StringComparison.OrdinalIgnoreCase)) continue;
                     if (kv.Key == "User-Agent") { req.Headers.Remove("User-Agent"); }
                     req.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
                 }
@@ -483,6 +485,7 @@ public sealed class SecureHttpClient : IDisposable
                         throw new MediaResolverException(MediaErrors.Blocked("Redirect downgrades https to http"));
                     if (method != HttpMethod.Get && method != HttpMethod.Head && !HasSameOrigin(url, next))
                         throw new MediaResolverException(MediaErrors.Blocked("Refusing to forward a request body across origins"));
+                    crossedOrigin |= !HasSameOrigin(url, next);
                     url = next; // the next loop iteration re-validates it and re-filters credentials for the new host
                     continue;
                 }

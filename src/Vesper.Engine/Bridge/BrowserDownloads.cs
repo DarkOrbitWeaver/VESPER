@@ -4,11 +4,11 @@ using System.Net.Http.Headers;
 namespace Vesper.Engine;
 
 /// <summary>
-/// Validator proof ladder for safe Chrome-to-VESPER download handoff:
+/// Validator proofs for staging verified browser downloads:
 /// <list type="bullet">
 /// <item><c>etag</c>: Strong HTTP ETag + matching representation.</item>
 /// <item><c>last-modified</c>: Strong RFC 9110 Last-Modified (>= 60s age) + exact Content-Length.</item>
-/// <item><c>attachment-length</c>: Explicit attachment or binary file >= 256 KiB with Accept-Ranges: bytes and exact Content-Length; Chrome remains paused as fallback until native verification succeeds.</item>
+/// <item><c>attachment-length</c>: Explicit attachment or binary file >= 256 KiB with Accept-Ranges: bytes and exact Content-Length.</item>
 /// </list>
 /// </summary>
 public sealed record BrowserTransferProof(long? Length, string? ETag, string? ContentType, bool AwaitingConfirmation = true,

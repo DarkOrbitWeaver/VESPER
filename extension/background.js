@@ -147,7 +147,6 @@ async function refreshNeverCaptureHosts() {
   siteRulesRefresh = (async () => {
     try {
       const reply = await nativeRequest(envelope('hello'), SITE_POLICY_TIMEOUT);
-      await rememberCaptureProofs(reply);
       return await cacheNeverCaptureHosts(reply);
     } catch { return false; }
   })().finally(() => { siteRulesRefresh = null; });
@@ -1402,7 +1401,8 @@ async function playerOptions(message, sender) {
   const youTube = isYouTubePage(page);
   const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
   const socialSite = VesperPlayerSource.isSocialFeedSite(page.href);
-  const socialFeed = socialSite && binding && /^https?:/.test(identity);
+  const socialFeed = (socialSite || /(?:^|\.)(?:x|twitter)\.com$/i.test(page.hostname))
+    && (!binding || /^https?:/.test(identity));
   const player = binding ? VesperMediaEvidence.playerFacts(message.playerFacts) : {};
   const mismatchedUrls = new Set();
   function forCurrentPlayer(reply, url) {
@@ -1900,11 +1900,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type.startsWith('batch-journal-') || message.type === 'batch-arm' || message.type === 'batch-status'
         || message.type === 'batch-clear' || message.type === 'batch-disarm')
       return VesperBatchEvents.handle(message.type, message, sender);
-    const recovery = recoverChromeCaptures();
-    // Native media selection and discovery do not own a Chrome download item.
-    // A recovering attachment must not hold up an unrelated player or picker.
-    if (!['media-element', 'media-options', 'media-source-select', 'media-select', 'native-picker'].includes(message.type))
-      await recovery;
     switch (message.type) {
       case 'smart-submit': {
         const page = mediaPage({}, sender);

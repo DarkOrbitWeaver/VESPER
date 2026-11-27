@@ -36,6 +36,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
     private sealed record JournalEntry(string Id, string Path, string State, string? Identity = null);
 
     internal sealed class Transfer(
+        Guid jobId,
         string origin,
         string name,
         long? expectedLength,
@@ -47,6 +48,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
         string? pageUrl = null,
         string? outputContainer = null) : IDisposable
     {
+        internal Guid JobId { get; } = jobId;
         internal string Origin { get; } = origin;
         internal string? PageUrl { get; } = pageUrl;
         internal string Name { get; } = name;
@@ -153,7 +155,8 @@ internal sealed class BrowserBodyReceiver : IDisposable
             if (tracks is { Count: 2 }) spaceNeeded = spaceNeeded * 2; // reserve staging + remux headroom
             if (_destination(name, spaceNeeded) is not { } folder) return new(false, "storage");
             string staging = PartialFile.PrepareStagingFolder(folder);
-            string path = Path.Combine(staging, name + "." + Guid.NewGuid().ToString("N")[..8] + ".vpart");
+            Guid jobId = Guid.NewGuid();
+            string path = Path.Combine(staging, name + "." + jobId.ToString("N")[..8] + ".vpart");
             RememberJournal(new JournalEntry(id, path, "receiving"));
             PartialFile file;
             try { file = PartialFile.Open(path, FileMode.CreateNew, allowDelete: true); }
@@ -173,7 +176,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 ForgetJournal(id);
                 throw;
             }
-            var transfer = new Transfer(origin, name, expectedLength, folder, file, identity, verifyMp4, tracks, pageUrl, outputContainer);
+            var transfer = new Transfer(jobId, origin, name, expectedLength, folder, file, identity, verifyMp4, tracks, pageUrl, outputContainer);
             _active.Add(id, transfer);
             Renew(transfer);
             return new(true, "ok");

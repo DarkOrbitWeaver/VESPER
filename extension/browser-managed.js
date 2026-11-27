@@ -1,6 +1,7 @@
 'use strict';
 
 const MANAGED_DOWNLOADS_KEY = 'vesperManagedDownloads';
+const MAX_MANAGED_DOWNLOADS = 128;
 const manualManagedDownloads = new Set();
 let managedWrites = Promise.resolve();
 let managedRefresh;
@@ -27,7 +28,7 @@ function managedHosts(item) {
 function managedCandidate(item) {
   const notMalicious = !['content', 'url', 'unwanted'].includes(item?.danger);
   const safeState = item?.state === 'complete' ? isSafe(item) : notMalicious;
-  return safeState && !startedByVesper(item) && Number.isSafeInteger(item?.id)
+  return safeState && !item?.incognito && !startedByVesper(item) && Number.isSafeInteger(item?.id)
     && Number.isFinite(Date.parse(item?.startTime))
     && /^(https?:|blob:|data:)/i.test(item?.finalUrl || item?.url || '')
     && managedHosts(item).length > 0;
@@ -69,7 +70,8 @@ function managedProgress(item, profile) {
   return {
     id: managedId(item, profile), name: (chromeFileName(item) || 'Chrome download').slice(0, 255),
     start: Date.parse(item.startTime), received: byteCount(item.bytesReceived) ?? 0,
-    length: knownSize(item), paused: item.paused === true, canResume: item.canResume === true,
+    length: [item.fileSize, item.totalBytes].find(value => Number.isSafeInteger(value) && value > 0),
+    paused: item.paused === true, canResume: item.canResume === true,
     hosts: managedHosts(item)
   };
 }
@@ -77,7 +79,7 @@ function managedProgress(item, profile) {
 async function rememberManaged(item, generation) {
   await updateManagedItems(items => {
     if (generation !== undefined && !captureAllowed(generation)) return items;
-    return [...items.filter(row => row.id !== item.id), { id: item.id, startTime: item.startTime }].slice(-MAX_BROWSER_RECORDS);
+    return [...items.filter(row => row.id !== item.id), { id: item.id, startTime: item.startTime }].slice(-MAX_MANAGED_DOWNLOADS);
   });
 }
 

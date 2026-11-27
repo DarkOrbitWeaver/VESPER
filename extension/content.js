@@ -339,20 +339,38 @@
     }, ENDED_PLAYER_TTL);
   }
 
+  function cardLinks(card, budget) {
+    const walker = document.createTreeWalker(card, 1); // elements only
+    const links = new Map();
+    for (let element = card; element; element = walker.nextNode()) {
+      if (--budget.remaining < 0) return null;
+      if (element.tagName === 'A' && element.href) {
+        if (links.size >= 32) return null;
+        links.set(element, { href: element.href, permalink: element.hasAttribute('data-permalink') });
+      } else if (element.tagName === 'TIME' && element.hasAttribute('datetime')) {
+        const link = links.get(element.closest('a[href]'));
+        if (link) link.permalink = true;
+      }
+    }
+    return [...links.values()];
+  }
+
   function cardContext(node, includePlayer) {
     if (!(node instanceof Element)) return null;
     const origin = location.origin;
     const candidates = [...nearby].filter(el => el.tagName === 'VIDEO' && el.isConnected
       && clippedPlayerRect(el.getBoundingClientRect()) && renderedPlayerBox(el));
-    for (let card = node, depth = 0; card && depth < 12 && card !== document.body; card = composedParent(card), depth++) {
+    const budget = { remaining: 768 };
+    for (let card = node, depth = 0; card && depth < 12 && card !== document.body
+        && card !== document.documentElement; card = composedParent(card), depth++) {
       const visibleVideos = candidates.filter(el => containsPlayer(card, el));
       // Allow carousels (Instagram/X/feeds) that pre-mount offscreen slide <video> elements inside one post card;
       // stop climbing only when multiple distinct cards' visible players share a feed wrapper.
       if (visibleVideos.length > 1 && card.tagName !== 'ARTICLE') break;
       if (includePlayer && !visibleVideos.length) continue;
       if (!includePlayer && visibleVideos.length && !visibleVideos.includes(node)) break;
-      const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
-        permalink: !!(link.querySelector?.('time[datetime]') || link.hasAttribute?.('data-permalink')) }));
+      const links = cardLinks(card, budget);
+      if (!links) return null;
       try {
         const own = card.getAttribute?.('data-permalink');
         if (own) links.push({ href: new URL(own, origin).href, permalink: true });
@@ -1074,7 +1092,7 @@
         .panel{position:fixed;width:340px;max-width:calc(100vw - 16px);max-height:min(630px,calc(100vh - 16px));
           background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;display:none;
           box-shadow:0 7px 22px #0003;overflow-x:hidden;overflow-y:auto;font-size:13px;transform-origin:top right}
-        .panel.show{display:block;animation:picker-open .16s ease-out}
+        .panel.show{display:block;pointer-events:auto;animation:picker-open .16s ease-out}
         @keyframes picker-open{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
         .receipt{position:fixed;max-width:calc(100vw - 16px);padding:6px 10px;border-radius:7px;border:1px solid var(--border);
           background:var(--surface);color:var(--sage);box-shadow:0 3px 10px #0003;font-size:12px;line-height:1.4;
@@ -1173,7 +1191,7 @@
     }, { signal });
     // Feed players often handle pointer/mouse events on a common ancestor.
     // Do not let interaction with our overlay toggle their playback controls.
-    for (const type of ['pointerdown','pointerup','mousedown','mouseup','dblclick'])
+    for (const type of ['pointerdown','pointerup','mousedown','mouseup','click','dblclick'])
       root.addEventListener(type, e => e.stopPropagation(), { signal });
     button.draggable = false;
     button.addEventListener('pointerdown', startDrag, { signal });
@@ -1875,12 +1893,14 @@
       if (!original && missingFormats && ['no-media', 'no-reusable-source', 'browser-context', 'unavailable',
           'site-refused', 'source-changed', 'source-expired', 'source-unavailable', 'sign-in', 'unsupported', 'network'].includes(result?.code)) {
         original = await globalThis.VesperBrowserBody?.inspectLocalMedia(src, location.origin);
-        if (!original && playerWitness?.tracks?.length && playerWitness.tracks.length <= 2
-            && playerWitness.tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
+        if (!isCurrentRequest(request)) return;
+        const tracks = !original && playerFragmentWitness(player, binding).tracks;
+        if (tracks?.length && tracks.length <= 2
+            && tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
               && Number.isSafeInteger(t.retainedBytes) && t.retainedBytes > 0)
-            && (playerWitness.tracks.length === 1
-              || playerWitness.tracks.some(t => t.role === 'audio') && playerWitness.tracks.some(t => t.role === 'video'))) {
-          mseExportTracks = playerWitness.tracks;
+            && (tracks.length === 1 || tracks.some(t => t.role === 'audio') && tracks.some(t => t.role === 'video')
+              && tracks.every(t => /\/webm/i.test(t.mimeType) === /\/webm/i.test(tracks[0].mimeType)))) {
+          mseExportTracks = tracks;
           const totalSize = mseExportTracks.reduce((s, t) => s + (t.retainedBytes || 0), 0);
           const mime = mseExportTracks.find(track => track.role !== 'audio')?.mimeType || mseExportTracks[0].mimeType;
           original = { mime, sizeBytes: totalSize, container: mseExportTracks.every(track => /\/webm/i.test(track.mimeType))

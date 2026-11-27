@@ -149,8 +149,7 @@ internal static class Mp4Demuxer
         long pos = 0;
         bool sawMoov = false;
         int total = 0;
-        byte[]? previousMoof = null;
-        long previousMoofEnd = 0;
+        var recentFragments = new Queue<(long MoofBody, int MoofLength, long Mdat)>();
         while (pos < length)
         {
             ct.ThrowIfCancellationRequested();
@@ -183,18 +182,29 @@ internal static class Mp4Demuxer
             {
                 if (!sawMoov) throw Bad("a movie fragment precedes the movie header");
                 byte[] moof = MuxIo.Load(s, pos + headerLen, size - headerLen, MaxMoofBytes, "movie fragment");
-                bool repeated = browserCapture && previousMoof is not null
-                    && moof.AsSpan().SequenceEqual(previousMoof) && HasExplicitDecodeTimes(moof)
-                    && RepeatsMediaData(s, length, previousMoofEnd, pos, pos + size, ct);
+                long media = pos + size;
+                long mediaSize = browserCapture ? MediaDataSize(s, length, media) : 0;
+                bool repeated = false;
+                if (mediaSize > 0 && HasExplicitDecodeTimes(moof))
+                {
+                    foreach (var previous in recentFragments)
+                    {
+                        if (previous.MoofLength != moof.Length || MediaDataSize(s, length, previous.Mdat) != mediaSize
+                            || !EqualRanges(s, previous.MoofBody, pos + headerLen, moof.Length, ct)
+                            || !EqualRanges(s, previous.Mdat, media, mediaSize, ct)) continue;
+                        repeated = true;
+                        break;
+                    }
+                    if (!repeated)
+                    {
+                        if (recentFragments.Count == 8) recentFragments.Dequeue();
+                        recentFragments.Enqueue((pos + headerLen, moof.Length, media));
+                    }
+                }
                 if (!repeated)
                 {
                     total += ParseMoof(moof, pos, states);
                     if (total > MaxSamples) throw Bad("the file declares too many samples");
-                }
-                if (browserCapture)
-                {
-                    previousMoof = moof;
-                    previousMoofEnd = pos + size;
                 }
             }
             pos += size;
@@ -239,21 +249,27 @@ internal static class Mp4Demuxer
         return foundTrack;
     }
 
-    private static bool RepeatsMediaData(Stream source, long length, long previous, long moof, long current, CancellationToken ct)
+    private static long MediaDataSize(Stream source, long length, long offset)
     {
-        long size = moof - previous;
-        if (size < 8 || size > length - current) return false;
+        long remaining = length - offset;
+        if (remaining < 8) return 0;
         Span<byte> header = stackalloc byte[16];
-        MuxIo.ReadExact(source, previous, header[..8]);
-        if (!header.Slice(4, 4).SequenceEqual("mdat"u8)) return false;
+        MuxIo.ReadExact(source, offset, header[..8]);
+        if (!header.Slice(4, 4).SequenceEqual("mdat"u8)) return 0;
         ulong declared = BinaryPrimitives.ReadUInt32BigEndian(header);
-        if (declared == 1 && size >= 16)
+        int headerSize = 8;
+        if (declared == 1)
         {
-            MuxIo.ReadExact(source, previous + 8, header.Slice(8, 8));
+            if (remaining < 16) return 0;
+            MuxIo.ReadExact(source, offset + 8, header.Slice(8, 8));
             declared = BinaryPrimitives.ReadUInt64BigEndian(header[8..]);
+            headerSize = 16;
         }
-        if (declared != (ulong)size) return false;
+        return declared >= (ulong)headerSize && declared <= (ulong)remaining ? (long)declared : 0;
+    }
 
+    private static bool EqualRanges(Stream source, long previous, long current, long size, CancellationToken ct)
+    {
         Span<byte> left = stackalloc byte[4096];
         Span<byte> right = stackalloc byte[4096];
         for (long offset = 0; offset < size;)

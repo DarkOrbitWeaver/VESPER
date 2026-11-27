@@ -254,7 +254,8 @@ public sealed partial class DownloadEngine
     {
         RequestCredentials? credentials = replacementCredentials ?? CredentialsFor(job.Id);
         var spec = new RequestSpec(offset, null, Referer: job.Referer, UserAgent: job.UserAgent,
-            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? job.SourceUrl);
+            Secrets: credentials?.Headers, CredentialOrigin: credentials?.Origin.AbsoluteUri ?? job.SourceUrl,
+            HostCookies: credentials?.HostCookies, OriginHeader: credentials?.OriginHeader);
         using HttpResponseMessage response = await _http.SendAsync(uri, spec, ct).ConfigureAwait(false);
         int status = (int)response.StatusCode;
         RangeCheck check = HttpFacts.CheckRangeResponse(response, offset, null);

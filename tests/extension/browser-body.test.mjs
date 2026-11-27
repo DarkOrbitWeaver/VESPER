@@ -100,7 +100,8 @@ test('worker copy accepts a complete CDN body and rejects an unverified partial 
         chunks.push(bytes);
       }
       host.postMessage({ ok: true, id: message.id, data: {
-        offset, ...(message.operation === 'finish' ? { accepted: true, jobId: 'worker-test' } : {})
+        offset, ...(message.operation === 'begin' ? { mediaCheck: message.mediaCheck } : {}),
+        ...(message.operation === 'finish' ? { accepted: true, jobId: 'worker-test' } : {})
       } });
     });
     const url = 'https://cdn.test/clip.mp4';

@@ -12,9 +12,16 @@ function setup() {
   }
   class Buffer {
     appendBuffer(value) { this.last = value; return undefined; }
+    remove() {}
+    buffered = { length: 1, start: () => 0, end: () => 10 };
   }
   class Source {
-    addSourceBuffer() { return new Buffer(); }
+    activeSourceBuffers = [];
+    addSourceBuffer() {
+      const buffer = new Buffer();
+      this.activeSourceBuffers.push(buffer);
+      return buffer;
+    }
   }
   class Player {
     constructor(src) { this.currentSrc = src; this.attributes = new Map(); }
@@ -39,13 +46,34 @@ function setup() {
     const el = new Player(WitnessURL.createObjectURL(source));
     return { source, el, buffer: source.addSourceBuffer('video/mp4') };
   };
-  const request = el => {
+  const provenance = el => {
     el.attributes.delete('data-vesper-media-provenance');
     listeners.get('vesper-media-provenance-request')({target:el});
-    return JSON.parse(el.attributes.get('data-vesper-media-provenance') || '{"paths":[]}').paths;
+    return JSON.parse(el.attributes.get('data-vesper-media-provenance') || '{"paths":[], "tracks":[]}');
   };
-  return {player, request, FetchResponse, WitnessURL, Player, advance: ms => time += ms};
+  return {player, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, Player, advance: ms => time += ms};
 }
+
+test('MSE keeps an identical init and refuses incomplete, inactive or edited tracks', () => {
+  const fixture = setup();
+  const { source, buffer, el } = fixture.player();
+  const mp4Box = type => Uint8Array.of(0, 0, 0, 8, ...[...type].map(char => char.charCodeAt(0)));
+  const init = Uint8Array.of(...mp4Box('ftyp'), ...mp4Box('moov'));
+  el.duration = 10;
+  el.buffered = buffer.buffered;
+  buffer.appendBuffer(init);
+  assert.equal(fixture.provenance(el).tracks[0].bufferedComplete, false);
+  buffer.appendBuffer(mp4Box('mdat'));
+  buffer.appendBuffer(init.slice());
+  assert.equal(fixture.provenance(el).tracks[0].bufferedComplete, true);
+  buffer.buffered = { length: 1, start: () => 0, end: () => 4 };
+  assert.equal(fixture.provenance(el).tracks[0].bufferedComplete, false);
+  buffer.buffered = el.buffered;
+  buffer.remove(0, 1);
+  assert.equal(fixture.provenance(el).tracks[0].bufferedComplete, false);
+  source.activeSourceBuffers.length = 0;
+  assert.equal(fixture.provenance(el).tracks.length, 0);
+});
 
 test('exact response buffer is associated with only the SourceBuffer that receives it', async () => {
   const b = setup(), a = b.player(), neighbour = b.player();
