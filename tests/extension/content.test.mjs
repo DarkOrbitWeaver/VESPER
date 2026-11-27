@@ -874,11 +874,11 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   video.duration = 95;
   video.videoHeight = 720;
   await window.__testContent.loadFormats();
-  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { durationSeconds: 95, height: 720 });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { durationSeconds: 95, height: 720, kind: 'video' });
 
   video.duration = Infinity;
   await window.__testContent.loadFormats();
-  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { height: 720, live: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1).playerFacts)), { height: 720, kind: 'video', live: true });
 
   const trim = window.__testContent.clipAvailability;
   const audioAac = trim({ canClip: true, clipUsesWholeFile: true, container: 'M4A' }, 95);
