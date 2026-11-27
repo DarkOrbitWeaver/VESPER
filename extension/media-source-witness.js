@@ -446,6 +446,7 @@
     totalRetainedBytes -= track.retainedBytes;
     track.initBytes = null;
     track.initHasMedia = false;
+    track.container = null;
     track.chunks = [];
     track.retainedBytes = 0;
     track.evicted = true;
@@ -484,6 +485,39 @@
       return 'video';
     }
     return 'muxed';
+  }
+
+  function mp4Role(init) {
+    const view = new DataView(init.buffer, init.byteOffset, init.byteLength);
+    const parents = [0x6d6f6f76, 0x7472616b, 0x6d646961]; // moov, trak, mdia
+    let video = false, audio = false, remaining = 128;
+    function scan(start, end, depth) {
+      for (let offset = start; offset < end;) {
+        if (offset + 8 > end || remaining-- <= 0) return false;
+        let size = view.getUint32(offset), header = 8;
+        const type = view.getUint32(offset + 4);
+        if (size === 1) {
+          if (offset + 16 > end) return false;
+          size = view.getUint32(offset + 8) * 4294967296 + view.getUint32(offset + 12);
+          header = 16;
+        } else if (size === 0) size = end - offset;
+        if (size < header || size > end - offset) return false;
+        const payload = offset + header;
+        if (type === parents[depth] && !scan(payload, offset + size, depth + 1)) return false;
+        if (depth === 3 && type === 0x68646c72 && size >= header + 12) { // hdlr
+          const handler = view.getUint32(payload + 8);
+          video ||= handler === 0x76696465; // vide
+          audio ||= handler === 0x736f756e; // soun
+        }
+        offset += size;
+      }
+      return true;
+    }
+    if (!scan(0, view.byteLength, 0)) return null;
+    if (video && audio) return 'muxed';
+    if (video) return 'video';
+    if (audio) return 'audio';
+    return null;
   }
 
   function matchBySample(sample) {
@@ -617,6 +651,8 @@
           if (reserveMseBytes(track, rawBytes.byteLength)) {
             track.initBytes = rawBytes.slice();
             track.initHasMedia = inspected.hasMedia;
+            track.container = inspected.container;
+            if (track.container === 'mp4') track.role = mp4Role(track.initBytes) || inferRole(track.mimeType);
           }
         } else if (!track.evicted && track.initBytes) {
           if (inspected?.hasInit) {
@@ -736,7 +772,7 @@
           tracks.push({
             id: track.id,
             role: track.role,
-            mimeType: track.mimeType,
+            mimeType: track.container ? (track.role === 'audio' ? 'audio/' : 'video/') + track.container : track.mimeType,
             hasInit: Boolean(track.initBytes),
             initLength: track.initBytes?.byteLength || 0,
             retainedBytes: track.retainedBytes,

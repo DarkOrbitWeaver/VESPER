@@ -353,11 +353,14 @@ async function earlyDirectDownload(message, sender) {
       const strongEtag = rawEtag && /^"[^"\x00-\x20\x7f]{0,254}"$/.test(rawEtag) ? rawEtag : undefined;
       const lastModified = !rawEtag ? strongLastModified(response.headers.get('last-modified'), response.headers.get('date')) : undefined;
       const useAttachmentLength = !rawEtag && !lastModified && acceptsRanges && length >= 262_144 && attachment;
+      const useGitHubArchive = !!archiveTarget && (!strongEtag && !useAttachmentLength
+        && !(lastModified && length > 0) || length === 0);
       const encoding = response.headers.get('content-encoding');
       Object.assign(facts, {
         status: response.status, mime, total: byteCount(length), attachment, ranges: acceptsRanges,
         redirected: !!response.redirected, signedIn: !!signedItems, finalRoute: final?.href,
-        proof: strongEtag ? 'etag' : lastModified ? 'last-modified' : useAttachmentLength ? 'attachment-length' : 'none'
+        proof: useGitHubArchive ? 'github-archive' : strongEtag ? 'etag'
+          : lastModified ? 'last-modified' : useAttachmentLength ? 'attachment-length' : 'none'
       });
       if (archiveTarget && (final?.href !== archiveTarget.href || !attachment
           || !['application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-gzip'].includes(mime)))
@@ -366,18 +369,18 @@ async function earlyDirectDownload(message, sender) {
       if (!final || credMode === 'include' && (response.redirected || final.origin !== page.origin)
           || final.protocol !== 'https:' && final.origin !== page.origin) return fallback('redirect-unverified');
       if (html && !namedHtml || !attachment && explicitName === null && !binary) return fallback('file-intent-unverified');
-      if (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0)
+      if (!useGitHubArchive && (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0))
         return fallback('length-unverified');
-      if (!strongEtag && !lastModified && !useAttachmentLength) return fallback('validator-unverified');
+      if (!useGitHubArchive && !strongEtag && !lastModified && !useAttachmentLength) return fallback('validator-unverified');
       if (encoding && encoding.toLowerCase() !== 'identity') return fallback('encoding-unverified');
       if (matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !captureAllowed(generation))
         return chromeFallback;
       const proof = {
-        ...(length === undefined ? {} : { length }),
+        ...(Number.isSafeInteger(length) && length > 0 ? { length } : {}),
         ...(mime ? { contentType: mime } : {}),
         attachment,
         ...(acceptsRanges ? { acceptsRanges: true } : {}),
-        ...(strongEtag ? { etag: strongEtag, basis: 'etag' }
+        ...(useGitHubArchive ? { basis: 'github-archive' } : strongEtag ? { etag: strongEtag, basis: 'etag' }
           : lastModified ? { lastModified, basis: 'last-modified' }
           : { basis: 'attachment-length' })
       };

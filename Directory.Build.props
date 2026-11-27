@@ -2,7 +2,7 @@
 
   <!-- Shared desktop, host and setup version. Packaging checks the extension version and stamps the source revision. -->
   <PropertyGroup>
-    <Version Condition="'$(Version)' == ''">2.0.0-aaa.2</Version>
+    <Version Condition="'$(Version)' == ''">2.0.0-aaa.8</Version>
     <SourceRevisionId Condition="'$(SourceRevisionId)' == ''">local</SourceRevisionId>
     <IncludeSourceRevisionInInformationalVersion>true</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>

@@ -17,13 +17,28 @@ public sealed record BrowserTransferProof(long? Length, string? ETag, string? Co
 {
     internal const long MinimumMetadataLength = 256 * 1024;
 
-    public static IReadOnlyList<string> AcceptedBases { get; } = ["etag", "last-modified", "attachment-length"];
+    public static IReadOnlyList<string> AcceptedBases { get; } = ["etag", "last-modified", "attachment-length", "github-archive"];
 
     internal bool UsesAttachmentLength => Basis == "attachment-length";
 
     internal bool UsesMetadata => Basis is "metadata" or "attachment-length";
 
     internal bool UsesLastModified => Basis == "last-modified";
+    internal bool UsesGitHubArchive => Basis == "github-archive";
+
+    internal bool MatchesGitHubArchive(Uri url)
+    {
+        if (url.Scheme != "https" || url.IdnHost != "codeload.github.com" || !url.IsDefaultPort
+            || url.Query.Length > 0 || url.Fragment.Length > 0 || url.UserInfo.Length > 0) return false;
+        string[] parts = url.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 4 || !parts.Take(2).All(name => name.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.'))) return false;
+        return parts[2] switch
+        {
+            "zip" => ContentType is "application/zip" or "application/x-zip-compressed",
+            "tar.gz" => ContentType is "application/gzip" or "application/x-gzip",
+            _ => false
+        };
+    }
 
     internal DateTimeOffset? LastModifiedValue =>
         LastModified is { Length: > 0 and <= 64 }
@@ -53,6 +68,8 @@ public sealed record BrowserTransferProof(long? Length, string? ETag, string? Co
                 "attachment-length" => Length >= MinimumMetadataLength
                     && AcceptsRanges == true && Attachment == true && ETag is null && LastModified is null
                     && ContentType is not (null or "text/html" or "application/xhtml+xml"),
+                "github-archive" => Length != 0 && ETag is null && LastModified is null && Attachment == true
+                    && ContentType is ("application/zip" or "application/x-zip-compressed" or "application/gzip" or "application/x-gzip"),
                 _ => false
             };
         }

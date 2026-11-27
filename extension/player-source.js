@@ -34,6 +34,8 @@ globalThis.VesperPlayerSource = (() => {
     return id !== 'audio' && /^[a-z0-9_-]{1,128}$/i.test(id) ? { kind: parts[kindAt], id } : null;
   }
 
+  const isFacebookHost = host => /(?:^|\.)(?:facebook\.com|fb\.watch)$/.test(host);
+
   function identity(value) {
     const url = http(value);
     if (!url) return null;
@@ -73,8 +75,12 @@ globalThis.VesperPlayerSource = (() => {
         if (rest.length === 2 && rest[0] === 'video' && /^[1-9]\d?$/.test(rest[1]))
           return 'x:' + id + ':video:' + rest[1];
       }
-    } else if (/(?:^|\.)(?:facebook\.com|fb\.watch)$/.test(host)) {
+    } else if (isFacebookHost(host)) {
       if (host === 'fb.watch' && parts[0]) return `facebook:watch:${parts[0]}`;
+      if (parts[0] === 'stories' && /^\d+$/.test(parts[1] || '')) {
+        const item = parts[2] || url.searchParams.get('story_fbid');
+        if (/^[a-z0-9_=-]{1,160}$/i.test(item || '')) return `facebook:story:${parts[1]}:${item}`;
+      }
       const index = parts.findIndex(part => part === 'reel' || part === 'videos' || part === 'watch');
       const id = url.searchParams.get('v') || (index >= 0 ? parts[index + 1] : null);
       if (/^\d+$/.test(id || '')) return `facebook:${id}`;
@@ -154,8 +160,9 @@ globalThis.VesperPlayerSource = (() => {
   }
 
   function isSocialFeedSite(pageUrl) {
-    return /(?:^|\.)(?:instagram|tiktok)\.com$/i.test(http(pageUrl)?.hostname || '');
+    const host = http(pageUrl)?.hostname || '';
+    return /(?:^|\.)(?:instagram|tiktok)\.com$/i.test(host) || isFacebookHost(host);
   }
 
-  return { http, identity, cardPage, kind, isSocialFeedSite, instagramPost };
+  return { http, identity, cardPage, kind, isSocialFeedSite, instagramPost, isFacebookHost };
 })();

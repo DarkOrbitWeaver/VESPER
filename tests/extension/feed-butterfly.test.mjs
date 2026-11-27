@@ -241,6 +241,7 @@ function makeContentHarness({ href = 'https://www.tiktok.com/', videos = [] } = 
   return {
     Media, Video, Elem, doc, context, window: context.window, flushRaf, tick, sentMessages, fetchCalls,
     triggerMO: records => moCallbacks.forEach(cb => cb(records)),
+    triggerIntersection: entries => ioCallback(entries),
     get host() { return mountedHost; },
     get perch() { return lastPerch; },
     get flyVisible() { return flyVisible; }
@@ -327,6 +328,32 @@ test('request budget: TikTok load, hover, autoplay and scroll send zero format l
   assert.equal(h.fetchCalls.length, 0, 'no page-context network fetch on passive paths');
 });
 
+test('a queued offscreen entry uses the video position when the feed has already scrolled', async () => {
+  const h = makeContentHarness();
+  const v = new h.Video({ src: 'blob:https://www.tiktok.com/next', readyState: 4, paused: false, _visible: false });
+  h.doc.body.appendChild(v);
+  h.triggerMO([{ type: 'childList', target: h.doc.body, addedNodes: [v], removedNodes: [] }]);
+  await h.tick();
+  h.flushRaf();
+  assert.equal(h.flyVisible, false);
+
+  v._visible = true;
+  h.triggerIntersection([{ target: v, isIntersecting: false }]);
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+});
+
+test('a Facebook story with decoded video gets the Butterfly without a URL source', async () => {
+  const h = makeContentHarness({ href: 'https://www.facebook.com/stories/12345/UzpfTEST=/' });
+  const v = new h.Video({ srcObject: {}, readyState: 4, paused: false, autoplay: true, defaultMuted: true, loop: true });
+  h.doc.body.appendChild(v);
+  h.triggerMO([{ type: 'childList', target: h.doc.body, addedNodes: [v], removedNodes: [] }]);
+  await h.tick();
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+  assert.equal(h.sentMessages.some(message => message.type === 'media-options'), false);
+});
+
 test('Instagram permalinks with a username prefix keep their post identity', () => {
   const ctx = vm.createContext({ URL });
   vm.runInContext(src('player-source'), ctx);
@@ -391,4 +418,14 @@ test('MSE: a full-buffer quality switch rebuilds the track; a partial remove sti
   assert.equal(provenance().tracks[0].bufferedComplete, true, 'a full-buffer ABR reset must not permanently evict the track');
   audio.remove(0, 1);
   assert.equal(provenance().tracks[0].bufferedComplete, false, 'a partial remove still invalidates the retained copy');
+
+  // A SourceBuffer can advertise both codecs while its init holds only video.
+  const makeBox = (type, payload) => Uint8Array.of(0, 0, 0, payload.length + 8, ...box(type).slice(4), ...payload);
+  const handler = makeBox('hdlr', Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 0, 118, 105, 100, 101));
+  const moov = makeBox('moov', makeBox('trak', makeBox('mdia', handler)));
+  const video = ms.addSourceBuffer('video/mp4; codecs="avc1.640028,mp4a.40.2"');
+  video.appendBuffer(moov);
+  video.appendBuffer(box('mdat'));
+  assert.equal(provenance().tracks[1].role, 'video');
+  assert.equal(provenance().tracks[1].mimeType, 'video/mp4');
 });

@@ -1434,6 +1434,25 @@ test('direct player evidence observed just before playback metadata is still cur
   assert.equal(options.data.choices[0].container, 'MP4');
 });
 
+test('Facebook looks up the active story source without resolving the surrounding page', async () => {
+  const page = 'https://www.facebook.com/stories/12345/UzpfTEST=/';
+  const playerUrl = 'https://video.example/story.mp4';
+  const sender = { url: page, tab: { id: 14 }, frameId: 0, documentId: 'facebook-story' };
+  const app = load({ 'media-source-options': checkedSource(14) });
+  try {
+    const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerHasMedia: true,
+      generation: 1, mediaChangedAt: Date.now() };
+    const unavailable = await app.message(request, sender);
+    assert.equal(unavailable.code, 'no-reusable-source');
+    assert.deepEqual(app.sent, []);
+
+    const formats = await app.message({ ...request, playerUrl }, sender);
+    assert.equal(formats.ok, true);
+    assert.deepEqual(app.sent.map(message => message.type), ['media-source-options']);
+    assert.equal(app.sent[0].candidates[0].url, playerUrl);
+  } finally { app.stopWorker(); }
+});
+
 test('a complete direct player file falls back to Chrome when VESPER reports no media', async () => {
   const app = load({ 'media-options': { ok: false, code: 'no-media', message: 'No downloadable media was found.' } });
   const page = 'https://www.youtube.com/shorts/bbbbbbbbbbb';
@@ -2920,7 +2939,7 @@ test('trusted direct intent stages and accepts before any Chrome download exists
     assert.equal(app.downloadHistory.length,0);
   }finally{app.stopWorker()}
 });
-test('public GitHub archives can redirect to the same repository on codeload without cookies', async () => {
+test('public GitHub archives use the correct codeload URL even without size or a strong validator', async () => {
   const page = 'https://github.com/owner/project';
   const url = page + '/archive/refs/heads/main.zip';
   const target = 'https://codeload.github.com/owner/project/zip/refs/heads/main';
@@ -2930,7 +2949,7 @@ test('public GitHub archives can redirect to the same repository on codeload wit
     earlyFetch: async (address, options) => {
       requests.push([address, options.credentials, options.redirect]);
       return { status: 200, url: target, redirected: true, headers: new Headers({
-        'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="project-main.zip"', ETag: '"commit"'
+        'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename="project-main.zip"', ETag: 'W/"commit"'
       }) };
     }
   });
@@ -2941,6 +2960,7 @@ test('public GitHub archives can redirect to the same repository on codeload wit
     assert.equal(app.sent[0].items[0].url, target);
     assert.equal(app.sent[0].items[0].originalUrl, url);
     assert.equal(app.sent[0].browserProof.length, undefined);
+    assert.equal(app.sent[0].browserProof.basis, 'github-archive');
     assert.deepEqual(app.cookieLookups, []);
     assert.deepEqual(app.downloadHistory, []);
   } finally { app.stopWorker(); }
@@ -3113,6 +3133,7 @@ test('player identity recognizes TikTok /video/ID, Facebook share/watch, Instagr
     assert.equal(id('https://vm.tiktok.com/video/7704503448573578527'), 'tiktok:7704503448573578527');
     assert.equal(id('https://fb.watch/xyz123'), 'facebook:watch:xyz123');
     assert.equal(id('https://www.facebook.com/share/r/abc789/'), 'facebook:share:abc789');
+    assert.equal(id('https://www.facebook.com/stories/12345/UzpfTEST=/?bucket_count=5'), 'facebook:story:12345:UzpfTEST=');
     assert.equal(id('https://www.instagram.com/stories/creator/350123456789/'), 'instagram:story:creator:350123456789');
     assert.equal(id('https://reanime.to/watch/demon-slayer/episode-1'), 'reanime:demon-slayer:episode-1');
   } finally { app.stopWorker(); }

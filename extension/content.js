@@ -33,6 +33,7 @@
   let activeBrowserCopy = null;
   let generatedCopy = null;
   let generatedIntentAt = 0;
+  let placementTimer = 0, lastPlacementFailure = 0;
   const still = () => motionMode === 'still';
   const butterflyHidden = () => extensionPaused || !hiddenButterflyHosts || hiddenButterflyHosts.has((location.hostname || '').toLowerCase());
   function setHiddenButterflyHosts(hosts) {
@@ -99,7 +100,7 @@
         nearby.delete(entry.target);
       } else {
         // The player may already be visible by the time a queued off-screen entry arrives.
-        const inView = entry.isIntersecting || nearby.has(entry.target) && Boolean(visiblePlayer(entry.target));
+        const inView = entry.isIntersecting || Boolean(visiblePlayer(entry.target));
         intersecting.set(entry.target, inView);
         if (inView) {
           nearby.add(entry.target);
@@ -114,6 +115,7 @@
   function retire() {
     if (signal.aborted) return;
     lifetime.abort();
+    clearTimeout(placementTimer);
     activeBrowserCopy?.controller.abort();
     generatedCopy?.controller.abort();
     visibility.disconnect();
@@ -398,6 +400,7 @@
   function cardPage(node) { return cardContext(node, false)?.page || null; }
 
   function cardPreview(target) {
+    if (VesperPlayerSource.isSocialFeedSite(pageAddress())) return null;
     const context = cardContext(target, true);
     if (context?.player) {
       const { page, player, card, links } = context;
@@ -506,7 +509,10 @@
   }
 
   function pageForPlayer(el) {
-    const contextPage = cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
+    const page = pageAddress();
+    if (VesperPlayerSource.isFacebookHost(location.hostname || '') && VesperPlayerSource.identity(page)?.startsWith('facebook:story:'))
+      return page;
+    const contextPage = cardPage(el) || (activePreview?.player === el ? activePreview.page : page);
     return activeYouTubePage(el, contextPage) || activeTikTokPage(el, contextPage) || instagramSlide(contextPage);
   }
 
@@ -640,8 +646,10 @@
       const interacted = candidates.filter(candidate => candidate.interacted);
       const main = candidates.filter(candidate => !candidate.adContext && !candidate.incidentalLoop);
       const videos = main.filter(candidate => players.get(candidate.id).tagName !== 'AUDIO');
+      const playing = socialFeed ? videos.filter(candidate => candidate.playing && candidate.ready && candidate.visibleFraction >= 0.55) : [];
       let eligible = main.length ? main : candidates;
-      if (interacted.length) eligible = interacted;
+      if (playing.length === 1) eligible = playing;
+      else if (interacted.length) eligible = interacted;
       else if (videos.length) eligible = videos;
       const intent = (globalThis.VesperInference || VesperIntelligence).rankPlayers(eligible);
       setIntentCertainty(intent.decisive);
@@ -1012,7 +1020,27 @@
     }
     consider(player);
     refreshPlayer(player);
+    if (type === 'playing') checkButterflyPlacement(player);
     if (player === video && type !== 'ended') schedulePrefetch(player);
+  }
+
+  function checkButterflyPlacement(player) {
+    if (!VesperPlayerSource.isSocialFeedSite(pageAddress()) || butterflyHidden() || document.hidden
+        || document.fullscreenElement || player.tagName !== 'VIDEO' || player.readyState < 2
+        || !visiblePlayer(player, 220, 140) || advertisementContext(player)
+        || Date.now() - lastPlacementFailure < 30_000) return;
+    if (video === player && host?.isConnected && button?.classList.contains('show')) return;
+    clearTimeout(placementTimer);
+    const time = player.currentTime;
+    placementTimer = setTimeout(() => {
+      placementTimer = 0;
+      if (!alive() || butterflyHidden() || document.hidden || document.fullscreenElement || player.paused
+          || player.currentTime <= time || !visiblePlayer(player, 220, 140)
+          || video === player && host?.isConnected && button?.classList.contains('show')) return;
+      lastPlacementFailure = Date.now();
+      void reportMediaFailure('placement', 'butterfly-missing', { player, generation: playback.get(player)?.generation },
+        { state: video === player ? 'hidden' : video ? 'different-player' : 'unattached' });
+    }, 900);
   }
 
   function resetPlayerSource(player, type) {

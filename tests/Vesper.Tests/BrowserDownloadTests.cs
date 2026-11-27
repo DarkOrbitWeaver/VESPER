@@ -8,6 +8,22 @@ public sealed class BrowserDownloadTests
     private const string TransferId = "chrome-transfer-test";
 
     [Fact]
+    public void Archive_handoffs_without_a_validator_are_limited_to_public_codeload_urls()
+    {
+        using var harness = new Harness(tweak: options => options.MaxConcurrentJobs = 0);
+        var proof = new BrowserTransferProof(null, null, "application/zip", Attachment: true, Basis: "github-archive");
+        var request = new AddRequest("https://codeload.github.com/owner/repo/zip/refs/heads/main",
+            RequestId: "github-archive:0", BrowserProof: proof);
+        Assert.Equal(AddStatus.Invalid, harness.Engine.Add(request with { Url = "https://example.com/owner/repo/zip/main" }).Status);
+        Assert.Equal(AddStatus.Invalid, harness.Engine.Add(request with { Url = request.Url + "?token=x" }).Status);
+        Assert.Equal(AddStatus.Invalid, harness.Engine.Add(request with
+        {
+            Secrets = new Dictionary<string, string> { ["Cookie"] = "fixture" }
+        }).Status);
+        Assert.True(harness.Engine.Add(request).Ok);
+    }
+
+    [Fact]
     public void ActivityCarriesOnlyBoundedDisplayFactsAndRejectsForeignIds()
     {
         const string sample = """

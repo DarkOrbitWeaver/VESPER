@@ -194,7 +194,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         if (Job.BrowserProof is not { Adopted: false } proof) return;
         HttpResponseMessage response = first.Response;
         string? etag = HttpFacts.StrongEtag(response);
-        bool sameRepresentation = proof.UsesLastModified
+        bool sameRepresentation = proof.UsesGitHubArchive
+            ? response.StatusCode == HttpStatusCode.OK && !first.Ranged && first.Total != 0
+                && (first.Total is not null || HttpFacts.HasCompleteBodyFraming(response))
+            : proof.UsesLastModified
             ? response.Headers.ETag is null && proof.LastModifiedValue is { } stamp
                 && response.Headers.Date is { } served && served - stamp >= TimeSpan.FromSeconds(60)
             : proof.UsesAttachmentLength
@@ -809,6 +812,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             }
 
             if (offset < prefix) throw Changed("the server now sends less data than was already saved");
+            if (offset == 0 && Job.BrowserProof is { UsesGitHubArchive: true })
+                throw Stop(RunOutcome.NeedsAttention("empty-archive", "GitHub returned an empty response. No archive was published."));
             if (!first.Decoded && first.Total is long expected && offset != expected)
                 throw new TransientNetworkException($"The connection closed after {Formatting.Bytes(offset)} of {Formatting.Bytes(expected)}.");
 

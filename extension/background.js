@@ -1418,6 +1418,8 @@ async function playerOptions(message, sender) {
   const identity = VesperPlayerSource.identity(page.href);
   const youTube = isYouTubePage(page);
   const binding = VesperPlayerSource.identity(message.playerPageUrl) === identity;
+  const facebookPlayback = VesperPlayerSource.isFacebookHost(page.hostname) && binding
+    && message.generation > 0 && playerActiveForWatch(message);
   const socialSite = VesperPlayerSource.isSocialFeedSite(page.href);
   const socialFeed = (socialSite || /(?:^|\.)(?:x|twitter)\.com$/i.test(page.hostname))
     && (!binding || /^https?:/.test(identity));
@@ -1516,7 +1518,8 @@ async function playerOptions(message, sender) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
         const witnessed = exactResources.has(evidence.url);
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
-        if (slicedPlayer || socialFeed && !witnessed && !(isManifest && fragmentAffinity(evidence.url, playerFragments) > 0)) continue;
+        if (slicedPlayer || (socialFeed || facebookPlayback) && !witnessed
+            && !(isManifest && fragmentAffinity(evidence.url, playerFragments) > 0)) continue;
         if ((witnessed || evidence.seen >= sourceCutoff)
             && (isManifest || (witnessed || evidence.seen >= directCutoff)
               && (isWholeDirectSource(evidence) || isRangedMediaCandidate(evidence)))
@@ -1580,7 +1583,8 @@ async function playerOptions(message, sender) {
     }
 
     // A page-wide result could describe a different player on an unfamiliar page.
-    if ((socialFeed || binding && message.multiplePlayers === true && /^https?:/.test(identity)) && !possibleSources.length) {
+    if ((socialFeed || facebookPlayback || binding && message.multiplePlayers === true && /^https?:/.test(identity))
+        && !possibleSources.length) {
       if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
       const exact = usableSource ? candidate(usableSource) : matchedManifest;
       if (exact) {

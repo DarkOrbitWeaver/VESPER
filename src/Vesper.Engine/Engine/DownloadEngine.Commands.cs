@@ -144,7 +144,9 @@ public sealed partial class DownloadEngine
         if (!Enum.IsDefined(request.Kind) || request.Kind is JobKind.BrowserFile or JobKind.BrowserStream)
             return new AddResult(AddStatus.Invalid, Guid.Empty, "Unsupported job kind.");
         if (request.BrowserProof is { } proof && (request.Kind != JobKind.Http || !proof.IsValid
-            || !proof.AwaitingConfirmation || request.Output != MediaOutput.Original || request.RequestId is null))
+            || !proof.AwaitingConfirmation || request.Output != MediaOutput.Original || request.RequestId is null
+            || proof.UsesGitHubArchive && (request.Secrets is { Count: > 0 } || request.HostCookies is { Count: > 0 }
+                || request.OriginHeader is not null || !proof.MatchesGitHubArchive(uri))))
             return new AddResult(AddStatus.Invalid, Guid.Empty, "Invalid browser handoff.");
         if (!Enum.IsDefined(request.Output) || request.Output != MediaOutput.Original &&
             (request.Kind is not (JobKind.Http or JobKind.Merge) || request.MediaProvider is not { Length: > 0 and <= 80 }
