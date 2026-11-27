@@ -8,11 +8,13 @@
   const { signal } = lifetime;
   const MIN_WIDTH = 220, MIN_HEIGHT = 120, FLY_SIZE = 44, FULLSCREEN_IDLE = 2300, ENDED_PLAYER_TTL = 10 * 60_000;
   const PREVIEW_EXIT_GRACE = 900, PREVIEW_MAX_LATCH = 2200;
+  const PLAYER_LAYOUT_GRACE = 180;
   let video = null;            // the player the butterfly is attached to
   let host = null, root = null, button = null, panel = null, receipt = null;
   let frame = 0, listening = false, pointer = null, pointerTarget = null, panelRequest = 0, unwatchTheme = null;
   let perch = null, companion = null, receiptTimer = 0, retryTimer = 0, previewExitTimer = 0;
   let previewRemovedAt = 0, previewPointerDistance = Infinity, panelMotion = null, fullscreenTimer = 0, endedPlayerTimer = 0;
+  let layoutLostAt = null, layoutGraceTimer = 0;
   let fullscreenPlayer = false;
   let manualPlayer = null; // A deliberate drag overrides automatic largest-player selection.
   let drag = null, movedPerch = null, suppressDragClick = false, suppressDragClickTimer = 0, pointerMovedAt = 0;
@@ -96,8 +98,10 @@
         observed.delete(entry.target);
         nearby.delete(entry.target);
       } else {
-        intersecting.set(entry.target, entry.isIntersecting);
-        if (entry.isIntersecting) {
+        // The player may already be visible by the time a queued off-screen entry arrives.
+        const inView = entry.isIntersecting || nearby.has(entry.target) && Boolean(visiblePlayer(entry.target));
+        intersecting.set(entry.target, inView);
+        if (inView) {
           nearby.add(entry.target);
           consider(entry.target);
         } else nearby.delete(entry.target);
@@ -606,10 +610,12 @@
         const fullArea = bounds ? bounds.width * bounds.height : area;
         const id = evidenceKey(el);
         const binding = playback.get(el);
+        const post = binding && VesperPlayerSource.identity(binding.page);
+        const feedPost = /^(?:tiktok|instagram|x):/.test(post || '');
         candidates.push({ id, area, visibleFraction: fullArea > 0 ? area / fullArea : 0,
           playing: !el.paused && !el.ended, ready: el.readyState >= 1,
           progressed: el.currentTime > 1, controls: el.controls || anchor !== el, muted: el.muted,
-          incidentalLoop: !!(el.defaultMuted && el.autoplay && el.loop && !el.controls),
+          incidentalLoop: !!(el.defaultMuted && el.autoplay && el.loop && !el.controls && !feedPost),
           interacted: !!(binding && playerInteraction?.id === id && playerInteraction.generation === binding.generation
             && now - playerInteraction.at <= 30_000),
           incumbent: el === video,
@@ -742,13 +748,18 @@
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
-    if (!observed.has(el) && (el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el)) &&
-        (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]')
-          || el instanceof HTMLVideoElement && el.poster)) {
+    if (!observed.has(el)) {
+      if (!(el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el))
+          || !(src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]')
+            || el instanceof HTMLVideoElement && el.poster)) return;
       observed.add(el);
       if (playerAnchor(el) === el) visibility.observe(el);
       else nearby.add(el);
-      if (visiblePlayer(el)) nearby.add(el);
+      watchLayoutAgain = true;
+    }
+    // Playback can start while the intersection observer still has an older layout.
+    if (!nearby.has(el) && visiblePlayer(el)) {
+      nearby.add(el);
       watchLayoutAgain = true;
     }
     if (!nearby.has(el) && el !== video) return;
@@ -1279,13 +1290,13 @@
 
   function attach(el, continuous = false) {
     if (video === el && host) {
-      if (host.isConnected === false) mount();
       clearTimeout(previewExitTimer);
       previewExitTimer = previewRemovedAt = 0;
       place(continuous);
       return;
     }
     const switching = Boolean(video);
+    clearLayoutGrace();
     cancelPrefetch();
     if (video && video !== el) retainedPickerDraft = null;
     clearTimeout(previewExitTimer);
@@ -1321,6 +1332,7 @@
     fullscreenPlayer = false;
     drag = null;
     clearTimeout(previewExitTimer);
+    clearLayoutGrace();
     previewExitTimer = previewRemovedAt = 0;
     closePanel();
     resize.disconnect();
@@ -1357,18 +1369,21 @@
   function place(continuous = false, switching = false) {
     if (!alive()) return;
     if (!video) return detach();
+    if (host?.isConnected === false) mount();
     const fullscreen = fullscreenTarget();
     const held = holdMissingPreview();
-    if (held) {
+    // Keep the current perch through a brief layout transition while the player is still on screen.
+    const rect = !held && video.isConnected && (
+      (manualPlayer === video ? visiblePlayer(video, 110, 70)
+        : visiblePlayer(video) || (perch && !switching && visiblePlayer(video, 88, 64)))
+      || pickerTransitionRect(video));
+    if (rect) clearLayoutGrace();
+    if (held || (!rect && !switching && !fullscreen && !fullscreenPlayer && holdPlayerLayout())) {
       button.hidden = false;
     } else if (!video.isConnected) {
       if (!perch || !panelMedia || !panel?.classList.contains('show')) return detach();
       button.hidden = true;
     } else {
-      // An already selected player can keep its perch through the last part of a scroll.
-      const rect = (manualPlayer === video ? visiblePlayer(video, 110, 70)
-        : visiblePlayer(video) || (perch && !switching && visiblePlayer(video, 88, 64)))
-        || pickerTransitionRect(video);
       button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement
         || fullscreen instanceof HTMLIFrameElement || !containsPlayer(fullscreen, video));
       if (button.hidden) {
@@ -1407,6 +1422,21 @@
       receipt.style.left = `${beside ? left : Math.max(8, x + FLY_SIZE - receipt.offsetWidth)}px`;
       receipt.style.top = `${Math.max(8, beside ? y + (FLY_SIZE - receipt.offsetHeight) / 2 : y + FLY_SIZE + 5)}px`;
     }
+  }
+
+  function holdPlayerLayout() {
+    if (!perch || !video.isConnected || !clippedPlayerRect(playerAnchor(video)?.getBoundingClientRect(), 88, 64)) return false;
+    if (layoutLostAt === null) {
+      layoutLostAt = Date.now();
+      layoutGraceTimer = setTimeout(schedule, PLAYER_LAYOUT_GRACE);
+    }
+    return Date.now() - layoutLostAt < PLAYER_LAYOUT_GRACE;
+  }
+
+  function clearLayoutGrace() {
+    clearTimeout(layoutGraceTimer);
+    layoutGraceTimer = 0;
+    layoutLostAt = null;
   }
 
   function fillsFullscreen(rect) {
@@ -1809,6 +1839,7 @@
   async function quickDownload() {
     if (!alive() || butterflyHidden()) return;
     syncPage();
+    if (!panel) return;
     if (panel.classList.contains('show')) closePanel();
     await loadFormats(false, true, true);
   }
@@ -1816,6 +1847,7 @@
   async function togglePanel() {
     if (!alive() || butterflyHidden()) return;
     syncPage();
+    if (!panel) return;
     if (panel.classList.contains('show')) return closePanel();
     await loadFormats();
   }
@@ -2967,6 +2999,13 @@
   window.addEventListener('scroll', geometryChanged, { passive: true, capture: true, signal });
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {
+    // Start with existing videos instead of waiting for the subtree walk to reach them.
+    let remaining = 16;
+    for (const player of document.getElementsByTagName?.('video') || []) {
+      if (remaining-- === 0) break;
+      consider(player);
+    }
+    if (nearby.size) schedule();
     discoveryObserver = new MutationObserver(mediaTreeChanged);
     discoveryObserver.observe(document.documentElement, discoveryOptions);
     discoveryNodes.add(document.documentElement);

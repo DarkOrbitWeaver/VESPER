@@ -99,7 +99,8 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
   const player = new Media(), page = 'https://example.test/watch/a';
   const context = vm.createContext({
     HTMLMediaElement: Media, HTMLVideoElement: Media, video: player,
-    alive: () => true, observed: new Set([player]), nearby: new Set([player]), announceVideoElement() {},
+    alive: () => true, observed: new Set([player]), nearby: new Set(), announceVideoElement() {},
+    visiblePlayer: () => true, watchLayoutAgain: false,
     mediaLedger: { playback() {} }, evidenceKey: () => 'player-1',
     location: { origin: 'https://example.test' }, VesperPlayerSource: { identity: v => v },
     cardPage: () => null, pageForPlayer: () => page, pageAddress: () => page, playback: new Map(),
@@ -115,6 +116,7 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
   });
   const consider = vm.runInContext(content.slice(start, end) + '\nconsider;', context);
   consider(player);
+  assert.ok(context.nearby.has(player), 'a now-visible observed player is admitted before the next intersection callback');
   consider(player);
   await Promise.resolve();
   assert.equal(context.closed, 0);
@@ -533,15 +535,63 @@ test('opening the picker pins the chosen feed player despite a larger autoplayin
     visiblePlayer = player => player === selected ? null : {left:0,top:0,right:800,bottom:800};
     selectPlayer();
     if (manualPlayer || movedPerch) throw Error('Off-screen pin survived feed transition');
+    video = null;
+    Object.assign(selected, { tagName: 'VIDEO', paused: false, defaultMuted: true, autoplay: true, loop: true, readyState: 4 });
+    Object.assign(neighbour, { tagName: 'VIDEO', paused: true, readyState: 1 });
+    playback.set(selected, { page: 'https://www.tiktok.com/embed/v2/7608248907960814879', generation: 1 });
+    visiblePlayer = player => player === selected ? {left:0,top:0,right:800,bottom:800} : {left:0,top:0,right:250,bottom:250};
+    selectPlayer();
     return calls;
   };\n})();`);
   runContent(context, content);
   const selected={isConnected:true,paused:true}, neighbour={isConnected:true,paused:false};
   const calls=window.testPin(selected,neighbour,{});
-  assert.equal(calls.length,3);
+  assert.equal(calls.length,4);
   assert.equal(calls[0],'place');
   assert.equal(calls[1],neighbour);
   assert.equal(calls[2],neighbour);
+  assert.equal(calls[3],selected, 'an identified muted TikTok post stays ahead of a paused neighbouring video');
+});
+
+test('a temporary layout gap keeps the live overlay and rearms only after the player is visible again', () => {
+  const content = source('content');
+  const start = content.indexOf('  function place(');
+  const end = content.indexOf('  function fillsFullscreen(', start);
+  const rect = { left: 100, top: 100, right: 600, bottom: 400 };
+  let now = 1000, rendered = false, onScreen = true, closed = 0;
+  const timers = [];
+  const player = { isConnected: true, getBoundingClientRect: () => rect };
+  const context = vm.createContext({
+    alive: () => true, video: player, manualPlayer: null, host: { isConnected: false },
+    mount() { context.host.isConnected = true; }, fullscreenTarget: () => null, fullscreenPlayer: false,
+    holdMissingPreview: () => false, visiblePlayer: () => rendered ? rect : null, pickerTransitionRect: () => null,
+    clippedPlayerRect: () => onScreen ? rect : null, playerAnchor: p => p,
+    PLAYER_LAYOUT_GRACE: 180, layoutLostAt: null, layoutGraceTimer: 0,
+    Date: { now: () => now }, setTimeout: (handler, delay) => timers.push({ handler, delay }), clearTimeout() {},
+    schedule() {}, stopFullscreenIdle() {}, detach() {}, updateFlyVisibility() {}, closePanel: () => closed++,
+    fillsFullscreen: () => false, playerPerch: () => ({ x: 10, y: 10 }), companion: { setPerch() {} },
+    panel: { classList: { contains: () => false } }, button: {}, receiptTimer: 0, drag: null, perch: { x: 10, y: 10 }
+  });
+  const place = vm.runInContext(content.slice(start, end) + '\nplace;', context);
+  place(); place();
+  assert.equal(context.host.isConnected, true);
+  assert.equal(context.button.hidden, false);
+  assert.equal(closed, 0);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 180);
+  now += 181;
+  place();
+  assert.equal(context.button.hidden, true, 'a still-hidden player loses the overlay at the deadline');
+  assert.equal(closed, 1);
+  assert.equal(timers.length, 1);
+  rendered = true;
+  place();
+  assert.equal(context.button.hidden, false);
+  rendered = false;
+  onScreen = false;
+  place();
+  assert.equal(context.button.hidden, true, 'scrolling away hides the old overlay immediately');
+  assert.equal(timers.length, 1);
 });
 
 test('Smart Select filters navigation links and reports direct file details', () => {
