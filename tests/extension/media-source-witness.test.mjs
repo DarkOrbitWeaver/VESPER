@@ -51,7 +51,8 @@ function setup() {
     listeners.get('vesper-media-provenance-request')({target:el});
     return JSON.parse(el.attributes.get('data-vesper-media-provenance') || '{"paths":[], "tracks":[]}');
   };
-  return {player, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, Player, advance: ms => time += ms};
+  return {player, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, MediaSource: Source, Player, context,
+    advance: ms => time += ms};
 }
 
 test('MSE keeps an identical init and refuses incomplete, inactive or edited tracks', () => {
@@ -137,6 +138,7 @@ test('media evidence graph ranks without confusing duration or directory with as
   assert.equal(graph.associate({...input,currentUrl:second.source.url}).selected,second);
   assert.equal(graph.associate({...input,sources:[first]}).selected,null);
 });
+
 
  test('same CDN path and duration cannot outrank an exact player resource match', () => {
   const context = vm.createContext({ URL });

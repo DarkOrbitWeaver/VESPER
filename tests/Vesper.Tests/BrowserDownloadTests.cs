@@ -76,27 +76,30 @@ public sealed class BrowserDownloadTests
     }
 
     [Fact]
-    public void RegisteringManagedChromeFileAddsAReadOnlyReferenceAndIsIdempotent()
+    public void StartupRemovesLegacyChromeHistoryRowsAndKeepsTheirFiles()
     {
-        using var harness = new Harness();
-        string destination = Path.Combine(harness.Root, "chrome-custom-folder");
-        Directory.CreateDirectory(destination);
-        string path = Path.Combine(destination, "saved.zip");
+        string root = Path.Combine(Path.GetTempPath(), "vesper-browser-history-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        string downloadedFile = Path.Combine(root, "chrome.zip");
         byte[] bytes = [1, 2, 3, 4, 5];
-        File.WriteAllBytes(path, bytes);
-        var file = new BrowserCompletedFile("demo-profile", "c-demo-profile-7-abc", path, bytes.Length, ["example.com"]);
+        File.WriteAllBytes(downloadedFile, bytes);
+        var legacy = new DownloadJob
+        {
+            Id = Guid.NewGuid(), Kind = JobKind.BrowserFile, State = JobState.Completed,
+            SourceUrl = "https://example.com/", FileName = Path.GetFileName(downloadedFile),
+            DestinationFolder = root, FinalPath = downloadedFile
+        };
+        using (var store = JobStore.Open(Path.Combine(root, "vesper.db")))
+            store.Save(legacy, "chrome-managed:old-item");
 
-        AddResult first = harness.Engine.RegisterBrowserDownload(file);
-        AddResult duplicate = harness.Engine.RegisterBrowserDownload(file);
+        using (DownloadEngine engine = DownloadEngine.Start(
+            new EngineOptions { DataDirectory = root, DefaultFolder = root, MaxConcurrentJobs = 0 }))
+            Assert.Empty(engine.Snapshots());
 
-        Assert.True(first.Ok, first.Message);
-        Assert.Equal(AddStatus.AlreadySubmitted, duplicate.Status);
-        JobSnapshot saved = harness.Engine.Snapshot(first.JobId)!;
-        Assert.Equal(JobKind.BrowserFile, saved.Kind);
-        Assert.Equal(JobState.Completed, saved.State);
-        Assert.Equal(path, saved.FinalPath);
-        Assert.Equal(bytes, File.ReadAllBytes(path));
-        Assert.True(File.Exists(path));
+        using (var migrated = JobStore.Open(Path.Combine(root, "vesper.db")))
+            Assert.Empty(migrated.LoadAll());
+        Assert.Equal(bytes, File.ReadAllBytes(downloadedFile));
+        Directory.Delete(root, recursive: true);
     }
 
     [Fact]

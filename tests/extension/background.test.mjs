@@ -1757,16 +1757,13 @@ test('an enrolled Chrome file can finish while the extension worker is asleep', 
   const first = load({}, { download, activity: true });
   await first.onCreated(download);
   await first.recover();
-  const receipt = first.ports[0].posted[0].files[0].id;
   first.stopWorker();
   Object.assign(download, { state: 'complete', fileSize: 50, exists: true });
   const next = load({ 'browser-managed': { ok: true } }, { download, activity: true, localData: first.localData });
   await next.recover();
-  const result = next.sent.find(message => message.operation === 'complete');
-  assert.equal(result.downloadId, receipt);
-  assert.equal(result.path, download.filename);
-  assert.equal(result.length, 50);
-  assert.deepEqual(next.actions, ['native']);
+  assert.equal(next.sent.some(message => message.operation === 'complete'), false);
+  assert.equal(download.state, 'complete');
+  assert.deepEqual(next.actions, []);
 });
 
 test('format submission uses an opaque selection and rejects an out-of-range choice', async () => {
@@ -1867,6 +1864,27 @@ const videoSender = { tab: { id: 17, url: videoPage }, url: videoPage, frameId: 
 const videoOptionsMessage = (pageUrl, extra = {}) => ({
   type: 'media-options', pageUrl, playerPageUrl: pageUrl, playerUrl: '', generation: 1,
   mediaChangedAt: 0, playerPlaying: false, ...extra
+});
+
+test('passive media options are skipped on Facebook and X, and on a YouTube home preview', async () => {
+  for (const page of ['https://www.facebook.com/reel/123456789012', 'https://fb.watch/abc123/',
+    'https://x.com/home', 'https://twitter.com/home']) {
+    const app = load({ 'media-options': mediaOptionsReply });
+    const result = await app.message(videoOptionsMessage(page, { prefetch: true }),
+      { url: page, tab: { id: 52, url: page, active: true }, frameId: 0, documentId: 'feed-doc' });
+    assert.equal(result?.data?.prefetchSkipped, true, page);
+    assert.equal(app.sent.some(message => message.type === 'media-options'), false, page);
+    app.stopWorker();
+  }
+
+  const home = 'https://www.youtube.com/';
+  const preview = videoPage;
+  const app = load({ 'media-options': mediaOptionsReply });
+  const result = await app.message(videoOptionsMessage(preview, { prefetch: true }),
+    { url: home, tab: { id: 53, url: home, active: true }, frameId: 0, documentId: 'home-doc' });
+  assert.equal(result?.data?.prefetchSkipped, true);
+  assert.equal(app.sent.some(message => message.type === 'media-options'), false);
+  app.stopWorker();
 });
 
 test('opening any HTTPS video picker uses sign-in after Chrome approves it', async () => {
@@ -3148,7 +3166,7 @@ test('F-46: archive paths and repository query parameters are recognized as earl
   } finally { app.stopWorker(); }
 });
 
-test('F-46: server-generated extensionless archive without validator falls back to managed Chrome and completes after window', async () => {
+test('a Chrome-completed archive is never imported into VESPER history', async () => {
   const codeloadUrl = 'https://codeload.github.com/DarkOrbitWeaver/VESPER/zip/refs/heads/main';
   const download = {
     id: 1046, url: codeloadUrl, finalUrl: codeloadUrl,
@@ -3165,10 +3183,9 @@ test('F-46: server-generated extensionless archive without validator falls back 
   Object.assign(download, { state: 'complete', fileSize: 6882236, exists: true });
   await app.onChanged({ id: download.id, state: { current: 'complete' } });
   await app.recover();
-  const completed = app.sent.find(m => m.type === 'browser-managed' && m.operation === 'complete');
-  assert.ok(completed, 'Completed Chrome download must be sent to desktop via browser-managed complete');
-  assert.equal(completed.path, download.filename);
-  assert.equal(completed.length, 6882236);
+  assert.equal(app.sent.some(message => message.type === 'browser-managed' && message.operation === 'complete'), false);
+  assert.equal(download.state, 'complete');
+  assert.equal(download.filename, 'C:\\Downloads\\VESPER-main.zip');
 });
 
 test('player identity recognizes TikTok /video/ID, Facebook share/watch, Instagram stories, and Reanime', () => {

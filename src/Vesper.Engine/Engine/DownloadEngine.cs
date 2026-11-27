@@ -72,6 +72,13 @@ public sealed partial class DownloadEngine : IDisposable
             GlobalLimiter.SetRate(options.GlobalLimitBytesPerSecond);
             foreach (DownloadJob job in store.LoadAll())
             {
+                if (job.Kind == JobKind.BrowserFile)
+                {
+                    // Older versions imported Chrome completions into VESPER history.
+                    // Remove only the database record. The downloaded file remains untouched.
+                    store.Delete(job.Id);
+                    continue;
+                }
                 _jobs[job.Id] = job;
                 AddDuplicateCandidateLocked(job);
             }

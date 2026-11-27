@@ -106,16 +106,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
     private async Task<BridgeResponse> ManageChromeDownloadAsync(BridgeRequest request, CancellationToken ct)
     {
         if (request.Operation == "complete")
-        {
-            BrowserCompletedFile file = request.CompletedFile!;
-            if (BlockedHost(file.Hosts, preferences().SiteRules) is not null)
-                return BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
-            AddResult result = engine.RegisterBrowserDownload(file);
-            if (result.Ok) owner.FinishBrowserActivity(file.DownloadId);
-            return result.Ok
-                ? BridgeResponse.Success(request.Id, result.Message, data: new { jobId = result.JobId })
-                : BridgeResponse.Fail(request.Id, result.Status == AddStatus.Busy ? "busy" : "invalid-file", result.Message);
-        }
+            return BridgeResponse.Fail(request.Id, "chrome-owned", "Chrome-owned downloads stay in Chrome history.");
 
         BrowserActivity activity = request.Activity!;
         BrowserActivity allowed = FilterManagedActivity(activity, preferences().SiteRules, out string[] blocked);

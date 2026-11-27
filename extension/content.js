@@ -945,7 +945,7 @@
 
   function schedulePrefetch(el, delay = 250) {
     if (!intentCertain || !el || butterflyHidden() || document.hidden || panelMedia || el !== video
-        || VesperPlayerSource.isSocialFeedSite(pageAddress())) return;
+        || VesperPlayerSource.blocksPassiveProbe(pageAddress())) return;
     if (prefetchTimer && prefetchTarget === el) return;
     cancelPrefetch();
     prefetchTarget = el;
@@ -958,7 +958,7 @@
 
   function prefetchPlayer(el) {
     if (!alive() || !intentCertain || document.hidden || butterflyHidden() || panelMedia || el !== video || !(el instanceof HTMLVideoElement) || !observed.has(el)
-        || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el) || VesperPlayerSource.isSocialFeedSite(pageAddress())) return;
+        || protectedVideos.has(el) || el.mediaKeys || !visiblePlayer(el) || VesperPlayerSource.blocksPassiveProbe(pageAddress())) return;
     const ended = isCurrentEndedPlayer(el);
     const src = playerSource(el) || (ended ? endedPlayer.binding.src : '');
     const targetPage = pageForPlayer(el);

@@ -75,6 +75,15 @@ test('generic query-only identifiers are not collapsed into the wrong post', () 
     {href: origin + '/watch?id=two', permalink:true}], origin), null);
 });
 
+test('passive format lookup stays off social feeds and embedded previews', () => {
+  const { blocksPassiveProbe, identity } = context.VesperPlayerSource;
+  for (const page of ['https://www.facebook.com/watch/?v=1234567890', 'https://fb.watch/abc123/',
+    'https://x.com/home', 'https://twitter.com/home', 'https://www.instagram.com/', 'https://www.tiktok.com/'])
+    assert.equal(blocksPassiveProbe(page), true, page);
+  assert.equal(blocksPassiveProbe('https://www.youtube.com/watch?v=EK3tCffac5k'), false);
+  assert.notEqual(identity('https://www.youtube.com/'), identity('https://www.youtube.com/watch?v=EK3tCffac5k'));
+});
+
 test('a site identity outranks a generic permalink, and malformed input is ignored', () => {
   const origin = 'https://www.dailymotion.com';
   assert.equal(cardPage([{ href: 'https://www.dailymotion.com/about', permalink: true },

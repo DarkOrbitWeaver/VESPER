@@ -163,7 +163,6 @@ internal sealed class DownloadItem
         JobState.Downloading when s.SpeedBytesPerSecond > 0 => Formatting.Rate(s.SpeedBytesPerSecond),
         JobState.Downloading => s.Message,
         JobState.Completed when s.FileMissing => "File not found",
-        JobState.Completed when s.Kind == JobKind.BrowserFile => "Saved by Chrome",
         JobState.Completed when s.Reason == "saved-original" => "Saved original format",
         JobState.Completed => s.CompletedUtc is { } done ? "Finished · " + done.ToLocalTime().ToString("MMM d, HH:mm") : "",
         JobState.WaitingForRetry or JobState.WaitingForNetwork => s.Message,

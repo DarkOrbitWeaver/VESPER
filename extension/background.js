@@ -1439,8 +1439,10 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
-  if (prefetch && (socialSite || message.refresh === true || sender.tab?.active === false || sender.tab?.incognito
-      || !sender.documentId || !binding || !Number.isInteger(message.generation) || message.generation < 1))
+  if (prefetch && (VesperPlayerSource.blocksPassiveProbe(page.href) || message.refresh === true
+      || sender.tab?.active === false || sender.tab?.incognito || !sender.documentId || !binding
+      || VesperPlayerSource.identity(sender.url) !== identity
+      || !Number.isInteger(message.generation) || message.generation < 1))
     return { ok: true, data: { prefetchSkipped: true } };
   const preState = prefetch ? null : await tabState(tab);
   const scoped = (preState?.sources || []).filter(entry => sender.documentId

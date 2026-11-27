@@ -539,10 +539,10 @@
         if (obj instanceof MediaSource) {
           let msState = mediaSources.get(obj);
           if (!msState) {
-            msState = { tracks: new Set() };
+            msState = { tracks: new Set(), paths: new Map() };
             mediaSources.set(obj, msState);
           }
-          objectUrls.set(url, { kind: 'mse', ref: new WeakRef(obj), msState, paths: new Map(), createdAt: now() });
+          objectUrls.set(url, { kind: 'mse', ref: new WeakRef(obj), msState, paths: msState.paths, createdAt: now() });
           while (objectUrls.size > MAX_SOURCES) objectUrls.delete(objectUrls.keys().next().value);
         } else if (typeof Blob === 'function' && obj instanceof Blob) {
           const prov = bufferProvenance.get(obj);
@@ -561,7 +561,7 @@
       try {
         let msState = mediaSources.get(this);
         if (!msState) {
-          msState = { tracks: new Set() };
+          msState = { tracks: new Set(), paths: new Map() };
           mediaSources.set(this, msState);
         }
         const track = {
@@ -668,11 +668,11 @@
           const seenAt = now();
           const ms = track.ownerRef.deref();
           if (ms) {
-            for (const record of objectUrls.values()) {
-              if (record.ref.deref() !== ms) continue;
-              record.paths.delete(prov.address);
-              record.paths.set(prov.address, { evidence: prov, seen: seenAt });
-              while (record.paths.size > MAX_URLS_PER_TRACK) record.paths.delete(record.paths.keys().next().value);
+            const msState = mediaSources.get(ms);
+            if (msState) {
+              msState.paths.delete(prov.address);
+              msState.paths.set(prov.address, { evidence: prov, seen: seenAt });
+              while (msState.paths.size > MAX_URLS_PER_TRACK) msState.paths.delete(msState.paths.keys().next().value);
             }
           }
         }
@@ -745,6 +745,14 @@
       && coversPlayback(buffer.buffered, player.duration, track.role === 'audio' ? 0.35 : 0.15);
   }
 
+  function mediaSourceState(player) {
+    const src = player.currentSrc || player.src;
+    const record = objectUrls.get(src);
+    if (record?.kind === 'mse') return record.msState;
+    const source = player.srcObject;
+    return source && typeof source === 'object' ? mediaSources.get(source) : null;
+  }
+
   // Rich provenance inspection for isolated content script
   document.addEventListener('vesper-media-provenance-request', event => {
     const player = event.composedPath?.()[0] || event.target;
@@ -752,9 +760,10 @@
     try {
       const src = player.currentSrc || player.src;
       const record = objectUrls.get(src);
-      if (!record?.ref.deref() || player.mediaKeys) return;
+      const msState = record?.kind === 'mse' ? record.msState : mediaSourceState(player);
+      if ((!record?.ref.deref() && !msState) || player.mediaKeys) return;
       const at = now();
-      const paths = [...record.paths.values()]
+      const paths = [...(record?.paths || msState?.paths || new Map()).values()]
         .filter(item => at - item.seen <= TTL)
         .slice(-24)
         .map(({ evidence, seen }) => ({
@@ -765,8 +774,8 @@
         }));
 
       const tracks = [];
-      if (record.kind === 'mse' && record.msState) {
-        for (const track of record.msState.tracks) {
+      if (msState) {
+        for (const track of msState.tracks) {
           if (!activeBuffer(track)) continue;
           const bufferedComplete = Boolean(completeTrack(player, track));
           tracks.push({
@@ -799,9 +808,9 @@
       player.removeAttribute('data-vesper-mse-export-query');
       if (!reqText) return;
       const req = JSON.parse(reqText);
-      const record = objectUrls.get(player.currentSrc || player.src);
-      if (record?.kind !== 'mse' || !record.msState) return;
-      const track = [...record.msState.tracks].find(t => t.id === req.trackId);
+      const msState = mediaSourceState(player);
+      if (!msState) return;
+      const track = [...msState.tracks].find(t => t.id === req.trackId);
       if (!track || req.length !== track.retainedBytes || !completeTrack(player, track)) return;
 
       const partCount = 1 + track.chunks.length;

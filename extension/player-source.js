@@ -164,5 +164,11 @@ globalThis.VesperPlayerSource = (() => {
     return /(?:^|\.)(?:instagram|tiktok)\.com$/i.test(host) || isFacebookHost(host);
   }
 
-  return { http, identity, cardPage, kind, isSocialFeedSite, instagramPost, isFacebookHost };
+  function blocksPassiveProbe(pageUrl) {
+    const host = http(pageUrl)?.hostname || '';
+    return isSocialFeedSite(pageUrl) || /(?:^|\.)(?:x|twitter)\.com$/i.test(host)
+      || /(?:^|\.)fb\.watch$/i.test(host);
+  }
+
+  return { http, identity, cardPage, kind, isSocialFeedSite, blocksPassiveProbe, instagramPost, isFacebookHost };
 })();

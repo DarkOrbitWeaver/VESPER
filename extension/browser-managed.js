@@ -161,14 +161,7 @@ async function refreshManaged() {
     if (nativeOwnsManagedItem(item, records) || !managedCandidate(item)) continue;
     if (item.state === 'in_progress') {
       if (files.length < 32) files.push(managedProgress(item, profile));
-    } else if (item.state === 'complete' && item.exists !== false && item.filename && byteCount(item.fileSize) !== undefined) {
-      const reply = await nativeRequest(envelope('browser-managed', {
-        operation: 'complete', profile, downloadId: managedId(item, profile), path: item.filename,
-        length: item.fileSize, hosts: managedHosts(item)
-      }), 10000);
-      if (reply?.ok || ['invalid', 'invalid-file', 'site-capture-disabled'].includes(reply?.code)) forget.push(entry);
-      else await armBrowserRecovery();
-    }
+    } else if (item.state === 'complete') forget.push(entry);
   }
   await forgetManaged(forget);
   if (!files.length && !managedPort) return;
@@ -209,7 +202,8 @@ async function refreshManaged() {
 }
 
 async function enrollAutomaticChromeDownload(item, generation) {
-  if (!managesChromeDownloads() || !managedCandidate(item) || !await captureCanBegin(generation)) return;
+  if (!managesChromeDownloads() || item?.state !== 'in_progress' || !managedCandidate(item)
+      || !await captureCanBegin(generation)) return;
   await siteRulesLoaded;
   if (!matchesNeverCaptureHost(item)) await rememberManaged(item, generation);
 }
