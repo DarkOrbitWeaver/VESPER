@@ -311,7 +311,8 @@ internal sealed class MergeTransfer(DownloadEngine engine, JobSession session, H
                     for (int i = 0; i < plan.Tracks.Count; i++)
                     {
                         var region = new RegionStream(source, plan.OffsetOf(i), plan.Tracks[i].Size);
-                        List<DemuxedTrack> demuxed = MediaMerger.Demux(region, region.Length, ct);
+                        List<DemuxedTrack> demuxed = MediaMerger.Demux(region, region.Length, ct,
+                            browserCapture: Job.NonResumable && plan.Provider == "browser");
                         if (plan.Tracks[i].Role == "muxed")
                         {
                             foreach (DemuxedTrack track in demuxed) inputs.Add((track, region));

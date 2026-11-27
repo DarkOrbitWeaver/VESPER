@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Vesper.Engine;
@@ -49,13 +50,21 @@ public sealed class BrowserBodyTests
         Assert.False(BridgeProtocol.TryParse(append.Replace("\"offset\":0", "\"offset\":-1"), out _, out _));
     }
 
-    [Fact]
-    public async Task BrowserTracksAreLengthCheckedAndRemuxedFromStaging()
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task BrowserTracksAreLengthCheckedAndRemuxedFromStaging(bool repeatedFragment, bool conflictingBytes)
     {
         using var h = new Harness();
         byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", name));
         byte[] video = Fixture("video-only.mp4");
-        byte[] audio = [.. Fixture("audio-init.mp4"), .. Fixture("audio-1.m4s")];
+        byte[] init = Fixture("audio-init.mp4");
+        byte[] fragment = Fixture("audio-1.m4s");
+        byte[] audio = repeatedFragment
+            ? [.. WithOpenEndedEdit(init, 1024), .. fragment, .. fragment]
+            : [.. init, .. fragment];
+        if (conflictingBytes) audio[^1] ^= 1;
         var opened = await Send(h, new("begin", Transfer, Origin, "clip.mp4", null,
             Tracks: [new("video", "mp4", video.Length), new("audio", "m4a", audio.Length)], OutputContainer: "mp4"));
         Assert.True(opened.Ok, opened.Message);
@@ -63,11 +72,54 @@ public sealed class BrowserBodyTests
         Assert.True((await Send(h, Append(0, video))).Ok);
         Assert.False((await Send(h, Finish())).Ok);
         Assert.True((await Send(h, Append(video.Length, audio) with { TrackIndex = 1 })).Ok);
-        var completed = await h.WaitForStateAsync(AcceptedId(await Send(h, Finish())), JobState.Completed);
+        Guid id = AcceptedId(await Send(h, Finish()));
+        JobSnapshot completed = await h.WaitForStateAsync(id, conflictingBytes ? JobState.NeedsAttention : JobState.Completed);
         Assert.Equal(JobKind.Merge, completed.Kind);
+        if (conflictingBytes)
+        {
+            Assert.False(File.Exists(completed.FinalPath));
+            Assert.Equal(video.Length + audio.Length, new FileInfo(completed.PartialPath!).Length);
+            return;
+        }
         Assert.EndsWith(".mp4", completed.FinalPath);
-        using var staged = PartialFile.Open(completed.FinalPath!, create: false);
-        MediaTrackProbe.RequireMp4Media(staged, default);
+        using (var staged = PartialFile.Open(completed.FinalPath!, create: false))
+            MediaTrackProbe.RequireMp4Media(staged, default);
+        if (repeatedFragment)
+        {
+            using var original = new MemoryStream([.. init, .. fragment]);
+            DemuxedTrack expected = Assert.Single(Mp4Demuxer.Read(original, original.Length, default));
+            using var output = File.OpenRead(completed.FinalPath!);
+            DemuxedTrack track = Mp4Demuxer.Read(output, output.Length, default).Single(track => track.Kind == TrackKind.Audio);
+            Assert.Equal(expected.Samples.Count, track.Samples.Count);
+            Mp4EditListEntry edit = Assert.Single(track.EditList!);
+            Assert.Equal(1024, edit.MediaTime);
+            Assert.Equal((Int128)(expected.DurationTicks - 1024) * track.EditMovieTimescale,
+                (Int128)edit.SegmentDuration * expected.Timescale);
+        }
+    }
+
+    private static byte[] WithOpenEndedEdit(byte[] init, uint mediaTime)
+    {
+        // Insert the edit into the checked-in AAC initialization segment before mvex.
+        int moov = init.AsSpan().IndexOf("moov"u8) - 4;
+        int trak = init.AsSpan().IndexOf("trak"u8) - 4;
+        int trackLength = BinaryPrimitives.ReadInt32BigEndian(init.AsSpan(trak));
+        var writer = new BoxWriter();
+        int edts = writer.Begin("edts");
+        int elst = writer.BeginFull("elst", 0, 0);
+        writer.U32(1);
+        writer.U32(0);
+        writer.U32(mediaTime);
+        writer.U16(1);
+        writer.U16(0);
+        writer.End(elst);
+        writer.End(edts);
+        byte[] edit = writer.ToArray();
+        int end = trak + trackLength;
+        byte[] result = [.. init.AsSpan(0, end), .. edit, .. init.AsSpan(end)];
+        BinaryPrimitives.WriteInt32BigEndian(result.AsSpan(moov), BinaryPrimitives.ReadInt32BigEndian(init.AsSpan(moov)) + edit.Length);
+        BinaryPrimitives.WriteInt32BigEndian(result.AsSpan(trak), trackLength + edit.Length);
+        return result;
     }
 
     [Fact]

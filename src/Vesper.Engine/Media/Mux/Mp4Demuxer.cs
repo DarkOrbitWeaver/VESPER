@@ -138,9 +138,10 @@ internal static class Mp4Demuxer
         public required DemuxedTrack Track;
         public Defaults Trex = new();
         public long NextDts;
+        public bool HasFragmentSamples;
     }
 
-    public static List<DemuxedTrack> Read(Stream s, long length, CancellationToken ct)
+    public static List<DemuxedTrack> Read(Stream s, long length, CancellationToken ct, bool browserCapture = false)
     {
         var states = new Dictionary<uint, State>();
         var order = new List<uint>();
@@ -148,6 +149,8 @@ internal static class Mp4Demuxer
         long pos = 0;
         bool sawMoov = false;
         int total = 0;
+        byte[]? previousMoof = null;
+        long previousMoofEnd = 0;
         while (pos < length)
         {
             ct.ThrowIfCancellationRequested();
@@ -180,8 +183,19 @@ internal static class Mp4Demuxer
             {
                 if (!sawMoov) throw Bad("a movie fragment precedes the movie header");
                 byte[] moof = MuxIo.Load(s, pos + headerLen, size - headerLen, MaxMoofBytes, "movie fragment");
-                total += ParseMoof(moof, pos, states);
-                if (total > MaxSamples) throw Bad("the file declares too many samples");
+                bool repeated = browserCapture && previousMoof is not null
+                    && moof.AsSpan().SequenceEqual(previousMoof) && HasExplicitDecodeTimes(moof)
+                    && RepeatsMediaData(s, length, previousMoofEnd, pos, pos + size, ct);
+                if (!repeated)
+                {
+                    total += ParseMoof(moof, pos, states);
+                    if (total > MaxSamples) throw Bad("the file declares too many samples");
+                }
+                if (browserCapture)
+                {
+                    previousMoof = moof;
+                    previousMoofEnd = pos + size;
+                }
             }
             pos += size;
         }
@@ -190,15 +204,68 @@ internal static class Mp4Demuxer
         var result = new List<DemuxedTrack>();
         foreach (uint id in order)
         {
-            var t = states[id].Track;
+            State state = states[id];
+            DemuxedTrack t = state.Track;
             if (t.Samples.Count == 0) continue;
             foreach (var smp in t.Samples)
                 if (smp.Size <= 0 || smp.Size > MaxSampleBytes || smp.Offset < 0 || smp.Offset > length - smp.Size)
                     throw Bad($"a {t.Kind.ToString().ToLowerInvariant()} sample points outside the file");
+            if (state.HasFragmentSamples && t.EditList is
+                [{ SegmentDuration: 0, MediaTime: >= 0, MediaRateInteger: 1, MediaRateFraction: 0 } edit])
+            {
+                // An open-ended fragment edit ends at the last presentation sample.
+                long end = 0;
+                foreach (TrackSample sample in t.Samples)
+                    end = Math.Max(end, checked(sample.Dts + sample.CtsOffset + sample.Duration));
+                if (end <= edit.MediaTime) throw Bad("a media edit starts beyond the captured samples");
+                t.EditList[0] = edit with { SegmentDuration = (ulong)(end - edit.MediaTime) };
+                t.EditMovieTimescale = t.Timescale;
+            }
             result.Add(t);
         }
         if (result.Count == 0) throw Bad("no audio or video samples were found");
         return result;
+    }
+
+    private static bool HasExplicitDecodeTimes(byte[] moof)
+    {
+        bool foundTrack = false;
+        foreach (var box in Children(moof, 0, moof.Length))
+        {
+            if (box.Type != "traf") continue;
+            if (Find(moof, box.Start, box.End, "tfdt") is null) return false;
+            foundTrack = true;
+        }
+        return foundTrack;
+    }
+
+    private static bool RepeatsMediaData(Stream source, long length, long previous, long moof, long current, CancellationToken ct)
+    {
+        long size = moof - previous;
+        if (size < 8 || size > length - current) return false;
+        Span<byte> header = stackalloc byte[16];
+        MuxIo.ReadExact(source, previous, header[..8]);
+        if (!header.Slice(4, 4).SequenceEqual("mdat"u8)) return false;
+        ulong declared = BinaryPrimitives.ReadUInt32BigEndian(header);
+        if (declared == 1 && size >= 16)
+        {
+            MuxIo.ReadExact(source, previous + 8, header.Slice(8, 8));
+            declared = BinaryPrimitives.ReadUInt64BigEndian(header[8..]);
+        }
+        if (declared != (ulong)size) return false;
+
+        Span<byte> left = stackalloc byte[4096];
+        Span<byte> right = stackalloc byte[4096];
+        for (long offset = 0; offset < size;)
+        {
+            ct.ThrowIfCancellationRequested();
+            int count = (int)Math.Min(left.Length, size - offset);
+            MuxIo.ReadExact(source, previous + offset, left[..count]);
+            MuxIo.ReadExact(source, current + offset, right[..count]);
+            if (!left[..count].SequenceEqual(right[..count])) return false;
+            offset += count;
+        }
+        return true;
     }
 
     internal static MediaMergeMetadata ReadMetadata(Stream s, long length)
@@ -899,6 +966,7 @@ internal static class Mp4Demuxer
                 uint tf = U32(b, trun.Start, trun.End) & 0xFFFFFF;
                 uint count = U32(b, trun.Start + 4, trun.End);
                 if (count > 1_000_000) throw Bad("a fragment declares too many samples");
+                if (count > 0) st.HasFragmentSamples = true;
                 int q = trun.Start + 8;
                 if ((tf & 0x01) != 0) { cursor = dataBase + (int)U32(b, q, trun.End); q += 4; }
                 else if (firstTrun) cursor = dataBase;

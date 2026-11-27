@@ -568,8 +568,8 @@ internal static class MediaMerger
     internal static int AvailableTrackSlots(string container, int existingTrackCount) =>
         container is "mp4" or "mkv" ? Math.Max(0, MaxTrackCount - existingTrackCount) : 0;
 
-    public static List<DemuxedTrack> Demux(Stream s, long length, CancellationToken ct) =>
-        WebmDemuxer.LooksLikeMatroska(s, length) ? WebmDemuxer.Read(s, length, ct) : Mp4Demuxer.Read(s, length, ct);
+    public static List<DemuxedTrack> Demux(Stream s, long length, CancellationToken ct, bool browserCapture = false) =>
+        WebmDemuxer.LooksLikeMatroska(s, length) ? WebmDemuxer.Read(s, length, ct) : Mp4Demuxer.Read(s, length, ct, browserCapture);
 
     /// <summary>The output container for these tracks, honouring <paramref name="requested"/> only when it is legal.</summary>
     public static string? ChooseContainer(IReadOnlyList<DemuxedTrack> tracks, string? requested)
