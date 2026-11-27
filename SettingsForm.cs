@@ -307,8 +307,8 @@ internal sealed class SettingsForm : VesperPopupForm
         previewSound.SetBounds(257, 574, 140, 29);
         sound.Width = Math.Max(UiKit.Scale(this, 120), previewSound.Left - sound.Left - UiKit.Scale(this, 8));
         previewSound.Click += (_, _) => VesperSounds.PlayCompletion();
-        var showOnCompletion = Check("Open VESPER when a download finishes", 25, 612,
-            _draft.OpenVesperOnCompletion, v => _draft.OpenVesperOnCompletion = v);
+        var flashOnCompletion = Check("Flash the taskbar when a download finishes", 25, 612,
+            _draft.FlashTaskbarOnCompletion, v => _draft.FlashTaskbarOnCompletion = v);
         const int completionRow = 28;
         var clipboard = Check("Offer to download links I copy", 25, 612 + completionRow, _draft.WatchClipboard, v => _draft.WatchClipboard = v);
         var tray = Check("Keep VESPER in the tray when I close the window", 25, 640 + completionRow, _draft.CloseToTray, v => _draft.CloseToTray = v);
@@ -323,7 +323,7 @@ internal sealed class SettingsForm : VesperPopupForm
         powerNote.SetBounds(45, 782 + completionRow, 470, 28);
         page.Controls.AddRange([folderLabel, folderNote, frame, browse, separator1, categories, categoryNote,
             separator2, templateHeading, templateNote, templateFrame, templatePreview, separator3, missing, missingNote,
-            separator4, notify, sound, previewSound, showOnCompletion, clipboard, tray, separator5, openFolder,
+            separator4, notify, sound, previewSound, flashOnCompletion, clipboard, tray, separator5, openFolder,
             sleepQueue, shutdownQueue, powerNote]);
         if (importDownloadList is not null && exportDownloadList is not null)
         {

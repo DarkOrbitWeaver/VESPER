@@ -1163,6 +1163,7 @@
           background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;display:none;
           box-shadow:0 7px 22px #0003;overflow-x:hidden;overflow-y:auto;font-size:13px;transform-origin:top right}
         .panel.show{display:block;pointer-events:auto;animation:picker-open .16s ease-out}
+        .panel.show[inert]{pointer-events:none}
         @keyframes picker-open{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
         .receipt{position:fixed;max-width:calc(100vw - 16px);padding:6px 10px;border-radius:7px;border:1px solid var(--border);
           background:var(--surface);color:var(--sage);box-shadow:0 3px 10px #0003;font-size:12px;line-height:1.4;

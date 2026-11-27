@@ -291,11 +291,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
 
         bool anyAccepted = results.Any(r => r.Status is "started" or "queued" or "already-submitted");
         if (anyAccepted)
-        {
-            if (!browserCapture && results.Any(r => r.Status is "started" or "queued"))
-                owner?.RequestBrowserPresentation("submit:" + request.Id, explicitRequest: true);
             return BridgeResponse.Success(request.Id, results: results);
-        }
         bool allDuplicate = results.All(r => r.Status == "duplicate");
         return new BridgeResponse(BridgeProtocol.Version, request.Id, false, allDuplicate ? "duplicate" : "rejected", results[0].Message, results);
     }
@@ -392,8 +388,6 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
         string id = request.TransferId!;
         if (request.Operation == "accept" && !await engine.AcceptBrowserTransferAsync(id, ct))
             return BridgeResponse.Fail(request.Id, "unavailable", "VESPER could not take over this download.");
-        if (request.Operation == "accept")
-            owner?.RequestBrowserPresentation("transfer:" + id, explicitRequest: false);
         if (request.Operation == "abandon") engine.AbandonBrowserTransfer(id);
 
         string State()

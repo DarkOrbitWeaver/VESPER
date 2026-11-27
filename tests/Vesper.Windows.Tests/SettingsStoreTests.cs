@@ -52,13 +52,15 @@ public sealed class SettingsStoreTests : IDisposable
     }
 
     [Fact]
-    public void OpeningAfterCompletionDefaultsOnAndCanBeDisabledSeparately()
+    public void TaskbarFlashKeepsTheExistingCompletionPreference()
     {
-        Assert.True(SettingsStore.Load(_root).OpenVesperOnCompletion);
-        Assert.Null(SettingsStore.Save(new VesperPreferences { OpenVesperOnCompletion = false, NotifyOnFinish = true }, _root));
+        Assert.True(SettingsStore.Load(_root).FlashTaskbarOnCompletion);
+        File.WriteAllText(Path.Combine(_root, "settings.json"), """{"OpenVesperOnCompletion":false,"NotifyOnFinish":true}""");
         var saved = SettingsStore.Load(_root);
-        Assert.False(saved.OpenVesperOnCompletion);
+        Assert.False(saved.FlashTaskbarOnCompletion);
         Assert.True(saved.NotifyOnFinish);
+        Assert.Null(SettingsStore.Save(saved, _root));
+        Assert.False(SettingsStore.Load(_root).FlashTaskbarOnCompletion);
     }
 
     [Fact]

@@ -110,6 +110,29 @@ public sealed class DownloadGridTests
     }
 
     [Fact]
+    public void EverythingShowsTheEmptyStateWhenOnlyHiddenMissingFilesRemain()
+    {
+        RunOnSta(() =>
+        {
+            using var form = new Form1(new VesperPreferences { ShowMissingCompleted = false }, null, startHidden: false);
+            var grid = (DownloadGrid)typeof(Form1).GetField("_grid", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            var filter = (VesperChoice)typeof(Form1).GetField("_filter", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            var search = (TextBox)typeof(Form1).GetField("_search", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(form)!;
+            form.LoadPreviewRows([new DownloadItem { Id = Guid.NewGuid(), Name = "gone.mp4", Status = JobStatus.Missing }]);
+            Assert.Empty(grid.VisibleItems);
+            Assert.Equal("No downloads yet", grid.EmptyTitle);
+            Assert.NotEmpty(grid.EmptyHint);
+
+            filter.SelectedIndex = 4;
+            Assert.Equal("No matching downloads", grid.EmptyTitle);
+            filter.SelectedIndex = 0;
+            search.Text = "gone";
+            typeof(Form1).GetMethod("RefreshList", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(form, null);
+            Assert.Equal("No matching downloads", grid.EmptyTitle);
+        });
+    }
+
+    [Fact]
     public void Ten_thousand_downloads_keep_search_order_and_selection_by_download_id()
     {
         RunOnSta(() =>

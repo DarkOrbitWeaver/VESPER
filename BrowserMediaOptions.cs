@@ -431,8 +431,6 @@ internal sealed partial class BrowserBridgeHandler
         var results = new List<BridgeResult> { primary };
         for (int index = 1; index < jobs.Count; index++)
             results.Add(QueueMedia(jobs[index], queue, $"{request.Id}:{index}"));
-        if (primary.Status is "started" or "queued")
-            owner?.RequestBrowserPresentation("media:" + request.Id, explicitRequest: false);
         return BridgeResponse.Success(request.Id, message: job.SubtitleNotice ?? "", results: results);
     }
 

@@ -198,7 +198,7 @@ public partial class Form1 : Form
     private bool _inboxQueued;
 
     private NotifyIcon? _tray;
-    private VesperNotice? _notice;
+    private readonly List<VesperNotice> _notices = [];
     private Rectangle _noticeWorkArea;
     private BridgeServer? _bridge;
     private BrowserBridgeHandler? _browserHandler;
@@ -236,6 +236,8 @@ public partial class Form1 : Form
             _tooltips.Dispose();
             _diskForecastTimer.Dispose();
             _announcementTimer.Dispose();
+            foreach (VesperNotice notice in _notices) notice.Dispose();
+            _notices.Clear();
         };
         _engine = engine;
         _startHidden = startHidden;
@@ -473,6 +475,8 @@ public partial class Form1 : Form
                 var added = DownloadItem.From(snapshot);
                 _items[snapshot.Id] = added;
                 InvalidateSortedFilterItems();
+                if (snapshot.Kind != JobKind.BrowserFile && snapshot.State != JobState.Cancelled)
+                    ShowOnTaskbar();
                 if (added.Status == JobStatus.Completed) Announce(JobStatus.Queued, added);
                 if (IsQueueTermination(snapshot))
                     queueTerminations.Add(snapshot);
@@ -642,14 +646,13 @@ public partial class Form1 : Form
         if (before == item.Status || item.Snapshot?.Kind == JobKind.BrowserFile) return;
         if (item.Status == JobStatus.Completed && before != JobStatus.Missing)
         {
-            if (_prefs.OpenVesperOnCompletion && Enabled && !_exiting
-                && (!Visible || WindowState == FormWindowState.Minimized || ActiveForm != this))
-                ShowFromTray();
+            if (_prefs.FlashTaskbarOnCompletion && Visible && !_exiting)
+                VesperWindowChrome.FlashTaskbar(this);
             if (_prefs.NotifyOnFinish && _tray is not null)
             {
-                _notice ??= new VesperNotice();
-                if (_notice.PresentCompletion(item.Name, _colors, NoticeArea, ShowFromTray) && _prefs.PlayCompletionSound)
+                if (_prefs.PlayCompletionSound && !_notices.Any(notice => notice.IsCompletion))
                     VesperSounds.PlayCompletion();
+                PresentNotice("Download complete", item.Name, VesperIcon.Check, () => OpenDownloadNotice(item.Id), duration: 3000);
             }
             return;
         }
@@ -660,10 +663,10 @@ public partial class Form1 : Form
         switch (item.Status)
         {
             case JobStatus.NeedsLink:
-                PresentNotice("Needs a new link", item.Name, VesperIcon.Clock, ShowFromTray);
+                PresentNotice("Needs a new link", item.Name, VesperIcon.Clock, () => OpenDownloadNotice(item.Id));
                 break;
             case JobStatus.NeedsAttention: case JobStatus.Failed: case JobStatus.Suspect:
-                PresentNotice("Download needs attention", item.Name, VesperIcon.Warning, ShowFromTray);
+                PresentNotice("Download needs attention", item.Name, VesperIcon.Warning, () => OpenDownloadNotice(item.Id));
                 break;
         }
     }
@@ -756,10 +759,46 @@ public partial class Form1 : Form
         }
     }
 
-    private void PresentNotice(string title, string detail, VesperIcon symbol, Action activate)
+    private void OpenDownloadNotice(Guid id)
     {
-        _notice ??= new VesperNotice();
-        _notice.Present(title, detail, symbol, _colors, NoticeArea, activate);
+        ShowFromTray();
+        if (Enabled && _engine?.Snapshot(id) is { } snapshot) RevealDownload(snapshot);
+    }
+
+    private void PresentNotice(string title, string detail, VesperIcon symbol, Action activate, int duration = 5000)
+    {
+        if (_exiting || IsDisposed) return;
+        var notice = new VesperNotice();
+        notice.FormClosed += (_, _) =>
+        {
+            if (_notices.Remove(notice)) PositionNotices();
+        };
+        _notices.Insert(0, notice);
+        PositionNotices();
+        notice.Present(title, detail, symbol, _colors, activate, duration);
+        PositionNotices(); // Showing on another monitor can change the window's DPI.
+    }
+
+    private void PositionNotices()
+    {
+        const int maxNotices = 4;
+        Rectangle area = NoticeArea;
+        int bottom = area.Bottom;
+        for (int i = 0; i < _notices.Count; i++)
+        {
+            VesperNotice notice = _notices[i];
+            if (i == maxNotices || !notice.PositionInStack(area, bottom, first: i == 0))
+            {
+                while (_notices.Count > i)
+                {
+                    VesperNotice oldest = _notices[^1];
+                    _notices.RemoveAt(_notices.Count - 1);
+                    oldest.Dispose();
+                }
+                break;
+            }
+            bottom = notice.Top;
+        }
     }
 
     private void RememberNoticeMonitor()
@@ -802,48 +841,19 @@ public partial class Form1 : Form
 
     internal void RequestShow() => PostToUi(ShowFromTray);
 
-    private readonly BrowserPresentationPolicy _browserPresentation = new();
-
-    // A new accepted browser job can reveal the existing window, never a new
-    // dialog. Completion has its own setting.
-    internal void RequestBrowserPresentation(string receipt, bool explicitRequest) => PostToUi(() =>
+    private void ShowOnTaskbar()
     {
-        if (_exiting || !_browserPresentation.ShouldPresent(receipt, explicitRequest, Environment.TickCount64))
-            return;
-        // Background browser captures reveal the window only if hidden/minimized and never steal keyboard focus from Chrome!
-        if (explicitRequest)
-        {
-            if (Enabled && (!Visible || WindowState == FormWindowState.Minimized || Form.ActiveForm != this))
-                ShowFromTray(activate: true);
-        }
-        else if (Enabled && !Visible)
-        {
-            ShowFromTray(activate: false);
-        }
-    });
+        if (Visible || _exiting || !Enabled) return;
+        _allowVisible = true;
+        VesperWindowChrome.ShowMinimized(this);
+    }
 
-    protected override bool ShowWithoutActivation => !_activateOnShow;
-    private bool _activateOnShow = true;
-
-    internal void ShowFromTray() => ShowFromTray(activate: true);
-
-    internal void ShowFromTray(bool activate)
+    internal void ShowFromTray()
     {
         _allowVisible = true;
-        _activateOnShow = activate;
-        try
-        {
-            Show();
-            if (activate)
-            {
-                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-                Activate();
-            }
-        }
-        finally
-        {
-            _activateOnShow = true;
-        }
+        Show();
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        Activate();
     }
 
     private bool HasActiveDownloads() => _hasActiveDownloads();
@@ -951,7 +961,8 @@ public partial class Form1 : Form
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         try { release.Wait(TimeSpan.FromSeconds(2)); }
         catch (AggregateException ex) { System.Diagnostics.Trace.WriteLine(ex.Message, "VESPER shutdown"); }
-        _notice?.Dispose();
+        foreach (VesperNotice notice in _notices) notice.Dispose();
+        _notices.Clear();
         VesperSounds.Stop();
         _tray?.ContextMenuStrip?.Dispose();
         _tray?.Dispose();
@@ -1275,7 +1286,7 @@ public partial class Form1 : Form
     {
         _colors = UiKit.Palette(_prefs);
         VesperWindowChrome.ApplyNativeColors(_colors);
-        _notice?.ApplyPalette(_colors);
+        foreach (VesperNotice notice in _notices) notice.ApplyPalette(_colors);
         if (_colors.Botanical) _botanicalArt ??= BotanicalArt.Acquire(_colors);
         else
         {
@@ -1337,12 +1348,11 @@ public partial class Form1 : Form
     private void RefreshList()
     {
         string term = _search.Text.Trim();
-        IEnumerable<DownloadItem> records = GetSortedFilterItems();
-        if (term.Length > 0) records = records.Where(r => r.MatchesSearch(term));
-
-        _grid.EmptyTitle = _items.Count == 0 ? "No downloads yet" : "No matching downloads";
-        _grid.EmptyHint = _items.Count == 0 ? "Add a link or send one from your browser." : "";
-        _grid.SetItems(records.ToList());
+        IReadOnlyList<DownloadItem> records = GetSortedFilterItems();
+        bool emptyInbox = records.Count == 0 && term.Length == 0 && _filter.SelectedText == "Everything";
+        _grid.EmptyTitle = emptyInbox ? "No downloads yet" : "No matching downloads";
+        _grid.EmptyHint = emptyInbox ? "Add a link or send one from your browser." : "";
+        _grid.SetItems(term.Length == 0 ? records : records.Where(r => r.MatchesSearch(term)).ToList());
         UpdateFooter();
         UpdateSelectedTools();
     }
@@ -1826,7 +1836,7 @@ public partial class Form1 : Form
         to.PerTransferRateLimitKbs = from.PerTransferRateLimitKbs; to.BandwidthPresetsKbs = [.. from.BandwidthPresetsKbs];
         to.MaxConnectionsPerJob = from.MaxConnectionsPerJob; to.NotifyOnFinish = from.NotifyOnFinish; to.WatchClipboard = from.WatchClipboard;
         to.PlayCompletionSound = from.PlayCompletionSound;
-        to.OpenVesperOnCompletion = from.OpenVesperOnCompletion;
+        to.FlashTaskbarOnCompletion = from.FlashTaskbarOnCompletion;
         to.OpenFolderWhenQueueFinishes = from.OpenFolderWhenQueueFinishes;
         to.SleepWhenQueueFinishes = from.SleepWhenQueueFinishes;
         to.ShutdownWhenQueueFinishes = from.ShutdownWhenQueueFinishes;

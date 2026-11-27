@@ -6,12 +6,11 @@ internal sealed class VesperNotice : Form
 {
     private readonly System.Windows.Forms.Timer _dismiss = new();
     private VesperPalette _palette;
-    private int _count;
     private string _title = "";
     private string _detail = "";
     private VesperIcon _symbol;
     private Action? _activate;
-    private Rectangle _workArea;
+    public bool IsCompletion => _symbol == VesperIcon.Check;
 
     public VesperNotice()
     {
@@ -22,7 +21,7 @@ internal sealed class VesperNotice : Form
         StartPosition = FormStartPosition.Manual;
         Cursor = Cursors.Hand;
         AccessibleRole = AccessibleRole.Alert;
-        _dismiss.Tick += Dismiss;
+        _dismiss.Tick += (_, _) => Close();
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -44,64 +43,29 @@ internal sealed class VesperNotice : Form
         Invalidate();
     }
 
-    public bool PresentCompletion(string fileName, VesperPalette palette, Rectangle workArea, Action activate)
+    public void Present(string title, string detail, VesperIcon symbol, VesperPalette palette, Action activate, int duration)
     {
-        if (Visible && _count > 0)
-        {
-            _count++;
-            _title = $"{_count} downloads complete";
-            _detail = fileName;
-            AccessibleName = _title + ". " + _detail;
-            ApplyPalette(palette);
-            return false;
-        }
-
-        Present("Download complete", fileName, VesperIcon.Check, palette, workArea, activate, duration: 3000, count: 1);
-        return true;
-    }
-
-    public void Present(string title, string detail, VesperIcon symbol, VesperPalette palette, Rectangle workArea,
-        Action activate, int duration = 5000, int count = 0)
-    {
-        _dismiss.Stop();
         _dismiss.Interval = duration;
         _title = title;
         _detail = detail;
         _symbol = symbol;
         _activate = activate;
-        _count = count;
-        _workArea = workArea;
         AccessibleName = _title + ". " + _detail;
         ApplyPalette(palette);
-        if (!Visible) Location = new Point(workArea.Right - 100, workArea.Bottom - 80);
-        PositionNotice();
-        if (!Visible)
-        {
-            Show();
-            PositionNotice();
-        }
+        Show();
         _dismiss.Start();
     }
 
-    private void PositionNotice()
+    public bool PositionInStack(Rectangle area, int bottom, bool first)
     {
         int S(int value) => UiKit.Scale(this, value);
-        int inset = S(18);
-        Size = new Size(Math.Min(S(350), Math.Max(1, _workArea.Width - inset * 2)), S(65));
-        Location = new Point(_workArea.Right - Width - inset, _workArea.Bottom - Height - inset);
-    }
-
-    protected override void OnDpiChanged(DpiChangedEventArgs e)
-    {
-        base.OnDpiChanged(e);
-        if (!_workArea.IsEmpty) PositionNotice();
-    }
-
-    private void Dismiss(object? sender, EventArgs e)
-    {
-        _dismiss.Stop();
-        _activate = null;
-        Hide();
+        int inset = Math.Min(S(18), Math.Min(area.Width, area.Height) / 4);
+        int width = Math.Max(1, Math.Min(S(350), area.Width - inset * 2));
+        int height = Math.Max(1, Math.Min(S(65), area.Height - inset * 2));
+        int top = bottom - height - (first ? inset : S(8));
+        if (!first && top < area.Top + inset) return false;
+        Bounds = new Rectangle(area.Right - width - inset, top, width, height);
+        return true;
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
@@ -109,7 +73,7 @@ internal sealed class VesperNotice : Form
         base.OnMouseUp(e);
         if (e.Button != MouseButtons.Left) return;
         Action? activate = _activate;
-        Dismiss(null, EventArgs.Empty);
+        Close();
         activate?.Invoke();
     }
 

@@ -9,14 +9,14 @@ namespace Vesper.Windows.Tests;
 public sealed class Form1InboxTests
 {
     [Fact]
-    public void EngineUpdateArrivingBeforeFirstHandleIsNotLost()
+    public void EngineUpdateArrivingBeforeFirstHandleShowsTheDownloadMinimized()
     {
         ExceptionDispatchInfo? failure = null;
         var thread = new Thread(() =>
         {
             try
             {
-                using var form = new Form1();
+                using var form = new Form1(new VesperPreferences(), null, startHidden: true);
                 Assert.False(form.IsHandleCreated, "This test must enqueue before Windows creates the form handle.");
 
                 Guid id = Guid.NewGuid();
@@ -32,6 +32,9 @@ public sealed class Form1InboxTests
                 Assert.True(items.TryGetValue(id, out DownloadItem? item),
                     "Creating the UI handle must flush earlier engine updates without another event.");
                 Assert.Equal("early-download.zip", item!.Name);
+                Assert.True(form.Visible);
+                Assert.Equal(FormWindowState.Minimized, form.WindowState);
+                Assert.NotSame(form, Form.ActiveForm);
             }
             catch (Exception ex) { failure = ExceptionDispatchInfo.Capture(ex); }
         }) { IsBackground = true };

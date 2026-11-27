@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Globalization;
 using System.Net;
+using System.Text.Json.Serialization;
 using Vesper.Engine;
 
 namespace VESPER;
@@ -213,7 +214,8 @@ internal sealed class VesperPreferences
     public int MaxConnectionsPerJob { get; set; } = 8;
     public bool NotifyOnFinish { get; set; } = true;
     public bool PlayCompletionSound { get; set; } = true;
-    public bool OpenVesperOnCompletion { get; set; } = true;
+    [JsonPropertyName("OpenVesperOnCompletion")]
+    public bool FlashTaskbarOnCompletion { get; set; } = true;
     public bool OpenFolderWhenQueueFinishes { get; set; }
     public bool SleepWhenQueueFinishes { get; set; }
     public bool ShutdownWhenQueueFinishes { get; set; }

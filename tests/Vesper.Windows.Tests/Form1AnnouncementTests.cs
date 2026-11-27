@@ -8,6 +8,21 @@ namespace Vesper.Windows.Tests;
 public sealed class Form1AnnouncementTests
 {
     [Fact]
+    public void NoticesStackAboveEachOtherWithinTheWorkArea()
+    {
+        using var newest = new VesperNotice();
+        using var older = new VesperNotice();
+        var area = new Rectangle(-900, 50, UiKit.Scale(newest, 800), UiKit.Scale(newest, 175));
+
+        Assert.True(newest.PositionInStack(area, area.Bottom, first: true));
+        Assert.True(older.PositionInStack(area, newest.Top, first: false));
+        Assert.True(area.Contains(newest.Bounds));
+        Assert.True(area.Contains(older.Bounds));
+        Assert.True(older.Bottom < newest.Top);
+        Assert.False(older.PositionInStack(area, older.Top, first: false));
+    }
+
+    [Fact]
     public void Screen_reader_throttle_keeps_the_most_recent_outcome()
     {
         ExceptionDispatchInfo? failure = null;
