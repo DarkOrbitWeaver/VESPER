@@ -5,7 +5,8 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 function cardWalker(card) {
-  const links = card.querySelectorAll('a[href]').map(link => ({ tagName: 'A', hasAttribute: () => false, ...link }));
+  const links = card.querySelectorAll('a[href]').map(link => link.tagName === 'A' ? link
+    : { tagName: 'A', hasAttribute: () => false, ...link });
   return { nextNode: () => links.shift() || null };
 }
 
@@ -961,16 +962,18 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   const card = new FakeElement();
   const video = new FakeVideo();
   const elsewhere = new FakeElement();
+  let watchLink = null;
   let hovering = false;
   let now = 1_000_000;
   const scheduled = [];
+  const sent = [];
   const node = () => ({
     setAttribute() {}, matches: selector => hovering && selector.includes(':hover'),
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false }
   });
   card.parentElement = body;
   elsewhere.parentElement = body;
-  card.querySelectorAll = selector => selector === 'a[href]' ? [{ href: item }] : selector === 'video' ? [video] : [];
+  card.querySelectorAll = selector => selector === 'a[href]' ? [watchLink || { href: item }] : selector === 'video' ? [video] : [];
   video.parentElement = card;
   let hoverTarget = card;
   const document = Object.assign(new EventTarget(), {
@@ -989,7 +992,8 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
     chrome: {
-      runtime: { id: 'vesper-test', onMessage: { addListener() {} }, sendMessage: async () => ({ ok: false, code: 'protected' }) },
+      runtime: { id: 'vesper-test', onMessage: { addListener() {} },
+        sendMessage: async message => { sent.push(message); return { ok: false, code: 'protected' }; } },
       storage: { sync: { get: async defaults => defaults }, onChanged: { addListener() {}, removeListener() {} } }
     }
   });
@@ -998,11 +1002,13 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   let detached = 0;
   const content = source('content').replace(/\}\)\(\);\s*$/, `window.__testContent = {
     onPointer, consider, refreshPlayer, holdMissingPreview, activePreview: () => activePreview,
+    resetPlayerSource, loadFormats, isCurrentRequest, request: () => panelRequest,
     stubMovement: onDetach => { selectPlayer = () => {}; detach = onDetach; },
     attachForTest: (player, controls) => {
       video = player; perch = { x: 10, y: 10 };
       ({ button, panel, receipt } = controls);
       companion = { setPickerOpen() {}, setVisible() {}, pointerMove() {} };
+      renderShell = () => {};
     }
   };\n})();`);
   runContent(context, content);
@@ -1034,6 +1040,33 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   runLatestTimer(900);
   assert.equal(detached, 1);
   assert.equal(page.activePreview(), null);
+
+  // On the homepage, the watch card still identifies the video after a replay/reset.
+  watchLink = { tagName: 'A', href: item, isConnected: true, parentElement: card, hasAttribute: () => false };
+  video.readyState = 1;
+  hoverTarget = card;
+  page.onPointer({ target: card, clientX: 220, clientY: 100 });
+  assert.equal(page.activePreview()?.watchLink, watchLink);
+  video.readyState = 0;
+  video.currentSrc = video.src = '';
+  page.resetPlayerSource(video, 'loadstart');
+  page.onPointer({ target: watchLink, clientX: 225, clientY: 103 });
+  const before = scheduled.length;
+  assert.equal(page.holdMissingPreview(), true);
+  assert.equal(scheduled.length, before, 'hovering the same card does not poll for its player');
+
+  video.isConnected = false;
+  await page.loadFormats();
+  const request = page.request();
+  const lookup = sent.findLast(message => message.type === 'media-options');
+  assert.equal(lookup.pageUrl, item);
+  assert.equal(lookup.playerUrl, '');
+  assert.equal(lookup.generation, 0);
+  assert.equal(page.isCurrentRequest(request), true);
+  page.resetPlayerSource(video, 'emptied');
+  assert.equal(page.isCurrentRequest(request), true, 'the watch picker survives another media reset');
+  watchLink.href = 'https://www.youtube.com/watch?v=ZYXWVUTSRQP';
+  assert.equal(page.isCurrentRequest(request), false, 'a recycled card invalidates the old picker');
 });
 
 test('a pointer still heading for the butterfly gets extra time, with a limit', async () => {
@@ -1140,7 +1173,7 @@ test('changes within a recycled card refresh its binding without scanning the do
   const anchor = { tagName: 'A', parentElement: article, nodeType: 1 };
   video.parentElement = article;
   const context = vm.createContext({
-    alive: () => true, video, host: null, document: {}, HTMLMediaElement: class {},
+    alive: () => true, video, host: null, activePreview: null, document: {}, HTMLMediaElement: class {},
     discoveryNodes: new Set(), refreshAfterDiscovery: false, prunePlayers: false,
     composedParent: node => node.parentElement, containsPlayer: (node, player) => node.contains?.(player),
     scheduleDiscovery() {}

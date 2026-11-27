@@ -220,7 +220,9 @@
     const previewMatches = !activePreview || activePreview.key === panelMedia.targetKey;
     const binding = panelMedia.player && playback.get(panelMedia.player);
     const sourceMatches = !panelMedia.generation || binding?.generation === panelMedia.generation;
-    if (pageMatches && previewMatches && sourceMatches && matchesPickerPlayer(panelMedia)) return true;
+    if (pageMatches && previewMatches && (panelMedia.preview
+      ? watchPreviewCurrent(panelMedia.preview) && !panelMedia.player.mediaKeys && !protectedVideos.has(panelMedia.player)
+      : sourceMatches && matchesPickerPlayer(panelMedia))) return true;
     retainedPickerDraft = null;
     closePanel();
     return false;
@@ -346,7 +348,7 @@
       if (--budget.remaining < 0) return null;
       if (element.tagName === 'A' && element.href) {
         if (links.size >= 32) return null;
-        links.set(element, { href: element.href, permalink: element.hasAttribute('data-permalink') });
+        links.set(element, { element, href: element.href, permalink: element.hasAttribute('data-permalink') });
       } else if (element.tagName === 'TIME' && element.hasAttribute('datetime')) {
         const link = links.get(element.closest('a[href]'));
         if (link) link.permalink = true;
@@ -381,7 +383,7 @@
         const area = el => { const r = el.getBoundingClientRect(); return r.width * r.height * (el.paused ? 1 : 1.15); };
         return area(b) - area(a);
       });
-      return { page, player: visibleVideos[0] };
+      return { page, player: visibleVideos[0], card, links };
     }
     return null;
   }
@@ -389,15 +391,27 @@
   function cardPage(node) { return cardContext(node, false)?.page || null; }
 
   function cardPreview(target) {
-    const card = cardContext(target, true);
-    if (card?.player) {
-      const page = card.page;
-      const player = card.player;
+    const context = cardContext(target, true);
+    if (context?.player) {
+      const { page, player, card, links } = context;
+      const here = VesperPlayerSource.http(pageAddress());
+      const watch = VesperPlayerSource.http(page);
+      if (here?.pathname === '/' && /(?:^|\.)youtube\.com$/.test(here.hostname) && watch?.pathname === '/watch'
+          && VesperPlayerSource.identity(page)?.startsWith('youtube:')) {
+        const watchLink = links.findLast(link => link.element?.isConnected && VesperPlayerSource.http(link.href)?.href === page)?.element;
+        if (watchLink) return { player, page, card, watchLink, key: page };
+      }
       const src = playerSource(player) || (activePreview?.player === player ? activePreview.binding?.src : '') || '';
       const key = `${VesperPlayerSource.identity(page)}|${page}|${src}|${playback.get(player)?.generation || 0}`;
       return { player, page, key };
     }
     return null;
+  }
+
+  function watchPreviewCurrent(preview) {
+    return !!preview?.watchLink?.isConnected && preview.card.isConnected
+      && containsPlayer(preview.card, preview.watchLink)
+      && VesperPlayerSource.http(preview.watchLink.href)?.href === preview.page;
   }
 
   function activatePreview(preview) {
@@ -415,6 +429,8 @@
     if (!pointer || panelMedia || pointerTarget === host || pointerOnButterfly()) return false;
     const target = document.elementFromPoint(pointer.x, pointer.y) || pointerTarget;
     if (target === host) return false;
+    if (activePreview?.player === player && watchPreviewCurrent(activePreview)
+        && containsPlayer(activePreview.card, target)) return false;
     const preview = cardPreview(target);
     return preview?.player === player && activatePreview(preview);
   }
@@ -545,6 +561,8 @@
     // Opening the picker is an explicit selection. Do not switch to a
     // larger or newly autoplaying neighbour until the picker closes.
     // Source-generation and navigation handlers still invalidate stale media.
+    if (panelMedia?.preview) isCurrentRequest(panelRequest);
+    if (activePreview?.watchLink && !watchPreviewCurrent(activePreview)) activePreview = null;
     if (panelMedia && video === panelMedia.player) {
       place(continuous);
       if (panelMedia) return;
@@ -713,7 +731,7 @@
   }
 
   function canAdoptInitialBinding(player, previous, src, page) {
-    if (previous || !panelMedia || panelMedia.player !== player || panelMedia.generation !== 0
+    if (previous || !panelMedia || panelMedia.preview || panelMedia.player !== player || panelMedia.generation !== 0
         || !panel?.classList.contains('show') || !player.isConnected
         || panelMedia.documentIdentity !== VesperPlayerSource.identity(pageAddress())) return false;
     const identity = VesperPlayerSource.identity(page);
@@ -750,13 +768,13 @@
         endedPlayer = null;
         clearTimeout(endedPlayerTimer);
       }
-      if (activePreview?.player === el) {
+      if (activePreview?.player === el && !activePreview.watchLink) {
         activePreview = { ...activePreview, page, src,
           key: `${VesperPlayerSource.identity(page)}|${page}|${src}|${binding.generation}`, binding };
         if (!adoptInitial && panelMedia && panelMedia.targetKey !== activePreview.key) closePanel();
       }
       if (el === video) mediaChangedAt = changedAt;
-      if (el === video && panelMedia?.player === el) {
+      if (el === video && panelMedia?.player === el && !panelMedia.preview) {
         retainedPickerDraft = null;
         if (adoptInitial) {
           // Invalidate the provisional lookup immediately; the first metadata
@@ -771,7 +789,7 @@
           });
         } else closePanel();
       }
-      if (el === video && retainedPickerDraft) retainedPickerDraft = null;
+      if (el === video && retainedPickerDraft && !watchPreviewCurrent(activePreview)) retainedPickerDraft = null;
     }
   }
 
@@ -804,6 +822,7 @@
 
   function touchesCurrentCard(node) {
     if (!video || node === document.body || node === document.documentElement) return false;
+    if (activePreview?.card && containsPlayer(activePreview.card, node)) return true;
     if (containsPlayer(node, video)) return true;
     for (let parent = composedParent(video), depth = 0; parent && parent !== document.body && depth < 6;
       parent = composedParent(parent), depth++) {
@@ -988,17 +1007,18 @@
       return;
     }
     const page = pageForPlayer(player);
+    const keepPreview = activePreview?.player === player && watchPreviewCurrent(activePreview);
     mediaLedger.playback({ key: evidenceKey(player), scope: location.origin,
       pageUrl: page, mediaUrl: playerSource(player),
       stableId: VesperPlayerSource.identity(page) || '', event: type });
     if (type === 'loadstart') {
       playback.delete(player);
-      if (activePreview?.player === player) activePreview = null;
+      if (activePreview?.player === player && !keepPreview) activePreview = null;
       if (player === video) {
         mediaChangedAt = Date.now();
-        retainedPickerDraft = null;
+        if (!keepPreview) retainedPickerDraft = null;
       }
-      if (panelMedia?.player === player) {
+      if (panelMedia?.player === player && !(keepPreview && panelMedia.preview)) {
         retainedPickerDraft = null;
         closePanel();
       }
@@ -1014,7 +1034,7 @@
       if (activePreview?.player === player && playback.has(player))
         activePreview = { ...activePreview, binding: playback.get(player) };
       playback.delete(player);
-      if (panelMedia?.player === player) {
+      if (panelMedia?.player === player && !(keepPreview && panelMedia.preview)) {
         retainedPickerDraft = null;
         closePanel();
       }
@@ -1200,7 +1220,10 @@
     button.addEventListener('pointercancel', finishDrag, { signal });
     button.addEventListener('lostpointercapture', finishDrag, { signal });
     button.addEventListener('focus', updateFlyVisibility, { signal });
-    button.addEventListener('blur', updateFlyVisibility, { signal });
+    button.addEventListener('blur', () => {
+      updateFlyVisibility();
+      holdMissingPreview();
+    }, { signal });
     root.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && panel.classList.contains('show')) {
         e.stopPropagation();
@@ -1594,7 +1617,7 @@
   function onPointer(e) {
     if (!alive()) return;
     const moved = !lastPointerPosition || lastPointerPosition.x !== e.clientX || lastPointerPosition.y !== e.clientY;
-    if (!moved && !drag) return;
+    if (!moved && !drag && e.target === pointerTarget) return;
     lastPointerPosition = { x: e.clientX, y: e.clientY };
     pointerMovedAt = Date.now();
     if (fullscreenPlayer) {
@@ -1609,7 +1632,8 @@
     }
     if (e.target !== pointerTarget) {
       pointerTarget = e.target;
-      const preview = cardPreview(e.target);
+      const preview = activePreview?.player.isConnected && watchPreviewCurrent(activePreview) && containsPlayer(activePreview.card, e.target)
+        ? activePreview : cardPreview(e.target);
       if (activatePreview(preview)) selectPlayer();
       else if (!preview && activePreview && !previewMissing() && !previewLatched()) {
         activePreview = null;
@@ -1647,6 +1671,16 @@
 
   function holdMissingPreview() {
     if (document.fullscreenElement || !perch || !previewMissing()) return false;
+    if (activePreview?.watchLink) {
+      if (!watchPreviewCurrent(activePreview) || !clippedPlayerRect(activePreview.card.getBoundingClientRect())
+          || !renderedPlayerBox(activePreview.card)) return false;
+      const target = pointer && document.elementFromPoint(pointer.x, pointer.y);
+      if (panelMedia?.preview || pointerOnButterfly() || target && containsPlayer(activePreview.card, target)) {
+        clearTimeout(previewExitTimer);
+        previewExitTimer = previewRemovedAt = 0;
+        return true;
+      }
+    }
     if (panelMedia?.player === video) return true;
     if (!previewRemovedAt) {
       previewRemovedAt = Date.now();
@@ -1789,16 +1823,22 @@
   async function loadFormats(refresh = false, keepSource = true, quick = false) {
     syncPage();
     if ((!video?.isConnected && activePreview?.player !== video) || !panel) return;
+    if (activePreview?.watchLink && !watchPreviewCurrent(activePreview)) {
+      activePreview = null;
+      selectPlayer();
+      return;
+    }
     // A new click also renews the bounded script-response watcher after MV3
     // worker suspension. Existing evidence remains scoped to this document.
     announceVideoElement(true);
     dismissReceipt();
     receipt.textContent = '';
     const player = video;
+    const watchPreview = activePreview?.player === player && watchPreviewCurrent(activePreview) ? activePreview : null;
     cancelPrefetch();
     // The first click can arrive before the observer has bound a loaded player.
     // Establish the current generation synchronously before opening the picker.
-    if (player?.isConnected && player.readyState >= 1 && !activeBrowserCopy) consider(player);
+    if (player?.isConnected && player.readyState >= 1 && !activeBrowserCopy && !watchPreview) consider(player);
     const request = ++panelRequest;
     // Reopening the butterfly must not start a second copy of the same Blob.
     if (activeBrowserCopy && activeBrowserCopy.player === player) {
@@ -1811,18 +1851,20 @@
     }
     const preview = activePreview?.player === player ? activePreview : null;
     const ended = isCurrentEndedPlayer(player);
-    const src = playerSource(player) || preview?.binding?.src || (ended ? endedPlayer.binding.src : '');
+    // Resolve the watch link. The inline player can be reset or only serve a preview.
+    const src = watchPreview ? '' : playerSource(player) || preview?.binding?.src || (ended ? endedPlayer.binding.src : '');
     const targetPage = activePreview?.player === player ? activePreview.page : pageForPlayer(player);
     const identity = VesperPlayerSource.identity(targetPage);
     const binding = playback.get(player) || preview?.binding || (ended ? endedPlayer.binding : null);
-    const current = !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
+    const current = !watchPreview && !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
     const targetKey = activePreview?.player === player ? activePreview.key
       : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
     const savedDraft = retainedPickerDraft?.targetKey === targetKey && retainedPickerDraft.player === player;
     if (retainedPickerDraft && !savedDraft) retainedPickerDraft = null;
     refresh = refresh || savedDraft;
     panelMedia = { documentIdentity: VesperPlayerSource.identity(pageAddress()), documentPage: pageAddress(), targetKey,
-      player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player), playerState: pickerPlayerState(player), generation: current ? binding.generation : 0 };
+      player, pageUrl: targetPage, src, formatSrc: current ? src : '', playerKey: evidenceKey(player),
+      preview: watchPreview, playerState: watchPreview ? null : pickerPlayerState(player), generation: current ? binding.generation : 0 };
     panel.classList.add('show');
     button.setAttribute('aria-expanded', 'true');
     companion.setPickerOpen(true, false, true);
