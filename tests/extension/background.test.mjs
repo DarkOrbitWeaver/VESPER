@@ -3230,9 +3230,12 @@ test('opening any HTTPS video picker uses sign-in after Chrome approves it', asy
     ['http://example.com/video', { signInPermission: true }, {}]
   ]) {
     const blocked = load({ 'media-options': mediaOptionsReply }, opts);
-    await blocked.message(videoOptionsMessage(address, extra), { ...sender, url: address, tab: { id: 17, url: address } });
+    const reply = await blocked.message(videoOptionsMessage(address, extra), { ...sender, url: address, tab: { id: 17, url: address } });
     assert.deepEqual(blocked.cookieLookups, []);
-    assert.equal(blocked.sent[0].mediaAuth, undefined);
+    if (extra.prefetch) {
+      assert.equal(reply.data.prefetchSkipped, true);
+      assert.equal(blocked.sent.length, 0);
+    } else assert.equal(blocked.sent[0].mediaAuth, undefined);
   }
 });
 
@@ -3384,11 +3387,14 @@ test('generic player prefetch requires a media URL observed by Chrome', async ()
   assert.equal(request.candidates[0].url, mediaUrl);
 });
 
-test('a verified range for the current player is prepared once and reused on click', async () => {
+test('a click during range prefetch gets picker choices from a single verification', async () => {
   const page = 'https://example.com/watch/current';
   const url = 'https://media.example/current.webm';
   const sender = { tab: { id: 22, url: page }, url: page, frameId: 0, documentId: 'range-doc' };
-  const app = load({ 'media-range-options': mediaOptionsReply });
+  let started, complete;
+  const verifying = new Promise(resolve => { started = resolve; });
+  const result = new Promise(resolve => { complete = resolve; });
+  const app = load({ 'media-range-options': () => { started(); return result; } });
   const message = videoOptionsMessage(page, { playerUrl: url, playerHasMedia: true,
     playerKey: 'media-1', mediaChangedAt: Date.now(), title: 'Current video' });
   try {
@@ -3401,10 +3407,16 @@ test('a verified range for the current player is prepared once and reused on cli
     assert.equal(preview.data.prefetchSkipped, true);
     assert.equal(app.sent.length, 0);
 
-    const prepared = await app.message({ ...message, prefetch: true }, sender);
+    const warm = app.message({ ...message, prefetch: true }, sender);
+    await verifying;
+    const click = app.message(message, sender);
+    await new Promise(resolve => setImmediate(resolve));
+    complete(mediaOptionsReply);
+    const prepared = await warm;
     assert.equal(prepared.data.prepared, true);
-    const reply = await app.message(message, sender);
+    const reply = await click;
     assert.equal(reply.ok, true);
+    assert.ok(reply.data.choices?.length || reply.data.sourceChoices?.length);
     assert.deepEqual(app.sent.map(request => request.type), ['media-range-options']);
     assert.equal(app.sent[0].candidates[0].observedETag, '"current"');
 

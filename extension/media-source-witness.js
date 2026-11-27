@@ -547,15 +547,11 @@
     });
   }
 
-  // Shadow DOM discovery: mark elements that attach shadow roots so isolated content.js can find nested players
+  // A connected host can attach a root without a document child-list change.
   if (typeof Element === 'function' && Element.prototype.attachShadow) {
-    const shadowRoots = new WeakMap();
     replace(Element.prototype, 'attachShadow', original => function (init) {
       const root = apply(original, this, [init]);
-      try {
-        shadowRoots.set(this, root);
-        this.setAttribute?.('data-vesper-shadow-host', '');
-      } catch {}
+      try { this.setAttribute('data-vesper-shadow-host', ''); } catch {}
       return root;
     });
   }

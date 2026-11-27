@@ -153,7 +153,7 @@ test('small nearby player wins when dropping over it; distant preview is ignored
     return rect.right - rect.left >= width && rect.bottom - rect.top >= height ? rect : null;
   };
   const dropTarget = contentFunction('dropTarget', 'finishDrag', {
-    observed: new Set([first, second, distant]), video: first, visiblePlayer, Math, Number, document: { fullscreenElement: null }
+    nearby: new Set([first, second, distant]), video: first, visiblePlayer, Math, Number, fullscreenTarget: () => null
   });
   assert.equal(dropTarget(730, 150), second);
   assert.equal(dropTarget(620, 145), second, 'a near-edge perch can attach');

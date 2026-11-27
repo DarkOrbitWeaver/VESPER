@@ -1432,8 +1432,9 @@ async function playerOptions(message, sender) {
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
   if (cached) return cached;
-  // Coalesce explicit clicks onto any matching in-flight anonymous prefetch.
-  const pendingKey = [lookupKey, auth.authorized ? 'signed' : ''].join('|');
+  // Page lookups and exact-source checks can share work. The picker must still
+  // run its own selection path because prefetch can return only a status.
+  const pendingKey = [lookupKey, prefetch ? 'prefetch' : 'picker', auth.authorized ? 'signed' : ''].join('|');
   if (mediaLookups.has(pendingKey)) return mediaLookups.get(pendingKey);
   const task = (async () => {
     const state = await tabState(tab);

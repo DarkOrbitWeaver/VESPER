@@ -247,7 +247,35 @@ async function main() {
     if (playerRaceTest && request.url === '/recycled-player') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end('<!doctype html><title>Recycled player fixture</title><article id="card" data-permalink="/posts/first">'
-        + '<video width="640" height="360" src="/player.webm" muted controls preload="auto"></video></article>');
+        + '<video width="640" height="360" src="/player.webm" muted controls preload="auto"></video></article>'
+        + '<button class="previous-post" aria-label="Previous post">&lt;</button><button class="next-post" aria-label="Next post">&gt;</button>'
+        + '<script>for (const [direction, post] of [["previous","first"], ["next","second"]]) {'
+        + 'document.querySelector("." + direction + "-post").onclick = () => {'
+        + 'const route = "/posts/" + post; history.pushState({}, "", route); card.dataset.permalink = route;'
+        + 'const video = card.querySelector("video"); video.style.opacity = 0;'
+        + 'requestAnimationFrame(() => requestAnimationFrame(() => {video.style.opacity = 1}));'
+        + '}; }</script>');
+      return;
+    }
+    if (playerRaceTest && request.url === '/scroll-feed') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<!doctype html><style>body{margin:0}#feed{height:98vh;overflow:auto}article{height:430px}</style><main id="feed">'
+        + Array.from({ length: 67 }, (_, i) => '<article>' + ([1, 33, 65].includes(i)
+          ? `<video id="post-${i}" style="margin-left:${i === 1 ? 0 : i === 33 ? 96 : 192}px" width="480" height="360" src="/player.webm?post=${i}" autoplay muted loop controls></video>`
+          : '<span>Earlier post</span>') + '</article>').join('') + '</main>');
+      return;
+    }
+    if (playerRaceTest && request.url.startsWith('/shadow-player?')) {
+      const mode = request.url.endsWith('open') ? 'open' : 'closed';
+      const video = '<video width="640" height="360" src="/player.webm" autoplay muted loop controls></video>';
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      if (request.url.includes('declarative')) {
+        response.end(`<!doctype html><section><template shadowrootmode="${mode}">${video}</template></section>`);
+      } else {
+        response.end('<!doctype html><section></section><script>window.addPlayer = () => {'
+          + `document.querySelector("section").attachShadow({mode:"${mode}"}).innerHTML=${JSON.stringify(video)}`
+          + '};</script>');
+      }
       return;
     }
     if (request.url === '/player') {
@@ -739,7 +767,7 @@ async function main() {
     }
 
     await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/player' }, tab);
-    async function flyShown() {
+    async function findButterfly() {
       const { root: dom } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
       const nodes = [dom];
       for (const node of nodes) {
@@ -747,17 +775,19 @@ async function main() {
         if (node.nodeName !== 'BUTTON') continue;
         const index = node.attributes?.indexOf('class') ?? -1;
         const classes = index < 0 ? [] : node.attributes[index + 1].split(' ');
-        if (classes.includes('fly')) return classes.includes('show');
+        if (classes.includes('fly')) return { nodeId: node.nodeId, shown: classes.includes('show') && !node.attributes.includes('hidden') };
       }
       return null;
     }
+    const flyShown = async () => (await findButterfly())?.shown ?? null;
     await waitFor(() => flyShown(), 5000, 'The butterfly did not appear on the regular player.');
     await evaluate('Pause on a page with a player', 'chrome.storage.local.set({ vesperPaused: true })');
     await waitFor(async () => !(await flyShown()), 5000, 'The butterfly stayed visible during Pause.');
     await evaluate('Resume on the same page', 'chrome.storage.local.set({ vesperPaused: false })');
     await waitFor(() => flyShown(), 5000, 'The butterfly did not return after resuming.');
     for (const [mode, enter, leave, pointerX] of [
-      ['native fullscreen', "player.requestFullscreen()", 'document.exitFullscreen()', 400],
+      ['wrapper fullscreen', "player.requestFullscreen()", 'document.exitFullscreen()', 400],
+      ['native video fullscreen', 'player.querySelector("video").requestFullscreen()', 'document.exitFullscreen()', 420],
       ['expanded player', "player.classList.add('expanded')", "player.classList.remove('expanded')", 440]
     ]) {
       const result = await browser.send('Runtime.evaluate', { expression: enter, awaitPromise: true, userGesture: true }, tab);
@@ -765,6 +795,15 @@ async function main() {
       await waitFor(async () => (await flyShown()) === false, 5000, 'The butterfly stayed visible in ' + mode);
       await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pointerX, y: 220 }, tab);
       await waitFor(() => flyShown(), 2500, 'The butterfly did not wake in ' + mode);
+      if (mode === 'native video fullscreen') {
+        await waitFor(async () => {
+          const fly = await findButterfly();
+          const { model } = await browser.send('DOM.getBoxModel', { nodeId: fly.nodeId }, tab);
+          const [x, y] = [(model.border[0] + model.border[4]) / 2, (model.border[1] + model.border[5]) / 2];
+          const hit = await browser.send('Runtime.evaluate', { expression: `document.elementFromPoint(${x}, ${y})?.hasAttribute('data-vesper-player')`, returnByValue: true }, tab);
+          return hit.result.value;
+        }, 2500, 'The butterfly was behind the native fullscreen video.');
+      }
       await browser.send('Runtime.evaluate', { expression: leave, awaitPromise: true }, tab);
     }
     // Actual MSE append calls in two simultaneous players, not a VM mock.
@@ -856,7 +895,7 @@ async function main() {
     await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
     await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
-    let recycledPlayer = null, preparedBeforeClick = null;
+    let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [];
     if (playerRaceTest) {
       function findButton(...classNames) {
         return waitFor(async () => {
@@ -877,12 +916,26 @@ async function main() {
         }, tab);
         assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
       }
+      async function clickButton(className) {
+        const target = await findButton(className);
+        const { model } = await browser.send('DOM.getBoxModel', { nodeId: target.nodeId }, tab);
+        const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
+        await browser.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, tab);
+        await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
+        await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
+      }
       await evaluate('Observe native verification for the prefetch fixture', `(() => {
         globalThis.__warmRequests = [];
         const request = nativeRequest;
+        const options = playerOptions;
+        playerOptions = async (...args) => {
+          if (!args[0].prefetch) globalThis.__foregroundOpened = true;
+          return options(...args);
+        };
         nativeRequest = async (...args) => {
           if (args[0]?.type !== 'media-source-options' || !args[0].url.endsWith('/mse-prefetch')) return request(...args);
           __warmRequests.push(args[0].candidates[0].url);
+          await new Promise(resolve => { globalThis.__finishPrefetch = resolve; });
           return { ok: true, data: { playbackMatches: 1, mediaSession: crypto.randomUUID().replaceAll('-', ''),
             choices: [{ index: 0, label: 'Original quality', container: 'MP4' }] } };
         };
@@ -890,7 +943,11 @@ async function main() {
       await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/mse-prefetch' }, tab);
       await waitFor(async () => (await evaluate('Check early verification', '__warmRequests.length')) === 1,
         7000, 'The active MSE player did not prepare the witnessed stream before opening the picker.');
-      await clickWith('fly');
+      await waitFor(() => flyShown(), 3000, 'The MediaSource fly was missing during prefetch.');
+      await clickButton('fly');
+      await waitFor(() => evaluate('Wait for the click to reach the worker', 'globalThis.__foregroundOpened'), 3000,
+        'The foreground click did not reach the worker while prefetch was pending.');
+      await evaluate('Release the source verification', '__finishPrefetch()');
       try { await findButton('primary', 'opt'); }
       catch (error) {
         const { root } = await browser.send('DOM.getDocument', { depth: -1, pierce: true }, tab);
@@ -945,7 +1002,50 @@ async function main() {
       }, 5000, 'The current picker could not submit.');
       assert.equal(fresh.lookedUp[1]?.page, '/posts/second');
       assert.deepEqual(fresh.submitted, [fresh.lookedUp[1].token]);
-      recycledPlayer = { unchangedDocumentUrl: true, unchangedCurrentSrc: true, staleSubmissions: 0, currentSubmissions: 1 };
+      const arrowPages = [];
+      for (const [direction, path] of [['previous', '/posts/first'], ['next', '/posts/second'], ['previous', '/posts/first']]) {
+        await clickButton(direction + '-post');
+        await waitFor(() => flyShown(), 1500, 'Butterfly did not follow the ' + direction + ' post.');
+        await clickButton('fly');
+        const observed = await waitFor(async () => {
+          const { lookedUp } = await evaluate('Check the post opened by the arrow', '__recycled');
+          return lookedUp.length > arrowPages.length + 2 ? lookedUp.at(-1).page : null;
+        }, 3000, 'The arrow left the picker unavailable.');
+        assert.equal(observed, path);
+        assert.equal((await identity())[1], beforeRecycle[1]);
+        arrowPages.push(observed);
+      }
+      recycledPlayer = { unchangedDocumentUrl: true, unchangedCurrentSrc: true, staleSubmissions: 0, currentSubmissions: 1, arrowPages };
+
+      await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/scroll-feed' }, tab);
+      await waitFor(() => playerBounds('post-1'), 3000, 'The scroll feed did not load.');
+      for (const post of [1, 33, 65, 33, 1, 65]) {
+        const started = Date.now();
+        await browser.send('Runtime.evaluate', {
+          expression: `document.getElementById('post-${post}').scrollIntoView({block:'start'})`
+        }, tab);
+        await waitFor(async () => {
+          const player = await playerBounds('post-' + post);
+          const fly = await findButterfly();
+          if (!player || !fly?.shown) return false;
+          const { model } = await browser.send('DOM.getBoxModel', { nodeId: fly.nodeId }, tab);
+          const x = (model.border[0] + model.border[4]) / 2, y = (model.border[1] + model.border[5]) / 2;
+          return Math.abs(x - (player.right - 32)) < 56 && Math.abs(y - player.top) < 64;
+        }, 1500, 'Butterfly did not follow the visible post after scrolling to ' + post);
+        scrollHandoffs.push({ post, elapsedMs: Date.now() - started });
+      }
+      for (const kind of ['declarative-open', 'declarative-closed', 'dynamic-open', 'dynamic-closed']) {
+        await browser.send('Page.navigate', { url: 'http://127.0.0.1:' + port + '/shadow-player?' + kind }, tab);
+        if (kind.startsWith('dynamic')) {
+          await waitFor(async () => (await browser.send('Runtime.evaluate',
+            { expression: 'typeof addPlayer === "function"', returnByValue: true }, tab)).result.value, 2000, 'Shadow fixture did not load.');
+          await browser.send('Runtime.evaluate', { expression: 'addPlayer()' }, tab);
+        }
+        await waitFor(() => flyShown(), 2000, 'Butterfly did not attach inside the ' + kind + ' shadow tree.');
+        await clickButton('fly');
+        await findButton('primary');
+        shadowPlayers.push(kind);
+      }
     }
     const finalObservations = await evaluate('Read final Chrome events', 'globalThis.__ownershipSmoke');
     process.stdout.write(JSON.stringify({
@@ -964,7 +1064,7 @@ async function main() {
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
-      nativeCapture, captureRace, managedDownloads, recycledPlayer
+      nativeCapture, captureRace, managedDownloads, recycledPlayer, scrollHandoffs, shadowPlayers
     }) + '\n');
   }
   finally {

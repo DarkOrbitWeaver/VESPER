@@ -5,6 +5,8 @@ import vm from 'node:vm';
 
 const source = name => readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8');
 function runContent(context, content = source('content')) {
+  context.requestAnimationFrame ??= () => 1;
+  context.location.origin ??= new URL(context.location.href).origin;
   const storage = context.chrome.storage ??= {};
   const local = storage.local ??= { get: async () => ({}) };
   const get = local.get;
@@ -91,7 +93,7 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
   const player = new Media(), page = 'https://example.test/watch/a';
   const context = vm.createContext({
     HTMLMediaElement: Media, HTMLVideoElement: Media, video: player,
-    alive: () => true, observed: new Set([player]), nativeAudioPlayer: () => false,
+    alive: () => true, observed: new Set([player]), nearby: new Set([player]), announceVideoElement() {},
     mediaLedger: { playback() {} }, evidenceKey: () => 'player-1',
     location: { origin: 'https://example.test' }, VesperPlayerSource: { identity: v => v },
     cardPage: () => null, pageForPlayer: () => page, pageAddress: () => page, playback: new Map(),
@@ -235,7 +237,7 @@ test('subtitle embedding stays opt-in and travels with the native media selectio
 
 test('ended media stays bound to its player and selected range notice explains what is fetched', () => {
   const content = source('content');
-  assert.match(content, /document\.addEventListener\('ended'/);
+  assert.match(content, /if \(type === 'ended'\) rememberEndedPlayer\(player\)/);
   assert.match(content, /pageIdentity === VesperPlayerSource\.identity\(pageForPlayer\(el\)\)/);
   assert.match(content, /playerHasMedia: current &&/);
   assert.match(content, /newPlayerPlaying/);
@@ -509,7 +511,7 @@ test('opening the picker pins the chosen feed player despite a larger autoplayin
     video = selected;
     host = overlay;
     panelMedia = { player: selected };
-    observed.add(selected); observed.add(neighbour);
+    nearby.add(selected); nearby.add(neighbour);
     const calls = [];
     place = () => calls.push('place');
     attach = player => calls.push(player);
@@ -661,6 +663,7 @@ test('Pause keeps browser copies running and page departure still stops them', a
 test('a feed player uses the unique page linked from its card', async () => {
   class FakeElement {
     parentElement = null;
+    contains(node) { return node === this || node.parentElement === this; }
     querySelectorAll() { return []; }
   }
 
@@ -715,12 +718,13 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
 
   const window = Object.assign(new EventTarget(), { navigation: new EventTarget() });
   const location = { href: 'https://www.instagram.com/' };
-  const videos = [];
-  const document = Object.assign(new EventTarget(), { querySelectorAll: () => videos });
+  const frames = [];
+  const document = Object.assign(new EventTarget(), { querySelectorAll: () => { throw Error('unexpected document scan'); } });
   const context = vm.createContext({
     window, document, location, URL, AbortController, innerWidth: 1200, innerHeight: 800,
     Element: Video, HTMLMediaElement: Video, HTMLVideoElement: Video,
     getComputedStyle: () => ({ visibility: 'visible' }),
+    requestAnimationFrame: callback => frames.push(callback),
     setTimeout: () => 1, clearTimeout() {},
     ResizeObserver: class {},
     IntersectionObserver: class { observe() {} },
@@ -728,14 +732,18 @@ test('an in-page navigation finds an already loaded reel without waiting for pla
     chrome: { runtime: { id: 'vesper-test', onMessage: { addListener() {} } } }
   });
   vm.runInContext(source('player-source'), context);
-  const content = source('content').replace(/\}\)\(\);\s*$/, `attach = el => { window.testPlayer = el; };\n})();`);
+  const content = source('content').replace(/\}\)\(\);\s*$/, `
+  attach = el => { window.testPlayer = el; };
+  window.observeReel = el => { observed.add(el); nearby.add(el); };
+  \n})();`);
   runContent(context, content);
 
   const reel = new Video();
   await new Promise(resolve => setImmediate(resolve));
-  videos.push(reel);
+  window.observeReel(reel);
   location.href = 'https://www.instagram.com/reels/';
   window.navigation.dispatchEvent(new Event('currententrychange'));
+  frames.shift()();
 
   assert.equal(window.testPlayer, reel);
 });
@@ -744,10 +752,12 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   class FakeElement {
     parentElement = null;
     isConnected = true;
+    contains(node) { return node === this || node.parentElement === this; }
     querySelectorAll() { return []; }
     getBoundingClientRect() { return { left: 0, top: 0, right: 480, bottom: 270, width: 480, height: 270 }; }
   }
   class FakeVideo extends FakeElement {
+    tagName = 'VIDEO';
     currentSrc = 'https://www.youtube.com/videoplayback?id=preview';
     src = this.currentSrc;
     readyState = 1;
@@ -917,7 +927,7 @@ test('a delayed hover preview keeps its linked page after the player is reset', 
   window.__testContent.refreshPlayer(unrelatedVideo);
   window.__testContent.setPanelForTest(unrelatedVideo);
   window.__testContent.setRetainedPickerDraft({ targetKey: 'test' });
-  emptiedHandler({ target: unrelatedVideo });
+  emptiedHandler({ type: 'emptied', target: unrelatedVideo });
   assert.equal(window.__testContent.panelOpenForTest(), false,
     'emptying the active player closes its pending picker request');
   assert.equal(window.__testContent.retainedDraftForTest(), null);
@@ -927,10 +937,12 @@ test('a butterfly left behind by an ended hover preview never leaves from under 
   class FakeElement {
     parentElement = null;
     isConnected = true;
+    contains(node) { return node === this || node.parentElement === this; }
     querySelectorAll() { return []; }
     getBoundingClientRect() { return { left: 0, top: 0, right: 480, bottom: 270, width: 480, height: 270 }; }
   }
   class FakeVideo extends FakeElement {
+    tagName = 'VIDEO';
     currentSrc = 'https://www.youtube.com/videoplayback?id=preview';
     src = this.currentSrc;
     readyState = 1;
@@ -1021,51 +1033,35 @@ test('a pointer still heading for the butterfly gets extra time, with a limit', 
   assert.match(source('content'), /\(previewLatched\(\) \|\| approaching\) && Date\.now\(\) - previewRemovedAt < PREVIEW_MAX_LATCH/);
 });
 
-test('feed DOM discovery coalesces inserted players and recovers a removed overlay', () => {
+test('feed DOM discovery queues only added subtrees and marks removed players for pruning', () => {
   const content = source('content');
   const start = content.indexOf('  function mediaTreeChanged(');
-  const end = content.indexOf('  function refreshPlayers(', start);
-  let passes = 0;
-  const frames = [];
-  const context = vm.createContext({ alive: () => true, host: null, observed: new Set(), discoveryFrame: 0,
-    requestAnimationFrame: callback => (frames.push(callback), frames.length),
-    refreshPlayers: () => passes++ });
+  const end = content.indexOf('  function touchesCurrentCard(', start);
+  const context = vm.createContext({ alive: () => true, host: null, HTMLMediaElement: class {},
+    discoveryNodes: new Set(), prunePlayers: false, refreshAfterDiscovery: false,
+    touchesCurrentCard: () => false, scheduleDiscovery() {} });
   const changed = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
-  const unrelated = {nodeType: 1, matches: () => false, querySelector: () => null};
-  const media = {nodeType: 1, matches: () => true};
-  changed([{type:'childList', addedNodes:[unrelated]}]);
-  assert.equal(frames.length, 0);
-  changed([{type:'childList', addedNodes:[media]}]);
-  changed([{type:'attributes', target:media}]);
-  assert.equal(frames.length, 1);
-  frames[0]();
-  assert.equal(passes, 1);
-  context.host = {isConnected:false};
-  changed([{type:'childList', addedNodes:[]}]);
-  assert.equal(frames.length, 2);
-  frames[1]();
-  assert.equal(passes, 2);
-  context.host = null;
-  context.observed.add({isConnected:false});
-  changed([{type:'childList', addedNodes:[]}]);
-  assert.equal(frames.length, 3);
+  const target = {};
+  const added = { nodeType: 1 };
+  const removed = { nodeType: 1 };
+  changed([{ type: 'childList', target, addedNodes: [added], removedNodes: [removed] }]);
+  changed([{ type: 'childList', target, addedNodes: [added], removedNodes: [] }]);
+  assert.deepEqual([...context.discoveryNodes], [added]);
+  assert.equal(context.prunePlayers, true);
+  assert.equal(context.refreshAfterDiscovery, false);
 });
 
 test('scroll re-ranks a competing visible feed player instead of merely moving the old overlay', () => {
   const content = source('content');
   const start = content.indexOf('  function schedule()');
   const end = content.indexOf('  function stopFullscreenIdle(', start);
-  let ranked = 0, placed = 0, callback;
-  const player = {};
-  const context = vm.createContext({ alive: () => true, frame:0, manualPlayer:null, video:player,
-    observed: new Set([player, {}]), visiblePlayer: () => ({}),
-    place: () => placed++, selectPlayer: () => ranked++, requestAnimationFrame: fn => (callback=fn,1) });
+  let ranked = 0, callback;
+  const context = vm.createContext({ alive: () => true, frame:0, layout: null,
+    selectPlayer: continuous => { assert.equal(continuous, true); ranked++; },
+    requestAnimationFrame: fn => (callback=fn,1) });
   const schedule = vm.runInContext(content.slice(start,end)+'\nschedule;', context);
-  schedule(); callback();
-  assert.equal(ranked,1); assert.equal(placed,0);
-  context.observed = new Set([player]);
-  schedule(); callback();
-  assert.equal(placed,1);
+  schedule(); schedule(); callback();
+  assert.equal(ranked,1);
 });
 
 test('a feed player can become visible before its intersection notification arrives', () => {
@@ -1127,46 +1123,28 @@ test('prefetch and picker share exact-post metadata and never borrow a social fe
   assert.equal(title(player,page,true),'Outer quoted post');
 });
 
-test('mediaTreeChanged refreshes players when a recycled container swaps post links', () => {
+test('changes within a recycled card refresh its binding without scanning the document', () => {
   const content = source('content');
   const start = content.indexOf('  function mediaTreeChanged(');
-  const end = content.indexOf('  function refreshPlayers(', start);
-  const video = { isConnected: true, matches: () => true };
-  const container = { nodeType: 1, matches: () => false, querySelector: () => null, contains: el => el === video };
-  const link = { nodeType: 1, matches: () => false, querySelector: () => null };
-  let scheduled = 0;
+  const end = content.indexOf('  function discoverShadow(', start);
+  const video = { isConnected: true };
+  const article = { matches: () => true, contains: node => node.parentElement === article };
+  const anchor = { tagName: 'A', parentElement: article, nodeType: 1 };
+  video.parentElement = article;
   const context = vm.createContext({
-    alive: () => true,
-    discoveryFrame: 0,
-    host: null,
-    observed: new Set([video]),
-    audioControls: new WeakMap(),
-    requestAnimationFrame: fn => (scheduled++, 1),
-    refreshPlayers: () => {}
+    alive: () => true, video, host: null, document: {}, HTMLMediaElement: class {},
+    discoveryNodes: new Set(), refreshAfterDiscovery: false, prunePlayers: false,
+    composedParent: node => node.parentElement, containsPlayer: (node, player) => node.contains?.(player),
+    scheduleDiscovery() {}
   });
   const mediaTreeChanged = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
-  mediaTreeChanged([{ type: 'childList', target: container, addedNodes: [link] }]);
-  assert.equal(scheduled, 1);
-});
-
-test('mediaTreeChanged refreshes when an observed card updates an anchor href', () => {
-  const content = source('content');
-  const start = content.indexOf('  function mediaTreeChanged(');
-  const end = content.indexOf('  function refreshPlayers(', start);
-  const video = { isConnected: true, matches: () => true };
-  const article = { nodeType: 1, contains: el => el === video };
-  const anchor = { tagName: 'A', parentElement: article };
-  let scheduled = 0;
-  const context = vm.createContext({
-    alive: () => true,
-    discoveryFrame: 0,
-    host: null,
-    observed: new Set([video]),
-    audioControls: new WeakMap(),
-    requestAnimationFrame: fn => (scheduled++, 1),
-    refreshPlayers: () => {}
-  });
-  const mediaTreeChanged = vm.runInContext(content.slice(start, end) + '\nmediaTreeChanged;', context);
+  mediaTreeChanged([{ type: 'attributes', attributeName: 'href', target: { tagName: 'A' } }]);
+  assert.equal(context.refreshAfterDiscovery, false);
   mediaTreeChanged([{ type: 'attributes', attributeName: 'href', target: anchor }]);
-  assert.equal(scheduled, 1);
+  assert.equal(context.refreshAfterDiscovery, true);
+  assert.equal(context.discoveryNodes.size, 0);
+  context.refreshAfterDiscovery = false;
+  mediaTreeChanged([{ type: 'childList', target: article, addedNodes: [anchor], removedNodes: [anchor] }]);
+  assert.equal(context.refreshAfterDiscovery, true);
+  assert.deepEqual([...context.discoveryNodes], [anchor]);
 });

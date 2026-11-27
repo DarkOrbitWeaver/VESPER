@@ -63,13 +63,13 @@ globalThis.VesperCompanion = (() => {
       if (previous?.x === x && previous.y === y && previous.faceLeft === faceLeft && previous.fullscreen === fullscreen) return;
       this.perch = { x, y, faceLeft, fullscreen };
       if (immediate || !previous || !this.visible || !this.ready || this.still) return this.resetPose();
-      if (continuous && !this.flight && !this.walk) {
+      if (continuous) {
+        if (this.flight || this.walk) return this.resetPose();
         this.position(this.x + (x - previous.x), this.y + (y - previous.y));
         return;
       }
       clearTimeout(this.retargetTimer);
       const transition = previous.fullscreen === fullscreen ? undefined : fullscreen ? 'fullscreen_arrive' : 'fullscreen_depart';
-      // Let rapid scroll and reel changes settle before selecting a new landing point.
       this.retargetTimer = setTimeout(() => {
         this.retargetTimer = 0;
         this.moveToPerch(transition);

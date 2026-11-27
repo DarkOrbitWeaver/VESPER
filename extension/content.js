@@ -78,25 +78,34 @@
   const prefetchRetried = new WeakMap();
   let generation = 0;
   const observed = new Set();
-  let discoveryObserver = null, discoveryFrame = 0, scrollScanTimer = 0;
+  const nearby = new Set();
+  const discoveryNodes = new Set();
+  let discoveryObserver = null, discoveryFrame = 0, discoveryWalker = null, refreshAfterDiscovery = false, prunePlayers = false;
   const discoveryOptions = { childList: true, subtree: true, attributes: true,
-    attributeFilter: ['src', 'href', 'controls', 'id', 'data-permalink', 'data-vesper-shadow-host'] };
+    attributeFilter: ['src', 'href', 'controls', 'poster', 'id', 'data-permalink', 'data-vesper-shadow-host'] };
   const observedRoots = new WeakSet();
   const intersecting = new WeakMap();
   const resize = new ResizeObserver(schedule);
+  const layout = typeof MutationObserver === 'function' ? new MutationObserver(schedule) : null;
+  let watchLayoutAgain = true;
   const visibility = new IntersectionObserver((entries) => {
     if (!alive()) return;
     for (const entry of entries) {
       if (!entry.target.isConnected) {
         visibility.unobserve(entry.target);
         observed.delete(entry.target);
+        nearby.delete(entry.target);
       } else {
         intersecting.set(entry.target, entry.isIntersecting);
-        if (entry.isIntersecting) consider(entry.target);
+        if (entry.isIntersecting) {
+          nearby.add(entry.target);
+          consider(entry.target);
+        } else nearby.delete(entry.target);
       }
     }
-    selectPlayer();
-  }, { threshold: [0, 0.1, 0.25, 0.5, 0.75, 1] });
+    watchLayoutAgain = true;
+    schedule();
+  }, { rootMargin: '160px', threshold: 0 });
 
   function retire() {
     if (signal.aborted) return;
@@ -104,14 +113,16 @@
     activeBrowserCopy?.controller.abort();
     generatedCopy?.controller.abort();
     visibility.disconnect();
+    layout?.disconnect();
     discoveryObserver?.disconnect();
     if (discoveryFrame) cancelAnimationFrame(discoveryFrame);
     discoveryFrame = 0;
-    clearTimeout(scrollScanTimer);
-    scrollScanTimer = 0;
+    discoveryNodes.clear();
+    discoveryWalker = null;
     resourceObserver?.disconnect();
     resourceObserver = null;
     observed.clear();
+    nearby.clear();
     unwatchMotion?.();
     retainedPickerDraft = null;
     // An extension reload can invalidate storage before page listeners are removed.
@@ -152,9 +163,10 @@
     mediaChangedAt = Date.now();
     endedPlayer = null;
     clearTimeout(endedPlayerTimer);
-    // SPA navigation can leave an intentionally pinned floating player alive.
-    if (!manualPlayer?.isConnected) { manualPlayer = null; movedPerch = null; }
+    manualPlayer = null;
+    movedPerch = null;
     activePreview = null;
+    playerInteraction = null;
     pointerTarget = null;
     if (panelMedia || receiptTimer) closePanel();
     if (video && !video.isConnected) detach();
@@ -167,7 +179,7 @@
   }
 
   function hasOtherPlayer(player) {
-    for (const other of observed) {
+    for (const other of nearby) {
       if (other !== player && visiblePlayer(other) && !advertisementContext(other)) return true;
     }
     return false;
@@ -246,7 +258,7 @@
     // Unlike getBoundingClientRect, this detects opacity and content visibility
     // inherited through containers (including virtualized feed cards).
     if (typeof el.checkVisibility === 'function')
-      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true });
     const style = getComputedStyle(el);
     if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
     return !hiddenPlayerContainer(el);
@@ -329,16 +341,16 @@
 
   function cardContext(node, includePlayer) {
     if (!(node instanceof Element)) return null;
-    const origin = new URL(pageAddress()).origin;
-    for (let card = node, depth = 0; card && depth < 16 && card !== document.body; card = card.parentElement, depth++) {
-      const allVideos = queryMediaIn(card, 'video');
-      // Ended-player visibility also looks up the card. Use geometry here to avoid a recursive lookup.
-      const visibleVideos = allVideos.filter(el => clippedPlayerRect(el.getBoundingClientRect()) && renderedPlayerBox(el));
+    const origin = location.origin;
+    const candidates = [...nearby].filter(el => el.tagName === 'VIDEO' && el.isConnected
+      && clippedPlayerRect(el.getBoundingClientRect()) && renderedPlayerBox(el));
+    for (let card = node, depth = 0; card && depth < 12 && card !== document.body; card = composedParent(card), depth++) {
+      const visibleVideos = candidates.filter(el => containsPlayer(card, el));
       // Allow carousels (Instagram/X/feeds) that pre-mount offscreen slide <video> elements inside one post card;
       // stop climbing only when multiple distinct cards' visible players share a feed wrapper.
       if (visibleVideos.length > 1 && card.tagName !== 'ARTICLE') break;
-      const videos = includePlayer ? visibleVideos.filter(el => observed.has(el)) : [];
-      if (includePlayer && !videos.length) continue;
+      if (includePlayer && !visibleVideos.length) continue;
+      if (!includePlayer && visibleVideos.length && !visibleVideos.includes(node)) break;
       const links = [...card.querySelectorAll('a[href]')].slice(0, 32).map(link => ({ href: link.href,
         permalink: !!(link.querySelector?.('time[datetime]') || link.hasAttribute?.('data-permalink')) }));
       try {
@@ -347,11 +359,11 @@
       } catch { /* A malformed permalink attribute names nothing. */ }
       const page = VesperPlayerSource.cardPage(links, origin);
       if (!page) continue;
-      videos.sort((a, b) => {
+      visibleVideos.sort((a, b) => {
         const area = el => { const r = el.getBoundingClientRect(); return r.width * r.height * (el.paused ? 1 : 1.15); };
         return area(b) - area(a);
       });
-      return { page, player: videos[0] };
+      return { page, player: visibleVideos[0] };
     }
     return null;
   }
@@ -390,32 +402,37 @@
   }
 
   function refreshPlayer(el) {
-    if (!observed.has(el)) return;
-    refreshHoveredPreview(el);
-    selectPlayer();
+    if (!nearby.has(el) && el !== video) return;
+    if (el === video || pointerTarget) refreshHoveredPreview(el);
+    schedule();
   }
 
-  function queryMediaIn(rootNode, selector = 'video,audio[controls]') {
-    const found = [];
-    const seenNodes = new Set();
-    function scan(scope, depth) {
-      if (!scope || depth > 5) return;
-      try {
-        for (const el of scope.querySelectorAll(selector)) {
-          if (!seenNodes.has(el)) { seenNodes.add(el); found.push(el); }
-        }
-        for (const hostEl of scope.querySelectorAll('[data-vesper-shadow-host]')) {
-          if (!hostEl.shadowRoot) continue;
-          if (discoveryObserver && !observedRoots.has(hostEl.shadowRoot)) {
-            discoveryObserver.observe(hostEl.shadowRoot, discoveryOptions);
-            observedRoots.add(hostEl.shadowRoot);
-          }
-          scan(hostEl.shadowRoot, depth + 1);
-        }
-      } catch {}
+  function composedParent(node) {
+    return node.parentElement || node.getRootNode?.().host || null;
+  }
+
+  function containsPlayer(container, player) {
+    for (let node = player; node; node = node.getRootNode?.().host) {
+      if (container === node || container.contains?.(node)) return true;
     }
-    scan(rootNode, 0);
-    return found;
+    return false;
+  }
+
+  function shadowRoot(node) {
+    if (!node?.localName || node === host) return null;
+    // Skip elements that cannot host a page shadow tree, including native media controls.
+    if (!node.localName.includes('-') && !/^(?:address|article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/.test(node.localName)) return null;
+    return node.shadowRoot || chrome.dom?.openOrClosedShadowRoot?.(node) || null;
+  }
+
+  function fullscreenTarget() {
+    let target = document.fullscreenElement;
+    while (target) {
+      const inner = shadowRoot(target)?.fullscreenElement;
+      if (!inner || inner === target) break;
+      target = inner;
+    }
+    return target;
   }
 
   function inspectPlayerWitnessAttributes(el) {
@@ -446,7 +463,18 @@
 
   function pageForPlayer(el) {
     const contextPage = cardPage(el) || (activePreview?.player === el ? activePreview.page : pageAddress());
-    return activeYouTubePage(el, contextPage) || activeTikTokPage(el, contextPage) || contextPage;
+    return activeYouTubePage(el, contextPage) || activeTikTokPage(el, contextPage) || instagramSlide(contextPage);
+  }
+
+  function instagramSlide(contextPage) {
+    if (!/(?:^|\.)instagram\.com$/i.test(location.hostname || '')) return contextPage;
+    const page = new URL(pageAddress());
+    if (!/^[1-9]\d{0,3}$/.test(page.searchParams.get('img_index') || '')) return contextPage;
+    const selected = VesperPlayerSource.identity(page.href);
+    page.searchParams.delete('img_index');
+    const post = VesperPlayerSource.identity(page.href);
+    if (!post?.startsWith('instagram:') || post !== VesperPlayerSource.identity(contextPage)) return contextPage;
+    return selected === post ? contextPage : pageAddress();
   }
 
   function titleForPlayer(player, targetPage, useDocumentTitle) {
@@ -485,43 +513,46 @@
     if (!certain) cancelPrefetch();
   }
 
-  function selectPlayer() {
+  function selectPlayer(continuous = false) {
     if (!alive()) return;
     if (butterflyHidden()) {
-      if (panelMedia && (contextPicker || activeBrowserCopy?.player === panelMedia.player)) place();
+      if (panelMedia && (contextPicker || activeBrowserCopy?.player === panelMedia.player)) place(continuous);
       else if (host) detach(true);
       return;
     }
-    if (drag && (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))) { place(true); return; }
+    if (drag?.player === video && video?.isConnected) {
+      if (visiblePlayer(video, 110, 70)) place(true);
+      return;
+    }
     // Opening the picker is an explicit selection. Do not switch to a
     // larger or newly autoplaying neighbour until the picker closes.
     // Source-generation and navigation handlers still invalidate stale media.
     if (panelMedia && video === panelMedia.player) {
-      place();
+      place(continuous);
       if (panelMedia) return;
     }
     if (holdMissingPreview()) { place(); return; }
-    const fullscreen = document.fullscreenElement;
+    const fullscreen = fullscreenTarget();
     if (manualPlayer && (!manualPlayer.isConnected || !visiblePlayer(manualPlayer, 110, 70)
-        && [...observed].some(el => el !== manualPlayer && visiblePlayer(el)))) {
+        && [...nearby].some(el => el !== manualPlayer && visiblePlayer(el)))) {
       manualPlayer = null;
       movedPerch = null;
     }
-    if (manualPlayer && (!fullscreen || fullscreen.contains(manualPlayer))) {
+    if (manualPlayer && (!fullscreen || containsPlayer(fullscreen, manualPlayer))) {
       setIntentCertainty(true);
-      if (video !== manualPlayer) attach(manualPlayer);
-      else place();
+      if (video !== manualPlayer) attach(manualPlayer, continuous);
+      else place(continuous);
       return;
     }
     let best = null;
-    if (activePreview && (!fullscreen || fullscreen.contains(activePreview.player))
+    if (activePreview && (!fullscreen || containsPlayer(fullscreen, activePreview.player))
         && visiblePlayer(activePreview.player)) best = activePreview.player;
     if (!best && isCurrentEndedPlayer(endedPlayer?.player)
-        && (!fullscreen || fullscreen.contains(endedPlayer.player))) {
-      const newPlayerPlaying = [...observed].some(el => el !== endedPlayer.player && !el.paused && !el.ended
-        && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el));
-      const videoAvailable = endedPlayer.player.tagName === 'AUDIO' && [...observed].some(el =>
-        el.tagName === 'VIDEO' && (!fullscreen || fullscreen.contains(el)) && visiblePlayer(el) && !advertisementContext(el));
+        && (!fullscreen || containsPlayer(fullscreen, endedPlayer.player))) {
+      const newPlayerPlaying = [...nearby].some(el => el !== endedPlayer.player && !el.paused && !el.ended
+        && (!fullscreen || containsPlayer(fullscreen, el)) && visiblePlayer(el));
+      const videoAvailable = endedPlayer.player.tagName === 'AUDIO' && [...nearby].some(el =>
+        el.tagName === 'VIDEO' && (!fullscreen || containsPlayer(fullscreen, el)) && visiblePlayer(el) && !advertisementContext(el));
       if (!newPlayerPlaying && !videoAvailable && visiblePlayer(endedPlayer.player)) best = endedPlayer.player;
     }
     const previouslyCertain = intentCertain;
@@ -529,8 +560,8 @@
     else {
       const candidates = [], players = new Map();
       const now = Date.now();
-      for (const el of observed) {
-        if (fullscreen && !fullscreen.contains(el)) continue;
+      for (const el of nearby) {
+        if (fullscreen && !containsPlayer(fullscreen, el)) continue;
         const r = visiblePlayer(el);
         if (!r) continue;
         const area = (r.right - r.left) * (r.bottom - r.top);
@@ -568,11 +599,11 @@
     }
     if (best) {
       const same = best === video;
-      attach(best);
+      attach(best, continuous);
       if (same && !previouslyCertain && intentCertain) schedulePrefetch(best);
     }
     else if (video && !video.isConnected) detach();
-    else if (video) place();
+    else if (video) place(continuous);
   }
 
   // Lets the background briefly watch this tab for manifests named only by Content-Type.
@@ -630,8 +661,8 @@
     if (resourceObserver || typeof PerformanceObserver === 'undefined') return;
     try {
       resourceObserver = new PerformanceObserver(list => {
-        if (!observed.size || !alive()) return;
-        const players = [...observed].filter(el => el.isConnected && (el.readyState >= 1 || !el.paused));
+        if (!nearby.size || !alive()) return;
+        const players = [...nearby].filter(el => el.isConnected && (el.readyState >= 1 || !el.paused));
         for (const entry of list.getEntries().slice(-24)) {
           if (entry.entryType !== 'resource'
               || !['fetch', 'xmlhttprequest', 'video', 'audio', 'other'].includes(entry.initiatorType)) continue;
@@ -675,14 +706,18 @@
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
     const src = el.currentSrc || el.src || '';
-    const page = pageForPlayer(el);
     if (!observed.has(el) && (el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el)) &&
         (src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]')
-          || el instanceof HTMLVideoElement && (el.poster || page !== pageAddress()))) {
+          || el instanceof HTMLVideoElement && el.poster)) {
       observed.add(el);
       if (playerAnchor(el) === el) visibility.observe(el);
-      announceVideoElement();
+      else nearby.add(el);
+      if (visiblePlayer(el)) nearby.add(el);
+      watchLayoutAgain = true;
     }
+    if (!nearby.has(el) && el !== video) return;
+    announceVideoElement();
+    const page = pageForPlayer(el);
     mediaLedger.playback({ key: evidenceKey(el), scope: location.origin, pageUrl: page,
       mediaUrl: src, stableId: VesperPlayerSource.identity(page) || '', duration: el.duration });
     const previous = playback.get(el) || (isCurrentEndedPlayer(el) ? endedPlayer.binding : null);
@@ -723,39 +758,118 @@
   }
 
   function mediaTreeChanged(records) {
-    if (!alive() || discoveryFrame) return;
-    const selector = 'video,audio[controls],source,[data-vesper-shadow-host]';
-    const relevant = (node) => node?.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector));
-    // Feed virtualization can insert a ready, paused player or swap post
-    // links inside a recycled card without firing a new media event.
-    const touchesObserved = target => target?.nodeType === 1 && [...observed].some(el => target.contains?.(el));
-    const linkInObservedCard = target => {
-      if (target?.tagName !== 'A') return false;
-      for (let parent = target.parentElement, depth = 0; parent && depth < 10; parent = parent.parentElement, depth++)
-        if (touchesObserved(parent)) return true;
-      return false;
-    };
-    if (host && !host.isConnected || [...observed].some(el => !el.isConnected || audioControls.get(el)?.isConnected === false)
-        || records.some(record => record.type === 'attributes'
-          ? (record.attributeName === 'href' ? linkInObservedCard(record.target) : relevant(record.target) || touchesObserved(record.target))
-          : [...record.addedNodes].some(node => relevant(node) || node?.tagName === 'A' && touchesObserved(record.target))
-              || relevant(record.target) || touchesObserved(record.target))) {
-      discoveryFrame = requestAnimationFrame(() => {
-        discoveryFrame = 0;
-        refreshPlayers();
-      });
+    if (!alive()) return;
+    for (const { type, target, attributeName, addedNodes, removedNodes } of records) {
+      if (target === host) continue;
+      if (type === 'attributes') {
+        if (attributeName === 'data-vesper-shadow-host') {
+          discoverShadow(target);
+        } else if (target instanceof HTMLMediaElement || target.tagName === 'SOURCE') {
+          consider(target.tagName === 'SOURCE' ? target.parentElement : target);
+          schedule();
+        } else if ((attributeName === 'data-permalink' || attributeName === 'id' || target.tagName === 'A')
+            && touchesCurrentCard(target)) {
+          // Post identity can change while the site reuses the same video element and URL.
+          refreshAfterDiscovery = true;
+        }
+        continue;
+      }
+      for (const node of addedNodes) if (node.nodeType === 1 && node !== host) discoveryNodes.add(node);
+      if (Array.from(removedNodes).some(node => node.nodeType === 1)) {
+        prunePlayers = true;
+        if (touchesCurrentCard(target)) refreshAfterDiscovery = true;
+      }
+      if (target instanceof HTMLMediaElement) consider(target);
     }
+    scheduleDiscovery();
+  }
+
+  function touchesCurrentCard(node) {
+    if (!video || node === document.body || node === document.documentElement) return false;
+    if (containsPlayer(node, video)) return true;
+    for (let parent = composedParent(video), depth = 0; parent && parent !== document.body && depth < 6;
+      parent = composedParent(parent), depth++) {
+      if (parent.matches?.('article,[role="article"],[data-permalink]')) return containsPlayer(parent, node);
+    }
+    return false;
+  }
+
+  function discoverShadow(node) {
+    const shadow = shadowRoot(node);
+    if (!shadow || observedRoots.has(shadow)) return;
+    observedRoots.add(shadow);
+    discoveryObserver?.observe(shadow, discoveryOptions);
+    watchMediaEvents(shadow);
+    discoveryNodes.add(shadow);
+  }
+
+  function scheduleDiscovery() {
+    if (discoveryFrame || !(discoveryWalker || discoveryNodes.size || refreshAfterDiscovery || prunePlayers)) return;
+    discoveryFrame = requestAnimationFrame(() => {
+      discoveryFrame = 0;
+      if (!alive()) return;
+      const deadline = performance.now() + 4;
+      let remaining = 384;
+      let playersChanged = false;
+      while (remaining-- > 0 && performance.now() < deadline) {
+        if (!discoveryWalker) {
+          const node = discoveryNodes.values().next().value;
+          if (!node) break;
+          discoveryNodes.delete(node);
+          if (!node.isConnected) continue;
+          discoveryWalker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT);
+          if (node.nodeType !== 1) discoveryWalker.nextNode();
+        }
+        const node = discoveryWalker.currentNode;
+        if (node.isConnected) {
+          if (node instanceof HTMLMediaElement) {
+            consider(node);
+            playersChanged = true;
+          } else if (node.tagName === 'SOURCE') {
+            consider(node.parentElement);
+            playersChanged = true;
+          } else if (node.tagName === 'A' && touchesCurrentCard(node)) {
+            refreshAfterDiscovery = true;
+          }
+          discoverShadow(node);
+        }
+        if (!node.isConnected || !discoveryWalker.nextNode()) discoveryWalker = null;
+      }
+      if (prunePlayers) {
+        prunePlayers = false;
+        playersChanged = pruneObservedPlayers() || playersChanged || Boolean(host && !host.isConnected);
+      }
+      if (refreshAfterDiscovery) {
+        refreshAfterDiscovery = false;
+        if (video?.isConnected) consider(video);
+        if (panelMedia) isCurrentRequest(panelRequest);
+        playersChanged = true;
+      }
+      if (playersChanged) schedule();
+      scheduleDiscovery();
+    });
+  }
+
+  function pruneObservedPlayers() {
+    let changed = false;
+    for (const el of observed) {
+      if (el.isConnected && playerAnchor(el)) continue;
+      visibility.unobserve(el);
+      observed.delete(el);
+      nearby.delete(el);
+      watchLayoutAgain = true;
+      changed = true;
+    }
+    return changed;
   }
 
   function refreshPlayers() {
     if (!alive()) return;
     syncPage();
-    if (butterflyHidden()) { selectPlayer(); return; }
-    for (const el of observed) {
-      if (!el.isConnected || !playerAnchor(el)) { visibility.unobserve(el); observed.delete(el); }
-    }
-    queryMediaIn(document).forEach(consider);
-    selectPlayer();
+    pruneObservedPlayers();
+    for (const el of nearby) consider(el);
+    if (panelMedia) isCurrentRequest(panelRequest);
+    schedule();
   }
 
   function cancelPrefetch() {
@@ -811,88 +925,90 @@
     });
   }
 
-  // Capture-phase listeners on document: media events do not bubble, but they can be captured. One-time cost.
-  for (const type of ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'durationchange']) document.addEventListener(type, (e) => {
-    if (type === 'playing') {
+  // Most media events stay inside their shadow tree.
+  function watchMediaEvents(target) {
+    for (const type of ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'durationchange', 'pause',
+      'seeking', 'ended', 'emptied', 'loadstart', 'encrypted']) {
+      target.addEventListener(type, onMediaEvent, { capture: true, passive: true, signal });
+    }
+  }
+
+  function onMediaEvent({ type, target: player }) {
+    if (!alive() || !(player instanceof HTMLMediaElement)) return;
+    if (type === 'seeking') {
+      if (player === video) announceVideoElement();
+      return;
+    }
+    if (type === 'encrypted') {
+      protectedVideos.add(player);
+      if (player === video) closePanel();
+      consider(player);
+      return;
+    }
+    if (type === 'emptied' || type === 'loadstart') {
+      resetPlayerSource(player, type);
+      return;
+    }
+    if (type === 'ended') rememberEndedPlayer(player);
+    if (type === 'playing' && player === video) {
       endedPlayer = null;
       clearTimeout(endedPlayerTimer);
     }
-    consider(e.target);
-    refreshPlayer(e.target);
-    if (e.target === video) {
-      announceVideoElement();
-      schedulePrefetch(e.target);
-    }
-  }, { capture: true, passive: true, signal });
-  // Renew on deliberate playback transitions, not a background timer or timeupdate loop.
-  document.addEventListener('seeking', e => {
-    if (alive() && e.target === video) announceVideoElement();
-  }, { capture: true, passive: true, signal });
-  document.addEventListener('ended', e => {
-    if (!alive()) return;
-    rememberEndedPlayer(e.target);
-    consider(e.target);
-    refreshPlayer(e.target);
-  }, { capture: true, passive: true, signal });
-  for (const type of ['emptied', 'loadstart']) document.addEventListener(type, (e) => {
-    if (!alive() || !(e.target instanceof HTMLMediaElement)) return;
-    if (type === 'loadstart' && panelMedia?.player === e.target && panelMedia.generation && matchesPickerPlayer(panelMedia)) {
+    consider(player);
+    refreshPlayer(player);
+    if (player === video && type !== 'ended') schedulePrefetch(player);
+  }
+
+  function resetPlayerSource(player, type) {
+    if (type === 'loadstart' && panelMedia?.player === player && panelMedia.generation && matchesPickerPlayer(panelMedia)) {
       announceVideoElement();
       return;
     }
-    if (e.target instanceof HTMLMediaElement) {
-      const page = pageForPlayer(e.target);
-      mediaLedger.playback({ key: evidenceKey(e.target), scope: location.origin,
-        pageUrl: page, mediaUrl: playerSource(e.target),
-        stableId: VesperPlayerSource.identity(page) || '', event: type });
+    protectedVideos.delete(player);
+    if (!nearby.has(player) && player !== video && playback.get(player) === undefined) {
+      if (type === 'loadstart') consider(player);
+      return;
     }
+    const page = pageForPlayer(player);
+    mediaLedger.playback({ key: evidenceKey(player), scope: location.origin,
+      pageUrl: page, mediaUrl: playerSource(player),
+      stableId: VesperPlayerSource.identity(page) || '', event: type });
     if (type === 'loadstart') {
-      protectedVideos.delete(e.target);
-      playback.delete(e.target);
-      if (activePreview?.player === e.target) activePreview = null;
-      if (e.target === video) {
+      playback.delete(player);
+      if (activePreview?.player === player) activePreview = null;
+      if (player === video) {
         mediaChangedAt = Date.now();
         retainedPickerDraft = null;
       }
-      if (panelMedia?.player === e.target) {
+      if (panelMedia?.player === player) {
         retainedPickerDraft = null;
         closePanel();
       }
+      if (endedPlayer?.player === player) {
+        endedPlayer = null;
+        clearTimeout(endedPlayerTimer);
+      }
+      consider(player);
+      refreshPlayer(player);
+    } else if (isCurrentEndedPlayer(player)) {
+      playback.set(player, endedPlayer.binding);
     } else {
-      protectedVideos.delete(e.target);
-      if (isCurrentEndedPlayer(e.target)) {
-        playback.set(e.target, endedPlayer.binding);
-      } else {
-        if (activePreview?.player === e.target && playback.has(e.target))
-          activePreview = { ...activePreview, binding: playback.get(e.target) };
-        playback.delete(e.target);
-        if (panelMedia?.player === e.target) {
-          retainedPickerDraft = null;
-          closePanel();
-        }
+      if (activePreview?.player === player && playback.has(player))
+        activePreview = { ...activePreview, binding: playback.get(player) };
+      playback.delete(player);
+      if (panelMedia?.player === player) {
+        retainedPickerDraft = null;
+        closePanel();
       }
     }
-    if (type === 'loadstart' && endedPlayer?.player === e.target) {
-      endedPlayer = null;
-      clearTimeout(endedPlayerTimer);
-    }
-    if (type === 'loadstart' && e.target instanceof HTMLMediaElement && (playerSource(e.target) || e.target.srcObject)) {
-      consider(e.target);
-      refreshPlayer(e.target);
-    }
-    if (e.target !== video) return;
+    if (player !== video) return;
     if (type === 'emptied') {
       mediaChangedAt = Date.now();
       schedule();
     }
     if (!panelMedia && receiptTimer) closePanel();
-  }, { capture: true, passive: true, signal });
-  document.addEventListener('encrypted', (e) => {
-    if (!alive() || !(e.target instanceof HTMLMediaElement)) return;
-    protectedVideos.add(e.target);
-    if (e.target === video) closePanel();
-    consider(e.target);
-  }, { capture: true, passive: true, signal });
+  }
+  watchMediaEvents(document);
 
   // the butterfly
 
@@ -937,7 +1053,7 @@
   function build(atlasUrl) {
     host = document.createElement('div');
     host.dataset.vesperPlayer = '';
-    host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;top:0;left:0;width:0;height:0;';
+    host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;inset:0 auto auto 0;width:0;height:0;margin:0;padding:0;border:0;overflow:visible;background:none;pointer-events:none;';
     root = host.attachShadow({ mode: 'closed' });
     const style = element('style');
     style.textContent = VesperTheme.css + `
@@ -1079,10 +1195,17 @@
   }
 
   function mount() {
-    const fullscreen = document.fullscreenElement;
-    // A video element in native fullscreen can't render the overlay as a child.
-    const parent = fullscreen && !(fullscreen instanceof HTMLVideoElement) ? fullscreen : document.documentElement;
+    const fullscreen = fullscreenTarget();
+    const nativeVideo = fullscreen instanceof HTMLVideoElement;
+    const parent = fullscreen && !nativeVideo ? fullscreen : document.documentElement;
     if (host.parentElement !== parent) parent.appendChild(host);
+    if (nativeVideo && typeof host.showPopover === 'function') {
+      host.setAttribute('popover', 'manual');
+      // Video is a replaced element. Its children cannot paint over it.
+      if (!host.matches(':popover-open')) host.showPopover();
+    } else if (host.hasAttribute('popover')) {
+      host.removeAttribute('popover');
+    }
   }
   document.addEventListener('fullscreenchange', () => {
     if (!alive()) return;
@@ -1106,14 +1229,15 @@
     button?.focus({ preventScroll: true });
   }, { signal });
 
-  function attach(el) {
+  function attach(el, continuous = false) {
     if (video === el && host) {
       if (host.isConnected === false) mount();
       clearTimeout(previewExitTimer);
       previewExitTimer = previewRemovedAt = 0;
-      place();
+      place(continuous);
       return;
     }
+    const switching = Boolean(video);
     cancelPrefetch();
     if (video && video !== el) retainedPickerDraft = null;
     clearTimeout(previewExitTimer);
@@ -1134,7 +1258,7 @@
       document.addEventListener('pointerleave', clearPointer, { passive: true, signal });
 
     }
-    place();
+    place(continuous, switching);
     schedulePrefetch(el);
   }
 
@@ -1182,10 +1306,10 @@
     return clippedPlayerRect(player.getBoundingClientRect());
   }
 
-  function place(continuous = false) {
+  function place(continuous = false, switching = false) {
     if (!alive()) return;
     if (!video) return detach();
-    const fullscreen = document.fullscreenElement;
+    const fullscreen = fullscreenTarget();
     const held = holdMissingPreview();
     if (held) {
       button.hidden = false;
@@ -1193,9 +1317,11 @@
       if (!perch || !panelMedia || !panel?.classList.contains('show')) return detach();
       button.hidden = true;
     } else {
-      const rect = (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))
+      // An already selected player can keep its perch through the last part of a scroll.
+      const rect = (manualPlayer === video ? visiblePlayer(video, 110, 70)
+        : visiblePlayer(video) || (perch && !switching && visiblePlayer(video, 88, 64)))
         || pickerTransitionRect(video);
-      button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLVideoElement || fullscreen instanceof HTMLIFrameElement || !fullscreen.contains(video));
+      button.hidden = !rect || !!fullscreen && (fullscreen instanceof HTMLIFrameElement || !containsPlayer(fullscreen, video));
       if (button.hidden) {
         fullscreenPlayer = false;
         stopFullscreenIdle();
@@ -1216,7 +1342,7 @@
         closePanel();
         return;
       }
-      companion.setPerch(perch.x, perch.y, perch.faceLeft, fullscreenPlayer, { continuous, immediate: !!drag?.moved });
+      companion.setPerch(perch.x, perch.y, perch.faceLeft, fullscreenPlayer, { continuous, immediate: switching || !!drag?.moved });
     }
     if (!perch) return detach();
     const { x, y, faceLeft } = perch;
@@ -1237,10 +1363,15 @@
   function fillsFullscreen(rect) {
     const fillsWidth = rect.left <= 8 && rect.right >= innerWidth - 8;
     const fillsHeight = rect.top <= 8 && rect.bottom >= innerHeight - 8;
+    if (!fillsWidth || !fillsHeight) return false;
     const display = window.screen;
     // The parent can fullscreen a cross-origin iframe without setting fullscreenElement inside it.
-    return Boolean(fillsWidth && fillsHeight && display && Math.abs(display.width - innerWidth) <= 8
-      && Math.abs(display.height - innerHeight) <= 8);
+    if (display && Math.abs(display.width - innerWidth) <= 8 && Math.abs(display.height - innerHeight) <= 8) return true;
+    if (VesperPlayerSource.isSocialFeedSite(pageAddress())) return false;
+    for (let node = video, depth = 0; node && depth < 6; node = composedParent(node), depth++) {
+      if (getComputedStyle(node).position === 'fixed') return true;
+    }
+    return false;
   }
 
   function playerPerch(rect, fullscreen) {
@@ -1328,10 +1459,10 @@
   function dropTarget(x, y) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
     let closest = null, bestDistance = 68;
-    for (const player of observed) {
+    for (const player of nearby) {
       if (player === video || !player.isConnected) continue;
-      const fullscreen = document.fullscreenElement;
-      if (fullscreen && !fullscreen.contains(player)) continue;
+      const fullscreen = fullscreenTarget();
+      if (fullscreen && !containsPlayer(fullscreen, player)) continue;
       if (player.readyState < 1 && !playerSource(player)) continue;
       const rect = visiblePlayer(player, 110, 70);
       if (!rect) continue;
@@ -1370,11 +1501,24 @@
   function schedule() {
     if (alive() && !frame) frame = requestAnimationFrame(() => {
       frame = 0;
-      // Geometry and focus can change before IntersectionObserver reports
-      // a new threshold. Re-rank competing players even if the old one remains visible.
-      if (observed.size <= 1 && (manualPlayer === video ? visiblePlayer(video, 110, 70) : visiblePlayer(video))) place(true);
-      else selectPlayer();
+      refreshPlayerLayout();
+      selectPlayer(true);
     });
+  }
+
+  function refreshPlayerLayout() {
+    if (!layout || !watchLayoutAgain) return;
+    watchLayoutAgain = false;
+    layout.disconnect();
+    const targets = new Set();
+    const options = { attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'inert'] };
+    for (const player of [...nearby].slice(0, VesperIntelligence.PLAYER_POLICY.limit)) {
+      for (let node = playerAnchor(player), depth = 0; node && depth < 8; node = composedParent(node), depth++) {
+        if (targets.has(node)) break;
+        targets.add(node);
+        layout.observe(node, options);
+      }
+    }
   }
 
   function stopFullscreenIdle() {
@@ -2673,7 +2817,7 @@
     const current = video && (playerSource(video) || activePreview?.binding?.src);
     if (!panel || button?.hidden || current !== url) {
       if (!url) return false;
-      const players = [...document.querySelectorAll('video,audio')]
+      const players = [...new Set([...nearby, ...document.querySelectorAll('video,audio')])]
         .filter(player => playerSource(player) === url && visiblePlayer(player));
       if (players.length !== 1) return false;
       attach(players[0]);
@@ -2709,17 +2853,15 @@
     if (e.persisted) companion?.setVisible(false); else retire();
   }, { signal });
   window.addEventListener('pageshow', refreshPlayers, { signal });
-  // These remain installed when the overlay is temporarily absent. No polling.
-  const geometryChanged = () => {
-    if (observed.size) schedule();
-    if (!scrollScanTimer) scrollScanTimer = setTimeout(() => { scrollScanTimer = 0; refreshPlayers(); }, 120);
-  };
+  // Scroll only repositions/ranks nearby players. Insertions are discovered separately.
+  const geometryChanged = () => { if (nearby.size || video) schedule(); };
   window.addEventListener('scroll', geometryChanged, { passive: true, capture: true, signal });
-  window.addEventListener('scrollend', refreshPlayers, { passive: true, capture: true, signal });
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {
     discoveryObserver = new MutationObserver(mediaTreeChanged);
     discoveryObserver.observe(document.documentElement, discoveryOptions);
+    discoveryNodes.add(document.documentElement);
+    scheduleDiscovery();
   }
   unwatchMotion = VesperTheme.watchPreference('motion', 'animate', value => {
     motionMode = value;
