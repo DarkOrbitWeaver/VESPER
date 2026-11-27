@@ -20,6 +20,8 @@ globalThis.VesperMediaEvidence = (() => {
 
     return {
       durationSeconds: positiveNumber(data.duration, MAX_DURATION_SECONDS),
+      sizeBytes: !best.sizeEstimated && Number.isSafeInteger(best.sizeBytes) && best.sizeBytes > 0
+        ? best.sizeBytes : undefined,
       height,
       live: typeof data.isLive === 'boolean' ? data.isLive : undefined,
       hasAudio,
@@ -104,8 +106,11 @@ globalThis.VesperMediaEvidence = (() => {
   }
 
   function matchesPlayback(player, facts) {
-    if ((player.height || player.kind === 'video') && facts.hasVideo === false) return false;
+    const video = player.height || player.kind === 'video';
+    if (video && facts.hasVideo === false) return false;
     if (player.kind === 'audio' && facts.hasAudio === false) return false;
+    // A header-only response can claim a video MIME type without a playable file.
+    if (video && player.durationSeconds >= 1 && !facts.durationSeconds && facts.sizeBytes < 1024) return false;
     if (!player.durationSeconds || !facts.durationSeconds) return true;
     const tolerance = Math.max(2, player.durationSeconds * 0.08);
     return Math.abs(player.durationSeconds - facts.durationSeconds) <= tolerance;

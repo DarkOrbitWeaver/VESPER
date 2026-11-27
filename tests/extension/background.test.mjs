@@ -2430,6 +2430,24 @@ test('a page lookup cannot offer a two-second preview for a long current player'
   assert.equal(result.code, 'source-changed');
 });
 
+test('an unverified 185-byte MP4 is not offered for a playing video', async () => {
+  const page = 'https://video.example/watch/movie';
+  const url = 'https://cdn.video.example/header.mp4';
+  const sender = { url: page, tab: { id: 37 }, frameId: 0, documentId: 'short-response' };
+  const app = load({ 'media-source-options': { ok: true, data: { choices: [{ index: 0, label: 'MP4', sizeBytes: 185 }] } } });
+  await app.onMedia({ url, tabId: 37, frameId: 0, documentId: sender.documentId, method: 'GET',
+    statusCode: 200, type: 'xmlhttprequest', timeStamp: Date.now(),
+    responseHeaders: responseHeaders({ 'Content-Type': 'video/mp4', 'Content-Length': '185' }) });
+  const reply = await app.message(videoOptionsMessage(page, {
+    playerUrl: 'blob:https://video.example/player', playerHasMedia: true, mediaChangedAt: Date.now(),
+    playerFacts: { durationSeconds: 5.5, kind: 'video' }
+  }), sender);
+  assert.equal(reply.ok, false);
+  assert.equal(reply.data?.sourceChoices, undefined);
+  assert.equal(reply.data?.browserBodyAvailable, undefined);
+  assert.equal(app.sent.filter(request => request.type === 'media-source-options').length, 1);
+});
+
 test('source verification checks at most five exact URLs', async () => {
   const page = 'https://video.example/watch/long-list';
   const sender = { url: page, tab: { id: 38 }, frameId: 0, documentId: 'long-list-doc' };

@@ -1820,7 +1820,7 @@
     if (playerFacts) {
       if (Number.isFinite(player.duration) && player.duration > 0) playerFacts.durationSeconds = player.duration;
       if (Number.isFinite(player.videoHeight) && player.videoHeight > 0) playerFacts.height = player.videoHeight;
-      if (player.tagName === 'AUDIO') playerFacts.kind = 'audio';
+      playerFacts.kind = player.tagName === 'AUDIO' ? 'audio' : 'video';
       if (player.duration === Infinity) playerFacts.live = true;
     }
     if (player.mediaKeys || protectedVideos.has(player))
