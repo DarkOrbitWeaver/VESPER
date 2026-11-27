@@ -1459,7 +1459,7 @@ async function playerOptions(message, sender) {
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
   const playerScope = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
-    mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
+    message.manifestOnPlayer === true, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
   const lookupKey = [playerScope, playbackFingerprints.join(',')].join('|');
   const verificationScope = !auth.authorized && !message.refresh && binding && sender.documentId
     && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
@@ -1484,10 +1484,9 @@ async function playerOptions(message, sender) {
       const evidence = observed(url);
       return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
     };
-    const manifestIsCurrent = evidence => Number.isInteger(message.generation) && message.generation > 0 && changedAt > 0
-      && evidence.seen >= changedAt - 15_000 && evidence.seen <= now + 1000;
-    const matchedManifest = manifest && state.sources.find(source => currentEvidence(source)
-      && source.url === manifest.href && manifestIsCurrent(source));
+    const matchedManifest = manifest && Number.isInteger(message.generation) && message.generation > 0 && changedAt > 0
+      && state.sources.find(item => item.url === manifest.href && ['hls', 'dash'].includes(item.kind)
+        && currentEvidence(item) && (item.seen >= changedAt - 15_000 || !prefetch && message.manifestOnPlayer === true));
     const resourceWitness = new Set((Array.isArray(message.resourceUrls) ? message.resourceUrls : [])
       .slice(0, 12).map(url => VesperIntelligence.http(url)?.href).filter(Boolean));
     const fragments = binding ? (Array.isArray(message.fragmentUrls) ? message.fragmentUrls : []).slice(0, 8)
@@ -1556,12 +1555,13 @@ async function playerOptions(message, sender) {
       return { ok: true, data: { prefetchSkipped: true } };
     const usableSource = source && !isPartialMediaUrl(source) && !matching?.unexpectedRange
       && !observedRange ? source : null;
-    const candidates = [usableSource, matchedManifest && matchedManifest.kind !== 'direct' ? manifest : null]
-      .filter(Boolean).map(url => {
-        const hint = candidate(url);
-        if (mutedLoop && url === source && hint.kind === 'direct') hint.mutedLoop = true;
-        return hint;
-      });
+    const candidates = [];
+    if (usableSource) {
+      const hint = candidate(usableSource);
+      if (mutedLoop && hint.kind === 'direct') hint.mutedLoop = true;
+      candidates.push(hint);
+    }
+    if (matchedManifest) candidates.push({ url: matchedManifest.url, kind: matchedManifest.kind, mimeType: matchedManifest.mime || undefined });
     const wholeRepresentation = usableSource && matching && isWholeDirectSource(matching)
       && /^(?:audio|video)\//.test(matching.mime);
     const title = binding || !youTube ? message.title : undefined;

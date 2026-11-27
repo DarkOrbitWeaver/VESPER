@@ -84,6 +84,7 @@
   const nearby = new Set();
   const discoveryNodes = new Set();
   let discoveryObserver = null, discoveryFrame = 0, discoveryWalker = null, refreshAfterDiscovery = false, prunePlayers = false;
+  let scrolled = false;
   const discoveryOptions = { childList: true, subtree: true, attributes: true,
     attributeFilter: ['src', 'href', 'controls', 'poster', 'id', 'data-permalink', 'data-vesper-shadow-host'] };
   const observedRoots = new WeakSet();
@@ -1619,9 +1620,26 @@
   function schedule() {
     if (alive() && !frame) frame = requestAnimationFrame(() => {
       frame = 0;
+      if (scrolled) {
+        scrolled = false;
+        recoverFeedPlayer();
+      }
       refreshPlayerLayout();
       selectPlayer(true);
     });
+  }
+
+  function recoverFeedPlayer() {
+    if (butterflyHidden() || document.hidden || visiblePlayer(video)) return;
+    if (Array.from(nearby).slice(0, VesperIntelligence.PLAYER_POLICY.limit).some(el => visiblePlayer(el))) return;
+    // A recycled card can become visible without a new intersection or playback event.
+    for (const x of [0.5, 0.7, 0.3]) {
+      const stack = document.elementsFromPoint?.(innerWidth * x, innerHeight / 2) || [];
+      const player = stack.slice(0, 12).find(el => el instanceof HTMLVideoElement && visiblePlayer(el));
+      if (!player) continue;
+      consider(player);
+      if (nearby.has(player)) return;
+    }
   }
 
   function refreshPlayerLayout() {
@@ -1973,10 +1991,10 @@
       return;
     }
     inspectPlayerWitnessAttributes(player);
-    const attachedManifest = player?.getAttribute?.('data-vesper-player-manifest') || '';
+    const attachedManifest = VesperPlayerSource.http(player?.getAttribute?.('data-vesper-player-manifest'));
     const playerWitness = current ? playerFragmentWitness(player, binding) : null;
     const bestManifest = current && !VesperPlayerSource.http(src)
-      ? (VesperPlayerSource.http(attachedManifest)?.href || declaredManifest(identity))
+      ? (attachedManifest?.href || declaredManifest(identity))
       : undefined;
     const result = await send({ type: 'media-options', refresh, pageUrl: targetPage, multiplePlayers: hasOtherPlayer(player),
       mediaChangedAt: current ? binding.changedAt : mediaChangedAt,
@@ -1991,7 +2009,7 @@
       playerFragmentUrls: playerWitness?.paths,
       playerCanonicalUrls: playerWitness?.canonicalUrls,
       playerResourceFingerprints: playerWitness?.fingerprints,
-      manifestUrl: bestManifest });
+      manifestUrl: bestManifest, manifestOnPlayer: Boolean(bestManifest && attachedManifest) });
     if (!isCurrentRequest(request)) {
       const stale = lookup.preview ? !watchPreviewCurrent(lookup.preview) : !matchesPickerPlayer(lookup);
       if (stale || !result?.ok)
@@ -3085,9 +3103,14 @@
     if (e.persisted) companion?.setVisible(false); else retire();
   }, { signal });
   window.addEventListener('pageshow', refreshPlayers, { signal });
-  // Scroll only repositions/ranks nearby players. Insertions are discovered separately.
   const geometryChanged = () => { if (nearby.size || video) schedule(); };
-  window.addEventListener('scroll', geometryChanged, { passive: true, capture: true, signal });
+  const feedPage = VesperPlayerSource.isSocialFeedSite(pageAddress())
+    || /(?:^|\.)(?:x|twitter)\.com$/i.test(location.hostname || '');
+  window.addEventListener('scroll', () => {
+    if (!feedPage) return geometryChanged();
+    scrolled = true;
+    schedule();
+  }, { passive: true, capture: true, signal });
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {
     // Start with existing videos instead of waiting for the subtree walk to reach them.

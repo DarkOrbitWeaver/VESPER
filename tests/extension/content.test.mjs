@@ -1200,7 +1200,7 @@ test('scroll re-ranks a competing visible feed player instead of merely moving t
   const start = content.indexOf('  function schedule()');
   const end = content.indexOf('  function stopFullscreenIdle(', start);
   let ranked = 0, callback;
-  const context = vm.createContext({ alive: () => true, frame:0, layout: null,
+  const context = vm.createContext({ alive: () => true, frame:0, layout: null, scrolled: false,
     selectPlayer: continuous => { assert.equal(continuous, true); ranked++; },
     requestAnimationFrame: fn => (callback=fn,1) });
   const schedule = vm.runInContext(content.slice(start,end)+'\nschedule;', context);

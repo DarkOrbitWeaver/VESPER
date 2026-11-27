@@ -958,6 +958,52 @@ test('the active player can recover its observed manifest during a late click', 
   assert.equal(app.sent.some(message => message.type === 'media-source-options'), false);
 });
 
+test('an attached playlist can predate playback and a typed playlist keeps its observed kind', async () => {
+  const page = 'https://embed.example/player';
+  const url = 'https://cdn.example/asset-123456/master.m3u8';
+  const opaqueUrl = 'https://cdn.example/asset-123456/read';
+  const sender = { url: page, tab: { id: 35 }, frameId: 2, documentId: 'preloaded-player' };
+  const app = load({ 'media-options': { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } } });
+  const changedAt = Date.now();
+  const response = { url, tabId: 35, frameId: 2, documentId: sender.documentId,
+    method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt - 45_000 };
+  await app.onMedia({ ...response, responseHeaders: [{ name: 'Content-Type', value: 'application/vnd.apple.mpegurl' }] });
+  const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerPlaying: true,
+    playerUrl: 'blob:https://embed.example/player', manifestUrl: url, generation: 8, mediaChangedAt: changedAt };
+  await app.message(request, sender);
+  assert.equal(app.sent.find(message => message.type === 'media-options').candidates.length, 0);
+  await app.message({ ...request, manifestOnPlayer: true }, sender);
+  const candidate = app.sent.filter(message => message.type === 'media-options').at(-1).candidates[0];
+  assert.equal(candidate.url, url);
+  assert.equal(candidate.kind, 'hls');
+  assert.equal(candidate.mimeType, 'application/vnd.apple.mpegurl');
+
+  await app.onMedia({ ...response, url: opaqueUrl, timeStamp: changedAt - 10_000,
+    responseHeaders: [{ name: 'Content-Type', value: 'application/dash+xml' }] });
+  await app.message({ ...request, manifestUrl: opaqueUrl }, sender);
+  const typed = app.sent.filter(message => message.type === 'media-options').at(-1).candidates[0];
+  assert.equal(typed.url, opaqueUrl);
+  assert.equal(typed.kind, 'dash');
+});
+
+test('a direct JSON-LD hint does not suppress observed playlist discovery for a blob player', async () => {
+  const page = 'https://embed.example/player';
+  const sender = { url: page, tab: { id: 35 }, frameId: 2, documentId: 'player-with-preview' };
+  const manifest = 'https://cdn.example/asset-123456/master.m3u8';
+  const preview = 'https://cdn.example/preview.mp4';
+  const app = load({ 'media-source-options': { ok: true, data: { choices: [{ index: 0, label: 'Best quality' }] } } });
+  const changedAt = Date.now();
+  for (const [url, mime, timeStamp] of [[manifest, 'application/vnd.apple.mpegurl', changedAt],
+    [preview, 'video/mp4', changedAt - 10_000]]) {
+    await app.onMedia({ url, tabId: 35, frameId: 2, documentId: sender.documentId,
+      method: 'GET', statusCode: 200, type: 'xmlhttprequest', timeStamp, responseHeaders: [{ name: 'Content-Type', value: mime }] });
+  }
+  await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerPlaying: true,
+    playerUrl: 'blob:https://embed.example/player', manifestUrl: preview, generation: 8, mediaChangedAt: changedAt }, sender);
+  assert.equal(app.sent.find(message => message.type === 'media-source-options').candidates[0].url, manifest);
+  assert.equal(app.sent.flatMap(message => message.candidates || []).some(candidate => candidate.url === preview), false);
+});
+
 test('an observed manifest from another document or frame is not reused for this player', async () => {
   const page = 'https://video.example/watch/current';
   const sender = { url: page, tab: { id: 36 }, frameId: 2, documentId: 'current-doc' };
@@ -972,7 +1018,7 @@ test('an observed manifest from another document or frame is not reused for this
   }
 
   const result = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page,
-    playerUrl: 'blob:https://video.example/player', manifestUrl: staleManifest, generation: 8,
+    playerUrl: 'blob:https://video.example/player', manifestUrl: staleManifest, manifestOnPlayer: true, generation: 8,
     playerPlaying: true, mediaChangedAt: Date.now(), playerFacts: { durationSeconds: 120 } }, sender);
 
   assert.equal(result.ok, true);

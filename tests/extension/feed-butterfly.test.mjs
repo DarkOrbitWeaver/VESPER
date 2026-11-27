@@ -343,6 +343,38 @@ test('a queued offscreen entry uses the video position when the feed has already
   assert.ok(h.flyVisible);
 });
 
+test('scroll recovers a recycled feed player without a new intersection or playback event', async () => {
+  const h = makeContentHarness();
+  const first = new h.Video({ src: 'blob:https://www.tiktok.com/first', readyState: 4, paused: false });
+  const second = new h.Video({ src: 'blob:https://www.tiktok.com/second', readyState: 4, paused: false, _visible: false });
+  second._rect = { left: 500, top: 40, right: 900, bottom: 740, width: 400, height: 700 };
+  h.doc.body.append(first, second);
+  h.triggerIntersection([{ target: first, isIntersecting: true }, { target: second, isIntersecting: false }]);
+  await h.tick();
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+  const firstPerch = h.perch;
+
+  first._visible = false;
+  second._visible = true;
+  let hitTests = 0;
+  h.doc.elementsFromPoint = (x, y) => {
+    if (y !== h.context.innerHeight / 2) return [];
+    hitTests++;
+    return [second];
+  };
+  for (let i = 0; i < 8; i++) h.window.dispatch('scroll');
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+  assert.notEqual(h.perch.x, firstPerch.x);
+  assert.equal(hitTests, 1);
+  h.window.dispatch('scroll');
+  h.flushRaf();
+  assert.equal(hitTests, 1, 'a visible player does not trigger another recovery');
+  assert.equal(h.sentMessages.filter(message => message.type === 'media-options').length, 0);
+  assert.equal(h.fetchCalls.length, 0);
+});
+
 test('a Facebook story with decoded video gets the Butterfly without a URL source', async () => {
   const h = makeContentHarness({ href: 'https://www.facebook.com/stories/12345/UzpfTEST=/' });
   const v = new h.Video({ srcObject: {}, readyState: 4, paused: false, autoplay: true, defaultMuted: true, loop: true });
