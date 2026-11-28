@@ -22,6 +22,7 @@ internal sealed class SegmentBufferLimiter
 
     internal long ActiveBytes { get { lock (_gate) return _activeBytes; } }
     internal int ActiveSlots { get { lock (_gate) return _activeSlots; } }
+    internal (int Slots, long Bytes) Usage { get { lock (_gate) return (_activeSlots, _activeBytes); } }
 
     internal static long Reservation(long maxCapacity, long? knownCapacity, int copies = 1)
     {

@@ -49,10 +49,9 @@ public class SequentialAndResumeTests
         Assert.Equal(server.V1, await File.ReadAllBytesAsync(done.FinalPath!));
         Assert.Equal(server.V1.Length, done.CommittedBytes);
         Assert.Equal(h.Downloads, Path.GetDirectoryName(done.FinalPath));
-        string staging = PartialFile.StagingFolder(h.Downloads);
+        string staging = PartialFile.PrivateFolder(h.Data);
         Assert.Equal(staging, Path.GetDirectoryName(done.PartialPath));
-        if (OperatingSystem.IsWindows())
-            Assert.True(File.GetAttributes(staging).HasFlag(FileAttributes.Hidden));
+        Assert.False(Directory.Exists(PartialFile.StagingFolder(h.Downloads)));
         Assert.Single(h.Files());                                                  // the .vpart staging file is gone
         Assert.False(File.Exists(done.PartialPath));
     }

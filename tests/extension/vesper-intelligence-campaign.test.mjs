@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { generate } from '../../tools/intelligence/corpus.mjs';
-import { validateCases, fitWeights, evaluate, promote, guardFailures } from '../../scripts/train-intelligence.mjs';
+import { validateCases, validateReviewIds, fitWeights, evaluate, promote, guardFailures } from '../../scripts/train-intelligence.mjs';
 
 const context = vm.createContext({ URL });
 for (const name of ['vesper-intelligence.js', 'vesper-model.js', 'vesper-inference.js', 'vesper-planner.js'])
@@ -70,6 +70,22 @@ test('leakage, weak-label evaluation and private fields are rejected by the trai
   assert.throws(() => validateCases('vesper.player-intent/2', weak), /Weak adapter labels/);
   const priv = structuredClone(data.player); priv.train[0].candidates[0].url = 'https://example.com/?token=x';
   assert.throws(() => validateCases('vesper.player-intent/2', priv), /Invalid candidate/);
+});
+
+test('promotion review IDs prevent duplicated independent samples across or within partitions', () => {
+  const data = {
+    train: [{ label: 'verified', caseId: 'case_0001' }],
+    validation: [{ label: 'user', caseId: 'case_0002' }],
+    holdout: [{ label: 'verified', caseId: 'case_0003' }]
+  };
+  assert.doesNotThrow(() => validateReviewIds(data));
+  data.holdout.push({ label: 'verified', caseId: 'CASE_0003' });
+  assert.throws(() => validateReviewIds(data), /Repeated independent review caseId/);
+  data.holdout.pop();
+  data.holdout[0].caseId = 'case_0001';
+  assert.throws(() => validateReviewIds(data), /Repeated independent review caseId/);
+  data.holdout[0].caseId = 'https://example.com/private';
+  assert.throws(() => validateReviewIds(data), /Missing opaque independent review caseId/);
 });
 
 test('fitting is deterministic and respects sign constraints', () => {

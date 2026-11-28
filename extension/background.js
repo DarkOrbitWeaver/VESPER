@@ -636,7 +636,7 @@ function rankObservedSources(sources, changedAt, resourceWitness = new Set(), fr
   const preferred = model?.decisive ? sources[Number(model.selected)] : null;
   const ranked = sources.map(source => ({ source, score: evidenceStrength(source, changedAt)
     + (exactResources.has(source.url) ? 24 : 0) + (source.sliceEvidence ? 24 : 0)
-    + (resourceWitness.has(source.url) ? 8 : 0) + 4 * sourceAffinity(source, fragments),
+    + (resourceWitness.has(source.url) ? 8 : 0) + (source.playerPathHint ? 10 : 0) + 4 * sourceAffinity(source, fragments),
     distance: Math.abs(source.seen - changedAt) }))
     .sort((a, b) => Number(b.source === preferred) - Number(a.source === preferred)
       || b.score - a.score || a.distance - b.distance)
@@ -1489,9 +1489,13 @@ async function playerOptions(message, sender) {
     && sender.documentId && Array.isArray(message.playerResourceFingerprints)
     ? [...new Set(message.playerResourceFingerprints.slice(0, 12)
       .filter(value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))].sort() : [];
+  const playerPaths = binding && message.generation > 0 && sender.documentId
+    ? [...new Set((Array.isArray(message.playerFragmentUrls) ? message.playerFragmentUrls : []).slice(0, 12)
+      .map(value => VesperPlayerSource.http(value)).filter(url => url && !url.search)
+      .map(url => url.origin + url.pathname))].sort() : [];
   const playerScope = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
     message.manifestOnPlayer === true, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
-  const lookupKey = [playerScope, playbackFingerprints.join(',')].join('|');
+  const lookupKey = [playerScope, playbackFingerprints.join(','), JSON.stringify(playerPaths)].join('|');
   const verificationScope = !auth.authorized && !message.refresh && binding && sender.documentId
     && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
@@ -1544,17 +1548,38 @@ async function playerOptions(message, sender) {
       if (slicedPlayer) exactResources.add(source.href);
       if (exactResources.size && !prefetch)
         possibleSources.push(...observedSliceCandidates(scoped, exactResources));
+      // A transformed buffer may retain a path hint without an exact URL
+      // fingerprint. A single currently observed URL at that exact path can
+      // be independently checked on an explicit click, never auto-selected.
+      // Count ALL current variants, including partial and older requests, so
+      // filtering cannot accidentally turn a shared CDN path into identity.
+      const pathVariants = new Map();
+      if (!prefetch && playerPaths.length) {
+        const wanted = new Set(playerPaths);
+        for (const item of scoped) {
+          const url = VesperPlayerSource.http(item.url);
+          const key = url && url.origin + url.pathname;
+          if (!wanted.has(key)) continue;
+          const variants = pathVariants.get(key) || new Set();
+          variants.add(item.url);
+          pathVariants.set(key, variants);
+        }
+      }
       for (const evidence of scoped) {
         const sourceCutoff = Math.max(now - sourceLifetime(evidence), changedAt - 15_000);
         const witnessed = exactResources.has(evidence.url);
         const isManifest = ['hls', 'dash'].includes(evidence.kind);
-        if (slicedPlayer || (socialFeed || facebookPlayback) && !witnessed
+        const url = VesperPlayerSource.http(evidence.url);
+        const pathHint = !prefetch && url && pathVariants.get(url.origin + url.pathname)?.size === 1
+          && evidence.seen >= directCutoff && !evidence.conflictingValidator
+          && (isWholeDirectSource(evidence) || isRangedMediaCandidate(evidence));
+        if (slicedPlayer || (socialFeed || facebookPlayback) && !witnessed && !pathHint
             && !(isManifest && fragmentAffinity(evidence.url, playerFragments) > 0)) continue;
         if ((witnessed || evidence.seen >= sourceCutoff)
             && (isManifest || (witnessed || evidence.seen >= directCutoff)
               && (isWholeDirectSource(evidence) || isRangedMediaCandidate(evidence)))
             && !possibleSources.some(item => item.url === evidence.url))
-          possibleSources.push(evidence);
+          possibleSources.push(pathHint && !witnessed ? { ...evidence, playerPathHint: true } : evidence);
       }
     }
     // Exact, independently observed declarations may be checked on request,

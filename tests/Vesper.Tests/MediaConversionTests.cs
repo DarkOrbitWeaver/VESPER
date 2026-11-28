@@ -69,7 +69,7 @@ public sealed class MediaConversionTests
         using var h = harness = new Harness(failpoint: point =>
         {
             if (point != "finalize.afterMediaPrepare") return;
-            string stage = Assert.Single(Directory.GetFiles(harness!.Downloads, "*.convert.mp4", SearchOption.AllDirectories));
+            string stage = Assert.Single(Directory.GetFiles(PartialFile.PrivateFolder(harness!.Data), "*.convert.mp4", SearchOption.AllDirectories));
             Assert.ThrowsAny<IOException>(() =>
             {
                 using var writer = File.Open(stage, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);

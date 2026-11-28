@@ -606,34 +606,35 @@ async function main() {
       + "link.download = 'vesper-page-made-fixture.bin'; document.body.append(link); link.click(); URL.revokeObjectURL(link.href); })()"
     }, tab);
     assert.ok(!generated.exceptionDetails, 'Could not create the isolated Blob download.');
-    await waitFor(async () => {
+    const blobDownload = await waitFor(async () => {
       const matches = await evaluate('Read page-made download', 'chrome.downloads.search({})');
       return matches.find(candidate => candidate.filename?.endsWith(blobName) && candidate.state === 'complete');
     }, 15000, 'Chrome did not finish the page-generated download.');
     assert.equal((await readFile(join(downloadFolder, blobName))).compare(bytes), 0);
     await waitFor(async () => {
       const capture = await evaluate('Read final capture decisions', "chrome.storage.session.get('vesperCaptureDecisions')");
-      return capture.vesperCaptureDecisions?.some(entry => entry.outcome === 'page-made');
+      return capture.vesperCaptureDecisions?.some(entry => entry.id === blobDownload.id
+        && entry.outcome === 'failed' && entry.reason === 'browser-generated');
     }, 5000, 'The extension did not record that Chrome owns the page-generated download.');
     let captureRace = null;
     let managedDownloads = null;
     if (captureRaceTest) {
-      await waitFor(async () => {
-        const reports = await evaluate('Read blob completion', '__ownershipSmoke.managed');
-        return reports.some(item => item.operation === 'complete' && item.path.endsWith(blobName));
-      }, 5000, 'VESPER did not receive the completed blob.');
       await browser.send('Runtime.evaluate', { expression:
         "(() => { const form = document.createElement('form'); form.method = 'POST'; form.action = '/single-post';"
         + "document.body.append(form); form.submit(); })()"
       }, tab);
       const post = await waitFor(async () => {
-        const reports = await evaluate('Read POST completion', '__ownershipSmoke.managed');
-        return reports.find(item => item.operation === 'complete' && item.path.endsWith('vesper-single-post.bin'));
-      }, 5000, 'VESPER did not receive the completed one-use POST.');
-      assert.ok(post.path.startsWith(downloadFolder));
-      assert.equal((await readFile(post.path)).compare(bytes), 0);
+        const matches = await evaluate('Read one-use POST download', 'chrome.downloads.search({})');
+        return matches.find(item => item.filename?.endsWith('vesper-single-post.bin') && item.state === 'complete');
+      }, 15000, 'Chrome did not finish the one-use POST.');
+      assert.ok(post.filename.startsWith(downloadFolder));
+      assert.equal((await readFile(post.filename)).compare(bytes), 0);
       assert.deepEqual(serverRequests.filter(entry => entry.path === '/single-post').map(entry => entry.method), ['POST']);
-      managedDownloads = { blob: true, oneUsePost: true };
+      const reports = await evaluate('Check Chrome-only completion', '__ownershipSmoke.managed');
+      assert.equal(reports.some(item => item.operation === 'complete'), false, 'Chrome-owned files must not be imported.');
+      const captures = await evaluate('Check generated files were not replayed', '__ownershipSmoke.raceCalls');
+      assert.equal(captures.some(call => call.type === 'browser-capture' || call.type === 'browser-submit'), false);
+      managedDownloads = { blobKeptInChrome: true, oneUsePostKeptInChrome: true, imported: false };
       captureRace = [];
       for (const fixture of ['fast', 'during-check', 'policy-window', 'delayed']) {
         const name = `vesper-race-${fixture}.bin`;

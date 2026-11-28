@@ -271,6 +271,10 @@ async function earlyDirectDownload(message, sender) {
   const attempt = crypto.randomUUID();
   const started = Date.now();
   const facts = { attempt, stage: 'click', named: typeof message.downloadName === 'string', query: url.includes('?') };
+  // Client time is diagnostic only, never authority for capture or ownership.
+  const clickAt = Number.isSafeInteger(message.clickAt) && message.clickAt <= started
+    && message.clickAt >= started - 15000 ? message.clickAt : started;
+  facts.dispatchMs = started - clickAt;
   const fallback = reason => {
     if (reason && captureAllowed()) {
       rememberDownloadFact(earlyFailures, url, { reason, attempt });
@@ -295,7 +299,13 @@ async function earlyDirectDownload(message, sender) {
       void recordFailure('handoff', 'possible-dual-ownership', page.href, url, {
         attempt, job: facts.job, native: 'accepted', browserId: chrome.id, chromeStarted: true, routeMatch: true
       });
-    return { ok: true };
+    const timing = {
+      dispatchMs: facts.dispatchMs, probeMs: facts.probeMs,
+      stageMs: facts.nativeMs, acceptMs: facts.acceptMs,
+      clickToAcceptMs: Math.max(0, Date.now() - clickAt)
+    };
+    if (captureAllowed(generation)) void recordStartupTiming(timing);
+    return { ok: true, timing };
   };
   try {
     try {
@@ -316,6 +326,7 @@ async function earlyDirectDownload(message, sender) {
       const timeout = setTimeout(() => controller.abort(), 3500);
       let response, signedItems = null;
       facts.stage = 'probe';
+      const probeStarted = Date.now();
       try {
         // Presigned file links can be valid only for GET.
         if (!VesperEarlyDownload.signedDownload(address)) {
@@ -329,7 +340,10 @@ async function earlyDirectDownload(message, sender) {
           response = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, credentials: credMode, redirect,
             cache: 'no-store', signal: controller.signal });
         }
-      } finally { clearTimeout(timeout); }
+      } finally {
+        clearTimeout(timeout);
+        facts.probeMs = Math.max(0, Date.now() - probeStarted);
+      }
       const rangeTotal = response.status === 206 ? /^bytes\s+0-0\/(\d+)$/i.exec(response.headers.get('content-range') || '')?.[1] : null;
       const acceptsRanges = response.status === 206 || (response.headers.get('accept-ranges') || '').toLowerCase().includes('bytes');
       if (response.body) await response.body.cancel().catch(() => {});
@@ -404,7 +418,9 @@ async function earlyDirectDownload(message, sender) {
       }
       accepting = true;
       facts.stage = 'native-accept';
+      const acceptStarted = Date.now();
       const result = await transferCommand(transferId, 'accept', 5000);
+      facts.acceptMs = Math.max(0, Date.now() - acceptStarted);
       if (result.ok && ['active', 'complete'].includes(result.data?.state))
         return accepted();
     } catch { /* ambiguous acceptance must be reconciled below */ }

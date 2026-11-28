@@ -97,7 +97,7 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
                 return segment.End;
             }
             long window = Math.Max(Alignment * 4, preferredWindowBytes);
-            long wireEnd = Math.Min(segment.End, segment.Next + window);
+            long wireEnd = segment.Next + Math.Min(segment.End - segment.Next, window);
             // If remaining after this window is tiny (< 512 KiB), absorb it into one request to save a round-trip
             if (segment.End - wireEnd < 512 * 1024) wireEnd = segment.End;
             segment.WireEnd = wireEnd;

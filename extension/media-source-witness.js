@@ -187,13 +187,16 @@
   function distinctiveSample(bytes, start, end, kind) {
     if (end - start < 128) return null;
     const first = bytes.slice(start, start + 32), last = bytes.slice(end - 32, end);
+    const middleAt = start + Math.floor((end - start - 32) / 2);
+    const middle = bytes.slice(middleAt, middleAt + 32);
     return new Set(first).size >= 12 && new Set(last).size >= 12
       && first.some((value, j) => value !== last[j])
-      ? {kind, length: end - start, first, last} : null;
+      ? {kind, length: end - start, first, middle, last} : null;
   }
   function equalSample(a, b) {
     return !!a && !!b && a.kind === b.kind && a.length === b.length
       && a.first.every((value, i) => value === b.first[i])
+      && a.middle.every((value, i) => value === b.middle[i])
       && a.last.every((value, i) => value === b.last[i]);
   }
   function mediaSample(input) {
@@ -212,7 +215,7 @@
       if (bytes.length >= 188 * 4 && bytes.length % 188 === 0
           && [0,188,376,564,bytes.length-188].every(i => bytes[i] === 0x47 && (bytes[i+3] & 0x30) !== 0))
         return distinctiveSample(bytes, 0, bytes.length, 'ts');
-      let offset = 0, sample = null;
+      let offset = 0, sample = null, mediaBoxes = 0;
       for (let i = 0; i < 128 && offset + 8 <= bytes.length; i++) {
         let size = view.getUint32(offset), header = 8;
         const type = view.getUint32(offset + 4);
@@ -221,7 +224,10 @@
           size = view.getUint32(offset + 12); header = 16;
         } else if (size === 0) size = bytes.length - offset;
         if (size < header || size > bytes.length - offset) return null;
-        if (type === 0x6d646174 && size - header >= 128) {
+        if (type === 0x6d646174) {
+          // One sampled payload cannot represent a multi-payload entity.
+          // Abstain rather than match an unrelated prefix to the last mdat.
+          if (++mediaBoxes > 1) return null;
           sample = distinctiveSample(bytes, offset + header, offset + size, 'mp4');
         }
         offset += size;
@@ -229,14 +235,14 @@
       return offset === bytes.length ? sample : null;
     } catch { return null; }
   }
-  function rememberBuffer(buffer, descriptor, view) {
+  function rememberBuffer(buffer, descriptor, view, observedAt = now()) {
     if (!descriptor || !(buffer instanceof ArrayBuffer || (typeof Blob === 'function' && buffer instanceof Blob))) return;
     const start = view?.byteOffset ?? 0;
     const end = start + (view?.byteLength ?? buffer.byteLength ?? buffer.size);
     const existing = bufferProvenance.get(buffer);
     if (existing?.address === descriptor.address && existing.start === start && existing.end === end && now() - existing.at <= TTL) return;
     const sample = buffer instanceof ArrayBuffer ? mediaSample(view || buffer) : null;
-    const record = { ...descriptor, at: now(), sample, start, end };
+    const record = { ...descriptor, at: observedAt, sample, start, end };
     computeDigestAsync(record);
     bufferProvenance.set(buffer, record);
     bufferRing.push({ ref: new WeakRef(buffer), record });
@@ -253,6 +259,10 @@
     try {
       const parent = bufferProvenance.get(this);
       if (parent && now() - parent.at <= TTL) {
+        // A copied view cannot restore exact evidence after mutation, nor
+        // renew the observation lifetime of the original network response.
+        if (parent.sample && !equalSample(parent.sample,
+            mediaSample(new Uint8Array(this, parent.start, parent.end - parent.start)))) return sliced;
         const index = Math.trunc(Number(begin) || 0);
         const offset = index < 0 ? Math.max(0, this.byteLength + index) : Math.min(this.byteLength, index);
         if (offset < parent.start || offset + sliced.byteLength > parent.end) return sliced;
@@ -261,7 +271,7 @@
           start: parent.slice.start + offset - parent.start,
           end: parent.slice.start + offset - parent.start + Math.max(0, sliced.byteLength - 1)
         } : null;
-        rememberBuffer(sliced, { ...parent, slice: childSlice });
+        rememberBuffer(sliced, { ...parent, slice: childSlice }, undefined, parent.at);
       }
     } catch {}
     return sliced;

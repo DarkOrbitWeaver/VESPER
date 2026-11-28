@@ -58,12 +58,13 @@
 
   function start(url, original) {
     pendingUrl = url;
+    const clickAt = intentAt || Date.now();
     intentAt = 0;
     void (async () => {
       try {
         const omitReferrer = original.rel?.split(/\s+/).includes('noreferrer')
           || original.getAttribute('referrerpolicy')?.toLowerCase() === 'no-referrer';
-        const reply = await chrome.runtime.sendMessage({type:'early-download', url,
+        const reply = await chrome.runtime.sendMessage({type:'early-download', url, clickAt,
           downloadName:original.getAttribute('download'), ...(omitReferrer ? { omitReferrer: true } : {})});
         if (reply?.ok) return;
         if (reply?.fallback === true) {

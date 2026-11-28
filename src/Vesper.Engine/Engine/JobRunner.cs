@@ -517,17 +517,10 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             if (primary) primaryWorker = worker;
         }
 
-        // Claim segment 0 for primary before spawning worker #2 so the already-open stream isn't raced off it.
+        // Establish a one-stream baseline before spending requests on parallelism.
         Segment? primarySegment = board.Acquire();
         StartWorker(primary: true, first.Response, primarySegment);
         int target = 1;
-        if (primarySegment is not null && segmented && Job.Identity == IdentityLevel.StrongEtag && !pieceMode && !recentlyThrottled
-            && _o.MaxConnectionsPerJob >= 2 && session.Limiter.BytesPerSecond == 0 && engine.GlobalLimiter.BytesPerSecond == 0
-            && board.HasAssignableWork && hostGate.Wait(0))
-        {
-            target = 2;
-            StartWorker();
-        }
 
         long lastChange = Stopwatch.GetTimestamp();
         long startingBytes = session.RunBytes;
@@ -577,7 +570,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     if (limited) target = 1;
                     else if (active == target && running == active && active == samplePopulation
                         && elapsed >= interval && bytes >= 64 * 1024 && rate > 0
-                        && board.RemainingBytes / rate > 2
+                        && ConnectionAdvisor.WorthParallelProbe(active, rate, board.RemainingBytes)
                         && Stopwatch.GetElapsedTime(lastChange) >= interval)
                     {
                         target = advisor.Recommend(active, rate, elapsed, interval);
@@ -663,9 +656,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
             {
                 if (response is null)
                 {
-                    long preferredWindow = segment.Rate >= 16 * 1024 * 1024 ? 16L * 1024 * 1024
-                        : segment.Rate >= 4 * 1024 * 1024 ? 8L * 1024 * 1024
-                        : 4L * 1024 * 1024;
+                    long preferredWindow = ConnectionAdvisor.ResponseWindowBytes(segment.Rate);
                     long wireEnd = board.PlanWireWindowEnd(segment, preferredWindow, boundedWindows);
                     response = await OpenRangeAsync(segment.Next, wireEnd - 1, total, ct).ConfigureAwait(false);
                 }

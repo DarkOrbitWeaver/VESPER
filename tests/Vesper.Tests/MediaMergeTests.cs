@@ -357,6 +357,67 @@ public sealed class MediaMergeTests
         Assert.Equal(protocol == "hls" ? 10 : 8, server.Requests.Values.Sum(queue => queue.Count));
     }
 
+    [Theory]
+    [InlineData("hls")]
+    [InlineData("dash")]
+    public async Task Cross_track_prefetch_pause_releases_buffers_and_preserves_committed_prefix(string protocol)
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        var plan = CreateSegmentedPlan(server, protocol);
+        // Extend each media entity with a valid, ignored MP4 free box to stress
+        // large-buffer accounting without changing any decoded sample.
+        const int padding = 2 * 1024 * 1024;
+        var entities = protocol == "hls" ? server.HlsFiles : server.Extra;
+        foreach (string path in entities.Keys.Where(path => path.EndsWith(".m4s", StringComparison.Ordinal)).ToArray())
+        {
+            byte[] original = entities[path];
+            byte[] padded = new byte[original.Length + padding];
+            original.CopyTo(padded, 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(padded.AsSpan(original.Length, 4), padding);
+            "free"u8.CopyTo(padded.AsSpan(original.Length + 4, 4));
+            entities[path] = padded;
+        }
+
+        var audioStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blockedVideo = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool hold = true;
+        server.BeforeResponse = async (path, ct) =>
+        {
+            if (path.EndsWith("/audio/av-1.m4s", StringComparison.Ordinal)) audioStarted.TrySetResult();
+            if (hold && path.EndsWith("/video/av-3.m4s", StringComparison.Ordinal))
+            {
+                blockedVideo.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            }
+        };
+        using var harness = new Harness(tweak: options =>
+        {
+            options.MaxConnectionsPerHost = 4;
+            options.MaxConnectionsPerJob = 4;
+        });
+        AddResult added = harness.Engine.Add(new AddRequest(plan.Tracks[0].Url,
+            FileName: "cross-track-resume.mp4", Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        await blockedVideo.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await audioStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var active = harness.Engine.MediaBufferUsage;
+        Assert.InRange(active.Slots, 1, SegmentBufferLimiter.MaxRetainedSegments);
+        Assert.InRange(active.Bytes, 1, 256L * 1024 * 1024);
+        harness.Engine.Pause(added.JobId);
+        JobSnapshot paused = await harness.WaitForStateAsync(added.JobId, JobState.Paused, seconds: 15);
+        Assert.True(paused.CommittedBytes > 0);
+        Assert.Equal((0, 0L), harness.Engine.MediaBufferUsage);
+        Assert.Null(paused.FinalPath);
+        Assert.Equal(paused.CommittedBytes, new FileInfo(paused.PartialPath).Length);
+        hold = false;
+        harness.Restart();
+        harness.Engine.Resume(added.JobId);
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed, seconds: 30);
+        Assert.Equal(2, ValidateSegmentedOutput(done.FinalPath!).TrackCount);
+        Assert.Equal((0, 0L), harness.Engine.MediaBufferUsage);
+    }
+
     [Fact]
     [Trait("Category", "SegmentedMergeBenchmark")]
     public async Task Measure_local_hls_and_dash_rendition_merges()

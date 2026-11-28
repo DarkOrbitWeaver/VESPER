@@ -20,7 +20,7 @@ function diagnosticRoute(value) {
 const failureFields = new Set([
   'stage', 'attempt', 'job', 'browserId', 'state', 'method', 'status', 'mime', 'bytes', 'total',
   'proof', 'attachment', 'ranges', 'redirected', 'query', 'named', 'signedIn', 'reuse', 'native', 'finalRoute',
-  'chromeError', 'chromeStarted', 'routeMatch', 'elapsedMs', 'nativeMs',
+  'chromeError', 'chromeStarted', 'routeMatch', 'elapsedMs', 'nativeMs', 'dispatchMs', 'probeMs', 'acceptMs',
   'source', 'ready', 'generation', 'playing', 'height', 'durationMs', 'preview', 'refresh', 'quick',
   'boundPlayer', 'boundPost', 'responses', 'exactMatches', 'candidates', 'postLookup', 'observedLookups',
   'witnesses', 'witnessPaths', 'objectKind', 'contentBuild', 'tracks', 'completeTracks', 'retainedBytes', 'bodyProof', 'attemptedBody', 'subtitleFailures'
@@ -44,6 +44,25 @@ function diagnosticFacts(facts) {
 }
 
 let logWrites = Promise.resolve(), logTimer, logSending = false, logRetryAfter = 0, logAddedWhileSending = false;
+
+// Anonymous, bounded local timings. No URLs, job IDs, credentials or native
+// export; recording is asynchronous and does not delay capture acceptance.
+const startupLogKey = 'vesperStartupTimings';
+let startupWrites = Promise.resolve();
+function recordStartupTiming(timing) {
+  const build = diagnosticToken(chrome.runtime.getManifest?.()?.version_name || chrome.runtime.getManifest?.()?.version);
+  if (!build || !timing) return Promise.resolve();
+  const facts = {};
+  for (const key of ['dispatchMs', 'probeMs', 'stageMs', 'acceptMs', 'clickToAcceptMs'])
+    if (Number.isSafeInteger(timing[key]) && timing[key] >= 0 && timing[key] <= 120000) facts[key] = timing[key];
+  if (facts.clickToAcceptMs === undefined) return Promise.resolve();
+  startupWrites = startupWrites.then(async () => {
+    const saved = await chrome.storage.local.get(startupLogKey);
+    const previous = Array.isArray(saved[startupLogKey]) ? saved[startupLogKey] : [];
+    await chrome.storage.local.set({ [startupLogKey]: [...previous.slice(-63), { kind: 'startup-timing', build, utc: Date.now(), facts }] });
+  }).catch(() => {});
+  return startupWrites;
+}
 
 function recordFailure(kind, code, page, resource, facts = {}) {
   const manifest = chrome.runtime.getManifest?.();

@@ -309,6 +309,36 @@ test('mutated sampled buffers lose exact provenance instead of certifying altere
   assert.deepEqual(b.request(a.el),[]);
 });
 
+test('mid-payload mutations and subsequent ArrayBuffer copies cannot restore source evidence', async () => {
+  const b=setup(), a=b.player(), other=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/clip.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  bytes[136]^=0xff;
+  a.buffer.appendBuffer(bytes);
+  other.buffer.appendBuffer(bytes.buffer.slice(0));
+  assert.deepEqual(b.request(a.el),[]);
+  assert.deepEqual(b.request(other.el),[]);
+});
+
+test('a derived buffer does not renew expired network provenance', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/clip.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  b.advance(119000);
+  const copy=bytes.buffer.slice(0);
+  b.advance(1001);
+  a.buffer.appendBuffer(copy);
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('a shared last mdat cannot identify a copied multi-payload response', async () => {
+  const b=setup(), a=b.player();
+  const join=(first,last)=>{const result=new Uint8Array(first.length+last.length);
+    result.set(first); result.set(last,first.length); return result;};
+  const bytes=join(fragment(1),fragment(3));
+  await new b.FetchResponse('https://cdn.test/clip.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  a.buffer.appendBuffer(join(fragment(2),fragment(3)));
+  assert.deepEqual(b.request(a.el),[]);
+});
+
 test('streaming ReadableStream reader chunks associate with the SourceBuffer that appends them', async () => {
   const b = setup(), a = b.player(), neighbour = b.player();
   class MockReader {

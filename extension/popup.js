@@ -10,13 +10,15 @@ function settingsStatus(message = '') {
 
 $('copy-diagnostics').onclick = async () => {
   try {
-    const { vesperFailureLog: entries = [] } = await chrome.storage.local.get('vesperFailureLog');
-    if (!entries.length) return settingsStatus('No browser failures recorded yet.');
+    const saved = await chrome.storage.local.get(['vesperFailureLog', 'vesperStartupTimings']);
+    const entries = [...(Array.isArray(saved.vesperFailureLog) ? saved.vesperFailureLog : []),
+      ...(Array.isArray(saved.vesperStartupTimings) ? saved.vesperStartupTimings : [])].sort((a, b) => a.utc - b.utc);
+    if (!entries.length) return settingsStatus('No browser diagnostics recorded yet.');
     const lines = entries.map(({ exported, ...entry }) => JSON.stringify({ ...entry, utc: new Date(entry.utc).toISOString() }));
     await navigator.clipboard.writeText(lines.join('\n'));
-    settingsStatus('Failure log copied.');
+    settingsStatus('Diagnostics copied.');
   } catch {
-    settingsStatus('Could not copy the failure log.');
+    settingsStatus('Could not copy diagnostics.');
   }
 };
 

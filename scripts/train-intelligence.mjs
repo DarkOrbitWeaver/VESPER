@@ -243,9 +243,27 @@ function boundedJson(path, maxBytes) {
   return { data: JSON.parse(raw.toString('utf8')), sha256: createHash('sha256').update(raw).digest('hex') };
 }
 
+// The operator must assign one opaque, stable review ID per independently
+// collected case. Repeated copies of a case must not inflate the release gate.
+// An ID is bookkeeping, not proof of real-world ground truth.
+export function validateReviewIds(partitions) {
+  const seen = new Set();
+  for (const split of ['train', 'validation', 'holdout']) {
+    for (const row of partitions[split]) {
+      if (row.label !== 'verified' && row.label !== 'user') continue;
+      if (typeof row.caseId !== 'string' || !/^[a-z0-9_-]{8,80}$/i.test(row.caseId))
+        throw Error('Missing opaque independent review caseId in ' + split);
+      const id = row.caseId.toLowerCase();
+      if (seen.has(id)) throw Error('Repeated independent review caseId: ' + id);
+      seen.add(id);
+    }
+  }
+}
+
 export function promotionEvaluation(model, partitions, baseline) {
   Inference.validateModel(model);
   validateCases(model.schema, partitions);
+  validateReviewIds(partitions);
   const independent = row => row.label === 'verified' || row.label === 'user';
   // The supplied corpus is independently reviewed by the operator; label claims in
   // model metadata are never evidence of real-world evaluation.

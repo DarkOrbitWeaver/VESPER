@@ -122,6 +122,8 @@ public sealed partial class DownloadEngine : IDisposable
     internal ValueTask<SegmentBufferLease> AcquireSegmentBufferAsync(long bytes, CancellationToken ct) =>
         _segmentBuffers.AcquireAsync(bytes, ct);
 
+    internal (int Slots, long Bytes) MediaBufferUsage => _segmentBuffers.Usage;
+
     // snapshots
 
     public IReadOnlyList<JobSnapshot> Snapshots()
@@ -493,6 +495,9 @@ public sealed partial class DownloadEngine : IDisposable
         {
             lock (_lock)
             {
+                // A published stopped state must not retain the partial-file handle.
+                // Resume, restart and inspection are legal as soon as that state is visible.
+                session.CloseFile();
                 _sessions.Remove(job.Id);
                 _forced.Remove(job.Id);
                 bool progressed = job.Extents.TotalBytes > session.CommittedAtStart;

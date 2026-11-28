@@ -1534,6 +1534,37 @@ test('generic feed attached declaration requires current document evidence and e
   } finally { app.stopWorker(); }
 });
 
+test('copied-buffer path hint admits a unique current source only for explicit verification', async () => {
+  const page = 'https://www.facebook.com/';
+  const path = 'https://cdn.test/opaque-media';
+  const url = path + '?token=first';
+  const sender = { url: page, tab: { id: 89 }, frameId: 0, documentId: 'copy-hint' };
+  const app = load({ 'media-source-options': checkedSource(15) });
+  const changedAt = Date.now();
+  const observe = (address, documentId = sender.documentId) => app.onMedia({
+    url: address, tabId: 89, frameId: 0, documentId, method: 'GET', statusCode: 200,
+    type: 'xmlhttprequest', timeStamp: changedAt,
+    responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+  try {
+    await observe(url);
+    await observe('https://cdn.test/neighbor.mp4');
+    const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: '',
+      playerFragmentUrls: [path], playerHasMedia: true, generation: 1, mediaChangedAt: changedAt };
+    assert.equal((await app.message(request, { ...sender, documentId: 'foreign' })).code, 'no-reusable-source');
+    await app.message({ ...request, prefetch: true }, sender);
+    assert.equal(app.sent.length, 0);
+    const reply = await app.message(request, sender);
+    assert.equal(reply.ok, true);
+    assert.equal(reply.data.sourceChoices.length, 1);
+    assert.equal(reply.data.choices, undefined);
+    assert.equal(app.sent[0].candidates[0].url, url);
+    await observe(path + '?token=second');
+    const ambiguous = await app.message({ ...request, refresh: true }, sender);
+    assert.equal(ambiguous.code, 'no-reusable-source');
+    assert.equal(app.sent.length, 1);
+  } finally { app.stopWorker(); }
+});
+
 test('Facebook looks up the active story source without resolving the surrounding page', async () => {
   const page = 'https://www.facebook.com/stories/12345/UzpfTEST=/';
   const playerUrl = 'https://video.example/story.mp4';
@@ -3050,13 +3081,35 @@ test('trusted direct intent stages and accepts before any Chrome download exists
     assert.equal(url,earlyUrl);assert.equal(opts.method,'HEAD');assert.equal(opts.credentials,'omit');return earlyHeaders();
   }});
   try{
-    const reply=await app.message({type:'early-download',url:earlyUrl},earlySender);
+    const reply=await app.message({type:'early-download',url:earlyUrl,clickAt:Date.now()-20},earlySender);
     assert.equal(reply.ok,true);
+    for (const key of ['dispatchMs','probeMs','stageMs','acceptMs','clickToAcceptMs'])
+      assert.ok(Number.isSafeInteger(reply.timing[key]) && reply.timing[key]>=0, key);
+    assert.ok(reply.timing.clickToAcceptMs>=reply.timing.dispatchMs);
     assert.deepEqual(app.sent.map(m=>m.type),['browser-capture','browser-transfer']);
     assert.equal(app.sent[0].browserProof.etag,'"v1"');
     assert.equal(app.sent[1].operation,'accept');
     assert.equal(app.downloadHistory.length,0);
   }finally{app.stopWorker()}
+});
+test('successful startup timing is local, bounded and contains no source identifiers', async () => {
+  const localData = { vesperStartupTimings: Array.from({ length: 64 }, () => ({ kind: 'startup-timing' })) };
+  const app = load({ 'browser-capture': started, 'browser-transfer': transfer('active') }, {
+    diagnosticBuild: 'timing-test', localData, earlyFetch: async () => earlyHeaders()
+  });
+  try {
+    const reply = await app.message({ type: 'early-download', url: earlyUrl, clickAt: Date.now() - 10 }, earlySender);
+    assert.equal(reply.ok, true);
+    await new Promise(resolve => setImmediate(resolve));
+    const entries = app.localData.vesperStartupTimings;
+    assert.equal(entries.length, 64);
+    const last = entries.at(-1);
+    assert.equal(last.kind, 'startup-timing');
+    assert.equal(last.build, 'timing-test');
+    assert.equal(last.facts.clickToAcceptMs, reply.timing.clickToAcceptMs);
+    assert.deepEqual(Object.keys(last).sort(), ['build', 'facts', 'kind', 'utc']);
+    assert.ok(!JSON.stringify(last).includes('example.com'));
+  } finally { app.stopWorker(); }
 });
 test('public GitHub archives use the correct codeload URL even without size or a strong validator', async () => {
   const page = 'https://github.com/owner/project';

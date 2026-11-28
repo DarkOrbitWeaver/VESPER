@@ -444,6 +444,20 @@ public class PacingTests
     }
 
     [Fact]
+    public void Advisor_preserves_fast_responses_and_scales_wire_windows()
+    {
+        const long MiB = 1024 * 1024;
+        Assert.False(ConnectionAdvisor.WorthParallelProbe(1, 200 * MiB, 500 * MiB));
+        Assert.True(ConnectionAdvisor.WorthParallelProbe(1, MiB, 6 * MiB));
+        Assert.True(ConnectionAdvisor.WorthParallelProbe(1, 200 * MiB, 2048 * MiB));
+        Assert.False(ConnectionAdvisor.WorthParallelProbe(1, double.NaN, 2048 * MiB));
+        Assert.Equal(16 * MiB, ConnectionAdvisor.ResponseWindowBytes(0));
+        Assert.Equal(8 * MiB, ConnectionAdvisor.ResponseWindowBytes(MiB));
+        Assert.Equal(64 * MiB, ConnectionAdvisor.ResponseWindowBytes(16 * MiB));
+        Assert.Equal(128 * MiB, ConnectionAdvisor.ResponseWindowBytes(200 * MiB));
+    }
+
+    [Fact]
     public void Advisor_never_changes_faster_than_the_ramp_interval() =>
         Assert.Equal(1, new ConnectionAdvisor(8).Recommend(1, 5_000_000, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(3)));
 

@@ -383,7 +383,8 @@ public sealed class DashTransferTests
             Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
         Assert.True(added.Ok, added.Message);
         await server.FirstFragmentStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await h.WaitAsync(added.JobId, _ => server.Hits("/av-2.m4s") == 1);
+        await h.WaitAsync(added.JobId, job => server.Hits("/av-2.m4s") == 1
+            && job.ProgressBytes >= Fixture("av-init.mp4").LongLength);
         h.Engine.Pause(added.JobId);
         var paused = await h.WaitForStateAsync(added.JobId, JobState.Paused);
         Assert.Null(paused.FinalPath);

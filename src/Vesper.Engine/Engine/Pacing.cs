@@ -253,6 +253,24 @@ public sealed class ConnectionAdvisor
     internal const long SmallFileMinimum = 1024 * 1024;
     internal const long SmallSplitMinimum = 256 * 1024;
 
+    // A probe costs a request and may cut an already productive response.
+    // Fast streams need a longer remaining horizon to justify that cost.
+    internal static bool WorthParallelProbe(int active, double rate, long remaining)
+    {
+        if (!double.IsFinite(rate) || rate <= 0 || remaining <= 0) return false;
+        double horizon = active > 1 ? 2 : rate >= 64 * 1024 * 1024 ? 8 : 3;
+        return remaining / rate > horizon;
+    }
+
+    // Keep a bounded time horizon rather than issuing many tiny requests
+    // on fast connections. Unknown rates begin with a moderate window.
+    internal static long ResponseWindowBytes(double rate)
+    {
+        const long MiB = 1024 * 1024;
+        return !double.IsFinite(rate) || rate <= 0 ? 16 * MiB
+            : (long)Math.Clamp(rate * 4, 8 * MiB, 128 * MiB);
+    }
+
     internal static bool WorthSmallFileSplit(long received, long remaining, TimeSpan elapsed)
     {
         // Measure from the first response, not from DNS/TLS or the resolving phase.
