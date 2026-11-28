@@ -112,6 +112,21 @@ test('a damaged or foreign record is discarded rather than trusted', async () =>
   }
 });
 
+test('one generation cannot inflate route experience across concurrent requests or reloads', async () => {
+  const { experience, data } = load();
+  const start = Date.now();
+  await Promise.all(Array.from({length: 8}, () => experience.note('media.example', 'observed', 'refused', start, 'doc:player:1')));
+  assert.equal((await experience.standing('media.example', 'observed', start)).refused, 1);
+  const reopened = load(data);
+  await reopened.experience.note('media.example', 'observed', 'refused', start, 'doc:player:1');
+  assert.equal((await reopened.experience.standing('media.example', 'observed', start)).refused, 1);
+  await reopened.experience.note('media.example', 'observed', 'verified', start, 'doc:player:1');
+  await reopened.experience.note('media.example', 'observed', 'verified', start, 'doc:player:1');
+  assert.equal((await reopened.experience.standing('media.example', 'observed', start)).verified, 1);
+  assert.equal((await reopened.experience.standing('media.example', 'observed', start)).refused, 0);
+  assert.doesNotMatch(JSON.stringify(reopened.data), /media\.example|doc:player|observed/);
+});
+
 test('clearing forgets everything', async () => {
   const { experience, data } = load();
   await experience.note('files.example', 'takeover', 'refused');

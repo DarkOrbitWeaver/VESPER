@@ -117,6 +117,48 @@ public sealed class MediaDeliveryHistoryTests
     }
 
     [Fact]
+    public void RepeatedProgramCopiesDoNotManufactureIndependentRouteEvidence()
+    {
+        var history = new MediaDeliveryHistory();
+        for (int i = 0; i < 12; i++)
+        {
+            var good = Job("generic", JobKind.Http, true);
+            good.OriginalPageUrl = "https://media.example/watch";
+            good.MediaId = "same-program";
+            history.Observe(good);
+            var bad = Job("generic", JobKind.Hls, false);
+            bad.OriginalPageUrl = good.OriginalPageUrl;
+            bad.MediaId = good.MediaId;
+            history.Observe(bad);
+        }
+        Assert.Null(history.Preferred("generic", Both, Now, pageUrl: "https://media.example/watch"));
+        for (int i = 0; i < 5; i++)
+        {
+            foreach (var (kind, success) in new[] { (JobKind.Http, true), (JobKind.Hls, false) })
+            {
+                var row = Job("generic", kind, success);
+                row.OriginalPageUrl = "https://media.example/watch";
+                row.MediaId = "independent-" + i;
+                history.Observe(row);
+            }
+        }
+        Assert.Equal(JobKind.Http, history.Preferred("generic", Both, Now, pageUrl: "https://media.example/watch"));
+    }
+
+    [Fact]
+    public void UnverifiedLengthOrInvalidDigestCannotTeachSuccessfulDelivery()
+    {
+        var history = new MediaDeliveryHistory();
+        var uncertain = Job("adapter", JobKind.Http, true);
+        uncertain.Reason = "unverified-length";
+        var invalid = Job("adapter", JobKind.Http, true);
+        invalid.PublishedSha256 = new string('z', 64);
+        history.Observe(uncertain);
+        history.Observe(invalid);
+        Assert.Equal(0, history.Count);
+    }
+
+    [Fact]
     public void BoundedHistoryForgetsRemovedRecordsAndIgnoresOldObservations()
     {
         var history = new MediaDeliveryHistory();

@@ -666,7 +666,7 @@ function singleVideoPlayer(app, page) {
       responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
     const before = app.sent.length;
     const reply = await app.message({ type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: 'blob:player',
-      generation, playerPlaying: true, mediaChangedAt: changedAt }, sender);
+      generation, playerKey: 'player-1', playerPlaying: true, mediaChangedAt: changedAt }, sender);
     return { reply, asked: app.sent.slice(before).map(message => message.type) };
   };
 }

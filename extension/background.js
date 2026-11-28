@@ -1169,7 +1169,7 @@ function rememberSourceSelections(sources, context) {
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
       seen: source.seen, validator: source.validator, bytes: source.bytes, minimumLength: source.minimumLength,
       rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
-      sliceEvidence: source.sliceEvidence,
+      sliceEvidence: source.sliceEvidence, experienceCase: source.experienceCase,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
     return source.verified
       ? verifiedSourceLabel({ ...source, token }, source.verified)
@@ -1697,7 +1697,10 @@ async function playerOptions(message, sender) {
     const lookupStrategy = auth.authorized ? 'page-lookup-signed' : 'page-lookup';
     if (prefetch) return pageLookup();
     const bothRoutes = !!singleVideo && possibleSources.length > 0;
-    const trafficStrategy = 'observed-lookup';
+    const trafficStrategy = 'observed-lookup-v2';
+    const experienceCase = sender.documentId && typeof message.playerKey === 'string' && message.playerKey.length <= 100
+      && Number.isInteger(message.generation) && message.generation > 0
+      ? [sender.documentId, frame, message.playerKey, message.generation].join(':') : null;
     let adapterPromising = true;
     if (bothRoutes) {
       const [promising, adapterScore, trafficScore] = await Promise.all([
@@ -1715,7 +1718,8 @@ async function playerOptions(message, sender) {
       lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
       const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
         : LOOKUP_REFUSALS.includes(reply.code) ? 'refused' : null;
-      return bothRoutes && outcome ? VesperExperience.note(page.hostname, lookupStrategy, outcome).catch(() => {}) : undefined;
+      return bothRoutes && outcome && experienceCase
+        ? VesperExperience.note(page.hostname, lookupStrategy, outcome, Date.now(), experienceCase).catch(() => {}) : undefined;
     };
     let trafficWork;
     const startTraffic = () => {
@@ -1807,14 +1811,22 @@ async function playerOptions(message, sender) {
       const ordered = association.nodes.map(node => node.entry);
       const usable = distinctVerifiedDeliveries(association.nodes.filter(node => node.compatible).map(node => node.entry),
         auth.authorized === true);
-      if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) return association.selected.reply;
+      if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) {
+        if (bothRoutes && experienceCase)
+          await VesperExperience.note(page.hostname, trafficStrategy, 'verified', Date.now(), experienceCase).catch(() => {});
+        return association.selected.reply;
+      }
       // Timing found these, so the user confirms which one is this player, even when only one
       // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
       // A matching duration or label does not prove two URLs are the same source.
       if (usable.length > 0) {
-        if (bothRoutes) await VesperExperience.note(page.hostname, trafficStrategy, 'verified').catch(() => {});
+        // A verified list may still describe a different program. Do not
+        // reward traffic until an independently bound selection is confirmed.
         const sourceChoices = rememberSourceSelections(usable.map(result =>
-          ({ ...result.source, verified: result.reply })), context);
+          ({ ...result.source, verified: result.reply,
+            experienceCase: bothRoutes && experienceCase && association.nodes.some(node =>
+              node.entry === result && node.compatible && (node.direct || node.witnessed)
+              && !result.source.group && !result.source.sliceEvidence) ? experienceCase : null })), context);
         const labels = new Map();
         for (const choice of sourceChoices) {
           const key = choice.displayLabel;
@@ -1923,8 +1935,12 @@ async function selectMediaSource(message, sender) {
     candidateUrls: (selection.group || [selection]).map(source => source.url) });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
   const expiry = Date.parse(selection.verified?.data?.formatsExpireAt || '');
-  if (!auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)) return selection.verified;
-  return explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
+  const reply = !auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)
+    ? selection.verified
+    : explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
+  if (selection.experienceCase && reply?.ok && reply.data?.choices?.length)
+    await VesperExperience.note(page.hostname, 'observed-lookup-v2', 'verified', Date.now(), selection.experienceCase).catch(() => {});
+  return reply;
 }
 
 async function confirmOrStartBrowserChoice(choice) {

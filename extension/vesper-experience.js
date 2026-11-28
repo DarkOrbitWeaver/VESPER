@@ -15,7 +15,7 @@ const VesperExperience = (() => {
   let writes = Promise.resolve();
 
   const hex = bytes => Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-  const fresh = () => ({ salt: crypto.randomUUID(), entries: {} });
+  const fresh = () => ({ salt: crypto.randomUUID(), entries: {}, receipts: {} });
 
   function load() {
     state ??= chrome.storage.local.get(KEY).then(saved => {
@@ -25,8 +25,14 @@ const VesperExperience = (() => {
       const entries = {};
       for (const [key, entry] of Object.entries(value.entries).slice(0, MAX_ENTRIES))
         if (/^[0-9a-f]{24}$/.test(key) && Array.isArray(entry) && entry.length === 3
-            && entry.every(Number.isFinite) && entry[0] >= 0 && entry[1] >= 0) entries[key] = entry;
-      return { salt: value.salt, entries };
+            && entry.every(Number.isFinite) && entry[0] >= 0 && entry[0] <= MAX_WEIGHT
+            && entry[1] >= 0 && entry[1] <= MAX_WEIGHT && entry[2] >= 0 && entry[2] <= Date.now() + 2000)
+          entries[key] = entry;
+      const receipts = {};
+      for (const [key, at] of Object.entries(value.receipts || {}).slice(0, MAX_ENTRIES))
+        if (/^[0-9a-f]{24}$/.test(key) && Number.isFinite(at) && at >= Date.now() - 86400_000
+            && at <= Date.now() + 2000) receipts[key] = at;
+      return { salt: value.salt, entries, receipts };
     }).catch(fresh);
     return state;
   }
@@ -49,6 +55,10 @@ const VesperExperience = (() => {
       keys.sort((a, b) => memory.entries[a][2] - memory.entries[b][2]);
       for (const key of keys.slice(0, keys.length - MAX_ENTRIES)) delete memory.entries[key];
     }
+    const cutoff = Date.now() - 86400_000;
+    for (const key of Object.keys(memory.receipts)) if (memory.receipts[key] < cutoff) delete memory.receipts[key];
+    const receipts = Object.keys(memory.receipts).sort((a, b) => memory.receipts[a] - memory.receipts[b]);
+    for (const key of receipts.slice(0, Math.max(0, receipts.length - MAX_ENTRIES))) delete memory.receipts[key];
     writes = writes.catch(() => {}).then(() => chrome.storage.local.set({ [KEY]: memory }));
     return writes;
   }
@@ -71,12 +81,17 @@ const VesperExperience = (() => {
     return refused < STAND_DOWN || verified >= refused;
   }
 
-  async function note(site, strategy, outcome, now = Date.now()) {
+  async function note(site, strategy, outcome, now = Date.now(), caseKey = null) {
     if (outcome !== 'verified' && outcome !== 'refused') return;
     const loaded = load();
     const memory = await loaded;
     const key = await keyFor(memory, site, strategy);
-    if (!key || state !== loaded) return;
+    const receipt = caseKey === null ? null : await keyFor(memory, caseKey, 'receipt:' + key + ':' + outcome);
+    if (!key || state !== loaded || caseKey !== null && !receipt) return;
+    // Reopening the same picker or replaying a reply is not independent experience.
+    // One refusal and one subsequent success can be learned for a generation.
+    if (receipt && memory.receipts[receipt] >= now - 86400_000) return;
+    if (receipt) memory.receipts[receipt] = now;
     const [verified, refused] = memory.entries[key] ? faded(memory.entries[key], now) : [0, 0];
     // A positive outcome clears refusal history for this strategy.
     memory.entries[key] = outcome === 'verified'

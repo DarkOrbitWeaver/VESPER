@@ -10,7 +10,8 @@ internal sealed class MediaDeliveryHistory
     private const int Capacity = 256;
     private static readonly TimeSpan Lifetime = TimeSpan.FromDays(30);
     private readonly Dictionary<Guid, Observation> _observations = [];
-    private readonly record struct Observation(string Provider, string? OriginKey, JobKind Kind, bool Completed, DateTime At, long Bytes = 0, double BytesPerSecond = 0);
+    private readonly record struct Observation(string Provider, string? OriginKey, JobKind Kind, bool Completed, DateTime At,
+        string? AssetKey, long Bytes = 0, double BytesPerSecond = 0);
     private readonly record struct Route(JobKind Kind, int Total, int Completed)
     {
         public double Rate => (double)Completed / Total;
@@ -29,7 +30,8 @@ internal sealed class MediaDeliveryHistory
         }
 
         bool complete = job.State == JobState.Completed && job.CompletedUtc is not null
-            && job.PublishedSha256 is { Length: 64 } && job.TotalBytes is > 0;
+            && job.PublishedSha256 is { Length: 64 } digest && digest.All(Uri.IsHexDigit)
+            && job.TotalBytes is > 0 && job.Reason != "unverified-length";
         bool failed = job.State == JobState.NeedsAttention
             && job.Reason is "media-validation" or "range-ignored" or "range-rejected" or "html" or "invalid-container" or "not-playlist";
         if (!complete && !failed)
@@ -46,10 +48,15 @@ internal sealed class MediaDeliveryHistory
             _observations.Remove(oldest.Key);
         }
         string? originKey = OriginKey(job.OriginalPageUrl);
+        string? assetKey = originKey is not null && job.MediaId is { Length: > 0 and <= 512 } mediaId
+            ? Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(originKey + "\n" + provider + "\n" + mediaId)))
+            : null;
         if (_observations.TryGetValue(job.Id, out var previous)
-            && previous.Provider == provider && previous.OriginKey == originKey && previous.Kind == job.Kind && previous.Completed == complete && previous.At == at)
+            && previous.Provider == provider && previous.OriginKey == originKey && previous.Kind == job.Kind
+            && previous.Completed == complete && previous.At == at && previous.AssetKey == assetKey)
             return;
-        _observations[job.Id] = new(provider, originKey, job.Kind, complete, at);
+        _observations[job.Id] = new(provider, originKey, job.Kind, complete, at, assetKey);
     }
 
     // An active, unrestricted native run is a performance observation, not a media identity label.
@@ -77,8 +84,16 @@ internal sealed class MediaDeliveryHistory
     {
         var kinds = available.Distinct().Where(kind => kind is JobKind.Http or JobKind.Hls or JobKind.Dash).ToArray();
         if (kinds.Length < 2) return null;
-        var recent = _observations.Values.Where(value => value.At >= now - Lifetime && value.At <= now
+        var eligible = _observations.Values.Where(value => value.At >= now - Lifetime && value.At <= now
             && kinds.Contains(value.Kind)).ToArray();
+        // Multiple copies of the same known program are not independent
+        // reliability trials. Keep the latest outcome per program and route.
+        // Unknown identity remains ordinary delivery evidence, never an identity label.
+        var recent = eligible.Where(value => value.AssetKey is null).Concat(eligible
+            .Where(value => value.AssetKey is not null)
+            .GroupBy(value => (value.AssetKey, value.Kind))
+            .Select(group => group.OrderByDescending(value => value.At).ThenBy(value => value.Completed).First()))
+            .ToArray();
 
         string? key = OriginKey(pageUrl);
         if (key is not null)
