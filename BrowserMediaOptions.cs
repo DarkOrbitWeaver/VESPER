@@ -349,7 +349,7 @@ internal sealed partial class BrowserBridgeHandler
         return BridgeResponse.Success(requestId, data: new
         {
             playbackMatches,
-            mediaSession = session.ToString("N"), formatsExpireAt = formatsExpire, deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, duration = item.Duration?.TotalSeconds,
+            mediaSession = session.ToString("N"), formatsExpireAt = formatsExpire, deliveryFingerprint, deliveryRecipeFingerprints, deliveryTrackFingerprint, item.Title, item.Provider, item.MediaId, item.VerifiedPostId, duration = item.Duration?.TotalSeconds,
             isLive = item.IsLive,
             thumbnail = item.Thumbnail is { Scheme: "https" } thumb ? thumb.AbsoluteUri : null,
             choices = presets, originalChoices = originalPresets.SequenceEqual(presets) ? [] : originalPresets, audioM4a, audioOutputs, more = exact,

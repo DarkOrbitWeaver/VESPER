@@ -21,6 +21,8 @@ public sealed record MediaItem
     public required Uri SourceUrl { get; init; }
     public required string Provider { get; init; }
     public string? MediaId { get; init; }
+    /// <summary>Post identifier confirmed by the provider response, not copied from the requested URL.</summary>
+    public string? VerifiedPostId { get; init; }
     public string Title { get; init; } = "";
     public string? Description { get; init; }
     public string? Uploader { get; init; }

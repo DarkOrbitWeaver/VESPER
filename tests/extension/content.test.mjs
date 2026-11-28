@@ -1230,7 +1230,7 @@ test('TikTok feed identity comes from the exact live player wrapper, not the hom
   const start = content.indexOf('  function activeTikTokPage(');
   const end = content.indexOf('  function setIntentCertainty(', start);
   const location = { hostname:'www.tiktok.com', origin:'https://www.tiktok.com' };
-  const context = vm.createContext({location, URL});
+  const context = vm.createContext({location, URL, visiblePlayer:player=>!player.hidden});
   vm.runInContext(source('player-source'),context);
   const identify = vm.runInContext(content.slice(start,end)+'\nactiveTikTokPage;',context);
   const player = {tagName:'VIDEO'};
@@ -1242,6 +1242,8 @@ test('TikTok feed identity comes from the exact live player wrapper, not the hom
   assert.equal(identify(player,permalink),permalink);
   wrapper.id = 'xgwrapper-0-7608248907960814880';
   assert.equal(identify(player,permalink),location.origin+'/embed/v2/7608248907960814880');
+  wrapper.querySelectorAll = ()=>[player,{hidden:true}];
+  assert.equal(identify(player,root),location.origin+'/embed/v2/7608248907960814880');
   wrapper.querySelectorAll = ()=>[player,{}];
   assert.equal(identify(player,root),null);
   wrapper.querySelectorAll = ()=>[player];

@@ -130,7 +130,7 @@ public class SiteAdapterTests
         string page = $$$"""
             <script data-sjs>{"if_not_gated_logged_out":{"code":"OtherReel","video_url":"{{{unrelated}}}"}}</script>
             <script data-sjs>{"if_not_gated_logged_out":{"video_url":"{{{unlabelled}}}"}}</script>
-            <script data-sjs>{"if_not_gated_logged_out":{"shortcode":"FixtureCode","video_url":"{{{requested}}}"}}</script>
+            <script data-sjs>{"if_not_gated_logged_out":{"shortcode":"FixtureCode","id":"123456789","video_url":"{{{requested}}}"}}</script>
             """;
         var h = new FakeHttpHandler().Add(InstagramPage, page)
             .AddMedia(unrelated, "video/mp4", 1000)
@@ -141,6 +141,8 @@ public class SiteAdapterTests
 
         Assert.True(result.IsSuccess, result.Error?.Diagnostic);
         Assert.Equal(requested, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        Assert.Equal("123456789", result.Item.MediaId);
+        Assert.Equal("FixtureCode", result.Item.VerifiedPostId);
         Assert.DoesNotContain(h.Requests, request => request.Url.AbsoluteUri == unrelated || request.Url.AbsoluteUri == unlabelled);
     }
 

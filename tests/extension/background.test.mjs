@@ -382,6 +382,14 @@ test('Chrome misses omit private windows, deliberately excluded sites, and pause
   }
 });
 
+test('browser and native diagnostic field allowlists agree',()=>{
+  const js=readFileSync(new URL('../../extension/diagnostics.js',import.meta.url),'utf8');
+  const cs=readFileSync(new URL('../../src/Vesper.Engine/Bridge/BridgeProtocol.cs',import.meta.url),'utf8');
+  const client=js.match(/const failureFields = new Set\(\[([\s\S]*?)\]\)/)[1];
+  const server=cs.match(/DiagnosticFields =\s*\[([\s\S]*?)\];/)[1];
+  assert.deepEqual([...client.matchAll(/'([^']+)'/g)].map(m=>m[1]).sort(),[...server.matchAll(/"([^"]+)"/g)].map(m=>m[1]).sort());
+});
+
 test('browser failure diagnostics survive a worker restart and export once when the helper is back', async () => {
   const file = { ...activeDownload(), url: 'https://cdn.test/download/private-name.patch?token=URL-SECRET', bytesReceived: 7 };
   const first = load({}, { download: file, diagnosticBuild: '2.0.0-old' });
@@ -423,6 +431,41 @@ test('browser failure diagnostics survive a worker restart and export once when 
     assert.doesNotMatch(JSON.stringify(batch), /SECRET|PRIVATE_USER|123456789|private-name|user-name/);
     assert.ok(second.localData.vesperFailureLog.every(entry => entry.exported));
   } finally { second.stopWorker(); }
+});
+
+test('one invalid diagnostic does not block valid entries and a new build retries the rejected entry',async()=>{
+  const entry=(id,code)=>({id,utc:Date.now(),build:'aaa.30',kind:'media-failed',code,facts:{contentBuild:'aaa.30',witnessPaths:10}});
+  const bad=entry('bad','invalid-entry'),good=entry('good','no-reusable-source');
+  const app=load({'browser-diagnostics':msg=>msg.entries.some(e=>e.id==='bad')?{ok:false,code:'invalid'}:{ok:true}},
+    {diagnosticBuild:'aaa.31',localData:{vesperFailureLog:[bad,good]}});
+  try{
+    await app.evaluate('exportPendingFailures()');
+    assert.equal(app.localData.vesperFailureLog[0].exportRejected,'aaa.31');
+    assert.equal(app.localData.vesperFailureLog[1].exported,true);
+    await app.evaluate('exportPendingFailures()');
+    assert.equal(app.sent.filter(m=>m.type==='browser-diagnostics').length,3);
+  }finally{app.stopWorker()}
+  const next=load({'browser-diagnostics':{ok:true}},{diagnosticBuild:'aaa.32',localData:app.localData});
+  try{
+    await next.evaluate('exportPendingFailures()');
+    assert.equal(next.localData.vesperFailureLog[0].exported,true);
+    assert.equal(next.sent[0].entries.length,1);
+  }finally{next.stopWorker()}
+});
+
+test('temporary diagnostic failure schedules a worker-surviving retry',async()=>{
+  let available=false;
+  const app=load({'browser-diagnostics':()=>available?{ok:true}:{ok:false,code:'host-error'}},{diagnosticBuild:'aaa.31'});
+  try{
+    await app.evaluate("recordFailure('media-failed','no-reusable-source','https://example.test/','blob:x',{witnessPaths:0})");
+    await app.evaluate('exportPendingFailures()');
+    assert.equal(app.localData.vesperFailureLog[0].exported,undefined);
+    assert.equal(await app.evaluate("chrome.alarms.get('vesper-failure-export')")!==undefined,true);
+    available=true;
+    app.advanceTime(60000);
+    await app.evaluate('exportPendingFailures()');
+    assert.equal(app.localData.vesperFailureLog[0].exported,true);
+  }finally{app.stopWorker()}
 });
 
 test('upgrade releases only a legacy zero-byte pause after its native transfer stops', async () => {
@@ -1546,6 +1589,97 @@ test('service-worker playback never becomes an HTTP replay or passive prefetch',
     assert.equal((await app.message({...request,type:'browser-body-media-proof'},sender)).ok,false);
     assert.equal(app.sent.length,0);
   } finally {app.stopWorker();}
+});
+
+test('controlled object playback can independently resolve a specific post but never replay its HTTP media',async()=>{
+  const page='https://www.youtube.com/watch?v=abcdefghijk';
+  const sender={url:page,tab:{id:91},frameId:0,documentId:'sw-post'};
+  for(const [provider,id,duration,allowed] of [['youtube','abcdefghijk',61,true],['youtube','wrongvideo1',61,false],
+    ['generic','abcdefghijk',61,false],['youtube','abcdefghijk',120,false],['youtube','abcdefghijk',null,false]]){
+    const reply=checkedSource(duration);
+    Object.assign(reply.data,{provider,mediaId:id});
+    const app=load({'media-options':reply,'media-select':{ok:true}});
+    const scope={pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.youtube.com/player',
+      playerKey:'player-1',generation:1,mediaChangedAt:Date.now(),playerHasMedia:true,
+      serviceWorkerPlayback:true,playerFacts:{durationSeconds:61,kind:'video',height:720}};
+    try{
+      assert.equal((await app.message({type:'media-options',...scope,prefetch:true},sender)).data.prefetchSkipped,true);
+      const result=await app.message({type:'media-options',...scope},sender);
+      assert.equal(result.ok,allowed);
+      assert.equal(app.sent[0].candidates,undefined);
+      if(allowed){
+        const chosen=await app.message({type:'media-select',...scope,mediaSession:reply.data.mediaSession,formatChoice:0,mode:'download'},sender);
+        assert.equal(chosen.ok,true);
+        const stale=await app.message({type:'media-select',...scope,generation:2,mediaSession:reply.data.mediaSession,formatChoice:0,mode:'download'},sender);
+        assert.equal(stale.ok,false);
+      }
+    }finally{app.stopWorker()}
+  }
+});
+
+test('controlled X playback offers independently verified sources only after explicit confirmation',async()=>{
+  const page='https://x.com/creator/status/123456789',url='https://video.twimg.com/ext_tw_video/123456789/pu/pl/master.m3u8';
+  const sender={url:page,tab:{id:92},frameId:0,documentId:'controlled-x'};
+  const app=load({'media-source-options':checkedSource(61,'720p MP4 with audio'),'media-select':{ok:true}});
+  const scope={pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://x.com/player',playerKey:'player-1',
+    generation:1,mediaChangedAt:Date.now(),playerHasMedia:true,serviceWorkerPlayback:true,
+    playerFacts:{durationSeconds:61,height:720,kind:'video'},playerFragmentUrls:['https://video.twimg.com/ext_tw_video/123456789/pu/pl/seg.m4s']};
+  try{
+    await app.onMedia({url,tabId:92,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'xmlhttprequest',
+      timeStamp:scope.mediaChangedAt,responseHeaders:responseHeaders({'Content-Type':'application/vnd.apple.mpegurl'})});
+    await app.onMedia({url:'https://video.twimg.com/ext_tw_video/999999999/pu/pl/master.m3u8',tabId:92,frameId:0,documentId:sender.documentId,
+      method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:scope.mediaChangedAt,responseHeaders:responseHeaders({'Content-Type':'application/vnd.apple.mpegurl'})});
+    const result=await app.message({type:'media-options',...scope},sender);
+    assert.equal(result.ok,true);
+    assert.equal(result.data.choices,undefined);
+    assert.equal(result.data.sourceChoices.length,1);
+    assert.equal(result.data.sourceChoices[0].requiresConfirmation,true);
+    assert.equal(result.data.sourceChoices[0].fingerprint,undefined);
+    assert.equal(app.sent[0].candidates[0].url,url);
+    assert.equal(app.sent.length,1);
+    const choice=await app.message({type:'media-source-select',...scope,sourceChoice:result.data.sourceChoices[0].token},sender);
+    assert.equal(choice.ok,true);
+    assert.equal((await app.message({type:'media-select',...scope,mediaSession:choice.data.mediaSession,formatChoice:0,mode:'download'},sender)).ok,true);
+    assert.equal((await app.message({type:'media-select',...scope,generation:2,mediaSession:choice.data.mediaSession,formatChoice:0,mode:'download'},sender)).ok,false);
+  }finally{app.stopWorker()}
+});
+
+test('controlled Facebook worker candidate requires a lone player, exact duration and explicit confirmation',async()=>{
+  const page='https://www.facebook.com/reel/123456789',url='https://cdn.test/movie.mp4?sig=opaque';
+  const sender={url:page,tab:{id:93},frameId:0,documentId:'controlled-worker'};
+  const app=load({'media-source-options':checkedSource(61,'720p MP4 with audio'),'media-select':{ok:true}});
+  const scope={pageUrl:page,playerPageUrl:page,playerUrl:'',playerKey:'player-1',workerMediaSource:true,multiplePlayers:false,
+    generation:1,mediaChangedAt:Date.now(),playerHasMedia:true,serviceWorkerPlayback:true,
+    playerFacts:{durationSeconds:61,height:720,kind:'video'}};
+  try{
+    await app.onMedia({url,tabId:93,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'xmlhttprequest',
+      timeStamp:scope.mediaChangedAt,responseHeaders:responseHeaders({'Content-Type':'video/mp4','Content-Length':'900000','ETag':'"v1"'})});
+    assert.equal((await app.message({type:'media-options',...scope,multiplePlayers:true},sender)).ok,false);
+    const result=await app.message({type:'media-options',...scope},sender);
+    assert.equal(result.ok,true);
+    assert.equal(result.data.sourceChoices[0].independentConfirmation,true);
+    assert.equal((await app.message({type:'media-source-select',...scope,multiplePlayers:true,sourceChoice:result.data.sourceChoices[0].token},sender)).ok,false);
+    const selected=await app.message({type:'media-source-select',...scope,sourceChoice:result.data.sourceChoices[0].token},sender);
+    assert.equal(selected.ok,true);
+    assert.equal((await app.message({type:'media-select',...scope,multiplePlayers:true,mediaSession:selected.data.mediaSession,formatChoice:0,mode:'download'},sender)).ok,false);
+    assert.equal((await app.message({type:'media-select',...scope,mediaSession:selected.data.mediaSession,formatChoice:0,mode:'download'},sender)).ok,true);
+  }finally{app.stopWorker()}
+});
+
+test('Instagram independent post resolution uses verified shortcode, not numeric media id',async()=>{
+  const page='https://www.instagram.com/reel/FixtureCode/';
+  const sender={url:page,tab:{id:94},frameId:0,documentId:'controlled-ig'};
+  for(const verifiedPostId of ['FixtureCode','OtherCode',undefined]){
+    const reply=checkedSource(61);
+    Object.assign(reply.data,{provider:'instagram',mediaId:'123456789',verifiedPostId});
+    const app=load({'media-options':reply});
+    try{
+      const result=await app.message({type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'blob:https://www.instagram.com/player',
+        playerKey:'player-1',generation:1,mediaChangedAt:Date.now(),playerHasMedia:true,serviceWorkerPlayback:true,
+        playerFacts:{durationSeconds:61,height:720,kind:'video'}},sender);
+      assert.equal(result.ok,verifiedPostId==='FixtureCode');
+    }finally{app.stopWorker()}
+  }
 });
 
 test('worker-only player declaration is a confirmation choice, not an observed source', async () => {

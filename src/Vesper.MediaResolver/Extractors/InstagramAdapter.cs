@@ -19,7 +19,7 @@ internal sealed class InstagramAdapter : AdapterBase
     private sealed record EmbeddedVideo(string MediaId, int Index, string? Title, string? Description,
         string? Uploader, Uri? Thumbnail, double? DurationSeconds, List<MediaCandidate> Candidates);
     private sealed record EmbeddedPageMedia(IReadOnlyList<EmbeddedVideo> Videos, bool IsCarousel,
-        int SlideCount, bool Truncated, string? Caption, string? Uploader);
+        int SlideCount, bool Truncated, string? Caption, string? Uploader, string? VerifiedPostId);
 
     public static readonly AdapterDescriptor Descriptor = new(
         "instagram", "Instagram", Matches, svc => new InstagramAdapter(svc),
@@ -71,7 +71,8 @@ internal sealed class InstagramAdapter : AdapterBase
             return MediaDiscoveryResult.FromItem(item with
             {
                 Provider = "instagram",
-                MediaId = embedded?.Videos.FirstOrDefault()?.MediaId ?? target.MediaId
+                MediaId = embedded?.Videos.FirstOrDefault()?.MediaId ?? target.MediaId,
+                VerifiedPostId = embedded?.VerifiedPostId
             }, result.Warnings, result.Notes);
         if (result.Collection is not null) return result;
 
@@ -215,7 +216,7 @@ internal sealed class InstagramAdapter : AdapterBase
                     }
                     if (videos.Count > 0)
                     {
-                        var candidate = new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader);
+                        var candidate = new EmbeddedPageMedia(videos, true, slideCount, truncated, caption, uploader, null);
                         if (useImmediately) return candidate;
                         if (unlabelled is null) unlabelled = candidate;
                         else if (!SameSources(unlabelled, candidate)) competing = true;
@@ -226,7 +227,7 @@ internal sealed class InstagramAdapter : AdapterBase
                 EmbeddedVideo? single = ReadVideo(media, target.MediaId, 0, caption, uploader, Math.Min(MaxVideoChoices, maxCandidates));
                 if (single is not null)
                 {
-                    var candidate = new EmbeddedPageMedia([single], false, 1, false, caption, uploader);
+                    var candidate = new EmbeddedPageMedia([single], false, 1, false, caption, uploader, hasShortcode ? code : null);
                     if (useImmediately) return candidate;
                     if (unlabelled is null) unlabelled = candidate;
                     else if (!SameSources(unlabelled, candidate)) competing = true;

@@ -574,10 +574,10 @@ public static class BridgeProtocol
     [
         "stage", "attempt", "job", "browserId", "state", "method", "status", "mime", "bytes", "total",
         "proof", "attachment", "ranges", "redirected", "query", "named", "signedIn", "reuse", "native", "finalRoute",
-        "chromeError", "chromeStarted", "routeMatch", "elapsedMs", "nativeMs",
-        "source", "ready", "generation", "playing", "height", "durationMs", "preview", "refresh", "quick",
+        "chromeError", "chromeStarted", "routeMatch", "elapsedMs", "nativeMs", "dispatchMs", "probeMs", "acceptMs",
+        "source", "ready", "generation", "playing", "height", "durationMs", "preview", "refresh", "quick", "serviceWorker",
         "boundPlayer", "boundPost", "responses", "exactMatches", "candidates", "postLookup", "observedLookups",
-        "witnesses", "tracks", "completeTracks", "retainedBytes", "bodyProof", "attemptedBody", "subtitleFailures"
+        "witnesses", "witnessPaths", "objectKind", "contentBuild", "tracks", "completeTracks", "retainedBytes", "bodyProof", "attemptedBody", "subtitleFailures"
     ];
 
     private static bool TryBrowserDiagnostics(JsonElement root, out List<BrowserDiagnostic> entries)

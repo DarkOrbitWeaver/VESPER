@@ -200,6 +200,10 @@ function recoverChromeDownloads() {
 }
 
 chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === FAILURE_EXPORT_ALARM) {
+    logRetryAfter = 0;
+    return exportPendingFailures();
+  }
   if (alarm.name === RECOVERY_ALARM) return recoverChromeDownloads().catch(() => {});
   if (alarm.name === SOURCE_EXPIRY_ALARM) return pruneObservedSources().catch(() => {});
 });

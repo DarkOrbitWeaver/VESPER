@@ -53,7 +53,8 @@ function setup() {
     finish(value) { this.value = value; this.readyState = 4; this.status = 200; this.dispatchEvent(new Event('loadend')); }
     get responseType() { return 'arraybuffer'; }
     get response() { return this.value; }
-    getResponseHeader(name) { return name === 'content-type' ? 'video/mp4' : ''; }
+    getAllResponseHeaders() { return 'content-type: video/mp4\r\n'; }
+    getResponseHeader(name) { throw new Error('Unexpected direct header read: '+name); }
   }
   const context = vm.createContext({ URL: WitnessURL, MediaSource: Source, SourceBuffer: Buffer, btoa,
     HTMLMediaElement: Player, Response: FetchResponse, XMLHttpRequest: Xhr, WeakRef, ArrayBuffer, Blob,

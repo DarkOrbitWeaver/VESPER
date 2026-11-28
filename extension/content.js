@@ -570,7 +570,7 @@
     for (let node = el.parentElement, depth = 0; node && depth < 12; node = node.parentElement, depth++) {
       const match = /^xgwrapper-\d+-(\d{10,24})$/.exec(node.id || '');
       if (!match) continue;
-      const videos = node.querySelectorAll('video');
+      const videos = [...node.querySelectorAll('video')].filter(player => player === el || visiblePlayer(player, 110, 70));
       if (videos.length !== 1 || videos[0] !== el) return null;
       const id = 'tiktok:' + match[1];
       if (VesperPlayerSource.identity(contextPage) === id) return contextPage;
@@ -678,6 +678,10 @@
       const intent = (globalThis.VesperInference || VesperIntelligence).rankPlayers(eligible);
       setIntentCertainty(intent.decisive);
       best = players.get(intent.selected);
+      // Presentation is not authority to download. Keep the unique active
+      // social video accessible even if the inference model abstains.
+      if (socialFeed && playing.length === 1 && !interacted.some(c => c.id !== playing[0].id))
+        best = players.get(playing[0].id);
     }
     if (best) {
       const same = best === video;
@@ -1063,6 +1067,11 @@
       if (!alive() || butterflyHidden() || document.hidden || document.fullscreenElement || player.paused
           || player.currentTime <= time || !visiblePlayer(player, 220, 140)
           || video === player && host?.isConnected && button?.classList.contains('show')) return;
+      if (!panelMedia && !manualPlayer && !drag && !advertisementContext(player)) {
+        consider(player);
+        selectPlayer(true);
+        if (video === player && host?.isConnected && button?.classList.contains('show')) return;
+      }
       lastPlacementFailure = Date.now();
       void reportMediaFailure('placement', 'butterfly-missing', { player, generation: playback.get(player)?.generation },
         { state: video === player ? 'hidden' : video ? 'different-player' : 'unattached' });
@@ -1522,8 +1531,8 @@
     if (!fillsWidth || !fillsHeight) return false;
     const display = window.screen;
     // The parent can fullscreen a cross-origin iframe without setting fullscreenElement inside it.
-    if (display && Math.abs(display.width - innerWidth) <= 8 && Math.abs(display.height - innerHeight) <= 8) return true;
     if (VesperPlayerSource.isSocialFeedSite(pageAddress())) return false;
+    if (display && Math.abs(display.width - innerWidth) <= 8 && Math.abs(display.height - innerHeight) <= 8) return true;
     for (let node = video, depth = 0; node && depth < 6; node = composedParent(node), depth++) {
       if (getComputedStyle(node).position === 'fixed') return true;
     }
@@ -2157,7 +2166,7 @@
     formats.playerLive = playerFacts?.live === true || formats.isLive === true;
     const pickerDuration = formats.playerLive ? null : formats.duration ?? duration;
     if (formats.sourceChoices?.length) {
-      if (formats.sourceChoices.some(source => source.requiresConfirmation)) {
+      if (formats.sourceChoices.some(source => source.requiresConfirmation && !source.independentConfirmation)) {
         lookup.workerConfirmation = true;
         lookup.workerManifest = attachedManifest?.href || '';
         if (formats.sourceChoices.some(source => source.requiresDeclaration) && !lookup.workerManifest
@@ -2945,6 +2954,7 @@
       ...extra, stage, attempt: lookup?.attempt, elapsedMs: lookup?.started ? Date.now() - lookup.started : undefined,
       source: /^blob:/i.test(src) ? 'blob' : VesperPlayerSource.http(src) ? 'http' : player?.srcObject ? 'object' : 'none',
       ready: player?.readyState, generation: lookup?.generation, playing: player && !player.paused && !player.ended,
+      serviceWorker: player ? serviceWorkerPlayback(player) : undefined,
       height: player?.videoHeight, durationMs: Number.isFinite(player?.duration) ? Math.round(player.duration * 1000) : undefined,
       preview: !!lookup?.preview || extra.preview, witnesses: witness?.fingerprints?.length,
       tracks: tracks?.length, completeTracks: tracks?.filter(track => track.bufferedComplete).length,

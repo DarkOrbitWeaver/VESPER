@@ -337,6 +337,14 @@ public sealed class BrowserStartupBenchmarkTests
                 Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length + archiveRows.Length, engine.Snapshots().Count);
                 Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length + archiveRows.Length, Directory.GetFiles(downloads).Length);
                 Assert.Equal(0, result.RootElement.GetProperty("chromeDownloads").GetInt32());
+                string diagnosticId = result.RootElement.GetProperty("diagnosticId").GetString()!;
+                string diagnostic = Assert.Single(engine.ReadLog(), line => line.Contains(diagnosticId, StringComparison.OrdinalIgnoreCase));
+                Assert.Contains("qa-controlled-source", diagnostic);
+                Assert.Contains("\"contentBuild\":\"2.0.0-aaa.30\"", diagnostic);
+                Assert.Contains("\"objectKind\":\"MediaSourceHandle\"", diagnostic);
+                Assert.DoesNotContain("SECRET", diagnostic);
+                Assert.DoesNotContain("123456789", diagnostic);
+                Console.WriteLine("DIAGNOSTIC_ROUNDTRIP verified: exactly one scrubbed row");
             }
             finally { bridge.CloseResolver(); }
         }

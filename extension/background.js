@@ -36,6 +36,7 @@ function nativeRequest(message, timeoutMs = 330000) {
   return VesperNativeSession.request(HOST, message, timeoutMs).then(reply => {
     if (message.type === 'hello' && reply?.ok) {
       logRetryAfter = 0;
+      if (typeof reply.data?.build === 'string' && reply.data.build.length <= 128) logPeerBuild = reply.data.build;
       scheduleFailureExport();
     }
     return reply;
@@ -456,16 +457,23 @@ async function formatEvidence(selection, selectedEvidence) {
   if (selection.workerDeclaration) return { kind: 'worker-declaration', digest: await evidenceDigest(selection.url) };
   if (selection.workerObserved) return { kind: 'worker-observed', digest: await evidenceDigest(selection.workerEvidence),
     changedAt: selection.workerChangedAt, player: selection.workerPlayerFacts };
-  return { kind: 'observed', members: await Promise.all(selectedEvidence.map(async item => ({
+  return { kind: 'observed', ...(selection.independentObject ? {independentObject:true, independentWorker:selection.independentWorker === true} : {}), members: await Promise.all(selectedEvidence.map(async item => ({
     digest: await evidenceDigest(evidenceSignature(item)), seen: item.seen
   }))) };
 }
 
 async function matchesFormatEvidence(guard, message, sender) {
-  if (!guard || typeof guard.kind !== 'string' || message.serviceWorkerPlayback === true) return false;
+  if (!guard || typeof guard.kind !== 'string') return false;
+  if (message.serviceWorkerPlayback === true && guard.kind !== 'independent-post'
+      && !(guard.independentObject && !VesperPlayerSource.http(message.playerUrl))) return false;
+  if (guard.independentObject && (message.serviceWorkerPlayback !== true || sender.tab?.incognito
+      || guard.independentWorker && (message.workerMediaSource !== true || message.multiplePlayers !== false))) return false;
   if (guard.signed && (sender.tab?.incognito || !await signInEnabled())) return false;
   if (sender.tab?.incognito && guard.kind.startsWith('worker-')) return false;
   if (!await refreshNeverCaptureHosts() || matchesNeverCaptureHost({url:mediaPage(message, sender)?.href,referrer:sender.url})) return false;
+  if (guard.kind === 'independent-post')
+    return message.serviceWorkerPlayback === true && !VesperPlayerSource.http(message.playerUrl)
+      && VesperPlayerSource.identity(mediaPage(message, sender)?.href) === guard.identity;
   if (guard.kind === 'page') {
     const url = VesperPlayerSource.http(message.playerUrl);
     if ((url && matchesNeverCaptureHost({url:url.href,referrer:sender.url}))
@@ -1276,9 +1284,15 @@ function rememberSourceSelections(sources, context) {
       detail: new URL(source.url).hostname + (sources.length > 1 ? ' · Source ' + (index + 1) : '')
         + ' · Unconfirmed player match'
     };
-    return source.verified
+    const label = source.verified
       ? verifiedSourceLabel({ ...source, token }, source.verified)
       : sourceLabel({ ...source, token });
+    if (context.independentObject) {
+      delete label.fingerprint;
+      label.requiresConfirmation = label.independentConfirmation = true;
+      label.displayDetail = [label.displayDetail, 'Unconfirmed player match'].filter(Boolean).join(' · ');
+    }
+    return label;
   });
 }
 
@@ -1590,6 +1604,69 @@ function playerActiveForWatch(message) {
   return message.playerPlaying === true || message.playerHasMedia === true;
 }
 
+// The resolver may verify an independently downloadable rendition of
+// controlled playback without claiming that it is the service worker's bytes.
+// Only explicit source confirmation can authorize a subsequent format choice.
+function independentMediaMatch(player, reply) {
+  const facts = VesperMediaEvidence.mediaFacts(reply);
+  return !!reply?.ok && !!reply.data?.choices?.length && !!facts.durationSeconds
+    && facts.live !== true && (player.kind === 'audio' ? facts.hasAudio === true
+      : facts.hasVideo === true || !!facts.height)
+    && VesperMediaEvidence.matchesPlayback(player, facts);
+}
+
+async function independentObjectOptions(message, sender, page, player) {
+  if (sender.tab?.incognito || !sender.documentId || !Number.isSafeInteger(sender.tab?.id)
+      || !/^player-\d{1,12}$/.test(message.playerKey || '') || !Number.isSafeInteger(message.generation)
+      || message.generation < 1 || !player.durationSeconds || player.live === true || !playerActiveForWatch(message)
+      || (!/^blob:/i.test(message.playerUrl || '') && message.workerMediaSource !== true)) return null;
+  const now = Date.now(), frame = sender.frameId ?? 0, tab = sender.tab.id;
+  const changedAt = message.mediaChangedAt;
+  if (!Number.isFinite(changedAt) || changedAt <= 0 || changedAt > now + 1000) return null;
+  const state = await tabState(tab);
+  const scoped = state.sources.filter(item => item.documentId === sender.documentId && (item.frameId ?? 0) === frame
+    && item.seen >= now - sourceLifetime(item) && item.seen <= now + 1000
+    && !item.conflictingValidator && (VesperEvidenceGraph.expiresAt(item.url) ?? Infinity) > now);
+  const exact = await matchPlaybackFingerprints(scoped, message.playerResourceFingerprints);
+  const paths = new Set((Array.isArray(message.playerFragmentUrls) ? message.playerFragmentUrls : []).slice(0,12)
+    .map(VesperPlayerSource.http).filter(url=>url && !url.search).map(url=>url.origin+url.pathname));
+  const fragments = [...paths].map(value=>{const u=new URL(value);return {host:u.host,parts:u.pathname.split('/').filter(Boolean)}});
+  // An opaque dedicated worker has no window-level append witness. A
+  // single visible player permits a bounded explicit source confirmation,
+  // never automatic identity or a training label.
+  const worker = message.workerMediaSource === true && message.multiplePlayers === false;
+  const recent = item => item.seen >= Math.max(changedAt - 15000, now - 120000);
+  const eligible = item => ['hls','dash'].includes(item.kind) || isWholeDirectSource(item) || isRangedMediaCandidate(item);
+  const variants = new Map();
+  for(const item of scoped){
+    const u=VesperPlayerSource.http(item.url);
+    if(u){const key=u.origin+u.pathname;variants.set(key,(variants.get(key)||0)+1);}
+  }
+  const bound = item => {
+    const u=VesperPlayerSource.http(item.url), key=u && u.origin+u.pathname;
+    return exact.has(item.url) || recent(item) && (paths.has(key) && variants.get(key)===1
+      || ['hls','dash'].includes(item.kind) && fragmentAffinity(item.url,fragments)>0);
+  };
+  const candidates = scoped.filter(item=>eligible(item) && (bound(item) || worker && recent(item)));
+  if(exact.size || worker){
+    const slices=observedSliceCandidates(scoped.filter(item=>!worker || exact.size || recent(item)),exact);
+    for(const item of slices) if(!candidates.some(other=>other.url===item.url)) candidates.push(item);
+  }
+  if(!candidates.length) return null;
+  const identity=VesperPlayerSource.identity(page.href);
+  const ranked=groupObservedAssets(rankObservedSources(candidates,changedAt,new Set(),fragments,exact),identity);
+  if(worker && !exact.size && !paths.size && ranked.length>5) return null;
+  const options=ranked.filter(item=>!(item.group||[item]).some(member=>matchesNeverCaptureHost({url:member.url,referrer:sender.url}))).slice(0,VERIFY_LIMIT);
+  const auth=await mediaAuthorization(page.href,sender,{userGesture:true,candidateUrls:options.flatMap(item=>(item.group||[item]).map(member=>member.url))});
+  const checked=await verifyObservedSerial(options,{auth,pageUrl:page.href,title:message.title,tab,
+    deadline:Date.now()+VERIFY_DEADLINE_MS},VERIFY_LIMIT);
+  const usable=distinctVerifiedDeliveries(checked.filter(result=>independentMediaMatch(player,result.reply)),auth.authorized===true);
+  if(!usable.length) return bestRefusal(checked) || null;
+  const context={identity,tab,frame,documentId:sender.documentId,generation:message.generation,playerKey:message.playerKey,
+    playerUrl:message.playerUrl || '',playerFacts:player,title:message.title,signed:auth.authorized===true,independentObject:true,independentWorker:worker && !exact.size && !paths.size};
+  return {ok:true,data:{title:message.title,sourceChoices:rememberSourceSelections(usable.map(result=>({...result.source,verified:result.reply})),context)}};
+}
+
 async function playerOptions(message, sender) {
   const page = mediaPage(message, sender);
   if (!page) return { ok: false, code: 'invalid', message: 'This page cannot be inspected.' };
@@ -1622,7 +1699,35 @@ async function playerOptions(message, sender) {
     if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
     if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:page.href,referrer:sender.url}))
       return { ok:false, code:'blocked', message:'VESPER could not confirm that this site permits native acquisition.' };
-    return { ok:false, code:'no-reusable-source', message:'The browser service worker may transform the playback bytes. Only a complete retained playback copy can be verified.' };
+    // A page controller is not proof that a post-specific resolver is unsafe.
+    // Never replay the potentially transformed HTTP resource here. On an
+    // explicit click, independently resolve the exact post, with no browser
+    // media hints or CDN credentials, and check the returned program ID.
+    const match = /^(youtube|tiktok|instagram):([\w-]+)$/.exec(identity || '');
+    const post = match && (match[1] !== 'instagram'
+      || ['reel','reels'].includes(VesperPlayerSource.instagramPost(page.pathname.split('/').filter(Boolean))?.kind));
+    if (!source && post && sender.documentId && message.generation > 0
+        && playerActiveForWatch(message) && player.durationSeconds && player.live !== true) {
+      const auth = await mediaAuthorization(page.href, sender, {userGesture:true});
+      const reply = explainMediaProtocol(await nativeRequest(envelope('media-options', {
+        ...auth, url:page.href, pageTitle:message.title
+      }), 60000));
+      if (reply?.ok && reply.data?.choices?.length && reply.data.provider === match[1]
+          && (match[1] === 'instagram' ? reply.data.verifiedPostId : reply.data.mediaId) === match[2]
+          && VesperMediaEvidence.mediaFacts(reply).durationSeconds
+          && VesperMediaEvidence.mediaFacts(reply).live !== true && VesperMediaEvidence.matchesPlayback(player, VesperMediaEvidence.mediaFacts(reply)))
+        return withFormatEvidence(reply, {kind:'independent-post', identity, signed:auth.authorized === true});
+      if (reply?.ok) return {ok:false, code:'source-changed', message:'The independently resolved post could not be matched to this playback.'};
+      if (['site-refused','sign-in','blocked','rate-limited','desktop-version-mismatch','protected','host-missing','host-error','app-unavailable'].includes(reply?.code)) return reply;
+      const alternative = await independentObjectOptions(message,sender,page,player);
+      return alternative || reply;
+    }
+    if (!source) {
+      const alternative=await independentObjectOptions(message,sender,page,player);
+      if(alternative) return alternative;
+    }
+    return { ok:false, code:'no-reusable-source', message:'The browser service worker may transform the playback bytes. Only an independently identified post or a complete retained playback copy can be verified.',
+      data:{mediaFailure:{boundPlayer:binding,boundPost:!!post,postLookup:'service-worker'}} };
   }
   if (prefetch && (message.workerMediaSource === true || VesperPlayerSource.blocksPassiveProbe(page.href) || message.refresh === true
       || sender.tab?.active === false || sender.tab?.incognito || !sender.documentId || !binding
@@ -2110,13 +2215,15 @@ async function selectBrowserFile(message, sender) {
 }
 
 async function selectMediaSource(message, sender) {
-  if (message.serviceWorkerPlayback === true) return { ok:false, code:'expired-selection', message:'Refresh the formats for the current video.' };
   const token = message.sourceChoice;
   const selection = sourceSelections.get(token);
   if (!selection || selection.expires <= Date.now()) {
     sourceSelections.delete(token);
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   }
+  if (message.serviceWorkerPlayback === true && !selection.independentObject) return expiredFormats();
+  if (selection.independentObject && (message.serviceWorkerPlayback !== true || sender.tab?.incognito
+      || selection.independentWorker && (message.workerMediaSource !== true || message.multiplePlayers !== false))) return expiredFormats();
   const page = mediaPage(message, sender);
   if (!page || selection.tab !== sender.tab?.id || selection.frame !== (sender.frameId ?? 0)
       || selection.documentId !== sender.documentId || selection.identity !== VesperPlayerSource.identity(page.href)
@@ -2184,7 +2291,8 @@ async function selectMediaSource(message, sender) {
     ? selection.verified
     : explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
   if (reply?.ok && reply.data?.choices?.length
-      && !VesperMediaEvidence.matchesPlayback(selection.playerFacts || {}, VesperMediaEvidence.mediaFacts(reply)))
+      && (selection.independentObject ? !independentMediaMatch(selection.playerFacts,reply)
+        : !VesperMediaEvidence.matchesPlayback(selection.playerFacts || {}, VesperMediaEvidence.mediaFacts(reply))))
     return { ok: false, code: 'source-changed', message: 'The selected source no longer matches this playback.' };
   const finalGuard = { ...guard, signed: auth.authorized === true };
   if (!await matchesFormatEvidence(finalGuard, message, sender)) return expiredFormats();
@@ -2457,6 +2565,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
+  scheduleFailureExport();
   await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({ id: 'vesper-smart', title: 'Smart Select files with VESPER', contexts: ['page'] });
   chrome.contextMenus.create({ id: 'vesper-download', title: 'Download with VESPER', contexts: ['link', 'video', 'audio'] });

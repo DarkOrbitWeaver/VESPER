@@ -89,7 +89,7 @@ async function evaluate(sessionId, expression) {
   if (response.exceptionDetails) throw Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text);
   return response.result?.value;
 }
-const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer']);
+const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer','browser-diagnostics']);
 if (publicMedia || retainedMedia) for (const type of ['media-options','media-source-options','media-select','media-selection-status','browser-diagnostics','browser-body']) allowed.add(type);
 try {
   await mkdir(chromeFolder,{recursive:true});
@@ -209,6 +209,11 @@ try {
   await until(()=>evaluate(worker,'globalThis.__vesperQaReady===true'),15000);
   const preflight=await evaluate(worker,"nativeRequest(envelope('hello'),12000)");
   assert(preflight?.ok,'QA transport preflight failed: '+JSON.stringify({preflight,relayEvents,browserErrors}));
+  const diagnostic=await evaluate(worker,"recordFailure('media-failed','qa-controlled-source','https://www.facebook.com/reel/123456789?token=SECRET','blob:https://www.facebook.com/private',{stage:'formats',contentBuild:'2.0.0-aaa.30',objectKind:'MediaSourceHandle',serviceWorker:true,witnessPaths:10,dispatchMs:8,probeMs:15,acceptMs:42,cookie:'SECRET'})");
+  assert(diagnostic?.id);
+  await evaluate(worker,'exportPendingFailures()');
+  await until(()=>evaluate(worker,'(async()=>((await chrome.storage.local.get("vesperFailureLog")).vesperFailureLog||[]).some(e=>e.id==='+JSON.stringify(diagnostic.id)+'&&e.exported))()'),15000);
+  await evaluate(worker,'exportPendingFailures()');
   await evaluate(worker,'VesperNativeSession.close()');
   calls.length=0;
   relayEvents.length=0;
@@ -387,7 +392,7 @@ try {
     assert.equal(chromeDownloads,0);
     assert.deepEqual(await readdir(chromeFolder),[]);
   }
-  await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,archiveRows,chromeDownloads}));
+  await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,archiveRows,chromeDownloads,diagnosticId:diagnostic.id}));
 } catch(error) {
   throw Error(error.message+' '+JSON.stringify({relayEvents:relayEvents.slice(-30),browserErrors,chromeDownloads,calls:calls.slice(-30).map(({key,...row})=>row)}),{cause:error});
 } finally {

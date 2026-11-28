@@ -14,7 +14,7 @@ public sealed class DiagnosticsTests
              "entries":[{"id":"29414d50-bf70-4cb8-bdfa-f9be14bb3cbf","utc":1704067200000,
               "build":"2.0.0-aaa.7","kind":"media-failed","code":"site-refused",
               "page":"https://www.instagram.com/reel/*","resource":"https://cdn.test/*.mp4",
-              "facts":{"stage":"formats","native":"site-refused","status":403,"bodyProof":"mse","observedLookups":"source-changed,site-refused"}}]}
+              "facts":{"stage":"formats","native":"site-refused","status":403,"bodyProof":"mse","observedLookups":"source-changed,site-refused","contentBuild":"2.0.0-aaa.30","objectKind":"MediaSourceHandle","witnessPaths":10,"dispatchMs":8,"probeMs":15,"acceptMs":42}}]}
             """;
         Assert.True(BridgeProtocol.TryParse(message, out var request, out string error), error);
         Assert.False(BridgeProtocol.TryParse(message.Replace("/reel/*", "/reel/*?token=SECRET"), out _, out _));
@@ -28,6 +28,8 @@ public sealed class DiagnosticsTests
         Assert.StartsWith("2024-01-01T00:00:00", line);
         Assert.Contains("2.0.0-aaa.7", line);
         Assert.Contains("\"status\":403", line);
+        Assert.Contains("\"contentBuild\":\"2.0.0-aaa.30\"", line);
+        Assert.Contains("\"witnessPaths\":10", line);
     }
 
     [Fact]

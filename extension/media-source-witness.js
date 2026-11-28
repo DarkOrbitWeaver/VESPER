@@ -458,7 +458,6 @@
               const val = apply(respDesc.get, this, []);
               try {
                 if (this.readyState === 4 && this.status >= 200 && this.status < 300) {
-                  const ct = this.getResponseHeader('content-type') || '';
                   if (this.responseType === 'arraybuffer' || this.responseType === 'blob') {
                     const meta = requestMeta.get(this);
                     // Reading the same completed XHR again is not new traffic.
@@ -467,12 +466,18 @@
                     meta.observed = true;
                     meta.completedAt ??= now();
                     if (now() - meta.completedAt > TTL) return val;
+                    // Enumerate only CORS-visible headers, once per media body.
+                    const headers = new Map(String(this.getAllResponseHeaders?.() || '').split(/\r?\n/).map(line => {
+                      const at = line.indexOf(':');
+                      return at > 0 ? [line.slice(0, at).trim().toLowerCase(), line.slice(at + 1).trim()] : ['', ''];
+                    }));
+                    const ct = headers.get('content-type') || '';
                     const desc = describeNetworkSource(
                       this.responseURL || meta?.url || '',
                       ct,
-                      this.getResponseHeader('content-range') || '',
+                      headers.get('content-range') || '',
                       meta?.rangeHeader || '',
-                      this.getResponseHeader('content-length')
+                      headers.get('content-length')
                     );
                     if (desc) rememberBuffer(val, desc, undefined, meta.completedAt);
                   }
