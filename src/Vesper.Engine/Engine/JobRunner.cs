@@ -531,6 +531,8 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
         long lastChange = Stopwatch.GetTimestamp();
         long startingBytes = session.RunBytes;
         long sampleBytes = startingBytes;
+        int samplePopulation = target;
+        bool wasLimited = false;
         bool smallProbeStarted = false;
         try
         {
@@ -545,20 +547,37 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                     target = 1;
                     lastChange = Stopwatch.GetTimestamp();
                     sampleBytes = session.RunBytes;
+                    samplePopulation = 1;
+                    advisor.ResetMeasurement();
                 }
 
                 if (segmented && board.HasWork)
                 {
                     int active = workers.Count(w => !w.Task.IsCompleted && !w.Draining);
+                    int running = workers.Count(w => !w.Task.IsCompleted);
                     TimeSpan interval = Job.Identity == IdentityLevel.StrongEtag && !pieceMode
                         ? TimeSpan.FromMilliseconds(Math.Min(_o.RampInterval.TotalMilliseconds, 800)) : _o.RampInterval;
                     TimeSpan elapsed = Stopwatch.GetElapsedTime(lastChange);
                     long bytes = session.RunBytes - sampleBytes;
                     double rate = elapsed.TotalSeconds > 0 ? bytes / elapsed.TotalSeconds : 0;
                     bool limited = session.Limiter.BytesPerSecond > 0 || engine.GlobalLimiter.BytesPerSecond > 0;
+                    if (limited != wasLimited)
+                    {
+                        advisor.ResetMeasurement();
+                        wasLimited = limited;
+                    }
+                    // Discard samples spanning a worker start, drain or rate-limit transition.
+                    if (active != samplePopulation || running != active || limited)
+                    {
+                        lastChange = Stopwatch.GetTimestamp();
+                        sampleBytes = session.RunBytes;
+                        samplePopulation = active;
+                    }
                     if (limited) target = 1;
-                    else if (active == target && elapsed >= interval && bytes > 0
-                        && board.RemainingBytes / rate > 2 && bytes >= 64 * 1024)
+                    else if (active == target && running == active && active == samplePopulation
+                        && elapsed >= interval && bytes >= 64 * 1024 && rate > 0
+                        && board.RemainingBytes / rate > 2
+                        && Stopwatch.GetElapsedTime(lastChange) >= interval)
                     {
                         target = advisor.Recommend(active, rate, elapsed, interval);
                         lastChange = Stopwatch.GetTimestamp();
@@ -575,6 +594,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                         else break;
                         lastChange = Stopwatch.GetTimestamp();
                         sampleBytes = session.RunBytes;
+                        samplePopulation = workers.Count(w => !w.Task.IsCompleted && !w.Draining);
                     }
                 }
                 if (adaptiveSmall && (session.Limiter.BytesPerSecond > 0 || engine.GlobalLimiter.BytesPerSecond > 0))

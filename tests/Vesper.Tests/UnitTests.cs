@@ -396,9 +396,51 @@ public class PacingTests
         n = advisor.Recommend(n, 1_800_000, enough, ramp);
         Assert.Equal(4, n);
         n = advisor.Recommend(n, 1_850_000, enough, ramp);
-        Assert.Equal(4, n);
-        Assert.Equal(4, advisor.Recommend(n, 1_900_000, enough, ramp));
+        Assert.Equal(2, n); // extra workers added almost no throughput
+        Assert.Equal(2, advisor.Recommend(n, 1_900_000, enough, ramp));
         Assert.Equal(2, advisor.OnThrottled(4));
+    }
+
+    [Fact]
+    public void Advisor_rejects_flat_or_degraded_bandwidth_probes()
+    {
+        var interval = TimeSpan.FromSeconds(1);
+        foreach (double rate in new[] { 1_020_000d, 800_000d })
+        {
+            var advisor = new ConnectionAdvisor(8);
+            Assert.Equal(2, advisor.Recommend(1, 1_000_000, interval, interval));
+            Assert.Equal(1, advisor.Recommend(2, rate, interval, interval));
+            Assert.Equal(1, advisor.Recommend(1, 1_000_000, interval, interval));
+            advisor.ResetMeasurement();
+            Assert.Equal(2, advisor.Recommend(1, 1_000_000, interval, interval));
+        }
+    }
+
+    [Fact]
+    public void Advisor_measures_the_actual_initial_population_and_ignores_invalid_samples()
+    {
+        var interval = TimeSpan.FromSeconds(1);
+        var advisor = new ConnectionAdvisor(8);
+        Assert.Equal(2, advisor.Recommend(2, double.NaN, interval, interval));
+        Assert.Equal(3, advisor.Recommend(2, 1_000_000, interval, interval));
+        Assert.Equal(2, advisor.Recommend(3, 1_000_000, interval, interval));
+    }
+
+    [Fact]
+    public void Advisor_reclaims_connections_on_a_shared_bandwidth_plateau()
+    {
+        var clock = new ManualTimeProvider();
+        var interval = TimeSpan.FromSeconds(1);
+        var advisor = new ConnectionAdvisor(8, clock);
+        Assert.Equal(3, advisor.Recommend(2, 1_000_000, interval, interval));
+        Assert.Equal(2, advisor.Recommend(3, 1_010_000, interval, interval));
+        Assert.Equal(2, advisor.Recommend(2, 1_000_000, interval, interval));
+        clock.Advance(TimeSpan.FromSeconds(11));
+        Assert.Equal(1, advisor.Recommend(2, 1_000_000, interval, interval));
+        Assert.Equal(1, advisor.Recommend(1, 990_000, interval, interval));
+        clock.Advance(TimeSpan.FromSeconds(11));
+        Assert.Equal(2, advisor.Recommend(1, 990_000, interval, interval));
+        Assert.Equal(4, advisor.Recommend(2, 1_900_000, interval, interval));
     }
 
     [Fact]

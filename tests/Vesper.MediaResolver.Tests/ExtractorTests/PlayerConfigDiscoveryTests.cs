@@ -165,6 +165,43 @@ public class PlayerConfigDiscoveryTests
         Assert.Equal(Target, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
     }
 
+    [Theory]
+    [InlineData("https://player-config.example/watch/9007199254740993")]
+    [InlineData("https://player-config.example/watch?id=9007199254740993")]
+    public async Task ExactNumericProgramIdentitySelectsOnlyItsOwnMedia(string page)
+    {
+        var config = new { items = new[]
+        {
+            new { id = 9007199254740992L, video_url = Decoy },
+            new { id = 9007199254740993L, video_url = Target }
+        }};
+        var h = new FakeHttpHandler().Add(page, "<script type=\"application/json\">" +
+            JsonSerializer.Serialize(config) + "</script>", "text/html")
+            .AddMedia(Target, "video/mp4", 4096).AddMedia(Decoy, "video/mp4", 4096);
+        using var resolver = T.Resolver(h);
+        var result = await resolver.ResolveAsync(T.Req(page), CancellationToken.None);
+        Assert.True(result.IsSuccess, result.Error?.Diagnostic);
+        Assert.Equal(Target, Assert.Single(result.Item!.Representations).Url.AbsoluteUri);
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsoluteUri == Decoy);
+    }
+
+    [Fact]
+    public async Task UnusableMatchedProgramCannotSelectAnUnrelatedNeighbour()
+    {
+        string page = Page + "/9007199254740993";
+        var config = new { items = new[]
+        {
+            new { id = 9007199254740992L, video_url = Decoy },
+            new { id = 9007199254740993L, video_url = "blob:unavailable" }
+        }};
+        var h = new FakeHttpHandler().Add(page, "<script type=\"application/json\">" +
+            JsonSerializer.Serialize(config) + "</script>", "text/html").AddMedia(Decoy, "video/mp4", 4096);
+        using var resolver = T.Resolver(h);
+        var result = await resolver.ResolveAsync(T.Req(page), CancellationToken.None);
+        Assert.False(result.IsSuccess);
+        Assert.DoesNotContain(h.Requests, request => request.Url.AbsoluteUri == Decoy);
+    }
+
     private static FakeHttpHandler Handler(string body) => new FakeHttpHandler()
         .Add(Page, body, "text/html").AddMedia(Target, "video/mp4", 4096).AddMedia(Decoy, "video/mp4", 4096);
     private static FakeHttpHandler Config(object config) => Handler("<script type=\"application/json\">" +

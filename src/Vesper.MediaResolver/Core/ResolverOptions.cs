@@ -17,6 +17,9 @@ public sealed class ResolverOptions
     /// <summary>Called once per completed lookup; measurements contain no source URLs.</summary>
     public Action<DiscoveryMeasurement>? Measurement { get; init; }
 
+    /// <summary>Optional local, salted route-outcome history. No media addresses or credentials are stored.</summary>
+    public string? RouteHistoryPath { get; init; }
+
     public int MaxRedirects { get; init; } = 5;
     public int MaxConcurrentRequests { get; init; } = 4;
 

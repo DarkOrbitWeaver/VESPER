@@ -17,11 +17,12 @@ internal sealed class PlayerConfigDiscovery
     private const int MaxGroups = 32;
     private int _remaining = 32_768;
     private bool _incomplete;
+    private int _unresolvedAffinity;
 
     private sealed record ScoredGroup(List<MediaCandidate> Candidates, int Affinity, string? Title, double? DurationSeconds, Uri? Thumbnail, List<SubtitleTrack> Subtitles);
     private readonly List<ScoredGroup> _groups = [];
 
-    internal bool HasEvidence => _groups.Count > 0 || _incomplete;
+    internal bool HasEvidence => _groups.Count > 0 || _incomplete || _unresolvedAffinity > 0;
 
     internal string? BestTitle => PickBestGroup()?.Title;
     internal double? BestDurationSeconds => PickBestGroup()?.DurationSeconds;
@@ -35,6 +36,7 @@ internal sealed class PlayerConfigDiscovery
     {
         if (_incomplete || _groups.Count == 0) return null;
         var ordered = _groups.OrderByDescending(group => group.Affinity).ToArray();
+        if (_unresolvedAffinity > 0 && ordered[0].Affinity <= _unresolvedAffinity) return null;
         return ordered.Length == 1 || ordered[0].Affinity > ordered[1].Affinity ? ordered[0] : null;
     }
 
@@ -118,7 +120,7 @@ internal sealed class PlayerConfigDiscovery
 
             if (prop.Value.ValueKind == JsonValueKind.String && prop.Value.GetString() is { Length: > 0 and <= 300 } strVal)
             {
-                if (norm is "id" or "videoid" or "shortcode" or "code" or "slug" or "awemeid" or "bvid" or "mediaid" or "clipid" or "postid")
+                if (norm is "id" or "videoid" or "shortcode" or "code" or "slug" or "awemeid" or "bvid" or "mediaid" or "clipid" or "postid" or "itemid")
                 {
                     if (pageTokens.Contains(strVal)) localAffinity += 30;
                 }
@@ -130,6 +132,13 @@ internal sealed class PlayerConfigDiscovery
                 {
                     thumbnail ??= UrlUtil.Resolve(baseUri, strVal);
                 }
+            }
+            else if (prop.Value.ValueKind == JsonValueKind.Number && norm is "id" or "videoid" or "mediaid" or "clipid" or "postid" or "itemid")
+            {
+                // Preserve exact decimal IDs, even beyond JavaScript's safe integer range.
+                string id = prop.Value.GetRawText();
+                if (id.Length is >= 4 and <= 80 && id.All(char.IsAsciiDigit) && pageTokens.Contains(id))
+                    localAffinity += 30;
             }
             else if (prop.Value.ValueKind == JsonValueKind.Number && norm is "duration" or "videoduration" or "lengthseconds" or "durationms")
             {
@@ -215,6 +224,12 @@ internal sealed class PlayerConfigDiscovery
             }
         }
 
+        // An explicitly matched program with an unusable declared source must
+        // not silently fall back to an unrelated neighbouring program.
+        if (group.Count == 0 && localAffinity > inheritedAffinity
+            && (DirectMediaKeys.Any(props.ContainsKey) || StreamArrayKeys.Any(props.ContainsKey)))
+            _unresolvedAffinity = Math.Max(_unresolvedAffinity, localAffinity);
+
         if (group.Count > 0)
         {
             int score = localAffinity;
@@ -296,6 +311,7 @@ internal sealed class PlayerConfigDiscovery
         "hls" or "hlsurl" or "hlsmanifesturl" or "m3u8" or "m3u8url" => "application/vnd.apple.mpegurl",
         "dash" or "dashurl" or "dashmanifesturl" or "mpd" or "mpdurl" => "application/dash+xml",
         "mp4" or "mp4url" or "videoversions" or "playaddr" or "downloadaddr" or "progressive" => declared ?? "video/mp4",
+        "videourl" => declared ?? "video/*",
         "audiourl" or "audiosources" => declared ?? "audio/mp4",
         _ => declared
     };

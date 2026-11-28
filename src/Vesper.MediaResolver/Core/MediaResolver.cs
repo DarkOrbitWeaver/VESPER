@@ -19,7 +19,7 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
     private readonly HttpMessageHandler? _handler;
     private readonly IReadOnlyList<AdapterDescriptor> _descriptors;
     private readonly RulePackStore _rulePacks;
-    private readonly OnlineLearner _routeLearner = new();
+    private readonly Lazy<OnlineLearner> _routeLearner;
     private readonly object _gate = new();
     private readonly Dictionary<string, IMediaSourceAdapter> _adapters = new(StringComparer.Ordinal);
     private ResolverServices? _services;
@@ -29,6 +29,7 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
     public DefaultMediaResolver(ResolverOptions? options = null, HttpMessageHandler? handler = null, IEnumerable<AdapterDescriptor>? adapters = null)
     {
         _options = options ?? new ResolverOptions();
+        _routeLearner = new(() => new OnlineLearner(_options.RouteHistoryPath));
         _handler = handler;
         _rulePacks = new RulePackStore(_options.RulePackDirectory, _options.RulePackPublicKeySpki);
         _descriptors = [DeclarativeExtractorAdapter.CreateDescriptor(_rulePacks), .. (adapters ?? AdapterRegistry.Default)];
@@ -192,7 +193,8 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
         bool hasAlternative = matches.Length >= 2 && matches[0].Id == "declarative-pack";
         if (hasAlternative)
         {
-            string? preferred = _routeLearner.SelectBestRoute(request.Url.IdnHost, [matches[1].Id, matches[0].Id]);
+            string? preferred = _routeLearner.Value.SelectBestRoute(request.Url.GetLeftPart(UriPartial.Authority),
+                [matches[1].Id, matches[0].Id], svc.Now);
             if (preferred == matches[1].Id) (matches[0], matches[1]) = (matches[1], matches[0]);
         }
         for (int index = 0; index < matches.Length; index++)
@@ -203,7 +205,12 @@ public sealed class DefaultMediaResolver : IMediaResolver, IDisposable
                 || answer.Error is { Code: MediaErrorCode.NoDownloadableMedia, BrowserMayHelp: true }
                 || answer.Error?.Code == MediaErrorCode.UnsupportedSite;
             if (hasAlternative && index < 2 && (answer.IsSuccess || fallback))
-                _routeLearner.RecordRouteOutcome(request.Url.IdnHost, descriptor.Id, answer.IsSuccess);
+            {
+                // A route only gets a positive outcome after its answer passes
+                // final validation. This is not a label for correct media identity.
+                bool usable = answer.IsSuccess && ResultFinalizer.Finalize(answer, _options, svc.Now).IsSuccess;
+                _routeLearner.Value.RecordRouteOutcome(request.Url.GetLeftPart(UriPartial.Authority), descriptor.Id, usable, now: svc.Now);
+            }
             if (answer.Error?.Code == MediaErrorCode.NotThisSite) continue;
             if (answer.IsSuccess || result is null) result = answer;
             if (!hasAlternative || index != 0 || !fallback) break;

@@ -264,73 +264,88 @@ public sealed class ConnectionAdvisor
 
     private int _ceiling;
     private bool _throttled;
-    private bool _cruising;
-    private long _cruiseSinceTicks;
-    private double _throughputAtLastChange;
-    private int _countAtLastChange = 1;
+    private long? _cruiseSinceTicks;
+    private bool _preferDown;
+    private readonly TimeProvider _clock;
+    private double _baselineRate;
+    private int _baselineCount;
+    private int _probeCount;
 
     private static readonly TimeSpan ReprobeInterval = TimeSpan.FromSeconds(10);
 
-    public ConnectionAdvisor(int maximum)
+    public ConnectionAdvisor(int maximum) : this(maximum, TimeProvider.System) { }
+
+    internal ConnectionAdvisor(int maximum, TimeProvider clock)
     {
         Maximum = maximum;
         _ceiling = maximum;
+        _clock = clock;
     }
 
     public int Maximum { get; }
 
+    // External changes (rate limits, host slots, a draining worker) invalidate
+    // the comparison. Only compare samples measured with a stable population.
+    internal void ResetMeasurement()
+    {
+        _baselineRate = 0;
+        _baselineCount = _probeCount = 0;
+        _cruiseSinceTicks = null;
+        _preferDown = false;
+    }
+
     public int Recommend(int current, double bytesPerSecond, TimeSpan sinceLastChange, TimeSpan rampInterval)
     {
         current = Math.Clamp(current, 1, Math.Max(1, _ceiling));
-        if (_throttled || sinceLastChange < rampInterval || bytesPerSecond <= 0) return current;
-
-        if (_cruising)
-        {
-            if (current < _ceiling && System.Diagnostics.Stopwatch.GetElapsedTime(_cruiseSinceTicks) >= ReprobeInterval)
-            {
-                _cruising = false;
-                _throughputAtLastChange = bytesPerSecond;
-                _countAtLastChange = current + 1;
-                return Math.Clamp(current + 1, 1, Math.Max(1, _ceiling));
-            }
+        if (_throttled || sinceLastChange < rampInterval || !double.IsFinite(bytesPerSecond) || bytesPerSecond <= 0)
             return current;
-        }
 
-        int next = current;
-        if (current == 1)
+        int step = 1;
+        if (_probeCount == current && _baselineCount > 0)
         {
-            next = Math.Min(_ceiling, 2);
-        }
-        else if (bytesPerSecond > _throughputAtLastChange * 1.10)
-        {
-            // Fast double-step when bandwidth scales cleanly (>35% gain), single-step otherwise
-            int step = bytesPerSecond > _throughputAtLastChange * 1.35 && current < 4 ? 2 : 1;
-            next = Math.Min(_ceiling, current + step);
-        }
-        else if (bytesPerSecond < _throughputAtLastChange * 0.88 && current > 1)
-        {
-            next = current - 1;
-            _cruising = true;
-            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            double gain = bytesPerSecond / _baselineRate;
+            bool up = current > _baselineCount;
+            // Accept more workers only for a meaningful gain; accept fewer
+            // when they retain at least 95% of throughput.
+            bool useful = up ? gain >= 1.10 : gain >= 0.95;
+            _probeCount = 0;
+            if (!useful)
+            {
+                _cruiseSinceTicks = _clock.GetTimestamp();
+                _preferDown = up;
+                return _baselineCount;
+            }
+            step = up && gain >= 1.35 && current < 4 ? 2 : 1;
+            _baselineCount = current;
+            _baselineRate = bytesPerSecond;
+            if (!up || current == _ceiling)
+            {
+                _cruiseSinceTicks = _clock.GetTimestamp();
+                _preferDown = current > 1;
+                return current;
+            }
         }
         else
         {
-            _cruising = true;
-            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            return current;
+            if (_baselineCount != current)
+            {
+                _probeCount = 0;
+                _baselineCount = current;
+            }
+            _baselineRate = bytesPerSecond;
         }
 
-        if (next >= _ceiling && current >= _ceiling)
-        {
-            _cruising = true;
-            _cruiseSinceTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-        }
-        next = Math.Clamp(next, 1, Math.Max(1, _ceiling));
-        if (next != current || next == _countAtLastChange)
-        {
-            _throughputAtLastChange = bytesPerSecond;
-            _countAtLastChange = next;
-        }
+        bool cruising = _cruiseSinceTicks is long;
+        if (_cruiseSinceTicks is long since && _clock.GetElapsedTime(since) < ReprobeInterval)
+            return current;
+        _cruiseSinceTicks = null;
+
+        // After a plateau, test whether fewer workers sustain the same rate.
+        // A rejected down-probe schedules an up-probe on the next cruise.
+        int next = current > 1 && (current == _ceiling || cruising && _preferDown)
+            ? current - 1 : Math.Min(_ceiling, current + step);
+        if (next < 1 || next == current) return current;
+        _probeCount = next;
         return next;
     }
 

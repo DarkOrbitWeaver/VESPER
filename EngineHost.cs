@@ -29,7 +29,7 @@ internal static class EngineHost
     }
 
     // Proxy changes take effect on restart for both discovery and the transfer engine.
-    internal static ResolverOptions MediaNetwork(int maxConcurrent = 4, EngineOptions? options = null)
+    internal static ResolverOptions MediaNetwork(int maxConcurrent = 4, EngineOptions? options = null, bool persistRouteHistory = false)
     {
         options ??= Volatile.Read(ref _activeNetwork);
         Uri? proxy = options?.Proxy == ProxyMode.Custom && Uri.TryCreate(options.ProxyAddress, UriKind.Absolute, out Uri? address)
@@ -41,6 +41,8 @@ internal static class EngineHost
             ProxyAddress = proxy,
             MaxConcurrentRequests = maxConcurrent,
             RulePackDirectory = Path.Combine(DataDirectory, "rules"),
+            RouteHistoryPath = persistRouteHistory && options is not null
+                ? Path.Combine(options.DataDirectory, "intelligence", "route-history.json") : null,
             RulePackPublicKeySpki = Environment.GetEnvironmentVariable("VESPER_RULE_PACK_PUBLIC_KEY"),
             LocalSemanticEndpoint = Uri.TryCreate(Environment.GetEnvironmentVariable("VESPER_LOCAL_SEMANTIC_ENDPOINT"),
                 UriKind.Absolute, out Uri? semanticEndpoint) ? semanticEndpoint : null,

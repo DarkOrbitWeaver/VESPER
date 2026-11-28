@@ -44,6 +44,27 @@ public class RankingModelTests
         Assert.Equal("adapter", learner.SelectBestRoute(site, routes, now.AddDays(365)));
     }
 
+    [Fact]
+    public void RouteLearningSurvivesRestartWithoutStoringOriginOrRouteText()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "vesper-learning-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(root, "outcomes.json");
+        try
+        {
+            var learner = new OnlineLearner(path);
+            var now = DateTimeOffset.UtcNow;
+            learner.RecordRouteOutcome("https://private.example", "route-a", false, now: now);
+            learner.RecordRouteOutcome("https://private.example", "route-b", true, double.NaN, now);
+            var reopened = new OnlineLearner(path);
+            Assert.Equal("route-b", reopened.SelectBestRoute("https://private.example", ["route-a", "route-b"], now));
+            string saved = File.ReadAllText(path);
+            Assert.DoesNotContain("private.example", saved);
+            Assert.DoesNotContain("route-b", saved);
+            Assert.Equal("route-a", reopened.SelectBestRoute("https://other.example", ["route-a", "route-b"], now));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
     private static string Mutate(Action<JsonObject> change)
     {
         var node = JsonNode.Parse(File.ReadAllText(ModelPath("active/source-association.json")))!.AsObject();

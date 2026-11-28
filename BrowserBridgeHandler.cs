@@ -22,7 +22,7 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             lock (_resolverGate)
             {
                 ObjectDisposedException.ThrowIf(_resolverClosed, this);
-                return _sharedResolver ??= new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options));
+                return _sharedResolver ??= new DefaultMediaResolver(EngineHost.MediaNetwork(options: engine.Options, persistRouteHistory: true));
             }
         }
     }

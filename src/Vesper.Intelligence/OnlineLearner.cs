@@ -57,7 +57,7 @@ public sealed class OnlineLearner
                 alpha = Math.Max(1.0, alpha * scale);
                 beta = Math.Max(1.0, beta * scale);
             }
-            double speed = succeeded && bytesPerSecond > 0
+            double speed = succeeded && double.IsFinite(bytesPerSecond) && bytesPerSecond > 0
                 ? (decayed.AvgThroughputBps > 0 ? decayed.AvgThroughputBps * 0.65 + bytesPerSecond * 0.35 : bytesPerSecond)
                 : decayed.AvgThroughputBps;
 
@@ -171,8 +171,23 @@ public sealed class OnlineLearner
             FileInfo info = new(_persistencePath);
             if (info.Length is <= 0 or > 1024 * 1024) return;
             var loaded = JsonSerializer.Deserialize<PersistedState>(File.ReadAllText(_persistencePath, Encoding.UTF8));
-            if (loaded is { Salt.Length: >= 8 } && loaded.Arms is not null && loaded.SourceWeightDeltas is not null)
-                _state = loaded;
+            if (loaded is not { Salt.Length: >= 8 and <= 64 } || loaded.Arms is null || loaded.SourceWeightDeltas is null)
+                return;
+            // A corrupt or edited local file must not inject arbitrary keys,
+            // non-finite weights, or an unbounded number of outcomes.
+            loaded.Arms = loaded.Arms.Where(pair => pair.Key.Length == 24 && pair.Key.All(Uri.IsHexDigit)
+                && pair.Value is { } arm && double.IsFinite(arm.Alpha) && double.IsFinite(arm.Beta)
+                && arm.Alpha is >= 1 and <= MaxEffectiveObservations
+                && arm.Beta is >= 1 and <= MaxEffectiveObservations
+                && double.IsFinite(arm.AvgThroughputBps) && arm.AvgThroughputBps >= 0
+                && arm.UpdatedUnixMs >= 0 && arm.UpdatedUnixMs <= DateTimeOffset.MaxValue.ToUnixTimeMilliseconds())
+                .OrderByDescending(pair => pair.Value.UpdatedUnixMs).Take(MaxArms)
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            loaded.SourceWeightDeltas = loaded.SourceWeightDeltas.Where(pair =>
+                FeatureSchema.SourceAssociation.Features.Contains(pair.Key)
+                && double.IsFinite(pair.Value) && Math.Abs(pair.Value) <= 4)
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+            _state = loaded;
         }
         catch { }
     }
