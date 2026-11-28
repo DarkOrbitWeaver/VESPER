@@ -1603,13 +1603,22 @@ test('worker without a declaration offers only bounded current-document choices,
     assert.equal(choice.requiresDeclaration,false);
     assert.equal(choice.fingerprint,undefined);
     assert.equal(app.sent.length,0);
-    const reply = await app.message({type:'media-source-select',sourceChoice:choice.token,pageUrl:page,
-      playerUrl:'',playerKey:request.playerKey,generation:1,workerMediaSource:true,manifestUrl:''},sender);
+    const select = (token, change = {}) => app.message({type:'media-source-select',sourceChoice:token,pageUrl:page,
+      playerUrl:'',playerKey:request.playerKey,generation:1,workerMediaSource:true,manifestUrl:'',multiplePlayers:false,...change},sender);
+    assert.equal((await select(choice.token,{multiplePlayers:true})).code,'expired-selection');
+    const next = await app.message({...request,refresh:true},sender);
+    const reply = await select(next.data.sourceChoices[0].token);
     assert.equal(reply.ok,true);
     assert.equal(app.sent.length,1);
     assert.equal(app.sent[0].candidates[0].url,url);
     assert.equal(app.sent[0].authorized,undefined);
+    const stale = await app.message({...request,refresh:true},sender);
+    await observe('https://cdn.test/another.mp4');
+    assert.equal((await select(stale.data.sourceChoices[0].token)).code,'expired-selection');
+    const both = await app.message({...request,refresh:true},sender);
+    assert.equal(both.data.sourceChoices.length,2);
     await observe('https://cdn.test/opaque.mp4?token=secret');
+    assert.equal((await select(both.data.sourceChoices[0].token)).code,'expired-selection');
     assert.equal((await app.message({...request,refresh:true},sender)).code,'no-reusable-source');
     assert.equal(app.sent.length,1);
   } finally {app.stopWorker();}

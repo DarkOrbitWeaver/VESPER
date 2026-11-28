@@ -99,28 +99,78 @@ export function fitWeights(schema, train, { epochs = 600, rate = 0.08, l2 = 0.00
   return Object.fromEntries(names.map((name, i) => [name, Math.round(w[i] * 1e4) / 1e4]));
 }
 
+// Case-level intervals are descriptive: related site-family observations
+// are correlated, so these are not guarantees about the web population.
+export function wilsonInterval(hits, total) {
+  if (!Number.isSafeInteger(total) || total <= 0 || !Number.isSafeInteger(hits) || hits < 0 || hits > total) return null;
+  const z = 1.959963984540054, p = hits / total, d = 1 + z * z / total;
+  const center = (p + z * z / (2 * total)) / d;
+  const half = z * Math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / d;
+  return { lower: Math.max(0, center - half), upper: Math.min(1, center + half) };
+}
+
 export function evaluate(rank, cases) {
   const scored = cases.filter(row => row.label !== 'adapter-weak');
   let decisive = 0, correct = 0, wrong = 0, ambiguousDecisive = 0, unambiguous = 0, top1 = 0, ambiguous = 0;
   const bins = Array.from({ length: 10 }, () => ({ n: 0, conf: 0, hit: 0 }));
+  const families = new Map();
   for (const row of scored) {
     const result = rank(row.candidates);
-    if (row.chosen === null) { ambiguous++; if (result.decisive) ambiguousDecisive++; continue; }
+    const group = row.group?.toLowerCase() || 'unknown';
+    const family = families.get(group) || { cases: 0, chosen: 0, decisive: 0, correct: 0, errors: 0 };
+    families.set(group, family);
+    family.cases++;
+    if (result.decisive) family.decisive++;
+    if (row.chosen === null) {
+      ambiguous++;
+      if (result.decisive) { ambiguousDecisive++; family.errors++; }
+      continue;
+    }
     unambiguous++;
+    family.chosen++;
     const hit = result.selected === row.chosen;
     if (hit) top1++;
-    if (result.decisive) { decisive++; if (hit) correct++; else wrong++; }
-    if (Number.isFinite(result.confidence)) {
+    if (result.decisive) {
+      decisive++;
+      if (hit) { correct++; family.correct++; }
+      else { wrong++; family.errors++; }
+    }
+    if (Number.isFinite(result.confidence) && result.confidence >= 0 && result.confidence <= 1) {
       const bin = bins[Math.min(9, Math.floor(result.confidence * 10))];
       bin.n++; bin.conf += result.confidence; bin.hit += hit ? 1 : 0;
     }
   }
-  const ece = unambiguous ? bins.reduce((a, b) => a + (b.n ? Math.abs(b.conf / b.n - b.hit / b.n) * b.n : 0), 0) / unambiguous : null;
+  const calibratedCases = bins.reduce((n, b) => n + b.n, 0);
+  const ece = calibratedCases ? bins.reduce((a, b) => a + (b.n ? Math.abs(b.conf / b.n - b.hit / b.n) * b.n : 0), 0) / calibratedCases : null;
   const allDecisive = decisive + ambiguousDecisive;
+  const familyRows = [...families.values()];
+  const macro = (numerator, denominator) => {
+    const eligible = familyRows.filter(row => row[denominator] > 0);
+    return eligible.length ? eligible.reduce((sum, row) => sum + row[numerator] / row[denominator], 0) / eligible.length : null;
+  };
   return { cases: scored.length, unambiguous, ambiguous, decisive: allDecisive, correctDecisive: correct, wrongDecisive: wrong,
     ambiguousDecisive, decisivePrecision: allDecisive ? correct / allDecisive : null,
     unambiguousRecall: unambiguous ? correct / unambiguous : null, top1Accuracy: unambiguous ? top1 / unambiguous : null,
-    expectedCalibrationError: ece };
+    expectedCalibrationError: ece, calibratedCases,
+    caseLevel95: { precision: wilsonInterval(correct, allDecisive), recall: wilsonInterval(correct, unambiguous) },
+    familyCount: families.size, familyMacroPrecision: macro('correct', 'decisive'), familyMacroRecall: macro('correct', 'chosen'),
+    familiesWithErrors: familyRows.filter(row => row.errors > 0).length };
+}
+
+// Aggregate accuracy can conceal a new wrong decision behind improvements on
+// unrelated cases. Compare the same labeled examples, not just totals.
+export function pairedSafety(candidate, baseline, cases) {
+  let newWrong = 0, correctedWrong = 0, lostCorrect = 0, gainedCorrect = 0;
+  for (const row of cases) {
+    if (row.label === 'adapter-weak') continue;
+    const classify = result => !result.decisive ? 0 : row.chosen !== null && result.selected === row.chosen ? 1 : -1;
+    const before = classify(baseline(row.candidates)), after = classify(candidate(row.candidates));
+    if (before !== -1 && after === -1) newWrong++;
+    if (before === -1 && after !== -1) correctedWrong++;
+    if (before === 1 && after !== 1) lostCorrect++;
+    if (before !== 1 && after === 1) gainedCorrect++;
+  }
+  return { newWrong, correctedWrong, lostCorrect, gainedCorrect };
 }
 
 function calibrate(schema, weights, validation) {
@@ -291,10 +341,12 @@ export function promotionEvaluation(model, partitions, baseline) {
   const gates = {};
   for (const split of ['validation', 'holdout']) {
     const candidate = evaluate(rank, partitions[split]), reference = evaluate(previous, partitions[split]);
+    const paired = pairedSafety(rank, previous, partitions[split]);
     const passed = (candidate.decisivePrecision ?? 0) >= 0.99 && (candidate.unambiguousRecall ?? 0) >= 0.95
-      && candidate.ambiguousDecisive === 0 && (candidate.decisivePrecision ?? 0) >= (reference.decisivePrecision ?? 0)
+      && candidate.ambiguousDecisive === 0 && paired.newWrong === 0
+      && (candidate.decisivePrecision ?? 0) >= (reference.decisivePrecision ?? 0)
       && (candidate.unambiguousRecall ?? 0) >= (reference.unambiguousRecall ?? 0);
-    gates[split] = { candidate, reference, passed };
+    gates[split] = { candidate, reference, paired, passed };
   }
   const failures = guardFailures(rank, model.schema);
   const { candidate, reference } = gates.holdout;
@@ -303,6 +355,7 @@ export function promotionEvaluation(model, partitions, baseline) {
   const improved = candidate.correctDecisive > reference.correctDecisive
     || candidate.wrongDecisive + candidate.ambiguousDecisive < reference.wrongDecisive + reference.ambiguousDecisive
     || (candidate.expectedCalibrationError !== null && reference.expectedCalibrationError !== null
+      && candidate.calibratedCases === candidate.unambiguous && reference.calibratedCases === reference.unambiguous
       && reference.expectedCalibrationError - candidate.expectedCalibrationError >= 0.01);
   if (!improved) failures.push('no-measurable-holdout-improvement');
   if (failures.length || Object.values(gates).some(gate => !gate.passed))

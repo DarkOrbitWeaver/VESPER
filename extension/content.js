@@ -2792,7 +2792,8 @@
     const result = await send({ type: 'media-source-select', sourceChoice: source.token,
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc,
       ...(source.requiresConfirmation && !remembered ? {
-        workerMediaSource: workerMediaSource(player), manifestUrl: lookup.workerManifest
+        workerMediaSource: workerMediaSource(player), manifestUrl: lookup.workerManifest,
+        multiplePlayers: hasOtherPlayer(player)
       } : {}) });
     if (!isCurrentRequest(request)) {
       if (!result?.ok) void reportMediaFailure('source', result?.code, lookup);

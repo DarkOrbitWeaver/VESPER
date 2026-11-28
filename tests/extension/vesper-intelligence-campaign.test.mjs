@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { generate } from '../../tools/intelligence/corpus.mjs';
-import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures } from '../../scripts/train-intelligence.mjs';
+import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures, wilsonInterval, pairedSafety } from '../../scripts/train-intelligence.mjs';
 
 const context = vm.createContext({ URL });
 for (const name of ['vesper-intelligence.js', 'vesper-model.js', 'vesper-inference.js', 'vesper-planner.js'])
@@ -102,6 +102,30 @@ test('review coverage counts only independently labeled examples and reports mis
   assert.equal(reviewed.splits.holdout.independent, 1);
   assert.equal(reviewed.splits.holdout.missingChosen, 199);
   assert.equal(reviewed.ready, false);
+});
+
+test('evaluation reports uncertainty, family imbalance and missing calibration coverage', () => {
+  const rows = [
+    ...Array.from({length: 200}, () => ({group:'large',label:'fixture',chosen:'a',candidates:[{id:'a'}]})),
+    {group:'small',label:'fixture',chosen:'b',candidates:[{id:'a'}]},
+    {group:'small',label:'fixture',chosen:null,candidates:[{id:'a'}]}
+  ];
+  const metrics = evaluate(() => ({decisive:true,selected:'a'}), rows);
+  assert.equal(metrics.correctDecisive, 200);
+  assert.equal(metrics.familyMacroRecall, 0.5);
+  assert.equal(metrics.familiesWithErrors, 1);
+  assert.equal(metrics.calibratedCases, 0);
+  assert.equal(metrics.expectedCalibrationError, null);
+  assert.ok(wilsonInterval(200,200).lower < 0.99);
+  assert.equal(wilsonInterval(0,0), null);
+});
+
+test('paired safety detects a newly wrong choice even if aggregate accuracy is unchanged', () => {
+  const rows = ['a','b'].map(id => ({group:'fixture',label:'fixture',chosen:id,candidates:[{id}]}));
+  const before = () => ({decisive:true,selected:'a'});
+  const after = () => ({decisive:true,selected:'b'});
+  assert.equal(evaluate(before,rows).decisivePrecision,evaluate(after,rows).decisivePrecision);
+  assert.deepEqual(pairedSafety(after,before,rows),{newWrong:1,correctedWrong:1,lostCorrect:1,gainedCorrect:1});
 });
 
 test('fitting is deterministic and respects sign constraints', () => {
