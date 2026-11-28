@@ -15,6 +15,19 @@ function graphAt(start = 1_000_000) {
   return { graph: G.create({ now: () => now }), advance: ms => { now += ms; return now; }, at: () => now };
 }
 
+test('acquisition verdict never upgrades a fragment or contradictory current generation', () => {
+  const url='https://cdn.example/clip.mp4', args={scope,playerKey:'v',generation:1,sourceUrl:url};
+  const candidate={url,kind:'direct',direct:true,witnessed:true,verified:true,compatible:true};
+  const partial=G.create().assessPicker({...args,candidates:[{...candidate,kind:'fragment'}]});
+  assert.equal(partial.verdict,'abstain');
+  assert.equal(partial.rows[0].recoverability,'partial-only');
+  assert.equal(partial.rows[0].compatible,false);
+  const conflict=G.create();
+  conflict.observePlayer({...args,sourceUrl:'https://cdn.example/other.mp4'});
+  assert.equal(conflict.assessPicker({...args,candidates:[candidate]}).verdict,'abstain');
+  assert.equal(G.create().assessPicker({...args,candidates:[{...candidate,conflictingValidator:true}]}).verdict,'abstain');
+});
+
 test('typed acquisition graph separates recoverability from playback identity', () => {
   const url = 'https://cdn.example/active.mp4';
   const candidate = {url,kind:'direct',direct:true,witnessed:true,verified:true,compatible:true};

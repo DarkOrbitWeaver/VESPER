@@ -2841,10 +2841,14 @@
     const close = renderShell(title, poster, seconds, sending);
     if (hadFocus) close.focus({ preventScroll: true });
     const lookup = panelMedia;
+    const worker = workerMediaSource(lookup.player);
+    if (worker) inspectPlayerWitnessAttributes(lookup.player);
+    const workerManifest = worker ? VesperPlayerSource.http(lookup.player?.getAttribute?.('data-vesper-player-manifest'))?.href || '' : '';
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src }
       : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent,
-        pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
+        pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc,
+        workerMediaSource: worker, manifestUrl: workerManifest, multiplePlayers: hasOtherPlayer(lookup.player) });
     if (!isCurrentRequest(request)) {
       if (!reply?.ok) void reportMediaFailure('submit', reply?.code, lookup);
       return;

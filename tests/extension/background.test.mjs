@@ -1624,6 +1624,42 @@ test('worker without a declaration offers only bounded current-document choices,
   } finally {app.stopWorker();}
 });
 
+test('confirmed opaque-worker format session rechecks its evidence before the actual download, including restart', async () => {
+  const page='https://example.test/watch', url='https://cdn.test/worker.mp4';
+  const sender={url:page,tab:{id:93},frameId:0,documentId:'worker-receipt'};
+  const mediaSession='e'.repeat(32), sessionData={};
+  const responses={'media-source-options':{ok:true,data:{mediaSession,duration:15,choices:[{index:0,hasVideo:true}]}},
+    'media-select':{ok:true}};
+  const app=load(responses,{sessionData});
+  const at=Date.now();
+  const scope={pageUrl:page,playerPageUrl:page,playerKey:'player-93',generation:1,playerUrl:''};
+  const request={...scope,type:'media-options',workerMediaSource:true,playerHasMedia:true,multiplePlayers:false,
+    mediaChangedAt:at,playerFacts:{kind:'video',durationSeconds:15,height:720}};
+  const select={...scope,type:'media-select',mediaSession,formatChoice:0,mode:'download',
+    workerMediaSource:true,manifestUrl:'',multiplePlayers:false};
+  const observe=(target,address)=>target.onMedia({url:address,tabId:93,frameId:0,documentId:sender.documentId,
+    method:'GET',statusCode:200,type:'xmlhttprequest',timeStamp:at,responseHeaders:[
+      {name:'Content-Type',value:'video/mp4'},{name:'Content-Length',value:'2000000'}]});
+  let restarted;
+  try {
+    await observe(app,url);
+    const options=await app.message(request,sender);
+    assert.equal(options.data.sourceChoices.length,1);
+    const source=options.data.sourceChoices[0];
+    const result=await app.message({...scope,type:'media-source-select',sourceChoice:source.token,
+      workerMediaSource:true,manifestUrl:'',multiplePlayers:false},sender);
+    assert.equal(result.data.mediaSession,mediaSession);
+    assert.equal(JSON.stringify(sessionData.vesperFormatSessions).includes(url),false);
+    assert.equal((await app.message({...select,multiplePlayers:true},sender)).code,'expired-selection');
+    assert.equal((await app.message(select,sender)).ok,true);
+    restarted=load(responses,{sessionData});
+    assert.equal((await restarted.message(select,sender)).ok,true);
+    await observe(restarted,'https://cdn.test/competing.mp4');
+    assert.equal((await restarted.message(select,sender)).code,'expired-selection');
+    assert.equal(restarted.sent.filter(r=>r.type==='media-select').length,1);
+  } finally {app.stopWorker();restarted?.stopWorker();}
+});
+
 test('generic worker handle cannot bypass confirmation via ordinary traffic or a matched declaration', async () => {
   const page='https://example.test/watch';
   const url='https://cdn.test/worker.mpd';

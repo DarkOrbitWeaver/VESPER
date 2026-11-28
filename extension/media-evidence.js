@@ -193,8 +193,13 @@ globalThis.VesperMediaEvidence = (() => {
     const decision = graph?.assessPicker({ scope, playerKey, generation, sourceUrl: currentUrl, worker,
       candidates: [...nodes].sort((a,b) => a.index - b.index).map(node => ({
         url: node.entry.source?.url, kind: node.entry.source?.kind, direct: node.direct,
-        witnessed: !!node.witnessed, verified: node.verified, compatible: node.compatible
+        witnessed: !!node.witnessed, verified: node.verified, compatible: node.compatible,
+        conflictingValidator: node.entry.source?.conflictingValidator === true
       })) });
+    const rows = new Map((decision?.rows || []).map(row => [row.index, row]));
+    // Reject contradicted/fragment-only hypotheses for every caller, not only
+    // the auto-selection branch. An incomplete graph cannot grant a choice.
+    for (const node of nodes) node.compatible = rows.get(node.index)?.compatible === true;
     return { nodes, selected: decision?.verdict === 'exact'
       ? nodes.find(node => node.index === decision.selected)?.entry || null : null };
   }

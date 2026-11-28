@@ -425,7 +425,53 @@ function persistFormatSessions() {
 
 const expiredFormats = () => ({ ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' });
 
-async function bindFormatSession(reply, message, sender) {
+async function evidenceDigest(value) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+// Persist only digests of the admitted resource set, not signed URLs.
+function evidenceSignature(item) {
+  return JSON.stringify([item.url, item.kind, item.validator, item.bytes, item.mime,
+    item.rangeResource === true, item.querySlice === true, item.rangeStart, item.rangeEnd]);
+}
+
+async function formatEvidence(selection, selectedEvidence) {
+  if (selection.workerDeclaration) return { kind: 'worker-declaration', digest: await evidenceDigest(selection.url) };
+  if (selection.workerObserved) return { kind: 'worker-observed', digest: await evidenceDigest(selection.workerEvidence),
+    changedAt: selection.workerChangedAt, player: selection.workerPlayerFacts };
+  return { kind: 'observed', members: await Promise.all(selectedEvidence.map(async item => ({
+    digest: await evidenceDigest(evidenceSignature(item)), seen: item.seen
+  }))) };
+}
+
+async function matchesFormatEvidence(guard, message, sender) {
+  if (!guard) return true;
+  if (sender.tab?.incognito && guard.kind !== 'observed') return false;
+  if (!await refreshNeverCaptureHosts()) return false;
+  if (guard.kind === 'worker-declaration') {
+    const url = VesperPlayerSource.http(message.manifestUrl);
+    return message.workerMediaSource === true && !!url && await evidenceDigest(url.href) === guard.digest
+      && !matchesNeverCaptureHost({url:url.href,referrer:sender.url});
+  }
+  const now = Date.now(), frame = sender.frameId ?? 0;
+  const state = await tabState(sender.tab.id);
+  if (guard.kind === 'worker-observed') {
+    if (message.workerMediaSource !== true || message.manifestUrl || message.multiplePlayers !== false) return false;
+    const sources = workerObservedCandidates(state.sources, sender.documentId, frame, guard.changedAt, now, guard.player);
+    return !!sources && await evidenceDigest(workerCandidateSnapshot(sources)) === guard.digest
+      && sources.every(source => !matchesNeverCaptureHost({url:source.url,referrer:sender.url}));
+  }
+  if (guard.kind !== 'observed' || !Array.isArray(guard.members) || !guard.members.length || guard.members.length > MAX_SOURCES) return false;
+  const sources = await Promise.all(state.sources.filter(source => source.documentId === sender.documentId
+    && (source.frameId ?? 0) === frame && Number.isFinite(source.seen) && source.seen <= now + 1000
+    && source.seen >= now - (source.kind === 'direct' ? 120_000 : sourceLifetime(source))
+    && !source.conflictingValidator && !matchesNeverCaptureHost({url:source.url,referrer:sender.url}))
+    .map(async source => ({digest: await evidenceDigest(evidenceSignature(source)), seen: source.seen})));
+  return guard.members.every(member => sources.some(source => source.digest === member.digest && source.seen >= member.seen));
+}
+
+async function bindFormatSession(reply, message, sender, evidence = null) {
   const token = reply?.data?.mediaSession;
   if (!reply?.ok || !reply.data?.choices?.length || !/^[a-f0-9]{32}$/i.test(token || '')
       || message.prefetch === true || !sender.tab) return reply;
@@ -438,7 +484,8 @@ async function bindFormatSession(reply, message, sender) {
   if (old && old.expires > Date.now() && old.scope !== scope) return expiredFormats();
   // Keep the binding long enough to resolve a lost acknowledgement after the
   // desktop session expires. The desktop still decides whether it can submit.
-  formatSessions.set(token, { scope, tab: sender.tab.id, expires: Date.now() + 600_000 });
+  if (old?.evidence && JSON.stringify(old.evidence) !== JSON.stringify(evidence)) return expiredFormats();
+  formatSessions.set(token, { scope, tab: sender.tab.id, expires: Date.now() + 600_000, ...(evidence ? { evidence } : {}) });
   await persistFormatSessions();
   return reply;
 }
@@ -446,7 +493,8 @@ async function bindFormatSession(reply, message, sender) {
 async function matchesFormatSession(token, message, sender) {
   await formatSessionsReady;
   const entry = formatSessions.get(token);
-  return !!entry && entry.expires > Date.now() && entry.scope === await formatScope(message, sender);
+  return !!entry && entry.expires > Date.now() && entry.scope === await formatScope(message, sender)
+    && await matchesFormatEvidence(entry.evidence, message, sender);
 }
 
 async function clearFormatSessions(tabId) {
@@ -1168,7 +1216,8 @@ function rememberSourceSelections(sources, context) {
     const token = crypto.randomUUID();
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
       seen: source.seen, validator: source.validator, bytes: source.bytes, minimumLength: source.minimumLength,
-      rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
+      rangeResource: source.rangeResource, querySlice: source.querySlice, rangeStart: source.rangeStart, rangeEnd: source.rangeEnd,
+      wholeRepresentation: source.wholeRepresentation, group: source.group,
       sliceEvidence: source.sliceEvidence, experienceCase: source.experienceCase,
       workerDeclaration: source.workerDeclaration === true, workerObserved: source.workerObserved === true,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
@@ -2001,7 +2050,7 @@ async function selectMediaSource(message, sender) {
         && !VesperMediaEvidence.matchesPlayback(selection.workerPlayerFacts, VesperMediaEvidence.mediaFacts(reply)))
       return { ok: false, code: 'source-changed', message: 'The declared stream does not match this playback.' };
     // Explicit declaration checks do not become independently verified identity labels.
-    return reply;
+    return bindFormatSession(reply, message, sender, await formatEvidence(selection));
   }
   const state = await tabState(selection.tab);
   const now = Date.now();
@@ -2037,7 +2086,7 @@ async function selectMediaSource(message, sender) {
         || (selection.workerPlayerFacts.kind === 'audio' ? facts.hasAudio !== true : facts.hasVideo !== true)
         || !VesperMediaEvidence.matchesPlayback(selection.workerPlayerFacts, facts)))
       return { ok: false, code: 'source-changed', message: 'The detected stream could not be matched to this playback.' };
-    return reply;
+    return bindFormatSession(reply, message, sender, await formatEvidence(selection));
   }
   const auth = await mediaAuthorization(page.href, sender, { userGesture: true,
     candidateUrls: (selection.group || [selection]).map(source => source.url) });
@@ -2048,7 +2097,7 @@ async function selectMediaSource(message, sender) {
     : explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
   if (selection.experienceCase && reply?.ok && reply.data?.choices?.length)
     await VesperExperience.note(page.hostname, 'observed-lookup-v2', 'verified', Date.now(), selection.experienceCase).catch(() => {});
-  return reply;
+  return bindFormatSession(reply, message, sender, await formatEvidence(selection, selectedEvidence));
 }
 
 async function confirmOrStartBrowserChoice(choice) {
@@ -2207,7 +2256,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'managed-downloads': return { ok: true, files: await listManagedCandidates() };
       case 'continue-managed': return continueManagedDownload(message.id, message.startTime);
       case 'media-options': return bindFormatSession(await playerOptions(message, sender), message, sender);
-      case 'media-source-select': return bindFormatSession(await selectMediaSource(message, sender), message, sender);
+      case 'media-source-select': return selectMediaSource(message, sender);
       case 'browser-media-select': return selectBrowserFile(message, sender);
       case 'media-select': {
         const { mediaSession, formatChoice, mode } = message;

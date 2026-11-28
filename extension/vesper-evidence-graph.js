@@ -252,12 +252,16 @@ globalThis.VesperEvidenceGraph = (() => {
         const url = parseHttp(item?.url);
         if (!url) continue;
         const resource = addSource(scope, url.href, item.kind || 'unknown');
+        const recoverability = item.kind === 'fragment' || item.fragmentOnly === true ? 'partial-only'
+          : item.verified === true ? 'checked-formats' : 'unknown';
+        const contradicted = item.compatible !== true || item.conflictingValidator === true
+          || nodes.get(gen)?.attrs.conflictingSource === true;
         const acquisition = add('acquisition', scopedKey(scope, playerKey, generation, index), {
-          scope, index, formatChecked: item.verified === true, compatible: item.compatible === true
+          scope, index, recoverability, compatible: !contradicted
         });
         if (!link(gen, acquisition, 'candidate-for') || !link(acquisition, resource, 'representation-of')) continue;
         if (item.verified === true) link(resource, acquisition, 'format-checked');
-        if (item.compatible !== true) link(gen, acquisition, 'contradicts');
+        if (contradicted || recoverability === 'partial-only') link(gen, acquisition, 'contradicts');
         if (item.witnessed === true && !worker) {
           const artifact = add('byte-artifact', scopedKey(scope, playerKey, generation, index), {
             scope, kind: 'resource-url-witness', complete: false
@@ -265,11 +269,14 @@ globalThis.VesperEvidenceGraph = (() => {
           link(gen, artifact, 'url-witness');
           link(artifact, resource, 'url-witness');
         }
-        const exact = !worker && item.direct === true && out(gen, 'plays').some(edge =>
+        const exact = !contradicted && !worker && item.direct === true && out(gen, 'plays').some(edge =>
           nodes.get(edge.to)?.attrs.url === url.href);
-        rows.push({ index, exact, witnessed: !worker && item.witnessed === true,
-          verified: item.verified === true, compatible: item.compatible === true,
-          verdict: item.compatible !== true ? 'reject' : item.verified !== true ? 'verify'
+        const witnessed = !contradicted && !worker && item.witnessed === true;
+        const compatible = !contradicted && recoverability !== 'partial-only';
+        rows.push({ index, exact, witnessed, recoverability,
+          identity: exact ? 'current-url' : witnessed ? 'resource-witness' : worker ? 'opaque-context' : 'unconfirmed',
+          verified: item.verified === true, compatible,
+          verdict: !compatible ? 'reject' : item.verified !== true ? 'verify'
             : exact ? 'exact' : 'confirm' });
       }
       // Eviction, malformed input or a lost generation cannot silently turn

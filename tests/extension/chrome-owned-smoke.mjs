@@ -1037,7 +1037,21 @@ async function main() {
       await clickButton('primary');
       await waitFor(async () => (await evaluate('Read worker submission','__workerMedia.submits.length'))===1,
         5000,'Confirmed current declaration could not submit.');
-      workerDeclaration = {realHandle:true, noUnconfirmedProbe:true, staleSubmissions:0, currentSubmissions:1};
+      // Same real worker-backed playback, but without a usable declaration.
+      // Its fragment request is not a complete resource and must not be
+      // substituted with an arbitrary nearby file.
+      await browser.send('Page.navigate',{url:'http://127.0.0.1:'+port+'/worker-mse'},tab);
+      await waitFor(async()=>{
+        const {result}=await browser.send('Runtime.evaluate',{expression:"(()=>{const v=document.querySelector('video');if(!v||v.readyState<1||!v.srcObject)return false;delete v.fixtureLibrary;return true})()",returnByValue:true},tab);
+        return result.value;
+      },10000,'Opaque worker fixture did not load.');
+      await waitFor(()=>flyShown(),5000,'Opaque worker lost the butterfly.');
+      await clickButton('fly');
+      await delay(350);
+      assert.deepEqual(await evaluate('No opaque worker candidate verified','__workerMedia.checks'),
+        [{url:'https://fixture.invalid/first.mpd',signed:false},{url:'https://fixture.invalid/second.mpd',signed:false}]);
+      assert.equal(await evaluate('No opaque worker submission','__workerMedia.submits.length'),1);
+      workerDeclaration = {realHandle:true, noUnconfirmedProbe:true, staleSubmissions:0, currentSubmissions:1,opaqueFragmentAbstained:true};
       await evaluate('Restore native fixture routing','nativeRequest = __beforeWorkerRequest');
 
       await evaluate('Observe native verification for the prefetch fixture', `(() => {
