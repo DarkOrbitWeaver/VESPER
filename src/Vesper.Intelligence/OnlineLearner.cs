@@ -53,9 +53,11 @@ public sealed class OnlineLearner
             double total = alpha + beta;
             if (total > MaxEffectiveObservations)
             {
-                double scale = MaxEffectiveObservations / total;
-                alpha = Math.Max(1.0, alpha * scale);
-                beta = Math.Max(1.0, beta * scale);
+                // Compress observations, not the Beta(1,1) prior. The
+                // posterior remains bounded even when every outcome agrees.
+                double scale = (MaxEffectiveObservations - 2) / (total - 2);
+                alpha = 1.0 + (alpha - 1.0) * scale;
+                beta = 1.0 + (beta - 1.0) * scale;
             }
             double speed = succeeded && double.IsFinite(bytesPerSecond) && bytesPerSecond > 0
                 ? (decayed.AvgThroughputBps > 0 ? decayed.AvgThroughputBps * 0.65 + bytesPerSecond * 0.35 : bytesPerSecond)

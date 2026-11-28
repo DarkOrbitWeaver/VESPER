@@ -190,9 +190,19 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
             if (!segment.Owned || segment.Next != segment.End) return false;
             Segment? next = segment.Node?.Next?.Value;
             if (next is null || next.Owned || next.Start != segment.End
-                || next.Next != next.Start || next.Claimed > next.Start || next.End > responseEndExclusive)
+                || next.Next != next.Start || next.Claimed > next.Start)
                 return false;
-            segment.End = next.End;
+            // If the open response covers only part of an untouched adjacent
+            // span, reclaim exactly that prefix and leave the remaining gap
+            // available to other workers. Never reclaim committed/claimed bytes.
+            long end = Math.Min(next.End, responseEndExclusive);
+            if (end <= next.Start) return false;
+            if (end < next.End)
+            {
+                var remaining = new Segment(end, next.End);
+                remaining.Node = _segments.AddAfter(next.Node!, remaining);
+            }
+            segment.End = end;
             Remove(next);
             return true;
         }

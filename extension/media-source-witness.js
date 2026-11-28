@@ -539,10 +539,10 @@
         if (obj instanceof MediaSource) {
           let msState = mediaSources.get(obj);
           if (!msState) {
-            msState = { tracks: new Set(), paths: new Map() };
+            msState = { tracks: new Set() };
             mediaSources.set(obj, msState);
           }
-          objectUrls.set(url, { kind: 'mse', ref: new WeakRef(obj), msState, paths: msState.paths, createdAt: now() });
+          objectUrls.set(url, { kind: 'mse', ref: new WeakRef(obj), msState, createdAt: now() });
           while (objectUrls.size > MAX_SOURCES) objectUrls.delete(objectUrls.keys().next().value);
         } else if (typeof Blob === 'function' && obj instanceof Blob) {
           const prov = bufferProvenance.get(obj);
@@ -561,7 +561,7 @@
       try {
         let msState = mediaSources.get(this);
         if (!msState) {
-          msState = { tracks: new Set(), paths: new Map() };
+          msState = { tracks: new Set() };
           mediaSources.set(this, msState);
         }
         const track = {
@@ -570,6 +570,7 @@
           role: inferRole(mimeType),
           ownerRef: new WeakRef(this),
           bufferRef: new WeakRef(sb),
+          paths: new Map(),
           initBytes: null,
           initHasMedia: false,
           chunks: [],
@@ -579,7 +580,10 @@
         };
         msState.tracks.add(track);
         sourceOwners.set(sb, track);
-        for (const event of ['error', 'abort']) sb.addEventListener?.(event, () => discardTrack(track));
+        for (const event of ['error', 'abort']) sb.addEventListener?.(event, () => {
+          track.paths.clear();
+          discardTrack(track);
+        });
         retainTrack(track);
       } catch {}
       return sb;
@@ -591,6 +595,7 @@
       if (track) {
         discardTrack(track);
         track.awaitingEmpty = start === 0 && end === Infinity;
+        if (track.awaitingEmpty) track.paths.clear();
       }
       return result;
     });
@@ -599,6 +604,7 @@
       const track = sourceOwners.get(this);
       if (track) {
         discardTrack(track);
+        track.paths.clear();
         track.awaitingEmpty = true;
         if (typeof mimeType === 'string') {
           track.mimeType = mimeType;
@@ -641,6 +647,11 @@
           ? exact : matchBySample(sample);
         const inspected = inspectMediaBytes(rawBytes);
 
+        // A new initialization after retained bytes were discarded cannot
+        // establish continuity with the previous program.
+        if (inspected?.hasInit && track.totalAppendedBytes > 0 && !track.initBytes)
+          track.paths.clear();
+
         if (empty && inspected?.hasInit) {
           track.awaitingEmpty = false;
           track.evicted = false;
@@ -658,7 +669,10 @@
           if (inspected?.hasInit) {
             const repeated = !inspected.hasMedia && track.initBytes.byteLength === rawBytes.byteLength
               && track.initBytes.every((byte, index) => byte === rawBytes[index]);
-            if (!repeated) discardTrack(track);
+            if (!repeated) {
+              track.paths.clear();
+              discardTrack(track);
+            }
           }
           else if (reserveMseBytes(track, rawBytes.byteLength)) track.chunks.push(rawBytes.slice());
         }
@@ -666,15 +680,9 @@
 
         if (prov && now() - prov.at <= TTL) {
           const seenAt = now();
-          const ms = track.ownerRef.deref();
-          if (ms) {
-            const msState = mediaSources.get(ms);
-            if (msState) {
-              msState.paths.delete(prov.address);
-              msState.paths.set(prov.address, { evidence: prov, seen: seenAt });
-              while (msState.paths.size > MAX_URLS_PER_TRACK) msState.paths.delete(msState.paths.keys().next().value);
-            }
-          }
+          track.paths.delete(prov.address);
+          track.paths.set(prov.address, { evidence: prov, seen: seenAt });
+          while (track.paths.size > MAX_URLS_PER_TRACK) track.paths.delete(track.paths.keys().next().value);
         }
       } catch {}
       return res;
@@ -763,8 +771,21 @@
       const msState = mediaSourceState(player);
       if ((!record?.ref.deref() && !msState) || player.mediaKeys) return;
       const at = now();
-      const paths = [...(record?.paths || msState?.paths || new Map()).values()]
-        .filter(item => at - item.seen <= TTL)
+      // Only active buffers can witness this player's current sources. Keep
+      // each track's evidence independent across replacement and codec changes.
+      const observed = new Map();
+      const collect = entries => {
+        for (const item of entries) {
+          if (at - item.seen > TTL) continue;
+          const previous = observed.get(item.evidence.address);
+          if (!previous || previous.seen <= item.seen) observed.set(item.evidence.address, item);
+        }
+      };
+      if (msState) {
+        for (const track of msState.tracks) if (activeBuffer(track)) collect(track.paths.values());
+      } else if (record?.paths) collect(record.paths.values());
+      const paths = [...observed.values()]
+        .sort((a, b) => a.seen - b.seen)
         .slice(-24)
         .map(({ evidence, seen }) => ({
           path: evidence.path,

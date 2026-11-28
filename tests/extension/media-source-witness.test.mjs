@@ -13,10 +13,14 @@ function setup() {
   class Buffer {
     appendBuffer(value) { this.last = value; return undefined; }
     remove() {}
+    changeType() {}
     buffered = { length: 1, start: () => 0, end: () => 10 };
   }
   class Source {
     activeSourceBuffers = [];
+    removeSourceBuffer(buffer) {
+      this.activeSourceBuffers = this.activeSourceBuffers.filter(item => item !== buffer);
+    }
     addSourceBuffer() {
       const buffer = new Buffer();
       this.activeSourceBuffers.push(buffer);
@@ -88,6 +92,27 @@ test('exact response buffer is associated with only the SourceBuffer that receiv
   assert.deepEqual(b.request(a.el), [{path:'https://cdn.test/movie-1234/segment.m4s', seen:100000}]);
   assert.deepEqual(b.request(neighbour.el), []);
   b.advance(120001);
+  assert.deepEqual(b.request(a.el), []);
+});
+
+test('only current active tracks contribute source witnesses after replacement or changeType', async () => {
+  const b = setup(), a = b.player();
+  const audio = a.source.addSourceBuffer('audio/mp4');
+  const attach = async (buffer, name) => {
+    const bytes = new ArrayBuffer(16);
+    await new b.FetchResponse('https://cdn.test/' + name + '.mp4', 'video/mp4', bytes).arrayBuffer();
+    buffer.appendBuffer(bytes);
+  };
+  await attach(a.buffer, 'old-video');
+  await attach(audio, 'audio');
+  assert.equal(b.request(a.el).length, 2);
+  a.buffer.changeType('video/webm');
+  assert.deepEqual(b.request(a.el).map(item => item.path), ['https://cdn.test/audio.mp4']);
+  await attach(a.buffer, 'new-video');
+  assert.equal(b.request(a.el).length, 2);
+  a.source.removeSourceBuffer(audio);
+  assert.deepEqual(b.request(a.el).map(item => item.path), ['https://cdn.test/new-video.mp4']);
+  a.buffer.remove(0, Infinity);
   assert.deepEqual(b.request(a.el), []);
 });
 
@@ -285,7 +310,14 @@ test('streaming ReadableStream reader chunks associate with the SourceBuffer tha
   const listeners = new Map();
   class StreamURL extends URL { static createObjectURL() { return 'blob:https://site.test/' + ++serial; } }
   class StreamBuf { appendBuffer(value) { this.last = value; } }
-  class StreamMS { addSourceBuffer() { return new StreamBuf(); } }
+  class StreamMS {
+    activeSourceBuffers = [];
+    addSourceBuffer() {
+      const buffer = new StreamBuf();
+      this.activeSourceBuffers.push(buffer);
+      return buffer;
+    }
+  }
   class StreamPlayer { constructor(src) { this.currentSrc = src; this.attributes = new Map(); } setAttribute(k, v) { this.attributes.set(k, v); } }
   class FetchRes {
     constructor(url, mime, stream) { this._url = url; this._mime = mime; this._stream = stream; this.headers = { get: () => mime }; }

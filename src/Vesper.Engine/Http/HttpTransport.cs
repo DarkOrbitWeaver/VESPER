@@ -52,7 +52,9 @@ internal sealed class HttpTransport : IDisposable
     private readonly bool _validateProxyDns;
     private readonly string? _proxyError;
     private readonly StreamAdmission _streams = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _http1OnlyHosts = new(StringComparer.OrdinalIgnoreCase);
+    // Protocol failures are scoped to the full origin and expire. Reuse the
+    // bounded cooldown structure; this is independent of server Retry-After.
+    private readonly OriginCooldown _http2Cooldown = new();
 
     public HttpTransport(EngineOptions options)
     {
@@ -160,8 +162,9 @@ internal sealed class HttpTransport : IDisposable
             // HTTP/2 multiplexes streams on one physical connection. A socket limit
             // is therefore not a request limit. Retain admission until disposal of
             // the response body, including on redirects and failed requests.
-            bool useHttp2 = (_options.EnableAdaptiveHttp2 || _options.Http2Experiment)
-                && !_http1OnlyHosts.ContainsKey(current.IdnHost);
+            // Use the actual request decision, not a second history lookup
+            // that could disagree after another worker records a failure.
+            bool useHttp2 = request.Version >= HttpVersion.Version20;
             IDisposable? lease = useHttp2
                 ? await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false)
                 : null;
@@ -224,8 +227,9 @@ internal sealed class HttpTransport : IDisposable
         }
         catch (HttpProtocolException) when (request.Version >= HttpVersion.Version20 && request.RequestUri is { } targetUri)
         {
-            // CDN / middlebox rejected HTTP/2 stream framing: remember host as HTTP/1.1 and retry immediately on H1.1
-            _http1OnlyHosts[targetUri.IdnHost] = 1;
+            // CDN / middlebox rejected HTTP/2 stream framing. Reconsider
+            // this exact origin after a bounded interval, not every request.
+            _http2Cooldown.Remember(targetUri, DateTimeOffset.UtcNow.AddMinutes(30));
             using var fallbackRequest = CloneAsHttp11(request);
             return await _client.SendAsync(fallbackRequest, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token).ConfigureAwait(false);
         }
@@ -250,7 +254,8 @@ internal sealed class HttpTransport : IDisposable
     private HttpRequestMessage BuildRequest(Uri url, RequestSpec spec, bool sameRequestOrigin, bool sameCredentialOrigin)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, url);
-        bool allowH2 = (_options.EnableAdaptiveHttp2 || _options.Http2Experiment) && !_http1OnlyHosts.ContainsKey(url.IdnHost);
+        bool allowH2 = (_options.EnableAdaptiveHttp2 || _options.Http2Experiment)
+            && _http2Cooldown.RetryAt(url) is null;
         if (allowH2 && url.Scheme == Uri.UriSchemeHttps)
         {
             request.Version = HttpVersion.Version20;

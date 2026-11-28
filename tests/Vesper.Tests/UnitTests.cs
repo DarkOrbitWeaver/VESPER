@@ -649,12 +649,19 @@ public class SegmentBoardTests
         board.Advance(first, 1000);
         Assert.False(board.TryExtend(first, 2000));
         board.Release(second);
-        Assert.False(board.TryExtend(first, 1999));
-        Assert.True(board.TryExtend(first, 2000));
+        Assert.False(board.TryExtend(first, 1000));
+        Assert.True(board.TryExtend(first, 1750));
         Assert.Equal(1000, first.Next);
-        Assert.Equal(2000, first.End);
+        Assert.Equal(1750, first.End);
         Assert.Equal(1000, board.RemainingBytes);
-        board.Advance(first, 1000);
+        var tail = board.Acquire()!;
+        Assert.Equal(1750, tail.Start);
+        Assert.Equal(2000, tail.End);
+        board.Advance(first, 750);
+        Assert.False(board.TryExtend(first, 2000)); // tail is owned
+        board.Release(tail);
+        Assert.True(board.TryExtend(first, 2000));
+        board.Advance(first, 250);
         Assert.False(board.HasWork);
     }
 

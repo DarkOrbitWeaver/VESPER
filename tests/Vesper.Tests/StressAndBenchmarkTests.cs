@@ -180,6 +180,9 @@ public class BenchmarkTests(ITestOutputHelper output)
         using var h = new Harness();
         var elapsed = new List<double>(SmallTransferIterations);
         var allocated = new List<double>(SmallTransferIterations);
+        var acceptance = new List<double>(SmallTransferIterations);
+        var requestCounts = new List<int>(SmallTransferIterations);
+        var cpu = new List<double>(SmallTransferIterations);
 
         for (int iteration = 0; iteration < SmallTransferIterations; iteration++)
         {
@@ -193,16 +196,23 @@ public class BenchmarkTests(ITestOutputHelper output)
 
             h.Engine.JobChanged += OnJobChanged;
             long allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+            using var process = Process.GetCurrentProcess();
+            TimeSpan cpuBefore = process.TotalProcessorTime;
+            int requestsBefore = server.Hits("/file");
             var watch = Stopwatch.StartNew();
             try
             {
                 AddResult added = h.Engine.Add(new AddRequest(url, FileName: $"small-{iteration}.bin"));
+                acceptance.Add(watch.Elapsed.TotalMilliseconds);
                 Assert.True(added.Ok, added.Message);
                 JobSnapshot done = await completed.Task.WaitAsync(TimeSpan.FromSeconds(15));
                 watch.Stop();
                 Assert.Equal(added.JobId, done.Id);
                 Assert.Equal(size, new FileInfo(done.FinalPath!).Length);
                 elapsed.Add(watch.Elapsed.TotalMilliseconds);
+                requestCounts.Add(server.Hits("/file") - requestsBefore);
+                process.Refresh();
+                cpu.Add((process.TotalProcessorTime - cpuBefore).TotalMilliseconds);
                 allocated.Add((GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore) / 1048576.0);
                 Assert.Equal(expectedHash, await HashFileAsync(done.FinalPath!));
             }
@@ -220,6 +230,11 @@ public class BenchmarkTests(ITestOutputHelper output)
             samples = elapsed.Count,
             medianMs = Median(elapsedSorted),
             p95Ms = Percentile(elapsedSorted, 0.95),
+            firstRunMs = elapsed[0],
+            medianWarmMs = Median(elapsed.Skip(1).Order().ToArray()),
+            medianAcceptanceMs = Median(acceptance.Order().ToArray()),
+            medianRequests = Median(requestCounts.Select(n => (double)n).Order().ToArray()),
+            medianProcessCpuMs = Median(cpu.Order().ToArray()),
             medianAllocatedMiB = Median(allocatedSorted)
         }));
     }

@@ -65,6 +65,25 @@ public class RankingModelTests
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 
+    [Fact]
+    public void RepeatedIdenticalOutcomesKeepThePriorAndPosteriorBounded()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "vesper-learning-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(root, "outcomes.json");
+        try
+        {
+            var learner = new OnlineLearner(path);
+            var now = DateTimeOffset.UtcNow;
+            for (int i = 0; i < 80; i++) learner.RecordRouteOutcome("https://example.test", "route", true, now: now);
+            using var saved = JsonDocument.Parse(File.ReadAllText(path));
+            var arm = saved.RootElement.GetProperty("Arms").EnumerateObject().Single().Value;
+            double alpha = arm.GetProperty("Alpha").GetDouble(), beta = arm.GetProperty("Beta").GetDouble();
+            Assert.Equal(1.0, beta);
+            Assert.InRange(alpha + beta, 31.99, 32.000001);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
     private static string Mutate(Action<JsonObject> change)
     {
         var node = JsonNode.Parse(File.ReadAllText(ModelPath("active/source-association.json")))!.AsObject();
