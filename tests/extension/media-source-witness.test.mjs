@@ -203,6 +203,7 @@ test('equal-length unrelated buffers and non-media responses do not create prove
 
 test('media evidence graph ranks without confusing duration or directory with asset identity', () => {
   const context = vm.createContext({ URL });
+  vm.runInContext(script('vesper-evidence-graph'), context);
   vm.runInContext(script('media-evidence'), context);
   const graph = context.VesperMediaEvidence;
   const entry = (url, duration) => ({source:{url}, reply:{ok:true,data:{duration,choices:[{height:720,hasVideo:true}]}}});
@@ -220,6 +221,7 @@ test('media evidence graph ranks without confusing duration or directory with as
 
  test('same CDN path and duration cannot outrank an exact player resource match', () => {
   const context = vm.createContext({ URL });
+  vm.runInContext(script('vesper-evidence-graph'), context);
   vm.runInContext(script('media-evidence'), context);
   const graph = context.VesperMediaEvidence;
   const entry = url => ({source:{url},reply:{ok:true,data:{duration:60,choices:[{height:720,hasVideo:true}]}}});
@@ -234,6 +236,7 @@ test('media evidence graph ranks without confusing duration or directory with as
 
  test('parsed manifest membership ranks verified streams without claiming ownership', () => {
   const context = vm.createContext({ URL });
+  vm.runInContext(script('vesper-evidence-graph'), context);
   vm.runInContext(script('media-evidence'), context);
   const graph = context.VesperMediaEvidence;
   const entry = (url, matches) => ({source:{url},reply:{ok:true,data:{duration:60,playbackMatches:matches,choices:[{height:720,hasVideo:true}]}}});

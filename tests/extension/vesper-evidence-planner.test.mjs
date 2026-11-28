@@ -15,6 +15,28 @@ function graphAt(start = 1_000_000) {
   return { graph: G.create({ now: () => now }), advance: ms => { now += ms; return now; }, at: () => now };
 }
 
+test('typed acquisition graph separates recoverability from playback identity', () => {
+  const url = 'https://cdn.example/active.mp4';
+  const candidate = {url,kind:'direct',direct:true,witnessed:true,verified:true,compatible:true};
+  const args = {scope,playerKey:'v',generation:1,sourceUrl:url};
+  const exact = G.create().assessPicker({...args,candidates:[candidate]});
+  assert.equal(exact.verdict,'exact');
+  assert.equal(exact.selected,0);
+  const worker = G.create().assessPicker({...args,worker:true,candidates:[candidate]});
+  assert.equal(worker.verdict,'confirm');
+  assert.equal(worker.selected,null);
+  assert.equal(worker.rows[0].witnessed,false);
+  const incompatible = G.create().assessPicker({...args,candidates:[{...candidate,compatible:false}]});
+  assert.equal(incompatible.verdict,'abstain');
+  const duplicate = G.create().assessPicker({...args,candidates:[candidate,candidate]});
+  assert.equal(duplicate.verdict,'confirm');
+  assert.equal(duplicate.selected,null);
+  const overflow = G.create({limits:{nodes:4,edges:4}}).assessPicker({...args,candidates:[candidate]});
+  assert.equal(overflow.verdict,'abstain');
+  assert.equal(G.create().assessPicker({...args,candidates:[candidate,{...candidate,url:'bad'}]}).verdict,'abstain');
+});
+
+
 test('requests bind only to the player generation that was current when they happened', () => {
   const { graph, advance, at } = graphAt();
   graph.observePlayer({ scope, playerKey: 'v1', generation: 1, at: at() });

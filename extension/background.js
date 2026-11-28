@@ -1501,7 +1501,7 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
-  if (prefetch && (VesperPlayerSource.blocksPassiveProbe(page.href) || message.refresh === true
+  if (prefetch && (message.workerMediaSource === true || VesperPlayerSource.blocksPassiveProbe(page.href) || message.refresh === true
       || sender.tab?.active === false || sender.tab?.incognito || !sender.documentId || !binding
       || VesperPlayerSource.identity(sender.url) !== identity
       || !Number.isInteger(message.generation) || message.generation < 1))
@@ -1671,7 +1671,7 @@ async function playerOptions(message, sender) {
     // A dedicated-worker MediaSourceHandle has no window-observable buffers.
     // Offer explicit confirmation only; no native request before selection.
     function workerChoice() {
-      if (prefetch || !binding || source || matchedManifest || possibleSources.length
+      if (prefetch || !binding || source
           || message.workerMediaSource !== true
           || !sender.documentId || sender.tab?.incognito || !Number.isInteger(tab)
           || typeof message.playerKey !== 'string' || !message.playerKey || message.playerKey.length > 100
@@ -1680,8 +1680,7 @@ async function playerOptions(message, sender) {
       let choices, workerEvidence;
       if (manifest) {
         if (message.manifestOnPlayer !== true || manifest.protocol !== 'https:' || manifest.search
-            || !/\.(?:m3u8|mpd)$/i.test(manifest.pathname) || isPartialMediaUrl(manifest)
-            || state.sources.some(item => currentEvidence(item) && item.url === manifest.href)) return null;
+            || !/\.(?:m3u8|mpd)$/i.test(manifest.pathname) || isPartialMediaUrl(manifest)) return null;
         choices = [{ url: manifest.href, kind: VesperPlayerSource.kind(manifest.href), workerDeclaration: true }];
       } else {
         if (message.multiplePlayers === true || !player.durationSeconds || player.live === true) return null;
@@ -1696,6 +1695,11 @@ async function playerOptions(message, sender) {
       candidateCount = choices.length;
       return { ok: true, data: { title, sourceChoices: rememberSourceSelections(choices, context) } };
     }
+    // Generic worker playback has no independently attributable current URL.
+    // Do not let the ordinary page/traffic path bypass explicit confirmation.
+    // A specific post identity can still use its existing resolver checks.
+    if (message.workerMediaSource === true && !source && !specificIdentity)
+      return workerChoice() || { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
     async function browserFallback(failure) {
       if (!wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network',
         'sign-in', 'no-media', 'unavailable', 'timeout'].includes(failure?.code)) return failure;
@@ -1870,7 +1874,10 @@ async function playerOptions(message, sender) {
       const association = VesperMediaEvidence.associate({
         sources: checked, player, currentUrl: source?.href || '',
         resources: [...resourceWitness], exactResources: [...exactResources], fragments: rankingFragments.map(fragment =>
-          fragment.origin + '/' + fragment.parts.join('/'))
+          fragment.origin + '/' + fragment.parts.join('/')),
+        scope: [tab, frame, sender.documentId].join(':'), playerKey: message.playerKey || 'player',
+        generation: Number.isSafeInteger(message.generation) && message.generation > 0 ? message.generation : 1,
+        worker: message.workerMediaSource === true
       });
       for (const node of association.nodes) if (!node.compatible) mismatchedUrls.add(node.entry.source.url);
       const ordered = association.nodes.map(node => node.entry);
@@ -2019,6 +2026,10 @@ async function selectMediaSource(message, sender) {
     if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:selection.url,referrer:sender.url}))
       return { ok: false, code: 'blocked', message: 'VESPER could not confirm that this site permits native acquisition.' };
     const reply = explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, {}, page.href, selection.title), 20000));
+    const latest = workerObservedCandidates((await tabState(selection.tab)).sources, selection.documentId, selection.frame,
+      selection.workerChangedAt, Date.now(), selection.workerPlayerFacts);
+    if (!latest || workerCandidateSnapshot(latest) !== selection.workerEvidence)
+      return { ok: false, code: 'expired-selection', message: 'The worker source changed during verification. Refresh the formats.' };
     const facts = VesperMediaEvidence.mediaFacts(reply);
     // Unlike a declared manifest, a timing-only candidate needs positive
     // duration and track agreement in addition to the user's confirmation.

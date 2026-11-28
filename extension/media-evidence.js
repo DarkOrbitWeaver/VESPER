@@ -119,7 +119,8 @@ globalThis.VesperMediaEvidence = (() => {
 
   // A graph is constructed for one picker request, never persisted across
   // documents. Edges are evidence, not download authority.
-  function associate({ sources, player = {}, currentUrl = '', resources = [], exactResources = [], fragments = [] } = {}) {
+  function associate({ sources, player = {}, currentUrl = '', resources = [], exactResources = [], fragments = [],
+    scope = 'picker', playerKey = 'player', generation = 1, worker = false } = {}) {
     const list = Array.isArray(sources) ? sources.slice(0, 32) : [];
     const observed = new Set(Array.isArray(resources) ? resources.slice(0, 12) : []);
     const bound = new Set(Array.isArray(exactResources) ? exactResources.slice(0, 32) : []);
@@ -146,8 +147,8 @@ globalThis.VesperMediaEvidence = (() => {
       const compatible = matchesPlayback(player, facts)
         && !(entry.source?.sliceEvidence && durationAgreement === false);
       const edges = [];
-      const direct = !!exact && url?.href === exact && !entry.source?.group;
-      const witnessed = bound.has(url?.href) || entry.source?.group?.some(member => bound.has(member.url));
+      const direct = !worker && !!exact && url?.href === exact && !entry.source?.group;
+      const witnessed = !worker && (bound.has(url?.href) || entry.source?.group?.some(member => bound.has(member.url)));
       if (direct) edges.push({ kind: 'current-source', weight: 20 });
       if (witnessed) edges.push({ kind: 'player-resource', weight: 24 });
       if (entry.source?.sliceEvidence) edges.push({ kind: 'player-slices', weight: 24 });
@@ -186,10 +187,16 @@ globalThis.VesperMediaEvidence = (() => {
     nodes.sort((a, b) => Number(b.direct && b.verified && b.compatible) - Number(a.direct && a.verified && a.compatible)
       || Number('source-' + b.index === preferred) - Number('source-' + a.index === preferred)
       || b.rank - a.rank || a.index - b.index);
-    // Duration, timing, CDN affinity and DOM hints can never prove the active
-    // asset. Only the exact current source with independently checked formats.
-    const direct = nodes.filter(node => node.direct && node.verified && node.compatible);
-    return { nodes, selected: direct.length === 1 ? direct[0].entry : null };
+    // Use the typed evidence graph for the actual selection verdict, not
+    // merely lookup ordering. Keep the model's ranking separate from identity.
+    const graph = globalThis.VesperEvidenceGraph?.create();
+    const decision = graph?.assessPicker({ scope, playerKey, generation, sourceUrl: currentUrl, worker,
+      candidates: [...nodes].sort((a,b) => a.index - b.index).map(node => ({
+        url: node.entry.source?.url, kind: node.entry.source?.kind, direct: node.direct,
+        witnessed: !!node.witnessed, verified: node.verified, compatible: node.compatible
+      })) });
+    return { nodes, selected: decision?.verdict === 'exact'
+      ? nodes.find(node => node.index === decision.selected)?.entry || null : null };
   }
 
   return { mediaFacts, playerFacts, score, trackLabel, matchesPlayback, associate };

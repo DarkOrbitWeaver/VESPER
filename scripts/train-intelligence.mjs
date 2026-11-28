@@ -173,6 +173,35 @@ export function pairedSafety(candidate, baseline, cases) {
   return { newWrong, correctedWrong, lostCorrect, gainedCorrect };
 }
 
+ // Resample whole site families, not individual correlated cases. This is a
+ // descriptive paired interval over the reviewed families, not a claim about
+ // unseen sites. Equal family weighting prevents a large site dominating it.
+export function pairedFamilyRecall(candidate, baseline, cases) {
+  const groups = new Map();
+  for (const row of cases) {
+    if (row.label === 'adapter-weak' || row.chosen === null) continue;
+    const key = row.group?.toLowerCase() || 'unknown';
+    const group = groups.get(key) || { count: 0, delta: 0 };
+    const correct = rank => { const result = rank(row.candidates); return Number(result.decisive && result.selected === row.chosen); };
+    group.count++;
+    group.delta += correct(candidate) - correct(baseline);
+    groups.set(key, group);
+  }
+  const values = [...groups.values()].map(g => g.delta / g.count);
+  if (!values.length) return { families: 0, mean: null, lower: null, upper: null, regressedFamilies: 0 };
+  let state = 0x51f15e;
+  const sample = () => { state = (Math.imul(state, 1664525) + 1013904223) >>> 0; return state / 4294967296; };
+  const draws = [];
+  for (let i = 0; i < 2000; i++) {
+    let total = 0;
+    for (let j = 0; j < values.length; j++) total += values[Math.floor(sample() * values.length)];
+    draws.push(total / values.length);
+  }
+  draws.sort((a,b) => a-b);
+  return { families: values.length, mean: values.reduce((a,b) => a+b,0) / values.length,
+    lower: draws[49], upper: draws[1949], regressedFamilies: values.filter(v => v < 0).length };
+}
+
 function calibrate(schema, weights, validation) {
   const labeled = validation.filter(row => row.chosen !== null && row.label !== 'adapter-weak');
   let best = { temperature: 1, nll: Infinity };
@@ -298,15 +327,26 @@ function boundedJson(path, maxBytes) {
 // collected case. Repeated copies of a case must not inflate the release gate.
 // An ID is bookkeeping, not proof of real-world ground truth.
 export function validateReviewIds(partitions) {
-  const seen = new Set();
+  const seen = new Set(), programs = new Set(), sessions = new Map();
+  const opaque = value => typeof value === 'string' && /^[a-z0-9_-]{8,80}$/i.test(value);
   for (const split of ['train', 'validation', 'holdout']) {
     for (const row of partitions[split]) {
       if (row.label !== 'verified' && row.label !== 'user') continue;
-      if (typeof row.caseId !== 'string' || !/^[a-z0-9_-]{8,80}$/i.test(row.caseId))
-        throw Error('Missing opaque independent review caseId in ' + split);
+      if (!opaque(row.caseId)) throw Error('Missing opaque independent review caseId in ' + split);
       const id = row.caseId.toLowerCase();
       if (seen.has(id)) throw Error('Repeated independent review caseId: ' + id);
       seen.add(id);
+      // Different formats, encodings and repeated captures of one program
+      // cannot inflate the independent case count. Sessions may contain
+      // several distinct programs but must never cross partitions.
+      if (!opaque(row.programId) || !opaque(row.sessionId))
+        throw Error('Missing opaque programId or sessionId in ' + split);
+      const program = row.programId.toLowerCase(), session = row.sessionId.toLowerCase();
+      if (programs.has(program)) throw Error('Repeated independent programId: ' + program);
+      programs.add(program);
+      if (sessions.has(session) && sessions.get(session) !== split)
+        throw Error('Session crosses partitions: ' + session);
+      sessions.set(session, split);
     }
   }
 }
@@ -342,11 +382,13 @@ export function promotionEvaluation(model, partitions, baseline) {
   for (const split of ['validation', 'holdout']) {
     const candidate = evaluate(rank, partitions[split]), reference = evaluate(previous, partitions[split]);
     const paired = pairedSafety(rank, previous, partitions[split]);
+    const familyRecall = pairedFamilyRecall(rank, previous, partitions[split]);
     const passed = (candidate.decisivePrecision ?? 0) >= 0.99 && (candidate.unambiguousRecall ?? 0) >= 0.95
       && candidate.ambiguousDecisive === 0 && paired.newWrong === 0
+      && familyRecall.regressedFamilies === 0
       && (candidate.decisivePrecision ?? 0) >= (reference.decisivePrecision ?? 0)
       && (candidate.unambiguousRecall ?? 0) >= (reference.unambiguousRecall ?? 0);
-    gates[split] = { candidate, reference, paired, passed };
+    gates[split] = { candidate, reference, paired, familyRecall, passed };
   }
   const failures = guardFailures(rank, model.schema);
   const { candidate, reference } = gates.holdout;

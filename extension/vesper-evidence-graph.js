@@ -7,13 +7,14 @@
 globalThis.VesperEvidenceGraph = (() => {
   const SCHEMA = 'vesper.evidence/1';
   const NODE_TYPES = new Set(['document', 'frame', 'player', 'generation', 'request', 'manifest',
-    'representation', 'track', 'config', 'control', 'interaction']);
-  // Relation strength is ordinal. Only 'strong' relations can make a source decisive on their own.
+    'representation', 'track', 'config', 'control', 'interaction', 'execution-context', 'byte-artifact', 'acquisition']);
+  // Format verification is evidence of recoverability, not of program identity.
   const RELATIONS = Object.freeze({
-    contains: 'structural', hosts: 'structural', generation: 'structural',
+    contains: 'structural', hosts: 'structural', generation: 'structural', 'runs-in': 'structural',
     plays: 'strong', fingerprint: 'strong', 'selected-by-user': 'strong',
     'requested-during': 'medium', 'segment-of': 'medium', 'representation-of': 'medium', 'track-of': 'medium',
-    declares: 'weak', 'controls': 'weak', hypothesizes: 'weak'
+    declares: 'weak', 'controls': 'weak', hypothesizes: 'weak', 'url-witness': 'medium',
+    'candidate-for': 'weak', 'format-checked': 'medium', 'contradicts': 'negative'
   });
   const LIMITS = Object.freeze({ nodes: 384, edges: 768, keyLength: 4608, lifetimeMs: 60 * 60_000 });
   // Signed-URL expiry parameters distilled from the resolver adapters and common CDN conventions
@@ -235,7 +236,52 @@ globalThis.VesperEvidenceGraph = (() => {
         if (node.attrs.scope === scopePrefix) removeNode(nodeId);
     }
 
-    return Object.freeze({ add, link, observePlayer, observeRequest, observeDeclared, observeFingerprint, associate, forget,
+    // Build acquisition hypotheses from already admitted evidence. This graph
+    // is per picker, not a persistent store of URLs or media bytes. A URL
+    // witness is explicitly not a byte hash or proof of a complete artifact.
+    function assessPicker({ scope, playerKey, generation, sourceUrl = '', worker = false, candidates = [] }) {
+      if (!Array.isArray(candidates) || candidates.length > 32) return { verdict: 'abstain', rows: [] };
+      const gen = observePlayer({ scope, playerKey, generation, sourceUrl: worker ? '' : sourceUrl });
+      if (!gen) return { verdict: 'abstain', rows: [] };
+      const execution = add('execution-context', scopedKey(scope, playerKey, generation), {
+        scope, kind: worker ? 'worker-handle-opaque' : 'window', attributable: !worker
+      });
+      link(gen, execution, 'runs-in');
+      const rows = [];
+      for (const [index, item] of candidates.entries()) {
+        const url = parseHttp(item?.url);
+        if (!url) continue;
+        const resource = addSource(scope, url.href, item.kind || 'unknown');
+        const acquisition = add('acquisition', scopedKey(scope, playerKey, generation, index), {
+          scope, index, formatChecked: item.verified === true, compatible: item.compatible === true
+        });
+        if (!link(gen, acquisition, 'candidate-for') || !link(acquisition, resource, 'representation-of')) continue;
+        if (item.verified === true) link(resource, acquisition, 'format-checked');
+        if (item.compatible !== true) link(gen, acquisition, 'contradicts');
+        if (item.witnessed === true && !worker) {
+          const artifact = add('byte-artifact', scopedKey(scope, playerKey, generation, index), {
+            scope, kind: 'resource-url-witness', complete: false
+          });
+          link(gen, artifact, 'url-witness');
+          link(artifact, resource, 'url-witness');
+        }
+        const exact = !worker && item.direct === true && out(gen, 'plays').some(edge =>
+          nodes.get(edge.to)?.attrs.url === url.href);
+        rows.push({ index, exact, witnessed: !worker && item.witnessed === true,
+          verified: item.verified === true, compatible: item.compatible === true,
+          verdict: item.compatible !== true ? 'reject' : item.verified !== true ? 'verify'
+            : exact ? 'exact' : 'confirm' });
+      }
+      // Eviction, malformed input or a lost generation cannot silently turn
+      // an incomplete set of hypotheses into a unique automatic choice.
+      if (evicted || rows.length !== candidates.length || !nodes.has(gen) || !nodes.has(execution))
+        return { verdict: 'abstain', rows: [] };
+      const exact = rows.filter(row => row.verdict === 'exact');
+      return { verdict: exact.length === 1 ? 'exact' : rows.some(row => row.verdict === 'confirm' || row.verdict === 'exact')
+        ? 'confirm' : 'abstain', selected: exact.length === 1 ? exact[0].index : null, rows };
+    }
+
+    return Object.freeze({ add, link, observePlayer, observeRequest, observeDeclared, observeFingerprint, associate, forget, assessPicker,
       snapshot: () => ({ schema: SCHEMA, nodes: nodes.size, edges: edges.size, evicted }) });
   }
 

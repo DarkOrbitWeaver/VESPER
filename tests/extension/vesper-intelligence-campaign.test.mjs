@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { generate } from '../../tools/intelligence/corpus.mjs';
-import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures, wilsonInterval, pairedSafety } from '../../scripts/train-intelligence.mjs';
+import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures, wilsonInterval, pairedSafety, pairedFamilyRecall } from '../../scripts/train-intelligence.mjs';
 
 const context = vm.createContext({ URL });
 for (const name of ['vesper-intelligence.js', 'vesper-model.js', 'vesper-inference.js', 'vesper-planner.js'])
@@ -72,11 +72,11 @@ test('leakage, weak-label evaluation and private fields are rejected by the trai
   assert.throws(() => validateCases('vesper.player-intent/2', priv), /Invalid candidate/);
 });
 
-test('promotion review IDs prevent duplicated independent samples across or within partitions', () => {
+test('promotion review IDs prevent duplicate programs and cross-partition sessions', () => {
   const data = {
-    train: [{ label: 'verified', caseId: 'case_0001' }],
-    validation: [{ label: 'user', caseId: 'case_0002' }],
-    holdout: [{ label: 'verified', caseId: 'case_0003' }]
+    train: [{ label: 'verified', caseId: 'case_0001', programId:'program_1', sessionId:'session_1' }],
+    validation: [{ label: 'user', caseId: 'case_0002', programId:'program_2', sessionId:'session_2' }],
+    holdout: [{ label: 'verified', caseId: 'case_0003', programId:'program_3', sessionId:'session_3' }]
   };
   assert.doesNotThrow(() => validateReviewIds(data));
   data.holdout.push({ label: 'verified', caseId: 'CASE_0003' });
@@ -86,6 +86,12 @@ test('promotion review IDs prevent duplicated independent samples across or with
   assert.throws(() => validateReviewIds(data), /Repeated independent review caseId/);
   data.holdout[0].caseId = 'https://example.com/private';
   assert.throws(() => validateReviewIds(data), /Missing opaque independent review caseId/);
+  data.holdout[0].caseId = 'case_0003';
+  data.holdout[0].programId = 'PROGRAM_1';
+  assert.throws(() => validateReviewIds(data), /Repeated independent programId/);
+  data.holdout[0].programId = 'program_3';
+  data.holdout[0].sessionId = 'SESSION_1';
+  assert.throws(() => validateReviewIds(data), /Session crosses partitions/);
 });
 
 test('review coverage counts only independently labeled examples and reports missing coverage', () => {
@@ -98,10 +104,27 @@ test('review coverage counts only independently labeled examples and reports mis
   const row = data.holdout.find(item => item.chosen !== null);
   row.label = 'verified';
   row.caseId = 'review_0001';
+  row.programId = 'program_0001';
+  row.sessionId = 'session_0001';
   const reviewed = reviewCoverage(schema, data);
   assert.equal(reviewed.splits.holdout.independent, 1);
   assert.equal(reviewed.splits.holdout.missingChosen, 199);
   assert.equal(reviewed.ready, false);
+});
+
+test('family paired recall exposes regressions hidden by a larger family', () => {
+  const rows = [
+    ...Array.from({length:100},()=>({group:'large',label:'fixture',chosen:'a',candidates:[{id:'a'}]})),
+    {group:'small',label:'fixture',chosen:'b',candidates:[{id:'b'}]}
+  ];
+  const before = c => ({decisive:c[0].id==='b',selected:c[0].id});
+  const after = c => ({decisive:c[0].id==='a',selected:c[0].id});
+  const paired = pairedFamilyRecall(after,before,rows);
+  assert.equal(paired.families,2);
+  assert.equal(paired.mean,0);
+  assert.equal(paired.regressedFamilies,1);
+  assert.equal(paired.lower,-1);
+  assert.equal(paired.upper,1);
 });
 
 test('evaluation reports uncertainty, family imbalance and missing calibration coverage', () => {

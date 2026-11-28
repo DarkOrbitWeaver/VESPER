@@ -1624,6 +1624,31 @@ test('worker without a declaration offers only bounded current-document choices,
   } finally {app.stopWorker();}
 });
 
+test('generic worker handle cannot bypass confirmation via ordinary traffic or a matched declaration', async () => {
+  const page='https://example.test/watch';
+  const url='https://cdn.test/worker.mpd';
+  const sender={url:page,tab:{id:92},frameId:0,documentId:'generic-worker'};
+  const app=load({'media-source-options':checkedSource(15)});
+  const at=Date.now();
+  const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'',
+    workerMediaSource:true,playerHasMedia:true,playerKey:'worker',generation:1,mediaChangedAt:at,
+    playerFacts:{kind:'video',durationSeconds:15,height:720}};
+  try {
+    await app.onMedia({url,tabId:92,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,
+      type:'xmlhttprequest',timeStamp:at,responseHeaders:[{name:'Content-Type',value:'application/dash+xml'}]});
+    const prefetch=await app.message({...request,prefetch:true},sender);
+    assert.equal(prefetch.data.prefetchSkipped,true);
+    for(const change of [{},{manifestUrl:url,manifestOnPlayer:true}]){
+      const reply=await app.message({...request,...change,refresh:true},sender);
+      assert.equal(reply.ok,true);
+      assert.equal(reply.data.choices,undefined);
+      assert.equal(reply.data.sourceChoices[0].requiresConfirmation,true);
+    }
+    assert.equal(app.sent.length,0);
+  } finally {app.stopWorker();}
+});
+
+
 test('copied-buffer path hint admits a unique current source only for explicit verification', async () => {
   const page = 'https://www.facebook.com/';
   const path = 'https://cdn.test/opaque-media';
