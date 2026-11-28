@@ -97,6 +97,34 @@ public sealed class ConnectionLimitTests
         else Assert.InRange(connectionIds.Count, 1, 4);
     }
 
+    [Fact]
+    public async Task Protocol_experiment_shares_one_budget_across_http1_origins_on_same_host()
+    {
+        await using var first = new FaultServer(1024);
+        await using var second = new FaultServer(1024);
+        await first.StartAsync();
+        await second.StartAsync();
+        using var http = new HttpTransport(new EngineOptions
+        {
+            DataDirectory = Path.GetTempPath(), AllowPrivateNetworks = true, Proxy = ProxyMode.Direct,
+            MaxConnectionsPerHost = 1, EnableAdaptiveHttp2 = true
+        });
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        using var held = await http.SendAsync(new Uri(first.Url("/file")), new RequestSpec(), stop.Token);
+        Assert.Equal(HttpVersion.Version11, held.Version);
+        var queued = http.SendAsync(new Uri(second.Url("/file")), new RequestSpec(), stop.Token);
+        try
+        {
+            await Task.Delay(100, stop.Token);
+            Assert.False(queued.IsCompleted);
+            Assert.Equal(0, second.Hits("/file"));
+        }
+        finally { held.Dispose(); }
+        using var response = await queued;
+        Assert.Equal(second.V1, await response.Content.ReadAsByteArrayAsync(stop.Token));
+        Assert.Equal(1, second.Hits("/file"));
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(2)]

@@ -140,7 +140,7 @@ internal static class MediaSourceRescue
         {
             StreamProtocol.Http => JobKind.Http, StreamProtocol.Hls => JobKind.Hls,
             StreamProtocol.Dash => JobKind.Dash, _ => JobKind.Merge
-        }).Distinct().ToArray());
+        }).Distinct().ToArray(), pageUrl: job.OriginalPageUrl);
         foreach (MediaRepresentation format in exact.Where(r => !r.IsLive
             && (r.Protocol != protocol && r.Protocol is (StreamProtocol.Http or StreamProtocol.Dash or StreamProtocol.Hls)
                 || r.Protocol == protocol && r.Url.AbsoluteUri != job.SourceUrl))

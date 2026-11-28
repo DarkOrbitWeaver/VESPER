@@ -188,9 +188,9 @@ public sealed partial class DownloadEngine : IDisposable
     }
 
     /// <summary>Advisory route preference from recent native outcomes; never evidence of media identity.</summary>
-    public JobKind? PreferredMediaDelivery(string provider, IReadOnlyCollection<JobKind> available, long? expectedBytes = null)
+    public JobKind? PreferredMediaDelivery(string provider, IReadOnlyCollection<JobKind> available, long? expectedBytes = null, string? pageUrl = null)
     {
-        lock (_lock) return _mediaDeliveryHistory.Preferred(provider, available, DateTime.UtcNow, expectedBytes);
+        lock (_lock) return _mediaDeliveryHistory.Preferred(provider, available, DateTime.UtcNow, expectedBytes, pageUrl);
     }
 
     private static bool IsDuplicateCandidate(DownloadJob job) =>

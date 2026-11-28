@@ -159,13 +159,12 @@ internal sealed class HttpTransport : IDisposable
             using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
             if (proxyAddress is not null)
                 _originAwareProxy!.PinRequest(request, current, proxyAddress);
-            // HTTP/2 multiplexes streams on one physical connection. A socket limit
-            // is therefore not a request limit. Retain admission until disposal of
-            // the response body, including on redirects and failed requests.
-            // Use the actual request decision, not a second history lookup
-            // that could disagree after another worker records a failure.
-            bool useHttp2 = request.Version >= HttpVersion.Version20;
-            IDisposable? lease = useHttp2
+            // When protocol experimentation is enabled, keep one shared host
+            // budget across both protocol pools, including HTTP/1 fallback and
+            // HTTP/2 streams that were already in flight. The ordinary H1-only
+            // path continues to use its existing pooled socket limit.
+            bool sharedProtocolBudget = _options.EnableAdaptiveHttp2 || _options.Http2Experiment;
+            IDisposable? lease = sharedProtocolBudget
                 ? await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false)
                 : null;
             HttpResponseMessage response;

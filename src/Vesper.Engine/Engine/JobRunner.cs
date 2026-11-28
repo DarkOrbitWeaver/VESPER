@@ -22,6 +22,7 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private PieceMap? _pieces;
     private bool _singleConnection;
     private bool _forceLinear;
+    private int _firstBodyRead;
 
     private sealed record FirstResult(HttpResponseMessage Response, long Start, bool Ranged, bool Replay, bool Decoded, long? Total);
 
@@ -984,7 +985,20 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
     private async ValueTask<int> ReadAsync(Stream body, Memory<byte> buffer, CancellationTokenSource stall, CancellationToken ct)
     {
         stall.CancelAfter(_o.StallTimeout);
-        try { return await body.ReadAsync(buffer, stall.Token).ConfigureAwait(false); }
+        try
+        {
+            int count = await body.ReadAsync(buffer, stall.Token).ConfigureAwait(false);
+            // Optional monotonic benchmark hook. No allocation or timestamp on
+            // the ordinary transfer path; this is the first body read, not
+            // the first packet on the wire or a durable write.
+            if (count > 0 && _o.FirstBodyRead is { } observe
+                && Interlocked.CompareExchange(ref _firstBodyRead, 1, 0) == 0)
+            {
+                try { observe(Job.Id, Stopwatch.GetTimestamp()); }
+                catch { /* instrumentation must never change the transfer */ }
+            }
+            return count;
+        }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new TransientNetworkException("The connection stalled.");

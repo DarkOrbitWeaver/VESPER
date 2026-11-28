@@ -1557,13 +1557,16 @@ async function playerOptions(message, sender) {
           possibleSources.push(evidence);
       }
     }
-    // A specific program's declared direct representation is a discovery hint,
-    // not playback proof. Admit only an independently observed resource from
-    // this exact document and generation, then require explicit source choice.
-    if (!prefetch && binding && !source && !matchedManifest && manifest && identity && !/^https?:/.test(identity)
+    // Exact, independently observed declarations may be checked on request,
+    // including a library attached to an object-backed/worker-backed player.
+    // Generic page-level metadata is not a player binding. Do not widen the
+    // generation window for a generic page, and never auto-select this hint.
+    const specificIdentity = identity && !/^https?:/.test(identity);
+    if (!prefetch && binding && !source && !matchedManifest && manifest
+        && (specificIdentity || message.manifestOnPlayer === true)
         && playerActiveOrLoaded && message.generation > 0 && changedAt > 0 && sender.documentId) {
       const declared = state.sources.find(item => item.url === manifest.href && currentEvidence(item)
-        && (item.seen >= changedAt - 15_000 || message.manifestOnPlayer === true)
+        && (item.seen >= changedAt - 15_000 || specificIdentity && message.manifestOnPlayer === true)
         && (isWholeDirectSource(item) || isRangedMediaCandidate(item)));
       if (declared && !possibleSources.some(item => item.url === declared.url))
         possibleSources.push({ ...declared, declared: true });

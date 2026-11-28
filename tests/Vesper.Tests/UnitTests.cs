@@ -638,6 +638,34 @@ public class SegmentBoardTests
         Assert.Equal(12 * 1024 * 1024, fast.End);
     }
 
+    private sealed class BoardClock : TimeProvider
+    {
+        private long _stamp = 1;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override long GetTimestamp() => _stamp;
+        public void Advance(TimeSpan duration) => _stamp += duration.Ticks;
+    }
+
+    [Fact]
+    public void Stalled_formerly_fast_range_is_reclaimed_before_currently_progressing_range()
+    {
+        var clock = new BoardClock();
+        var board = new SegmentBoard(128 * 1024, rateAware: true, clock: clock);
+        board.Add(new Segment(0, 4 * 1024 * 1024));
+        board.Add(new Segment(4 * 1024 * 1024, 8 * 1024 * 1024));
+        Segment stalled = board.Acquire()!, current = board.Acquire()!;
+        stalled.Rate = 4_000_000;
+        current.Rate = 1_000_000;
+        board.ClaimChunk(stalled, 65536);
+        clock.Advance(TimeSpan.FromSeconds(8));
+        board.Advance(current, 65536);
+        Segment stolen = board.Acquire(1_000_000)!;
+        Assert.Equal(4 * 1024 * 1024, stolen.End);
+        Assert.Equal(stalled.End, stolen.Start);
+        Assert.True(stolen.Start >= stalled.Claimed);
+        Assert.Equal(8 * 1024 * 1024, current.End);
+    }
+
     [Fact]
     public void Adjacent_range_reuse_requires_free_untouched_bytes_inside_response()
     {

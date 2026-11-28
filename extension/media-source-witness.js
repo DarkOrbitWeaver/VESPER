@@ -720,17 +720,37 @@
         const id = ytPlayer.getVideoData()?.video_id;
         if (/^[A-Za-z0-9_-]{11}$/.test(id || '')) video.setAttribute('data-vesper-youtube-video-id', id);
       }
-      // Generic HLS.js / Dash.js / Shaka / Video.js attached instance manifest discovery
+      // Attached-library declarations are hints, not observations of worker
+      // SourceBuffers. Read data properties only (never run arbitrary getters),
+      // and abstain if the active element exposes conflicting source URLs.
+      const own = (obj, key) => obj && typeof obj === 'object'
+        ? Object.getOwnPropertyDescriptor(obj, key)?.value : undefined;
+      const candidates = new Set();
+      const consider = (value, type, manifestField = false) => {
+        const parsed = typeof value === 'string' ? parseHttpUrl(value) : null;
+        if (!parsed) return;
+        const mime = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        if (manifestField || /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(parsed.href)
+            || /(?:mpegurl|dash\+xml)/i.test(mime)
+            || /^(?:audio|video)\//.test(mime)
+            || /\.(?:mp4|m4a|webm|mp3|ogg|opus|flac)(?:[?#]|$)/i.test(parsed.href))
+          candidates.add(parsed.href);
+      };
       for (const key of Object.getOwnPropertyNames(video).slice(0, 40)) {
-        const val = Object.getOwnPropertyDescriptor(video, key)?.value;
-        if (!val || typeof val !== 'object') continue;
-        const manifestCandidate = val.url || val.manifestUri_ || val.src_ || val.currentSource?.src;
-        const parsed = typeof manifestCandidate === 'string' ? parseHttpUrl(manifestCandidate) : null;
-        if (parsed && /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(parsed.href)) {
-          video.setAttribute('data-vesper-player-manifest', parsed.href);
-          break;
-        }
+        try {
+          const val = own(video, key);
+          if (!val || typeof val !== 'object') continue;
+          consider(own(val, 'manifestUri_'), '', true);
+          consider(own(val, 'manifestUrl'), '', true);
+          // A generic url property alone is meaningful only for a manifest.
+          const url = own(val, 'url');
+          if (typeof url === 'string' && /\.(?:m3u8|mpd)(?:[?#]|$)/i.test(url)) consider(url);
+          const current = own(val, 'currentSource');
+          consider(own(current, 'src'), own(current, 'type') || own(current, 'mimeType'));
+          consider(own(val, 'src_'), own(val, 'type_') || own(val, 'mimeType'));
+        } catch { /* one unavailable property must not hide other declarations */ }
       }
+      if (candidates.size === 1) video.setAttribute('data-vesper-player-manifest', candidates.values().next().value);
     } catch {}
   }, true);
 

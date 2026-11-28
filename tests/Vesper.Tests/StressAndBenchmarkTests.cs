@@ -170,14 +170,17 @@ public class BenchmarkTests(ITestOutputHelper output)
             adaptiveMedianMs = Median(samples.Where(s => s.Connections == 4).Select(s => s.Milliseconds).Order().ToArray()) }));
     }
 
-    [Fact]
-    public async Task Measure_small_direct_download_latency()
+    [Theory]
+    [InlineData(16 * 1024)]
+    [InlineData(256 * 1024)]
+    public async Task Measure_small_direct_download_latency(int size)
     {
-        const int size = 16 * 1024;
         await using var server = new FaultServer(size);
         await server.StartAsync();
         string expectedHash = Payloads.Sha256(server.V1);
-        using var h = new Harness();
+        var firstReads = new System.Collections.Concurrent.ConcurrentDictionary<Guid, long>();
+        using var h = new Harness(tweak: options => options.FirstBodyRead = (id, stamp) => firstReads.TryAdd(id, stamp));
+        var firstReadMs = new List<double>(SmallTransferIterations);
         var elapsed = new List<double>(SmallTransferIterations);
         var allocated = new List<double>(SmallTransferIterations);
         var acceptance = new List<double>(SmallTransferIterations);
@@ -199,6 +202,7 @@ public class BenchmarkTests(ITestOutputHelper output)
             using var process = Process.GetCurrentProcess();
             TimeSpan cpuBefore = process.TotalProcessorTime;
             int requestsBefore = server.Hits("/file");
+            long start = Stopwatch.GetTimestamp();
             var watch = Stopwatch.StartNew();
             try
             {
@@ -208,6 +212,10 @@ public class BenchmarkTests(ITestOutputHelper output)
                 JobSnapshot done = await completed.Task.WaitAsync(TimeSpan.FromSeconds(15));
                 watch.Stop();
                 Assert.Equal(added.JobId, done.Id);
+                Assert.True(firstReads.TryRemove(done.Id, out long stamp));
+                double firstMs = Stopwatch.GetElapsedTime(start, stamp).TotalMilliseconds;
+                Assert.InRange(firstMs, 0, watch.Elapsed.TotalMilliseconds + 1);
+                firstReadMs.Add(firstMs);
                 Assert.Equal(size, new FileInfo(done.FinalPath!).Length);
                 elapsed.Add(watch.Elapsed.TotalMilliseconds);
                 requestCounts.Add(server.Hits("/file") - requestsBefore);
@@ -233,6 +241,9 @@ public class BenchmarkTests(ITestOutputHelper output)
             firstRunMs = elapsed[0],
             medianWarmMs = Median(elapsed.Skip(1).Order().ToArray()),
             medianAcceptanceMs = Median(acceptance.Order().ToArray()),
+            medianFirstBodyReadMs = Median(firstReadMs.Order().ToArray()),
+            p95FirstBodyReadMs = Percentile(firstReadMs.Order().ToArray(), 0.95),
+            coldFirstBodyReadMs = firstReadMs[0],
             medianRequests = Median(requestCounts.Select(n => (double)n).Order().ToArray()),
             medianProcessCpuMs = Median(cpu.Order().ToArray()),
             medianAllocatedMiB = Median(allocatedSorted)

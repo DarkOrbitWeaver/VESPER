@@ -136,7 +136,7 @@ internal sealed partial class BrowserBridgeHandler
         long? expectedBytes = knownSizes.Length > 0 && knownSizes.All(r => r.FileSize is > 0 && !r.FileSizeIsEstimate)
             && knownSizes.Max(r => r.FileSize!.Value) / 2 <= knownSizes.Min(r => r.FileSize!.Value)
             ? knownSizes.Max(r => r.FileSize!.Value) : null;
-        StreamProtocol? preferredDelivery = (deliveries.Length < 2 ? null : engine.PreferredMediaDelivery(item.Provider, deliveries, expectedBytes)) switch
+        StreamProtocol? preferredDelivery = (deliveries.Length < 2 ? null : engine.PreferredMediaDelivery(item.Provider, deliveries, expectedBytes, pageUrl)) switch
         {
             JobKind.Http => StreamProtocol.Http,
             JobKind.Hls => StreamProtocol.Hls,

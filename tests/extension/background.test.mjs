@@ -1508,6 +1508,32 @@ test('specific post declaration can verify an observed direct file without assig
   } finally { app.stopWorker(); }
 });
 
+test('generic feed attached declaration requires current document evidence and explicit selection', async () => {
+  const page = 'https://www.facebook.com/';
+  const url = 'https://cdn.test/opaque-source';
+  const sender = { url: page, tab: { id: 88 }, frameId: 0, documentId: 'attached-direct' };
+  const app = load({ 'media-source-options': checkedSource(15) });
+  const changedAt = Date.now();
+  try {
+    await app.onMedia({ url, tabId: 88, frameId: 0, documentId: sender.documentId, method: 'GET',
+      statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt,
+      responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+    const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: '',
+      manifestUrl: url, manifestOnPlayer: true, playerHasMedia: true, generation: 1, mediaChangedAt: changedAt };
+    const wrong = await app.message(request, { ...sender, documentId: 'other' });
+    assert.equal(wrong.code, 'no-reusable-source');
+    assert.equal(app.sent.length, 0);
+    const unbound = await app.message({ ...request, manifestOnPlayer: false }, sender);
+    assert.equal(unbound.code, 'no-reusable-source');
+    assert.equal(app.sent.length, 0);
+    const reply = await app.message(request, sender);
+    assert.equal(reply.ok, true);
+    assert.equal(reply.data.sourceChoices.length, 1);
+    assert.equal(reply.data.choices, undefined);
+    assert.equal(app.sent.length, 1);
+  } finally { app.stopWorker(); }
+});
+
 test('Facebook looks up the active story source without resolving the surrounding page', async () => {
   const page = 'https://www.facebook.com/stories/12345/UzpfTEST=/';
   const playerUrl = 'https://video.example/story.mp4';

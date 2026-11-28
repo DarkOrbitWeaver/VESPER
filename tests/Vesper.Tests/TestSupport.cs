@@ -51,6 +51,8 @@ internal sealed class FaultServer : IAsyncDisposable
     public ConcurrentDictionary<string, byte[]> HlsFiles { get; } = new();
     public ConcurrentDictionary<string, string> Redirects { get; } = new();
     public ConcurrentDictionary<string, ConcurrentQueue<ObservedHeaders>> Requests { get; } = new();
+    // Optional synchronization point for deterministic concurrency tests.
+    public Func<string, CancellationToken, Task>? BeforeResponse { get; set; }
     /// <summary>Additional range-capable payloads by path (merge-job tests register synthetic media here).</summary>
     public ConcurrentDictionary<string, byte[]> Extra { get; } = new();
     public ConcurrentDictionary<string, string> ExtraContentTypes { get; } = new();
@@ -98,6 +100,7 @@ internal sealed class FaultServer : IAsyncDisposable
             ctx.Request.Headers["Authorization"].FirstOrDefault(),
             ctx.Request.Headers["Referer"].FirstOrDefault()));
         if (ctx.Request.Headers.TryGetValue("Range", out var range)) RangeHeaders.Enqueue(path + " " + range);
+        if (BeforeResponse is { } before) await before(path, ctx.RequestAborted);
         HttpResponse res = ctx.Response;
         if (Redirects.TryGetValue(path, out string? location))
         {

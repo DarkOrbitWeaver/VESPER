@@ -81,6 +81,7 @@ public sealed class EngineOptions
     public long FreeSpaceReserve { get; init; } = 64L * 1024 * 1024;
     public TimeSpan ProgressInterval { get; init; } = TimeSpan.FromMilliseconds(200);
 
+    internal Action<Guid, long>? FirstBodyRead { get; set; }
     internal Action<string, string, string, MediaOutput, CancellationToken>? ConvertMedia { get; init; }
 
     /// <summary>

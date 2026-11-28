@@ -39,6 +39,7 @@ internal sealed class Segment(long start, long end)
     public long SampleAt { get; set; }
     public long SampleBytes { get; set; }
     public double Rate { get; set; }
+    public long? LastProgressAt { get; set; }
     internal LinkedListNode<Segment>? Node { get; set; }
 }
 
@@ -48,10 +49,11 @@ internal sealed class Segment(long start, long end)
 /// so the current response can finish, and lowers split granularity during the
 /// final 10 % tail so idle workers close slow-tail stragglers immediately.
 /// </summary>
-internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, long totalBytes = 0)
+internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, long totalBytes = 0, TimeProvider? clock = null)
 {
     private const long Alignment = 64 * 1024;
     private const long TailMinSplitBytes = 256 * 1024;
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     private readonly object _gate = new();
     private readonly LinkedList<Segment> _segments = new();
 
@@ -107,12 +109,14 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
     {
         lock (_gate)
         {
+            long now = _clock.GetTimestamp();
             // 1. Prefer an unowned free gap (in sequential file order for locality)
             Segment? free = _segments.FirstOrDefault(s => !s.Owned && s.Next < s.End);
             if (free is not null)
             {
                 free.Owned = true;
                 free.SampleAt = 0;
+                free.LastProgressAt = now;
                 free.SampleBytes = 0;
                 free.Rate = callerRateHint > 0 ? callerRateHint : 0;
                 return free;
@@ -126,7 +130,7 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
                 foreach (Segment segment in _segments)
                 {
                     if (!segment.Owned || segment.Rate <= 0) continue;
-                    helperRate += segment.Rate;
+                    helperRate += EffectiveRate(segment, now);
                     samples++;
                 }
                 if (samples > 0) helperRate /= samples;
@@ -135,11 +139,13 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
             // 2. Steal from the highest-ETA straggler (preferring clean splits above WireEnd so the victim's HTTP response drains cleanly!)
             Segment? victim = null;
             double highestEta = 0;
+            double selectedRate = 0;
             foreach (Segment segment in _segments)
             {
                 long bytes = SplittableBytes(segment);
                 if (!segment.Owned || bytes < 2 * splitMin) continue;
-                double victimRate = segment.Rate > 0 ? segment.Rate : (helperRate > 0 ? helperRate : 1.0);
+                double measuredRate = EffectiveRate(segment, now);
+                double victimRate = measuredRate > 0 ? measuredRate : (helperRate > 0 ? helperRate : 1.0);
                 double eta = rateAware ? bytes / victimRate : bytes;
                 // Slight bonus if we can split cleanly past the victim's active HTTP wire window without truncating its in-flight stream
                 if (segment.WireEnd > segment.Next && segment.End - segment.WireEnd >= splitMin)
@@ -148,6 +154,7 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
                 {
                     highestEta = eta;
                     victim = segment;
+                    selectedRate = measuredRate;
                 }
             }
             if (victim is null) return null;
@@ -155,10 +162,10 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
             long floor = Math.Max(victim.Next, victim.Claimed);
             long remaining = victim.End - floor;
             long stolen = remaining / 2;
-            if (helperRate > 0 && victim.Rate > 0)
+            if (helperRate > 0 && selectedRate > 0)
             {
                 stolen = (long)Math.Clamp(
-                    helperRate * remaining / (helperRate + victim.Rate),
+                    helperRate * remaining / (helperRate + selectedRate),
                     splitMin,
                     remaining - splitMin);
             }
@@ -173,6 +180,7 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
             var tail = new Segment(mid, victim.End)
             {
                 Owned = true,
+                LastProgressAt = now,
                 Rate = callerRateHint > 0 ? callerRateHint : 0
             };
             victim.End = mid;
@@ -237,16 +245,28 @@ internal sealed class SegmentBoard(long minSplitBytes, bool rateAware = false, l
         }
     }
 
+    // A formerly fast connection can stop delivering. Do not rank a stalled
+    // span using an indefinitely fresh throughput sample. Keep a nonzero
+    // floor to avoid pathological split proportions; claims are unchanged.
+    private double EffectiveRate(Segment segment, long now)
+    {
+        if (!rateAware || segment.Rate <= 0 || segment.LastProgressAt is not long last)
+            return segment.Rate;
+        double idle = _clock.GetElapsedTime(last, now).TotalSeconds;
+        return segment.Rate / Math.Clamp(idle, 1.0, 20.0);
+    }
+
     public void Advance(Segment segment, int written)
     {
         lock (_gate)
         {
             segment.Next += written;
             if (!rateAware) return;
-            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            long now = _clock.GetTimestamp();
+            if (written > 0) segment.LastProgressAt = now;
             if (segment.SampleAt == 0) segment.SampleAt = now;
             segment.SampleBytes += written;
-            double elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(segment.SampleAt, now).TotalSeconds;
+            double elapsed = _clock.GetElapsedTime(segment.SampleAt, now).TotalSeconds;
             if (elapsed < 0.2) return;
             double rate = segment.SampleBytes / elapsed;
             segment.Rate = segment.Rate == 0 ? rate : segment.Rate * 0.55 + rate * 0.45;

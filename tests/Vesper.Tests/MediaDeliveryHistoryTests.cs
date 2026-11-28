@@ -42,6 +42,31 @@ public sealed class MediaDeliveryHistoryTests
     }
 
     [Fact]
+    public void GenericOriginsLearnIndependentlyWithoutBorrowingAnotherOriginOutcome()
+    {
+        var history = new MediaDeliveryHistory();
+        for (int i = 0; i < 6; i++)
+        {
+            foreach (var (page, kind, success) in new[]
+            {
+                ("https://a.example/watch", JobKind.Http, true),
+                ("https://a.example/watch", JobKind.Hls, false),
+                ("https://b.example/watch", JobKind.Http, false),
+                ("https://b.example/watch", JobKind.Hls, true)
+            })
+            {
+                var job = Job("generic", kind, success);
+                job.OriginalPageUrl = page + "?item=" + i;
+                history.Observe(job);
+            }
+        }
+        Assert.Equal(JobKind.Http, history.Preferred("generic", Both, Now, pageUrl: "https://a.example/other"));
+        Assert.Equal(JobKind.Hls, history.Preferred("generic", Both, Now, pageUrl: "https://b.example/other"));
+        Assert.Null(history.Preferred("generic", Both, Now, pageUrl: "https://c.example/watch"));
+        Assert.Null(history.Preferred("generic", Both, Now, pageUrl: "https://a.example:8443/watch"));
+    }
+
+    [Fact]
     public void NoEvidenceFromQueueAcceptanceChromeUserCancellationOrMissingPublication()
     {
         var history = new MediaDeliveryHistory();

@@ -10,7 +10,7 @@ internal sealed class MediaDeliveryHistory
     private const int Capacity = 256;
     private static readonly TimeSpan Lifetime = TimeSpan.FromDays(30);
     private readonly Dictionary<Guid, Observation> _observations = [];
-    private readonly record struct Observation(string Provider, JobKind Kind, bool Completed, DateTime At, long Bytes = 0, double BytesPerSecond = 0);
+    private readonly record struct Observation(string Provider, string? OriginKey, JobKind Kind, bool Completed, DateTime At, long Bytes = 0, double BytesPerSecond = 0);
     private readonly record struct Route(JobKind Kind, int Total, int Completed)
     {
         public double Rate => (double)Completed / Total;
@@ -45,10 +45,11 @@ internal sealed class MediaDeliveryHistory
             if (oldest.Value.At >= at) return;
             _observations.Remove(oldest.Key);
         }
+        string? originKey = OriginKey(job.OriginalPageUrl);
         if (_observations.TryGetValue(job.Id, out var previous)
-            && previous.Provider == provider && previous.Kind == job.Kind && previous.Completed == complete && previous.At == at)
+            && previous.Provider == provider && previous.OriginKey == originKey && previous.Kind == job.Kind && previous.Completed == complete && previous.At == at)
             return;
-        _observations[job.Id] = new(provider, job.Kind, complete, at);
+        _observations[job.Id] = new(provider, originKey, job.Kind, complete, at);
     }
 
     // An active, unrestricted native run is a performance observation, not a media identity label.
@@ -62,12 +63,30 @@ internal sealed class MediaDeliveryHistory
 
     internal void Forget(Guid id) => _observations.Remove(id);
 
-    internal JobKind? Preferred(string provider, IReadOnlyCollection<JobKind> available, DateTime now, long? expectedBytes = null)
+    // Reconstruct local context from existing job records; retain no raw origin
+    // or path in the advisory cache. Generic sites can learn independently.
+    private static string? OriginKey(string? pageUrl)
+    {
+        if (!Uri.TryCreate(pageUrl, UriKind.Absolute, out Uri? page)
+            || page.Scheme is not ("http" or "https") || page.UserInfo.Length != 0) return null;
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(page.GetLeftPart(UriPartial.Authority))));
+    }
+
+    internal JobKind? Preferred(string provider, IReadOnlyCollection<JobKind> available, DateTime now, long? expectedBytes = null, string? pageUrl = null)
     {
         var kinds = available.Distinct().Where(kind => kind is JobKind.Http or JobKind.Hls or JobKind.Dash).ToArray();
         if (kinds.Length < 2) return null;
         var recent = _observations.Values.Where(value => value.At >= now - Lifetime && value.At <= now
             && kinds.Contains(value.Kind)).ToArray();
+
+        string? key = OriginKey(pageUrl);
+        if (key is not null)
+        {
+            var originRows = recent.Where(value => value.OriginKey == key).ToArray();
+            var localOrigin = Compare(originRows, kinds, false);
+            if (localOrigin.Enough) return localOrigin.Preferred ?? CompareSpeed(originRows, kinds, expectedBytes);
+        }
 
         // Prefer evidence from the same named adapter. Transfer to another adapter only
         // when each compared route was observed across multiple named adapter families.

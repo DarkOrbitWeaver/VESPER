@@ -28,8 +28,9 @@ function setup() {
     }
   }
   class Player {
-    constructor(src) { this.currentSrc = src; this.attributes = new Map(); }
+    constructor(src) { this.currentSrc = src; this.attributes = new Map(); this.tagName = 'VIDEO'; this.readyState = 4; }
     setAttribute(key, value) { this.attributes.set(key, value); }
+    removeAttribute(key) { this.attributes.delete(key); }
   }
   class FetchResponse {
     constructor(url, mime, buffer) {
@@ -55,9 +56,26 @@ function setup() {
     listeners.get('vesper-media-provenance-request')({target:el});
     return JSON.parse(el.attributes.get('data-vesper-media-provenance') || '{"paths":[], "tracks":[]}');
   };
-  return {player, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, MediaSource: Source, Player, context,
+  const declaration = el => {
+    listeners.get('vesper-youtube-identity-request')({target:el});
+    return el.attributes.get('data-vesper-player-manifest');
+  };
+  return {player, declaration, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, MediaSource: Source, Player, context,
     advance: ms => time += ms};
 }
+
+test('attached declarations are unique, typed, and do not invoke accessors', () => {
+  const b = setup(), a = b.player();
+  let reads = 0;
+  a.el.library = { currentSource: { src: 'https://cdn.test/extensionless', type: 'video/mp4' } };
+  Object.defineProperty(a.el.library, 'url', { get() { reads++; throw new Error('getter'); } });
+  assert.equal(b.declaration(a.el), 'https://cdn.test/extensionless');
+  assert.equal(reads, 0);
+  a.el.other = { manifestUrl: 'https://cdn.test/second.mpd' };
+  assert.equal(b.declaration(a.el), undefined);
+  delete a.el.library;
+  assert.equal(b.declaration(a.el), 'https://cdn.test/second.mpd');
+});
 
 test('MSE keeps an identical init and refuses incomplete, inactive or edited tracks', () => {
   const fixture = setup();

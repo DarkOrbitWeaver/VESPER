@@ -316,6 +316,47 @@ public sealed class MediaMergeTests
         }
     }
 
+    [Theory]
+    [InlineData("hls")]
+    [InlineData("dash")]
+    public async Task Clear_init_and_next_rendition_overlap_without_reordering_output(string protocol)
+    {
+        await using var server = new FaultServer();
+        await server.StartAsync();
+        MediaMergePlan plan = CreateSegmentedPlan(server, protocol);
+        var firstVideo = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstAudio = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int initOverlapped = 0, trackOverlapped = 0;
+        server.BeforeResponse = async (path, ct) =>
+        {
+            if (path.EndsWith("/video/av-1.m4s", StringComparison.Ordinal)) firstVideo.TrySetResult();
+            if (path.EndsWith("/audio/av-1.m4s", StringComparison.Ordinal)) firstAudio.TrySetResult();
+            if (path.EndsWith("/video/av-init.mp4", StringComparison.Ordinal))
+            {
+                try { await firstVideo.Task.WaitAsync(TimeSpan.FromSeconds(3), ct); Interlocked.Exchange(ref initOverlapped, 1); }
+                catch (TimeoutException) { }
+            }
+            if (path.EndsWith("/video/av-3.m4s", StringComparison.Ordinal))
+            {
+                try { await firstAudio.Task.WaitAsync(TimeSpan.FromSeconds(3), ct); Interlocked.Exchange(ref trackOverlapped, 1); }
+                catch (TimeoutException) { }
+            }
+        };
+        using var harness = new Harness(tweak: options =>
+        {
+            options.MaxConnectionsPerHost = 4;
+            options.MaxConnectionsPerJob = 4;
+        });
+        AddResult added = harness.Engine.Add(new AddRequest(plan.Tracks[0].Url,
+            FileName: "overlap.mp4", Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+        Assert.True(added.Ok, added.Message);
+        JobSnapshot done = await harness.WaitForStateAsync(added.JobId, JobState.Completed, seconds: 15);
+        Assert.Equal(1, initOverlapped);
+        Assert.Equal(1, trackOverlapped);
+        ValidateSegmentedOutput(done.FinalPath!);
+        Assert.Equal(protocol == "hls" ? 10 : 8, server.Requests.Values.Sum(queue => queue.Count));
+    }
+
     [Fact]
     [Trait("Category", "SegmentedMergeBenchmark")]
     public async Task Measure_local_hls_and_dash_rendition_merges()

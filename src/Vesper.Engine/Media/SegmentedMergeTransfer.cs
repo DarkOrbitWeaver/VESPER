@@ -135,28 +135,35 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
                     var keyForPart = (ti, pi);
                     if (!pending.TryGetValue(keyForPart, out var current))
                         pending[keyForPart] = current = FetchBufferedPartAsync(part, fetchStop.Token);
-                    // Reserve the next-to-write part first, then independent clear parts
-                    // in order. This preserves FIFO buffer admission across concurrent jobs.
-                    int lookahead = pi + 1;
-                    for (; lookahead < prepared.Parts.Count; lookahead++)
+                    // Admit a contiguous prefix in durable write order, including
+                    // the next rendition when capacity is available. Never hold
+                    // later-track buffers while an earlier part has not been queued.
+                    // Clear init and media objects are independent network reads;
+                    // validation/decryption and journal writes remain ordered.
+                    int admissionLimit = window.Limit(part.Url);
+                    Part previous = part;
+                    bool stopAdmission = false;
+                    for (int aheadTrack = ti; aheadTrack < tracks.Length && !stopAdmission; aheadTrack++)
                     {
-                        Part candidate = prepared.Parts[lookahead];
-                        if (pending.ContainsKey((ti, lookahead))) continue;
-                        if (pending.Count >= window.Limit(candidate.Url)
-                            || !CanPrefetch(prepared.Parts[lookahead - 1], candidate)) break;
-                        pending[(ti, lookahead)] = FetchBufferedPartAsync(candidate, fetchStop.Token);
-                    }
-                    // Only when all remaining parts of this track are already admitted
-                    // may a clear initialization/first object from the next track overlap.
-                    // Its independent stage is not committed until the previous track ends.
-                    if (lookahead == prepared.Parts.Count && ti + 1 < tracks.Length
-                        && tracks[ti + 1].Parts.Count > 0 && !pending.ContainsKey((ti + 1, 0)))
-                    {
-                        Part nextTrack = tracks[ti + 1].Parts[0];
-                        if (pending.Count < window.Limit(nextTrack.Url)
-                            && part.Key is null && nextTrack.Key is null
-                            && !string.Equals(part.Url, nextTrack.Url, StringComparison.Ordinal))
-                            pending[(ti + 1, 0)] = FetchBufferedPartAsync(nextTrack, fetchStop.Token);
+                        var ahead = tracks[aheadTrack].Parts;
+                        for (int aheadPart = aheadTrack == ti ? pi + 1 : 0; aheadPart < ahead.Count; aheadPart++)
+                        {
+                            Part candidate = ahead[aheadPart];
+                            var candidateKey = (aheadTrack, aheadPart);
+                            if (pending.ContainsKey(candidateKey))
+                            {
+                                previous = candidate;
+                                continue;
+                            }
+                            admissionLimit = Math.Min(admissionLimit, window.Limit(candidate.Url));
+                            if (pending.Count >= admissionLimit || !CanPrefetch(previous, candidate))
+                            {
+                                stopAdmission = true;
+                                break;
+                            }
+                            pending[candidateKey] = FetchBufferedPartAsync(candidate, fetchStop.Token);
+                            previous = candidate;
+                        }
                     }
                     long waitStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     using BufferedPart received = await current.ConfigureAwait(false);
@@ -218,7 +225,7 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
     }
 
     private static bool CanPrefetch(Part first, Part second)
-        => !first.Initialization && !second.Initialization && first.Key is null && second.Key is null
+        => first.Key is null && second.Key is null
            && (!string.Equals(first.Url, second.Url, StringComparison.Ordinal)
                || first.Offset is long a && first.Length is long al && second.Offset is long b
                    && second.Length is long bl && a >= 0 && b >= 0 && al > 0 && bl > 0
