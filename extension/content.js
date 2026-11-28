@@ -216,6 +216,16 @@
     return player?.srcObject?.constructor?.name === 'MediaSourceHandle';
   }
 
+  // Service workers can replace an ordinary resource with synthetic/cache bytes.
+  // A replayed HTTP request cannot establish identity with that playback.
+  function serviceWorkerPlayback(player) {
+    try {
+      if (globalThis.navigator?.serviceWorker?.controller) return true;
+      const http = VesperPlayerSource.http(playerSource(player));
+      return !!http && performance.getEntriesByName(http.href, 'resource').some(entry => entry.workerStart > 0);
+    } catch { return false; }
+  }
+
   function matchesWorkerDeclaration(media) {
     if (!media.workerConfirmation) return true;
     inspectPlayerWitnessAttributes(media.player);
@@ -992,6 +1002,7 @@
       playerUrl: current ? src : '', playerKey: evidenceKey(el), generation: current ? binding.generation : 0,
       mutedLoop: current && activePreview?.player !== el && isMutedLoop(el, src),
       playerResourceFingerprints: witness?.fingerprints, playerFragmentUrls: witness?.paths,
+      workerMediaSource: workerMediaSource(el), serviceWorkerPlayback: serviceWorkerPlayback(el),
       manifestUrl: current && !VesperPlayerSource.http(src) ? declaredManifest(identity) : undefined
     }).then(reply => {
       if (!reply?.data?.prefetchSkipped || prefetchedPlayers.get(el) !== key) return;
@@ -2066,7 +2077,7 @@
       playerCanonicalUrls: playerWitness?.canonicalUrls,
       playerResourceFingerprints: playerWitness?.fingerprints,
       manifestUrl: bestManifest, manifestOnPlayer: Boolean(bestManifest && attachedManifest),
-      workerMediaSource: current && workerMediaSource(player) });
+      workerMediaSource: current && workerMediaSource(player), serviceWorkerPlayback: current && serviceWorkerPlayback(player) });
     if (!isCurrentRequest(request)) {
       const stale = lookup.preview ? !watchPreviewCurrent(lookup.preview) : !matchesPickerPlayer(lookup);
       if (stale || !result?.ok)
@@ -2106,16 +2117,14 @@
         }
         if (!original) currentWitness = playerFragmentWitness(player, binding);
         const tracks = !original && currentWitness?.tracks;
-        if (tracks?.length && tracks.length <= 2
-            && tracks.every(t => t.bufferedComplete && /^(?:audio|video)\/(?:mp4|webm)(?:;|$)/i.test(t.mimeType)
-              && Number.isSafeInteger(t.retainedBytes) && t.retainedBytes > 0)
-            && (tracks.length === 1 || tracks.some(t => t.role === 'audio') && tracks.some(t => t.role === 'video')
-              && tracks.every(t => /\/webm/i.test(t.mimeType) === /\/webm/i.test(tracks[0].mimeType)))) {
-          mseExportTracks = tracks;
-          const totalSize = mseExportTracks.reduce((s, t) => s + (t.retainedBytes || 0), 0);
-          const mime = mseExportTracks.find(track => track.role !== 'audio')?.mimeType || mseExportTracks[0].mimeType;
-          original = { mime, sizeBytes: totalSize, container: mseExportTracks.every(track => /\/webm/i.test(track.mimeType))
-            ? 'WebM' : mseExportTracks.length === 1 && /^audio\//i.test(mime) ? 'M4A' : 'MP4' };
+        const retained = tracks?.length && globalThis.VesperEvidenceGraph?.create().assessRetained({
+          scope:location.origin,playerKey:evidenceKey(player),generation:binding.generation,
+          worker:workerMediaSource(player),tracks,protectedMedia:!!player.mediaKeys||protectedVideos.has(player),
+          live:playerFacts?.live===true
+        });
+        if(retained?.verdict==='reconstructable-playback'){
+          mseExportTracks=tracks;
+          original=retained;
         }
       }
       if (!isCurrentRequest(request)) return;
@@ -2129,7 +2138,7 @@
           mseExportTracks,
           title: formats?.title || title,
           choices: [{
-            index: 0, label: audio ? 'Original audio' : 'Original quality',
+            index: 0, label: mseExportTracks ? 'Playback copy' : audio ? 'Original audio' : 'Original quality',
             detail: height || (audio ? 'Audio' : 'Video'), container: original.container,
             sizeBytes: original.sizeBytes, canClip: false
           }]
@@ -2225,7 +2234,8 @@
         await VesperBrowserBody.copyWorkerMedia({ ...options, player: {
           playerUrl: src, pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
           generation: binding.generation, mediaChangedAt: binding.changedAt, playerCanonicalUrls: witness.canonicalUrls,
-          playerResourceFingerprints: witness.fingerprints, workerMediaSource: workerMediaSource(player)
+          playerResourceFingerprints: witness.fingerprints, workerMediaSource: workerMediaSource(player),
+          serviceWorkerPlayback: serviceWorkerPlayback(player)
         } });
       } else {
         let mediaProof;
@@ -2233,7 +2243,7 @@
           const reply = await send({ type: 'browser-body-media-proof', playerUrl: src,
             pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
             generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin,
-            workerMediaSource: workerMediaSource(player) });
+            workerMediaSource: workerMediaSource(player), serviceWorkerPlayback: serviceWorkerPlayback(player) });
           if (!reply?.ok || reply.data.workerFetch || playback.get(player) !== binding || controller.signal.aborted)
             throw Object.assign(new Error('No verified browser file is available.'), { code: reply?.code || 'proof-unavailable' });
           mediaProof = reply.data;
@@ -2791,6 +2801,7 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, seconds, loading);
     const result = await send({ type: 'media-source-select', sourceChoice: source.token,
+      serviceWorkerPlayback: serviceWorkerPlayback(panelMedia.player),
       pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc,
       ...(source.requiresConfirmation && !remembered ? {
         workerMediaSource: workerMediaSource(player), manifestUrl: lookup.workerManifest,
@@ -2846,10 +2857,12 @@
     if (worker) inspectPlayerWitnessAttributes(lookup.player);
     const workerManifest = worker ? VesperPlayerSource.http(lookup.player?.getAttribute?.('data-vesper-player-manifest'))?.href || '' : '';
     const reply = await send(formats.browserChoice ? { type: 'browser-media-select', browserChoice: formats.browserChoice,
-      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src }
+      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerUrl: panelMedia.src,
+      serviceWorkerPlayback: serviceWorkerPlayback(lookup.player) }
       : { type: 'media-select', mediaSession: formats.mediaSession, formatChoice, mode, ...intent,
         pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc,
-        workerMediaSource: worker, manifestUrl: workerManifest, multiplePlayers: hasOtherPlayer(lookup.player) });
+        workerMediaSource: worker, manifestUrl: workerManifest, multiplePlayers: hasOtherPlayer(lookup.player),
+        serviceWorkerPlayback: serviceWorkerPlayback(lookup.player) });
     if (!isCurrentRequest(request)) {
       if (!reply?.ok) void reportMediaFailure('submit', reply?.code, lookup);
       return;

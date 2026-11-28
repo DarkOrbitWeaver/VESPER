@@ -618,7 +618,8 @@
           chunks: [],
           retainedBytes: 0,
           totalAppendedBytes: 0,
-          evicted: false
+          evicted: false,
+          timelineAdjusted: false
         };
         msState.tracks.add(track);
         sourceOwners.set(sb, track);
@@ -697,9 +698,16 @@
         if (empty && inspected?.hasInit) {
           track.awaitingEmpty = false;
           track.evicted = false;
+          track.timelineAdjusted = false;
           track.totalAppendedBytes = 0;
           retainTrack(track);
         }
+        // Raw retained bytes cannot reproduce a SourceBuffer timeline that
+        // applies sequence mode, offsets, or clipping. Keep attribution but
+        // do not advertise an unedited reconstruction.
+        if (this.mode !== 'segments' || this.timestampOffset !== 0
+            || this.appendWindowStart !== 0 || this.appendWindowEnd !== Infinity)
+          track.timelineAdjusted = true;
         if (!track.evicted && track.totalAppendedBytes === 0 && inspected?.hasInit) {
           if (reserveMseBytes(track, rawBytes.byteLength)) {
             track.initBytes = rawBytes.slice();
@@ -797,7 +805,8 @@
   }, true);
 
   function coversPlayback(buffered, duration, tolerance = 0.15) {
-    return buffered?.length === 1 && buffered.start(0) <= 0.15 && buffered.end(0) >= duration - tolerance;
+    return buffered?.length === 1 && buffered.start(0) <= 0.15
+      && buffered.end(0) >= duration - tolerance && buffered.end(0) <= duration + tolerance;
   }
 
   function activeBuffer(track) {
@@ -808,7 +817,9 @@
 
   function completeTrack(player, track) {
     const buffer = activeBuffer(track);
-    return track.initBytes && !track.evicted && (track.initHasMedia || track.chunks.length > 0) && buffer && !buffer.updating
+    return track.initBytes && !track.evicted && !track.timelineAdjusted
+      && track.ownerRef.deref()?.readyState === 'ended'
+      && (track.initHasMedia || track.chunks.length > 0) && buffer && !buffer.updating
       && Number.isFinite(player.duration) && player.duration > 0
       && coversPlayback(player.buffered, player.duration)
       // AAC audio tails end up to one priming/frame group short of the video.
@@ -869,7 +880,9 @@
             initLength: track.initBytes?.byteLength || 0,
             retainedBytes: track.retainedBytes,
             totalAppendedBytes: track.totalAppendedBytes,
-            bufferedComplete
+            bufferedComplete,
+            timelineAdjusted: track.timelineAdjusted,
+            ended: track.ownerRef.deref()?.readyState === 'ended'
           });
         }
       }

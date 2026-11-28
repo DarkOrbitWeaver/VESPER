@@ -450,7 +450,7 @@ async function formatEvidence(selection, selectedEvidence) {
 }
 
 async function matchesFormatEvidence(guard, message, sender) {
-  if (!guard || typeof guard.kind !== 'string') return false;
+  if (!guard || typeof guard.kind !== 'string' || message.serviceWorkerPlayback === true) return false;
   if (guard.signed && (sender.tab?.incognito || !await signInEnabled())) return false;
   if (sender.tab?.incognito && guard.kind.startsWith('worker-')) return false;
   if (!await refreshNeverCaptureHosts() || matchesNeverCaptureHost({url:mediaPage(message, sender)?.href,referrer:sender.url})) return false;
@@ -696,18 +696,21 @@ function sourceAffinity(source, fragments) {
 // Automatic selection uses VesperMediaEvidence.associate; timing and
 // fragment-directory hints may rank sources but cannot establish ownership.
 
-function rankObservedSources(sources, changedAt, resourceWitness = new Set(), fragments = [], exactResources = new Set()) {
+function rankObservedSources(sources, changedAt, resourceWitness = new Set(), fragments = [], exactResources = new Set(), playerUrl = '') {
   const proven = source => exactResources.has(source.url)
     || Boolean(source.sliceEvidence?.length && source.sliceEvidence.every(member => exactResources.has(member.url)));
   // The model may prioritize a proven candidate for verification, not admit
   // new candidates or grant acquisition authority. On abstention retain the
   // deterministic evidence order and probe-family diversity.
-  const model = globalThis.VesperInference?.rankSources(sources.slice(0, 32).map((source, index) => ({
-    id: String(index), playerBound: proven(source), resourceWitness: proven(source),
-    currentGeneration: proven(source) ? true : null, wholeFile: isWholeDirectSource(source),
-    declared: source.declared === true, hypothesized: !proven(source), fragmentOnly: false
-  })));
-  const preferred = model?.decisive ? sources[Number(model.selected)] : null;
+  const graph = VesperEvidenceGraph.create();
+  const projection = graph.assessPicker({scope:'probe-ranking',playerKey:'player',generation:1,
+    sourceUrl:playerUrl,candidates:sources.slice(0,32).map(source=>({
+      url:source.url,kind:source.kind,direct:source.url===playerUrl,witnessed:proven(source),
+      verified:false,compatible:!source.conflictingValidator,wholeFile:isWholeDirectSource(source),
+      declared:source.declared===true
+    }))});
+  const model = globalThis.VesperInference?.rankSources(projection.rows.filter(row=>row.compatible).map(row=>row.features));
+  const preferred = model?.decisive ? sources[Number(model.selected.slice('source-'.length))] : null;
   const ranked = sources.map(source => ({ source, score: evidenceStrength(source, changedAt)
     + (exactResources.has(source.url) ? 24 : 0) + (source.sliceEvidence ? 24 : 0)
     + (resourceWitness.has(source.url) ? 8 : 0) + (source.playerPathHint ? 10 : 0) + 4 * sourceAffinity(source, fragments),
@@ -1392,7 +1395,7 @@ function frameBrowserBodyProof(state, message, sender, useSignIn = false) {
       || !Number.isInteger(message.generation) || message.generation < 1
       || !Number.isFinite(message.mediaChangedAt) || message.mediaChangedAt <= 0
       || !VesperBrowserBody.eligibleHttpMedia(url.href)
-      || message.workerMediaSource === true
+      || message.workerMediaSource === true || message.serviceWorkerPlayback === true
       || (VesperEvidenceGraph.expiresAt(url.href) ?? Infinity) <= Date.now()
       || isPartialMediaUrl(url)) return null;
   const now = Date.now();
@@ -1421,7 +1424,7 @@ function frameBrowserBodyProof(state, message, sender, useSignIn = false) {
 }
 
 async function observedBrowserBodyProof(state, message, sender, useSignIn) {
-  if (!message || message.workerMediaSource === true) return null;
+  if (!message || message.workerMediaSource === true || message.serviceWorkerPlayback === true) return null;
   const frameProof = frameBrowserBodyProof(state, message, sender, useSignIn);
   if (frameProof && (frameProof.credentials !== 'include' || useSignIn))
     return frameProof;
@@ -1596,6 +1599,12 @@ async function playerOptions(message, sender) {
   const frame = sender.frameId ?? 0;
   const tab = sender.tab?.id;
   const prefetch = message.prefetch === true;
+  if (binding && message.serviceWorkerPlayback === true) {
+    if (prefetch) return { ok: true, data: { prefetchSkipped: true } };
+    if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:page.href,referrer:sender.url}))
+      return { ok:false, code:'blocked', message:'VESPER could not confirm that this site permits native acquisition.' };
+    return { ok:false, code:'no-reusable-source', message:'The browser service worker may transform the playback bytes. Only a complete retained playback copy can be verified.' };
+  }
   if (prefetch && (message.workerMediaSource === true || VesperPlayerSource.blocksPassiveProbe(page.href) || message.refresh === true
       || sender.tab?.active === false || sender.tab?.incognito || !sender.documentId || !binding
       || VesperPlayerSource.identity(sender.url) !== identity
@@ -1896,7 +1905,7 @@ async function playerOptions(message, sender) {
             for (const url of await matchPlaybackFingerprints(possibleSources, playbackFingerprints)) exactResources.add(url);
           }
           // Resource witnesses must influence the verification budget, not only the display order.
-          const ranked = groupObservedAssets(rankObservedSources(possibleSources, changedAt, resourceWitness, rankingFragments, exactResources)
+          const ranked = groupObservedAssets(rankObservedSources(possibleSources, changedAt, resourceWitness, rankingFragments, exactResources, source?.href || '')
             .slice(0, VERIFY_LIMIT + 4), identity);
           const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints], tab, verificationScope,
             deadline: Date.now() + VERIFY_DEADLINE_MS };
@@ -2057,6 +2066,7 @@ async function playerOptions(message, sender) {
 }
 
 async function selectBrowserFile(message, sender) {
+  if (message.serviceWorkerPlayback === true) return { ok:false, code:'expired-selection', message:'Refresh the formats for the current video.' };
   await browserChoicesReady;
   const choice = browserChoices.get(message.browserChoice);
   if (!choice || choice.expires <= Date.now() || choice.tab !== sender.tab?.id || choice.frame !== (sender.frameId ?? 0)
@@ -2073,6 +2083,7 @@ async function selectBrowserFile(message, sender) {
 }
 
 async function selectMediaSource(message, sender) {
+  if (message.serviceWorkerPlayback === true) return { ok:false, code:'expired-selection', message:'Refresh the formats for the current video.' };
   const token = message.sourceChoice;
   const selection = sourceSelections.get(token);
   if (!selection || selection.expires <= Date.now()) {

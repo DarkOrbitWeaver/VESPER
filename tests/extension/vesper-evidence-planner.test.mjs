@@ -136,6 +136,26 @@ test('resources are interchangeable only with strong validators; names, hosts an
   assert.equal(G.interchangeable({ url: 'https://cdn/a/clip.mp4' }, { url: 'https://cdn/b/clip.mp4' }).verdict, 'verify');
 });
 
+test('retained media is a reconstruction only when every current track is complete and unedited',()=>{
+  const video={id:'video',role:'video',mimeType:'video/mp4',bufferedComplete:true,ended:true,
+    timelineAdjusted:false,hasInit:true,initLength:100,retainedBytes:1000,totalAppendedBytes:1000};
+  const audio={...video,id:'audio',role:'audio',mimeType:'audio/mp4'};
+  const check=(tracks,extra={})=>G.create().assessRetained({scope:'doc',playerKey:'p',generation:1,tracks,...extra});
+  assert.equal(check([video]).verdict,'reconstructable-playback');
+  assert.equal(check([video,audio]).sizeBytes,2000);
+  assert.equal(check([audio]).container,'M4A');
+  for(const changed of [
+    {ended:false},{bufferedComplete:false},{timelineAdjusted:true},{hasInit:false},
+    {retainedBytes:0},{initLength:2000},{totalAppendedBytes:999},{role:'audio'}
+  ]) assert.equal(check([{...video,...changed}]).verdict,'abstain');
+  for(const flags of [{worker:true},{protectedMedia:true},{live:true}])
+    assert.equal(check([video],flags).verdict,'abstain');
+  assert.equal(check([video,video]).verdict,'abstain');
+  assert.equal(check([video,{...audio,mimeType:'audio/webm'}]).verdict,'abstain');
+  assert.equal(check([video,{...video,id:'video2'}]).verdict,'abstain');
+  assert.equal(check([video,audio],{generation:0}).verdict,'abstain');
+});
+
 const verified = (kind, extra = {}) => ({ key: kind + '-src', kind, provenance: 'observed', verified: true, ...extra });
 const explicit = { explicit: true, scoped: true, wants: 'media' };
 
@@ -299,6 +319,8 @@ for (const flag of ['oneUse', 'post', 'blob']) {
 
 test('ownership still requires replay proof and preserves unresumable Chrome bytes', () => {
   assert.equal(P.ownershipRoute({ approved: true, nativeReplayVerified: true, chromeHasBytes: true }).route, 'chrome-keep');
-  assert.equal(P.ownershipRoute({ approved: true, nativeReplayVerified: true, chromeHasBytes: true, chromeReplaySafe: true }).route, 'native-http');
+  assert.equal(P.ownershipRoute({ approved: true, nativeReplayVerified: true, chromeHasBytes: true, chromeReplaySafe: true }).route, 'chrome-keep');
+  assert.equal(P.ownershipRoute({ approved: true, originalBytesProven: true, chromeExists: true }).route, 'chrome-keep');
+  assert.equal(P.plan({intent:explicit,sources:[verified('direct')],capabilities:{chromeDownload:{exists:true,receivingBytes:false,replaySafe:true}}}).next.route,'chrome-keep');
   assert.equal(P.ownershipRoute({ approved: true, chromeReplaySafe: true, chromeHasBytes: true }).route, 'chrome-keep');
 });

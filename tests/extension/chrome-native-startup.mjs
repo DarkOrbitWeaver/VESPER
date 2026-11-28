@@ -31,7 +31,7 @@ async function until(fn, limit = 10000) {
   throw Error('Fixture deadline');
 }
 
-const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [];
+const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [], relayEvents = [], browserErrors = [];
 const publicMedia = process.env.VESPER_QA_PUBLIC_MEDIA === '1';
 let proc, socket, server, seq = 0, active, chromeDownloads = 0;
 const pending = new Map();
@@ -114,12 +114,13 @@ try {
       if (close) { sessions.get(key)?.child.stdin.end(); sessions.delete(key); return json({ok:true}); }
       if (!allowed.has(message?.type)) return json({id:message?.id,ok:false,code:'qa-denied'});
       const started = performance.now(), trial = active?.trial;
+      relayEvents.push({trial,type:message.type,stage:'received'});
       const host = sessions.get(key) || openHost(key);
       const reply = await host.send(message);
       calls.push({trial,type:message.type,operation:message.operation,ok:reply.ok,key,ms:performance.now()-started,
         jobId:reply.results?.[0]?.jobId,code:reply.code});
       return json(reply);
-    } catch (e) { res.writeHead(500); res.end(JSON.stringify({ok:false,code:'qa-error',message:String(e)})); }
+    } catch (e) { relayEvents.push({trial:active?.trial,stage:'error',message:String(e)}); res.writeHead(500); res.end(JSON.stringify({ok:false,code:'qa-error',message:String(e)})); }
   });
   await new Promise(ok=>server.listen(0,'127.0.0.1',ok));
   const base = 'http://127.0.0.1:'+server.address().port, relay=base+'/'+secret;
@@ -141,6 +142,8 @@ try {
   socket.addEventListener('message',e=>{
     const m=JSON.parse(e.data);
     if(m.method==='Browser.downloadWillBegin') chromeDownloads++;
+    if(m.method==='Runtime.exceptionThrown' && browserErrors.length<30)
+      browserErrors.push(m.params.exceptionDetails?.exception?.description||m.params.exceptionDetails?.text);
     const p=pending.get(m.id); if(!p)return; pending.delete(m.id); clearTimeout(p.timer);
     if(m.error)p.reject(Error(m.error.message));else p.resolve(m.result||{});
   });
@@ -148,9 +151,16 @@ try {
   await send('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:chromeFolder,eventsEnabled:true});
   const workerTarget=await until(async()=> (await send('Target.getTargets')).targetInfos.find(t=>t.type==='service_worker'&&t.url.includes(loaded.id)));
   const worker=(await send('Target.attachToTarget',{targetId:workerTarget.targetId,flatten:true})).sessionId;
+  await send('Runtime.enable',{},worker);
+  const preflight=await evaluate(worker,"nativeRequest(envelope('hello'),12000)");
+  assert(preflight?.ok,'QA transport preflight failed: '+JSON.stringify({preflight,relayEvents,browserErrors}));
+  await evaluate(worker,'VesperNativeSession.close()');
+  calls.length=0;
+  relayEvents.length=0;
   const target=(await send('Target.createTarget',{url:'about:blank'})).targetId;
   const page=(await send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
   await send('Page.enable',{},page);
+  await send('Runtime.enable',{},page);
   for(let trial=0;trial<(publicMedia?0:12);trial++){
     const mode=trial%2?'warm':'cold', delayMs=trial<6?0:80, name='fixture-'+trial+'.bin';
     active={trial,delayMs};
@@ -242,6 +252,8 @@ try {
   assert.equal(chromeDownloads,0);
   assert.deepEqual(await readdir(chromeFolder),[]);
   await writeFile(result,JSON.stringify({rows,mediaRows,chromeDownloads}));
+} catch(error) {
+  throw Error(error.message+' '+JSON.stringify({relayEvents:relayEvents.slice(-30),browserErrors,chromeDownloads,calls:calls.slice(-30).map(({key,...row})=>row)}),{cause:error});
 } finally {
   if(socket){try{await send('Browser.close')}catch{}socket.close()}
   if(proc&&proc.exitCode===null){try{execFileSync('taskkill',['/PID',String(proc.pid),'/T','/F'],{stdio:'ignore'})}catch{}}

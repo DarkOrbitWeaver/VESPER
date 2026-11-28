@@ -281,6 +281,63 @@ async function main() {
       };`);
       return;
     }
+    if (playerRaceTest && request.url === '/sw-fixture/sw.js') {
+      response.writeHead(200, {'Content-Type':'text/javascript'});
+      response.end(`self.addEventListener('install',e=>e.waitUntil((async()=>{
+        const cache=await caches.open('fixture-media-v1');
+        const media=await fetch('/asset-100001/clip.m4s');
+        await cache.put('/sw-fixture/cache.mp4',media);
+        await self.skipWaiting();
+      })()));
+      self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
+      self.addEventListener('fetch',e=>{
+        if(new URL(e.request.url).pathname==='/sw-fixture/cache.mp4')
+          e.respondWith((async()=>{
+            const entry=await caches.match('/sw-fixture/cache.mp4');
+            return new Response(await entry.arrayBuffer(),{headers:{'Content-Type':'video/mp4'}});
+          })());
+      });`);
+      return;
+    }
+    if (playerRaceTest && request.url === '/sw-fixture/page') {
+      response.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+      response.end(`<!doctype html><title>Service worker playback fixture</title><video width="640" height="360" muted autoplay controls></video>
+        <script>window.swFixture={ready:false,error:null};
+        (async()=>{
+          await navigator.serviceWorker.register('/sw-fixture/sw.js');
+          await navigator.serviceWorker.ready;
+          if(!navigator.serviceWorker.controller)await new Promise(resolve=>navigator.serviceWorker.addEventListener('controllerchange',resolve,{once:true}));
+          const video=document.querySelector('video'),ms=new MediaSource();
+          video.src=URL.createObjectURL(ms);
+          await new Promise(resolve=>ms.addEventListener('sourceopen',resolve,{once:true}));
+          const track=ms.addSourceBuffer('video/mp4; codecs="avc1.42c00a,mp4a.40.2"');
+          window.swTrack=track;
+          const response=await fetch('/sw-fixture/cache.mp4');
+          const bytes=await response.arrayBuffer();
+          await new Promise((resolve,reject)=>{track.addEventListener('updateend',resolve,{once:true});track.addEventListener('error',reject,{once:true});track.appendBuffer(bytes);});
+          ms.endOfStream();swFixture.ready=true;
+        })().catch(e=>swFixture.error=String(e));</script>`);
+      return;
+    }
+    if (playerRaceTest && request.url === '/webcodecs-fixture') {
+      response.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+      response.end(`<!doctype html><title>WebCodecs playback fixture</title><canvas width="64" height="64"></canvas>
+        <script>window.codecFixture={frames:0,error:null,ready:false};
+        (async()=>{
+          const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d'),chunks=[];
+          const config={codec:'vp8',width:64,height:64,bitrate:100000,framerate:30};
+          const encoder=new VideoEncoder({output:chunk=>chunks.push(chunk),error:e=>codecFixture.error=String(e)});
+          encoder.configure(config);
+          for(let i=0;i<3;i++){ctx.fillStyle=['red','green','blue'][i];ctx.fillRect(0,0,64,64);
+            const frame=new VideoFrame(canvas,{timestamp:i*33333,duration:33333});encoder.encode(frame,{keyFrame:i===0});frame.close();}
+          await encoder.flush();encoder.close();
+          const decoder=new VideoDecoder({output:frame=>{ctx.drawImage(frame,0,0);frame.close();codecFixture.frames++;},error:e=>codecFixture.error=String(e)});
+          decoder.configure({codec:'vp8'});
+          for(const chunk of chunks)decoder.decode(chunk);
+          await decoder.flush();decoder.close();codecFixture.ready=true;
+        })().catch(e=>codecFixture.error=String(e));</script>`);
+      return;
+    }
     if (request.url === '/mse-feed' || request.url === '/mse-prefetch') {
       const prefetch = request.url === '/mse-prefetch';
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -991,6 +1048,7 @@ async function main() {
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
     await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
     let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [], workerDeclaration = null, workerTransfers = [];
+    let serviceWorkerFixture = null, webCodecsFixture = null;
     if (playerRaceTest) {
       function findButton(...classNames) {
         return waitFor(async () => {
@@ -1122,6 +1180,52 @@ async function main() {
         workerTransfers.push({mode,networkIdentity:false,retainedTracks:witness.tracks.length,
           complete:witness.tracks.every(t=>t.bufferedComplete)});
       }
+
+      await evaluate('Observe service worker picker requests', `(() => {
+        globalThis.__swPicker = [];
+        const previous = playerOptions;
+        playerOptions = async (...args) => {
+          const result = await previous(...args);
+          if (args[0]?.playerPageUrl?.includes('/sw-fixture/page'))
+            __swPicker.push({mediated:args[0].serviceWorkerPlayback===true,prefetch:args[0].prefetch===true,code:result.code});
+          return result;
+        };
+      })()`);
+      await browser.send('Page.navigate',{url:'http://127.0.0.1:'+port+'/sw-fixture/page'},tab);
+      const swWitness=await waitFor(async()=>{
+        const {result}=await browser.send('Runtime.evaluate',{expression:`(()=>{
+          if(window.swFixture?.error)return {error:swFixture.error};
+          const v=document.querySelector('video');
+          if(!window.swFixture?.ready||!v||v.readyState<1)return null;
+          v.removeAttribute('data-vesper-media-provenance');
+          v.dispatchEvent(new Event('vesper-media-provenance-request',{bubbles:true}));
+          return JSON.parse(v.getAttribute('data-vesper-media-provenance')||'null');
+        })()`,returnByValue:true},tab);
+        return result.value;
+      },10000,'Service worker playback failed.');
+      assert.ok(!swWitness.error,JSON.stringify(swWitness));
+      assert.ok(swWitness.tracks.every(t=>t.bufferedComplete),'Expected complete retained service-worker playback');
+      await waitFor(()=>flyShown(),5000,'Service worker playback lost the butterfly.');
+      await clickButton('fly');
+      await waitFor(async()=> (await evaluate('Service-worker selection evidence','__swPicker')).some(x=>x.mediated&&!x.prefetch&&x.code==='no-reusable-source'),5000,'Service worker playback was not guarded.');
+      const evicted=await browser.send('Runtime.evaluate',{expression:`(async()=>{
+        const v=document.querySelector('video');
+        await new Promise(resolve=>{swTrack.addEventListener('updateend',resolve,{once:true});swTrack.remove(0,0.5)});
+        v.removeAttribute('data-vesper-media-provenance');
+        v.dispatchEvent(new Event('vesper-media-provenance-request',{bubbles:true}));
+        return JSON.parse(v.getAttribute('data-vesper-media-provenance')||'null').tracks.every(t=>!t.bufferedComplete);
+      })()`,awaitPromise:true,returnByValue:true},tab);
+      assert.equal(evicted.result.value,true);
+      serviceWorkerFixture={retainedComplete:true,originReplayRefused:true,evictionInvalidated:true};
+      await browser.send('Page.navigate',{url:'http://127.0.0.1:'+port+'/webcodecs-fixture'},tab);
+      const codec=await waitFor(async()=>{
+        const {result}=await browser.send('Runtime.evaluate',{expression:'window.codecFixture?.ready||window.codecFixture?.error ? window.codecFixture : null',returnByValue:true},tab);
+        return result.value;
+      },10000,'WebCodecs playback failed.');
+      assert.equal(codec.error,null);
+      assert.equal(codec.frames,3);
+      assert.ok(!await flyShown(),'Canvas-only WebCodecs must not invent a media player');
+      webCodecsFixture={decodedFrames:codec.frames,unsupportedCanvasAbstention:true};
 
       await evaluate('Observe native verification for the prefetch fixture', `(() => {
         globalThis.__warmRequests = [];
@@ -1268,7 +1372,7 @@ async function main() {
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       workerDeclaration,
-      workerTransfers,
+      workerTransfers, serviceWorkerFixture, webCodecsFixture,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
       nativeCapture, captureRace, managedDownloads, recycledPlayer, scrollHandoffs, shadowPlayers
     }) + '\n');

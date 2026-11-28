@@ -56,6 +56,19 @@ globalThis.VesperEvidenceGraph = (() => {
     return parsed.origin + parsed.pathname.slice(0, parsed.pathname.lastIndexOf('/') + 1);
   }
 
+  // Shared projection for live probe ordering, verified picker ranking and independent offline observations.
+  // Unknown facts remain null; a reference label never supplies model inputs.
+  function sourceFeatures(id, row, facts = {}) {
+    const strong = row.exact === true || row.witnessed === true;
+    return { id, exactPlayerUrl: row.exact === true, playerBound: strong,
+      currentGeneration: facts.stale === true ? false : strong ? true : null,
+      manifestParent: facts.manifestParent === true ? true : null,
+      resourceWitness: row.witnessed === true, wholeFile: facts.wholeFile ?? null,
+      declared: facts.declared === true, durationAgreement: facts.durationAgreement ?? null,
+      adContext: facts.adContext === true, hypothesized: !strong,
+      stale: facts.stale === true, fragmentOnly: row.recoverability === 'partial-only' };
+  }
+
   function create({ now = Date.now, limits = {} } = {}) {
     const maxNodes = Math.min(Number.isSafeInteger(limits.nodes) && limits.nodes > 0 ? limits.nodes : LIMITS.nodes, LIMITS.nodes);
     const maxEdges = Math.min(Number.isSafeInteger(limits.edges) && limits.edges > 0 ? limits.edges : LIMITS.edges, LIMITS.edges);
@@ -275,11 +288,12 @@ globalThis.VesperEvidenceGraph = (() => {
           nodes.get(edge.to)?.attrs.url === url.href);
         const witnessed = !contradicted && !worker && item.witnessed === true;
         const compatible = !contradicted && recoverability !== 'partial-only';
-        rows.push({ index, exact, witnessed, recoverability,
+        const row = { index, exact, witnessed, recoverability,
           identity: exact ? 'current-url' : witnessed ? 'resource-witness' : worker ? 'opaque-context' : 'unconfirmed',
           verified: item.verified === true, compatible,
           verdict: !compatible ? 'reject' : item.verified !== true ? 'verify'
-            : exact ? 'exact' : 'confirm' });
+            : exact ? 'exact' : 'confirm' };
+        rows.push({ ...row, features: sourceFeatures('source-' + index, row, item) });
       }
       // Eviction, malformed input or a lost generation cannot silently turn
       // an incomplete set of hypotheses into a unique automatic choice.
@@ -290,7 +304,41 @@ globalThis.VesperEvidenceGraph = (() => {
         ? 'confirm' : 'abstain', selected: exact.length === 1 ? exact[0].index : null, rows };
     }
 
-    return Object.freeze({ add, link, observePlayer, observeRequest, observeDeclared, observeFingerprint, associate, forget, assessPicker,
+    // A retained playback artifact is a reconstruction, not an original HTTP
+    // representation. Admission requires a complete unedited active track set.
+    function assessRetained({scope,playerKey,generation,worker=false,tracks=[],protectedMedia=false,live=false}) {
+      const gen=observePlayer({scope,playerKey,generation});
+      if(!gen||worker||protectedMedia||live||!Array.isArray(tracks)||tracks.length<1||tracks.length>2)
+        return {verdict:'abstain'};
+      const ids=new Set(), containers=new Set(), roles=new Set();
+      let size=0;
+      for(const track of tracks){
+        const match=/^(audio|video)\/(mp4|webm)(?:;|$)/i.exec(track?.mimeType||'');
+        if(!match||typeof track.id!=='string'||track.id.length>100||ids.has(track.id)
+          || !['audio','video','muxed'].includes(track.role)||track.bufferedComplete!==true
+          || track.ended!==true||track.timelineAdjusted!==false||track.hasInit!==true
+          || !Number.isSafeInteger(track.retainedBytes)||track.retainedBytes<=0||track.retainedBytes>24*1024*1024
+          || !Number.isSafeInteger(track.initLength)||track.initLength<=0||track.initLength>track.retainedBytes
+          || !Number.isSafeInteger(track.totalAppendedBytes)||track.totalAppendedBytes<track.retainedBytes)
+          return {verdict:'abstain'};
+        if((match[1].toLowerCase()==='audio') !== (track.role==='audio'))return {verdict:'abstain'};
+        ids.add(track.id);containers.add(match[2].toLowerCase());roles.add(track.role);size+=track.retainedBytes;
+        const node=add('track',scopedKey(scope,playerKey,generation,track.id),{scope,role:track.role});
+        const artifact=add('byte-artifact',scopedKey(scope,playerKey,generation,track.id,'retained'),
+          {scope,kind:'retained-playback',complete:true,bytes:track.retainedBytes});
+        if(!link(gen,node,'track-of')||!link(node,artifact,'representation-of'))return {verdict:'abstain'};
+      }
+      if(containers.size!==1||tracks.length===2&&(!roles.has('audio')||!roles.has('video')))return {verdict:'abstain'};
+      const acquisition=add('acquisition',scopedKey(scope,playerKey,generation,'retained'),{
+        scope,recoverability:'reconstructable-playback',originalBytes:false,bytes:size
+      });
+      if(!link(gen,acquisition,'candidate-for')||evicted)return {verdict:'abstain'};
+      const mime=tracks.find(t=>t.role!=='audio')?.mimeType||tracks[0].mimeType;
+      return {verdict:'reconstructable-playback',sizeBytes:size,mime,
+        container:containers.has('webm')?'WebM':tracks.length===1&&roles.has('audio')?'M4A':'MP4'};
+    }
+
+    return Object.freeze({ add, link, observePlayer, observeRequest, observeDeclared, observeFingerprint, associate, forget, assessPicker, assessRetained,
       snapshot: () => ({ schema: SCHEMA, nodes: nodes.size, edges: edges.size, evicted }) });
   }
 

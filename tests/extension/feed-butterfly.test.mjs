@@ -483,6 +483,7 @@ test('MSE: a full-buffer quality switch rebuilds the track; a partial remove sti
   const listeners = new Map();
   class WitnessURL extends URL { static createObjectURL() { return 'blob:https://www.instagram.com/' + ++serial; } }
   class Buffer {
+    mode='segments'; timestampOffset=0; appendWindowStart=0; appendWindowEnd=Infinity;
     appendBuffer() {}
     remove(start, end) {
       if (start === 0 && end === Infinity) this.buffered = { length: 0 };
@@ -491,6 +492,7 @@ test('MSE: a full-buffer quality switch rebuilds the track; a partial remove sti
     buffered = { length: 1, start: () => 0, end: () => 14.78 };
   }
   class Source {
+    readyState='ended';
     activeSourceBuffers = [];
     addSourceBuffer() { const b = new Buffer(); this.activeSourceBuffers.push(b); return b; }
   }

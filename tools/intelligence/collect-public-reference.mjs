@@ -80,7 +80,7 @@ export function referenceLabel(spec, playback, responses) {
   const matches = playback.filter(p=>p.src===spec.expected && p.ready && p.played === true && Number.isFinite(p.duration) && p.duration>0);
   if (matches.length !== 1) return {status:'reference-not-established'};
   if (!responses.some(r=>r.url===spec.expected && r.kind==='direct' && r.status>=200 && r.status<300
-      && r.frame===matches[0].frame))
+      && r.frame===matches[0].frame && r.execution===matches[0].execution))
     return {status:'reference-response-missing'};
   return {status:'verified',playerId:matches[0].id,resource:spec.expected};
 }
@@ -90,15 +90,20 @@ export function sourceObservation(runtime, spec, playback, responses, reference)
   if (!player || !player.ready || !publicUrl(player.src) || responses.length > 32) return null;
   const graph = runtime.VesperEvidenceGraph.create();
   const scope='public-reference', playerKey='player', generation=1;
-  graph.observePlayer({scope,playerKey,generation,sourceUrl:player.src,at:0});
-  for(const item of responses) if(publicUrl(item.url) && item.frame===player.frame)
-    graph.observeRequest({scope,playerKey,generation,url:item.url,kind:item.kind,at:1});
-  const features=runtime.VesperInference.SCHEMAS['vesper.source-association/1'].features;
-  const candidates=graph.associate({scope,playerKey}).candidates;
-  const rows=candidates.map(c=>({id:c.id,...Object.fromEntries(features.filter(f=>c[f]!==undefined).map(f=>[f,c[f]]))}));
+  const candidates=[...new Map(responses.filter(item=>publicUrl(item.url)&&item.frame===player.frame
+    && item.execution===player.execution)
+    .map(item=>[item.url,item])).values()];
+  // The same pre-verification representation as live acquisition. Neither a
+  // reference label nor a successful native transfer supplies model features.
+  const decision=graph.assessPicker({scope,playerKey,generation,sourceUrl:player.src,candidates:candidates.map(item=>({
+    url:item.url,kind:item.kind,direct:item.url===player.src,witnessed:false,verified:false,
+    compatible:true,wholeFile:item.wholeFile??null
+  }))});
+  const admitted=decision.rows.filter(row=>row.compatible);
+  const rows=admitted.map(row=>row.features);
   // The reference joins only after observations are constructed. It never
   // selects candidates, changes features, or overrides an abstention.
-  const chosen=reference.status==='verified' ? candidates.find(c=>c.url===reference.resource)?.id : null;
+  const chosen=reference.status==='verified' ? admitted.find(row=>candidates[row.index].url===reference.resource)?.features.id : null;
   return {candidates:rows,chosen:chosen??null,established:!!chosen};
 }
 
@@ -127,13 +132,34 @@ async function run(chrome,output,manifest) {
     socket.addEventListener('message',event=>{
       const m=JSON.parse(event.data),p=pending.get(m.id);
       if(p){pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(Error('CDP error')):p.resolve(m.result||{});return;}
-      if(!current||m.sessionId!==current.session||m.method!=='Network.responseReceived')return;
+      if(!current||!current.sessions.has(m.sessionId))return;
+      if(m.method==='Target.attachedToTarget'){
+        const state=current, child=m.params.sessionId, kind=m.params.targetInfo.type;
+        if(state.sessions.size>=16||state.attachments.length>=16){state.overflow=true;return;}
+        if(!['iframe','worker','service_worker','shared_worker'].includes(kind))return;
+        state.sessions.set(child,kind);
+        state.attachments.push((async()=>{
+          try{
+            await send('Network.enable',{},child);
+            // Observe child targets; never evaluate or rewrite a worker.
+            if(kind==='iframe')await send('Page.enable',{},child);
+            await send('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true},child);
+          }catch{state.incomplete=true;}
+        })());
+        return;
+      }
+      if(m.method==='Target.detachedFromTarget'){
+        current.sessions.delete(m.params.sessionId);
+        return;
+      }
+      if(m.method!=='Network.responseReceived')return;
       const r=m.params.response,kind=mediaKind(r.mimeType||''),url=publicUrl(r.url);
       if(!kind||!url||r.status<200||r.status>=300)return;
       const frame=m.params.frameId;
-      const key=JSON.stringify([frame,url]);
+      const key=JSON.stringify([m.sessionId,frame,url]);
       if(!current.responses.has(key)&&current.responses.size>=32){current.overflow=true;return;}
-      current.responses.set(key,{url,kind,status:r.status,frame});
+      const length=Number(Object.entries(r.headers||{}).find(([name])=>name.toLowerCase()==='content-length')?.[1]);
+      current.responses.set(key,{url,kind,status:r.status,frame,execution:m.sessionId,wholeFile:r.status===200&&kind==='direct'&&Number.isSafeInteger(length)&&length>0?true:null});
     });
     const browser=(await send('Browser.getVersion')).product;
     await send('Browser.setDownloadBehavior',{behavior:'deny'});
@@ -148,16 +174,57 @@ async function run(chrome,output,manifest) {
         await send('Browser.setDownloadBehavior',{behavior:'deny',browserContextId:context});
         target=(await send('Target.createTarget',{url:'about:blank',browserContextId:context})).targetId;
         const session=(await send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
-        current={session,responses:new Map(),overflow:false};
+        current={session,sessions:new Map([[session,'page']]),attachments:[],responses:new Map(),overflow:false,incomplete:false};
         await send('Network.enable',{},session);
         await send('Page.enable',{},session);
+        await send('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true},session);
         const nav=await send('Page.navigate',{url:spec.page},session);
         if(nav.errorText)throw Error('navigation failed');
-        const expression="(()=>[...document.querySelectorAll('video,audio')].slice(0,33).map((v,i)=>{const b=v.getBoundingClientRect(),w=Math.max(0,Math.min(innerWidth,b.right)-Math.max(0,b.left)),h=Math.max(0,Math.min(innerHeight,b.bottom)-Math.max(0,b.top));return {id:'player-'+i,src:v.currentSrc,area:w*h,visibleFraction:b.width*b.height>0?w*h/(b.width*b.height):0,centerDistance:Math.min(1,Math.hypot(b.left+b.width/2-innerWidth/2,b.top+b.height/2-innerHeight/2)/Math.hypot(innerWidth/2,innerHeight/2)),ready:v.readyState>=1,played:v.readyState>=2&&v.currentTime>0.1,playing:!v.paused&&!v.ended,progressed:v.currentTime>1,controls:v.controls,muted:v.muted,incidentalLoop:v.defaultMuted&&v.autoplay&&v.loop&&!v.controls,duration:Number.isFinite(v.duration)?v.duration:null,declaredSource:!!v.getAttribute('src')}}))()";
+        // A WeakMap in a QA-only isolated world binds progression to the same
+        // DOM element. Reordered/recycled elements must not inherit old IDs.
+        const expression=`(()=>{const state=globalThis.__vesperReference??=( {ids:new WeakMap(),next:0} );
+          return [...document.querySelectorAll('video,audio')].slice(0,33).map(v=>{
+            if(!state.ids.has(v))state.ids.set(v,++state.next);
+            const b=v.getBoundingClientRect(),w=Math.max(0,Math.min(innerWidth,b.right)-Math.max(0,b.left)),h=Math.max(0,Math.min(innerHeight,b.bottom)-Math.max(0,b.top));
+            return {id:state.ids.get(v),src:v.currentSrc,area:w*h,visibleFraction:b.width*b.height>0?w*h/(b.width*b.height):0,
+              centerDistance:Math.min(1,Math.hypot(b.left+b.width/2-innerWidth/2,b.top+b.height/2-innerHeight/2)/Math.hypot(innerWidth/2,innerHeight/2)),
+              ready:v.readyState>=1,played:false,position:v.currentTime,seeking:v.seeking,playing:!v.paused&&!v.ended,progressed:v.currentTime>1,
+              controls:v.controls,muted:v.muted,incidentalLoop:v.defaultMuted&&v.autoplay&&v.loop&&!v.controls,
+              duration:Number.isFinite(v.duration)?v.duration:null,declaredSource:!!v.getAttribute('src')};
+          });
+        })()`;
         const frame=(await send('Page.getFrameTree',{},session)).frameTree.frame.id;
-        const timedExpression=expression.replace('played:v.readyState>=2&&v.currentTime>0.1', 'played:false,position:v.currentTime,seeking:v.seeking');
-        const readPlayback=async()=> ((await send('Runtime.evaluate',{expression:timedExpression,returnByValue:true},session)).result?.value||[])
-          .map(p=>({...p,frame}));
+        const worlds=new Map();
+        const readPlayback=async()=>{
+          await Promise.allSettled(current.attachments);
+          const rows=[],seenFrames=new Set();
+          for(const [execution,kind] of current.sessions){
+            if(!['page','iframe'].includes(kind))continue;
+            let tree;
+            try{tree=(await send('Page.getFrameTree',{},execution)).frameTree;}catch{current.incomplete=true;continue;}
+            const frames=[tree];
+            for(const node of frames){
+              frames.push(...(node.childFrames||[]));
+              const id=node.frame.id,key=JSON.stringify([execution,id]);
+              if(seenFrames.has(id))continue;
+              if(seenFrames.size>=16){current.overflow=true;break;}
+              try{
+                if(!worlds.has(key)){
+                  const world=await send('Page.createIsolatedWorld',{frameId:id,worldName:'vesper-reference'},execution);
+                  worlds.set(key,world.executionContextId);
+                }
+                const contextId=worlds.get(key);
+                const result=await send('Runtime.evaluate',{expression,contextId,returnByValue:true},execution);
+                if(result.exceptionDetails)throw Error('world unavailable');
+                seenFrames.add(id);
+                const prefix=sha(execution+':'+id+':'+contextId).slice(0,12);
+                for(const p of result.result?.value||[])rows.push({...p,id:prefix+'-'+p.id,frame:id,execution,contextId});
+              }catch{worlds.delete(key);if(id===frame)current.incomplete=true;}
+            }
+          }
+          if(rows.length>32)current.overflow=true;
+          return rows.slice(0,33);
+        };
         let playback=[];
         try{playback=await until(async()=>{const p=await readPlayback();return p.some(v=>v.ready)?p:null},spec.probeOnly?6000:12000);}
         catch{playback=await readPlayback();}
@@ -166,23 +233,27 @@ async function run(chrome,output,manifest) {
           // predeclared public sample, muted in the isolated QA context.
           const expected=JSON.stringify(spec.expected);
           const before=new Map(playback.map(p=>[p.id,p]));
-          await send('Runtime.evaluate',{expression:"(()=>{const v=[...document.querySelectorAll('video,audio')].find(v=>v.currentSrc==="+expected+");if(v){v.muted=true;v.play().catch(()=>{})}})()"},session);
+          const target=playback.find(p=>p.src===spec.expected&&p.ready);
+          await send('Runtime.evaluate',{expression:"(()=>{const v=[...document.querySelectorAll('video,audio')].find(v=>v.currentSrc==="+expected+");if(v){v.muted=true;v.play().catch(()=>{})}})()",contextId:target.contextId},target.execution);
           const measure=async()=> (await readPlayback()).map(p=>{
             const prior=before.get(p.id);
-            return {...p,played:!!prior&&prior.src===p.src&&prior.frame===p.frame&&p.ready
+            return {...p,played:!!prior&&prior.src===p.src&&prior.frame===p.frame&&prior.execution===p.execution&&prior.contextId===p.contextId&&p.ready
               && !p.seeking&&p.position-prior.position>0.1};
           });
           try{playback=await until(async()=>{const p=await measure();return p.some(v=>v.src===spec.expected&&v.played)?p:null},8000);}
           catch{playback=await readPlayback();}
         }
         const responses=[...current.responses.values()];
-        const ref=current.overflow||playback.length>32?{status:'observation-overflow'}:referenceLabel(spec,playback,responses);
-        const playerRows=playback.filter(p=>p.area>0).map(({src,played,frame,position,seeking,...row})=>row);
+        const ref=current.overflow||playback.length>32?{status:'observation-overflow'}:current.incomplete?{status:'observer-incomplete'}:referenceLabel(spec,playback,responses);
+        // Nested viewport geometry is not top-level visibility; do not train player intent from it.
+        const playerRows=playback.filter(p=>p.area>0&&p.frame===frame&&p.execution===session)
+          .map(({src,played,frame,execution,contextId,position,seeking,...row})=>row);
         const source=sourceObservation(runtime,spec,playback,responses,ref);
         observations.push({...common,split:spec.split,players:playerRows,sourceCandidates:source?.candidates||[],
-          mediaResponses:responses.length,overflow:current.overflow||playback.length>32});
+          mediaResponses:responses.length,overflow:current.overflow||playback.length>32,
+          contexts:[...current.sessions.values()],frameCount:new Set(playback.map(p=>p.frame)).size,incomplete:current.incomplete});
         labels.push({...common,status:ref.status,player:ref.playerId||null,source:source?.established?source.chosen:null});
-        if(ref.status==='verified'&&playerRows.some(p=>p.id===ref.playerId))
+        if(ref.status==='verified'&&playback.every(p=>p.frame===frame&&p.execution===session)&&playerRows.some(p=>p.id===ref.playerId))
           corpus.player[spec.split].push({...common,label:'verified',chosen:ref.playerId,candidates:playerRows});
         if(source?.established)
           corpus.source[spec.split].push({...common,label:'verified',chosen:source.chosen,candidates:source.candidates});

@@ -98,7 +98,6 @@ async function logChromeMiss(item, generation, useEarlyFailure = true) {
   const failure = useEarlyFailure && recentDownloadFact(earlyFailures, original);
   const native = recentDownloadFact(nativeAttempts, original) || recentDownloadFact(nativeAttempts, final);
   const received = byteCount(item.bytesReceived);
-  if (useEarlyFailure) rememberDownloadFact(chromeStarts, original, { id: item.id });
   const entry = {
     id: item.id, startTime: item.startTime, at: Date.now(), outcome: 'failed',
     reason: failure?.reason || (/^(blob:|data:)/i.test(original) ? 'browser-generated'
@@ -207,6 +206,14 @@ chrome.alarms.onAlarm.addListener(alarm => {
 
 chrome.downloads.onCreated.addListener(async item => {
   const generation = captureGeneration;
+  // Record ownership synchronously, before policy/storage/diagnostic awaits.
+  // A pending early native stage must see a browser-created entry at zero bytes.
+  if (capturePaused !== true && item && !item.incognito && !item.byExtensionId
+      && Number.isSafeInteger(item.id) && /^https?:/i.test(item.url || '')) {
+    const original = item.url.split('#', 1)[0], final = (item.finalUrl || original).split('#', 1)[0];
+    rememberDownloadFact(chromeStarts, original, {id:item.id});
+    if (final !== original) rememberDownloadFact(chromeStarts, final, {id:item.id});
+  }
   try {
     if (!await captureCanBegin(generation)) return;
     await logChromeMiss(item, generation);
@@ -275,7 +282,12 @@ async function earlyDirectDownload(message, sender) {
   const clickAt = Number.isSafeInteger(message.clickAt) && message.clickAt <= started
     && message.clickAt >= started - 15000 ? message.clickAt : started;
   facts.dispatchMs = started - clickAt;
+  let finalUrl;
+  const browserOwns = () => [url, finalUrl].some(address =>
+    (recentDownloadFact(chromeStarts, address)?.seen ?? 0) >= started);
+  const chromeOwned = {ok:true,browserOwned:true};
   const fallback = reason => {
+    if (browserOwns()) return chromeOwned;
     if (reason && captureAllowed()) {
       rememberDownloadFact(earlyFailures, url, { reason, attempt });
       if (nativeAttempts.get(url)?.attempt === attempt) nativeAttempts.delete(url);
@@ -310,7 +322,7 @@ async function earlyDirectDownload(message, sender) {
   try {
     try {
       await siteRulesLoaded;
-      if (!await captureCanBegin(generation) || matchesNeverCaptureHost({ url, referrer: page.href })) return chromeFallback;
+      if (!await captureCanBegin(generation) || matchesNeverCaptureHost({ url, referrer: page.href })) return fallback();
       // With permission, check the same signed-in representation the click would see.
       // A guest file can look valid while containing different data.
       const archiveTarget = githubArchiveTarget(url);
@@ -321,7 +333,7 @@ async function earlyDirectDownload(message, sender) {
       const redirect = credMode === 'include' ? 'error' : 'follow';
       if (credMode === 'include' && await captureSiteDecision({ url, referrer: page.href }, true) !== 'allowed')
         return fallback('site-policy');
-      if (!captureAllowed(generation)) return chromeFallback;
+      if (!captureAllowed(generation)) return fallback();
       // Start only the local native-session handshake during the existing
       // response probe. No stage/accept message may precede verified evidence.
       VesperNativeSession.prepare?.(HOST);
@@ -352,6 +364,7 @@ async function earlyDirectDownload(message, sender) {
       if (response.body) await response.body.cancel().catch(() => {});
       const statusOk = response.status === 200 || (response.status === 206 && !!rangeTotal);
       const final = VesperPlayerSource.http(response.url || url);
+      finalUrl = final?.href;
       if (credMode === 'include' && final?.origin === page.origin && !response.redirected) {
         const enriched = await withSignIn([{ url: final.href, originalUrl: url, ...(message.omitReferrer ? {} : { referer: page.href }), userAgent: navigator.userAgent }],
           { frame: { tabId: sender.tab.id, frameId: sender.frameId ?? 0, ...(sender.documentId ? { documentId: sender.documentId } : {}) }, userGesture: true });
@@ -391,7 +404,8 @@ async function earlyDirectDownload(message, sender) {
       if (!useGitHubArchive && !strongEtag && !lastModified && !useAttachmentLength) return fallback('validator-unverified');
       if (encoding && encoding.toLowerCase() !== 'identity') return fallback('encoding-unverified');
       if (matchesNeverCaptureHost({ url, finalUrl: final.href, referrer: page.href }) || !captureAllowed(generation))
-        return chromeFallback;
+        return fallback();
+      if (browserOwns()) return chromeOwned;
       const proof = {
         ...(Number.isSafeInteger(length) && length > 0 ? { length } : {}),
         ...(mime ? { contentType: mime } : {}),
@@ -414,7 +428,16 @@ async function earlyDirectDownload(message, sender) {
       facts.nativeMs = Date.now() - nativeStarted;
       facts.job = staged.results?.[0]?.jobId;
       facts.native = staged.results?.[0]?.transferReason || staged.code;
-      if (!staged.ok || staged.results?.[0]?.transferReady !== true || !captureAllowed(generation)) {
+      if (browserOwns()) {
+        // No native acceptance has been sent. Leave Chrome's original entry alone,
+        // and tell the content script not to replay the suppressed default click.
+        await transferCommand(transferId, 'abandon', 3000).catch(() => {});
+        return chromeOwned;
+      }
+      const route = VesperPlanner.ownershipRoute({approved:captureAllowed(generation),
+        nativeReplayVerified:staged.ok && staged.results?.[0]?.transferReady === true,
+        chromeExists:browserOwns()});
+      if (route.route !== 'native-http') {
         // No accept has been dispatched, so a late staged job cannot publish.
         await transferCommand(transferId, 'abandon', 3000).catch(() => {});
         return fallback(staged.code === 'site-capture-disabled' ? undefined : 'native-declined');

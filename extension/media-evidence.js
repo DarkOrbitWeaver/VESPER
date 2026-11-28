@@ -177,23 +177,18 @@ globalThis.VesperMediaEvidence = (() => {
       candidates: [...nodes].sort((a,b) => a.index - b.index).map(node => ({
         url: node.entry.source?.url, kind: node.entry.source?.kind, direct: node.direct,
         witnessed: !!node.witnessed, verified: node.verified, compatible: node.compatible,
-        conflictingValidator: node.entry.source?.conflictingValidator === true
+        conflictingValidator: node.entry.source?.conflictingValidator === true,
+        manifestParent: node.edges.some(edge => edge.kind === 'manifest-segment'),
+        wholeFile: node.entry.source?.wholeRepresentation === true || node.entry.source?.rangeResource === true ? true : null,
+        durationAgreement: node.durationAgreement == null ? null : Number(node.durationAgreement),
+        declared: node.entry.source?.declared === true
       })) });
     const rows = new Map((decision?.rows || []).map(row => [row.index, row]));
     // Reject contradicted/fragment-only hypotheses for every caller, not only
     // the auto-selection branch. An incomplete graph cannot grant a choice.
     for (const node of nodes) node.compatible = rows.get(node.index)?.compatible === true;
-    const learned = globalThis.VesperInference?.rankSources(nodes.filter(node => node.verified && node.compatible).map(node => {
-      const row = rows.get(node.index);
-      return { id: 'source-' + node.index, exactPlayerUrl: row.exact,
-        playerBound: row.exact || row.witnessed, resourceWitness: row.witnessed,
-        manifestParent: node.edges.some(edge => edge.kind === 'manifest-segment'),
-        wholeFile: node.entry.source?.wholeRepresentation === true || node.entry.source?.rangeResource === true ? true : null,
-        durationAgreement: node.durationAgreement == null ? null : Number(node.durationAgreement),
-        currentGeneration: row.exact || row.witnessed ? true : null,
-        hypothesized: !row.exact && !row.witnessed && !!node.entry.source?.sliceEvidence,
-        fragmentOnly: false };
-    }));
+    const learned = globalThis.VesperInference?.rankSources(nodes.filter(node => node.verified && node.compatible)
+      .map(node => rows.get(node.index).features));
     const preferred = learned?.decisive ? learned.selected : null;
     nodes.sort((a, b) => Number(rows.get(b.index)?.verdict === 'exact') - Number(rows.get(a.index)?.verdict === 'exact')
       || Number('source-' + b.index === preferred) - Number('source-' + a.index === preferred)

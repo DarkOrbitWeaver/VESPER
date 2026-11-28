@@ -36,10 +36,10 @@ globalThis.VesperPlanner = (() => {
   // Ownership for a user-initiated browser download. An explicit VESPER action or an actual Chrome
   // download is the authority; a model score never is. Chrome keeps bytes it already owns.
   function ownershipRoute({ approved, nativeReplayVerified, originalBytesProven, browserReadAllowed,
-    isOneUse, isPost, isBlob, isDrm, chromeHasBytes, chromeReplaySafe = false } = {}) {
+    isOneUse, isPost, isBlob, isDrm, chromeExists, chromeHasBytes } = {}) {
     if (isDrm) return { tier: 'unsupported', route: null, reason: 'Protected media' };
     if (!approved) return { tier: 'chrome', route: 'chrome-keep', reason: 'No download authority' };
-    if (chromeHasBytes && !chromeReplaySafe && !originalBytesProven) return { tier: 'chrome', route: 'chrome-keep', reason: 'Original Chrome bytes are already owned' };
+    if (chromeExists || chromeHasBytes) return { tier: 'chrome', route: 'chrome-keep', reason: 'Chrome already owns the download' };
     if (originalBytesProven) return { tier: 'original-stream', route: 'browser-body', reason: 'Original stream ownership proven' };
     if (!isOneUse && !isPost && !isBlob && nativeReplayVerified)
       return { tier: 'native', route: 'native-http', reason: 'Independent GET verified replayable' };
@@ -82,8 +82,8 @@ globalThis.VesperPlanner = (() => {
     if (attempts.length >= MAX_ATTEMPTS) return result('stopped', null, 'attempt-budget');
 
     const chrome = caps.chromeDownload || {};
-    // The browser is already receiving the original bytes and nothing proves a safe takeover.
-    if (chrome.receivingBytes === true && chrome.originalBytesProven !== true && chrome.replaySafe !== true) return result('fallback', 'chrome-keep', 'chrome-owns-bytes');
+    // Ownership starts at onCreated, even at zero bytes. No proof can authorize a second copy.
+    if (chrome.exists === true || chrome.receivingBytes === true) return result('fallback', 'chrome-keep', 'chrome-owns-bytes');
     if (situation.selection?.ambiguous === true && intent.explicit === true)
       return result('needs-user', 'resolve-selection', 'ambiguous-target', { missing: ['user-selection'] });
 

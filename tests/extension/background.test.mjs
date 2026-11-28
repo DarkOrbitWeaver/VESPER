@@ -1534,6 +1534,20 @@ test('generic feed attached declaration requires current document evidence and e
   } finally { app.stopWorker(); }
 });
 
+test('service-worker playback never becomes an HTTP replay or passive prefetch', async () => {
+  const page='https://example.com/watch';
+  const sender={url:page,tab:{id:90},frameId:0,documentId:'sw-playback'};
+  const app=load();
+  const request={type:'media-options',pageUrl:page,playerPageUrl:page,playerUrl:'https://example.com/media.mp4',
+    playerKey:'player-sw',generation:1,mediaChangedAt:Date.now(),playerHasMedia:true,serviceWorkerPlayback:true};
+  try {
+    assert.equal((await app.message({...request,prefetch:true},sender)).data.prefetchSkipped,true);
+    assert.equal((await app.message(request,sender)).code,'no-reusable-source');
+    assert.equal((await app.message({...request,type:'browser-body-media-proof'},sender)).ok,false);
+    assert.equal(app.sent.length,0);
+  } finally {app.stopWorker();}
+});
+
 test('worker-only player declaration is a confirmation choice, not an observed source', async () => {
   const page = 'https://www.facebook.com/';
   const url = 'https://cdn.test/worker.mpd';
@@ -1563,6 +1577,7 @@ test('worker-only player declaration is a confirmation choice, not an observed s
     assert.equal((await select({manifestUrl:'https://cdn.test/new.mpd'})).code,'expired-selection');
     assert.equal((await select({generation:2})).code,'expired-selection');
     assert.equal((await select({workerMediaSource:false})).code,'expired-selection');
+    assert.equal((await select({serviceWorkerPlayback:true})).code,'expired-selection');
     assert.equal(app.sent.length,0);
     const reply=await select({});
     assert.equal(reply.ok,true);
@@ -3244,6 +3259,40 @@ test('two early requests for the same click never send the second download to Ch
     assert.equal(app.sent.filter(message => message.type === 'browser-capture').length, 1);
     assert.deepEqual(app.downloadHistory, []);
   } finally { app.stopWorker(); }
+});
+test('Chrome creation during the response probe suppresses native and default replay', async () => {
+  let finish, entered;
+  const probeEntered = new Promise(resolve => { entered = resolve; });
+  const probe = new Promise(resolve => { finish = resolve; });
+  const file = {...activeDownload(),url:earlyUrl,finalUrl:earlyUrl,bytesReceived:0};
+  const app = load({'browser-capture':started,'browser-transfer':transfer('active')},
+    {download:file,earlyFetch:()=>{entered();return probe;}});
+  try {
+    const pending = app.message({type:'early-download',url:earlyUrl},earlySender);
+    await probeEntered;
+    await app.onCreated(file);
+    finish(earlyHeaders());
+    assert.equal((await pending).browserOwned,true);
+    assert.equal(app.sent.filter(m=>m.type==='browser-capture').length,0);
+    assert.deepEqual(app.actions,[]);
+  } finally { app.stopWorker(); }
+});
+test('Chrome creation during native staging abandons before accepting', async () => {
+  let finish, entered;
+  const stageEntered = new Promise(resolve=>{entered=resolve;});
+  const stage = new Promise(resolve=>{finish=resolve;});
+  const file = {...activeDownload(),url:earlyUrl,finalUrl:earlyUrl,bytesReceived:0};
+  const app = load({'browser-capture':()=>{entered();return stage;},'browser-transfer':transfer('failed')},
+    {download:file,earlyFetch:async()=>earlyHeaders()});
+  try {
+    const pending=app.message({type:'early-download',url:earlyUrl},earlySender);
+    await stageEntered;
+    await app.onCreated(file);
+    finish(started);
+    assert.equal((await pending).browserOwned,true);
+    assert.deepEqual(app.sent.filter(m=>m.type==='browser-transfer').map(m=>m.operation),['abandon']);
+    assert.deepEqual(app.actions.filter(action=>action!=='native'),[]);
+  } finally {app.stopWorker();}
 });
 function earlyHeaders(url=earlyUrl, changes={}) {
   return {status:200,url,headers:new Headers({'Content-Type':'application/octet-stream','Content-Length':'500000','ETag':'"v1"','Content-Disposition':'attachment',...changes})};

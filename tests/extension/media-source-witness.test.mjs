@@ -11,12 +11,14 @@ function setup() {
     static createObjectURL() { return 'blob:https://site.test/' + ++serial; }
   }
   class Buffer {
+    mode='segments'; timestampOffset=0; appendWindowStart=0; appendWindowEnd=Infinity;
     appendBuffer(value) { this.last = value; return undefined; }
     remove() {}
     changeType() {}
     buffered = { length: 1, start: () => 0, end: () => 10 };
   }
   class Source {
+    readyState='ended';
     activeSourceBuffers = [];
     removeSourceBuffer(buffer) {
       this.activeSourceBuffers = this.activeSourceBuffers.filter(item => item !== buffer);
@@ -107,6 +109,21 @@ test('MSE keeps an identical init and refuses incomplete, inactive or edited tra
   assert.equal(fixture.provenance(el).tracks[0].bufferedComplete, false);
   source.activeSourceBuffers.length = 0;
   assert.equal(fixture.provenance(el).tracks.length, 0);
+});
+
+test('open, timestamp-adjusted, window-clipped and sequence-mode MSE tracks cannot be exported as complete',()=>{
+  for(const mutation of ['open','offset','window','sequence']){
+    const b=setup(), {source,el,buffer}=b.player();
+    el.duration=10;el.buffered=buffer.buffered;
+    if(mutation==='open')source.readyState='open';
+    if(mutation==='offset')buffer.timestampOffset=5;
+    if(mutation==='window')buffer.appendWindowStart=0.5;
+    if(mutation==='sequence')buffer.mode='sequence';
+    const box=type=>Uint8Array.of(0,0,0,8,...[...type].map(c=>c.charCodeAt(0)));
+    buffer.appendBuffer(Uint8Array.of(...box('ftyp'),...box('moov')));
+    buffer.appendBuffer(box('mdat'));
+    assert.equal(b.provenance(el).tracks[0].bufferedComplete,false,mutation);
+  }
 });
 
 test('exact response buffer is associated with only the SourceBuffer that receives it', async () => {
