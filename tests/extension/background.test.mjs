@@ -1573,6 +1573,48 @@ test('worker-only player declaration is a confirmation choice, not an observed s
   } finally { app.stopWorker(); }
 });
 
+test('worker without a declaration offers only bounded current-document choices, not automatic formats', async () => {
+  const page = 'https://www.facebook.com/';
+  const url = 'https://cdn.test/worker.mp4';
+  const sender = { url: page, tab: { id: 91 }, frameId: 0, documentId: 'worker-observed' };
+  const app = load({ 'media-source-options': { ok: true, data: {duration:15, choices:[{index:0,hasVideo:true}] } } });
+  const at = Date.now();
+  const request = { type:'media-options', pageUrl:page, playerPageUrl:page, playerUrl:'',
+    workerMediaSource:true, playerHasMedia:true, playerKey:'worker-player', generation:1, mediaChangedAt:at,
+    playerFacts:{kind:'video',durationSeconds:15,height:720} };
+  const observe = (address, documentId=sender.documentId, seen=at) => app.onMedia({
+    url:address, tabId:91, frameId:0, documentId, method:'GET', statusCode:200,
+    type:'xmlhttprequest', timeStamp:seen, responseHeaders:[
+      {name:'Content-Type',value:'video/mp4'},{name:'Content-Length',value:'2000000'}] });
+  try {
+    await observe('https://cdn.test/foreign.mp4','other-document');
+    await observe('https://cdn.test/old.mp4',sender.documentId,at-5000);
+    assert.equal((await app.message(request,sender)).code,'no-reusable-source');
+    await observe(url);
+    assert.equal((await app.message({...request,multiplePlayers:true},sender)).code,'no-reusable-source');
+    await app.message({...request,prefetch:true},sender);
+    assert.equal(app.sent.length,0);
+    const options = await app.message(request,sender);
+    assert.equal(options.ok,true);
+    assert.equal(options.data.choices,undefined);
+    assert.equal(options.data.sourceChoices.length,1);
+    const choice = options.data.sourceChoices[0];
+    assert.equal(choice.requiresConfirmation,true);
+    assert.equal(choice.requiresDeclaration,false);
+    assert.equal(choice.fingerprint,undefined);
+    assert.equal(app.sent.length,0);
+    const reply = await app.message({type:'media-source-select',sourceChoice:choice.token,pageUrl:page,
+      playerUrl:'',playerKey:request.playerKey,generation:1,workerMediaSource:true,manifestUrl:''},sender);
+    assert.equal(reply.ok,true);
+    assert.equal(app.sent.length,1);
+    assert.equal(app.sent[0].candidates[0].url,url);
+    assert.equal(app.sent[0].authorized,undefined);
+    await observe('https://cdn.test/opaque.mp4?token=secret');
+    assert.equal((await app.message({...request,refresh:true},sender)).code,'no-reusable-source');
+    assert.equal(app.sent.length,1);
+  } finally {app.stopWorker();}
+});
+
 test('copied-buffer path hint admits a unique current source only for explicit verification', async () => {
   const page = 'https://www.facebook.com/';
   const path = 'https://cdn.test/opaque-media';

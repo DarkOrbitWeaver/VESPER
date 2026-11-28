@@ -7,15 +7,30 @@ using Xunit.Abstractions;
 namespace Vesper.MediaResolver.Tests.LiveTests;
 
 /// <summary>
-/// OPT-IN live checks against legally accessible, freely redistributable test media. They do nothing unless the
-/// environment variable VESPER_LIVE_TESTS=1 is set (then they use the real network). A silent early return means
-/// "not run", never "verified". The URLs below were chosen from public documentation and have NOT been exercised yet;
-/// if one has moved, update it and record the result in COMPATIBILITY.md.
+/// Opt-in live checks against public test media. Disabled checks are reported
+/// as skipped, never as passing. An unavailable fixture is a failed live check,
+/// not a successful resolver result.
 /// </summary>
 public class LiveTests
 {
     private readonly ITestOutputHelper _out;
-    private static bool Enabled => Environment.GetEnvironmentVariable("VESPER_LIVE_TESTS") == "1";
+    public sealed class LiveFactAttribute : FactAttribute
+    {
+        public LiveFactAttribute()
+        {
+            if (Environment.GetEnvironmentVariable("VESPER_LIVE_TESTS") != "1")
+                Skip = "Set VESPER_LIVE_TESTS=1 to run public network checks.";
+        }
+    }
+
+    public sealed class LiveTheoryAttribute : TheoryAttribute
+    {
+        public LiveTheoryAttribute()
+        {
+            if (Environment.GetEnvironmentVariable("VESPER_LIVE_TESTS") != "1")
+                Skip = "Set VESPER_LIVE_TESTS=1 to run public network checks.";
+        }
+    }
 
     public LiveTests(ITestOutputHelper output) => _out = output;
 
@@ -28,19 +43,20 @@ public class LiveTests
         return res;
     }
 
-    [Fact]
-    public async Task DirectMp4_BlenderBigBuckBunny()
+    [LiveTheory]
+    [InlineData("https://mdn.github.io/shared-assets/videos/flower.mp4")]
+    [InlineData("https://mdn.github.io/shared-assets/videos/flower.webm")]
+    [InlineData("https://media.w3.org/2010/05/bunny/trailer.mp4")]
+    public async Task DirectPublicMedia(string url)
     {
-        if (!Enabled) return;
-        var res = await ResolveLive("https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4");
+        var res = await ResolveLive(url);
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
-        Assert.True(res.Item!.Representations[0].FileSize > 0);
+        Assert.Contains(res.Item!.Representations, r => r.Protocol == StreamProtocol.Http && r.FileSize > 0);
     }
 
-    [Fact]
+    [LiveFact]
     public async Task InternetArchive_PublicDomainItem()
     {
-        if (!Enabled) return;
         var res = await ResolveLive("https://archive.org/details/Popeye_forPresident");
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
         var item = res.Item!;
@@ -48,20 +64,18 @@ public class LiveTests
         Assert.NotNull(FormatSelector.Select(item, FormatPreferences.BestQuality).Selection);
     }
 
-    [Fact]
+    [LiveFact]
     public async Task Hls_AppleAdvancedExample()
     {
-        if (!Enabled) return;
         var res = await ResolveLive("https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8");
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
         Assert.Contains(res.Item!.Representations, r => r.Protocol == StreamProtocol.Hls && r.Height > 0);
         Assert.NotEmpty(QualityMenuBuilder.BuildDefault(res.Item));
     }
 
-    [Fact]
+    [LiveFact]
     public async Task Dash_AkamaiBigBuckBunny()
     {
-        if (!Enabled) return;
         var res = await ResolveLive("https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd");
         Assert.True(res.IsSuccess, res.Error?.Diagnostic);
         Assert.Contains(res.Item!.Representations, r => r.Protocol == StreamProtocol.Dash);

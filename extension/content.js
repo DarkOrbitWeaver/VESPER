@@ -217,10 +217,10 @@
   }
 
   function matchesWorkerDeclaration(media) {
-    if (!media.workerManifest) return true;
+    if (!media.workerConfirmation) return true;
     inspectPlayerWitnessAttributes(media.player);
     return workerMediaSource(media.player)
-      && VesperPlayerSource.http(media.player.getAttribute('data-vesper-player-manifest'))?.href === media.workerManifest;
+      && (VesperPlayerSource.http(media.player.getAttribute('data-vesper-player-manifest'))?.href || '') === media.workerManifest;
   }
 
   function matchesPickerPlayer(media) {
@@ -2149,8 +2149,10 @@
     const pickerDuration = formats.playerLive ? null : formats.duration ?? duration;
     if (formats.sourceChoices?.length) {
       if (formats.sourceChoices.some(source => source.requiresConfirmation)) {
-        lookup.workerManifest = attachedManifest?.href;
-        if (!lookup.workerManifest || !isCurrentRequest(request)) return;
+        lookup.workerConfirmation = true;
+        lookup.workerManifest = attachedManifest?.href || '';
+        if (formats.sourceChoices.some(source => source.requiresDeclaration) && !lookup.workerManifest
+            || !isCurrentRequest(request)) return;
       }
       const savedSource = keepSource ? chosenSources.get(player) : null;
       if (savedSource?.targetKey === targetKey) {
@@ -2772,7 +2774,7 @@
       (hasMatch && !matchesLength(source) ? alternateList : list).append(option);
     }
     const prompt = formats.sourceChoices.some(source => source.requiresConfirmation)
-      ? 'The player declares this stream. Confirm the source before VESPER checks its formats.'
+      ? 'Playback identity is unconfirmed. Choose a matching source before VESPER checks its formats.'
       : formats.sourceChoices.length === 1 ? 'Choose the source to see formats.'
         : 'Choose the source that matches your player.';
     renderShell(title, poster, seconds, element('div', 'msg', prompt), list,

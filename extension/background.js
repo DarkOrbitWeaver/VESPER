@@ -1164,17 +1164,20 @@ function rememberSourceSelections(sources, context) {
     if (selection.expires <= now) sourceSelections.delete(token);
   while (sourceSelections.size + sources.length > 32)
     sourceSelections.delete(sourceSelections.keys().next().value);
-  return sources.map(source => {
+  return sources.map((source, index) => {
     const token = crypto.randomUUID();
     sourceSelections.set(token, { ...context, url: source.url, kind: source.kind, mime: source.mime,
       seen: source.seen, validator: source.validator, bytes: source.bytes, minimumLength: source.minimumLength,
       rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
       sliceEvidence: source.sliceEvidence, experienceCase: source.experienceCase,
-      workerDeclaration: source.workerDeclaration === true,
+      workerDeclaration: source.workerDeclaration === true, workerObserved: source.workerObserved === true,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
-    if (source.workerDeclaration) return {
-      token, requiresConfirmation: true, label: 'Declared ' + source.kind.toUpperCase() + ' stream',
-      detail: new URL(source.url).hostname + ' · Confirm before checking formats'
+    if (source.workerDeclaration || source.workerObserved) return {
+      token, requiresConfirmation: true, requiresDeclaration: source.workerDeclaration === true,
+      label: source.workerDeclaration ? 'Declared ' + source.kind.toUpperCase() + ' stream'
+        : 'Detected ' + (source.kind === 'direct' ? typeName(source.mime) + ' file' : source.kind.toUpperCase() + ' stream'),
+      detail: new URL(source.url).hostname + (sources.length > 1 ? ' · Source ' + (index + 1) : '')
+        + ' · Unconfirmed player match'
     };
     return source.verified
       ? verifiedSourceLabel({ ...source, token }, source.verified)
@@ -1645,20 +1648,42 @@ async function playerOptions(message, sender) {
     // never as exact playback evidence. Do not contact it before selection.
     function workerChoice() {
       if (prefetch || !binding || source || matchedManifest || possibleSources.length
-          || message.workerMediaSource !== true || message.manifestOnPlayer !== true
+          || message.workerMediaSource !== true
           || !sender.documentId || sender.tab?.incognito || !Number.isInteger(tab)
           || typeof message.playerKey !== 'string' || !message.playerKey || message.playerKey.length > 100
           || !Number.isInteger(message.generation) || message.generation < 1
-          || !playerActiveOrLoaded || changedAt <= 0 || changedAt > now + 1000
-          || manifest?.protocol !== 'https:' || manifest.search
-          || !/\.(?:m3u8|mpd)$/i.test(manifest.pathname) || isPartialMediaUrl(manifest)
-          || state.sources.some(item => currentEvidence(item) && item.url === manifest.href)) return null;
-      const declared = { url: manifest.href, kind: VesperPlayerSource.kind(manifest.href), workerDeclaration: true };
+          || !playerActiveOrLoaded || changedAt <= 0 || changedAt > now + 1000) return null;
+      let choices;
+      if (manifest) {
+        if (message.manifestOnPlayer !== true || manifest.protocol !== 'https:' || manifest.search
+            || !/\.(?:m3u8|mpd)$/i.test(manifest.pathname) || isPartialMediaUrl(manifest)
+            || state.sources.some(item => currentEvidence(item) && item.url === manifest.href)) return null;
+        choices = [{ url: manifest.href, kind: VesperPlayerSource.kind(manifest.href), workerDeclaration: true }];
+      } else {
+        // An uninstrumented worker may nevertheless have document-scoped
+        // responses. Timing alone never proves playback identity. Refuse
+        // anonymous worker traffic, signed URLs, fragments and broad feeds.
+        if (message.multiplePlayers === true || !player.durationSeconds || player.live === true) return null;
+        const plausible = state.sources.filter(item => currentEvidence(item)
+          && item.seen >= changedAt - 2000 && item.seen >= now - 30000);
+        const eligible = plausible.filter(item => {
+          const url = VesperPlayerSource.http(item.url);
+          return url?.protocol === 'https:' && !url.search && !isPartialMediaUrl(url)
+            && !item.conflictingValidator && (['hls', 'dash'].includes(item.kind)
+              || item.kind === 'direct' && isWholeDirectSource(item)
+                && Number.isSafeInteger(item.bytes) && item.bytes >= 1024
+                && (player.kind === 'audio' ? item.mime?.startsWith('audio/') : item.mime?.startsWith('video/')));
+        });
+        // Do not hide competing traffic by filtering it down to a lucky URL.
+        // The whole plausible set must be eligible and small enough to show.
+        if (!eligible.length || eligible.length > 3 || eligible.length !== plausible.length) return null;
+        choices = eligible.map(item => ({ ...item, workerObserved: true }));
+      }
       const context = { identity, tab, frame, documentId: sender.documentId, signed: false,
         generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl || '', title,
         workerPlayerFacts: player };
-      candidateCount = 1;
-      return { ok: true, data: { title, sourceChoices: rememberSourceSelections([declared], context) } };
+      candidateCount = choices.length;
+      return { ok: true, data: { title, sourceChoices: rememberSourceSelections(choices, context) } };
     }
     async function browserFallback(failure) {
       if (!wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network',
@@ -1973,6 +1998,25 @@ async function selectMediaSource(message, sender) {
   const selectedEvidence = selection.sliceEvidence?.map(source => ({...source, sliceWitness:true})) || selection.group || [selection];
   if (!selectedEvidence.every(current))
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
+  if (selection.workerObserved) {
+    if (sender.tab?.incognito || message.workerMediaSource !== true || message.manifestUrl
+        || selection.seen < now - 30000
+        || !state.sources.some(source => source.url === selection.url && current(selection)
+          && source.documentId === selection.documentId && (source.frameId ?? 0) === selection.frame
+          && source.validator === selection.validator && source.bytes === selection.bytes && source.mime === selection.mime && !source.conflictingValidator))
+      return { ok: false, code: 'expired-selection', message: 'The worker source changed. Refresh the formats.' };
+    if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:selection.url,referrer:sender.url}))
+      return { ok: false, code: 'blocked', message: 'VESPER could not confirm that this site permits native acquisition.' };
+    const reply = explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, {}, page.href, selection.title), 20000));
+    const facts = VesperMediaEvidence.mediaFacts(reply);
+    // Unlike a declared manifest, a timing-only candidate needs positive
+    // duration and track agreement in addition to the user's confirmation.
+    if (reply?.ok && reply.data?.choices?.length && (!facts.durationSeconds || facts.live === true
+        || (selection.workerPlayerFacts.kind === 'audio' ? facts.hasAudio !== true : facts.hasVideo !== true)
+        || !VesperMediaEvidence.matchesPlayback(selection.workerPlayerFacts, facts)))
+      return { ok: false, code: 'source-changed', message: 'The detected stream could not be matched to this playback.' };
+    return reply;
+  }
   const auth = await mediaAuthorization(page.href, sender, { userGesture: true,
     candidateUrls: (selection.group || [selection]).map(source => source.url) });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.

@@ -31,7 +31,8 @@ async function until(fn, limit = 10000) {
   throw Error('Fixture deadline');
 }
 
-const sessions = new Map(), calls = [], rows = [], requests = [];
+const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [];
+const publicMedia = process.env.VESPER_QA_PUBLIC_MEDIA === '1';
 let proc, socket, server, seq = 0, active, chromeDownloads = 0;
 const pending = new Map();
 function openHost(key) {
@@ -80,6 +81,7 @@ async function evaluate(sessionId, expression) {
   return response.result?.value;
 }
 const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer']);
+if (publicMedia) for (const type of ['media-options','media-source-options','media-select','browser-diagnostics']) allowed.add(type);
 try {
   await mkdir(chromeFolder,{recursive:true});
   await cp(join(root,'extension'),ext,{recursive:true});
@@ -149,7 +151,7 @@ try {
   const target=(await send('Target.createTarget',{url:'about:blank'})).targetId;
   const page=(await send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
   await send('Page.enable',{},page);
-  for(let trial=0;trial<12;trial++){
+  for(let trial=0;trial<(publicMedia?0:12);trial++){
     const mode=trial%2?'warm':'cold', delayMs=trial<6?0:80, name='fixture-'+trial+'.bin';
     active={trial,delayMs};
     await send('Page.navigate',{url:base+'/fixture?name='+name},page);
@@ -182,9 +184,49 @@ try {
     const http=requests.filter(r=>r.name===name);
     rows.push({trial,mode,delayMs,jobId:stage.jobId,clickEpochMs,timing,handshakeMs:handshake?.ms??0,requests:http.length});
   }
+  if(publicMedia){
+    // These exact public sample URLs are independently referenced by the
+    // C# test. Do not infer the expected source from VESPER's own result.
+    const addresses=['https://mdn.github.io/shared-assets/videos/flower.mp4',
+      'https://mdn.github.io/shared-assets/videos/flower.webm'];
+    async function button(className){
+      return until(async()=>{
+        const {root:dom}=await send('DOM.getDocument',{depth:-1,pierce:true},page);
+        const nodes=[dom];
+        for(const node of nodes){
+          nodes.push(...(node.children||[]),...(node.shadowRoots||[]));
+          const i=node.attributes?.indexOf('class')??-1;
+          if(node.nodeName==='BUTTON'&&i>=0&&node.attributes[i+1].split(' ').includes(className)){
+            try{
+              const {model}=await send('DOM.getBoxModel',{nodeId:node.nodeId},page);
+              const x=(model.border[0]+model.border[4])/2,y=(model.border[1]+model.border[5])/2;
+              if(x>0&&y>0)return {x,y};
+            }catch{}
+          }
+        }
+      },20000);
+    }
+    async function click(className){
+      const rect=await button(className);
+      await send('Input.dispatchMouseEvent',{type:'mouseMoved',...rect},page);
+      await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...rect},page);
+      await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...rect},page);
+    }
+    for(const [trial,address] of addresses.entries()){
+      active={trial,delayMs:0};
+      const nav=await send('Page.navigate',{url:address},page);
+      assert(!nav.errorText,nav.errorText);
+      const playback=await until(()=>evaluate(page,'(()=>{const v=document.querySelector("video");return v?.readyState>=1&&v.currentSrc==='+JSON.stringify(address)+'?{src:v.currentSrc,duration:v.duration,width:v.videoWidth,height:v.videoHeight}:null})()'),15000);
+      assert(playback.width>0&&playback.height>0&&playback.duration>0);
+      await click('fly');
+      await click('primary');
+      const submitted=await until(()=>calls.find(c=>c.trial===trial&&c.type==='media-select'&&c.ok&&c.jobId),20000);
+      mediaRows.push({trial,address,jobId:submitted.jobId,playback});
+    }
+  }
   assert.equal(chromeDownloads,0);
   assert.deepEqual(await readdir(chromeFolder),[]);
-  await writeFile(result,JSON.stringify({rows,chromeDownloads}));
+  await writeFile(result,JSON.stringify({rows,mediaRows,chromeDownloads}));
 } finally {
   if(socket){try{await send('Browser.close')}catch{}socket.close()}
   if(proc&&proc.exitCode===null){try{execFileSync('taskkill',['/PID',String(proc.pid),'/T','/F'],{stdio:'ignore'})}catch{}}

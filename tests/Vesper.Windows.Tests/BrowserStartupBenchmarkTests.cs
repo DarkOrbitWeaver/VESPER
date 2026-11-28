@@ -74,7 +74,8 @@ public sealed class BrowserStartupBenchmarkTests
                 Assert.True(process.ExitCode == 0, (await stdout) + "\n" + (await stderr));
                 using var result = JsonDocument.Parse(await File.ReadAllTextAsync(start.Environment["VESPER_QA_RESULT"]!, ct));
                 var rows = result.RootElement.GetProperty("rows").EnumerateArray().ToArray();
-                Assert.Equal(12, rows.Length);
+                bool publicMedia = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_MEDIA") == "1";
+                Assert.Equal(publicMedia ? 0 : 12, rows.Length);
                 byte[] expected = new byte[256 * 1024];
                 for (int i = 0; i < expected.Length; i++) expected[i] = (byte)(i * 31 + (i >> 8));
                 var ids = new HashSet<Guid>();
@@ -100,8 +101,59 @@ public sealed class BrowserStartupBenchmarkTests
                         bytes = expected.Length, verified = true
                     }));
                 }
-                Assert.Equal(rows.Length, engine.Snapshots().Count);
-                Assert.Equal(rows.Length, Directory.GetFiles(downloads).Length);
+                var mediaRows = result.RootElement.GetProperty("mediaRows").EnumerateArray().ToArray();
+                Assert.Equal(publicMedia ? 2 : 0, mediaRows.Length);
+                if (publicMedia)
+                {
+                    string[] addresses = ["https://mdn.github.io/shared-assets/videos/flower.mp4",
+                        "https://mdn.github.io/shared-assets/videos/flower.webm"];
+                    using var client = new HttpClient(new SocketsHttpHandler
+                    {
+                        UseCookies = false, UseProxy = false, AllowAutoRedirect = false,
+                        ConnectTimeout = TimeSpan.FromSeconds(8)
+                    }) { Timeout = TimeSpan.FromSeconds(15) };
+                    for (int i = 0; i < mediaRows.Length; i++)
+                    {
+                        var row = mediaRows[i];
+                        Assert.Equal(addresses[i], row.GetProperty("address").GetString());
+                        Assert.Equal(addresses[i], row.GetProperty("playback").GetProperty("src").GetString());
+                        Guid id = row.GetProperty("jobId").GetGuid();
+                        Assert.True(ids.Add(id));
+                        JobSnapshot? snapshot;
+                        while (true)
+                        {
+                            snapshot = engine.Snapshot(id);
+                            Assert.NotNull(snapshot);
+                            if (snapshot.State is JobState.Completed or JobState.Failed or JobState.NeedsAttention or JobState.NeedsLink) break;
+                            await Task.Delay(25, ct);
+                        }
+                        Assert.True(snapshot.State == JobState.Completed, $"{snapshot.State}: {snapshot.Reason} {snapshot.Message}");
+                        using var reference = await client.GetAsync(addresses[i], HttpCompletionOption.ResponseHeadersRead, ct);
+                        reference.EnsureSuccessStatusCode();
+                        const int limit = 4 * 1024 * 1024;
+                        Assert.InRange(reference.Content.Headers.ContentLength ?? 0, 1, limit);
+                        using var bytes = new MemoryStream();
+                        await using (var stream = await reference.Content.ReadAsStreamAsync(ct))
+                        {
+                            byte[] block = new byte[65536];
+                            int n;
+                            while ((n = await stream.ReadAsync(block, ct)) > 0)
+                            {
+                                Assert.True(bytes.Length + n <= limit);
+                                bytes.Write(block, 0, n);
+                            }
+                        }
+                        Assert.Equal(bytes.ToArray(), await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
+                        Console.WriteLine("PUBLIC_BROWSER_MEDIA " + JsonSerializer.Serialize(new
+                        {
+                            address = addresses[i], bytes = bytes.Length,
+                            sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes.ToArray())),
+                            playback = row.GetProperty("playback"), verified = true
+                        }));
+                    }
+                }
+                Assert.Equal(rows.Length + mediaRows.Length, engine.Snapshots().Count);
+                Assert.Equal(rows.Length + mediaRows.Length, Directory.GetFiles(downloads).Length);
                 Assert.Equal(0, result.RootElement.GetProperty("chromeDownloads").GetInt32());
             }
             finally { bridge.CloseResolver(); }
