@@ -3229,8 +3229,32 @@ test('a contradictory current HTTP representation invalidates the picker and exi
     await report('"v2"',seen+1);
     assert.equal((await app.message({type:'media-select',...scope,mediaSession:token,formatChoice:0,mode:'download'},sender)).ok,false);
     assert.equal(app.sent.filter(r=>r.type==='media-select').length,0);
+    assert.equal((await app.message({type:'media-options',...scope},sender)).code,'source-changed');
     assert.equal((await app.message({type:'media-options',...scope,refresh:true},sender)).code,'source-changed');
   } finally {app.stopWorker();}
+});
+
+test('normal range progression preserves a verified picker but changed or missing identity does not',async()=>{
+  const page='https://video.example/watch',url='https://cdn.example/movie.mp4',token='c'.repeat(32);
+  const sender={url:page,tab:{id:87},frameId:0,documentId:'progressing-file'};
+  for(const [nextTag,nextTotal,allowed] of [['"v1"',700000,true],['"v2"',700000,false],['"v1"',800000,false],[null,700000,false]]){
+    const reply={ok:true,data:{mediaSession:token,choices:[{index:0}]}};
+    const app=load({'media-options':reply,'media-range-options':reply,'media-source-options':reply,'media-select':{ok:true}});
+    const seen=Date.now();
+    const base={url,tabId:87,frameId:0,documentId:sender.documentId,method:'GET',statusCode:206,type:'media'};
+    const report=(tag,total,start,stamp)=>app.onMedia({...base,timeStamp:stamp,responseHeaders:responseHeaders({
+      'Content-Type':'video/mp4','Content-Length':'1000','Content-Range':'bytes '+start+'-'+(start+999)+'/'+total,
+      ...(tag?{ETag:tag}:{})})});
+    const scope={pageUrl:page,playerPageUrl:page,playerUrl:url,playerKey:'player-1',generation:1,mediaChangedAt:seen};
+    try{
+      await report('"v1"',700000,0,seen);
+      assert.equal((await app.message({type:'media-options',...scope},sender)).ok,true);
+      await report(nextTag,nextTotal,1000,seen+1);
+      const result=await app.message({type:'media-select',...scope,mediaSession:token,formatChoice:0,mode:'download'},sender);
+      assert.equal(result.ok,allowed);
+      assert.equal(app.sent.filter(r=>r.type==='media-select').length,allowed?1:0);
+    }finally{app.stopWorker()}
+  }
 });
 
 test('preloaded blob media is admitted only by a recent exact witness in the same document', async () => {
@@ -3376,6 +3400,30 @@ test('public GitHub archives use the correct codeload URL even without size or a
     assert.deepEqual(app.cookieLookups, []);
     assert.deepEqual(app.downloadHistory, []);
   } finally { app.stopWorker(); }
+});
+
+test('direct codeload archives accept weak ETags without length, but not unrelated endpoints', async () => {
+  const url='https://codeload.github.com/owner/project/zip/refs/heads/main';
+  const sender={...earlySender,url:'https://github.com/owner/project'};
+  for(const [address,final,expected] of [[url,url,true],[url,url+'/wrong',false],
+    ['https://codeload.github.com/zip/file', 'https://codeload.github.com/zip/file', false],
+    ['https://example.com/owner/project/zip/refs/heads/main','https://example.com/owner/project/zip/refs/heads/main',false]]){
+    const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{
+      prefs:{useSignIn:true},signInPermission:true,earlyFetch:async()=>({status:200,url:final,headers:new Headers({
+        'Content-Type':'application/zip','Content-Disposition':'attachment; filename="project-main.zip"',ETag:'W/"commit"'
+      })})
+    });
+    try{
+      const reply=await app.message({type:'early-download',url:address},sender);
+      assert.equal(reply.ok===true,expected);
+      assert.equal(app.sent.length,expected?2:0);
+      if(expected){
+        assert.equal(app.sent[0].browserProof.basis,'github-archive');
+        assert.equal(app.sent[0].items[0].url,url);
+        assert.deepEqual(app.cookieLookups,[]);
+      }
+    }finally{app.stopWorker()}
+  }
 });
 
 test('a failed pre-click probe explains the resulting Chrome miss without reopening it', async () => {

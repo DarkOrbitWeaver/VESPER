@@ -2,7 +2,7 @@
 (() => {
   'use strict';
   const file = /\.(?:zip|7z|rar|tar|gz|xz|bz2|zst|tgz|msi|exe|msix|msixbundle|appx|apk|appimage|pkg|iso|dmg|deb|rpm|bin|whl|patch|diff)$/i;
-  const archivePath = /(?:^|\/)(?:zip|tarball|archive)(?:\/|$)/i;
+  const archivePath = /(?:^|\/)(?:zip|tar\.gz|tarball|archive)(?:\/|$)/i;
   const downloadPath = /(?:^|\/)(?:download|downloads|attachment|attachments|export)(?:\/|$)/i;
   const downloadLabel = /^(?:download(?:\s+(?:file|archive|attachment|document|report|video|audio|pdf|zip))?|télécharger(?:\s+le\s+fichier)?|descargar(?:\s+archivo)?|تنزيل(?:\s+الملف)?|تحميل(?:\s+الملف)?)$/iu;
   const queryKeys = new Set(['id','file','filename','name','format','download','version','arch','platform','lang',

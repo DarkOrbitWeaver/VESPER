@@ -261,7 +261,12 @@ void capturePreferencesReady.then(recoverChromeDownloads).catch(() => {});
 // response proof, then commit ownership. Never replay an uncertain acceptance.
 function githubArchiveTarget(address) {
   const url = new URL(address);
-  if (url.origin !== 'https://github.com' || url.search) return null;
+  if (url.search || url.hash || url.username || url.password) return null;
+  // A direct codeload link has the same public archive contract as the
+  // redirected GitHub link, including weak ETags and unknown lengths.
+  if (url.origin === 'https://codeload.github.com')
+    return /^\/[\w.-]+\/[\w.-]+\/(?:zip|tar\.gz)\/.+$/.test(url.pathname) ? url : null;
+  if (url.origin !== 'https://github.com') return null;
   const match = /^\/([\w.-]+\/[\w.-]+)\/archive\/(.+)\.(zip|tar\.gz)$/.exec(url.pathname);
   if (!match) return null;
   const [, repo, ref, format] = match;

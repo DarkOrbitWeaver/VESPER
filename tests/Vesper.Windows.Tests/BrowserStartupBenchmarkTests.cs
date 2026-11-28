@@ -100,8 +100,9 @@ public sealed class BrowserStartupBenchmarkTests
                 var rows = result.RootElement.GetProperty("rows").EnumerateArray().ToArray();
                 bool publicMedia = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_MEDIA") == "1";
                 bool retainedMedia = Environment.GetEnvironmentVariable("VESPER_QA_RETAINED_MEDIA") == "1";
-                Assert.False(publicMedia && retainedMedia);
-                Assert.Equal(publicMedia || retainedMedia ? 0 : 12, rows.Length);
+                bool publicArchive = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_ARCHIVE") == "1";
+                Assert.True(new[] { publicMedia, retainedMedia, publicArchive }.Count(v => v) <= 1);
+                Assert.Equal(publicMedia || retainedMedia || publicArchive ? 0 : 12, rows.Length);
                 byte[] expected = new byte[256 * 1024];
                 for (int i = 0; i < expected.Length; i++) expected[i] = (byte)(i * 31 + (i >> 8));
                 var ids = new HashSet<Guid>();
@@ -283,8 +284,58 @@ public sealed class BrowserStartupBenchmarkTests
                     Console.WriteLine("RETAINED_BROWSER_MEDIA " + JsonSerializer.Serialize(new { samples,
                         inputBytes = input.Length, outputBytes = output.Length, tracks = actual.Length, verified = true }));
                 }
-                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length, engine.Snapshots().Count);
-                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length, Directory.GetFiles(downloads).Length);
+                var archiveRows = result.RootElement.GetProperty("archiveRows").EnumerateArray().ToArray();
+                Assert.Equal(publicArchive ? 2 : 0, archiveRows.Length);
+                if (publicArchive)
+                {
+                    string[] expectedAddresses = [
+                        "https://github.com/octocat/Hello-World/archive/refs/heads/master.zip",
+                        "https://codeload.github.com/octocat/Hello-World/zip/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"];
+                    using var referenceClient = new HttpClient(new SocketsHttpHandler
+                    {
+                        AllowAutoRedirect = false, UseCookies = false, UseProxy = false,
+                        ConnectTimeout = TimeSpan.FromSeconds(8)
+                    }) { Timeout = TimeSpan.FromSeconds(20) };
+                    referenceClient.DefaultRequestHeaders.UserAgent.ParseAdd("VESPER-QA/1.0");
+                    for (int i = 0; i < archiveRows.Length; i++)
+                    {
+                        var row = archiveRows[i];
+                        Assert.Equal(expectedAddresses[i], row.GetProperty("address").GetString());
+                        Guid id = row.GetProperty("jobId").GetGuid();
+                        Assert.True(ids.Add(id));
+                        var saved = engine.Snapshot(id);
+                        Assert.NotNull(saved);
+                        Assert.Equal(JobState.Completed, saved.State);
+                        string target = i == 0 ? "https://codeload.github.com/octocat/Hello-World/zip/refs/heads/master" : expectedAddresses[i];
+                        using var response = await referenceClient.GetAsync(target, HttpCompletionOption.ResponseHeadersRead, ct);
+                        response.EnsureSuccessStatusCode();
+                        Assert.Equal("application/zip", response.Content.Headers.ContentType?.MediaType);
+                        using var bytes = new MemoryStream();
+                        await using (var stream = await response.Content.ReadAsStreamAsync(ct))
+                        {
+                            byte[] block = new byte[16384];
+                            int n;
+                            while ((n = await stream.ReadAsync(block, ct)) > 0)
+                            {
+                                Assert.True(bytes.Length + n <= 2 * 1024 * 1024);
+                                bytes.Write(block, 0, n);
+                            }
+                        }
+                        byte[] expectedArchive = bytes.ToArray();
+                        Assert.Equal(expectedArchive, await File.ReadAllBytesAsync(saved.FinalPath!, ct));
+                        bytes.Position = 0;
+                        using var archive = new System.IO.Compression.ZipArchive(bytes, System.IO.Compression.ZipArchiveMode.Read);
+                        Assert.Contains(archive.Entries, e => e.Name == "README");
+                        Console.WriteLine("PUBLIC_ARCHIVE " + JsonSerializer.Serialize(new
+                        {
+                            route = i == 0 ? "github-redirect" : "direct-codeload",
+                            address = expectedAddresses[i], bytes = expectedArchive.Length,
+                            sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(expectedArchive)), verified = true
+                        }));
+                    }
+                }
+                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length + archiveRows.Length, engine.Snapshots().Count);
+                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length + archiveRows.Length, Directory.GetFiles(downloads).Length);
                 Assert.Equal(0, result.RootElement.GetProperty("chromeDownloads").GetInt32());
             }
             finally { bridge.CloseResolver(); }

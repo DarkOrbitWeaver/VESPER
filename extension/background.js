@@ -435,6 +435,18 @@ async function evidenceDigest(value) {
 
 // Persist only digests of the admitted resource set, not signed URLs.
 function evidenceSignature(item) {
+  const url = VesperPlayerSource.http(item.url);
+  // A range is a location within a representation, not its identity.
+  // Only a strong validator and known full extent justify ignoring its bounds.
+  if (item.kind === 'direct' && url && !isPartialMediaUrl(url)
+      && !item.querySlice && !item.unexpectedRange && !item.conflictingValidator
+      && typeof item.validator === 'string' && /^"[^"\x00-\x20\x7f]{1,254}"$/.test(item.validator)
+      && Number.isSafeInteger(item.bytes) && item.bytes > 0 && item.bytes <= MAX_MEDIA_RANGE_LENGTH
+      && (item.wholeRepresentation === true || item.rangeResource === true
+        && Number.isSafeInteger(item.rangeStart) && Number.isSafeInteger(item.rangeEnd)
+        && item.rangeStart >= 0 && item.rangeEnd >= item.rangeStart && item.rangeEnd < item.bytes)) {
+    return JSON.stringify(['strong-representation', item.url, item.kind, item.validator, item.bytes, item.mime]);
+  }
   return JSON.stringify([item.url, item.kind, item.validator, item.bytes, item.mime,
     item.rangeResource === true, item.querySlice === true, item.rangeStart, item.rangeEnd,
     item.minimumLength, item.wholeRepresentation === true, item.unexpectedRange === true]);
@@ -1644,7 +1656,11 @@ async function playerOptions(message, sender) {
     && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
   if (message.refresh === true && message.prefetch !== true) mediaPrefetchCache.delete(lookupKey);
   const cached = !auth.authorized && cachedMediaOptions(lookupKey);
-  if (cached) return forCurrentPlayer(cached);
+  if (cached) {
+    const guard = formatReplyEvidence.get(cached);
+    if (!guard || await matchesFormatEvidence(guard, message, sender)) return forCurrentPlayer(cached);
+    mediaPrefetchCache.delete(lookupKey);
+  }
   // Page lookups and exact-source checks can share work. The picker must still
   // run its own selection path because prefetch can return only a status.
   const pendingKey = [lookupKey, prefetch ? 'prefetch' : 'picker', auth.authorized ? 'signed' : ''].join('|');

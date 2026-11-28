@@ -36,7 +36,11 @@ const publicMedia = process.env.VESPER_QA_PUBLIC_MEDIA === '1';
 const retainedMedia = process.env.VESPER_QA_RETAINED_MEDIA === '1';
 const publicCampaign = publicMedia && !!process.env.VESPER_QA_PUBLIC_CASES;
 const downloadVariants = process.env.VESPER_QA_DOWNLOAD_VARIANTS === '1';
-assert(!(publicMedia && retainedMedia));
+const publicArchive = process.env.VESPER_QA_PUBLIC_ARCHIVE === '1';
+assert([publicMedia,retainedMedia,publicArchive].filter(Boolean).length<=1);
+const archiveAddresses = ['https://github.com/octocat/Hello-World/archive/refs/heads/master.zip',
+  'https://codeload.github.com/octocat/Hello-World/zip/7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'];
+const archiveRows=[];
 const retainedBytes = retainedMedia ? await readFile(join(root,'tests/Vesper.Tests/Fixtures/Media/instinct-mse.mp4')) : null;
 let proc, socket, server, seq = 0, active, chromeDownloads = 0;
 const pending = new Map();
@@ -123,6 +127,12 @@ try {
           })().catch(e=>retained.error=String(e));
         </script>`);
       }
+      if (publicArchive && url.pathname === '/archive-fixture') {
+        const address=archiveAddresses[Number(url.searchParams.get('case'))];
+        if(!address){res.writeHead(404);return res.end();}
+        res.writeHead(200,{'Content-Type':'text/html','Cache-Control':'no-store'});
+        return res.end('<a id="download" href="'+address+'">Download ZIP</a>');
+      }
       if (url.pathname === '/fixture' && /^fixture-\d+\.bin$/.test(name || '')) {
         res.writeHead(200,{'Content-Type':'text/html'});
         if(active?.scenario==='labelled')
@@ -206,7 +216,7 @@ try {
   const page=(await send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
   await send('Page.enable',{},page);
   await send('Runtime.enable',{},page);
-  for(let trial=0;trial<(publicMedia||retainedMedia?0:12);trial++){
+  for(let trial=0;trial<(publicMedia||retainedMedia||publicArchive?0:12);trial++){
     const mode=trial%2?'warm':'cold', delayMs=trial<6?0:80, name='fixture-'+trial+'.bin';
     const scenario=downloadVariants?['direct','labelled','delayed'][trial%3]:'direct';
     active={trial,delayMs,scenario};
@@ -239,6 +249,23 @@ try {
     assert.equal(!!handshake,mode==='cold','cold/warm classification must be observed, not assumed');
     const http=requests.filter(r=>r.name===name);
     rows.push({trial,mode,delayMs,scenario,jobId:stage.jobId,clickEpochMs,timing,handshakeMs:handshake?.ms??0,requests:http.length});
+  }
+  if(publicArchive){
+    for(const [trial,address] of archiveAddresses.entries()){
+      active={trial,delayMs:0};
+      const prior=(await readdir(downloads)).length;
+      await send('Page.navigate',{url:base+'/archive-fixture?case='+trial},page);
+      await until(()=>evaluate(page,'!!document.querySelector("#download")'));
+      await delay(350);
+      const rect=await evaluate(page,'(()=>{const r=document.querySelector("#download").getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()');
+      await send('Input.dispatchMouseEvent',{type:'mouseMoved',...rect},page);
+      await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...rect},page);
+      await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...rect},page);
+      const staged=await until(()=>calls.find(c=>c.trial===trial&&c.type==='browser-capture'&&c.ok&&c.jobId),20000);
+      await until(()=>calls.some(c=>c.trial===trial&&c.type==='browser-transfer'&&c.operation==='accept'&&c.ok),20000);
+      await until(async()=> (await readdir(downloads)).length>prior,20000);
+      archiveRows.push({trial,address,jobId:staged.jobId});
+    }
   }
   if(publicMedia||retainedMedia){
     // These exact public sample URLs are independently referenced by the
@@ -360,7 +387,7 @@ try {
     assert.equal(chromeDownloads,0);
     assert.deepEqual(await readdir(chromeFolder),[]);
   }
-  await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,chromeDownloads}));
+  await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,archiveRows,chromeDownloads}));
 } catch(error) {
   throw Error(error.message+' '+JSON.stringify({relayEvents:relayEvents.slice(-30),browserErrors,chromeDownloads,calls:calls.slice(-30).map(({key,...row})=>row)}),{cause:error});
 } finally {
