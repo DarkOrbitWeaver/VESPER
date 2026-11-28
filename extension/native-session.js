@@ -16,6 +16,7 @@ globalThis.VesperNativeSession = (() => {
   const MISSING = /not found|forbidden|access to the specified native messaging host/i;
   let port = null;
   let opening = null;
+  let cancelOpening = null;
   let multiplexed = null;          // null: unknown, true: host supports sessions, false: use one-shot messages
   let idleTimer = 0;
   let active = 0;
@@ -49,8 +50,11 @@ globalThis.VesperNativeSession = (() => {
     clearTimeout(idleTimer);
     idleTimer = 0;
     const current = port;
+    const cancel = cancelOpening;
     port = null;
     opening = null;
+    cancelOpening = null;
+    cancel?.();
     if (current) {
       failInFlight({ ok: false, code: 'host-error', message: 'The VESPER connection closed.' });
       try { current.disconnect(); } catch { /* Already closed. */ }
@@ -74,13 +78,14 @@ globalThis.VesperNativeSession = (() => {
   // An older host answers "Unknown request type" and exits, which selects one-shot messages.
   function open(host) {
     if (opening) return opening;
-    opening = new Promise(resolve => {
+    const attempt = new Promise(resolve => {
       let decided = false;
       let connection;
       const decide = value => {
         if (decided) return;
         decided = true;
         clearTimeout(timer);
+        if (cancelOpening === cancel) cancelOpening = null;
         resolve(value);
       };
       const unsupported = () => {
@@ -88,7 +93,12 @@ globalThis.VesperNativeSession = (() => {
         decide({ ok: false, code: 'unsupported' });
         try { connection?.disconnect(); } catch { /* Already closed. */ }
       };
+      const cancel = () => {
+        decide({ ok: false, code: 'host-error', message: 'The VESPER connection closed.' });
+        try { connection?.disconnect(); } catch { /* Already closed. */ }
+      };
       const timer = setTimeout(unsupported, HANDSHAKE_MS);
+      cancelOpening = cancel;
       try { connection = chrome.runtime.connectNative(host); }
       catch (error) {
         multiplexed = false;
@@ -127,10 +137,11 @@ globalThis.VesperNativeSession = (() => {
       try { connection.postMessage({ v: 2, id: handshakeId, type: 'session-open' }); }
       catch { unsupported(); }
     }).then(result => {
-      if (!result.ok) opening = null;
+      if (!result.ok && opening === attempt) opening = null;
       return result;
     });
-    return opening;
+    opening = attempt;
+    return attempt;
   }
 
   function sendOverPort(job, remainingMs) {
@@ -216,6 +227,14 @@ globalThis.VesperNativeSession = (() => {
     });
   }
 
-  return Object.freeze({ request, close: closePort,
+  // Only a local protocol handshake. A verified user-initiated capture may
+  // overlap this with its browser response probe; no URL, credentials or
+  // desktop request is sent, and a declined capture leaves an idle port.
+  function prepare(host) {
+    if (port || opening || multiplexed === false || typeof chrome.runtime.connectNative !== 'function') return;
+    void open(host).catch(() => {});
+  }
+
+  return Object.freeze({ request, prepare, close: closePort,
     snapshot: () => ({ connected: !!port, multiplexed, active, waiting: waiting.length }) });
 })();

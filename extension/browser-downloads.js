@@ -322,6 +322,9 @@ async function earlyDirectDownload(message, sender) {
       if (credMode === 'include' && await captureSiteDecision({ url, referrer: page.href }, true) !== 'allowed')
         return fallback('site-policy');
       if (!captureAllowed(generation)) return chromeFallback;
+      // Start only the local native-session handshake during the existing
+      // response probe. No stage/accept message may precede verified evidence.
+      VesperNativeSession.prepare?.(HOST);
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3500);
       let response, signedItems = null;

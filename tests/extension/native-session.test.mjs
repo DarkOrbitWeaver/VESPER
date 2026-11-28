@@ -98,6 +98,59 @@ test('format discovery reserves slots for urgent transfer ownership and user act
   } finally {b.stop();}
 });
 
+test('preparation overlaps a later request without sending a desktop command', async () => {
+  const b=setup({holdHandshake:true});
+  try {
+    b.session.prepare('host');
+    b.session.prepare('host');
+    assert.equal(b.connections,1);
+    assert.equal(b.requests.length,0);
+    const request=b.session.request('host',message('verified'),1000);
+    assert.equal(b.requests.length,0);
+    b.ports[0].handshake();
+    await b.tick();
+    assert.equal(b.connections,1);
+    assert.deepEqual(b.requests.map(x=>x.message.id),['verified']);
+    b.ports[0].reply({id:'verified',ok:true});
+    assert.equal((await request).ok,true);
+    assert.equal(b.oneShots,0);
+  } finally {b.stop();}
+});
+
+test('closing a prepared handshake cannot resurrect an obsolete port or clear a replacement', async () => {
+  const b=setup({holdHandshake:true});
+  try {
+    b.session.prepare('host');
+    b.session.close();
+    assert.equal(b.ports[0].disconnected,true);
+    b.session.prepare('host');
+    const request=b.session.request('host',message('current'),1000);
+    b.ports[0].handshake();
+    await b.tick();
+    assert.equal(b.session.snapshot().connected,false);
+    assert.equal(b.requests.length,0);
+    b.ports[1].handshake();
+    await b.tick();
+    assert.equal(b.connections,2);
+    assert.equal(b.requests.length,1);
+    assert.equal(b.requests[0].port,b.ports[1]);
+    b.ports[1].reply({id:'current',ok:true});
+    assert.equal((await request).ok,true);
+  } finally {b.stop();}
+});
+
+test('prepared legacy handshake retains one-shot compatibility', async () => {
+  const b=setup({legacy:true});
+  try {
+    b.session.prepare('host');
+    await b.tick();
+    b.session.prepare('host');
+    assert.equal((await b.session.request('host',message('legacy'),1000)).ok,true);
+    assert.equal(b.connections,1);
+    assert.equal(b.oneShots,1);
+  } finally {b.stop();}
+});
+
 test('cold handshake respects individual deadlines without replaying timed-out work', async () => {
   const b=setup({holdHandshake:true});
   try {
