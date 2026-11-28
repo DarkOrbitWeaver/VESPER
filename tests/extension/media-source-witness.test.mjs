@@ -100,6 +100,30 @@ test('a media response fetched before MediaSource creation retains exact object 
   assert.deepEqual(b.request(neighbour.el), []);
 });
 
+test('object-backed MSE emits provenance for its own active buffers only', async () => {
+  const b = setup();
+  const source = new b.MediaSource(), neighbour = new b.MediaSource();
+  const a = new b.Player(''), other = new b.Player('');
+  a.srcObject = source;
+  other.srcObject = neighbour;
+  const buffer = source.addSourceBuffer('video/mp4');
+  neighbour.addSourceBuffer('video/mp4');
+  const bytes = new ArrayBuffer(16);
+  await new b.FetchResponse('https://cdn.test/clip.mp4?session=private', 'video/mp4', bytes).arrayBuffer();
+  buffer.appendBuffer(bytes);
+  assert.equal(b.provenance(a).kind, 'mse');
+  assert.deepEqual(b.request(a), [{path:'https://cdn.test/clip.mp4',seen:100000}]);
+  assert.deepEqual(b.request(other), []);
+  a.mediaKeys = {};
+  assert.deepEqual(b.request(a), []);
+  a.mediaKeys = null;
+  const stale = b.player();
+  a.currentSrc = stale.el.currentSrc;
+  a.srcObject = {};
+  assert.deepEqual(b.request(a), []);
+  assert.deepEqual(b.provenance(a).tracks, []);
+});
+
 test('direct media Blob URL retains only its own response provenance', async () => {
   const b = setup(), blob = new Blob(['media'], {type:'video/mp4'});
   const response = new b.FetchResponse('https://cdn.test/clip.mp4?session=private', 'video/mp4', blob);

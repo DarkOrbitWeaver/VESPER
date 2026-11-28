@@ -229,7 +229,7 @@ function makeContentHarness({ href = 'https://www.tiktok.com/', videos = [] } = 
   vm.runInContext(src('vesper-inference'), context);
   vm.runInContext(src('browser-preferences'), context);
   vm.runInContext(src('browser-body'), context);
-  vm.runInContext(src('content'), context);
+  vm.runInContext(src('content').replace(/\}\)\(\);\s*$/, 'globalThis.testWitness = playerFragmentWitness; globalThis.testButtonDisabled = () => !!button?.disabled; })();'), context);
 
   const flushRaf = () => {
     for (let i = 0; i < 10 && rafQueue.length; i++) {
@@ -375,6 +375,55 @@ test('scroll recovers a recycled feed player without a new intersection or playb
   assert.equal(h.fetchCalls.length, 0);
 });
 
+test('scroll discovers a playing card away from the middle row even with a paused incumbent', async () => {
+  const h = makeContentHarness();
+  const first = new h.Video({ src: 'blob:https://www.tiktok.com/first', readyState: 4, paused: true });
+  first._rect = { left: 150, top: 20, right: 550, bottom: 280, width: 400, height: 260 };
+  const next = new h.Video({ src: 'blob:https://www.tiktok.com/next', readyState: 4, paused: false, _visible: false });
+  next._rect = { left: 650, top: 480, right: 1050, bottom: 790, width: 400, height: 310 };
+  h.doc.body.append(first, next);
+  h.triggerIntersection([{ target: first, isIntersecting: true }]);
+  await h.tick();
+  h.flushRaf();
+  const old = h.perch;
+  assert.ok(h.flyVisible);
+  assert.ok(old.x < 550);
+  next._visible = true;
+  h.doc.elementsFromPoint = (x, y) => x >= 650 && x <= 1050 && y >= 480 ? [next] : [];
+  h.window.dispatch('scroll');
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+  assert.notEqual(h.perch.x, old.x);
+  assert.equal(h.sentMessages.filter(m => m.type === 'media-options').length, 0);
+  assert.equal(h.fetchCalls.length, 0);
+});
+
+test('the final scroll event gets one delayed recovery when the next card settles late', async () => {
+  const h = makeContentHarness();
+  const first = new h.Video({ src: 'blob:https://www.tiktok.com/first', readyState: 4, paused: false });
+  const next = new h.Video({ src: 'blob:https://www.tiktok.com/next', readyState: 4, paused: false, _visible: false });
+  next._rect = { left: 650, top: 40, right: 1050, bottom: 740, width: 400, height: 700 };
+  h.doc.body.append(first, next);
+  h.triggerIntersection([{ target: first, isIntersecting: true }]);
+  await h.tick();
+  h.flushRaf();
+  const old = h.perch;
+  first._visible = false;
+  h.window.dispatch('scroll');
+  h.flushRaf();
+  assert.ok(h.flyVisible, 'presentation survives the transition');
+  assert.equal(h.context.testButtonDisabled(), true, 'old media cannot be acquired during transition');
+  next._visible = true;
+  h.doc.elementsFromPoint = () => [next];
+  await h.tick(180);
+  h.flushRaf();
+  assert.ok(h.flyVisible);
+  assert.equal(h.context.testButtonDisabled(), false);
+  assert.notEqual(h.perch.x, old.x);
+  assert.equal(h.sentMessages.filter(m => m.type === 'media-options').length, 0);
+  assert.equal(h.fetchCalls.length, 0);
+});
+
 test('a Facebook story with decoded video gets the Butterfly without a URL source', async () => {
   const h = makeContentHarness({ href: 'https://www.facebook.com/stories/12345/UzpfTEST=/' });
   const v = new h.Video({ srcObject: {}, readyState: 4, paused: false, autoplay: true, defaultMuted: true, loop: true });
@@ -384,6 +433,37 @@ test('a Facebook story with decoded video gets the Butterfly without a URL sourc
   h.flushRaf();
   assert.ok(h.flyVisible);
   assert.equal(h.sentMessages.some(message => message.type === 'media-options'), false);
+});
+
+test('content requests object-backed provenance only for the current bound object', () => {
+  const h = makeContentHarness();
+  const object = {};
+  const v = new h.Video({ srcObject: object, readyState: 4 });
+  let requests = 0;
+  v.dispatchEvent = () => {
+    requests++;
+    v.setAttribute('data-vesper-media-provenance', JSON.stringify({ paths: [{ path: 'https://cdn.test/media', seen: Date.now() }], tracks: [{ id: 'sb-1' }] }));
+  };
+  const binding = { src: '', srcObject: object };
+  assert.equal(h.context.testWitness(v, binding).tracks.length, 1);
+  assert.equal(requests, 1);
+  v.srcObject = {};
+  assert.equal(h.context.testWitness(v, binding).tracks.length, 0);
+  assert.equal(requests, 1);
+  v.srcObject = object;
+  v.mediaKeys = {};
+  assert.equal(h.context.testWitness(v, binding).tracks.length, 0);
+  assert.equal(requests, 1);
+});
+
+test('Instagram reel alias is preferred to the generic post link in either order', () => {
+  const h = makeContentHarness();
+  const origin = 'https://www.instagram.com';
+  const reel = { href: origin + '/reels/AbC123/' };
+  const post = { href: origin + '/p/AbC123/' };
+  assert.equal(h.context.VesperPlayerSource.cardPage([reel, post], origin), reel.href);
+  assert.equal(h.context.VesperPlayerSource.cardPage([post, reel], origin), reel.href);
+  assert.equal(h.context.VesperPlayerSource.cardPage([post, {href: origin + '/reel/different/'}], origin), null);
 });
 
 test('Instagram permalinks with a username prefix keep their post identity', () => {

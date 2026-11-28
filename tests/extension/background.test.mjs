@@ -1480,6 +1480,34 @@ test('direct player evidence observed just before playback metadata is still cur
   assert.equal(options.data.choices[0].container, 'MP4');
 });
 
+test('specific post declaration can verify an observed direct file without assigning it to the player', async () => {
+  const page = 'https://www.facebook.com/reel/1234567890';
+  const url = 'https://cdn.test/clip.mp4';
+  const sender = { url: page, tab: { id: 87 }, frameId: 0, documentId: 'declared-direct' };
+  const app = load({ 'media-source-options': checkedSource(15) });
+  const changedAt = Date.now();
+  try {
+    await app.onMedia({ url, tabId: 87, frameId: 0, documentId: sender.documentId, method: 'GET',
+      statusCode: 200, type: 'xmlhttprequest', timeStamp: changedAt,
+      responseHeaders: [{ name: 'Content-Type', value: 'video/mp4' }] });
+    const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: '',
+      manifestUrl: url, playerHasMedia: true, generation: 1, mediaChangedAt: changedAt };
+    const wrong = await app.message(request, { ...sender, documentId: 'foreign' });
+    assert.equal(wrong.code, 'no-reusable-source');
+    assert.equal(app.sent.length, 0);
+    const generic = 'https://www.facebook.com/';
+    const ambiguous = await app.message({ ...request, pageUrl: generic, playerPageUrl: generic }, { ...sender, url: generic });
+    assert.equal(ambiguous.code, 'no-reusable-source');
+    assert.equal(app.sent.length, 0);
+    const reply = await app.message(request, sender);
+    assert.equal(reply.ok, true);
+    assert.equal(reply.data.sourceChoices.length, 1);
+    assert.equal(reply.data.choices, undefined);
+    assert.equal(app.sent.length, 1);
+    assert.equal(app.sent[0].candidates[0].url, url);
+  } finally { app.stopWorker(); }
+});
+
 test('Facebook looks up the active story source without resolving the surrounding page', async () => {
   const page = 'https://www.facebook.com/stories/12345/UzpfTEST=/';
   const playerUrl = 'https://video.example/story.mp4';
@@ -2760,7 +2788,8 @@ test('incompatible installed helper produces one useful error and no unchecked s
       generation:1,playerPlaying:true,mediaChangedAt:changedAt},sender);
     assert.equal(result.code,'desktop-version-mismatch');
     assert.equal(result.data?.sourceChoices,undefined);
-    assert.equal(app.sent.filter(m=>m.type==='media-source-options').length,5);
+    assert.equal(app.sent.filter(m=>m.type==='media-source-options').length,1,
+      'a global helper refusal must stop the serial verification queue');
   } finally {app.stopWorker();}
 });
 test('additional source candidates must pass verification before appearing in the picker', async()=>{

@@ -161,7 +161,9 @@ test('initial metadata refreshes a provisional picker once but a replacement inv
     loadFormats: refresh => { assert.equal(refresh, true); context.reloaded++; },
     closed: 0, reloaded: 0
   });
-  const consider = vm.runInContext(content.slice(start, end) + '\nconsider;', context);
+  const sourceStart = content.indexOf('  function playerSource(');
+  const sourceEnd = content.indexOf('\n  function ', sourceStart + 1);
+  const consider = vm.runInContext(content.slice(sourceStart, sourceEnd) + '\n' + content.slice(start, end) + '\nconsider;', context);
   consider(player);
   assert.ok(context.nearby.has(player), 'a now-visible observed player is admitted before the next intersection callback');
   consider(player);
@@ -614,7 +616,7 @@ test('a temporary layout gap keeps the live overlay and rearms only after the pl
     mount() { context.host.isConnected = true; }, fullscreenTarget: () => null, fullscreenPlayer: false,
     holdMissingPreview: () => false, visiblePlayer: () => rendered ? rect : null, pickerTransitionRect: () => null,
     clippedPlayerRect: () => onScreen ? rect : null, playerAnchor: p => p,
-    PLAYER_LAYOUT_GRACE: 180, layoutLostAt: null, layoutGraceTimer: 0,
+    PLAYER_LAYOUT_GRACE: 180, layoutLostAt: null, layoutGraceTimer: 0, scrollSettleTimer: 0,
     Date: { now: () => now }, setTimeout: (handler, delay) => timers.push({ handler, delay }), clearTimeout() {},
     schedule() {}, stopFullscreenIdle() {}, detach() {}, updateFlyVisibility() {}, closePanel: () => closed++,
     fillsFullscreen: () => false, playerPerch: () => ({ x: 10, y: 10 }), companion: { setPerch() {} },

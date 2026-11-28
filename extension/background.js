@@ -623,11 +623,23 @@ function sourceAffinity(source, fragments) {
 // fragment-directory hints may rank sources but cannot establish ownership.
 
 function rankObservedSources(sources, changedAt, resourceWitness = new Set(), fragments = [], exactResources = new Set()) {
+  const proven = source => exactResources.has(source.url)
+    || Boolean(source.sliceEvidence?.length && source.sliceEvidence.every(member => exactResources.has(member.url)));
+  // The model may prioritize a proven candidate for verification, not admit
+  // new candidates or grant acquisition authority. On abstention retain the
+  // deterministic evidence order and probe-family diversity.
+  const model = globalThis.VesperInference?.rankSources(sources.slice(0, 32).map((source, index) => ({
+    id: String(index), playerBound: proven(source), resourceWitness: proven(source),
+    currentGeneration: proven(source) ? true : null, wholeFile: isWholeDirectSource(source),
+    declared: source.declared === true, hypothesized: !proven(source), fragmentOnly: false
+  })));
+  const preferred = model?.decisive ? sources[Number(model.selected)] : null;
   const ranked = sources.map(source => ({ source, score: evidenceStrength(source, changedAt)
     + (exactResources.has(source.url) ? 24 : 0) + (source.sliceEvidence ? 24 : 0)
     + (resourceWitness.has(source.url) ? 8 : 0) + 4 * sourceAffinity(source, fragments),
     distance: Math.abs(source.seen - changedAt) }))
-    .sort((a, b) => b.score - a.score || a.distance - b.distance)
+    .sort((a, b) => Number(b.source === preferred) - Number(a.source === preferred)
+      || b.score - a.score || a.distance - b.distance)
     .map(entry => entry.source);
   const first = [], alternatives = [], families = new Set();
   for (const source of ranked) {
@@ -703,6 +715,22 @@ async function verifyObservedSource(source, { auth, pageUrl, title, playbackFing
     if (formatLookups.get(key) === work && captureAllowed(generation)) rememberMediaOptions(key, tab, reply);
     return reply;
   } finally { if (formatLookups.get(key) === work) formatLookups.delete(key); }
+}
+
+async function verifyObservedSerial(sources, options, budget) {
+  const queue = sources.slice(), checked = [];
+  while (queue.length && budget-- > 0 && Date.now() < options.deadline) {
+    const candidate = queue.shift();
+    const reply = await verifyObservedSource(candidate, options);
+    if (SOCIAL_LOOKUP_STOPS.has(reply?.code)) {
+      checked.push({ source: candidate, reply });
+      break;
+    }
+    if (candidate.group?.length > 1 && !reply?.ok && reply.code === 'invalid')
+      queue.unshift(...candidate.group);
+    else checked.push({ source: candidate, reply });
+  }
+  return checked;
 }
 
 async function verifyObservedSources(sources, options) {
@@ -1421,6 +1449,7 @@ async function playerOptions(message, sender) {
   const facebookPlayback = VesperPlayerSource.isFacebookHost(page.hostname) && binding
     && message.generation > 0 && playerActiveForWatch(message);
   const socialSite = VesperPlayerSource.isSocialFeedSite(page.href);
+  const serialLookups = VesperPlayerSource.blocksPassiveProbe(page.href);
   const socialFeed = (socialSite || /(?:^|\.)(?:x|twitter)\.com$/i.test(page.hostname))
     && (!binding || /^https?:/.test(identity));
   let candidateCount = 0, postBound = false;
@@ -1527,6 +1556,17 @@ async function playerOptions(message, sender) {
             && !possibleSources.some(item => item.url === evidence.url))
           possibleSources.push(evidence);
       }
+    }
+    // A specific program's declared direct representation is a discovery hint,
+    // not playback proof. Admit only an independently observed resource from
+    // this exact document and generation, then require explicit source choice.
+    if (!prefetch && binding && !source && !matchedManifest && manifest && identity && !/^https?:/.test(identity)
+        && playerActiveOrLoaded && message.generation > 0 && changedAt > 0 && sender.documentId) {
+      const declared = state.sources.find(item => item.url === manifest.href && currentEvidence(item)
+        && (item.seen >= changedAt - 15_000 || message.manifestOnPlayer === true)
+        && (isWholeDirectSource(item) || isRangedMediaCandidate(item)));
+      if (declared && !possibleSources.some(item => item.url === declared.url))
+        possibleSources.push({ ...declared, declared: true });
     }
     // A page-specific adapter may identify a single video without guessing among feed resources.
     const singleVideo = binding && identity && (identity.startsWith('tiktok:')
@@ -1642,7 +1682,7 @@ async function playerOptions(message, sender) {
     const lookupRun = bothRoutes ? lookupPlan({ scope: [tab, frame, sender.documentId].join(':'), message, source,
       possibleSources, changedAt, adapterPromising }) : null;
     const witnessedPlayback = possibleSources.some(candidate => exactResources.has(candidate.url) || candidate.sliceEvidence?.length);
-    const trafficFirst = socialSite && witnessedPlayback || lookupRun?.next().next?.route === 'verify-observed';
+    const trafficFirst = serialLookups && witnessedPlayback || lookupRun?.next().next?.route === 'verify-observed';
     const learnLookup = reply => {
       lookupRun?.report({ route: 'adapter-lookup', outcome: reply.ok ? 'succeeded' : 'failed' });
       const outcome = reply.ok && reply.data?.choices?.length ? 'verified'
@@ -1667,13 +1707,10 @@ async function playerOptions(message, sender) {
           const options = { auth, pageUrl: page.href, title: pickerTitle, playbackFingerprints: [...fingerprints], tab, verificationScope,
             deadline: Date.now() + VERIFY_DEADLINE_MS };
           const checked = [];
-          if (socialSite) {
-            for (const candidate of ranked.slice(0, VERIFY_LIMIT)) {
-              if (Date.now() >= options.deadline) break;
-              const reply = await verifyObservedSource(candidate, options);
-              checked.push({ source: candidate, reply });
-              if (SOCIAL_LOOKUP_STOPS.has(reply?.code)) break;
-            }
+          if (serialLookups) {
+            // Respect refusals and a single shared verification budget, even
+            // when a grouped source falls back to its original observed members.
+            checked.push(...await verifyObservedSerial(ranked.slice(0, VERIFY_LIMIT), options, VERIFY_LIMIT));
           } else checked.push(...await verifyObservedSources(ranked.slice(0, VERIFY_LIMIT), options));
           return { pickerTitle, context, fingerprints, exactResources, ranked, options, checked };
         })();
@@ -1686,7 +1723,7 @@ async function playerOptions(message, sender) {
     if ((possibleSources.length === 0 || singleVideo) && !trafficFirst) {
       // Preserve the page's policy/identity verdict. If it is slow, overlap a
       // bounded exact-source check so a refusal does not cost two serial waits.
-      const hedge = bothRoutes && !socialSite && !formatLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
+      const hedge = bothRoutes && !serialLookups && !formatLookups.has(pageKey) ? setTimeout(startTraffic, LOOKUP_HEDGE_MS) : null;
       let reply;
       try { reply = await pageLookup(); }
       finally { if (hedge !== null) clearTimeout(hedge); }
@@ -1697,7 +1734,7 @@ async function playerOptions(message, sender) {
         // adapter. Do not retry policy/protection or uncertain identity failures.
         const exact = wholeRepresentation ? matching : matchedManifest;
         if (!prefetch && exact && Number.isInteger(message.generation) && message.generation > 0
-            && !(socialSite && SOCIAL_LOOKUP_STOPS.has(reply.code))
+            && !(serialLookups && SOCIAL_LOOKUP_STOPS.has(reply.code))
             && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
           const checked = forCurrentPlayer(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
           observedOutcomes = [mediaLookupTrace(checked)];
@@ -1705,7 +1742,7 @@ async function playerOptions(message, sender) {
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
         return browserFallback(reply);
-      } else if (reply.ok || socialSite && SOCIAL_LOOKUP_STOPS.has(reply.code) || !LOOKUP_REFUSALS.includes(reply.code)) {
+      } else if (reply.ok || serialLookups && SOCIAL_LOOKUP_STOPS.has(reply.code) || !LOOKUP_REFUSALS.includes(reply.code)) {
         return reply;
       }
     }
@@ -1724,12 +1761,14 @@ async function playerOptions(message, sender) {
           && result.reply.data.playbackMatches <= fingerprints.size);
       const needsMore = !checked.some(usableReply) || fingerprints.size > 0 && !checked.some(boundMatch);
       if (!socialSite && needsMore && ranked.length > VERIFY_LIMIT && options.deadline - Date.now() >= 1000
-          && !checked.some(result => ['protected', 'blocked', 'rate-limited', 'host-missing',
-            'app-unavailable', 'host-error'].includes(result.reply?.code))) {
-        checked.push(...await verifyObservedSources(ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4), options));
+          && !checked.some(result => SOCIAL_LOOKUP_STOPS.has(result.reply?.code)
+            || ['host-missing', 'app-unavailable', 'host-error'].includes(result.reply?.code))) {
+        const remaining = ranked.slice(VERIFY_LIMIT, VERIFY_LIMIT + 4);
+        checked.push(...await (serialLookups
+          ? verifyObservedSerial(remaining, options, 4) : verifyObservedSources(remaining, options)));
       }
       observedOutcomes = checked.slice(0, 8).map(result => mediaLookupTrace(result.reply));
-      const socialRefusal = socialSite && checked.find(result => SOCIAL_LOOKUP_STOPS.has(result.reply?.code));
+      const socialRefusal = serialLookups && checked.find(result => SOCIAL_LOOKUP_STOPS.has(result.reply?.code));
       if (socialRefusal && !checked.some(usableReply)) return browserFallback(socialRefusal.reply);
       const association = VesperMediaEvidence.associate({
         sources: checked, player, currentUrl: source?.href || '',
@@ -1958,11 +1997,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await siteRulesLoaded;
       if (matchesNeverCaptureHost({ url: page.href })) return { ok: false };
       const kind = message.category === 'download' ? 'download-failed' : 'media-failed';
-      const entry = await recordFailure(kind, message.code, page.href, message.resource, message.facts);
+      const target = mediaPage(message, sender);
+      const entry = await recordFailure(kind, message.code, target?.href || page.href, message.resource, message.facts);
       return { ok: !!entry, data: entry };
     }
     if (message.type === 'media-options' && message.prefetch === true
-        && (VesperPlayerSource.isSocialFeedSite(sender.url) || !await captureCanBegin()))
+        && (VesperPlayerSource.blocksPassiveProbe(sender.url) || !await captureCanBegin()))
       return { ok: true, data: { prefetchSkipped: true } };
     if (message.type === 'browser-body-status') return bodyReceiptStatus(message, sender);
     if (message.type === 'browser-body-media-proof') return browserBodyMediaProof(message, sender);

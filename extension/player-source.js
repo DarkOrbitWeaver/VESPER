@@ -140,7 +140,13 @@ globalThis.VesperPlayerSource = (() => {
       const url = http(link?.href);
       if (!url || url.origin !== origin) continue;
       const name = identity(url.href);
-      if (name && !/^https?:/.test(name)) known.set(name, url.href);
+      if (name && !/^https?:/.test(name)) {
+        // An Instagram post and its reel alias refer to the same identity. Keep
+        // the more specific video permalink regardless of DOM link order.
+        const previous = known.get(name);
+        const reel = value => ['reel', 'reels'].includes(instagramPost(new URL(value).pathname.split('/').filter(Boolean))?.kind);
+        if (!previous || !name.startsWith('instagram:') || !reel(previous) || reel(url.href)) known.set(name, url.href);
+      }
       else if (link.permalink === true && url.pathname.length > 1) permalinks.set(url.href, url.href);
     }
     if (known.size === 1) return known.values().next().value;

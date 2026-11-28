@@ -746,11 +746,11 @@
   }
 
   function mediaSourceState(player) {
-    const src = player.currentSrc || player.src;
-    const record = objectUrls.get(src);
-    if (record?.kind === 'mse') return record.msState;
+    // srcObject overrides the URL, even when an old src remains on the element.
     const source = player.srcObject;
-    return source && typeof source === 'object' ? mediaSources.get(source) : null;
+    if (source) return typeof source === 'object' ? mediaSources.get(source) : null;
+    const record = objectUrls.get(player.currentSrc || player.src);
+    return record?.kind === 'mse' ? record.msState : null;
   }
 
   // Rich provenance inspection for isolated content script
@@ -759,8 +759,8 @@
     if (!(player instanceof HTMLMediaElement)) return;
     try {
       const src = player.currentSrc || player.src;
-      const record = objectUrls.get(src);
-      const msState = record?.kind === 'mse' ? record.msState : mediaSourceState(player);
+      const record = player.srcObject ? null : objectUrls.get(src);
+      const msState = mediaSourceState(player);
       if ((!record?.ref.deref() && !msState) || player.mediaKeys) return;
       const at = now();
       const paths = [...(record?.paths || msState?.paths || new Map()).values()]
@@ -792,7 +792,7 @@
       }
 
       player.setAttribute('data-vesper-media-provenance', JSON.stringify({
-        kind: record.kind,
+        kind: record?.kind || 'mse',
         paths,
         tracks
       }));

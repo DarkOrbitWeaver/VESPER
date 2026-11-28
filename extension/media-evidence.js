@@ -20,7 +20,7 @@ globalThis.VesperMediaEvidence = (() => {
 
     return {
       durationSeconds: positiveNumber(data.duration, MAX_DURATION_SECONDS),
-      sizeBytes: !best.sizeEstimated && Number.isSafeInteger(best.sizeBytes) && best.sizeBytes > 0
+      sizeBytes: !best.sizeEstimated && Number.isSafeInteger(best.sizeBytes) && best.sizeBytes >= 0
         ? best.sizeBytes : undefined,
       height,
       live: typeof data.isLive === 'boolean' ? data.isLive : undefined,
@@ -110,7 +110,8 @@ globalThis.VesperMediaEvidence = (() => {
     if (video && facts.hasVideo === false) return false;
     if (player.kind === 'audio' && facts.hasAudio === false) return false;
     // A header-only response can claim a video MIME type without a playable file.
-    if (video && player.durationSeconds >= 1 && !facts.durationSeconds && facts.sizeBytes < 1024) return false;
+    if (video && player.durationSeconds >= 1 && !facts.durationSeconds
+        && Number.isSafeInteger(facts.sizeBytes) && facts.sizeBytes < 1024) return false;
     if (!player.durationSeconds || !facts.durationSeconds) return true;
     const tolerance = Math.max(2, player.durationSeconds * 0.08);
     return Math.abs(player.durationSeconds - facts.durationSeconds) <= tolerance;
@@ -178,7 +179,8 @@ globalThis.VesperMediaEvidence = (() => {
         wholeFile: node.entry.source?.wholeRepresentation === true || node.entry.source?.rangeResource === true ? true : null,
         durationAgreement: node.durationAgreement == null ? null : Number(node.durationAgreement),
         currentGeneration: node.direct || node.witnessed ? true : null,
-        hypothesized: !!node.entry.source?.sliceEvidence, fragmentOnly: node.entry.source?.kind === 'fragment' };
+        hypothesized: !node.direct && !node.witnessed && !!node.entry.source?.sliceEvidence,
+        fragmentOnly: node.entry.source?.kind === 'fragment' };
     }));
     const preferred = learned?.decisive ? learned.selected : null;
     nodes.sort((a, b) => Number(b.direct && b.verified && b.compatible) - Number(a.direct && a.verified && a.compatible)

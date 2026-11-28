@@ -84,7 +84,7 @@
   const nearby = new Set();
   const discoveryNodes = new Set();
   let discoveryObserver = null, discoveryFrame = 0, discoveryWalker = null, refreshAfterDiscovery = false, prunePlayers = false;
-  let scrolled = false;
+  let scrolled = false, scrollSettleTimer = 0;
   const discoveryOptions = { childList: true, subtree: true, attributes: true,
     attributeFilter: ['src', 'href', 'controls', 'poster', 'id', 'data-permalink', 'data-vesper-shadow-host'] };
   const observedRoots = new WeakSet();
@@ -117,6 +117,7 @@
     if (signal.aborted) return;
     lifetime.abort();
     clearTimeout(placementTimer);
+    clearTimeout(scrollSettleTimer);
     activeBrowserCopy?.controller.abort();
     generatedCopy?.controller.abort();
     visibility.disconnect();
@@ -182,7 +183,7 @@
   window.addEventListener('popstate', refreshPlayers, { signal });
 
   function playerSource(player) {
-    return player.currentSrc || player.src || '';
+    return player.srcObject ? '' : player.currentSrc || player.src || '';
   }
 
   function hasOtherPlayer(player) {
@@ -661,7 +662,7 @@
       attach(best, continuous);
       if (same && !previouslyCertain && intentCertain) schedulePrefetch(best);
     }
-    else if (video && !video.isConnected) detach();
+    else if (video && !video.isConnected && !(scrollSettleTimer && perch)) detach();
     else if (video) place(continuous);
   }
 
@@ -694,7 +695,8 @@
     return result;
   }
   function playerFragmentWitness(player, binding) {
-    if (!player || !binding || !/^blob:https?:/i.test(playerSource(player))
+    if (!player || !binding || player.srcObject !== binding.srcObject || playerSource(player) !== binding.src
+        || !(player.srcObject || /^blob:https?:/i.test(playerSource(player)))
         || player.mediaKeys || protectedVideos.has(player))
       return { paths: [], canonicalUrls: [], fingerprints: [], tracks: [] };
     const attribute = 'data-vesper-media-provenance';
@@ -764,7 +766,7 @@
 
   function consider(el) {
     if (!alive() || !(el instanceof HTMLMediaElement)) return;
-    const src = el.currentSrc || el.src || '';
+    const src = playerSource(el);
     if (!observed.has(el)) {
       if (!(el instanceof HTMLVideoElement || el.tagName === 'AUDIO' && playerAnchor(el))
           || !(src || el.srcObject || el.readyState >= 1 || el.querySelector('source[src]')
@@ -1418,6 +1420,17 @@
         : visiblePlayer(video) || (perch && !switching && visiblePlayer(video, 88, 64)))
       || pickerTransitionRect(video));
     if (rect) clearLayoutGrace();
+    // Presentation is allowed to outlive the old player for one scroll-settle
+    // window. Acquisition is not: close the old picker and disable the button.
+    if (!rect && !held && scrollSettleTimer && perch && !fullscreen && !fullscreenPlayer
+        && !butterflyHidden() && !document.hidden) {
+      if (panelMedia) closePanel();
+      button.hidden = false;
+      button.disabled = true;
+      updateFlyVisibility();
+      return;
+    }
+    button.disabled = false;
     if (held || (!rect && !switching && !fullscreen && !fullscreenPlayer && holdPlayerLayout())) {
       button.hidden = false;
     } else if (!video.isConnected) {
@@ -1631,15 +1644,43 @@
   }
 
   function recoverFeedPlayer() {
-    if (butterflyHidden() || document.hidden || visiblePlayer(video)) return;
-    if (Array.from(nearby).slice(0, VesperIntelligence.PLAYER_POLICY.limit).some(el => visiblePlayer(el))) return;
-    // A recycled card can become visible without a new intersection or playback event.
-    for (const x of [0.5, 0.7, 0.3]) {
-      const stack = document.elementsFromPoint?.(innerWidth * x, innerHeight / 2) || [];
-      const player = stack.slice(0, 12).find(el => el instanceof HTMLVideoElement && visiblePlayer(el));
-      if (!player) continue;
-      consider(player);
-      if (nearby.has(player)) return;
+    if (butterflyHidden() || document.hidden) return;
+    const playing = el => el?.tagName === 'VIDEO' && !el.paused && !el.ended
+      && el.readyState >= 1 && !advertisementContext(el) && visiblePlayer(el);
+    // A small, partly scrolled-out incumbent or a paused card must not prevent recovery.
+    const dominant = el => {
+      const r = playing(el);
+      if (!r) return false;
+      const bounds = playerAnchor(el)?.getBoundingClientRect();
+      return bounds && (r.right - r.left) * (r.bottom - r.top) >= bounds.width * bounds.height * 0.55
+        && viewportCenterDistance(r) <= 0.45;
+    };
+    if (dominant(video)) return;
+    for (const el of [...nearby].slice(0, VesperIntelligence.PLAYER_POLICY.limit)) {
+      if (!dominant(el)) continue;
+      consider(el);
+      return;
+    }
+    // Hit-test a bounded viewport grid before scanning DOM; no network work here.
+    // The new card can be visible with no intersection/playback notification yet.
+    const seen = new Set();
+    for (const y of [0.5, 0.75, 0.25]) {
+      for (const x of [0.5, 0.7, 0.3, 0.85, 0.15]) {
+        const stack = document.elementsFromPoint?.(innerWidth * x, innerHeight * y) || [];
+        for (const el of stack.slice(0, 12)) {
+          if (!(el instanceof HTMLVideoElement) || seen.has(el) || !visiblePlayer(el)) continue;
+          seen.add(el);
+          consider(el);
+          if (dominant(el) && nearby.has(el)) return;
+        }
+      }
+    }
+    // Covered or newly recycled videos may not be hit-test targets. Reconcile a
+    // bounded set of already observed players as well.
+    let remaining = VesperIntelligence.PLAYER_POLICY.limit;
+    for (const el of observed) {
+      if (remaining-- <= 0) break;
+      if (playing(el)) consider(el);
     }
   }
 
@@ -1909,6 +1950,7 @@
   }
 
   async function loadFormats(refresh = false, keepSource = true, quick = false) {
+    if (button?.disabled) return;
     syncPage();
     const started = Date.now(), attempt = globalThis.crypto?.randomUUID?.();
     if (!video || (!video.isConnected && activePreview?.player !== video) || !panel) {
@@ -1949,7 +1991,8 @@
     const targetPage = activePreview?.player === player ? activePreview.page : pageForPlayer(player);
     const identity = VesperPlayerSource.identity(targetPage);
     const binding = playback.get(player) || preview?.binding || (ended ? endedPlayer.binding : null);
-    const current = !watchPreview && !previewMissing() && binding?.src === src && VesperPlayerSource.identity(binding.page) === identity;
+    const current = !watchPreview && !previewMissing() && binding?.src === src
+      && binding.srcObject === player.srcObject && VesperPlayerSource.identity(binding.page) === identity;
     const targetKey = activePreview?.player === player ? activePreview.key
       : `${identity}|${targetPage}|${src}|${current ? binding.generation : 0}`;
     const savedDraft = retainedPickerDraft?.targetKey === targetKey && retainedPickerDraft.player === player;
@@ -2064,7 +2107,7 @@
       }
       if (!isCurrentRequest(request)) return;
       if (original && playerSource(player) === src && playback.get(player) === binding
-          && !player.mediaKeys && !protectedVideos.has(player)) {
+          && player.srcObject === binding.srcObject && !player.mediaKeys && !protectedVideos.has(player)) {
         const audio = original.mime.startsWith('audio/');
         const height = !audio && player.videoHeight > 0 ? player.videoHeight + 'p' : '';
         formats = {
@@ -2201,6 +2244,8 @@
   }
 
   function declaredManifest(identity) {
+    if (!identity) return;
+    const urls = new Set();
     for (const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0, 6)) {
       if (script.textContent.length > 64 * 1024) continue;
       try {
@@ -2209,10 +2254,11 @@
         for (const entry of entries.slice(0, 12)) {
           if (entry?.['@type'] !== 'VideoObject' || ![entry.url, entry['@id'], entry.embedUrl].some(url => VesperPlayerSource.identity(url) === identity)) continue;
           const url = VesperPlayerSource.http(entry.contentUrl);
-          if (url) return url.href;
+          if (url) urls.add(url.href);
         }
       } catch { /* This page did not expose usable video metadata. */ }
     }
+    if (urls.size === 1) return urls.values().next().value;
   }
 
   function renderShell(title, poster, seconds, ...body) {
@@ -2859,7 +2905,15 @@
       retainedBytes: tracks?.reduce((sum, track) => sum + (Number.isSafeInteger(track.retainedBytes) ? track.retainedBytes : 0), 0)
     };
     const category = stage === 'browser-copy' || stage === 'submit' ? 'download' : 'media';
-    const reply = await send({ type: 'diagnostic-failure', category, code, resource: src, facts });
+    const manifest = chrome.runtime.getManifest?.();
+    facts.contentBuild = manifest?.version_name || manifest?.version;
+    if (player?.srcObject) {
+      const type = player.srcObject.constructor?.name;
+      facts.objectKind = ['MediaSource', 'MediaSourceHandle', 'MediaStream', 'Blob', 'File'].includes(type) ? type : 'unknown';
+    }
+    facts.witnessPaths = witness?.paths?.length;
+    const reply = await send({ type: 'diagnostic-failure', category, code, resource: src,
+      pageUrl: lookup?.pageUrl, facts });
     return reply?.data || { utc: new Date().toISOString(), code: code || 'unknown', stage, source: facts.source };
   }
 
@@ -3111,6 +3165,15 @@
     if (!feedPage) return geometryChanged();
     scrolled = true;
     schedule();
+    clearTimeout(scrollSettleTimer);
+    // Snap-scrolling and recycled cards can settle after the final scroll event.
+    // One bounded recheck; never poll continuously or start a lookup.
+    scrollSettleTimer = setTimeout(() => {
+      scrollSettleTimer = 0;
+      if (!alive() || document.hidden || butterflyHidden()) return;
+      scrolled = true;
+      schedule();
+    }, 160);
   }, { passive: true, capture: true, signal });
   window.addEventListener('resize', geometryChanged, { passive: true, signal });
   if (typeof MutationObserver !== 'undefined' && document.documentElement) {

@@ -23,7 +23,7 @@ const failureFields = new Set([
   'chromeError', 'chromeStarted', 'routeMatch', 'elapsedMs', 'nativeMs',
   'source', 'ready', 'generation', 'playing', 'height', 'durationMs', 'preview', 'refresh', 'quick',
   'boundPlayer', 'boundPost', 'responses', 'exactMatches', 'candidates', 'postLookup', 'observedLookups',
-  'witnesses', 'tracks', 'completeTracks', 'retainedBytes', 'bodyProof', 'attemptedBody', 'subtitleFailures'
+  'witnesses', 'witnessPaths', 'objectKind', 'contentBuild', 'tracks', 'completeTracks', 'retainedBytes', 'bodyProof', 'attemptedBody', 'subtitleFailures'
 ]);
 
 function diagnosticFacts(facts) {
