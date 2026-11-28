@@ -212,6 +212,17 @@
     };
   }
 
+  function workerMediaSource(player) {
+    return player?.srcObject?.constructor?.name === 'MediaSourceHandle';
+  }
+
+  function matchesWorkerDeclaration(media) {
+    if (!media.workerManifest) return true;
+    inspectPlayerWitnessAttributes(media.player);
+    return workerMediaSource(media.player)
+      && VesperPlayerSource.http(media.player.getAttribute('data-vesper-player-manifest'))?.href === media.workerManifest;
+  }
+
   function matchesPickerPlayer(media) {
     const { player, playerState: before } = media;
     if (!player?.isConnected || !before || player.mediaKeys || protectedVideos.has(player)) return false;
@@ -219,7 +230,8 @@
     return before.identity === now.identity && before.current === now.current
       && before.srcObject === now.srcObject && before.assigned === now.assigned
       && before.alternatives.length === now.alternatives.length
-      && before.alternatives.every((src, i) => src === now.alternatives[i]);
+      && before.alternatives.every((src, i) => src === now.alternatives[i])
+      && matchesWorkerDeclaration(media);
   }
 
   function isCurrentRequest(request) {
@@ -2053,7 +2065,8 @@
       playerFragmentUrls: playerWitness?.paths,
       playerCanonicalUrls: playerWitness?.canonicalUrls,
       playerResourceFingerprints: playerWitness?.fingerprints,
-      manifestUrl: bestManifest, manifestOnPlayer: Boolean(bestManifest && attachedManifest) });
+      manifestUrl: bestManifest, manifestOnPlayer: Boolean(bestManifest && attachedManifest),
+      workerMediaSource: current && workerMediaSource(player) });
     if (!isCurrentRequest(request)) {
       const stale = lookup.preview ? !watchPreviewCurrent(lookup.preview) : !matchesPickerPlayer(lookup);
       if (stale || !result?.ok)
@@ -2135,9 +2148,13 @@
     formats.playerLive = playerFacts?.live === true || formats.isLive === true;
     const pickerDuration = formats.playerLive ? null : formats.duration ?? duration;
     if (formats.sourceChoices?.length) {
+      if (formats.sourceChoices.some(source => source.requiresConfirmation)) {
+        lookup.workerManifest = attachedManifest?.href;
+        if (!lookup.workerManifest || !isCurrentRequest(request)) return;
+      }
       const savedSource = keepSource ? chosenSources.get(player) : null;
       if (savedSource?.targetKey === targetKey) {
-        const matches = formats.sourceChoices.filter(source => source.fingerprint === savedSource.fingerprint);
+        const matches = formats.sourceChoices.filter(source => !source.requiresConfirmation && source.fingerprint === savedSource.fingerprint);
         if (matches.length === 1) return inspectSource(matches[0], title, poster, pickerDuration, formats.playerLive, true);
       }
       return renderSourceChoices(title, poster, pickerDuration, formats);
@@ -2754,8 +2771,10 @@
       // other videos accessible instead of silently replacing the user's video.
       (hasMatch && !matchesLength(source) ? alternateList : list).append(option);
     }
-    const prompt = formats.sourceChoices.length === 1 ? 'Choose the source to see formats.'
-      : 'Choose the source that matches your player.';
+    const prompt = formats.sourceChoices.some(source => source.requiresConfirmation)
+      ? 'The player declares this stream. Confirm the source before VESPER checks its formats.'
+      : formats.sourceChoices.length === 1 ? 'Choose the source to see formats.'
+        : 'Choose the source that matches your player.';
     renderShell(title, poster, seconds, element('div', 'msg', prompt), list,
       ...(alternateList.childElementCount ? [other] : []));
   }
@@ -2769,7 +2788,10 @@
     loading.setAttribute('role', 'status');
     renderShell(title, poster, seconds, loading);
     const result = await send({ type: 'media-source-select', sourceChoice: source.token,
-      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc });
+      pageUrl: panelMedia.pageUrl, generation: panelMedia.generation, playerKey: panelMedia.playerKey, playerUrl: panelMedia.formatSrc,
+      ...(source.requiresConfirmation && !remembered ? {
+        workerMediaSource: workerMediaSource(player), manifestUrl: lookup.workerManifest
+      } : {}) });
     if (!isCurrentRequest(request)) {
       if (!result?.ok) void reportMediaFailure('source', result?.code, lookup);
       return;
@@ -2783,7 +2805,7 @@
       }
       const previous = chosenSources.get(player);
       if (!fingerprint || previous?.fingerprint !== fingerprint) retainedPickerDraft = null;
-      if (fingerprint) chosenSources.set(player, { targetKey, fingerprint });
+      if (fingerprint && !source.requiresConfirmation) chosenSources.set(player, { targetKey, fingerprint });
       else chosenSources.delete(player);
       formats.fromSourceChoice = true;
       formats.playerLive = playerLive || formats.isLive === true;

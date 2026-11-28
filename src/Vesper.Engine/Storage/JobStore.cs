@@ -73,6 +73,9 @@ public sealed class JobStore : IDisposable
         """,
         """
         ALTER TABLE jobs ADD COLUMN publication_copy_identity TEXT;
+        """,
+        """
+        ALTER TABLE jobs ADD COLUMN delivery_elapsed_ms INTEGER;
         """
     ];
 
@@ -300,7 +303,8 @@ public sealed class JobStore : IDisposable
         "rescue_candidate", "rescue_mode", "sha256_verified", "unverified_resume", "non_resumable", "media_state", "generation",
         "original_page_url", "media_provider", "media_id", "media_quality", "media_thumbnail_url", "media_expires_at", "media_plan_json", "media_format_id",
         "media_output", "pending_conversion_bytes", "pending_conversion_digest", "browser_proof", "media_metadata_json", "published_sha256",
-        "partial_identity", "final_resource_identity", "published_file_identity", "pending_conversion_identity", "publication_copy_identity"
+        "partial_identity", "final_resource_identity", "published_file_identity", "pending_conversion_identity", "publication_copy_identity",
+        "delivery_elapsed_ms"
     ];
 
     private static readonly string UpsertSql =
@@ -442,6 +446,7 @@ public sealed class JobStore : IDisposable
         yield return ("pending_conversion_identity", j.PendingConversionIdentity);
         yield return ("publication_copy_identity", j.PublicationCopyIdentity);
         yield return ("published_sha256", j.PublishedSha256);
+        yield return ("delivery_elapsed_ms", j.DeliveryElapsedMilliseconds);
         yield return ("partial_identity", j.PartialIdentity);
         yield return ("final_resource_identity", j.FinalResourceIdentity);
         yield return ("published_file_identity", j.PublishedFileIdentity);
@@ -497,6 +502,7 @@ public sealed class JobStore : IDisposable
             CreatedUtc = Date("created_utc") ?? DateTime.UtcNow,
             UpdatedUtc = Date("updated_utc") ?? DateTime.UtcNow,
             CompletedUtc = Date("completed_utc"),
+            DeliveryElapsedMilliseconds = NInt("delivery_elapsed_ms"),
             RetryCount = (int)Int("retry_count"),
             NextRetryUtc = Date("next_retry_utc"),
             ETag = NStr("etag"),

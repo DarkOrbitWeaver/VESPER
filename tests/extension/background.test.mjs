@@ -1534,6 +1534,45 @@ test('generic feed attached declaration requires current document evidence and e
   } finally { app.stopWorker(); }
 });
 
+test('worker-only player declaration is a confirmation choice, not an observed source', async () => {
+  const page = 'https://www.facebook.com/';
+  const url = 'https://cdn.test/worker.mpd';
+  const sender = { url: page, tab: { id: 90 }, frameId: 0, documentId: 'worker-declaration' };
+  const app = load({ 'media-source-options': checkedSource(15) });
+  const request = { type: 'media-options', pageUrl: page, playerPageUrl: page, playerUrl: '',
+    manifestUrl: url, manifestOnPlayer: true, workerMediaSource: true, playerHasMedia: true,
+    playerKey: 'player-worker', generation: 1, mediaChangedAt: Date.now() };
+  try {
+    for (const change of [{workerMediaSource:false}, {manifestOnPlayer:false}, {playerKey:''},
+      {manifestUrl:url+'?signature=x'}, {manifestUrl:'http://cdn.test/worker.mpd'}, {manifestUrl:'https://cdn.test/segment-1.m4s'}]) {
+      const refused = await app.message({...request,...change},sender);
+      assert.equal(refused.code,'no-reusable-source');
+    }
+    await app.message({...request,prefetch:true},sender);
+    assert.equal(app.sent.length,0);
+    const select = async change => {
+      const options = await app.message(request,sender);
+      assert.equal(options.ok,true);
+      assert.equal(options.data.choices,undefined);
+      const source = options.data.sourceChoices[0];
+      assert.equal(source.requiresConfirmation,true);
+      assert.equal(source.fingerprint,undefined);
+      return app.message({type:'media-source-select',sourceChoice:source.token,pageUrl:page,
+        playerUrl:'',playerKey:request.playerKey,generation:1,workerMediaSource:true,manifestUrl:url,...change},sender);
+    };
+    assert.equal((await select({manifestUrl:'https://cdn.test/new.mpd'})).code,'expired-selection');
+    assert.equal((await select({generation:2})).code,'expired-selection');
+    assert.equal((await select({workerMediaSource:false})).code,'expired-selection');
+    assert.equal(app.sent.length,0);
+    const reply=await select({});
+    assert.equal(reply.ok,true);
+    assert.equal(app.sent.length,1);
+    assert.equal(app.sent[0].candidates[0].url,url);
+    assert.equal(app.sent[0].authorized,undefined);
+    assert.equal(app.sent[0].hostCredentials,undefined);
+  } finally { app.stopWorker(); }
+});
+
 test('copied-buffer path hint admits a unique current source only for explicit verification', async () => {
   const page = 'https://www.facebook.com/';
   const path = 'https://cdn.test/opaque-media';

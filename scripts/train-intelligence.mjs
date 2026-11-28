@@ -1,6 +1,7 @@
 // Offline training, evaluation, promotion and rollback for VESPER Intelligence models.
 // This script cannot load websites or authorize downloads. Runtime never retrains itself.
 //   node scripts/train-intelligence.mjs fit [corpus.json] [outDir]
+//   node scripts/train-intelligence.mjs review <reviewed-corpus.json>
 //   node scripts/train-intelligence.mjs promote <model.json> <reviewed-corpus.json>
 //   node scripts/train-intelligence.mjs rollback <schema>
 //   node scripts/train-intelligence.mjs verify
@@ -260,20 +261,31 @@ export function validateReviewIds(partitions) {
   }
 }
 
+// Review is read-only. Label provenance remains the reviewer’s responsibility;
+// fixture results and predictions cannot be substituted for reviewed cases.
+export function reviewCoverage(schema, partitions) {
+  validateCases(schema, partitions);
+  validateReviewIds(partitions);
+  const splits = {};
+  for (const split of ['train', 'validation', 'holdout']) {
+    const rows = partitions[split];
+    const independent = rows.filter(row => row.label === 'verified' || row.label === 'user');
+    const chosen = independent.filter(row => row.chosen !== null).length;
+    const ambiguous = independent.length - chosen;
+    const families = new Set(independent.map(row => row.group.toLowerCase())).size;
+    splits[split] = { total: rows.length, independent: independent.length, chosen, ambiguous, families,
+      missingChosen: Math.max(0, 200 - chosen), missingAmbiguous: Math.max(0, 30 - ambiguous),
+      missingFamilies: Math.max(0, 10 - families),
+      ready: independent.length === rows.length && chosen >= 200 && ambiguous >= 30 && families >= 10 };
+  }
+  return { splits, ready: splits.validation.ready && splits.holdout.ready };
+}
+
 export function promotionEvaluation(model, partitions, baseline) {
   Inference.validateModel(model);
-  validateCases(model.schema, partitions);
-  validateReviewIds(partitions);
-  const independent = row => row.label === 'verified' || row.label === 'user';
-  // The supplied corpus is independently reviewed by the operator; label claims in
-  // model metadata are never evidence of real-world evaluation.
-  for (const split of ['validation', 'holdout']) {
-    const rows = partitions[split];
-    if (rows.some(row => !independent(row)) || rows.filter(row => row.chosen !== null).length < 200
-        || rows.filter(row => row.chosen === null).length < 30
-        || new Set(rows.map(row => row.group.toLowerCase())).size < 10)
-      throw Error('Refusing to promote without sufficient independent real labels in ' + split);
-  }
+  const coverage = reviewCoverage(model.schema, partitions);
+  if (!coverage.ready)
+    throw Error('Refusing to promote without sufficient independent real labels: ' + JSON.stringify(coverage.splits));
   const rank = Inference.createRanker(model).rank;
   const previous = Inference.createRanker(baseline).rank;
   const gates = {};
@@ -285,6 +297,14 @@ export function promotionEvaluation(model, partitions, baseline) {
     gates[split] = { candidate, reference, passed };
   }
   const failures = guardFailures(rank, model.schema);
+  const { candidate, reference } = gates.holdout;
+  // Merely reproducing the active model is not a demonstrated improvement.
+  // Calibration may improve in isolation only when safety and recall do not regress.
+  const improved = candidate.correctDecisive > reference.correctDecisive
+    || candidate.wrongDecisive + candidate.ambiguousDecisive < reference.wrongDecisive + reference.ambiguousDecisive
+    || (candidate.expectedCalibrationError !== null && reference.expectedCalibrationError !== null
+      && reference.expectedCalibrationError - candidate.expectedCalibrationError >= 0.01);
+  if (!improved) failures.push('no-measurable-holdout-improvement');
   if (failures.length || Object.values(gates).some(gate => !gate.passed))
     throw Error('Promotion gates failed: ' + JSON.stringify({ gates, failures }));
   return gates;
@@ -353,6 +373,17 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const report = { corpus: { schema: corpus.schema, seed: corpus.seed, holdoutArchetypes: corpus.holdoutArchetypes }, player, source };
     writeFileSync(`${out}/report.json`, JSON.stringify(report, null, 1) + '\n');
     console.log(JSON.stringify({ out, player: { holdout: player.holdout, gates: player.gates }, source: { holdout: source.holdout, gates: source.gates } }, null, 1));
+  } else if (command === 'review') {
+    const { data: corpus } = boundedJson(args[0], 32 * 1024 * 1024);
+    const models = activeModels(), report = {};
+    for (const [kind, schema] of [['player', 'vesper.player-intent/2'], ['source', 'vesper.source-association/1']]) {
+      const partitions = corpus[kind];
+      const coverage = reviewCoverage(schema, partitions);
+      const rank = Inference.createRanker(models[schema]).rank;
+      report[kind] = { ...coverage, baseline: Object.fromEntries(['validation', 'holdout'].map(split =>
+        [split, evaluate(rank, partitions[split].filter(row => row.label === 'verified' || row.label === 'user'))])) };
+    }
+    console.log(JSON.stringify(report, null, 2));
   } else if (command === 'promote') console.log('promoted ' + promote(args[0], { corpusPath: args[1] }));
   else if (command === 'rollback') console.log('restored ' + rollback(args[0]));
   else if (command === 'verify') console.log(JSON.stringify(verifyShipped()));

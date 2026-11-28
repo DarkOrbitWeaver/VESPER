@@ -185,6 +185,7 @@ public sealed class JobStoreRecoveryTests
         using var writer = new SqliteConnection($"Data Source={path};Pooling=False");
         writer.Open();
         Execute(writer, """
+            ALTER TABLE jobs DROP COLUMN delivery_elapsed_ms;
             ALTER TABLE jobs DROP COLUMN published_file_identity;
             ALTER TABLE jobs DROP COLUMN final_resource_identity;
             ALTER TABLE jobs DROP COLUMN pending_conversion_identity;

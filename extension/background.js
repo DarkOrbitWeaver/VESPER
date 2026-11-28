@@ -1170,7 +1170,12 @@ function rememberSourceSelections(sources, context) {
       seen: source.seen, validator: source.validator, bytes: source.bytes, minimumLength: source.minimumLength,
       rangeResource: source.rangeResource, wholeRepresentation: source.wholeRepresentation, group: source.group,
       sliceEvidence: source.sliceEvidence, experienceCase: source.experienceCase,
+      workerDeclaration: source.workerDeclaration === true,
       expires: now + 60_000, verified: context.signed ? undefined : source.verified });
+    if (source.workerDeclaration) return {
+      token, requiresConfirmation: true, label: 'Declared ' + source.kind.toUpperCase() + ' stream',
+      detail: new URL(source.url).hostname + ' · Confirm before checking formats'
+    };
     return source.verified
       ? verifiedSourceLabel({ ...source, token }, source.verified)
       : sourceLabel({ ...source, token });
@@ -1494,7 +1499,7 @@ async function playerOptions(message, sender) {
       .map(value => VesperPlayerSource.http(value)).filter(url => url && !url.search)
       .map(url => url.origin + url.pathname))].sort() : [];
   const playerScope = [tab, frame, sender.documentId, identity, page.href, message.playerKey, message.generation, source?.href, manifest?.href,
-    message.manifestOnPlayer === true, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
+    message.manifestOnPlayer === true, message.workerMediaSource === true, mutedLoop, message.multiplePlayers === true, message.mediaChangedAt].join('|');
   const lookupKey = [playerScope, playbackFingerprints.join(','), JSON.stringify(playerPaths)].join('|');
   const verificationScope = !auth.authorized && !message.refresh && binding && sender.documentId
     && Number.isInteger(message.generation) && message.generation > 0 ? playerScope : null;
@@ -1635,6 +1640,26 @@ async function playerOptions(message, sender) {
     const wholeRepresentation = usableSource && matching && isWholeDirectSource(matching)
       && /^(?:audio|video)\//.test(matching.mime);
     const title = binding || !youTube ? message.title : undefined;
+    // A dedicated-worker MediaSourceHandle has no window-observable buffers.
+    // Offer a single player-owned public manifest as an explicit candidate,
+    // never as exact playback evidence. Do not contact it before selection.
+    function workerChoice() {
+      if (prefetch || !binding || source || matchedManifest || possibleSources.length
+          || message.workerMediaSource !== true || message.manifestOnPlayer !== true
+          || !sender.documentId || sender.tab?.incognito || !Number.isInteger(tab)
+          || typeof message.playerKey !== 'string' || !message.playerKey || message.playerKey.length > 100
+          || !Number.isInteger(message.generation) || message.generation < 1
+          || !playerActiveOrLoaded || changedAt <= 0 || changedAt > now + 1000
+          || manifest?.protocol !== 'https:' || manifest.search
+          || !/\.(?:m3u8|mpd)$/i.test(manifest.pathname) || isPartialMediaUrl(manifest)
+          || state.sources.some(item => currentEvidence(item) && item.url === manifest.href)) return null;
+      const declared = { url: manifest.href, kind: VesperPlayerSource.kind(manifest.href), workerDeclaration: true };
+      const context = { identity, tab, frame, documentId: sender.documentId, signed: false,
+        generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl || '', title,
+        workerPlayerFacts: player };
+      candidateCount = 1;
+      return { ok: true, data: { title, sourceChoices: rememberSourceSelections([declared], context) } };
+    }
     async function browserFallback(failure) {
       if (!wholeRepresentation || !['host-missing', 'host-error', 'app-unavailable', 'network',
         'sign-in', 'no-media', 'unavailable', 'timeout'].includes(failure?.code)) return failure;
@@ -1663,7 +1688,7 @@ async function playerOptions(message, sender) {
         observedOutcomes = [mediaLookupTrace(reply)];
         return browserFallback(reply);
       }
-      return { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
+      return workerChoice() || { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
     }
     // A single-video page can give the resolver a better identity than nearby network traffic.
     const pageInput = { ...auth, url: page.href, pageTitle: title,
@@ -1772,6 +1797,10 @@ async function playerOptions(message, sender) {
           observedOutcomes = [mediaLookupTrace(checked)];
           if (checked.ok && checked.data?.choices?.length) return checked;
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
+        }
+        if (['no-media', 'no-reusable-source', 'unsupported'].includes(reply.code) && !observedOutcomes.length) {
+          const declared = workerChoice();
+          if (declared) return declared;
         }
         return browserFallback(reply);
       } else if (reply.ok || serialLookups && SOCIAL_LOOKUP_STOPS.has(reply.code) || !LOOKUP_REFUSALS.includes(reply.code)) {
@@ -1918,6 +1947,19 @@ async function selectMediaSource(message, sender) {
     return { ok: false, code: 'expired-selection', message: 'Refresh the formats for the current video.' };
   }
   sourceSelections.delete(token);
+  if (selection.workerDeclaration) {
+    if (sender.tab?.incognito || message.workerMediaSource !== true
+        || VesperPlayerSource.http(message.manifestUrl)?.href !== selection.url)
+      return { ok: false, code: 'expired-selection', message: 'The player declaration changed. Refresh the formats.' };
+    if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:selection.url,referrer:sender.url}))
+      return { ok: false, code: 'blocked', message: 'VESPER could not confirm that this site permits native acquisition.' };
+    const reply = explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, {}, page.href, selection.title), 20000));
+    if (reply?.ok && reply.data?.choices?.length
+        && !VesperMediaEvidence.matchesPlayback(selection.workerPlayerFacts, VesperMediaEvidence.mediaFacts(reply)))
+      return { ok: false, code: 'source-changed', message: 'The declared stream does not match this playback.' };
+    // Explicit declaration checks do not become independently verified identity labels.
+    return reply;
+  }
   const state = await tabState(selection.tab);
   const now = Date.now();
   const current = selected => state.sources.some(source => source.url === selected.url && source.documentId === selection.documentId

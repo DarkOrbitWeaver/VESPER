@@ -100,10 +100,8 @@ public sealed class MediaDeliveryHistoryTests
             var fast = Job("adapter", JobKind.Http, true);
             var slow = Job("adapter", JobKind.Hls, true);
             fast.TotalBytes = slow.TotalBytes = size;
-            history.Observe(fast);
-            history.Observe(slow);
-            history.ObserveTiming(fast, TimeSpan.FromSeconds(2));
-            history.ObserveTiming(slow, TimeSpan.FromSeconds(5));
+            fast.DeliveryElapsedMilliseconds = MediaDeliveryHistory.EligibleElapsed(fast, TimeSpan.FromSeconds(2));
+            slow.DeliveryElapsedMilliseconds = MediaDeliveryHistory.EligibleElapsed(slow, TimeSpan.FromSeconds(5));
             history.Observe(fast);
             history.Observe(slow);
             Assert.Equal(i == 5 ? JobKind.Http : (JobKind?)null,
@@ -114,6 +112,44 @@ public sealed class MediaDeliveryHistoryTests
         Assert.Null(history.Preferred("unseen", Both, Now, size));
         history.Observe(Job("adapter", JobKind.Http, false));
         Assert.Null(history.Preferred("adapter", Both, Now, size));
+    }
+
+    [Fact]
+    public void VerifiedTimingSurvivesDatabaseReopenAndCannotTeachUnverifiedDelivery()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "vesper-delivery-timing-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string path = Path.Combine(root, "jobs.db");
+            const long size = 4 * 1024 * 1024;
+            using (var store = JobStore.Open(path))
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    foreach (var (kind, duration) in new[] { (JobKind.Http, 2), (JobKind.Hls, 5) })
+                    {
+                        var job = Job("generic", kind, true);
+                        job.OriginalPageUrl = "https://media.example/watch";
+                        job.MediaId = "asset-" + i;
+                        job.TotalBytes = size;
+                        job.DeliveryElapsedMilliseconds = MediaDeliveryHistory.EligibleElapsed(job, TimeSpan.FromSeconds(duration));
+                        Assert.Equal(duration * 1000L, job.DeliveryElapsedMilliseconds);
+                        store.Save(job);
+                    }
+                }
+            }
+            var history = new MediaDeliveryHistory();
+            using (var reopened = JobStore.Open(path))
+                foreach (var job in reopened.LoadAll()) history.Observe(job);
+            Assert.Equal(JobKind.Http, history.Preferred("generic", Both, Now, size, "https://media.example/watch"));
+            var invalid = Job("generic", JobKind.Http, true);
+            invalid.TotalBytes = size;
+            Assert.Null(MediaDeliveryHistory.EligibleElapsed(invalid, null));
+            Assert.Null(MediaDeliveryHistory.EligibleElapsed(invalid, TimeSpan.FromMilliseconds(10)));
+            invalid.Reason = "unverified-length";
+            Assert.Null(MediaDeliveryHistory.EligibleElapsed(invalid, TimeSpan.FromSeconds(2)));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 
     [Fact]

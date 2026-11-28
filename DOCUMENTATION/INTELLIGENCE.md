@@ -29,7 +29,9 @@ The configuration discovery component tolerates common structural changes but st
 | extension/vesper-model.js, intelligence/models | Shipped model artifacts, history for rollback, unpromoted candidates |
 | src/Vesper.Intelligence/SourceEvidence.cs | Source evidence, verification-budget ordering used by GenericAdapter, resource compatibility |
 
-Train, evaluate, promote and roll back with `scripts/train-intelligence.mjs` (`fit`, `promote`, `rollback`, `verify`); the controlled corpus and adapter-knowledge distillation live in `tools/intelligence`. The shipped models are conservative baselines (authored weights, validation-chosen thresholds) because no independent real labels exist yet; `promote` refuses synthetic-only candidates. See VESPER_INTELLIGENCE_COMPLETE_IMPLEMENTATION.md.
+Train, evaluate, promote and roll back with `scripts/train-intelligence.mjs` (`fit`, `review`, `promote`, `rollback`, `verify`); the controlled corpus and adapter-knowledge distillation live in `tools/intelligence`. The shipped models are conservative baselines (authored weights, validation-chosen thresholds) because no independent real labels exist yet; `promote` refuses synthetic-only candidates. See VESPER_INTELLIGENCE_COMPLETE_IMPLEMENTATION.md.
+
+Run `node scripts/train-intelligence.mjs review <reviewed-corpus.json>` before fitting or promoting to see independent-label coverage, missing chosen/ambiguous cases, missing site families, and active-model metrics on reviewed validation and holdout data. The report is read-only. The reviewer must independently establish labels and group related cases; the tool cannot certify their provenance. Promotion also requires a measured holdout improvement in correct decisions, errors, or calibration, without precision or recall regression.
 
 ## Offline learning, not production self-modification
 

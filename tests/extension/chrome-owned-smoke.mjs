@@ -199,6 +199,42 @@ async function main() {
       setTimeout(() => response.end(bytes), 600);
       return;
     }
+    if (playerRaceTest && request.url === '/worker-mse') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end(`<!doctype html><title>Dedicated worker fixture</title>
+        <video id="worker-player" width="640" height="360" muted controls autoplay></video>
+        <script>
+          window.workerFixture = { error: null };
+          const video = document.querySelector('video');
+          video.fixtureLibrary = { manifestUrl: 'https://fixture.invalid/first.mpd' };
+          const worker = new Worker('/worker-mse.js');
+          worker.onmessage = event => {
+            if (typeof event.data === 'string') workerFixture.error = event.data;
+            else video.srcObject = event.data;
+          };
+          worker.onerror = event => workerFixture.error = event.message;
+        </script>`);
+      return;
+    }
+    if (playerRaceTest && request.url === '/worker-mse.js') {
+      response.writeHead(200, { 'Content-Type': 'application/javascript' });
+      response.end(`const source = new MediaSource();
+        const handle = source.handle;
+        source.addEventListener('sourceopen', async () => {
+          try {
+            const buffer = source.addSourceBuffer('video/mp4; codecs="avc1.42c00a,mp4a.40.2"');
+            const bytes = await (await fetch('/asset-100001/clip.m4s')).arrayBuffer();
+            await new Promise((resolve, reject) => {
+              buffer.addEventListener('updateend', resolve, {once:true});
+              buffer.addEventListener('error', reject, {once:true});
+              buffer.appendBuffer(bytes);
+            });
+            source.endOfStream();
+          } catch (error) { postMessage(String(error)); }
+        }, {once:true});
+        postMessage(handle, [handle]);`);
+      return;
+    }
     if (request.url === '/mse-feed' || request.url === '/mse-prefetch') {
       const prefetch = request.url === '/mse-prefetch';
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -908,7 +944,7 @@ async function main() {
     await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
     await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
-    let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [];
+    let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [], workerDeclaration = null;
     if (playerRaceTest) {
       function findButton(...classNames) {
         return waitFor(async () => {
@@ -942,6 +978,68 @@ async function main() {
         await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
         await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
       }
+      // Actual MediaSourceHandle transferred from a dedicated worker. Only the
+      // native replies are simulated; no external manifest is contacted.
+      await evaluate('Isolate worker declaration lookup', `(() => {
+        globalThis.__workerMedia = { checks: [], submits: [] };
+        globalThis.__beforeWorkerRequest = nativeRequest;
+        nativeRequest = async (...args) => {
+          const message = args[0];
+          if (message.type === 'media-options' && message.url.endsWith('/worker-mse'))
+            return { ok:false, code:'no-media' };
+          if (message.type === 'media-source-options' && message.url.endsWith('/worker-mse')) {
+            __workerMedia.checks.push({ url:message.candidates[0].url, signed:!!message.authorized });
+            return { ok:true, data:{ mediaSession:crypto.randomUUID().replaceAll('-',''),
+              choices:[{index:0,label:'Original quality',container:'MP4'}] } };
+          }
+          if (message.type === 'media-select') {
+            __workerMedia.submits.push(message.mediaSession);
+            return {ok:true,results:[{status:'queued'}]};
+          }
+          return __beforeWorkerRequest(...args);
+        };
+      })()`);
+      await browser.send('Page.navigate', {url:'http://127.0.0.1:' + port + '/worker-mse'}, tab);
+      const handle = await waitFor(async () => {
+        const {result} = await browser.send('Runtime.evaluate', {expression:`(() => {
+          if (window.workerFixture?.error) return {error:workerFixture.error};
+          const v=document.querySelector('video');
+          if (!v || v.readyState<1 || !v.srcObject) return null;
+          v.dispatchEvent(new Event('vesper-youtube-identity-request',{bubbles:true}));
+          v.removeAttribute('data-vesper-media-provenance');
+          v.dispatchEvent(new Event('vesper-media-provenance-request',{bubbles:true}));
+          return {kind:v.srcObject.constructor.name, declaration:v.getAttribute('data-vesper-player-manifest'),
+            witness: v.getAttribute('data-vesper-media-provenance')};
+        })()`,returnByValue:true},tab);
+        return result.value;
+      },10000,'Dedicated worker media failed to load.');
+      assert.equal(handle.kind,'MediaSourceHandle',JSON.stringify(handle));
+      assert.equal(handle.declaration,'https://fixture.invalid/first.mpd');
+      assert.equal(handle.witness,null,'Worker data must not be represented as exact window provenance.');
+      await waitFor(() => flyShown(),5000,'Worker-backed player lost the butterfly.');
+      await clickButton('fly');
+      await findButton('opt');
+      assert.deepEqual(await evaluate('No unconfirmed manifest request','__workerMedia.checks'),[]);
+      await clickButton('opt');
+      await findButton('primary');
+      assert.deepEqual(await evaluate('Confirmed manifest request','__workerMedia.checks'),
+        [{url:'https://fixture.invalid/first.mpd',signed:false}]);
+      await clickWith('primary', "this.ownerDocument.querySelector('video').fixtureLibrary.manifestUrl='https://fixture.invalid/second.mpd'");
+      await delay(250);
+      assert.deepEqual(await evaluate('Changed declaration did not submit','__workerMedia.submits'),[]);
+      await waitFor(() => flyShown(),5000,'Worker player did not recover after the declaration changed.');
+      await clickButton('fly');
+      await findButton('opt');
+      await clickButton('opt');
+      await findButton('primary');
+      assert.deepEqual(await evaluate('Fresh declaration checked','__workerMedia.checks'),
+        [{url:'https://fixture.invalid/first.mpd',signed:false},{url:'https://fixture.invalid/second.mpd',signed:false}]);
+      await clickButton('primary');
+      await waitFor(async () => (await evaluate('Read worker submission','__workerMedia.submits.length'))===1,
+        5000,'Confirmed current declaration could not submit.');
+      workerDeclaration = {realHandle:true, noUnconfirmedProbe:true, staleSubmissions:0, currentSubmissions:1};
+      await evaluate('Restore native fixture routing','nativeRequest = __beforeWorkerRequest');
+
       await evaluate('Observe native verification for the prefetch fixture', `(() => {
         globalThis.__warmRequests = [];
         const request = nativeRequest;
@@ -1084,6 +1182,7 @@ async function main() {
       customAudioButterfly: true,
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
+      workerDeclaration,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
       nativeCapture, captureRace, managedDownloads, recycledPlayer, scrollHandoffs, shadowPlayers
     }) + '\n');

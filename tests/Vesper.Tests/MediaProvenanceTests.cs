@@ -146,6 +146,7 @@ public sealed class MediaProvenanceTests
                 raw.Open();
                 using var command = raw.CreateCommand();
                 command.CommandText = """
+                    ALTER TABLE jobs DROP COLUMN delivery_elapsed_ms;
                     ALTER TABLE jobs DROP COLUMN published_file_identity;
                     ALTER TABLE jobs DROP COLUMN final_resource_identity;
                     ALTER TABLE jobs DROP COLUMN pending_conversion_identity;
@@ -174,7 +175,8 @@ public sealed class MediaProvenanceTests
             Assert.Equal(retained.PartialIdentity, roundTrip.PartialIdentity);
             Assert.Equal(retained.FinalResourceIdentity, roundTrip.FinalResourceIdentity);
             Assert.Equal(retained.PublishedFileIdentity, roundTrip.PublishedFileIdentity);
-            Assert.Equal(11, JobStore.SchemaVersion);
+            Assert.Equal(12, JobStore.SchemaVersion);
+            Assert.Null(roundTrip.DeliveryElapsedMilliseconds);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }

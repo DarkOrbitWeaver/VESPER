@@ -438,6 +438,8 @@ public sealed partial class DownloadEngine : IDisposable
         JobState oldState = job.State;
         string oldMessage = job.Message;
         DateTime? oldRetry = job.NextRetryUtc;
+        long? oldElapsed = job.DeliveryElapsedMilliseconds;
+        job.DeliveryElapsedMilliseconds = null;
         job.State = JobState.Resolving;
         job.Message = "";
         job.NextRetryUtc = null;
@@ -448,6 +450,7 @@ public sealed partial class DownloadEngine : IDisposable
             job.State = oldState;
             job.Message = oldMessage;
             job.NextRetryUtc = oldRetry;
+            job.DeliveryElapsedMilliseconds = oldElapsed;
             _sessions.Remove(job.Id);
             session.Dispose();
             throw;
@@ -511,14 +514,14 @@ public sealed partial class DownloadEngine : IDisposable
                 string previousSourceUrl = job.SourceUrl;
                 DownloadJob updated = job.CopyForUpdate();
                 ApplyOutcome(updated, outcome, progressed);
+                updated.DeliveryElapsedMilliseconds = outcome.State == JobState.Completed
+                    ? MediaDeliveryHistory.EligibleElapsed(updated, elapsed) : null;
                 try
                 {
                     SaveLocked(updated);
                     job.ApplyPersistedState(updated);
                     ReconcileDuplicateCandidateLocked(job, wasCandidate, previousSourceUrl);
                     Changed(job);
-                    if (elapsed is { } duration && outcome.State == JobState.Completed)
-                        _mediaDeliveryHistory.ObserveTiming(job, duration);
                     LogRunEnd(job, outcome.Message);
                 }
                 catch (LocalStorageException ex)

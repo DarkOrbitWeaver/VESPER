@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { generate } from '../../tools/intelligence/corpus.mjs';
-import { validateCases, validateReviewIds, fitWeights, evaluate, promote, guardFailures } from '../../scripts/train-intelligence.mjs';
+import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures } from '../../scripts/train-intelligence.mjs';
 
 const context = vm.createContext({ URL });
 for (const name of ['vesper-intelligence.js', 'vesper-model.js', 'vesper-inference.js', 'vesper-planner.js'])
@@ -86,6 +86,22 @@ test('promotion review IDs prevent duplicated independent samples across or with
   assert.throws(() => validateReviewIds(data), /Repeated independent review caseId/);
   data.holdout[0].caseId = 'https://example.com/private';
   assert.throws(() => validateReviewIds(data), /Missing opaque independent review caseId/);
+});
+
+test('review coverage counts only independently labeled examples and reports missing coverage', () => {
+  const schema = 'vesper.player-intent/2';
+  const data = structuredClone(corpus.player);
+  const coverage = reviewCoverage(schema, data);
+  assert.equal(coverage.ready, false);
+  assert.equal(coverage.splits.holdout.independent, 0);
+  assert.equal(coverage.splits.holdout.missingChosen, 200);
+  const row = data.holdout.find(item => item.chosen !== null);
+  row.label = 'verified';
+  row.caseId = 'review_0001';
+  const reviewed = reviewCoverage(schema, data);
+  assert.equal(reviewed.splits.holdout.independent, 1);
+  assert.equal(reviewed.splits.holdout.missingChosen, 199);
+  assert.equal(reviewed.ready, false);
 });
 
 test('fitting is deterministic and respects sign constraints', () => {

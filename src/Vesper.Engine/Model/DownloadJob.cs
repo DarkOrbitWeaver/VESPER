@@ -114,6 +114,9 @@ public sealed class DownloadJob
     public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedUtc { get; set; } = DateTime.UtcNow;
     public DateTime? CompletedUtc { get; set; }
+    // Advisory measured active elapsed time, never used for integrity or resume.
+    // Null for resumed, capped, retried or unverified deliveries.
+    public long? DeliveryElapsedMilliseconds { get; set; }
 
     public int RetryCount { get; set; }
     public DateTime? NextRetryUtc { get; set; }
@@ -213,6 +216,7 @@ public sealed class DownloadJob
         CreatedUtc = saved.CreatedUtc;
         UpdatedUtc = saved.UpdatedUtc;
         CompletedUtc = saved.CompletedUtc;
+        DeliveryElapsedMilliseconds = saved.DeliveryElapsedMilliseconds;
         RetryCount = saved.RetryCount;
         NextRetryUtc = saved.NextRetryUtc;
         ETag = saved.ETag;

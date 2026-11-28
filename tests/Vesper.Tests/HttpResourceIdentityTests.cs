@@ -73,8 +73,9 @@ public sealed class HttpResourceIdentityTests
             {
                 connection.Open();
                 using SqliteCommand command = connection.CreateCommand();
-                command.CommandText = $"ALTER TABLE jobs DROP COLUMN pending_conversion_identity; " +
-                    $"ALTER TABLE jobs DROP COLUMN publication_copy_identity; PRAGMA user_version = {JobStore.SchemaVersion - 2};";
+                command.CommandText = "ALTER TABLE jobs DROP COLUMN delivery_elapsed_ms; " +
+                    "ALTER TABLE jobs DROP COLUMN pending_conversion_identity; " +
+                    "ALTER TABLE jobs DROP COLUMN publication_copy_identity; PRAGMA user_version = 9;";
                 command.ExecuteNonQuery();
             }
 

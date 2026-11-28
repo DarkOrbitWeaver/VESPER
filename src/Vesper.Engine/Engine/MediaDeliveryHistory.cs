@@ -52,20 +52,29 @@ internal sealed class MediaDeliveryHistory
             ? Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
                 System.Text.Encoding.UTF8.GetBytes(originKey + "\n" + provider + "\n" + mediaId)))
             : null;
-        if (_observations.TryGetValue(job.Id, out var previous)
-            && previous.Provider == provider && previous.OriginKey == originKey && previous.Kind == job.Kind
-            && previous.Completed == complete && previous.At == at && previous.AssetKey == assetKey)
-            return;
-        _observations[job.Id] = new(provider, originKey, job.Kind, complete, at, assetKey);
+        long bytes = 0;
+        double speed = 0;
+        if (complete && job.DeliveryElapsedMilliseconds is >= 250 and <= 604800000
+            && job.TotalBytes is long size && size >= 1024 * 1024)
+        {
+            bytes = size;
+            speed = size * 1000.0 / job.DeliveryElapsedMilliseconds.Value;
+        }
+        _observations[job.Id] = new(provider, originKey, job.Kind, complete, at, assetKey, bytes, speed);
     }
 
-    // An active, unrestricted native run is a performance observation, not a media identity label.
-    internal void ObserveTiming(DownloadJob job, TimeSpan elapsed)
+    // Store only real measured, unrestricted, verified completed media runs.
+    // The elapsed value piggybacks on the existing final job transaction.
+    internal static long? EligibleElapsed(DownloadJob job, TimeSpan? elapsed)
     {
-        if (!_observations.TryGetValue(job.Id, out var observation) || !observation.Completed
-            || observation.At != job.CompletedUtc || job.TotalBytes is not long bytes || bytes < 1024 * 1024
-            || elapsed.TotalMilliseconds < 250 || observation.BytesPerSecond > 0) return;
-        _observations[job.Id] = observation with { Bytes = bytes, BytesPerSecond = bytes / elapsed.TotalSeconds };
+        if (elapsed is not { } duration || duration.TotalMilliseconds < 250 || duration.TotalDays > 7
+            || job.State != JobState.Completed || job.CompletedUtc is null
+            || job.MediaProvider is not { Length: > 0 and <= 80 }
+            || job.Kind is not (JobKind.Http or JobKind.Hls or JobKind.Dash)
+            || job.Output != MediaOutput.Original || job.Reason == "unverified-length"
+            || job.PublishedSha256 is not { Length: 64 } digest || !digest.All(Uri.IsHexDigit)
+            || job.TotalBytes is not >= 1024 * 1024) return null;
+        return (long)duration.TotalMilliseconds;
     }
 
     internal void Forget(Guid id) => _observations.Remove(id);
