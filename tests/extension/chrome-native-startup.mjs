@@ -77,7 +77,7 @@ function send(method, params = {}, sessionId) {
 }
 async function evaluate(sessionId, expression) {
   const response = await send('Runtime.evaluate', {expression,returnByValue:true,awaitPromise:true}, sessionId);
-  if (response.exceptionDetails) throw Error(response.exceptionDetails.text);
+  if (response.exceptionDetails) throw Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text);
   return response.result?.value;
 }
 const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer']);
@@ -132,6 +132,10 @@ try {
     'chrome.runtime.sendNativeMessage=(_host,message,cb)=>{const key=crypto.randomUUID();void exchange({key,message}).then(cb,()=>cb({ok:false,code:"qa-error"})).finally(()=>exchange({key,close:true}).catch(()=>{}))};})();\n';
   const nativePath=join(ext,'native-session.js');
   await writeFile(nativePath,prelude+await readFile(nativePath,'utf8'));
+  const backgroundPath=join(ext,'background.js');
+  // Target discovery can precede completion of importScripts and top-level initialization.
+  // Signal only after the copied production worker has fully evaluated.
+  await writeFile(backgroundPath,(await readFile(backgroundPath,'utf8'))+'\n;globalThis.__vesperQaReady=true;\n');
   proc=spawn(chrome,['--headless=new','--enable-unsafe-extension-debugging','--no-first-run','--no-default-browser-check',
     '--disable-background-networking','--disable-default-apps','--window-size=1100,800','--user-data-dir='+profile,
     '--remote-debugging-port=0','--remote-allow-origins=*','about:blank'],{stdio:'ignore',windowsHide:true});
@@ -152,6 +156,7 @@ try {
   const workerTarget=await until(async()=> (await send('Target.getTargets')).targetInfos.find(t=>t.type==='service_worker'&&t.url.includes(loaded.id)));
   const worker=(await send('Target.attachToTarget',{targetId:workerTarget.targetId,flatten:true})).sessionId;
   await send('Runtime.enable',{},worker);
+  await until(()=>evaluate(worker,'globalThis.__vesperQaReady===true'),15000);
   const preflight=await evaluate(worker,"nativeRequest(envelope('hello'),12000)");
   assert(preflight?.ok,'QA transport preflight failed: '+JSON.stringify({preflight,relayEvents,browserErrors}));
   await evaluate(worker,'VesperNativeSession.close()');
