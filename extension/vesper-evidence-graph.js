@@ -315,6 +315,7 @@ globalThis.VesperEvidenceGraph = (() => {
       for(const track of tracks){
         const match=/^(audio|video)\/(mp4|webm)(?:;|$)/i.exec(track?.mimeType||'');
         if(!match||typeof track.id!=='string'||track.id.length>100||ids.has(track.id)
+          || !Number.isSafeInteger(track.revision)||track.revision<0
           || !['audio','video','muxed'].includes(track.role)||track.bufferedComplete!==true
           || track.ended!==true||track.timelineAdjusted!==false||track.hasInit!==true
           || !Number.isSafeInteger(track.retainedBytes)||track.retainedBytes<=0||track.retainedBytes>24*1024*1024

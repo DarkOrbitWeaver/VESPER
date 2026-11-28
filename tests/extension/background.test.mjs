@@ -3214,6 +3214,25 @@ test('out-of-order media callbacks cannot restore an obsolete ETag or CORS polic
   assert.equal(state.sources[0].conflictingValidator,true);
 });
 
+test('a contradictory current HTTP representation invalidates the picker and existing session', async () => {
+  const page='https://video.example/watch', url='https://cdn.example/movie.mp4', token='b'.repeat(32);
+  const sender={url:page,tab:{id:87},frameId:0,documentId:'changed-current-file'};
+  const app=load({'media-options':{ok:true,data:{mediaSession:token,choices:[{index:0}]}},'media-select':{ok:true}});
+  const seen=Date.now();
+  const base={url,tabId:87,frameId:0,documentId:sender.documentId,method:'GET',statusCode:200,type:'media'};
+  const report=(tag,timeStamp)=>app.onMedia({...base,timeStamp,responseHeaders:responseHeaders({
+    'Content-Type':'video/mp4','Content-Length':'700000',ETag:tag})});
+  const scope={pageUrl:page,playerPageUrl:page,playerUrl:url,playerKey:'player-1',generation:1,mediaChangedAt:seen};
+  try {
+    await report('"v1"',seen);
+    assert.equal((await app.message({type:'media-options',...scope},sender)).ok,true);
+    await report('"v2"',seen+1);
+    assert.equal((await app.message({type:'media-select',...scope,mediaSession:token,formatChoice:0,mode:'download'},sender)).ok,false);
+    assert.equal(app.sent.filter(r=>r.type==='media-select').length,0);
+    assert.equal((await app.message({type:'media-options',...scope,refresh:true},sender)).code,'source-changed');
+  } finally {app.stopWorker();}
+});
+
 test('preloaded blob media is admitted only by a recent exact witness in the same document', async () => {
   const page = 'https://video.example/feed';
   const sender = { url: page, tab: { id: 81 }, frameId: 0, documentId: 'preloaded-doc' };

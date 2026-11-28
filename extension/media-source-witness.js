@@ -485,6 +485,7 @@
   }
 
   function discardTrack(track) {
+    track.revision++;
     totalRetainedBytes -= track.retainedBytes;
     track.initBytes = null;
     track.initHasMedia = false;
@@ -608,6 +609,7 @@
         }
         const track = {
           id: 'sb-' + (++trackCounter),
+          revision: 0,
           mimeType: String(mimeType || ''),
           role: inferRole(mimeType),
           ownerRef: new WeakRef(this),
@@ -675,6 +677,8 @@
       const res = apply(original, this, [data, ...rest]);
       try {
         if (!track) return res;
+        // Even an equal-length replacement invalidates an open export snapshot.
+        track.revision++;
         const rawBytes = ArrayBuffer.isView(data)
           ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
           : data instanceof ArrayBuffer ? new Uint8Array(data) : null;
@@ -874,6 +878,7 @@
           const bufferedComplete = Boolean(completeTrack(player, track));
           tracks.push({
             id: track.id,
+            revision: track.revision,
             role: track.role,
             mimeType: track.container ? (track.role === 'audio' ? 'audio/' : 'video/') + track.container : track.mimeType,
             hasInit: Boolean(track.initBytes),
@@ -906,8 +911,17 @@
       const req = JSON.parse(reqText);
       const msState = mediaSourceState(player);
       if (!msState) return;
-      const track = [...msState.tracks].find(t => t.id === req.trackId);
-      if (!track || req.length !== track.retainedBytes || !completeTrack(player, track)) return;
+      const active = [...msState.tracks].filter(activeBuffer);
+      if (!Array.isArray(req.tracks) || req.tracks.length !== active.length || active.length < 1 || active.length > 2
+          || new Set(req.tracks.map(t => t?.id)).size !== active.length
+          || !active.every(t => req.tracks.some(expected => expected?.id === t.id
+            && expected.revision === t.revision && expected.length === t.retainedBytes) && completeTrack(player, t))) return;
+      if (req.validateOnly === true) {
+        player.setAttribute('data-vesper-mse-export-chunk', JSON.stringify({ valid: true }));
+        return;
+      }
+      const track = active.find(t => t.id === req.trackId);
+      if (!track) return;
 
       const partCount = 1 + track.chunks.length;
       const index = req.partIndex;

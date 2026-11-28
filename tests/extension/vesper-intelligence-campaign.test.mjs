@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { generate } from '../../tools/intelligence/corpus.mjs';
-import { validateCases, validateReviewIds, reviewCoverage, fitWeights, evaluate, promote, guardFailures, wilsonInterval, pairedSafety, pairedFamilyRecall } from '../../scripts/train-intelligence.mjs';
+import { validateCases, validateReviewIds, reviewCoverage, fitReviewedSchema, fitWeights, evaluate, promote, guardFailures, wilsonInterval, pairedSafety, pairedFamilyRecall } from '../../scripts/train-intelligence.mjs';
 
 const context = vm.createContext({ URL });
 for (const name of ['vesper-intelligence.js', 'vesper-model.js', 'vesper-inference.js', 'vesper-planner.js'])
@@ -110,6 +110,23 @@ test('review coverage counts only independently labeled examples and reports mis
   assert.equal(reviewed.splits.holdout.independent, 1);
   assert.equal(reviewed.splits.holdout.missingChosen, 199);
   assert.equal(reviewed.ready, false);
+});
+
+test('reviewed fitting refuses singleton-only data even if evaluation coverage is large', () => {
+  const make = (split, n, ambiguous = 0) => Array.from({length:n+ambiguous}, (_, i) => ({
+    group: split+'-'+i%10, label:'verified', caseId:split+'_case_'+i, programId:split+'_program_'+i,
+    sessionId:split+'_session_'+i, chosen:i<n?'a':null, candidates:[{id:'a',area:1000,ready:true}]
+  }));
+  const partitions = {train:make('train',20),validation:make('validation',200,30),holdout:make('holdout',200,30)};
+  const schema = 'vesper.player-intent/2';
+  const coverage = reviewCoverage(schema, partitions);
+  assert.equal(coverage.splits.validation.ready, true);
+  assert.equal(coverage.splits.holdout.ready, true);
+  assert.equal(coverage.training.informativePairs, 0);
+  assert.equal(coverage.ready, false);
+  assert.equal(fitReviewedSchema(schema, partitions, '2.1.0-reviewed', I.BASELINES[schema], 'fixture').fitted, false);
+  partitions.train[0].candidates.push({id:'b',area:500,ready:false});
+  assert.equal(reviewCoverage(schema, partitions).training.informativePairs, 1);
 });
 
 test('family paired recall exposes regressions hidden by a larger family', () => {

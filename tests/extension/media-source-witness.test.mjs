@@ -32,6 +32,7 @@ function setup() {
   class Player {
     constructor(src) { this.currentSrc = src; this.attributes = new Map(); this.tagName = 'VIDEO'; this.readyState = 4; }
     setAttribute(key, value) { this.attributes.set(key, value); }
+    getAttribute(key) { return this.attributes.get(key); }
     removeAttribute(key) { this.attributes.delete(key); }
   }
   class FetchResponse {
@@ -54,7 +55,7 @@ function setup() {
     get response() { return this.value; }
     getResponseHeader(name) { return name === 'content-type' ? 'video/mp4' : ''; }
   }
-  const context = vm.createContext({ URL: WitnessURL, MediaSource: Source, SourceBuffer: Buffer,
+  const context = vm.createContext({ URL: WitnessURL, MediaSource: Source, SourceBuffer: Buffer, btoa,
     HTMLMediaElement: Player, Response: FetchResponse, XMLHttpRequest: Xhr, WeakRef, ArrayBuffer, Blob,
     Date: class extends Date { static now() { return time; } },
     document: { addEventListener: (type, fn) => listeners.set(type, fn) } });
@@ -73,7 +74,13 @@ function setup() {
     listeners.get('vesper-youtube-identity-request')({target:el});
     return el.attributes.get('data-vesper-player-manifest');
   };
-  return {player, declaration, request: el => provenance(el).paths, provenance, FetchResponse, Xhr, WitnessURL, MediaSource: Source, Player, context,
+  const exportChunk = (el, query) => {
+    el.removeAttribute('data-vesper-mse-export-chunk');
+    el.setAttribute('data-vesper-mse-export-query', JSON.stringify(query));
+    listeners.get('vesper-mse-export-request')({target:el});
+    return JSON.parse(el.getAttribute('data-vesper-mse-export-chunk') || 'null');
+  };
+  return {player, declaration, request: el => provenance(el).paths, provenance, exportChunk, FetchResponse, Xhr, WitnessURL, MediaSource: Source, Player, context,
     advance: ms => time += ms};
 }
 
@@ -124,6 +131,33 @@ test('open, timestamp-adjusted, window-clipped and sequence-mode MSE tracks cann
     buffer.appendBuffer(box('mdat'));
     assert.equal(b.provenance(el).tracks[0].bufferedComplete,false,mutation);
   }
+});
+
+test('export snapshot rejects equal-length replacement and added or removed active tracks', () => {
+  const b=setup(), {source,el,buffer}=b.player();
+  el.duration=10;el.buffered=buffer.buffered;
+  const box=type=>Uint8Array.of(0,0,0,8,...[...type].map(c=>c.charCodeAt(0)));
+  const init=Uint8Array.of(...box('ftyp'),...box('moov'));
+  const append=(track)=>{track.appendBuffer(init);track.appendBuffer(box('mdat'));};
+  const snapshot=()=>b.provenance(el).tracks.map(t=>({id:t.id,revision:t.revision,length:t.retainedBytes}));
+  append(buffer);
+  const before=snapshot();
+  assert.equal(b.exportChunk(el,{tracks:before,validateOnly:true}).valid,true);
+  assert.ok(b.exportChunk(el,{tracks:before,trackId:before[0].id,partIndex:0,subOffset:0}).chunk);
+  buffer.remove(0,Infinity);
+  buffer.buffered={length:0};append(buffer);
+  buffer.buffered=el.buffered;
+  const after=snapshot();
+  assert.equal(after[0].length,before[0].length);
+  assert.notEqual(after[0].revision,before[0].revision);
+  assert.equal(b.exportChunk(el,{tracks:before,validateOnly:true}),null);
+  assert.equal(b.exportChunk(el,{tracks:after,validateOnly:true}).valid,true);
+  const audio=source.addSourceBuffer('audio/mp4');append(audio);
+  assert.equal(b.exportChunk(el,{tracks:after,validateOnly:true}),null);
+  const both=snapshot();
+  assert.equal(b.exportChunk(el,{tracks:both,validateOnly:true}).valid,true);
+  source.removeSourceBuffer(audio);
+  assert.equal(b.exportChunk(el,{tracks:both,validateOnly:true}),null);
 });
 
 test('exact response buffer is associated with only the SourceBuffer that receives it', async () => {

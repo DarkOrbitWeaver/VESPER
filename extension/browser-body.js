@@ -419,7 +419,8 @@ globalThis.VesperBrowserBody = (() => {
   // identified browser document are accepted. Native provenance is derived here.
   // Export already-buffered MSE SourceBuffer tracks (1 or 2 tracks) directly from MAIN world into native remuxer!
   async function exportMseBuffer({ player, tracks, title, pageUrl, signal, onProgress = () => {},
-    connect = options => chrome.runtime.connect(options) }) {
+    isCurrent = () => true, connect = options => chrome.runtime.connect(options),
+    queryReceipt = transferId => chrome.runtime.sendMessage({ type: 'browser-body-status', transferId }) }) {
     if (!player || !Array.isArray(tracks) || tracks.length < 1 || tracks.length > 2)
       throw new Error('No buffered MSE tracks available.');
     const isWebm = tracks.every(t => String(t.mimeType || '').toLowerCase().includes('webm'));
@@ -433,6 +434,34 @@ globalThis.VesperBrowserBody = (() => {
       length: t.retainedBytes
     }));
 
+    const snapshot = tracks.map(t => ({ id: t.id, revision: t.revision, length: t.retainedBytes }));
+    if (snapshot.some(t => typeof t.id !== 'string' || !Number.isSafeInteger(t.revision) || t.revision < 0))
+      throw new Error('Refresh the playback copy before downloading.');
+    // A changed revision is not permission to retry an uncertain publication.
+    const receiptKey = JSON.stringify(['mse', pageUrl, snapshot.map(t => t.id)]);
+    const prior = pendingReceipts.get(receiptKey);
+    if (prior) {
+      const accepted = await resolveReceipt(queryReceipt, prior);
+      if (!accepted) throw uncertainFinish();
+      pendingReceipts.delete(receiptKey);
+      return accepted;
+    }
+    if (pendingReceipts.size >= MAX_PENDING_RECEIPTS) throw uncertainFinish();
+    function readSnapshot(query) {
+      if (signal?.aborted || !isCurrent()) throw new Error('The selected playback changed.');
+      player.removeAttribute('data-vesper-mse-export-chunk');
+      player.setAttribute('data-vesper-mse-export-query', JSON.stringify({ ...query, tracks: snapshot }));
+      try {
+        player.dispatchEvent(new Event('vesper-mse-export-request', { bubbles: true, composed: true }));
+        const raw = player.getAttribute('data-vesper-mse-export-chunk');
+        if (!raw) throw new Error('MSE buffer is no longer available in the player.');
+        return JSON.parse(raw);
+      } finally {
+        player.removeAttribute('data-vesper-mse-export-query');
+        player.removeAttribute('data-vesper-mse-export-chunk');
+      }
+    }
+    if (!readSnapshot({ validateOnly: true }).valid) throw new Error('The selected playback changed.');
     const channel = openChannel(connect, signal);
     let transferId = null, finishing = false, sent = 0;
     const unanswered = [];
@@ -472,24 +501,16 @@ globalThis.VesperBrowserBody = (() => {
 
       for (let ti = 0; ti < tracks.length; ti++) {
         activeTrackIdx = ti;
+        const trackStart = sent;
         let partIndex = 0, subOffset = 0;
         while (true) {
-          if (signal?.aborted) throw new Error('MSE export cancelled.');
-          player.removeAttribute('data-vesper-mse-export-chunk');
-          player.setAttribute('data-vesper-mse-export-query', JSON.stringify({
-            trackId: tracks[ti].id, length: tracks[ti].retainedBytes, partIndex, subOffset
-          }));
-          player.dispatchEvent(new Event('vesper-mse-export-request', { bubbles: true, composed: true }));
-          const raw = player.getAttribute('data-vesper-mse-export-chunk');
-          player.removeAttribute('data-vesper-mse-export-chunk');
-          if (!raw) throw new Error('MSE buffer is no longer available in the player.');
-          const parsed = JSON.parse(raw);
+          const parsed = readSnapshot({ trackId: tracks[ti].id, partIndex, subOffset });
           if (parsed.done || typeof parsed.chunk !== 'string' || parsed.chunk.length > 524288
               || !Number.isSafeInteger(parsed.nextPartIndex) || !Number.isSafeInteger(parsed.nextSubOffset)
               || parsed.nextPartIndex !== partIndex + 1 && (parsed.nextPartIndex !== partIndex || parsed.nextSubOffset <= subOffset))
             throw new Error('The MSE buffer changed during the copy.');
           const bytes = decodeBase64(parsed.chunk);
-          if (bytes.length < 1 || sent + used + bytes.length > totalEstimate)
+          if (bytes.length < 1 || sent + used + bytes.length - trackStart > snapshot[ti].length)
             throw new Error('The MSE buffer changed during the copy.');
           for (let start = 0; start < bytes.length;) {
             const count = Math.min(CHUNK - used, bytes.length - start);
@@ -503,16 +524,28 @@ globalThis.VesperBrowserBody = (() => {
           if (parsed.finishedAfterThis) break;
         }
         await flush(activeTrackIdx);
+        if (sent - trackStart !== snapshot[ti].length) throw new Error('The MSE track ended early.');
       }
 
       while (unanswered.length) await unanswered.shift();
+      if (sent !== totalEstimate || !readSnapshot({ validateOnly: true }).valid)
+        throw new Error('The selected playback changed before publication.');
       finishing = true;
       const done = await channel.send({ operation: 'finish' });
-      if (!done.accepted || done.offset !== totalEstimate || sent !== totalEstimate || typeof done.jobId !== 'string')
+      if (!done.accepted || done.offset !== totalEstimate || typeof done.jobId !== 'string')
         throw new Error('VESPER did not confirm the MSE stream.');
       return done;
     } catch (error) {
-      if (finishing && error.code !== 'invalid-media') throw uncertainFinish();
+      if (finishing && transferId && error?.code !== 'invalid-media') {
+        const receipt = { transferId, length: sent };
+        pendingReceipts.set(receiptKey, receipt);
+        const accepted = await resolveReceipt(queryReceipt, receipt);
+        if (accepted) {
+          pendingReceipts.delete(receiptKey);
+          return accepted;
+        }
+        throw uncertainFinish();
+      }
       if (!finishing && transferId && !signal?.aborted) await channel.send({ operation: 'abort' }).catch(() => {});
       throw error;
     } finally {

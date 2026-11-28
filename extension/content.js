@@ -2228,7 +2228,10 @@
       };
       const options = { title, signal: controller.signal, onProgress };
       if (formats.mseExportTracks) {
-        await VesperBrowserBody.exportMseBuffer({ ...options, player, tracks: formats.mseExportTracks });
+        const isCurrent = () => playback.get(player) === binding && matchesPickerPlayer(copy.panelMedia)
+          && copy.panelMedia.documentIdentity === VesperPlayerSource.identity(pageAddress());
+        await VesperBrowserBody.exportMseBuffer({ ...options, player, tracks: formats.mseExportTracks,
+          pageUrl: copy.panelMedia.pageUrl, isCurrent });
       } else if (formats.browserBodyProof?.workerFetch) {
         const witness = playerFragmentWitness(player, binding);
         await VesperBrowserBody.copyWorkerMedia({ ...options, player: {

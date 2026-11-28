@@ -456,8 +456,15 @@ async function matchesFormatEvidence(guard, message, sender) {
   if (!await refreshNeverCaptureHosts() || matchesNeverCaptureHost({url:mediaPage(message, sender)?.href,referrer:sender.url})) return false;
   if (guard.kind === 'page') {
     const url = VesperPlayerSource.http(message.playerUrl);
-    return (!url || !matchesNeverCaptureHost({url:url.href,referrer:sender.url}))
-      && (guard.expiresAt == null || guard.expiresAt > Date.now());
+    if ((url && matchesNeverCaptureHost({url:url.href,referrer:sender.url}))
+        || (guard.expiresAt != null && guard.expiresAt <= Date.now())) return false;
+    if (!url || !sender.documentId) return !guard.currentResource;
+    const state = await tabState(sender.tab.id);
+    const current = state.sources.find(item => item.url === url.href && item.documentId === sender.documentId
+      && (item.frameId ?? 0) === (sender.frameId ?? 0));
+    if (current?.conflictingValidator) return false;
+    return !guard.currentResource || !!current
+      && await evidenceDigest(evidenceSignature(current)) === guard.currentResource;
   }
   if (guard.kind === 'worker-declaration') {
     const url = VesperPlayerSource.http(message.manifestUrl);
@@ -1652,6 +1659,9 @@ async function playerOptions(message, sender) {
       && source.seen >= now - sourceLifetime(source) && source.seen <= now + 1000;
     const observed = url => state.sources.find(s => currentEvidence(s) && s.seen >= directCutoff && s.url === url.href);
     const matching = source ? observed(source) : null;
+    if (matching?.conflictingValidator || (source && (VesperEvidenceGraph.expiresAt(source.href) ?? Infinity) <= now))
+      return prefetch ? { ok:true, data:{prefetchSkipped:true} }
+        : { ok:false, code:'source-changed', message:'The current playback resource changed. Refresh the video before trying again.' };
     const candidate = url => {
       const evidence = observed(url);
       return { url: url.href, kind: evidence?.kind || VesperPlayerSource.kind(url.href), mimeType: evidence?.mime || undefined };
@@ -1842,11 +1852,12 @@ async function playerOptions(message, sender) {
     const pageKey = lookupKey + '|' + JSON.stringify([pageInput.candidates, pageInput.pageTitle]);
     const pageLookup = async () => {
       const lookup = () => nativeRequest(envelope('media-options', pageInput), 60000);
-      const checkedPage = result => {
+      const checkedPage = async result => {
         const reply = forCurrentPlayer(result);
         pageOutcome = mediaLookupTrace(reply);
         return withFormatEvidence(reply, { kind: 'page', signed: auth.authorized === true,
-          expiresAt: source ? VesperEvidenceGraph.expiresAt(source.href) : null });
+          expiresAt: source ? VesperEvidenceGraph.expiresAt(source.href) : null,
+          ...(matching ? { currentResource: await evidenceDigest(evidenceSignature(matching)) } : {}) });
       };
       if (auth.authorized || message.refresh === true)
         return checkedPage(await lookup());

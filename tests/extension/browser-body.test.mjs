@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createHash, webcrypto } from 'node:crypto';
 import vm from 'node:vm';
 
-const context = vm.createContext({ URL, Uint8Array, btoa, crypto: webcrypto, Date,
+const context = vm.createContext({ URL, Uint8Array, btoa, atob, Event, crypto: webcrypto, Date,
   Number, String, Math, Set, Map, setTimeout, clearTimeout, AbortController });
 for (const name of ['vesper-intelligence', 'browser-body'])
   vm.runInContext(readFileSync(new URL(`../../extension/${name}.js`, import.meta.url), 'utf8'), context);
@@ -82,6 +82,40 @@ test('same-origin finite blob streams byte-exact chunks through both sides of th
   assert.deepEqual(b.messages.map(message => message.operation), ['begin', ...Array(Math.ceil(source.length / body.CHUNK)).fill('append'), 'finish']);
   assert.deepEqual(progress.at(-1), [source.length, source.length]);
   assert.equal(b.messages.some(message => 'cookie' in message || 'authorization' in message || 'path' in message), false);
+});
+
+function msePlayer(id, bytes) {
+  const attributes=new Map();
+  let valid=true;
+  const tracks=[{id,revision:1,role:'muxed',mimeType:'video/mp4',retainedBytes:bytes.length}];
+  const player={
+    removeAttribute:k=>attributes.delete(k),setAttribute:(k,v)=>attributes.set(k,v),getAttribute:k=>attributes.get(k),
+    dispatchEvent(){
+      const query=JSON.parse(attributes.get('data-vesper-mse-export-query'));
+      if(!valid||query.tracks.length!==1||query.tracks[0].id!==id||query.tracks[0].revision!==1)return;
+      const data=query.validateOnly?{valid:true}:{chunk:Buffer.from(bytes).toString('base64'),nextPartIndex:1,nextSubOffset:0,finishedAfterThis:true};
+      attributes.set('data-vesper-mse-export-chunk',JSON.stringify(data));
+    }
+  };
+  return {player,tracks,invalidate:()=>valid=false};
+}
+
+test('MSE copy checks exact snapshot before publication and recovers a lost finish receipt',async()=>{
+  const bytes=source.slice(0,2048);
+  const complete=msePlayer('retained-complete',bytes), b=bridge();
+  const result=await body.exportMseBuffer({...complete,title:'Fixture',pageUrl:origin+'/watch',connect:b.connect});
+  assert.equal(result.jobId,'native-job-12345');
+  assert.deepEqual(Buffer.concat(b.chunks),Buffer.from(bytes));
+  const stale=msePlayer('retained-stale',bytes), aborted=bridge();
+  await assert.rejects(body.exportMseBuffer({...stale,title:'Fixture',pageUrl:origin+'/watch',connect:aborted.connect,
+    onProgress:()=>stale.invalidate()}),/MSE buffer/);
+  assert.equal(aborted.messages.some(x=>x.operation==='finish'),false);
+  assert.equal(aborted.messages.some(x=>x.operation==='abort'),true);
+  const lost=msePlayer('retained-lost',bytes), drop=bridge({loseFinish:true});
+  let queries=0;
+  const receipt=async()=>{queries++;return {ok:true,data:{accepted:true,offset:bytes.length,jobId:'existing-mse'}};};
+  const accepted=await body.exportMseBuffer({...lost,title:'Fixture',pageUrl:origin+'/watch',connect:drop.connect,queryReceipt:receipt});
+  assert.equal(accepted.jobId,'existing-mse');assert.equal(queries,1);
 });
 
 test('worker copy accepts a complete CDN body and rejects an unverified partial response', async () => {

@@ -2,6 +2,7 @@
 // This script cannot load websites or authorize downloads. Runtime never retrains itself.
 //   node scripts/train-intelligence.mjs fit [corpus.json] [outDir]
 //   node scripts/train-intelligence.mjs review <reviewed-corpus.json>
+//   node scripts/train-intelligence.mjs fit-reviewed <reviewed-corpus.json> <outDir>
 //   node scripts/train-intelligence.mjs promote <model.json> <reviewed-corpus.json>
 //   node scripts/train-intelligence.mjs rollback <schema>
 //   node scripts/train-intelligence.mjs verify
@@ -368,14 +369,26 @@ export function reviewCoverage(schema, partitions) {
       missingFamilies: Math.max(0, 10 - families),
       ready: independent.length === rows.length && chosen >= 200 && ambiguous >= 30 && families >= 10 };
   }
-  return { splits, ready: splits.validation.ready && splits.holdout.ready };
+  const train = partitions.train.filter(row => row.label === 'verified' || row.label === 'user');
+  let informativePairs = 0, competingCases = 0;
+  const families = new Set();
+  for (const row of train) {
+    if (row.chosen === null) continue;
+    const v = vectors(schema, row), chosen = v.get(row.chosen);
+    if (!chosen) continue;
+    const pairs = [...v].filter(([id, other]) => id !== row.chosen && other.some((x, i) => x !== chosen[i])).length;
+    if (pairs) { informativePairs += pairs; competingCases++; families.add(row.group.toLowerCase()); }
+  }
+  const training = { informativePairs, competingCases, families: families.size,
+    ready: train.length === partitions.train.length && informativePairs > 0 };
+  return { splits, training, ready: training.ready && splits.validation.ready && splits.holdout.ready };
 }
 
 export function promotionEvaluation(model, partitions, baseline) {
   Inference.validateModel(model);
   const coverage = reviewCoverage(model.schema, partitions);
   if (!coverage.ready)
-    throw Error('Refusing to promote without sufficient independent real labels: ' + JSON.stringify(coverage.splits));
+    throw Error('Refusing to promote without sufficient independent real labels: ' + JSON.stringify(coverage));
   const rank = Inference.createRanker(model).rank;
   const previous = Inference.createRanker(baseline).rank;
   const gates = {};
@@ -403,6 +416,22 @@ export function promotionEvaluation(model, partitions, baseline) {
   if (failures.length || Object.values(gates).some(gate => !gate.passed))
     throw Error('Promotion gates failed: ' + JSON.stringify({ gates, failures }));
   return gates;
+}
+
+// Independent fitting never uses fixture or weak labels, and does not tune on holdout.
+export function fitReviewedSchema(schema, partitions, version, baseline, corpusSha256) {
+  const coverage = reviewCoverage(schema, partitions);
+  if (!coverage.ready) return { schema, coverage, fitted: false, promotable: false };
+  const weights = fitWeights(schema, partitions.train);
+  const cal = calibrate(schema, weights, partitions.validation);
+  const model = { ...seal(schema, weights, cal.temperature, cal.margin, cal.minConfidence, version),
+    provenance: { labels: 'reviewed-independent-corpus', corpusSha256, independentRealLabels: partitions.holdout.length } };
+  try {
+    const evaluation = promotionEvaluation(model, partitions, baseline);
+    return { schema, coverage, fitted: true, promotable: true, model, evaluation };
+  } catch (error) {
+    return { schema, coverage, fitted: true, promotable: false, reason: error.message };
+  }
 }
 
 export function promote(path, { corpusPath } = {}) {
@@ -468,6 +497,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const report = { corpus: { schema: corpus.schema, seed: corpus.seed, holdoutArchetypes: corpus.holdoutArchetypes }, player, source };
     writeFileSync(`${out}/report.json`, JSON.stringify(report, null, 1) + '\n');
     console.log(JSON.stringify({ out, player: { holdout: player.holdout, gates: player.gates }, source: { holdout: source.holdout, gates: source.gates } }, null, 1));
+  } else if (command === 'fit-reviewed') {
+    if (!args[1]) throw Error('Specify a separate candidate output directory');
+    const { data: corpus, sha256 } = boundedJson(args[0], 32 * 1024 * 1024);
+    const models = activeModels(), report = {};
+    for (const [kind, schema, version] of [['player', 'vesper.player-intent/2', '2.1.0-reviewed'], ['source', 'vesper.source-association/1', '1.1.0-reviewed']]) {
+      report[kind] = fitReviewedSchema(schema, corpus[kind], version, models[schema], sha256);
+    }
+    mkdirSync(args[1], { recursive: true });
+    for (const result of Object.values(report)) if (result.promotable)
+      writeFileSync(`${args[1]}/${SCHEMA_FILES[result.schema]}-reviewed.json`, JSON.stringify(result.model, null, 1) + '\n', { flag: 'wx' });
+    writeFileSync(`${args[1]}/reviewed-report.json`, JSON.stringify({ corpusSha256: sha256, ...report }, null, 1) + '\n', { flag: 'wx' });
+    console.log(JSON.stringify(report, null, 2));
+    if (Object.values(report).some(result => !result.promotable)) process.exitCode = 2;
   } else if (command === 'review') {
     const { data: corpus } = boundedJson(args[0], 32 * 1024 * 1024);
     const models = activeModels(), report = {};

@@ -75,7 +75,9 @@ public sealed class BrowserStartupBenchmarkTests
                 using var result = JsonDocument.Parse(await File.ReadAllTextAsync(start.Environment["VESPER_QA_RESULT"]!, ct));
                 var rows = result.RootElement.GetProperty("rows").EnumerateArray().ToArray();
                 bool publicMedia = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_MEDIA") == "1";
-                Assert.Equal(publicMedia ? 0 : 12, rows.Length);
+                bool retainedMedia = Environment.GetEnvironmentVariable("VESPER_QA_RETAINED_MEDIA") == "1";
+                Assert.False(publicMedia && retainedMedia);
+                Assert.Equal(publicMedia || retainedMedia ? 0 : 12, rows.Length);
                 byte[] expected = new byte[256 * 1024];
                 for (int i = 0; i < expected.Length; i++) expected[i] = (byte)(i * 31 + (i >> 8));
                 var ids = new HashSet<Guid>();
@@ -152,8 +154,52 @@ public sealed class BrowserStartupBenchmarkTests
                         }));
                     }
                 }
-                Assert.Equal(rows.Length + mediaRows.Length, engine.Snapshots().Count);
-                Assert.Equal(rows.Length + mediaRows.Length, Directory.GetFiles(downloads).Length);
+                var retainedRows = result.RootElement.GetProperty("retainedRows").EnumerateArray().ToArray();
+                Assert.Equal(retainedMedia ? 1 : 0, retainedRows.Length);
+                foreach (var row in retainedRows)
+                {
+                    Guid id = row.GetProperty("jobId").GetGuid();
+                    Assert.True(ids.Add(id));
+                    JobSnapshot? snapshot;
+                    while (true)
+                    {
+                        snapshot = engine.Snapshot(id);
+                        Assert.NotNull(snapshot);
+                        if (snapshot.State is JobState.Completed or JobState.Failed or JobState.NeedsAttention or JobState.NeedsLink) break;
+                        await Task.Delay(25, ct);
+                    }
+                    Assert.True(snapshot.State == JobState.Completed, $"{snapshot.State}: {snapshot.Reason} {snapshot.Message}");
+                    string repo = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(script)!, "..", ".."));
+                    using var input = File.OpenRead(Path.Combine(repo, "tests", "Vesper.Tests", "Fixtures", "Media", "instinct-mse.mp4"));
+                    using var output = File.OpenRead(snapshot.FinalPath!);
+                    var original = Mp4Demuxer.Read(input, input.Length, ct).OrderBy(t => t.Kind).ToArray();
+                    var actual = Mp4Demuxer.Read(output, output.Length, ct).OrderBy(t => t.Kind).ToArray();
+                    Assert.Equal(original.Length, actual.Length);
+                    Assert.Contains(actual, t => t.Kind == TrackKind.Video);
+                    Assert.Contains(actual, t => t.Kind == TrackKind.Audio);
+                    int samples = 0;
+                    for (int i = 0; i < original.Length; i++)
+                    {
+                        var a = original[i]; var b = actual[i];
+                        Assert.Equal(a.Kind, b.Kind);
+                        Assert.Equal(a.Codec, b.Codec);
+                        Assert.Equal(a.Samples.Count, b.Samples.Count);
+                        for (int n = 0; n < a.Samples.Count; n++)
+                        {
+                            var x = a.Samples[n]; var y = b.Samples[n];
+                            Assert.Equal(x.Size, y.Size);
+                            byte[] left = new byte[x.Size], right = new byte[y.Size];
+                            input.Position = x.Offset; input.ReadExactly(left);
+                            output.Position = y.Offset; output.ReadExactly(right);
+                            Assert.Equal(left, right);
+                            samples++;
+                        }
+                    }
+                    Console.WriteLine("RETAINED_BROWSER_MEDIA " + JsonSerializer.Serialize(new { samples,
+                        inputBytes = input.Length, outputBytes = output.Length, tracks = actual.Length, verified = true }));
+                }
+                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length, engine.Snapshots().Count);
+                Assert.Equal(rows.Length + mediaRows.Length + retainedRows.Length, Directory.GetFiles(downloads).Length);
                 Assert.Equal(0, result.RootElement.GetProperty("chromeDownloads").GetInt32());
             }
             finally { bridge.CloseResolver(); }

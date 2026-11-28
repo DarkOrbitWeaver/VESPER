@@ -31,8 +31,11 @@ async function until(fn, limit = 10000) {
   throw Error('Fixture deadline');
 }
 
-const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [], relayEvents = [], browserErrors = [];
+const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [], retainedRows = [], relayEvents = [], browserErrors = [];
 const publicMedia = process.env.VESPER_QA_PUBLIC_MEDIA === '1';
+const retainedMedia = process.env.VESPER_QA_RETAINED_MEDIA === '1';
+assert(!(publicMedia && retainedMedia));
+const retainedBytes = retainedMedia ? await readFile(join(root,'tests/Vesper.Tests/Fixtures/Media/instinct-mse.mp4')) : null;
 let proc, socket, server, seq = 0, active, chromeDownloads = 0;
 const pending = new Map();
 function openHost(key) {
@@ -81,7 +84,7 @@ async function evaluate(sessionId, expression) {
   return response.result?.value;
 }
 const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer']);
-if (publicMedia) for (const type of ['media-options','media-source-options','media-select','media-selection-status','browser-diagnostics']) allowed.add(type);
+if (publicMedia || retainedMedia) for (const type of ['media-options','media-source-options','media-select','media-selection-status','browser-diagnostics','browser-body']) allowed.add(type);
 try {
   await mkdir(chromeFolder,{recursive:true});
   await cp(join(root,'extension'),ext,{recursive:true});
@@ -89,6 +92,30 @@ try {
     try {
       const url = new URL(req.url,'http://127.0.0.1');
       const name = url.searchParams.get('name');
+      if (retainedMedia && url.pathname === '/retained-sw.js') {
+        res.writeHead(200,{'Content-Type':'text/javascript','Cache-Control':'no-store'});
+        return res.end("self.addEventListener('install',e=>e.waitUntil(self.skipWaiting()));self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));");
+      }
+      if (retainedMedia && url.pathname === '/retained-mse') {
+        res.writeHead(200,{'Content-Type':'text/html','Cache-Control':'no-store'});
+        return res.end(`<!doctype html><title>Retained playback fixture</title><video width="640" height="360" controls muted autoplay></video><script>
+          window.retained={ready:false,error:null};
+          (async()=>{
+            // The real service-worker guard takes the browser-context route;
+            // never relax the native resolver's private-network policy.
+            await navigator.serviceWorker.register('/retained-sw.js');
+            await navigator.serviceWorker.ready;
+            if(!navigator.serviceWorker.controller)await new Promise(resolve=>navigator.serviceWorker.addEventListener('controllerchange',resolve,{once:true}));
+            const video=document.querySelector('video'),ms=new MediaSource();
+            video.src=URL.createObjectURL(ms);
+            await new Promise(resolve=>ms.addEventListener('sourceopen',resolve,{once:true}));
+            const track=ms.addSourceBuffer('video/mp4; codecs="avc1.42c00a,mp4a.40.2"');
+            const bytes=Uint8Array.from(atob(${JSON.stringify(retainedBytes.toString('base64'))}),c=>c.charCodeAt(0));
+            await new Promise((resolve,reject)=>{track.addEventListener('updateend',resolve,{once:true});track.addEventListener('error',reject,{once:true});track.appendBuffer(bytes);});
+            ms.endOfStream();retained.ready=true;
+          })().catch(e=>retained.error=String(e));
+        </script>`);
+      }
       if (url.pathname === '/fixture' && /^fixture-\d+\.bin$/.test(name || '')) {
         res.writeHead(200,{'Content-Type':'text/html'});
         return res.end('<a id="download" href="/'+name+'">Download fixture</a>');
@@ -118,7 +145,7 @@ try {
       const host = sessions.get(key) || openHost(key);
       const reply = await host.send(message);
       calls.push({trial,type:message.type,operation:message.operation,ok:reply.ok,key,ms:performance.now()-started,
-        jobId:reply.results?.[0]?.jobId,code:reply.code});
+        jobId:reply.results?.[0]?.jobId||reply.data?.jobId,code:reply.code});
       return json(reply);
     } catch (e) { relayEvents.push({trial:active?.trial,stage:'error',message:String(e)}); res.writeHead(500); res.end(JSON.stringify({ok:false,code:'qa-error',message:String(e)})); }
   });
@@ -166,7 +193,7 @@ try {
   const page=(await send('Target.attachToTarget',{targetId:target,flatten:true})).sessionId;
   await send('Page.enable',{},page);
   await send('Runtime.enable',{},page);
-  for(let trial=0;trial<(publicMedia?0:12);trial++){
+  for(let trial=0;trial<(publicMedia||retainedMedia?0:12);trial++){
     const mode=trial%2?'warm':'cold', delayMs=trial<6?0:80, name='fixture-'+trial+'.bin';
     active={trial,delayMs};
     await send('Page.navigate',{url:base+'/fixture?name='+name},page);
@@ -199,7 +226,7 @@ try {
     const http=requests.filter(r=>r.name===name);
     rows.push({trial,mode,delayMs,jobId:stage.jobId,clickEpochMs,timing,handshakeMs:handshake?.ms??0,requests:http.length});
   }
-  if(publicMedia){
+  if(publicMedia||retainedMedia){
     // These exact public sample URLs are independently referenced by the
     // C# test. Do not infer the expected source from VESPER's own result.
     const addresses=['https://mdn.github.io/shared-assets/videos/flower.mp4',
@@ -233,7 +260,7 @@ try {
       await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...rect},page);
       await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...rect},page);
     }
-    for(const [trial,address] of addresses.entries()){
+    for(const [trial,address] of (publicMedia?addresses:[]).entries()){
       active={trial,delayMs:0};
       const nav=await send('Page.navigate',{url:address},page);
       assert(!nav.errorText,nav.errorText);
@@ -253,10 +280,33 @@ try {
       const submitted=await until(()=>calls.find(c=>c.trial===trial&&c.type==='media-select'&&c.ok&&c.jobId),20000);
       mediaRows.push({trial,address,jobId:submitted.jobId,playback});
     }
+    if(retainedMedia){
+      active={trial:0,delayMs:0};
+      await send('Page.navigate',{url:base+'/retained-mse'},page);
+      await send('Page.bringToFront',{},page);
+      const playback=await until(()=>evaluate(page,`(()=>{
+        if(window.retained?.error)return {error:retained.error};
+        const v=document.querySelector('video');
+        if(!window.retained?.ready||v?.readyState<1)return null;
+        v.removeAttribute('data-vesper-media-provenance');
+        v.dispatchEvent(new Event('vesper-media-provenance-request',{bubbles:true}));
+        const witness=JSON.parse(v.getAttribute('data-vesper-media-provenance')||'null');
+        return {duration:v.duration,width:v.videoWidth,height:v.videoHeight,witness};
+      })()`),15000);
+      assert(!playback.error,JSON.stringify(playback));
+      assert(playback.witness?.tracks?.length===1&&playback.witness.tracks[0].bufferedComplete,JSON.stringify(playback));
+      assert.deepEqual(playback.witness.paths,[]);
+      await click('fly');await click('primary');
+      const accepted=await until(()=>calls.find(c=>c.type==='browser-body'&&c.operation==='finish'&&c.ok&&c.jobId),20000);
+      assert.equal(calls.filter(c=>c.type==='browser-body'&&c.operation==='begin').length,1);
+      assert.equal(calls.filter(c=>c.type==='media-select').length,0);
+      retainedRows.push({jobId:accepted.jobId,duration:playback.duration,width:playback.width,height:playback.height,
+        bytes:retainedBytes.length});
+    }
   }
   assert.equal(chromeDownloads,0);
   assert.deepEqual(await readdir(chromeFolder),[]);
-  await writeFile(result,JSON.stringify({rows,mediaRows,chromeDownloads}));
+  await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,chromeDownloads}));
 } catch(error) {
   throw Error(error.message+' '+JSON.stringify({relayEvents:relayEvents.slice(-30),browserErrors,chromeDownloads,calls:calls.slice(-30).map(({key,...row})=>row)}),{cause:error});
 } finally {

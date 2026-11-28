@@ -228,6 +228,7 @@ async function run(chrome,output,manifest) {
         let playback=[];
         try{playback=await until(async()=>{const p=await readPlayback();return p.some(v=>v.ready)?p:null},spec.probeOnly?6000:12000);}
         catch{playback=await readPlayback();}
+        const beforeVerification=playback;
         if(!spec.probeOnly&&playback.some(v=>v.src===spec.expected&&v.ready)){
           // Prove actual playback, not merely a metadata header. Only play the
           // predeclared public sample, muted in the isolated QA context.
@@ -246,14 +247,18 @@ async function run(chrome,output,manifest) {
         const responses=[...current.responses.values()];
         const ref=current.overflow||playback.length>32?{status:'observation-overflow'}:current.incomplete?{status:'observer-incomplete'}:referenceLabel(spec,playback,responses);
         // Nested viewport geometry is not top-level visibility; do not train player intent from it.
-        const playerRows=playback.filter(p=>p.area>0&&p.frame===frame&&p.execution===session)
+        // Do not train a competing-player ranker on the gesture used to establish its reference.
+        const playerFeatures=beforeVerification.length>1?beforeVerification:playback;
+        const playerRows=playerFeatures.filter(p=>p.area>0&&p.frame===frame&&p.execution===session)
           .map(({src,played,frame,execution,contextId,position,seeking,...row})=>row);
         const source=sourceObservation(runtime,spec,playback,responses,ref);
         observations.push({...common,split:spec.split,players:playerRows,sourceCandidates:source?.candidates||[],
           mediaResponses:responses.length,overflow:current.overflow||playback.length>32,
           contexts:[...current.sessions.values()],frameCount:new Set(playback.map(p=>p.frame)).size,incomplete:current.incomplete});
         labels.push({...common,status:ref.status,player:ref.playerId||null,source:source?.established?source.chosen:null});
-        if(ref.status==='verified'&&playback.every(p=>p.frame===frame&&p.execution===session)&&playerRows.some(p=>p.id===ref.playerId))
+        if(ref.status==='verified'&&playback.every(p=>p.frame===frame&&p.execution===session)
+            &&playerFeatures.every(p=>p.frame===frame&&p.execution===session)
+            &&playerFeatures.some(p=>p.id===ref.playerId&&p.src===ref.resource)&&playerRows.some(p=>p.id===ref.playerId))
           corpus.player[spec.split].push({...common,label:'verified',chosen:ref.playerId,candidates:playerRows});
         if(source?.established)
           corpus.source[spec.split].push({...common,label:'verified',chosen:source.chosen,candidates:source.candidates});

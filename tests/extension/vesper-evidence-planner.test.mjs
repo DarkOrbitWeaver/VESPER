@@ -137,7 +137,7 @@ test('resources are interchangeable only with strong validators; names, hosts an
 });
 
 test('retained media is a reconstruction only when every current track is complete and unedited',()=>{
-  const video={id:'video',role:'video',mimeType:'video/mp4',bufferedComplete:true,ended:true,
+  const video={id:'video',revision:1,role:'video',mimeType:'video/mp4',bufferedComplete:true,ended:true,
     timelineAdjusted:false,hasInit:true,initLength:100,retainedBytes:1000,totalAppendedBytes:1000};
   const audio={...video,id:'audio',role:'audio',mimeType:'audio/mp4'};
   const check=(tracks,extra={})=>G.create().assessRetained({scope:'doc',playerKey:'p',generation:1,tracks,...extra});
@@ -145,7 +145,7 @@ test('retained media is a reconstruction only when every current track is comple
   assert.equal(check([video,audio]).sizeBytes,2000);
   assert.equal(check([audio]).container,'M4A');
   for(const changed of [
-    {ended:false},{bufferedComplete:false},{timelineAdjusted:true},{hasInit:false},
+    {ended:false},{bufferedComplete:false},{timelineAdjusted:true},{hasInit:false},{revision:-1},{revision:undefined},
     {retainedBytes:0},{initLength:2000},{totalAppendedBytes:999},{role:'audio'}
   ]) assert.equal(check([{...video,...changed}]).verdict,'abstain');
   for(const flags of [{worker:true},{protectedMedia:true},{live:true}])
