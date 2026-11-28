@@ -11,6 +11,7 @@
   const MAX_BUFFERS = 256;
   const MAX_URLS_PER_TRACK = 64;
   const MAX_INIT_BYTES = 256 * 1024;
+  const RETAINED_CHUNK_BYTES = 256 * 1024;
   const MAX_TRACK_BUFFER_BYTES = 24 * 1024 * 1024;
   const MAX_TOTAL_MSE_BYTES = 64 * 1024 * 1024;
   const TTL = 120_000;
@@ -18,6 +19,7 @@
   const now = Date.now.bind(Date);
 
   const objectUrls = new Map();       // blobUrl -> { ref: WeakRef<MediaSource|Blob>, createdAt, tracks: Set<TrackState>, paths: Map }
+  const playerRecords = new WeakMap(); // active element -> exact object URL and weak object reference
   const sourceOwners = new WeakMap(); // SourceBuffer -> TrackState
   const mediaSources = new WeakMap(); // MediaSource -> tracks
   const bufferProvenance = new WeakMap(); // ArrayBuffer | Blob -> ProvenanceRecord
@@ -488,6 +490,10 @@
     track.revision++;
     totalRetainedBytes -= track.retainedBytes;
     track.initBytes = null;
+    track.prefix = null;
+    track.prefixLength = 0;
+    track.tail = null;
+    track.tailUsed = 0;
     track.initHasMedia = false;
     track.container = null;
     track.chunks = [];
@@ -517,6 +523,62 @@
     totalRetainedBytes += count;
     track.retainedBytes += count;
     return true;
+  }
+
+  // Small streaming appends share a fixed-size page. The byte cap also
+  // bounds the number of retained objects, even for one-byte appends.
+  function appendRetained(track, bytes) {
+    if (!reserveMseBytes(track, bytes.byteLength)) return;
+    for (let offset = 0; offset < bytes.byteLength;) {
+      if (!track.tail || track.tailUsed === RETAINED_CHUNK_BYTES) {
+        track.tail = new Uint8Array(RETAINED_CHUNK_BYTES);
+        track.tailUsed = 0;
+        track.chunks.push(track.tail.subarray(0, 0));
+      }
+      const count = Math.min(bytes.byteLength - offset, RETAINED_CHUNK_BYTES - track.tailUsed);
+      track.tail.set(bytes.subarray(offset, offset + count), track.tailUsed);
+      track.tailUsed += count;
+      offset += count;
+      track.chunks[track.chunks.length - 1] = track.tail.subarray(0, track.tailUsed);
+    }
+  }
+
+  function rememberInit(track, bytes, inspected) {
+    track.initBytes = bytes;
+    track.initHasMedia = inspected.hasMedia;
+    track.container = inspected.container;
+    if (track.container === 'mp4') track.role = mp4Role(bytes.subarray(0, inspected.initEnd)) || inferRole(track.mimeType);
+  }
+
+  // MSE accepts arbitrary byte partitions, not just whole initialization
+  // boxes. Collect the initial prefix once, with bounded geometric growth.
+  function appendInitial(track, rawBytes, inspected) {
+    if (!track.prefix && inspected?.hasInit && track.totalAppendedBytes === 0) {
+      if (reserveMseBytes(track, rawBytes.byteLength)) rememberInit(track, rawBytes.slice(), inspected);
+      return;
+    }
+    const remaining = MAX_INIT_BYTES - track.prefixLength;
+    const count = Math.min(rawBytes.byteLength, remaining);
+    if (count <= 0 || !reserveMseBytes(track, count)) {
+      if (!track.evicted) discardTrack(track);
+      return;
+    }
+    const length = track.prefixLength + count;
+    if (!track.prefix || track.prefix.length < length) {
+      const next = new Uint8Array(Math.min(MAX_INIT_BYTES, Math.max(length, (track.prefix?.length || 128) * 2)));
+      if (track.prefix) next.set(track.prefix.subarray(0, track.prefixLength));
+      track.prefix = next;
+    }
+    track.prefix.set(rawBytes.subarray(0, count), track.prefixLength);
+    track.prefixLength = length;
+    const prefix = track.prefix.subarray(0, length);
+    const info = inspectMediaBytes(prefix);
+    if (info?.hasInit) {
+      rememberInit(track, prefix, info);
+      track.prefix = null;
+      track.prefixLength = 0;
+      if (count < rawBytes.byteLength) appendRetained(track, rawBytes.subarray(count));
+    } else if (length === MAX_INIT_BYTES) discardTrack(track);
   }
 
   function inferRole(mimeType) {
@@ -616,6 +678,10 @@
           bufferRef: new WeakRef(sb),
           paths: new Map(),
           initBytes: null,
+          prefix: null,
+          prefixLength: 0,
+          tail: null,
+          tailUsed: 0,
           initHasMedia: false,
           chunks: [],
           retainedBytes: 0,
@@ -712,13 +778,8 @@
         if (this.mode !== 'segments' || this.timestampOffset !== 0
             || this.appendWindowStart !== 0 || this.appendWindowEnd !== Infinity)
           track.timelineAdjusted = true;
-        if (!track.evicted && track.totalAppendedBytes === 0 && inspected?.hasInit) {
-          if (reserveMseBytes(track, rawBytes.byteLength)) {
-            track.initBytes = rawBytes.slice();
-            track.initHasMedia = inspected.hasMedia;
-            track.container = inspected.container;
-            if (track.container === 'mp4') track.role = mp4Role(track.initBytes) || inferRole(track.mimeType);
-          }
+        if (!track.evicted && !track.initBytes) {
+          appendInitial(track, rawBytes, inspected);
         } else if (!track.evicted && track.initBytes) {
           if (inspected?.hasInit) {
             const repeated = !inspected.hasMedia && track.initBytes.byteLength === rawBytes.byteLength
@@ -728,7 +789,7 @@
               discardTrack(track);
             }
           }
-          else if (reserveMseBytes(track, rawBytes.byteLength)) track.chunks.push(rawBytes.slice());
+          else appendRetained(track, rawBytes);
         }
         track.totalAppendedBytes += rawBytes.byteLength;
 
@@ -830,11 +891,36 @@
       && coversPlayback(buffer.buffered, player.duration, track.role === 'audio' ? 0.35 : 0.15);
   }
 
+  function currentObjectRecord(player) {
+    if (player.srcObject) { playerRecords.delete(player); return null; }
+    const url = player.currentSrc || player.src;
+    const record = objectUrls.get(url);
+    if (record?.ref.deref()) {
+      playerRecords.set(player, { url, record });
+      return record;
+    }
+    const previous = playerRecords.get(player);
+    if (previous?.url === url && previous.record.ref.deref()) return previous.record;
+    playerRecords.delete(player);
+    return null;
+  }
+
+  // Pin an attached element across unrelated object URL creation in feeds.
+  // Never carry its record forward after a source change.
+  for (const type of ['loadstart', 'loadedmetadata', 'playing', 'emptied']) {
+    document.addEventListener(type, event => {
+      const player = event.composedPath?.()[0] || event.target;
+      if (!(player instanceof HTMLMediaElement)) return;
+      if (type === 'emptied') playerRecords.delete(player);
+      else if (player.currentSrc) currentObjectRecord(player);
+    }, true);
+  }
+
   function mediaSourceState(player) {
     // srcObject overrides the URL, even when an old src remains on the element.
     const source = player.srcObject;
     if (source) return typeof source === 'object' ? mediaSources.get(source) : null;
-    const record = objectUrls.get(player.currentSrc || player.src);
+    const record = currentObjectRecord(player);
     return record?.kind === 'mse' ? record.msState : null;
   }
 
@@ -843,8 +929,7 @@
     const player = event.composedPath?.()[0] || event.target;
     if (!(player instanceof HTMLMediaElement)) return;
     try {
-      const src = player.currentSrc || player.src;
-      const record = player.srcObject ? null : objectUrls.get(src);
+      const record = currentObjectRecord(player);
       const msState = mediaSourceState(player);
       if ((!record?.ref.deref() && !msState) || player.mediaKeys) return;
       const at = now();

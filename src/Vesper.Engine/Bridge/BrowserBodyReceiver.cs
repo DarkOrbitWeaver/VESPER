@@ -48,7 +48,8 @@ internal sealed class BrowserBodyReceiver : IDisposable
         bool verifyMp4,
         IReadOnlyList<BrowserBodyTrackSpec>? tracks = null,
         string? pageUrl = null,
-        string? outputContainer = null) : IDisposable
+        string? outputContainer = null,
+        bool verifyWebm = false) : IDisposable
     {
         internal Guid JobId { get; } = jobId;
         internal string Origin { get; } = origin;
@@ -56,6 +57,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
         internal string Name { get; } = name;
         internal long? ExpectedLength { get; } = expectedLength;
         internal bool VerifyMp4 { get; } = verifyMp4;
+        internal bool VerifyWebm { get; } = verifyWebm;
         internal string Folder { get; } = folder;
         internal PartialFile File { get; } = file;
         internal string? Identity { get; } = identity;
@@ -129,12 +131,14 @@ internal sealed class BrowserBodyReceiver : IDisposable
         bool verifyMp4 = false,
         IReadOnlyList<BrowserBodyTrackSpec>? tracks = null,
         string? pageUrl = null,
-        string? outputContainer = null)
+        string? outputContainer = null,
+        bool verifyWebm = false)
     {
         if (!BridgeProtocol.IsRequestId(id) || origin.Length > 512 || !Uri.TryCreate(origin, UriKind.Absolute, out Uri? uri)
             || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0
             || uri.AbsoluteUri != uri.GetLeftPart(UriPartial.Authority) + "/"
-            || expectedLength is < 1 or > MaxBytes || name.Length is < 1 or > 255)
+            || expectedLength is < 1 or > MaxBytes || name.Length is < 1 or > 255
+            || verifyMp4 && verifyWebm || verifyWebm && tracks is { Count: > 1 })
             return new(false, "invalid");
         name = FileNames.Sanitize(name);
         await _gate.WaitAsync(ct).ConfigureAwait(false);
@@ -146,7 +150,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
             {
                 if (exclusiveSession) return new(false, "busy");
                 if (existing.Origin != origin || existing.Name != name || existing.ExpectedLength != expectedLength || existing.VerifyMp4 != verifyMp4
-                    || existing.PageUrl != pageUrl || existing.OutputContainer != outputContainer
+                    || existing.VerifyWebm != verifyWebm || existing.PageUrl != pageUrl || existing.OutputContainer != outputContainer
                     || !(existing.Tracks ?? []).SequenceEqual(tracks ?? []))
                     return new(false, "conflict");
                 Renew(existing);
@@ -154,7 +158,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
             }
             if (_active.Count >= MaxConcurrentTransfers) return new(false, "busy");
             long spaceNeeded = expectedLength ?? StreamingMinReserve;
-            if (tracks is { Count: 2 }) spaceNeeded = spaceNeeded * 2; // reserve staging + remux headroom
+            if (tracks is { Count: > 0 }) spaceNeeded = spaceNeeded * 2; // reserve staging + remux headroom
             if (_destination(name, spaceNeeded) is not { } folder) return new(false, "storage");
             PartialFile.PreparePrivateFolder(_partialsFolder);
             Guid jobId = Guid.NewGuid();
@@ -178,7 +182,7 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 ForgetJournal(id);
                 throw;
             }
-            var transfer = new Transfer(jobId, origin, name, expectedLength, folder, file, identity, verifyMp4, tracks, pageUrl, outputContainer);
+            var transfer = new Transfer(jobId, origin, name, expectedLength, folder, file, identity, verifyMp4, tracks, pageUrl, outputContainer, verifyWebm);
             _active.Add(id, transfer);
             Renew(transfer);
             return new(true, "ok");
@@ -265,6 +269,11 @@ internal sealed class BrowserBodyReceiver : IDisposable
                 if (transfer.VerifyMp4 && (transfer.Tracks is null || transfer.Tracks.Count <= 1))
                 {
                     try { MediaTrackProbe.RequireMp4Media(transfer.File, ct); }
+                    catch (MediaContainerException) { return new(false, "invalid-media"); }
+                }
+                if (transfer.VerifyWebm)
+                {
+                    try { MediaTrackProbe.RequireWebmMedia(transfer.File, ct); }
                     catch (MediaContainerException) { return new(false, "invalid-media"); }
                 }
                 string digest = Convert.ToHexString(transfer.Hash.GetHashAndReset());

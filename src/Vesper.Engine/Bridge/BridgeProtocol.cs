@@ -368,8 +368,13 @@ public static class BridgeProtocol
                     || !TryLength(root, "length", out long? length)
                     || length is < 1 or > BrowserBodyReceiver.MaxBytes)
                     return false;
-                bool verifyMp4 = root.TryGetProperty("mediaCheck", out JsonElement check);
-                if (verifyMp4 && (check.ValueKind != JsonValueKind.String || check.GetString() != "mp4")) return false;
+                bool verifyMp4 = false, verifyWebm = false;
+                if (root.TryGetProperty("mediaCheck", out JsonElement check))
+                {
+                    if (check.ValueKind != JsonValueKind.String || check.GetString() is not ("mp4" or "webm")) return false;
+                    verifyMp4 = check.GetString() == "mp4";
+                    verifyWebm = check.GetString() == "webm";
+                }
                 bool automatic = true;
                 if (root.TryGetProperty("automatic", out JsonElement intent))
                 {
@@ -411,7 +416,7 @@ public static class BridgeProtocol
 
                 request = new(operation, transferId!, page.AbsoluteUri, FileNames.Sanitize(name), length,
                     Session: session, VerifyMp4: verifyMp4, Automatic: automatic, Tracks: tracks,
-                    PageUrl: pageUrl, OutputContainer: outputContainer);
+                    PageUrl: pageUrl, OutputContainer: outputContainer, VerifyWebm: verifyWebm);
                 return true;
             }
             case "append":

@@ -118,6 +118,40 @@ test('MSE keeps an identical init and refuses incomplete, inactive or edited tra
   assert.equal(fixture.provenance(el).tracks.length, 0);
 });
 
+test('active object URL survives feed churn without crossing source replacement', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/live.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  a.buffer.appendBuffer(bytes);
+  assert.equal(b.request(a.el)[0].path,'https://cdn.test/live.m4s');
+  const others=Array.from({length:40},()=>b.player());
+  assert.equal(b.request(a.el)[0].path,'https://cdn.test/live.m4s');
+  a.el.currentSrc=others.at(-1).el.currentSrc;
+  assert.deepEqual(b.request(a.el),[]);
+  a.el.currentSrc='https://site.test/new.mp4';
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('partitioned initialization and thousands of tiny appends preserve exact bytes in bounded chunks', () => {
+  const b=setup(), {el,buffer}=b.player();
+  el.duration=10;el.buffered=buffer.buffered;
+  const input=readFileSync(new URL('../Vesper.Tests/Fixtures/Media/instinct-mse.mp4',import.meta.url));
+  for(let start=0;start<input.length;start+=7) buffer.appendBuffer(new Uint8Array(input.subarray(start,start+7)));
+  const track=b.provenance(el).tracks[0];
+  assert.equal(track.bufferedComplete,true);
+  assert.equal(track.retainedBytes,input.length);
+  const tracks=[{id:track.id,revision:track.revision,length:track.retainedBytes}];
+  const parts=[];let partIndex=0,subOffset=0;
+  while(true){
+    const next=b.exportChunk(el,{tracks,trackId:track.id,partIndex,subOffset});
+    assert(next?.chunk);
+    parts.push(Buffer.from(next.chunk,'base64'));
+    if(next.finishedAfterThis)break;
+    partIndex=next.nextPartIndex;subOffset=next.nextSubOffset;
+    assert(parts.length<8,'tiny appends should be coalesced');
+  }
+  assert.deepEqual(Buffer.concat(parts),input);
+});
+
 test('open, timestamp-adjusted, window-clipped and sequence-mode MSE tracks cannot be exported as complete',()=>{
   for(const mutation of ['open','offset','window','sequence']){
     const b=setup(), {source,el,buffer}=b.player();

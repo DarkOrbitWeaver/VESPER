@@ -34,6 +34,8 @@ async function until(fn, limit = 10000) {
 const sessions = new Map(), calls = [], rows = [], requests = [], mediaRows = [], retainedRows = [], relayEvents = [], browserErrors = [];
 const publicMedia = process.env.VESPER_QA_PUBLIC_MEDIA === '1';
 const retainedMedia = process.env.VESPER_QA_RETAINED_MEDIA === '1';
+const publicCampaign = publicMedia && !!process.env.VESPER_QA_PUBLIC_CASES;
+const downloadVariants = process.env.VESPER_QA_DOWNLOAD_VARIANTS === '1';
 assert(!(publicMedia && retainedMedia));
 const retainedBytes = retainedMedia ? await readFile(join(root,'tests/Vesper.Tests/Fixtures/Media/instinct-mse.mp4')) : null;
 let proc, socket, server, seq = 0, active, chromeDownloads = 0;
@@ -111,24 +113,35 @@ try {
             await new Promise(resolve=>ms.addEventListener('sourceopen',resolve,{once:true}));
             const track=ms.addSourceBuffer('video/mp4; codecs="avc1.42c00a,mp4a.40.2"');
             const bytes=Uint8Array.from(atob(${JSON.stringify(retainedBytes.toString('base64'))}),c=>c.charCodeAt(0));
-            await new Promise((resolve,reject)=>{track.addEventListener('updateend',resolve,{once:true});track.addEventListener('error',reject,{once:true});track.appendBuffer(bytes);});
+            // Actual browser parser receives split MP4 box headers and data.
+            for(let start=0;start<bytes.length;){
+              const length=start<24?7:1531;
+              const chunk=bytes.subarray(start,start+length);start+=chunk.length;
+              await new Promise((resolve,reject)=>{track.addEventListener('updateend',resolve,{once:true});track.addEventListener('error',reject,{once:true});track.appendBuffer(chunk);});
+            }
             ms.endOfStream();retained.ready=true;
           })().catch(e=>retained.error=String(e));
         </script>`);
       }
       if (url.pathname === '/fixture' && /^fixture-\d+\.bin$/.test(name || '')) {
         res.writeHead(200,{'Content-Type':'text/html'});
+        if(active?.scenario==='labelled')
+          return res.end('<a id="download" href="/download?id='+name+'">Download file</a>');
+        if(active?.scenario==='delayed')
+          return res.end('<button id="download">Export file</button><script>document.querySelector("#download").addEventListener("click",()=>setTimeout(()=>{const a=document.createElement("a");a.href="/export?file='+name+'";a.download="'+name+'";a.click()},500));</script>');
         return res.end('<a id="download" href="/'+name+'">Download fixture</a>');
       }
-      if (/^\/fixture-\d+\.bin$/.test(url.pathname) && ['GET','HEAD'].includes(req.method)) {
-        requests.push({name:url.pathname.slice(1),method:req.method,range:!!req.headers.range});
+      const fileName = url.pathname === '/download' ? url.searchParams.get('id')
+        : url.pathname === '/export' ? url.searchParams.get('file') : url.pathname.slice(1);
+      if (/^fixture-\d+\.bin$/.test(fileName || '') && ['GET','HEAD'].includes(req.method)) {
+        requests.push({name:fileName,method:req.method,range:!!req.headers.range});
         await delay(active?.delayMs || 0);
         const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
         const from = range ? Number(range[1]) : 0;
         const to = range?.[2] ? Math.min(Number(range[2]),payload.length-1) : payload.length-1;
         if (from > to) { res.writeHead(416); return res.end(); }
         res.writeHead(range?206:200,{'Content-Type':'application/octet-stream','Content-Length':to-from+1,
-          'Content-Disposition':'attachment; filename="'+url.pathname.slice(1)+'"','Accept-Ranges':'bytes','ETag':'"fixture-v1"',
+          'Content-Disposition':'attachment; filename="'+fileName+'"','Accept-Ranges':'bytes','ETag':'"fixture-v1"',
           ...(range?{'Content-Range':'bytes '+from+'-'+to+'/'+payload.length}:{})});
         return res.end(req.method === 'HEAD' ? undefined : payload.subarray(from,to+1));
       }
@@ -195,7 +208,8 @@ try {
   await send('Runtime.enable',{},page);
   for(let trial=0;trial<(publicMedia||retainedMedia?0:12);trial++){
     const mode=trial%2?'warm':'cold', delayMs=trial<6?0:80, name='fixture-'+trial+'.bin';
-    active={trial,delayMs};
+    const scenario=downloadVariants?['direct','labelled','delayed'][trial%3]:'direct';
+    active={trial,delayMs,scenario};
     await send('Page.navigate',{url:base+'/fixture?name='+name},page);
     await until(()=>evaluate(page,'!!document.querySelector("#download")'));
     await delay(250);
@@ -224,13 +238,18 @@ try {
     const handshake=trialCalls.find(c=>c.type==='session-open'&&c.key===stage.key);
     assert.equal(!!handshake,mode==='cold','cold/warm classification must be observed, not assumed');
     const http=requests.filter(r=>r.name===name);
-    rows.push({trial,mode,delayMs,jobId:stage.jobId,clickEpochMs,timing,handshakeMs:handshake?.ms??0,requests:http.length});
+    rows.push({trial,mode,delayMs,scenario,jobId:stage.jobId,clickEpochMs,timing,handshakeMs:handshake?.ms??0,requests:http.length});
   }
   if(publicMedia||retainedMedia){
     // These exact public sample URLs are independently referenced by the
     // C# test. Do not infer the expected source from VESPER's own result.
-    const addresses=['https://mdn.github.io/shared-assets/videos/flower.mp4',
-      'https://mdn.github.io/shared-assets/videos/flower.webm'];
+    const addresses=publicCampaign ? JSON.parse((await readFile(process.env.VESPER_QA_PUBLIC_CASES,'utf8')).replace(/^\uFEFF/,'')) :
+      ['https://mdn.github.io/shared-assets/videos/flower.mp4','https://mdn.github.io/shared-assets/videos/flower.webm'];
+    assert(Array.isArray(addresses)&&addresses.length>0&&addresses.length<=24&&new Set(addresses).size===addresses.length);
+    for(const address of addresses){
+      const u=new URL(address);
+      assert(u.protocol==='https:'&&!u.username&&!u.password&&!u.search&&!u.hash&&!u.port);
+    }
     async function button(className){
       return until(async()=>{
         const {root:dom}=await send('DOM.getDocument',{depth:-1,pierce:true},page);
@@ -260,15 +279,41 @@ try {
       await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...rect},page);
       await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...rect},page);
     }
+    async function selectOriginal(){
+      // Exercise the actual format control. No direct native submission or
+      // source returned by VESPER is used as the independent reference.
+      const {root:dom}=await send('DOM.getDocument',{depth:-1,pierce:true},page);
+      const nodes=[dom];
+      for(const node of nodes){
+        nodes.push(...(node.children||[]),...(node.shadowRoots||[]));
+        if(node.nodeName!=='SELECT')continue;
+        let object;
+        try{
+          ({object}=await send('DOM.resolveNode',{nodeId:node.nodeId},page));
+          const reply=await send('Runtime.callFunctionOn',{objectId:object.objectId,
+            functionDeclaration:'function(){if(!this.closest(".output")||this.closest(".output").hidden)return false;const index=[...this.options].findIndex(o=>/^Original (?:audio|format)$/.test(o.textContent));if(index<0)return false;this.selectedIndex=index;this.dispatchEvent(new Event("change",{bubbles:true}));return true}',returnByValue:true},page);
+          if(reply.result?.value===true)return;
+        }catch{}finally{if(object)await send('Runtime.releaseObject',{objectId:object.objectId},page).catch(()=>{});}
+      }
+    }
     for(const [trial,address] of (publicMedia?addresses:[]).entries()){
       active={trial,delayMs:0};
+      let stage='navigate';
+      try{
       const nav=await send('Page.navigate',{url:address},page);
       assert(!nav.errorText,nav.errorText);
       await send('Page.bringToFront',{},page);
-      const playback=await until(()=>evaluate(page,'(()=>{const v=document.querySelector("video");return v?.readyState>=1&&v.currentSrc==='+JSON.stringify(address)+'?{src:v.currentSrc,duration:v.duration,width:v.videoWidth,height:v.videoHeight}:null})()'),15000);
-      assert(playback.width>0&&playback.height>0&&playback.duration>0);
+      stage='playback';
+      const playback=await until(()=>evaluate(page,'(()=>{const v=document.querySelector("video,audio");return v?.readyState>=1&&v.currentSrc==='+JSON.stringify(address)+'?{src:v.currentSrc,duration:v.duration,width:v.videoWidth||0,height:v.videoHeight||0}:null})()'),15000);
+      assert(playback.duration>0&&Number.isFinite(playback.duration));
+      stage='picker';
       await click('fly');
-      try { await click('primary'); }
+      try {
+        await button('primary');
+        if(publicCampaign)await selectOriginal();
+        stage='submission';
+        await click('primary');
+      }
       catch (error) {
         const {root:dom}=await send('DOM.getDocument',{depth:-1,pierce:true},page);
         const nodes=[dom];
@@ -277,8 +322,15 @@ try {
           .map(n=>n.nodeValue).filter(v=>v.length<=200);
         throw Error(error.message+' '+JSON.stringify({messages,calls:calls.map(({key,...row})=>row)}));
       }
-      const submitted=await until(()=>calls.find(c=>c.trial===trial&&c.type==='media-select'&&c.ok&&c.jobId),20000);
-      mediaRows.push({trial,address,jobId:submitted.jobId,playback});
+      const submitted=await until(()=>calls.find(c=>c.trial===trial&&c.ok&&c.jobId
+        &&(c.type==='media-select'||(c.type==='browser-body'&&c.operation==='finish'))),30000);
+      mediaRows.push({trial,address,status:'submitted',jobId:submitted.jobId,route:submitted.type,playback});
+      }catch(error){
+        if(!publicCampaign)throw error;
+        mediaRows.push({trial,address,status:'failed',stage,reason:String(error.message).slice(0,1200),
+          codes:calls.filter(c=>c.trial===trial).map(c=>({type:c.type,code:c.code,ok:c.ok})).slice(-12)});
+      }
+      if(publicCampaign)console.log(JSON.stringify({trial,status:mediaRows.at(-1).status,stage:mediaRows.at(-1).stage}));
     }
     if(retainedMedia){
       active={trial:0,delayMs:0};
@@ -304,8 +356,10 @@ try {
         bytes:retainedBytes.length});
     }
   }
-  assert.equal(chromeDownloads,0);
-  assert.deepEqual(await readdir(chromeFolder),[]);
+  if(!publicCampaign){
+    assert.equal(chromeDownloads,0);
+    assert.deepEqual(await readdir(chromeFolder),[]);
+  }
   await writeFile(result,JSON.stringify({rows,mediaRows,retainedRows,chromeDownloads}));
 } catch(error) {
   throw Error(error.message+' '+JSON.stringify({relayEvents:relayEvents.slice(-30),browserErrors,chromeDownloads,calls:calls.slice(-30).map(({key,...row})=>row)}),{cause:error});
@@ -314,5 +368,6 @@ try {
   if(proc&&proc.exitCode===null){try{execFileSync('taskkill',['/PID',String(proc.pid),'/T','/F'],{stdio:'ignore'})}catch{}}
   for(const host of sessions.values()){host.child.stdin.end();if(host.child.exitCode===null)host.child.kill()}
   if(server){server.closeAllConnections();await new Promise(ok=>server.close(ok))}
-  await rm(scratch,{recursive:true,force:true,maxRetries:8,retryDelay:200});
+  try { await rm(scratch,{recursive:true,force:true,maxRetries:16,retryDelay:200}); }
+  catch(error) { console.error('QA scratch cleanup deferred: '+error.code); }
 }

@@ -19,6 +19,28 @@ public sealed class BrowserStartupBenchmarkTests
         }
     }
 
+    // Test-only independent ID3v2 parser. Accept the ordinary v2.4 header
+    // emitted by VESPER, and require MPEG frame sync after the tag. Any
+    // unsupported/malformed header is a verification failure.
+    private static int MpegAudioOffset(byte[] bytes)
+    {
+        int offset = 0;
+        if (bytes.AsSpan().StartsWith("ID3"u8))
+        {
+            Assert.True(bytes.Length >= 10 && bytes[3] == 4 && bytes[4] == 0 && bytes[5] == 0);
+            for (int i = 6; i < 10; i++)
+            {
+                Assert.True((bytes[i] & 128) == 0);
+                offset = (offset << 7) | bytes[i];
+            }
+            Assert.InRange(offset, 1, 1000000);
+            offset += 10;
+        }
+        Assert.True(bytes.Length >= offset + 4 && bytes[offset] == 255
+            && (bytes[offset + 1] & 0xe0) == 0xe0 && (bytes[offset + 1] & 6) == 2);
+        return offset;
+    }
+
     [StartupFact]
     public async Task IsolatedChromeMeasuresClickThroughVerifiedNativePublication()
     {
@@ -32,7 +54,9 @@ public sealed class BrowserStartupBenchmarkTests
         string root = Path.Combine(Path.GetTempPath(), "vesper-startup-qa-" + Guid.NewGuid().ToString("N"));
         string downloads = Path.Combine(root, "downloads");
         Directory.CreateDirectory(downloads);
-        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+        string? campaignPath = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_CASES");
+        bool publicCampaign = Environment.GetEnvironmentVariable("VESPER_QA_PUBLIC_MEDIA") == "1" && !string.IsNullOrEmpty(campaignPath);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(publicCampaign ? 10 : 3));
         CancellationToken ct = deadline.Token;
         try
         {
@@ -104,35 +128,56 @@ public sealed class BrowserStartupBenchmarkTests
                     }));
                 }
                 var mediaRows = result.RootElement.GetProperty("mediaRows").EnumerateArray().ToArray();
-                Assert.Equal(publicMedia ? 2 : 0, mediaRows.Length);
+                var campaignOutcomes = new List<object>();
+                int publicVerified = 0;
                 if (publicMedia)
                 {
-                    string[] addresses = ["https://mdn.github.io/shared-assets/videos/flower.mp4",
-                        "https://mdn.github.io/shared-assets/videos/flower.webm"];
+                    string[] addresses = publicCampaign
+                        ? JsonSerializer.Deserialize<string[]>(await File.ReadAllTextAsync(campaignPath!, ct))!
+                        : ["https://mdn.github.io/shared-assets/videos/flower.mp4", "https://mdn.github.io/shared-assets/videos/flower.webm"];
+                    Assert.InRange(addresses.Length, 1, 24);
+                    Assert.Equal(addresses.Length, addresses.Distinct(StringComparer.Ordinal).Count());
+                    Assert.Equal(addresses.Length, mediaRows.Length);
+                    foreach (string address in addresses)
+                    {
+                        Uri uri = new(address);
+                        Assert.True(uri.Scheme == "https" && uri.UserInfo.Length == 0 && uri.Query.Length == 0
+                            && uri.Fragment.Length == 0 && uri.IsDefaultPort);
+                    }
                     using var client = new HttpClient(new SocketsHttpHandler
                     {
                         UseCookies = false, UseProxy = false, AllowAutoRedirect = false,
                         ConnectTimeout = TimeSpan.FromSeconds(8)
                     }) { Timeout = TimeSpan.FromSeconds(15) };
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("VESPER-QA/1.0 (public media integrity verification)");
                     for (int i = 0; i < mediaRows.Length; i++)
                     {
                         var row = mediaRows[i];
                         Assert.Equal(addresses[i], row.GetProperty("address").GetString());
+                        if (publicCampaign && row.GetProperty("status").GetString() != "submitted")
+                        {
+                            campaignOutcomes.Add(new { address = addresses[i], status = "browser-miss", evidence = row.Clone() });
+                            continue;
+                        }
+                        try
+                        {
                         Assert.Equal(addresses[i], row.GetProperty("playback").GetProperty("src").GetString());
                         Guid id = row.GetProperty("jobId").GetGuid();
                         Assert.True(ids.Add(id));
                         JobSnapshot? snapshot;
+                        long publicationDeadline = Environment.TickCount64 + 30000;
                         while (true)
                         {
                             snapshot = engine.Snapshot(id);
                             Assert.NotNull(snapshot);
                             if (snapshot.State is JobState.Completed or JobState.Failed or JobState.NeedsAttention or JobState.NeedsLink) break;
+                            Assert.True(Environment.TickCount64 < publicationDeadline, "Native publication deadline");
                             await Task.Delay(25, ct);
                         }
                         Assert.True(snapshot.State == JobState.Completed, $"{snapshot.State}: {snapshot.Reason} {snapshot.Message}");
                         using var reference = await client.GetAsync(addresses[i], HttpCompletionOption.ResponseHeadersRead, ct);
                         reference.EnsureSuccessStatusCode();
-                        const int limit = 4 * 1024 * 1024;
+                        int limit = (publicCampaign ? 16 : 4) * 1024 * 1024;
                         Assert.InRange(reference.Content.Headers.ContentLength ?? 0, 1, limit);
                         using var bytes = new MemoryStream();
                         await using (var stream = await reference.Content.ReadAsStreamAsync(ct))
@@ -145,14 +190,54 @@ public sealed class BrowserStartupBenchmarkTests
                                 bytes.Write(block, 0, n);
                             }
                         }
-                        Assert.Equal(bytes.ToArray(), await File.ReadAllBytesAsync(snapshot.FinalPath!, ct));
-                        Console.WriteLine("PUBLIC_BROWSER_MEDIA " + JsonSerializer.Serialize(new
+                        byte[] sourceBytes = bytes.ToArray();
+                        byte[] publishedBytes = await File.ReadAllBytesAsync(snapshot.FinalPath!, ct);
+                        string verification = "byte-exact";
+                        if (!sourceBytes.AsSpan().SequenceEqual(publishedBytes))
+                        {
+                            // Original MP3 output intentionally embeds title/artwork.
+                            // Check the entire unchanged encoded stream independently
+                            // instead of mistaking an added ID3 tag for corruption.
+                            Assert.Equal(".mp3", Path.GetExtension(snapshot.FinalPath!).ToLowerInvariant());
+                            Assert.True(sourceBytes.AsSpan(MpegAudioOffset(sourceBytes))
+                                .SequenceEqual(publishedBytes.AsSpan(MpegAudioOffset(publishedBytes))),
+                                "The original MP3 payload was changed");
+                            verification = "encoded-audio-exact";
+                        }
+                        var verified = new
                         {
                             address = addresses[i], bytes = bytes.Length,
-                            sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes.ToArray())),
+                            sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(sourceBytes)),
+                            publishedBytes = publishedBytes.Length,
+                            publishedSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(publishedBytes)),
+                            verification, route = row.GetProperty("route").GetString(),
                             playback = row.GetProperty("playback"), verified = true
-                        }));
+                        };
+                        campaignOutcomes.Add(verified);
+                        publicVerified++;
+                        Console.WriteLine("PUBLIC_BROWSER_MEDIA " + JsonSerializer.Serialize(verified));
+                        }
+                        catch (Exception error) when (publicCampaign && error is not OperationCanceledException)
+                        {
+                            campaignOutcomes.Add(new { address = addresses[i], status = "publication-miss", reason = error.GetType().Name,
+                                detail = error.Message.Length <= 256 ? error.Message : error.Message[..256] });
+                        }
                     }
+                }
+                else Assert.Empty(mediaRows);
+                if (publicCampaign)
+                {
+                    var report = new { attempted = mediaRows.Length, verified = publicVerified,
+                        chromeDownloads = result.RootElement.GetProperty("chromeDownloads").GetInt32(),
+                        nativeJobs = engine.Snapshots().Count, outcomes = campaignOutcomes };
+                    string? path = Environment.GetEnvironmentVariable("VESPER_QA_CAMPAIGN_REPORT");
+                    if (!string.IsNullOrEmpty(path))
+                    {
+                        await using var output = File.Open(path, FileMode.CreateNew, FileAccess.Write);
+                        await JsonSerializer.SerializeAsync(output, report, new JsonSerializerOptions { WriteIndented = true }, ct);
+                    }
+                    Console.WriteLine("PUBLIC_CAMPAIGN " + JsonSerializer.Serialize(report));
+                    Assert.Equal(mediaRows.Length, publicVerified);
                 }
                 var retainedRows = result.RootElement.GetProperty("retainedRows").EnumerateArray().ToArray();
                 Assert.Equal(retainedMedia ? 1 : 0, retainedRows.Length);
@@ -204,6 +289,18 @@ public sealed class BrowserStartupBenchmarkTests
             }
             finally { bridge.CloseResolver(); }
         }
-        finally { Directory.Delete(root, recursive: true); }
+        finally
+        {
+            // Chromium's child processes can release their profile handles a
+            // little after the parent exits. Never mask an acquisition error.
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); break; }
+                catch (IOException) when (attempt < 11) { await Task.Delay(250); }
+                catch (UnauthorizedAccessException) when (attempt < 11) { await Task.Delay(250); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                { Console.WriteLine("QA scratch cleanup deferred: " + ex.GetType().Name); }
+            }
+        }
     }
 }

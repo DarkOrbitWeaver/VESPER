@@ -36,6 +36,10 @@ public sealed class BrowserBodyTests
             """;
         Assert.True(BridgeProtocol.TryParse(begin, out var request, out var error), error);
         Assert.Equal(123, request.BrowserBody!.Length);
+        Assert.True(BridgeProtocol.TryParse(begin.Replace("123}", "123,\"mediaCheck\":\"webm\"}"), out var webm, out error), error);
+        Assert.True(webm.BrowserBody!.VerifyWebm);
+        Assert.False(webm.BrowserBody.VerifyMp4);
+        Assert.False(BridgeProtocol.TryParse(begin.Replace("123}", "123,\"mediaCheck\":\"unknown\"}"), out _, out _));
         Assert.False(BridgeProtocol.TryParse(begin.Replace("clip.mp4", "../clip.mp4"), out _, out _));
         Assert.False(BridgeProtocol.TryParse(begin.Replace("https://example.test/", "https://example.test/private?token=x"), out _, out _));
         Assert.False(BridgeProtocol.TryParse(begin.Replace("https://example.test/", "https://u:p@example.test/"), out _, out _));
@@ -142,6 +146,55 @@ public sealed class BrowserBodyTests
         var actual = Assert.Single(Mp4Demuxer.Read(output, output.Length, default));
         Assert.Equal(expected.Samples.Count, actual.Samples.Count);
         Assert.Equal(expected.DurationTicks, actual.DurationTicks);
+        var receipt = await Send(h, new("status", Transfer, Origin));
+        Assert.Equal(id, AcceptedId(receipt));
+        Assert.Equal(audio.Length, JsonSerializer.SerializeToElement(receipt.Data, BridgeProtocol.Json).GetProperty("offset").GetInt64());
+    }
+
+    [Theory]
+    [InlineData("muxed.webm", "muxed", false)]
+    [InlineData("video-only.webm", "video", false)]
+    [InlineData("quiet-track.webm", "audio", false)]
+    [InlineData("muxed.webm", "muxed", true)]
+    public async Task RetainedWebmUsesVerifiedRemuxAndNeverPublishesMalformedBytes(string fixture, string role, bool truncate)
+    {
+        using var h = new Harness();
+        byte[] original = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", "Media", fixture));
+        byte[] bytes = truncate ? original[..(original.Length / 2)] : original;
+        Assert.True((await Send(h, new("begin", Transfer, Origin, "clip.webm", bytes.Length,
+            Tracks: [new(role, "webm", bytes.Length)], OutputContainer: "webm"))).Ok);
+        for (int offset = 0; offset < bytes.Length; offset += BrowserBodyReceiver.ChunkBytes)
+            Assert.True((await Send(h, Append(offset, bytes.AsSpan(offset, Math.Min(BrowserBodyReceiver.ChunkBytes, bytes.Length - offset)).ToArray()))).Ok);
+        Guid id = AcceptedId(await Send(h, Finish()));
+        JobSnapshot completed = await h.WaitForStateAsync(id, truncate ? JobState.NeedsAttention : JobState.Completed);
+        Assert.Equal(JobKind.Merge, completed.Kind);
+        var receipt = await Send(h, new("status", Transfer, Origin));
+        Assert.Equal(id, AcceptedId(receipt));
+        Assert.Equal(bytes.Length, JsonSerializer.SerializeToElement(receipt.Data, BridgeProtocol.Json).GetProperty("offset").GetInt64());
+        if (truncate)
+        {
+            Assert.False(File.Exists(completed.FinalPath));
+            return;
+        }
+        using var input = new MemoryStream(original);
+        using var output = File.OpenRead(completed.FinalPath!);
+        var expected = WebmDemuxer.Read(input, input.Length, default).OrderBy(t => t.Kind).ToArray();
+        var actual = WebmDemuxer.Read(output, output.Length, default).OrderBy(t => t.Kind).ToArray();
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.Equal(expected[i].Kind, actual[i].Kind);
+            Assert.Equal(expected[i].Samples.Count, actual[i].Samples.Count);
+            for (int n = 0; n < expected[i].Samples.Count; n++)
+            {
+                var a = expected[i].Samples[n]; var b = actual[i].Samples[n];
+                Assert.Equal(a.Size, b.Size);
+                byte[] left = new byte[a.Size], right = new byte[b.Size];
+                input.Position = a.Offset; input.ReadExactly(left);
+                output.Position = b.Offset; output.ReadExactly(right);
+                Assert.Equal(left, right);
+            }
+        }
     }
 
     [Fact]
@@ -225,6 +278,37 @@ public sealed class BrowserBodyTests
             Assert.Equal("invalid-media", result.Code);
             Assert.Empty(h.Engine.Snapshots());
             Assert.False((await Send(h, new("status", Transfer, Origin))).Ok);
+        }
+    }
+
+    [Theory]
+    [InlineData("muxed.webm", false)]
+    [InlineData("video-only.webm", false)]
+    [InlineData("quiet-track.webm", false)]
+    [InlineData("muxed.webm", true)]
+    [InlineData("av-init.mp4", false)]
+    public async Task DirectWebmCopyChecksContainerBeforeAcceptance(string fixture, bool truncate)
+    {
+        using var h = new Harness();
+        byte[] bytes = DashTransferTests.Fixture(fixture);
+        if (truncate) bytes = bytes[..(bytes.Length / 2)];
+        var begin = await Send(h, Begin(bytes.Length, "clip.webm") with { VerifyWebm = true });
+        Assert.True(begin.Ok, begin.Message);
+        Assert.Equal("webm", JsonSerializer.SerializeToElement(begin.Data, BridgeProtocol.Json).GetProperty("mediaCheck").GetString());
+        Assert.False((await Send(h, Begin(bytes.Length, "clip.webm"))).Ok);
+        for (int offset = 0; offset < bytes.Length; offset += BrowserBodyReceiver.ChunkBytes)
+            Assert.True((await Send(h, Append(offset, bytes.AsSpan(offset, Math.Min(BrowserBodyReceiver.ChunkBytes, bytes.Length - offset)).ToArray()))).Ok);
+        var result = await Send(h, Finish());
+        if (truncate || !fixture.EndsWith(".webm", StringComparison.Ordinal))
+        {
+            Assert.False(result.Ok);
+            Assert.Equal("invalid-media", result.Code);
+            Assert.Empty(h.Engine.Snapshots());
+        }
+        else
+        {
+            var saved = await h.WaitForStateAsync(AcceptedId(result), JobState.Completed);
+            Assert.Equal(bytes, await File.ReadAllBytesAsync(saved.FinalPath!));
         }
     }
 

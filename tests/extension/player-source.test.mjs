@@ -7,7 +7,14 @@ import vm from 'node:vm';
 const context = { URL };
 vm.createContext(context);
 vm.runInContext(readFileSync(new URL('../../extension/player-source.js', import.meta.url), 'utf8'), context);
-const { cardPage } = context.VesperPlayerSource;
+const { cardPage, playbackKind } = context.VesperPlayerSource;
+
+test('loaded standalone audio in a VIDEO wrapper is classified by metadata, not tag name',()=>{
+  assert.equal(playbackKind({tagName:'AUDIO',readyState:0}),'audio');
+  assert.equal(playbackKind({tagName:'VIDEO',readyState:1,videoWidth:0,videoHeight:0}),'audio');
+  assert.equal(playbackKind({tagName:'VIDEO',readyState:0,videoWidth:0,videoHeight:0}),'video');
+  assert.equal(playbackKind({tagName:'VIDEO',readyState:1,videoWidth:1920,videoHeight:1080}),'video');
+});
 
 test('a card with one site identity names that post, whatever else it links to', () => {
   const origin = 'https://www.reddit.com';

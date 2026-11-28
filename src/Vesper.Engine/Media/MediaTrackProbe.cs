@@ -142,55 +142,153 @@ internal static class MediaTrackProbe
 
     private static bool WebmHasAudio(PartialFile file, CancellationToken ct, out bool finiteSegment)
     {
-        finiteSegment = false;
         long position = 0;
         var ebml = FileElement(file, ref position, file.Length);
-        if (ebml.Id != 0x1a45dfa3) throw Bad("Missing EBML header.");
+        if (ebml.Id != WebmDemuxer.IdEbml) throw Bad("Missing EBML header.");
         position = ebml.End;
         var segment = FileElement(file, ref position, file.Length);
-        if (segment.Id != 0x18538067) throw Bad("Missing WebM segment.");
+        if (segment.Id != WebmDemuxer.IdSegment) throw Bad("Missing WebM segment.");
         finiteSegment = !segment.UnknownSize && segment.End == file.Length;
         for (int count = 0; position < segment.End && count < 100_000; count++)
         {
             ct.ThrowIfCancellationRequested();
             var element = FileElement(file, ref position, segment.End);
-            if (element.Id == 0x1654ae6b)
-            {
-                if (element.End - position > 4 * 1024 * 1024) throw Bad("Oversized WebM track metadata.");
-                byte[] tracks = Read(file, position, (int)(element.End - position));
-                int p = 0; bool audio = false;
-                while (p < tracks.Length)
-                {
-                    var track = MemoryElement(tracks, ref p, tracks.Length);
-                    if (track.Id == 0xae)
-                    {
-                        int q = p; ulong? kind = null; string? codec = null;
-                        while (q < track.End)
-                        {
-                            var property = MemoryElement(tracks, ref q, (int)track.End);
-                            if (property.Id == 0x6d80) throw Bad("Encoded/encrypted WebM tracks are unsupported.");
-                            if (property.Id == 0x83)
-                            {
-                                if (property.End - q is < 1 or > 8) throw Bad("Invalid WebM track type.");
-                                ulong value = 0; for (int i = q; i < property.End; i++) value = value * 256 + tracks[i]; kind = value;
-                            }
-                            if (property.Id == 0x86 && property.End - q <= 128) codec = Encoding.ASCII.GetString(tracks, q, (int)property.End - q);
-                            q = (int)property.End;
-                        }
-                        if (kind == 2)
-                        {
-                            if (codec is not ("A_OPUS" or "A_VORBIS" or "A_AAC" or "A_MPEG/L3" or "A_FLAC"))
-                                throw Bad("The WebM declares an unsupported audio track.");
-                            audio = true;
-                        }
-                    }
-                    p = (int)track.End;
-                }
-                return audio;
-            }
+            if (element.Id == WebmDemuxer.IdTracks)
+                return ReadWebmTracks(file, position, element, requirePlayable: false).Audio;
             position = element.End;
         }
         throw Bad("No bounded WebM track table was found.");
+    }
+
+    /// <summary>
+    /// Validates an explicitly requested complete browser WebM copy without
+    /// reading its media payload into memory or allocating a sample index.
+    /// This is a container/track/payload-presence check, not codec decoding.
+    /// </summary>
+    internal static void RequireWebmMedia(PartialFile file, CancellationToken ct)
+    {
+        long position = 0;
+        var ebml = FileElement(file, ref position, file.Length);
+        if (ebml.Id != WebmDemuxer.IdEbml || ebml.UnknownSize || ebml.End - position > 4096)
+            throw Bad("Missing or oversized EBML header.");
+        byte[] header = Read(file, position, (int)(ebml.End - position));
+        string? docType = null;
+        for (int i = 0; i < header.Length;)
+        {
+            var field = MemoryElement(header, ref i, header.Length);
+            if (field.Id == 0x4282 && field.End - i <= 32)
+                docType = Encoding.ASCII.GetString(header, i, (int)field.End - i);
+            i = (int)field.End;
+        }
+        if (docType is not ("webm" or "matroska")) throw Bad("Unsupported EBML document type.");
+        position = ebml.End;
+        var segment = FileElement(file, ref position, file.Length);
+        if (segment.Id != WebmDemuxer.IdSegment || segment.End != file.Length)
+            throw Bad("Missing or incomplete WebM segment.");
+        bool tracks = false, media = false;
+        int remaining = 100_000;
+        while (position < segment.End)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (--remaining < 0) throw Bad("Too many WebM elements.");
+            var element = FileElement(file, ref position, segment.End);
+            if (element.Id == WebmDemuxer.IdCluster)
+            {
+                if (!tracks) throw Bad("A WebM cluster precedes the track list.");
+                media |= WebmClusterHasBlock(file, ref position, element, ref remaining, ct);
+                continue;
+            }
+            if (element.UnknownSize) throw Bad("Unsupported unknown-size WebM element.");
+            if (element.Id == WebmDemuxer.IdTracks)
+            {
+                if (tracks) throw Bad("Duplicate WebM track list.");
+                var facts = ReadWebmTracks(file, position, element, requirePlayable: true);
+                tracks = facts.Audio || facts.Video;
+                if (!tracks) throw Bad("The WebM has no playable audio or video track.");
+            }
+            position = element.End;
+        }
+        if (!tracks || !media) throw Bad("The WebM has no complete media block.");
+    }
+
+    private static (bool Audio, bool Video) ReadWebmTracks(PartialFile file, long position, Element element, bool requirePlayable)
+    {
+        if (element.UnknownSize || element.End - position > 4 * 1024 * 1024)
+            throw Bad("Oversized or unbounded WebM track metadata.");
+        byte[] tracks = Read(file, position, (int)(element.End - position));
+        int p = 0; bool audio = false, video = false;
+        while (p < tracks.Length)
+        {
+            var track = MemoryElement(tracks, ref p, tracks.Length);
+            if (track.Id == 0xae)
+            {
+                int q = p; ulong? kind = null; string? codec = null;
+                while (q < track.End)
+                {
+                    var property = MemoryElement(tracks, ref q, (int)track.End);
+                    if (property.Id == 0x6d80) throw Bad("Encoded/encrypted WebM tracks are unsupported.");
+                    if (property.Id == 0x83)
+                    {
+                        if (property.End - q is < 1 or > 8) throw Bad("Invalid WebM track type.");
+                        ulong value = 0; for (int i = q; i < property.End; i++) value = value * 256 + tracks[i]; kind = value;
+                    }
+                    if (property.Id == 0x86 && property.End - q <= 128) codec = Encoding.ASCII.GetString(tracks, q, (int)property.End - q);
+                    q = (int)property.End;
+                }
+                if (kind == 2)
+                {
+                    if (codec is not ("A_OPUS" or "A_VORBIS" or "A_AAC" or "A_MPEG/L3" or "A_FLAC"))
+                        throw Bad("The WebM declares an unsupported audio track.");
+                    audio = true;
+                }
+                if (kind == 1)
+                {
+                    if (requirePlayable && codec is not ("V_VP8" or "V_VP9" or "V_AV1" or "V_MPEG4/ISO/AVC" or "V_MPEGH/ISO/HEVC"))
+                        throw Bad("The WebM declares an unsupported video track.");
+                    video = true;
+                }
+            }
+            p = (int)track.End;
+        }
+        return (audio, video);
+    }
+
+    private static bool WebmClusterHasBlock(PartialFile file, ref long position, Element cluster, ref int remaining, CancellationToken ct)
+    {
+        bool media = false;
+        while (position < cluster.End)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (--remaining < 0) throw Bad("Too many WebM elements.");
+            long start = position;
+            var child = FileElement(file, ref position, cluster.End);
+            if (cluster.UnknownSize && child.Id is WebmDemuxer.IdCluster or WebmDemuxer.IdCues or WebmDemuxer.IdTags
+                or WebmDemuxer.IdChapters or WebmDemuxer.IdAttachments or WebmDemuxer.IdSeekHead or WebmDemuxer.IdInfo or WebmDemuxer.IdTracks)
+            { position = start; return media; }
+            if (child.UnknownSize) throw Bad("Unknown-size WebM cluster child.");
+            if (child.Id == 0xa3 && child.End - position >= 5) media = true;
+            if (child.Id == 0xa0)
+            {
+                long groupPosition = position;
+                bool block = false;
+                while (groupPosition < child.End)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (--remaining < 0) throw Bad("Too many WebM elements.");
+                    var member = FileElement(file, ref groupPosition, child.End);
+                    if (member.UnknownSize) throw Bad("Unknown-size WebM block group child.");
+                    if (member.Id == 0xa1 && member.End - groupPosition >= 5) block = true;
+                    groupPosition = member.End;
+                }
+                if (!block) throw Bad("Missing WebM block.");
+                media = true;
+            }
+            position = child.End;
+            // A finite cluster's declared extent is already checked. Skip
+            // its remaining blocks rather than indexing a long movie.
+            if (media && !cluster.UnknownSize) { position = cluster.End; break; }
+        }
+        return media;
     }
 
     private readonly record struct Element(ulong Id, long End, bool UnknownSize = false);

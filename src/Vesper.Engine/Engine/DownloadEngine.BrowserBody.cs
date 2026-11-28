@@ -20,7 +20,8 @@ public sealed record BrowserBodyRequest(
     int TrackIndex = 0,
     IReadOnlyList<BrowserBodyTrackSpec>? Tracks = null,
     string? PageUrl = null,
-    string? OutputContainer = null);
+    string? OutputContainer = null,
+    bool VerifyWebm = false);
 
 public sealed partial class DownloadEngine
 {
@@ -43,7 +44,16 @@ public sealed partial class DownloadEngine
             {
                 if (request.Operation == "status" && !string.Equals(request.Origin, accepted.SourceUrl, StringComparison.Ordinal))
                     return BridgeResponse.Fail(requestId, "missing", "No matching browser receipt.");
-                return BridgeResponse.Success(requestId, data: new { accepted = true, jobId = id, offset = accepted.TotalBytes,
+                // A remux can have a different published length. The receipt
+                // acknowledges the browser's input, not the output container.
+                long? received = accepted.TotalBytes;
+                if (accepted.Kind == JobKind.Merge)
+                {
+                    received = MediaMergePlan.TryParse(accepted.MediaPlanJson, Options.AllowPrivateNetworks, out var plan, out _)
+                        && plan.Provider == "browser" && plan.MediaId == request.TransferId
+                        ? plan.Tracks.Sum(track => track.Size) : null;
+                }
+                return BridgeResponse.Success(requestId, data: new { accepted = true, jobId = id, offset = received,
                     state = accepted.State.ToString() });
             }
             if (request.Operation == "status")
@@ -57,7 +67,7 @@ public sealed partial class DownloadEngine
             case "begin" when request.Origin is not null && request.FileName is not null:
                 reply = await receiver.BeginAsync(
                     request.TransferId, request.Origin, request.FileName, request.Length, ct,
-                    request.Session, request.VerifyMp4, request.Tracks, request.PageUrl, request.OutputContainer)
+                    request.Session, request.VerifyMp4, request.Tracks, request.PageUrl, request.OutputContainer, request.VerifyWebm)
                     .ConfigureAwait(false);
                 if (reply.Code == "storage")
                     return BridgeResponse.Fail(requestId, "storage", "Not enough free space for the browser file, or its folder is unavailable.");
@@ -80,7 +90,7 @@ public sealed partial class DownloadEngine
         if (!reply.Ok)
             return BridgeResponse.Fail(requestId, reply.Code, "The browser stream could not be accepted. No completed file was claimed.");
         return BridgeResponse.Success(requestId, data: new { offset = reply.Offset, accepted = reply.JobId is not null, jobId = reply.JobId,
-            mediaCheck = request.Operation == "begin" && request.VerifyMp4 ? "mp4" : null });
+            mediaCheck = request.Operation == "begin" ? request.VerifyMp4 ? "mp4" : request.VerifyWebm ? "webm" : null : null });
     }
 
     private string? BrowserBodyDestination(string name, long length)
@@ -109,8 +119,9 @@ public sealed partial class DownloadEngine
         Guid id = body.JobId;
         DownloadJob job;
 
-        if (body.Tracks is { Count: > 0 } specs
-            && (specs.Count == 2 || specs[0].Container is "mp4" or "m4a"))
+        // Retained WebM is also a playback reconstruction, not a byte-exact
+        // original file. Route every declared track through the verified remux.
+        if (body.Tracks is { Count: > 0 } specs)
         {
             string outContainer = body.OutputContainer ?? Path.GetExtension(body.Name).TrimStart('.').ToLowerInvariant();
             if (outContainer is not ("mp4" or "m4a" or "webm" or "mkv")) outContainer = "mp4";

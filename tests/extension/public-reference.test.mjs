@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
-import {validateManifest,referenceLabel,sourceObservation} from '../../tools/intelligence/collect-public-reference.mjs';
+import {validateManifest,referenceLabel,sourceObservation,playerIntentLabel} from '../../tools/intelligence/collect-public-reference.mjs';
 
 const url='https://cdn.example.org/video.mp4', other='https://cdn.example.org/other.mp4';
 const spec={group:'public-family',split:'train',programId:'program-one',page:url};
@@ -19,6 +19,10 @@ test('public reference manifest rejects signed URLs, local addresses, duplicate 
   assert.throws(()=>validateManifest([spec,{...spec,page:other}]),/Duplicate program/);
   assert.throws(()=>validateManifest([spec,{...spec,programId:'program-two',page:other,split:'holdout'}]),/Family crosses/);
   assert.throws(()=>validateManifest([spec,{...spec,programId:'program-two'}]),/Duplicate expected resource/);
+  assert.throws(()=>validateManifest([{...spec,competitors:[url]}]),/Duplicate competing resource/);
+  assert.throws(()=>validateManifest([{...spec,competitors:['https://private.local/a']}]),/Invalid competing resources/);
+  assert.throws(()=>validateManifest([{...spec,competitors:[other]},{...spec,group:'second-family',programId:'program-two',page:other,split:'holdout'}]),/Resource crosses partitions/);
+  assert.deepEqual(validateManifest([{...spec,competitors:[other]}])[0].competitors,[other]);
 });
 
 test('reference label requires predeclared identity, actual playback and a successful response, independent of model',()=>{
@@ -26,6 +30,7 @@ test('reference label requires predeclared identity, actual playback and a succe
   for(const playback of [[{...player,played:false}],[{...player,src:other}],[player,{...player,id:'player-1'}]])
     assert.equal(referenceLabel(normalized,playback,[response]).status,'reference-not-established');
   assert.equal(referenceLabel(normalized,[player],[]).status,'reference-response-missing');
+  assert.equal(referenceLabel(normalized,[player],[{...response,fromServiceWorker:true}]).status,'worker-mediated-reference-unproven');
   assert.equal(referenceLabel(normalized,[{...player,frame:'top'}],[{...response,frame:'child'}]).status,'reference-response-missing');
   assert.equal(referenceLabel(normalized,[{...player,frame:'top'}],[{...response,frame:'top'}]).status,'verified');
   assert.equal(referenceLabel({...normalized,probeOnly:true},[player],[response]).status,'probe-only');
@@ -42,5 +47,21 @@ test('unreviewed observations cannot become labels and exported model features c
   const unreviewed=sourceObservation(runtime,normalized,[player],responses,{status:'probe-only'});
   assert.equal(unreviewed.established,false);
   assert.equal(unreviewed.chosen,null);
-  assert.equal(sourceObservation(runtime,normalized,[player,{...player,id:'player-1'}],responses,ref),null);
+  const competing=[player,{...player,id:'player-1',src:other}];
+  assert.equal(sourceObservation(runtime,normalized,competing,responses,ref),null);
+  const scoped=sourceObservation(runtime,normalized,competing,responses,ref,player.id);
+  assert.equal(scoped.established,true);
+  assert.equal(scoped.candidates.length,2);
+  const wrong=sourceObservation(runtime,normalized,competing,responses,ref,'player-1');
+  assert.equal(wrong.established,false);
+  assert.equal(JSON.stringify(scoped).includes('https:'),false);
+});
+
+test('scripted competing playback does not establish natural player intent',()=>{
+  const ref=referenceLabel(normalized,[player],[response]);
+  assert.deepEqual(playerIntentLabel(ref,[player],[player]),{status:'verified',chosen:player.id});
+  const rival={...player,id:'player-1',src:other};
+  assert.equal(playerIntentLabel(ref,[player,rival],[player,rival]).chosen,null);
+  assert.equal(playerIntentLabel(ref,[player,rival],[player]).status,'requires-independent-intent-review');
+  assert.equal(playerIntentLabel({status:'probe-only'},[player],[player]).chosen,null);
 });

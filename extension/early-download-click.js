@@ -9,6 +9,9 @@
     if (paused) intentAt = 0;
   });
   const canIntercept = () => !paused && !!chrome.runtime.id;
+  // A document worker can synthesize different bytes for the original click.
+  // The extension worker's HEAD/GET is not evidence of that representation.
+  const canReplayHttp = () => canIntercept() && !navigator.serviceWorker?.controller;
   window.addEventListener('click', event => {
     if (canIntercept() && event.isTrusted && navigator.userActivation?.isActive
         && event.composedPath().some(node => node?.matches?.('button,a,input[type=button],input[type=submit],[role=button]')))
@@ -16,10 +19,10 @@
   }, true);
 
   window.addEventListener('click', event => {
-    if (!canIntercept() || document.querySelector('base[target]')) return;
+    if (!canReplayHttp() || document.querySelector('base[target]')) return;
     const chosen = VesperEarlyDownload.clickCandidate(event, location.href);
     if (!chosen) return;
-    const {anchor, url} = chosen;
+    const {anchor, url, explicitIntent} = chosen;
     if (pendingUrl) {
       if (pendingUrl === url) event.preventDefault();
       return;
@@ -29,13 +32,14 @@
     for (const name of ['download', 'referrerpolicy', 'rel', 'target'])
       if (anchor.hasAttribute(name)) original.setAttribute(name, anchor.getAttribute(name));
     event.preventDefault();
-    start(url, original);
-  }, { capture: true });
+    start(url, original, explicitIntent);
+  // Let target/document click handlers cancel their own default action first.
+  });
 
   document.addEventListener('vesper-early-download-request', event => {
     // Page-authored events are only proposals. Independently verify a recent,
     // one-shot trusted gesture and a supported download link.
-    if (!canIntercept() || !event.cancelable || !intentAt || Date.now() - intentAt > 15_000
+    if (!canReplayHttp() || !event.cancelable || !intentAt || Date.now() - intentAt > 15_000
         || typeof event.detail !== 'string' || event.detail.length > 6000) return;
     let proposal;
     try { proposal = JSON.parse(event.detail); } catch { return; }
@@ -52,20 +56,24 @@
     const original = document.createElement('a');
     original.href = url;
     original.download = proposal.downloadName;
+    if (typeof proposal.referrerPolicy === 'string') original.setAttribute('referrerpolicy', proposal.referrerPolicy.slice(0, 64));
     event.preventDefault();
     start(url, original);
   });
 
-  function start(url, original) {
+  function start(url, original, explicitIntent = false) {
     pendingUrl = url;
     const clickAt = intentAt || Date.now();
     intentAt = 0;
     void (async () => {
       try {
-        const omitReferrer = original.rel?.split(/\s+/).includes('noreferrer')
-          || original.getAttribute('referrerpolicy')?.toLowerCase() === 'no-referrer';
+        const referrerPolicy = original.getAttribute('referrerpolicy')
+          || document.querySelector('meta[name="referrer" i]')?.getAttribute('content') || '';
+        const omitReferrer = original.rel?.toLowerCase().split(/\s+/).includes('noreferrer')
+          || referrerPolicy.toLowerCase() === 'no-referrer';
         const reply = await chrome.runtime.sendMessage({type:'early-download', url, clickAt,
-          downloadName:original.getAttribute('download'), ...(omitReferrer ? { omitReferrer: true } : {})});
+          downloadName:original.getAttribute('download'), explicitIntent, referrerPolicy:referrerPolicy.slice(0,64),
+          ...(omitReferrer ? { omitReferrer: true } : {})});
         if (reply?.ok) return;
         if (reply?.fallback === true) {
           original.click();

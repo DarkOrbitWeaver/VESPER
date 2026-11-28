@@ -3408,6 +3408,28 @@ test('trusted direct intent accepts a seasoned Last-Modified only without an ETa
     } finally { app.stopWorker(); }
   }
 });
+test('explicit download labels admit only bounded attachment endpoints',async()=>{
+  const url='https://example.com/download?id=45';
+  for(const [attachment,expected] of [['attachment; filename="report.pdf"',true],['inline',false]]){
+    const app=load({'browser-capture':started,'browser-transfer':transfer('active')},
+      {earlyFetch:async()=>earlyHeaders(url,{'Content-Type':'application/pdf','Content-Disposition':attachment})});
+    try{
+      const cand=app.evaluate('VesperEarlyDownload.candidate');
+      assert.equal(cand(url,earlySender.url),null);
+      assert.equal(cand(url,earlySender.url,null,true),url);
+      assert.equal(cand(url+'&token=opaque',earlySender.url,null,true),null);
+      const click=app.evaluate('VesperEarlyDownload.clickCandidate');
+      const anchor={tagName:'A',href:url,textContent:'Download file',hasAttribute:()=>false,getAttribute:()=>null};
+      const event={isTrusted:true,defaultPrevented:false,cancelable:true,button:0,composedPath:()=>[anchor]};
+      assert.equal(click(event,earlySender.url).explicitIntent,true);
+      assert.equal(click({...event,composedPath:()=>[{...anchor,textContent:'Learn more'}]},earlySender.url),null);
+      const reply=await app.message({type:'early-download',url,explicitIntent:true},earlySender);
+      assert.equal(reply.ok,expected);
+      assert.equal(app.sent.filter(x=>x.type==='browser-capture').length,expected?1:0);
+    }finally{app.stopWorker();}
+  }
+});
+
 test('explicit same-origin named exports admit extensionless URLs and safe query parameters',async()=>{
   for(const [url,name,mime] of [
     ['https://example.com/export','archive.zip','application/zip'],
@@ -3479,6 +3501,22 @@ test('same-origin signed-in early download requires permission and never follows
       }
     }finally{app.stopWorker()}
   }
+});
+test('early handoff protects the referring document path across origins',async()=>{
+  const source='https://example.com/private/report?access=internal';
+  const url='https://cdn.example.net/report.zip';
+  const app=load({'browser-capture':started,'browser-transfer':transfer('active')},{earlyFetch:async address=>earlyHeaders(address)});
+  try{
+    const policy=app.evaluate('VesperEarlyDownload.referrer');
+    assert.equal(policy(source,url,''),'https://example.com/');
+    assert.equal(policy(source,url,'same-origin'),undefined);
+    assert.equal(policy(source,'https://example.com/report.zip','origin'),'https://example.com/');
+    assert.equal(policy(source,'https://example.com/report.zip','no-referrer'),undefined);
+    assert.equal(policy(source,'http://example.com/report.zip','unsafe-url'),undefined);
+    const sender={...earlySender,url:source};
+    assert.equal((await app.message({type:'early-download',url},sender)).ok,true);
+    assert.equal(app.sent[0].items[0].referer,'https://example.com/');
+  }finally{app.stopWorker()}
 });
 test('refused native stage permits replay but uncertain acceptance never starts a duplicate',async()=>{
   for(const uncertain of [false,true]){

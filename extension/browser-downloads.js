@@ -273,7 +273,8 @@ async function earlyDirectDownload(message, sender) {
   const chromeFallback = { ok: false, fallback: true };
   const uncertain = { ok: false, fallback: false, message: 'VESPER could not confirm ownership. Check VESPER before retrying.' };
   const page = VesperPlayerSource.http(sender.url);
-  const url = page && VesperEarlyDownload.candidate(message.url, page.href, message.downloadName);
+  const url = page && VesperEarlyDownload.candidate(message.url, page.href, message.downloadName, message.explicitIntent === true);
+  const semanticOnly = !!url && !VesperEarlyDownload.candidate(message.url, page.href, message.downloadName);
   if (!url || !sender.tab || sender.tab.incognito || !Number.isSafeInteger(sender.tab.id)) return chromeFallback;
   const attempt = crypto.randomUUID();
   const started = Date.now();
@@ -365,10 +366,15 @@ async function earlyDirectDownload(message, sender) {
       const statusOk = response.status === 200 || (response.status === 206 && !!rangeTotal);
       const final = VesperPlayerSource.http(response.url || url);
       finalUrl = final?.href;
+      const referer = message.omitReferrer ? undefined : VesperEarlyDownload.referrer(page.href, final?.href, message.referrerPolicy);
       if (credMode === 'include' && final?.origin === page.origin && !response.redirected) {
-        const enriched = await withSignIn([{ url: final.href, originalUrl: url, ...(message.omitReferrer ? {} : { referer: page.href }), userAgent: navigator.userAgent }],
+        if (!await signInEnabled()) return fallback('site-policy');
+        // The cookie initiator is the document, even when it omits Referer.
+        const matches = await signInCookies(final.href, page.href,
           { frame: { tabId: sender.tab.id, frameId: sender.frameId ?? 0, ...(sender.documentId ? { documentId: sender.documentId } : {}) }, userGesture: true });
-        if (enriched.authorized) signedItems = enriched.items;
+        const cookie = matches.map(c => c.name + '=' + c.value).join('; ');
+        if (matches.length && (!cookie || cookie.length > 8192 || /[\r\n\0]/.test(cookie))) return fallback('site-policy');
+        if (cookie) signedItems = [{url:final.href,originalUrl:url,...(referer ? {referer} : {}),userAgent:navigator.userAgent,cookie}];
       }
       const mime = mimeType(response.headers.get('content-type'));
       const disposition = response.headers.get('content-disposition') || '';
@@ -398,7 +404,7 @@ async function earlyDirectDownload(message, sender) {
       if (!statusOk) return fallback('probe-status');
       if (!final || credMode === 'include' && (response.redirected || final.origin !== page.origin)
           || final.protocol !== 'https:' && final.origin !== page.origin) return fallback('redirect-unverified');
-      if (html && !namedHtml || !attachment && explicitName === null && !binary) return fallback('file-intent-unverified');
+      if (semanticOnly && !attachment || html && !namedHtml || !attachment && explicitName === null && !binary) return fallback('file-intent-unverified');
       if (!useGitHubArchive && (length === undefined ? !(archiveTarget && strongEtag) : !Number.isSafeInteger(length) || length <= 0))
         return fallback('length-unverified');
       if (!useGitHubArchive && !strongEtag && !lastModified && !useAttachmentLength) return fallback('validator-unverified');
@@ -416,7 +422,7 @@ async function earlyDirectDownload(message, sender) {
           : { basis: 'attachment-length' })
       };
       const items = signedItems || [{ url: final.href, originalUrl: url,
-        ...(message.omitReferrer ? {} : { referer: page.href }), userAgent: navigator.userAgent }];
+        ...(referer ? { referer } : {}), userAgent: navigator.userAgent }];
       // A server-specified attachment filename wins over the HTML download name.
       if (explicitName && !/;\s*filename\*?\s*=/i.test(disposition)) items[0].fileName = explicitName;
       const request = envelope(signedItems ? 'browser-submit' : 'browser-capture', { mode: 'download', authorized: !!signedItems, browserProof: proof, items });

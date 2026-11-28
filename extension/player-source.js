@@ -176,5 +176,14 @@ globalThis.VesperPlayerSource = (() => {
       || /(?:^|\.)fb\.watch$/i.test(host);
   }
 
-  return { http, identity, cardPage, kind, isSocialFeedSite, blocksPassiveProbe, instagramPost, isFacebookHost };
+  // Chromium's standalone audio documents can use a VIDEO element even
+  // when the loaded resource has no visual track. Once metadata is ready,
+  // dimensions describe playback more accurately than the wrapper tag.
+  function playbackKind(player) {
+    if (player?.tagName === 'AUDIO') return 'audio';
+    return player?.tagName === 'VIDEO' && player.readyState >= 1
+      && player.videoWidth === 0 && player.videoHeight === 0 ? 'audio' : 'video';
+  }
+
+  return { http, identity, cardPage, kind, playbackKind, isSocialFeedSite, blocksPassiveProbe, instagramPost, isFacebookHost };
 })();

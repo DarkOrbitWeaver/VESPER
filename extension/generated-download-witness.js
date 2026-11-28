@@ -55,10 +55,10 @@
     if (!event.isTrusted && name && /^https?:\/\//i.test(anchor.href)
         && !anchor.hasAttribute('ping') && !anchor.hasAttribute('attributionsrc')
         && (!anchor.target || anchor.target.toLowerCase() === '_self')
-        && !anchor.rel?.split(/\s+/).includes('noreferrer')) {
+        && !anchor.rel?.toLowerCase().split(/\s+/).includes('noreferrer')) {
       try {
         const proposal = new CustomEvent('vesper-early-download-request', {
-          detail: JSON.stringify({ url: anchor.href, downloadName: name }), cancelable: true
+          detail: JSON.stringify({ url: anchor.href, downloadName: name, referrerPolicy: anchor.referrerPolicy || '' }), cancelable: true
         });
         if (!apply(dispatch, document, [proposal])) { intentAt = 0; event.preventDefault(); }
       } catch {}

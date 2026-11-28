@@ -392,6 +392,19 @@ test('an older native helper must acknowledge MP4 validation before receiving an
   assert.equal(b.chunks.length, 0);
 });
 
+test('direct WebM copy negotiates verification before transmitting bytes', async () => {
+  for (const mime of ['video/webm', 'audio/webm']) {
+    const b = bridge();
+    await copy(b, {fetcher: async()=>response(source, source.length, mime)});
+    assert.equal(b.messages[0].mediaCheck, 'webm');
+    assert.deepEqual(Buffer.concat(b.chunks), Buffer.from(source));
+    const old = bridge({oldHelper:true});
+    await assert.rejects(copy(old, {fetcher:async()=>response(source, source.length, mime)}), /Update the desktop helper/);
+    assert.equal(old.chunks.length, 0);
+    assert.deepEqual(old.messages.map(m=>m.operation), ['begin', 'abort']);
+  }
+});
+
 test('a confirmed media validation failure does not create an uncertain receipt', async () => {
   const b = bridge({ invalidMedia: true });
   let statusQueries = 0;

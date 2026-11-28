@@ -561,7 +561,7 @@
       || !social && document.querySelectorAll('video,audio').length === 1);
     return (useDocumentTitle && specific && identity === documentIdentity && document.title.replace(/\s+- YouTube$/, ''))
       || player.getAttribute?.('aria-label')?.trim().slice(0, 300)
-      || (player.tagName === 'AUDIO' ? 'This audio' : 'This video');
+      || (VesperPlayerSource.playbackKind(player) === 'audio' ? 'This audio' : 'This video');
   }
   function activeTikTokPage(el, contextPage) {
     if (!/(?:^|\.)tiktok\.com$/i.test(location.hostname || '') || el?.tagName !== 'VIDEO') return null;
@@ -2041,7 +2041,7 @@
     if (playerFacts) {
       if (Number.isFinite(player.duration) && player.duration > 0) playerFacts.durationSeconds = player.duration;
       if (Number.isFinite(player.videoHeight) && player.videoHeight > 0) playerFacts.height = player.videoHeight;
-      playerFacts.kind = player.tagName === 'AUDIO' ? 'audio' : 'video';
+      playerFacts.kind = VesperPlayerSource.playbackKind(player);
       if (player.duration === Infinity) playerFacts.live = true;
     }
     if (player.mediaKeys || protectedVideos.has(player)) {

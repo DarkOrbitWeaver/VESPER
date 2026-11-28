@@ -269,7 +269,7 @@ globalThis.VesperBrowserBody = (() => {
   }
 
   function mediaCheckFor(mime) {
-    return ['mp4', 'm4a', 'mov'].includes(EXTENSIONS[mime]) ? 'mp4' : undefined;
+    return EXTENSIONS[mime] === 'webm' ? 'webm' : ['mp4', 'm4a', 'mov'].includes(EXTENSIONS[mime]) ? 'mp4' : undefined;
   }
 
   async function copyBlob({ url, origin, title, generated = null, mediaProof = null, signal, onProgress = () => {},
@@ -793,7 +793,7 @@ globalThis.VesperBrowserBody = (() => {
         phase = 'finished';
       } else if (operation === 'begin' && phase === 'new') {
         const hasLen = message.length !== undefined && message.length !== null;
-        if (message.mediaCheck !== undefined && message.mediaCheck !== 'mp4'
+        if (message.mediaCheck !== undefined && !['mp4', 'webm'].includes(message.mediaCheck)
             || (hasLen && (!Number.isSafeInteger(message.length) || message.length < 1 || message.length > MAX_BYTES))
             || typeof message.fileName !== 'string' || !message.fileName || message.fileName.length > 255
             || /[\\/:\u0000-\u001f]/.test(message.fileName))
