@@ -170,25 +170,8 @@ globalThis.VesperMediaEvidence = (() => {
       return { index, entry, edges, verified, direct, witnessed, compatible, durationAgreement,
         rank: edges.reduce((sum, edge) => sum + edge.weight, 0) };
     });
-    // The portable model ranks already-verified candidates. It cannot select a
-    // source without the independent exact-player check below.
-    const learned = globalThis.VesperInference?.rankSources(nodes.filter(node => node.verified && node.compatible).map(node => {
-      return { id: 'source-' + node.index, exactPlayerUrl: node.direct,
-        playerBound: node.direct || !!node.witnessed,
-        resourceWitness: !!node.witnessed,
-        manifestParent: node.edges.some(edge => edge.kind === 'manifest-segment'),
-        wholeFile: node.entry.source?.wholeRepresentation === true || node.entry.source?.rangeResource === true ? true : null,
-        durationAgreement: node.durationAgreement == null ? null : Number(node.durationAgreement),
-        currentGeneration: node.direct || node.witnessed ? true : null,
-        hypothesized: !node.direct && !node.witnessed && !!node.entry.source?.sliceEvidence,
-        fragmentOnly: node.entry.source?.kind === 'fragment' };
-    }));
-    const preferred = learned?.decisive ? learned.selected : null;
-    nodes.sort((a, b) => Number(b.direct && b.verified && b.compatible) - Number(a.direct && a.verified && a.compatible)
-      || Number('source-' + b.index === preferred) - Number('source-' + a.index === preferred)
-      || b.rank - a.rank || a.index - b.index);
-    // Use the typed evidence graph for the actual selection verdict, not
-    // merely lookup ordering. Keep the model's ranking separate from identity.
+    // Both inference and acquisition consume the same admitted graph rows.
+    // Learned ranking cannot restore an identity or capability the graph rejected.
     const graph = globalThis.VesperEvidenceGraph?.create();
     const decision = graph?.assessPicker({ scope, playerKey, generation, sourceUrl: currentUrl, worker,
       candidates: [...nodes].sort((a,b) => a.index - b.index).map(node => ({
@@ -200,6 +183,21 @@ globalThis.VesperMediaEvidence = (() => {
     // Reject contradicted/fragment-only hypotheses for every caller, not only
     // the auto-selection branch. An incomplete graph cannot grant a choice.
     for (const node of nodes) node.compatible = rows.get(node.index)?.compatible === true;
+    const learned = globalThis.VesperInference?.rankSources(nodes.filter(node => node.verified && node.compatible).map(node => {
+      const row = rows.get(node.index);
+      return { id: 'source-' + node.index, exactPlayerUrl: row.exact,
+        playerBound: row.exact || row.witnessed, resourceWitness: row.witnessed,
+        manifestParent: node.edges.some(edge => edge.kind === 'manifest-segment'),
+        wholeFile: node.entry.source?.wholeRepresentation === true || node.entry.source?.rangeResource === true ? true : null,
+        durationAgreement: node.durationAgreement == null ? null : Number(node.durationAgreement),
+        currentGeneration: row.exact || row.witnessed ? true : null,
+        hypothesized: !row.exact && !row.witnessed && !!node.entry.source?.sliceEvidence,
+        fragmentOnly: false };
+    }));
+    const preferred = learned?.decisive ? learned.selected : null;
+    nodes.sort((a, b) => Number(rows.get(b.index)?.verdict === 'exact') - Number(rows.get(a.index)?.verdict === 'exact')
+      || Number('source-' + b.index === preferred) - Number('source-' + a.index === preferred)
+      || b.rank - a.rank || a.index - b.index);
     return { nodes, selected: decision?.verdict === 'exact'
       ? nodes.find(node => node.index === decision.selected)?.entry || null : null };
   }

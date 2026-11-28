@@ -254,7 +254,9 @@ globalThis.VesperEvidenceGraph = (() => {
         const resource = addSource(scope, url.href, item.kind || 'unknown');
         const recoverability = item.kind === 'fragment' || item.fragmentOnly === true ? 'partial-only'
           : item.verified === true ? 'checked-formats' : 'unknown';
+        const expiry = expiresAt(url.href);
         const contradicted = item.compatible !== true || item.conflictingValidator === true
+          || expiry !== null && expiry <= now()
           || nodes.get(gen)?.attrs.conflictingSource === true;
         const acquisition = add('acquisition', scopedKey(scope, playerKey, generation, index), {
           scope, index, recoverability, compatible: !contradicted

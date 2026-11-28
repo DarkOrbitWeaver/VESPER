@@ -81,7 +81,7 @@ async function evaluate(sessionId, expression) {
   return response.result?.value;
 }
 const allowed = new Set(['session-open','hello','capture-preflight','browser-capture','browser-submit','browser-transfer']);
-if (publicMedia) for (const type of ['media-options','media-source-options','media-select','browser-diagnostics']) allowed.add(type);
+if (publicMedia) for (const type of ['media-options','media-source-options','media-select','media-selection-status','browser-diagnostics']) allowed.add(type);
 try {
   await mkdir(chromeFolder,{recursive:true});
   await cp(join(root,'extension'),ext,{recursive:true});
@@ -117,7 +117,7 @@ try {
       const host = sessions.get(key) || openHost(key);
       const reply = await host.send(message);
       calls.push({trial,type:message.type,operation:message.operation,ok:reply.ok,key,ms:performance.now()-started,
-        jobId:reply.results?.[0]?.jobId});
+        jobId:reply.results?.[0]?.jobId,code:reply.code});
       return json(reply);
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ok:false,code:'qa-error',message:String(e)})); }
   });
@@ -198,6 +198,10 @@ try {
           const i=node.attributes?.indexOf('class')??-1;
           if(node.nodeName==='BUTTON'&&i>=0&&node.attributes[i+1].split(' ').includes(className)){
             try{
+              const {object}=await send('DOM.resolveNode',{nodeId:node.nodeId},page);
+              const {result}=await send('Runtime.callFunctionOn',{objectId:object.objectId,functionDeclaration:'function(){const r=this.getBoundingClientRect();const s=getComputedStyle(this);return !this.disabled&&!this.hidden&&s.visibility==="visible"&&s.display!=="none"&&Number(s.opacity)>0&&s.pointerEvents!=="none"&&r.width>0&&r.height>0&&(this.classList.contains("fly")?this.classList.contains("show"):true)}',returnByValue:true},page);
+              await send('Runtime.releaseObject',{objectId:object.objectId},page);
+              if(!result.value)continue;
               const {model}=await send('DOM.getBoxModel',{nodeId:node.nodeId},page);
               const x=(model.border[0]+model.border[4])/2,y=(model.border[1]+model.border[5])/2;
               if(x>0&&y>0)return {x,y};
@@ -207,8 +211,10 @@ try {
       },20000);
     }
     async function click(className){
-      const rect=await button(className);
+      let rect=await button(className);
       await send('Input.dispatchMouseEvent',{type:'mouseMoved',...rect},page);
+      await new Promise(resolve=>setTimeout(resolve,100));
+      rect=await button(className);
       await send('Input.dispatchMouseEvent',{type:'mousePressed',button:'left',clickCount:1,...rect},page);
       await send('Input.dispatchMouseEvent',{type:'mouseReleased',button:'left',clickCount:1,...rect},page);
     }
@@ -216,10 +222,19 @@ try {
       active={trial,delayMs:0};
       const nav=await send('Page.navigate',{url:address},page);
       assert(!nav.errorText,nav.errorText);
+      await send('Page.bringToFront',{},page);
       const playback=await until(()=>evaluate(page,'(()=>{const v=document.querySelector("video");return v?.readyState>=1&&v.currentSrc==='+JSON.stringify(address)+'?{src:v.currentSrc,duration:v.duration,width:v.videoWidth,height:v.videoHeight}:null})()'),15000);
       assert(playback.width>0&&playback.height>0&&playback.duration>0);
       await click('fly');
-      await click('primary');
+      try { await click('primary'); }
+      catch (error) {
+        const {root:dom}=await send('DOM.getDocument',{depth:-1,pierce:true},page);
+        const nodes=[dom];
+        for(const node of nodes) nodes.push(...(node.children||[]),...(node.shadowRoots||[]));
+        const messages=nodes.filter(n=>n.nodeName==='#text' && /VESPER|media|format|download|stream|expired/i.test(n.nodeValue))
+          .map(n=>n.nodeValue).filter(v=>v.length<=200);
+        throw Error(error.message+' '+JSON.stringify({messages,calls:calls.map(({key,...row})=>row)}));
+      }
       const submitted=await until(()=>calls.find(c=>c.trial===trial&&c.type==='media-select'&&c.ok&&c.jobId),20000);
       mediaRows.push({trial,address,jobId:submitted.jobId,playback});
     }

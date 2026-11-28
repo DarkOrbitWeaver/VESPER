@@ -731,6 +731,39 @@ public sealed class BrowserBridgeTests
     }
 
     [Fact]
+    public async Task MediaReceiptLookupAndRevokedPolicyCannotCreateNewJobs()
+    {
+        using var fixture = new PickerEngineFixture();
+        var preferences = new VesperPreferences();
+        var bridge = new BrowserBridgeHandler(null!, fixture.Engine, () => preferences);
+        var item = new MediaItem
+        {
+            SourceUrl = new Uri("https://video.example.test/watch/one"), Provider = "test", Title = "Video",
+            Representations = [new MediaRepresentation
+            {
+                Id = "direct", Url = new Uri("https://cdn.example.test/video.mp4"),
+                Content = StreamContent.VideoAndAudio, Container = "mp4", VideoCodec = "h264", AudioCodec = "aac"
+            }]
+        };
+        var createOptions = typeof(BrowserBridgeHandler).GetMethod("CreateBrowserOptions",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var options = (BridgeResponse)createOptions.Invoke(bridge,
+            ["test-options", item, item.SourceUrl.AbsoluteUri, CancellationToken.None, null])!;
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(options.Data, BridgeProtocol.Json));
+        var token = Guid.Parse(json.RootElement.GetProperty("mediaSession").GetString()!);
+        var request = new BridgeRequest("media-receipt-test", "media-select", "queue", null, [], MediaSession: token, FormatChoice: 0);
+        var status = request with { Type = "media-selection-status" };
+        Assert.False((await bridge.HandleAsync(status, CancellationToken.None)).Ok);
+        Assert.True((await bridge.HandleAsync(request, CancellationToken.None)).Ok);
+        Assert.True((await bridge.HandleAsync(status, CancellationToken.None)).Ok);
+        preferences.SiteRules = [new SiteRule { Host = "cdn.example.test", NeverCapture = true }];
+        Assert.True((await bridge.HandleAsync(request, CancellationToken.None)).Ok);
+        var newRequest = request with { Id = "media-receipt-new" };
+        Assert.Equal("site-capture-disabled", (await bridge.HandleAsync(newRequest, CancellationToken.None)).Code);
+        Assert.False((await bridge.HandleAsync(newRequest with { Type = "media-selection-status" }, CancellationToken.None)).Ok);
+    }
+
+    [Fact]
     public async Task Browser_auto_capture_refuses_every_known_host_before_engine_submission()
     {
         var preferences = new VesperPreferences

@@ -49,6 +49,16 @@ test('typed acquisition graph separates recoverability from playback identity', 
   assert.equal(G.create().assessPicker({...args,candidates:[candidate,{...candidate,url:'bad'}]}).verdict,'abstain');
 });
 
+test('an expired signed source cannot survive the graph acquisition verdict', () => {
+  const { graph, advance } = graphAt(1700000000000);
+  const url = 'https://cdn.example/clip.mp4?expires=1700000001';
+  const args = {scope,playerKey:'v',generation:1,sourceUrl:url,
+    candidates:[{url,kind:'direct',direct:true,verified:true,compatible:true}]};
+  assert.equal(graph.assessPicker(args).verdict,'exact');
+  advance(2000);
+  assert.equal(graph.assessPicker(args).verdict,'abstain');
+});
+
 
 test('requests bind only to the player generation that was current when they happened', () => {
   const { graph, advance, at } = graphAt();

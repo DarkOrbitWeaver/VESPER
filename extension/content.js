@@ -2225,14 +2225,15 @@
         await VesperBrowserBody.copyWorkerMedia({ ...options, player: {
           playerUrl: src, pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
           generation: binding.generation, mediaChangedAt: binding.changedAt, playerCanonicalUrls: witness.canonicalUrls,
-          playerResourceFingerprints: witness.fingerprints
+          playerResourceFingerprints: witness.fingerprints, workerMediaSource: workerMediaSource(player)
         } });
       } else {
         let mediaProof;
         if (formats.browserBodyProof) {
           const reply = await send({ type: 'browser-body-media-proof', playerUrl: src,
             pageUrl: copy.panelMedia.pageUrl, playerPageUrl: copy.panelMedia.pageUrl,
-            generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin });
+            generation: binding.generation, mediaChangedAt: binding.changedAt, playerCrossOrigin: player.crossOrigin,
+            workerMediaSource: workerMediaSource(player) });
           if (!reply?.ok || reply.data.workerFetch || playback.get(player) !== binding || controller.signal.aborted)
             throw Object.assign(new Error('No verified browser file is available.'), { code: reply?.code || 'proof-unavailable' });
           mediaProof = reply.data;

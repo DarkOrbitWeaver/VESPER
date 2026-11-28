@@ -2674,6 +2674,27 @@ test('scoped format sessions survive worker restart without retaining raw player
   assert.equal((await restarted.message(select, videoSender)).code, 'expired-selection');
 });
 
+test('revoked media policy allows only a prior receipt, never a new submission', async () => {
+  const token = 'e'.repeat(32);
+  let blocked = false;
+  const accepted = new Set();
+  const app = load({
+    hello: () => ({ ok: true, data: { siteRules: { neverCaptureHosts: blocked ? ['www.youtube.com'] : [] } } }),
+    'media-options': { ok: true, data: { mediaSession: token, choices: [{ index: 0 }] } },
+    'media-select': request => { accepted.add(request.id); return { ok: true }; },
+    'media-selection-status': request => ({ ok: accepted.has(request.id) })
+  });
+  const scope = { pageUrl: videoPage, playerPageUrl: videoPage, playerKey: 'player-1', generation: 1, playerUrl: '' };
+  const select = { type: 'media-select', mediaSession: token, formatChoice: 0, mode: 'download', ...scope };
+  assert.equal((await app.message({ type: 'media-options', ...scope }, videoSender)).ok, true);
+  assert.equal((await app.message(select, videoSender)).ok, true);
+  blocked = true;
+  assert.equal((await app.message(select, videoSender)).ok, true);
+  assert.equal((await app.message({ ...select, mode: 'queue' }, videoSender)).code, 'expired-selection');
+  assert.equal(app.sent.filter(r => r.type === 'media-select').length, 1);
+  assert.equal(app.sent.filter(r => r.type === 'media-selection-status').length, 2);
+});
+
 
 test('Smart Select from a content script cannot bypass native review or choose a destination', async () => {
   const app = load({ 'batch-review': { ok: true, results: [] } });

@@ -71,6 +71,9 @@ internal sealed partial class BrowserBridgeHandler(Form1 owner, DownloadEngine e
             case "media-select":
                 return SelectBrowserMedia(request);
 
+            case "media-selection-status":
+                return AcceptedMediaSelection(request.Id);
+
             case "batch-review":
             case "submit":
             case "browser-submit":

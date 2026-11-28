@@ -370,6 +370,18 @@ internal sealed partial class BrowserBridgeHandler
         });
     }
 
+    // A receipt query is read-only, even if the original session is still live.
+    private BridgeResponse AcceptedMediaSelection(string requestId)
+    {
+        if (engine.FindAcceptedSubmission(requestId + ":0") is not Guid first)
+            return BridgeResponse.Fail(requestId, "expired-selection", "No accepted selection was found.");
+        var accepted = new List<BridgeResult> { new("", "already-submitted", first.ToString("D"), "Previously accepted.") };
+        for (int i = 1; i < 64; i++)
+            if (engine.FindAcceptedSubmission(requestId + ":" + i) is Guid extra)
+                accepted.Add(new BridgeResult("", "already-submitted", extra.ToString("D"), "Previously accepted.", Subtitle: true));
+        return BridgeResponse.Success(requestId, message: "The original download was accepted. Check any requested subtitle jobs before retrying.", results: accepted.ToArray());
+    }
+
     private BridgeResponse SelectBrowserMedia(BridgeRequest request)
     {
         MediaDownloadChoice? job = null;
@@ -390,16 +402,7 @@ internal sealed partial class BrowserBridgeHandler
         {
             // The worker may retry the original request after its format session
             // expired. A durable acceptance is not authority to create another job.
-            var accepted = new List<BridgeResult>();
-            if (engine.FindAcceptedSubmission(request.Id + ":0") is Guid first)
-            {
-                accepted.Add(new BridgeResult("", "already-submitted", first.ToString("D"), "Previously accepted."));
-                for (int i = 1; i < 64; i++)
-                    if (engine.FindAcceptedSubmission(request.Id + ":" + i) is Guid extra)
-                        accepted.Add(new BridgeResult("", "already-submitted", extra.ToString("D"), "Previously accepted.", Subtitle: true));
-                return BridgeResponse.Success(request.Id, message: "The original download was accepted. Check any requested subtitle jobs before retrying.", results: accepted.ToArray());
-            }
-            return BridgeResponse.Fail(request.Id, "expired-selection", "These formats have expired. Refresh them to try again.");
+            return AcceptedMediaSelection(request.Id);
         }
         if (request.Clip is not null || request.AudioTrackId is not null || request.SubtitleLanguages is not null
             || request.EmbedSubtitles)
@@ -424,6 +427,10 @@ internal sealed partial class BrowserBridgeHandler
         }
         bool queue = request.Mode == "queue";
         var jobs = ExpandSubtitleChoices([job]);
+        var siteRules = SiteRule.Normalize(preferences().SiteRules);
+        if (jobs.Any(choice => MediaSelectionBlocked(choice, siteRules)))
+            return AcceptedMediaSelection(request.Id) is { Ok: true } receipt ? receipt
+                : BridgeResponse.Fail(request.Id, "site-capture-disabled", "This site is set to keep downloads in Chrome.");
         BridgeResult primary = QueueMedia(jobs[0], queue, request.Id + ":0");
         if (primary.JobId is null)
             return BridgeResponse.Fail(request.Id, "rejected", primary.Message) with { Results = [primary] };
@@ -432,6 +439,26 @@ internal sealed partial class BrowserBridgeHandler
         for (int index = 1; index < jobs.Count; index++)
             results.Add(QueueMedia(jobs[index], queue, $"{request.Id}:{index}"));
         return BridgeResponse.Success(request.Id, message: job.SubtitleNotice ?? "", results: results);
+    }
+
+    internal static bool MediaSelectionBlocked(MediaDownloadChoice job, IReadOnlyList<SiteRule> rules)
+    {
+        if (!rules.Any(rule => rule.NeverCapture)) return false;
+        bool Blocked(string? address) => SiteRule.ForPage(rules, address)?.NeverCapture == true;
+        if (Blocked(job.Url) || Blocked(job.Referer) || Blocked(job.OriginalPageUrl)
+            || job.SubtitleTracks?.Any(track => Blocked(track.Url.AbsoluteUri)) == true) return true;
+        if (job.MediaPlanJson is not { } json || job.Kind is not (JobKind.Merge or JobKind.Dash)) return false;
+        // Inspect the concrete planned tracks and fragments before any job is queued.
+        bool DashBlocked(DashDownloadPlan plan) => Blocked(plan.Initialization.Url) || plan.Fragments.Any(part => Blocked(part.Url));
+        try
+        {
+            if (job.Kind == JobKind.Dash)
+                return System.Text.Json.JsonSerializer.Deserialize<DashDownloadPlan>(json) is not { } dash || DashBlocked(dash);
+            var merge = System.Text.Json.JsonSerializer.Deserialize<MediaMergePlan>(json);
+            return merge is null || merge.Tracks.Any(track => Blocked(track.Url) || Blocked(track.Source?.PlaylistUrl)
+                || track.Source?.Dash is { } nested && DashBlocked(nested)) || merge.Subtitles.Any(track => Blocked(track.Url));
+        }
+        catch (System.Text.Json.JsonException) { return true; }
     }
 
     internal BridgeResult QueueMedia(MediaDownloadChoice job, bool queue, string requestId)

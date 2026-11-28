@@ -94,7 +94,8 @@ chrome.runtime.onConnect?.addListener(port => {
     async stream(message, sender, options) {
       const reply = await browserBodyMediaProof(message.player, sender, { worker: true });
       if (!reply.ok || !reply.data.workerFetch) throw new Error(reply.message || 'No verified browser file is available.');
-      if (reply.data.credentials === 'include' && !await signInEnabled()) reply.data.credentials = 'omit';
+      if (reply.data.credentials === 'include' && !await signInEnabled())
+        throw new Error('Browser sign-in was disabled; refresh the formats.');
       return VesperBrowserBody.streamFromWorker({
         ...options, proof: reply.data, title: message.title,
         origin: new URL(sender.url).origin,
@@ -392,6 +393,8 @@ const sourceWrites = new Map();
 const mediaLookups = new Map();
 const sourceSelections = new Map();
 const formatSessions = new Map();
+// Internal provenance follows cached replies without exposing guard data to content scripts.
+const formatReplyEvidence = new WeakMap();
 const formatSessionsKey = 'vesperFormatSessions';
 let formatSessionWrites = Promise.resolve();
 const formatSessionsReady = chrome.storage.session.get(formatSessionsKey).then(({ [formatSessionsKey]: saved }) => {
@@ -433,7 +436,8 @@ async function evidenceDigest(value) {
 // Persist only digests of the admitted resource set, not signed URLs.
 function evidenceSignature(item) {
   return JSON.stringify([item.url, item.kind, item.validator, item.bytes, item.mime,
-    item.rangeResource === true, item.querySlice === true, item.rangeStart, item.rangeEnd]);
+    item.rangeResource === true, item.querySlice === true, item.rangeStart, item.rangeEnd,
+    item.minimumLength, item.wholeRepresentation === true, item.unexpectedRange === true]);
 }
 
 async function formatEvidence(selection, selectedEvidence) {
@@ -446,9 +450,15 @@ async function formatEvidence(selection, selectedEvidence) {
 }
 
 async function matchesFormatEvidence(guard, message, sender) {
-  if (!guard) return true;
-  if (sender.tab?.incognito && guard.kind !== 'observed') return false;
-  if (!await refreshNeverCaptureHosts()) return false;
+  if (!guard || typeof guard.kind !== 'string') return false;
+  if (guard.signed && (sender.tab?.incognito || !await signInEnabled())) return false;
+  if (sender.tab?.incognito && guard.kind.startsWith('worker-')) return false;
+  if (!await refreshNeverCaptureHosts() || matchesNeverCaptureHost({url:mediaPage(message, sender)?.href,referrer:sender.url})) return false;
+  if (guard.kind === 'page') {
+    const url = VesperPlayerSource.http(message.playerUrl);
+    return (!url || !matchesNeverCaptureHost({url:url.href,referrer:sender.url}))
+      && (guard.expiresAt == null || guard.expiresAt > Date.now());
+  }
   if (guard.kind === 'worker-declaration') {
     const url = VesperPlayerSource.http(message.manifestUrl);
     return message.workerMediaSource === true && !!url && await evidenceDigest(url.href) === guard.digest
@@ -466,12 +476,13 @@ async function matchesFormatEvidence(guard, message, sender) {
   const sources = await Promise.all(state.sources.filter(source => source.documentId === sender.documentId
     && (source.frameId ?? 0) === frame && Number.isFinite(source.seen) && source.seen <= now + 1000
     && source.seen >= now - (source.kind === 'direct' ? 120_000 : sourceLifetime(source))
-    && !source.conflictingValidator && !matchesNeverCaptureHost({url:source.url,referrer:sender.url}))
+    && !source.conflictingValidator && !matchesNeverCaptureHost({url:source.url,referrer:sender.url})
+    && (VesperEvidenceGraph.expiresAt(source.url) ?? Infinity) > now)
     .map(async source => ({digest: await evidenceDigest(evidenceSignature(source)), seen: source.seen})));
   return guard.members.every(member => sources.some(source => source.digest === member.digest && source.seen >= member.seen));
 }
 
-async function bindFormatSession(reply, message, sender, evidence = null) {
+async function bindFormatSession(reply, message, sender, evidence = formatReplyEvidence.get(reply)) {
   const token = reply?.data?.mediaSession;
   if (!reply?.ok || !reply.data?.choices?.length || !/^[a-f0-9]{32}$/i.test(token || '')
       || message.prefetch === true || !sender.tab) return reply;
@@ -479,6 +490,7 @@ async function bindFormatSession(reply, message, sender, evidence = null) {
   // A result from an older content script can still be displayed, but must
   // not authorize a native submission without a scoped selection.
   if (!scope) return reply;
+  if (!evidence) return expiredFormats();
   await formatSessionsReady;
   const old = formatSessions.get(token);
   if (old && old.expires > Date.now() && old.scope !== scope) return expiredFormats();
@@ -490,11 +502,25 @@ async function bindFormatSession(reply, message, sender, evidence = null) {
   return reply;
 }
 
-async function matchesFormatSession(token, message, sender) {
+async function scopedFormatSession(token, message, sender) {
   await formatSessionsReady;
   const entry = formatSessions.get(token);
-  return !!entry && entry.expires > Date.now() && entry.scope === await formatScope(message, sender)
-    && await matchesFormatEvidence(entry.evidence, message, sender);
+  return entry && entry.expires > Date.now() && entry.scope === await formatScope(message, sender) ? entry : null;
+}
+
+function withFormatEvidence(reply, guard) {
+  if (reply?.ok && reply.data?.choices?.length) formatReplyEvidence.set(reply, guard);
+  return reply;
+}
+
+async function checkedSourceReply(reply, source, auth) {
+  if (!reply?.ok || !reply.data?.choices?.length) return reply;
+  const members = source.sliceEvidence || source.group || [source];
+  // Only real observations qualify for a response receipt.
+  const guard = members.every(member => Number.isFinite(member.seen))
+    ? await formatEvidence(source, members)
+    : { kind: 'page', expiresAt: VesperEvidenceGraph.expiresAt(source.url) };
+  return withFormatEvidence(reply, { ...guard, signed: auth.authorized === true });
 }
 
 async function clearFormatSessions(tabId) {
@@ -1366,6 +1392,8 @@ function frameBrowserBodyProof(state, message, sender, useSignIn = false) {
       || !Number.isInteger(message.generation) || message.generation < 1
       || !Number.isFinite(message.mediaChangedAt) || message.mediaChangedAt <= 0
       || !VesperBrowserBody.eligibleHttpMedia(url.href)
+      || message.workerMediaSource === true
+      || (VesperEvidenceGraph.expiresAt(url.href) ?? Infinity) <= Date.now()
       || isPartialMediaUrl(url)) return null;
   const now = Date.now();
   const observed = state.sources.find(source => source.url === url.href
@@ -1393,7 +1421,7 @@ function frameBrowserBodyProof(state, message, sender, useSignIn = false) {
 }
 
 async function observedBrowserBodyProof(state, message, sender, useSignIn) {
-  if (!message) return null;
+  if (!message || message.workerMediaSource === true) return null;
   const frameProof = frameBrowserBodyProof(state, message, sender, useSignIn);
   if (frameProof && (frameProof.credentials !== 'include' || useSignIn))
     return frameProof;
@@ -1430,6 +1458,16 @@ async function observedBrowserBodyProof(state, message, sender, useSignIn) {
   if (unique.size !== 1) return null;
   const [source] = unique.values();
   if (!VesperBrowserBody.eligibleHttpMedia(source.url) || source.sliceEvidence && !source.validator) return null;
+  const scope = bodyScope(sender);
+  const graph = VesperEvidenceGraph.create({ limits: { nodes: 16, edges: 24 } });
+  const decision = graph.assessPicker({ scope, playerKey: 'body', generation: message.generation,
+    sourceUrl: playerUrl?.href || '', candidates: [{
+      url: source.url, kind: source.kind, direct: playerUrl?.href === source.url,
+      witnessed: witnessedUrls.has(source.url) || canonical.has(source.url)
+        || source.sliceEvidence?.some(member => witnessedUrls.has(member.url)),
+      verified: false, compatible: !source.conflictingValidator
+    }] });
+  if (!decision.rows[0]?.compatible || !decision.rows[0].exact && !decision.rows[0].witnessed) return null;
   return {
     url: source.url, etag: source.validator || undefined, length: source.bytes || null,
     minimumLength: source.minimumLength, mime: source.mime, workerFetch: true,
@@ -1461,6 +1499,14 @@ async function browserBodyMediaProof(message, sender, { worker = false } = {}) {
   // cookie store is sent to the native engine.
   if (!(await refreshNeverCaptureHosts()) || matchesNeverCaptureHost({url:proof.url,referrer:sender.url}))
     return { ok:false,code:'blocked',message:'VESPER could not confirm that this site permits native acquisition.' };
+  // Recheck the observation after asynchronous policy and consent queries.
+  const currentSignIn = await useBrowserSignIn();
+  const latest = await tabState(sender.tab.id);
+  const current = worker ? await observedBrowserBodyProof(latest, message, sender, currentSignIn)
+    : frameBrowserBodyProof(latest, message, sender, currentSignIn);
+  if (!current || JSON.stringify(current) !== JSON.stringify(proof)
+      || matchesNeverCaptureHost({url:proof.url,referrer:sender.url}))
+    return {ok:false,code:'source-changed',message:'The verified browser file changed. Refresh the formats.'};
   return { ok:true, data:proof };
 }
 
@@ -1775,7 +1821,7 @@ async function playerOptions(message, sender) {
         const reply = forCurrentPlayer(await nativeRequest(
           exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
         observedOutcomes = [mediaLookupTrace(reply)];
-        return browserFallback(reply);
+        return browserFallback(await checkedSourceReply(reply, matching?.url === exact.url ? matching : exact, auth));
       }
       return workerChoice() || { ok: false, code: 'no-reusable-source', message: 'VESPER couldn’t verify a source for this player.' };
     }
@@ -1790,7 +1836,8 @@ async function playerOptions(message, sender) {
       const checkedPage = result => {
         const reply = forCurrentPlayer(result);
         pageOutcome = mediaLookupTrace(reply);
-        return reply;
+        return withFormatEvidence(reply, { kind: 'page', signed: auth.authorized === true,
+          expiresAt: source ? VesperEvidenceGraph.expiresAt(source.href) : null });
       };
       if (auth.authorized || message.refresh === true)
         return checkedPage(await lookup());
@@ -1841,6 +1888,7 @@ async function playerOptions(message, sender) {
         trafficWork = (async () => {
           const pickerTitle = binding ? message.title : undefined;
           const context = { identity, tab, frame, documentId: sender.documentId, signed: auth.authorized === true,
+            playerFacts: player,
             generation: message.generation, playerKey: message.playerKey, playerUrl: message.playerUrl, title: pickerTitle };
           // Include exact witnesses for recently observed direct/range candidates
           // too; the earlier scoped pass already covered blob-backed players.
@@ -1884,7 +1932,7 @@ async function playerOptions(message, sender) {
             && ['browser-context', 'sign-in', 'site-refused', 'source-changed', 'no-media', 'unavailable', 'source-unavailable', 'source-expired'].includes(reply.code)) {
           const checked = forCurrentPlayer(await nativeRequest(exactSourceRequest(exact, auth, page.href, title, playbackFingerprints), 20000), exact.url);
           observedOutcomes = [mediaLookupTrace(checked)];
-          if (checked.ok && checked.data?.choices?.length) return checked;
+          if (checked.ok && checked.data?.choices?.length) return checkedSourceReply(checked, exact, auth);
           if (['protected','blocked','rate-limited','desktop-version-mismatch'].includes(checked.code)) return checked;
         }
         if (['no-media', 'no-reusable-source', 'unsupported'].includes(reply.code) && !observedOutcomes.length) {
@@ -1935,7 +1983,7 @@ async function playerOptions(message, sender) {
       if (association.selected && !association.selected.source.sliceEvidence && usable.includes(association.selected)) {
         if (bothRoutes && experienceCase)
           await VesperExperience.note(page.hostname, trafficStrategy, 'verified', Date.now(), experienceCase).catch(() => {});
-        return association.selected.reply;
+        return checkedSourceReply(association.selected.reply, association.selected.source, auth);
       }
       // Timing found these, so the user confirms which one is this player, even when only one
       // verified. Each row shows checked facts, and choosing it reuses the verified reply at once.
@@ -2088,16 +2136,23 @@ async function selectMediaSource(message, sender) {
       return { ok: false, code: 'source-changed', message: 'The detected stream could not be matched to this playback.' };
     return bindFormatSession(reply, message, sender, await formatEvidence(selection));
   }
+  const guard = await formatEvidence(selection, selectedEvidence);
+  if (!await matchesFormatEvidence(guard, message, sender)) return expiredFormats();
   const auth = await mediaAuthorization(page.href, sender, { userGesture: true,
     candidateUrls: (selection.group || [selection]).map(source => source.url) });
   // Signed choices get a fresh check so changing sign-in permissions cannot reuse the earlier session.
   const expiry = Date.parse(selection.verified?.data?.formatsExpireAt || '');
-  const reply = !auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)
+  const reply = !selection.signed && !auth.authorized && selection.verified?.ok && (!Number.isFinite(expiry) || expiry > now)
     ? selection.verified
     : explainMediaProtocol(await nativeRequest(exactSourceRequest(selection, auth, page.href, selection.title), 60000));
+  if (reply?.ok && reply.data?.choices?.length
+      && !VesperMediaEvidence.matchesPlayback(selection.playerFacts || {}, VesperMediaEvidence.mediaFacts(reply)))
+    return { ok: false, code: 'source-changed', message: 'The selected source no longer matches this playback.' };
+  const finalGuard = { ...guard, signed: auth.authorized === true };
+  if (!await matchesFormatEvidence(finalGuard, message, sender)) return expiredFormats();
   if (selection.experienceCase && reply?.ok && reply.data?.choices?.length)
     await VesperExperience.note(page.hostname, 'observed-lookup-v2', 'verified', Date.now(), selection.experienceCase).catch(() => {});
-  return bindFormatSession(reply, message, sender, await formatEvidence(selection, selectedEvidence));
+  return bindFormatSession(reply, message, sender, finalGuard);
 }
 
 async function confirmOrStartBrowserChoice(choice) {
@@ -2276,8 +2331,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return { ok: false, code: 'invalid', message: 'Enter a start time before the end time.' };
           range = { start, end };
         }
-        if (!sender.url.startsWith(EXTENSION_PAGES) && !await matchesFormatSession(mediaSession, message, sender))
-          return expiredFormats();
+        const extensionPage = sender.url.startsWith(EXTENSION_PAGES);
+        const session = extensionPage ? null : await scopedFormatSession(mediaSession, message, sender);
+        if (!extensionPage && !session) return expiredFormats();
         const suffix = range ? `-${Math.round(range.start * 1000).toString(36)}-${Math.round(range.end * 1000).toString(36)}` : '';
         let intentSuffix = '';
         if (audioTrack || subtitles?.length || includeAutoSubtitles || embedSubtitles) {
@@ -2285,8 +2341,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const digest = await crypto.subtle.digest('SHA-256', bytes);
           intentSuffix = '-' + [...new Uint8Array(digest)].slice(0, 16).map(byte => byte.toString(16).padStart(2, '0')).join('');
         }
+        const id = `${mediaSession}-${formatChoice}-${mode}${suffix}${intentSuffix}`;
+        if (!extensionPage && (!await matchesFormatEvidence(session.evidence, message, sender)
+            || formatSessions.get(mediaSession) !== session || session.expires <= Date.now())) {
+          // A stale guard cannot authorize a new job. Query only the existing receipt.
+          const receipt = await nativeRequest(envelope('media-selection-status', { id }), 5000);
+          return receipt?.ok ? receipt : expiredFormats();
+        }
         return nativeRequest(envelope('media-select', {
-          id: `${mediaSession}-${formatChoice}-${mode}${suffix}${intentSuffix}`,
+          id,
           mediaSession, formatChoice, mode, range, audioTrack, subtitles, includeAutoSubtitles, embedSubtitles
         }), 25000);
       }

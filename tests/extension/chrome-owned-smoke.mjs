@@ -235,6 +235,52 @@ async function main() {
         postMessage(handle, [handle]);`);
       return;
     }
+    if (playerRaceTest && request.url.startsWith('/worker-transfer?')) {
+      const mode = new URL(request.url, 'http://fixture.invalid').searchParams.get('mode');
+      if (!['classic','module','blob','copied'].includes(mode)) { response.writeHead(400).end(); return; }
+      response.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+      response.end(`<!doctype html><title>Worker transfer fixture</title><video id="transfer-player" width="640" height="360" muted controls autoplay></video>
+        <script>
+          window.transferFixture={error:null,ready:false};
+          (async()=>{
+            const video=document.querySelector('video'), ms=new MediaSource();
+            video.src=URL.createObjectURL(ms);
+            await new Promise(resolve=>ms.addEventListener('sourceopen',resolve,{once:true}));
+            const track=ms.addSourceBuffer('video/mp4; codecs="avc1.42c00a,mp4a.40.2"');
+            window.transferTrack=track;
+            const mode=${JSON.stringify(mode)};
+            let worker;
+            if(mode==='blob'){
+              const code="onmessage=async e=>{const b=await(await fetch(e.data.url)).arrayBuffer();postMessage(b,[b])}";
+              const workerUrl=URL.createObjectURL(new Blob([code],{type:'text/javascript'}));
+              worker=new Worker(workerUrl);
+              URL.revokeObjectURL(workerUrl);
+            }else worker=new Worker('/worker-transfer.js',{type:mode==='module'?'module':'classic'});
+            const bytes=await new Promise((resolve,reject)=>{
+              worker.onmessage=e=>resolve(e.data); worker.onerror=e=>reject(Error(e.message));
+              worker.postMessage({url:location.origin+'/asset-100001/clip.m4s',copy:mode==='copied'});
+            });
+            worker.terminate();
+            await new Promise((resolve,reject)=>{
+              track.addEventListener('updateend',resolve,{once:true});
+              track.addEventListener('error',()=>reject(Error('append failed')),{once:true});
+              track.appendBuffer(bytes);
+            });
+            ms.endOfStream();
+            transferFixture.ready=true;
+          })().catch(e=>transferFixture.error=String(e));
+        </script>`);
+      return;
+    }
+    if (playerRaceTest && request.url === '/worker-transfer.js') {
+      response.writeHead(200, {'Content-Type':'text/javascript'});
+      response.end(`self.onmessage=async e=>{
+        let bytes=await(await fetch(e.data.url)).arrayBuffer();
+        if(e.data.copy) bytes=new Uint8Array(bytes).slice().buffer;
+        if(e.data.copy) self.postMessage(bytes); else self.postMessage(bytes,[bytes]);
+      };`);
+      return;
+    }
     if (request.url === '/mse-feed' || request.url === '/mse-prefetch') {
       const prefetch = request.url === '/mse-prefetch';
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -944,7 +990,7 @@ async function main() {
     await browser.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, tab);
     await browser.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, tab);
     await waitFor(() => butterflyInside('audio-control'), 5000, 'The butterfly did not follow the custom audio control.');
-    let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [], workerDeclaration = null;
+    let recycledPlayer = null, preparedBeforeClick = null, scrollHandoffs = [], shadowPlayers = [], workerDeclaration = null, workerTransfers = [];
     if (playerRaceTest) {
       function findButton(...classNames) {
         return waitFor(async () => {
@@ -1053,6 +1099,29 @@ async function main() {
       assert.equal(await evaluate('No opaque worker submission','__workerMedia.submits.length'),1);
       workerDeclaration = {realHandle:true, noUnconfirmedProbe:true, staleSubmissions:0, currentSubmissions:1,opaqueFragmentAbstained:true};
       await evaluate('Restore native fixture routing','nativeRequest = __beforeWorkerRequest');
+      // Real worker-owned fetch, with a transferable or structured-cloned buffer
+      // appended to a window SourceBuffer. The retained bytes may be playable,
+      // but a window hook cannot claim the worker's network response identity.
+      for (const mode of ['classic','module','blob','copied']) {
+        await browser.send('Page.navigate',{url:'http://127.0.0.1:'+port+'/worker-transfer?mode='+mode},tab);
+        const witness = await waitFor(async()=>{
+          const {result}=await browser.send('Runtime.evaluate',{expression:`(()=>{
+            if(window.transferFixture?.error)return {error:transferFixture.error};
+            const v=document.querySelector('video');
+            if(!window.transferFixture?.ready||!v||v.readyState<1)return null;
+            v.removeAttribute('data-vesper-media-provenance');
+            v.dispatchEvent(new Event('vesper-media-provenance-request',{bubbles:true}));
+            return JSON.parse(v.getAttribute('data-vesper-media-provenance')||'null');
+          })()`,returnByValue:true},tab);
+          return result.value;
+        },10000,'Worker transfer playback failed: '+mode);
+        assert.ok(!witness.error,JSON.stringify(witness));
+        assert.equal(witness.kind,'mse');
+        assert.deepEqual(witness.paths,[],'Worker-only fetch invented a network identity: '+mode);
+        assert.ok(witness.tracks.some(t=>t.retainedBytes>0&&t.hasInit),JSON.stringify(witness));
+        workerTransfers.push({mode,networkIdentity:false,retainedTracks:witness.tracks.length,
+          complete:witness.tracks.every(t=>t.bufferedComplete)});
+      }
 
       await evaluate('Observe native verification for the prefetch fixture', `(() => {
         globalThis.__warmRequests = [];
@@ -1098,8 +1167,10 @@ async function main() {
           if (message.prefetch) return { ok: true, data: { prefetchSkipped: true } };
           const token = crypto.randomUUID().replaceAll('-', '');
           __recycled.lookedUp.push({ page: new URL(message.pageUrl).pathname, token });
-          return { ok: true, data: { mediaSession: token, title: 'Reused player',
-            choices: [{ index: 0, label: 'Original quality', detail: 'Fixture', container: 'WEBM' }] } };
+          // This stub replaces playerOptions, including its production provenance binding.
+          return withFormatEvidence({ ok: true, data: { mediaSession: token, title: 'Reused player',
+            choices: [{ index: 0, label: 'Original quality', detail: 'Fixture', container: 'WEBM' }] } },
+            {kind:'page', signed:false});
         };
         const originalRequest = nativeRequest;
         nativeRequest = async (...args) => {
@@ -1197,6 +1268,7 @@ async function main() {
       intentScenarios,
       msePlayerAssociation: { players: mse.length, transports: ['fetch','xhr'], isolated: true, queriesRemoved: true },
       workerDeclaration,
+      workerTransfers,
       nativeMessagingInvoked: finalObservations.nativeCalls > 0,
       nativeCapture, captureRace, managedDownloads, recycledPlayer, scrollHandoffs, shadowPlayers
     }) + '\n');

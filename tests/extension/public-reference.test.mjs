@@ -26,6 +26,8 @@ test('reference label requires predeclared identity, actual playback and a succe
   for(const playback of [[{...player,played:false}],[{...player,src:other}],[player,{...player,id:'player-1'}]])
     assert.equal(referenceLabel(normalized,playback,[response]).status,'reference-not-established');
   assert.equal(referenceLabel(normalized,[player],[]).status,'reference-response-missing');
+  assert.equal(referenceLabel(normalized,[{...player,frame:'top'}],[{...response,frame:'child'}]).status,'reference-response-missing');
+  assert.equal(referenceLabel(normalized,[{...player,frame:'top'}],[{...response,frame:'top'}]).status,'verified');
   assert.equal(referenceLabel({...normalized,probeOnly:true},[player],[response]).status,'probe-only');
 });
 
