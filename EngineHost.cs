@@ -61,6 +61,7 @@ internal static class EngineHost
             BrowserDownloadsFolder = WindowsDownloadsFolder(),
             AllowPrivateNetworks = p.AllowPrivateNetworks,
             PauseOnMeteredNetwork = p.PauseOnMeteredNetwork,
+            EnableAdaptiveHttp2 = p.EnableAdaptiveHttp2,
             Proxy = Enum.TryParse(p.ProxyMode, out ProxyMode mode) ? mode : ProxyMode.Direct,
             ProxyAddress = string.IsNullOrWhiteSpace(p.ProxyAddress) ? null : p.ProxyAddress
         };

@@ -52,6 +52,19 @@ public sealed class SettingsStoreTests : IDisposable
     }
 
     [Fact]
+    public void AdaptiveHttp2IsOptInAndSurvivesPreferencesCopyAndSave()
+    {
+        Assert.False(SettingsStore.Load(_root).EnableAdaptiveHttp2);
+        var destination = new VesperPreferences();
+        Form1.CopyPreferences(new VesperPreferences { EnableAdaptiveHttp2 = true }, destination);
+        Assert.True(destination.EnableAdaptiveHttp2);
+        Assert.Null(SettingsStore.Save(destination, _root));
+        Assert.True(SettingsStore.Load(_root).EnableAdaptiveHttp2);
+        Form1.CopyPreferences(new VesperPreferences(), destination);
+        Assert.False(destination.EnableAdaptiveHttp2);
+    }
+
+    [Fact]
     public void TaskbarFlashKeepsTheExistingCompletionPreference()
     {
         Assert.True(SettingsStore.Load(_root).FlashTaskbarOnCompletion);

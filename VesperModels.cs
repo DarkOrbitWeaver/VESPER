@@ -224,6 +224,7 @@ internal sealed class VesperPreferences
     public bool PauseOnMeteredNetwork { get; set; }
     public bool CloseToTray { get; set; } = true;
     public bool AllowPrivateNetworks { get; set; }
+    public bool EnableAdaptiveHttp2 { get; set; }
     public List<SiteRule> SiteRules { get; set; } = [];
     public string ProxyMode { get; set; } = "Direct";
     public string ProxyAddress { get; set; } = "";

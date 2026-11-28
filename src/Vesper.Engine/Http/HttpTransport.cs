@@ -133,11 +133,7 @@ internal sealed class HttpTransport : IDisposable
             if (!visited.Add(current.AbsoluteUri)) throw new RedirectException("The server redirected in a loop.");
             UrlPolicy.EnsureAllowed(current, _options.AllowPrivateNetworks);
             if (_options.Cooldown.RetryAt(current) is { } retryAt)
-            {
-                var deferred = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
-                deferred.Headers.RetryAfter = new RetryConditionHeaderValue(retryAt);
-                return deferred;
-            }
+                return Deferred(retryAt);
             IPAddress? proxyAddress = null;
             if (_validateProxyDns)
             {
@@ -156,29 +152,27 @@ internal sealed class HttpTransport : IDisposable
             bool sameRequestOrigin = UrlPolicy.IsSameOrigin(url, current);
             bool sameCredentialOrigin = initialRequestWithinCredentialOrigin
                 && UrlPolicy.IsSameOrigin(credentialOrigin!, current);
-            using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
-            if (proxyAddress is not null)
-                _originAwareProxy!.PinRequest(request, current, proxyAddress);
-            // When protocol experimentation is enabled, keep one shared host
-            // budget across both protocol pools, including HTTP/1 fallback and
-            // HTTP/2 streams that were already in flight. The ordinary H1-only
-            // path continues to use its existing pooled socket limit.
-            bool sharedProtocolBudget = _options.EnableAdaptiveHttp2 || _options.Http2Experiment;
-            IDisposable? lease = sharedProtocolBudget
-                ? await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false)
-                : null;
+            // Admit all protocols before dispatch: the socket pool alone queues
+            // requests invisibly, where a new Retry-After cannot stop them.
+            // Share the host budget across ports, redirects and protocol pools.
+            IDisposable? lease = await _streams.AcquireAsync(current, _options.MaxConnectionsPerHost, ct).ConfigureAwait(false);
             HttpResponseMessage response;
             try
             {
-                response = await SendOnceAsync(request, ct).ConfigureAwait(false);
-                if (lease is not null)
-                {
-                    response.Content = new AdmittedContent(response.Content, lease);
-                    lease = null;
-                }
+                ct.ThrowIfCancellationRequested();
+                if (_options.Cooldown.RetryAt(current) is { } afterQueue)
+                    return Deferred(afterQueue);
+                using HttpRequestMessage request = BuildRequest(current, spec, sameRequestOrigin, sameCredentialOrigin);
+                if (proxyAddress is not null)
+                    _originAwareProxy!.PinRequest(request, current, proxyAddress);
+                response = await SendOnceAsync(request, current, ct).ConfigureAwait(false);
+                // Both the primary and fallback response must expose the actual
+                // validated resource, not the proxy-pinned numeric destination.
+                request.RequestUri = current;
+                response.Content = new AdmittedContent(response.Content, lease);
+                lease = null;
             }
             finally { lease?.Dispose(); }
-            request.RequestUri = current;
             if (response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
             {
                 DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -216,21 +210,48 @@ internal sealed class HttpTransport : IDisposable
         throw new RedirectException("The server redirected too many times.");
     }
 
-    private async Task<HttpResponseMessage> SendOnceAsync(HttpRequestMessage request, CancellationToken ct)
+    private static HttpResponseMessage Deferred(DateTimeOffset retryAt)
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+        response.Headers.RetryAfter = new RetryConditionHeaderValue(retryAt);
+        return response;
+    }
+
+    internal static bool IsHttp2ProtocolFailure(Exception ex) =>
+        ex is HttpProtocolException
+        || ex is HttpRequestException { HttpRequestError: HttpRequestError.HttpProtocolError or HttpRequestError.VersionNegotiationError }
+        || ex is HttpRequestException { InnerException: HttpProtocolException };
+
+    private async Task<HttpResponseMessage> SendOnceAsync(HttpRequestMessage request, Uri origin, CancellationToken ct)
     {
         using var headerTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         headerTimeout.CancelAfter(_options.HeaderTimeout);
         try
         {
-            return await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token).ConfigureAwait(false);
-        }
-        catch (HttpProtocolException) when (request.Version >= HttpVersion.Version20 && request.RequestUri is { } targetUri)
-        {
-            // CDN / middlebox rejected HTTP/2 stream framing. Reconsider
-            // this exact origin after a bounded interval, not every request.
-            _http2Cooldown.Remember(targetUri, DateTimeOffset.UtcNow.AddMinutes(30));
-            using var fallbackRequest = CloneAsHttp11(request);
-            return await _client.SendAsync(fallbackRequest, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token).ConfigureAwait(false);
+            try
+            {
+                HttpResponseMessage response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead,
+                    headerTimeout.Token).ConfigureAwait(false);
+                // An observed ALPN downgrade is useful negative evidence, not
+                // a failure. Reconsider periodically; never persist URLs or
+                // infer support for other origins sharing a CDN/IP.
+                if (request.Version >= HttpVersion.Version20 && response.Version < HttpVersion.Version20)
+                    _http2Cooldown.Remember(origin, DateTimeOffset.UtcNow.AddMinutes(5));
+                return response;
+            }
+            catch (Exception ex) when (request.Version >= HttpVersion.Version20
+                && IsHttp2ProtocolFailure(ex) && !headerTimeout.IsCancellationRequested)
+            {
+                _http2Cooldown.Remember(origin, DateTimeOffset.UtcNow.AddMinutes(30));
+                if (_options.Cooldown.RetryAt(origin) is { } retryAt) return Deferred(retryAt);
+                // GET only, before body exposure. Preserve the exact pinned URI
+                // and all conditional range / consent-scoped request headers.
+                using var fallbackRequest = CloneAsHttp11(request);
+                HttpResponseMessage fallback = await _client.SendAsync(fallbackRequest, HttpCompletionOption.ResponseHeadersRead,
+                    headerTimeout.Token).ConfigureAwait(false);
+                fallbackRequest.RequestUri = origin;
+                return fallback;
+            }
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

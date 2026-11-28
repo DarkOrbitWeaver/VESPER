@@ -1810,7 +1810,8 @@ public partial class Form1 : Form
 
         VesperPreferences updated = dialog.Result;
         bool restartNeeded = updated.AllowPrivateNetworks != _prefs.AllowPrivateNetworks
-            || updated.ProxyMode != _prefs.ProxyMode || updated.ProxyAddress != _prefs.ProxyAddress;
+            || updated.ProxyMode != _prefs.ProxyMode || updated.ProxyAddress != _prefs.ProxyAddress
+            || updated.EnableAdaptiveHttp2 != _prefs.EnableAdaptiveHttp2;
         bool disabledPowerAction = (_prefs.SleepWhenQueueFinishes && !updated.SleepWhenQueueFinishes)
             || (_prefs.ShutdownWhenQueueFinishes && !updated.ShutdownWhenQueueFinishes);
         CopyPreferences(updated, _prefs);
@@ -1823,7 +1824,7 @@ public partial class Form1 : Form
         ApplyAppearance();
         RefreshList();
         if (restartNeeded)
-            VesperMessageBox.Show(this, "Network access and proxy changes apply the next time VESPER starts.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            VesperMessageBox.Show(this, "Network access, proxy and HTTP protocol changes apply the next time VESPER starts.", "Settings", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     internal static void CopyPreferences(VesperPreferences from, VesperPreferences to)
@@ -1842,6 +1843,7 @@ public partial class Form1 : Form
         to.ShutdownWhenQueueFinishes = from.ShutdownWhenQueueFinishes;
         to.PreventSleep = from.PreventSleep; to.PauseOnMeteredNetwork = from.PauseOnMeteredNetwork;
         to.CloseToTray = from.CloseToTray; to.AllowPrivateNetworks = from.AllowPrivateNetworks;
+        to.EnableAdaptiveHttp2 = from.EnableAdaptiveHttp2;
         to.ProxyMode = from.ProxyMode; to.ProxyAddress = from.ProxyAddress; to.ScheduleEnabled = from.ScheduleEnabled;
         to.ScheduleStart = from.ScheduleStart; to.ScheduleEnd = from.ScheduleEnd; to.BrowserAction = from.BrowserAction;
     }

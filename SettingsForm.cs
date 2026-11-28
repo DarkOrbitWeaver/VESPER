@@ -720,10 +720,16 @@ internal sealed class SettingsForm : VesperPopupForm
         meteredNote.SetBounds(45, 559, 480, 34);
         meteredNote.AutoEllipsis = false;
 
+        var adaptiveHttp = Check("Adaptive HTTP/2 (experimental)", 25, 610, _draft.EnableAdaptiveHttp2,
+            v => _draft.EnableAdaptiveHttp2 = v);
+        var adaptiveNote = Label("Uses HTTP/2 when supported, with automatic HTTP/1.1 fallback. Restart required.", 8, muted: true);
+        adaptiveNote.SetBounds(45, 637, 480, 34);
+        adaptiveNote.AutoEllipsis = false;
+
         page.Controls.AddRange([connLabel, connNote, connections, separator1, schedule, scheduleNote, _scheduleStartFrame, to, _scheduleEndFrame,
             scheduleHint, separator2, proxyLabel, proxyNote, proxy, _proxyFrame, separator3, privateNetworks, privateNote, sleep,
-            metered, meteredNote]);
-        page.AutoScrollMinSize = new Size(0, 610);
+            metered, meteredNote, adaptiveHttp, adaptiveNote]);
+        page.AutoScrollMinSize = new Size(0, 690);
         void Layout()
         {
             int right = page.ClientSize.Width - S(25);
@@ -736,6 +742,7 @@ internal sealed class SettingsForm : VesperPopupForm
             scheduleHint.Width = Math.Max(S(120), right - scheduleHint.Left);
             privateNote.Width = Math.Max(S(200), right - S(45));
             meteredNote.Width = Math.Max(S(200), right - S(45));
+            adaptiveNote.Width = Math.Max(S(200), right - S(45));
         }
         page.Resize += (_, _) => Layout();
         Layout();

@@ -126,6 +126,103 @@ public sealed class ConnectionLimitTests
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Queued_requests_recheck_retry_after_before_dispatch(bool adaptive)
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var app = builder.Build();
+        var arrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int hits = 0;
+        app.MapGet("/throttle", async (HttpContext context) =>
+        {
+            Interlocked.Increment(ref hits);
+            arrived.TrySetResult();
+            await release.Task.WaitAsync(context.RequestAborted);
+            context.Response.StatusCode = 429;
+            context.Response.Headers.RetryAfter = "120";
+        });
+        app.MapGet("/queued", () =>
+        {
+            Interlocked.Increment(ref hits);
+            return "should not arrive";
+        });
+        await app.StartAsync();
+        await using var other = new FaultServer(1024);
+        await other.StartAsync();
+        using var http = new HttpTransport(new EngineOptions
+        {
+            DataDirectory = Path.GetTempPath(), AllowPrivateNetworks = true,
+            MaxConnectionsPerHost = 1, EnableAdaptiveHttp2 = adaptive
+        });
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var origin = new Uri(app.Urls.Single());
+        Task<HttpResponseMessage> first = http.SendAsync(new Uri(origin, "/throttle"), new RequestSpec(), timeout.Token);
+        try
+        {
+            await arrived.Task.WaitAsync(timeout.Token);
+            Task<HttpResponseMessage> queued = http.SendAsync(new Uri(origin, "/queued"), new RequestSpec(), timeout.Token);
+            Assert.False(queued.IsCompleted);
+            Assert.Equal(1, Volatile.Read(ref hits));
+            release.TrySetResult();
+            using (var refused = await first)
+            {
+                Assert.Equal(HttpStatusCode.TooManyRequests, refused.StatusCode);
+                Assert.False(queued.IsCompleted);
+            }
+            using var blocked = await queued;
+            Assert.Equal(HttpStatusCode.TooManyRequests, blocked.StatusCode);
+            Assert.NotNull(blocked.Headers.RetryAfter?.Date);
+            Assert.Equal(1, Volatile.Read(ref hits));
+            // Cooldown is origin-specific even though the budget is host-wide.
+            using var allowed = await http.SendAsync(new Uri(other.Url("/file")), new RequestSpec(), timeout.Token);
+            Assert.Equal(other.V1, await allowed.Content.ReadAsByteArrayAsync(timeout.Token));
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Cancellation_releases_queued_transport_admission(bool adaptive)
+    {
+        await using var server = new FaultServer(1024);
+        await server.StartAsync();
+        using var http = new HttpTransport(new EngineOptions
+        {
+            DataDirectory = Path.GetTempPath(), AllowPrivateNetworks = true,
+            MaxConnectionsPerHost = 1, EnableAdaptiveHttp2 = adaptive
+        });
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var cancelled = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
+        var uri = new Uri(server.Url("/file"));
+        using (var held = await http.SendAsync(uri, new RequestSpec(), deadline.Token))
+        {
+            var queued = http.SendAsync(uri, new RequestSpec(), cancelled.Token);
+            Assert.False(queued.IsCompleted);
+            cancelled.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+            Assert.Equal(1, server.Hits("/file"));
+        }
+        using var next = await http.SendAsync(uri, new RequestSpec(), deadline.Token);
+        Assert.Equal(server.V1, await next.Content.ReadAsByteArrayAsync(deadline.Token));
+        Assert.Equal(2, server.Hits("/file"));
+    }
+
+    [Fact]
+    public void Protocol_fallback_does_not_treat_transport_security_or_generic_failures_as_negotiation()
+    {
+        Assert.True(HttpTransport.IsHttp2ProtocolFailure(new HttpRequestException(HttpRequestError.HttpProtocolError, "protocol")));
+        Assert.True(HttpTransport.IsHttp2ProtocolFailure(new HttpRequestException(HttpRequestError.VersionNegotiationError, "version")));
+        foreach (var error in new[] { HttpRequestError.SecureConnectionError, HttpRequestError.NameResolutionError,
+            HttpRequestError.ConnectionError, HttpRequestError.InvalidResponse, HttpRequestError.Unknown })
+            Assert.False(HttpTransport.IsHttp2ProtocolFailure(new HttpRequestException(error, "not a protocol failure")));
+        Assert.False(HttpTransport.IsHttp2ProtocolFailure(new OperationCanceledException()));
+    }
+
+    [Theory]
     [InlineData(1)]
     [InlineData(2)]
     public async Task Shared_transport_respects_small_per_host_limits(int limit)

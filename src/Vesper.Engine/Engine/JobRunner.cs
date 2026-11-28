@@ -835,7 +835,12 @@ internal sealed class JobRunner(DownloadEngine engine, JobSession session, HttpT
                 // boundary as well: a cleanly framed but short response can still be a truncated file.
                 bool framed = HttpFacts.HasCompleteBodyFraming(first.Response);
                 if (!framed || Job.AcceptsRanges && !first.Decoded)
+                {
+                    // EOF is already observed; release the response's host
+                    // admission before acquiring another slot for the probe.
+                    first.Response.Dispose();
                     await VerifyUnknownLengthAsync(offset, ct).ConfigureAwait(false);
+                }
                 engine.UpdateJob(Job, j => j.TotalBytes = offset);
             }
         }
