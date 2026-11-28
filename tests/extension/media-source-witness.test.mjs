@@ -41,8 +41,19 @@ function setup() {
     arrayBuffer() { return this.promise; }
     blob() { return this.promise; }
   }
+  class Xhr extends EventTarget {
+    readyState = 0;
+    status = 0;
+    open(method, url) { this.responseURL = url; this.readyState = 1; this.status = 0; this.value = null; }
+    setRequestHeader() {}
+    send() {}
+    finish(value) { this.value = value; this.readyState = 4; this.status = 200; this.dispatchEvent(new Event('loadend')); }
+    get responseType() { return 'arraybuffer'; }
+    get response() { return this.value; }
+    getResponseHeader(name) { return name === 'content-type' ? 'video/mp4' : ''; }
+  }
   const context = vm.createContext({ URL: WitnessURL, MediaSource: Source, SourceBuffer: Buffer,
-    HTMLMediaElement: Player, Response: FetchResponse, WeakRef, ArrayBuffer, Blob,
+    HTMLMediaElement: Player, Response: FetchResponse, XMLHttpRequest: Xhr, WeakRef, ArrayBuffer, Blob,
     Date: class extends Date { static now() { return time; } },
     document: { addEventListener: (type, fn) => listeners.set(type, fn) } });
   vm.runInContext(script('media-source-witness'), context);
@@ -60,7 +71,7 @@ function setup() {
     listeners.get('vesper-youtube-identity-request')({target:el});
     return el.attributes.get('data-vesper-player-manifest');
   };
-  return {player, declaration, request: el => provenance(el).paths, provenance, FetchResponse, WitnessURL, MediaSource: Source, Player, context,
+  return {player, declaration, request: el => provenance(el).paths, provenance, FetchResponse, Xhr, WitnessURL, MediaSource: Source, Player, context,
     advance: ms => time += ms};
 }
 
@@ -327,6 +338,33 @@ test('a derived buffer does not renew expired network provenance', async () => {
   b.advance(1001);
   a.buffer.appendBuffer(copy);
   assert.deepEqual(b.request(a.el),[]);
+});
+
+test('late appends cannot renew the original network evidence lifetime', async () => {
+  const b=setup(), a=b.player(), bytes=fragment();
+  await new b.FetchResponse('https://cdn.test/old.m4s','video/mp4',bytes.buffer).arrayBuffer();
+  b.advance(119000);
+  a.buffer.appendBuffer(bytes);
+  assert.equal(b.request(a.el).length,1);
+  b.advance(1001);
+  assert.deepEqual(b.request(a.el),[]);
+});
+
+test('XHR rereads and delayed first access cannot restore old response authority; new requests can', () => {
+  const b=setup(), a=b.player(), xhr=new b.Xhr(), bytes=fragment();
+  xhr.open('GET','https://cdn.test/old.m4s'); xhr.send(); xhr.finish(bytes.buffer);
+  a.buffer.appendBuffer(xhr.response);
+  assert.equal(b.request(a.el).length,1);
+  b.advance(120001);
+  a.buffer.appendBuffer(xhr.response);
+  assert.deepEqual(b.request(a.el),[]);
+  xhr.open('GET','https://cdn.test/delayed.m4s'); xhr.send(); xhr.finish(fragment(2).buffer);
+  b.advance(120001);
+  a.buffer.appendBuffer(xhr.response);
+  assert.deepEqual(b.request(a.el),[]);
+  xhr.open('GET','https://cdn.test/new.m4s'); xhr.send(); xhr.finish(fragment(3).buffer);
+  a.buffer.appendBuffer(xhr.response);
+  assert.equal(b.request(a.el)[0].path,'https://cdn.test/new.m4s');
 });
 
 test('a shared last mdat cannot identify a copied multi-payload response', async () => {

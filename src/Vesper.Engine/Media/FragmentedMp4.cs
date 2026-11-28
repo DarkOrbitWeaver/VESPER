@@ -12,7 +12,7 @@ internal sealed record Mp4Progress(uint Sequence, IReadOnlyList<Mp4TrackProgress
 /// <summary>
 /// Structural validator, not a decoder or a general muxer. Supports clear avc1/avc3/hvc1/hev1/av01/mp4a/Opus
 /// fragmented MP4 with moof-relative offsets, tfdt, explicit trun data offsets, and contiguous track timelines.
-/// Absolute offsets, edit lists, encrypted samples and track changes are rejected rather than rewritten.
+/// Absolute offsets, encrypted samples and track changes are rejected. Single rate-1 media edits are preserved only during remux.
 /// No payload-sized allocations: mdat is checked by declared sample ranges, not copied or scanned.
 /// </summary>
 internal sealed class FragmentedMp4
@@ -68,7 +68,7 @@ internal sealed class FragmentedMp4
         foreach (var trak in traks)
         {
             var tk = Boxes(data, trak.Payload, trak.End);
-            if (tk.Any(b => b.Type == "edts")) throw Bad("Edit-list timelines require remuxing and are not supported.");
+            if (!captureSamples && tk.Any(b => b.Type == "edts")) throw Bad("Edit-list timelines require remuxing and are not supported.");
             var tkhd = One(tk, "tkhd"); Need(tkhd, 24);
             int version = data[tkhd.Payload];
             if (version is not (0 or 1)) throw Bad("Unsupported tkhd version.");
@@ -122,6 +122,32 @@ internal sealed class FragmentedMp4
                 Language = Mp4Demuxer.UnpackLanguage(U16(data, mdhd.Payload + (mdhdVersion == 0 ? 20 : 32))),
                 Mp4SampleEntry = sampleEntry
             };
+            if (tk.Any(b => b.Type == "edts"))
+            {
+                var mvhd = One(children, "mvhd"); Need(mvhd, 20);
+                uint mv = U32(data, mvhd.Payload);
+                if (mv != 0 && mv != 0x01000000) throw Bad("Unsupported movie header version.");
+                if (mv != 0) Need(mvhd, 32);
+                uint movieScale = U32(data, mvhd.Payload + (mv == 0 ? 12 : 20));
+                if (movieScale == 0) throw Bad("Zero movie timescale.");
+                var edts = One(tk, "edts");
+                var elst = One(Boxes(data, edts.Payload, edts.End), "elst");
+                Need(elst, 8);
+                uint ev = U32(data, elst.Payload);
+                int entrySize = ev == 0 ? 12 : ev == 0x01000000 ? 20 : 0;
+                if (entrySize == 0 || U32(data, elst.Payload + 4) != 1 || elst.End - elst.Payload != 8 + entrySize)
+                    throw Bad("Only a single rate-1 media edit is supported during remux.");
+                int p = elst.Payload + 8;
+                ulong editDuration = ev == 0 ? U32(data, p) : BinaryPrimitives.ReadUInt64BigEndian(data.Slice(p, 8));
+                long editStart = ev == 0 ? BinaryPrimitives.ReadInt32BigEndian(data.Slice(p + 4, 4))
+                    : BinaryPrimitives.ReadInt64BigEndian(data.Slice(p + 8, 8));
+                if (editStart < 0 || U32(data, p + entrySize - 4) != 0x00010000)
+                    throw Bad("Only a nonnegative rate-1 media edit is supported during remux.");
+                mediaTrack.MovieTimescale = movieScale;
+                mediaTrack.EditMovieTimescale = movieScale;
+                mediaTrack.EditMediaTime = editStart;
+                mediaTrack.EditList = [new Mp4EditListEntry(editDuration, editStart, 1, 0)];
+            }
             Mp4Demuxer.ParseSampleEntry(mediaTrack, sampleEntry, 0, sampleEntry.Length);
             if (handler == "vide" && (mediaTrack.Width <= 0 || mediaTrack.Height <= 0))
                 throw Bad("The video sample entry has invalid dimensions.");
@@ -330,6 +356,9 @@ internal sealed class FragmentedMp4
     {
         if ((requireAudio && !HasAudio) || (requireVideo && !HasVideo)
             || _tracks.Values.Any(t => t.Samples == 0)) throw Bad("The output is missing a required audio/video track or contains no samples for a declared track.");
+        if (_captureSamples)
+            foreach (var track in _tracks.Values)
+                Mp4Demuxer.ResolveOpenEndedFragmentEdit(track.Media);
     }
 
     private static List<Box> Boxes(ReadOnlySpan<byte> data, int start, int end)

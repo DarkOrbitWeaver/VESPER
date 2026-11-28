@@ -288,8 +288,10 @@ internal sealed class HlsWebVttTransfer(DownloadEngine engine, JobSession sessio
             if (lease is not null && declaredLength is long known)
                 lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, known, copies));
             await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
-            using var buffer = new MemoryStream(declaredLength is > 0 and <= int.MaxValue
-                ? (int)declaredLength.Value : 16 * 1024);
+            if (declaredLength is long fixedLength)
+                return await MediaBodyReader.ReadKnownAsync(body, checked((int)fixedLength), stall,
+                    engine.Options.StallTimeout, ct, "An HLS subtitle response ended early.").ConfigureAwait(false);
+            using var buffer = new MemoryStream(16 * 1024);
             byte[] chunk = new byte[16 * 1024];
             int read;
             while ((read = await body.ReadAsync(chunk, stall.Token).ConfigureAwait(false)) > 0)

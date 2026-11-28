@@ -329,7 +329,16 @@ internal sealed class DashTransfer(DownloadEngine engine, JobSession session, Ht
             try
             {
                 await using var stream = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
-                using var body = new MemoryStream(declared is > 0 ? (int)declared.Value : 64 * 1024);
+                if (declared is long fixedLength)
+                {
+                    if (part.Length is long expectedRange && expectedRange != fixedLength)
+                        throw new TransientNetworkException("The DASH object ended before its declared size.");
+                    if (fixedLength == 0) throw new RunnerStop(Stop("The fragment was empty."));
+                    return await MediaBodyReader.ReadKnownAsync(stream, checked((int)fixedLength), stall,
+                        engine.Options.StallTimeout, ct, "The DASH object ended before its declared size.",
+                        session.Limiter, engine.GlobalLimiter).ConfigureAwait(false);
+                }
+                using var body = new MemoryStream(64 * 1024);
                 byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
                 try
                 {

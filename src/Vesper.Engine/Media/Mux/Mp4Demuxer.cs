@@ -220,21 +220,24 @@ internal static class Mp4Demuxer
             foreach (var smp in t.Samples)
                 if (smp.Size <= 0 || smp.Size > MaxSampleBytes || smp.Offset < 0 || smp.Offset > length - smp.Size)
                     throw Bad($"a {t.Kind.ToString().ToLowerInvariant()} sample points outside the file");
-            if (state.HasFragmentSamples && t.EditList is
-                [{ SegmentDuration: 0, MediaTime: >= 0, MediaRateInteger: 1, MediaRateFraction: 0 } edit])
-            {
-                // An open-ended fragment edit ends at the last presentation sample.
-                long end = 0;
-                foreach (TrackSample sample in t.Samples)
-                    end = Math.Max(end, checked(sample.Dts + sample.CtsOffset + sample.Duration));
-                if (end <= edit.MediaTime) throw Bad("a media edit starts beyond the captured samples");
-                t.EditList[0] = edit with { SegmentDuration = (ulong)(end - edit.MediaTime) };
-                t.EditMovieTimescale = t.Timescale;
-            }
+            if (state.HasFragmentSamples) ResolveOpenEndedFragmentEdit(t);
             result.Add(t);
         }
         if (result.Count == 0) throw Bad("no audio or video samples were found");
         return result;
+    }
+
+    internal static void ResolveOpenEndedFragmentEdit(DemuxedTrack track)
+    {
+        if (track.EditList is not
+            [{ SegmentDuration: 0, MediaTime: >= 0, MediaRateInteger: 1, MediaRateFraction: 0 } edit]) return;
+        // An open-ended fragment edit ends at the last presentation sample.
+        long end = 0;
+        foreach (TrackSample sample in track.Samples)
+            end = Math.Max(end, checked(sample.Dts + sample.CtsOffset + sample.Duration));
+        if (end <= edit.MediaTime) throw Bad("a media edit starts beyond the captured samples");
+        track.EditList[0] = edit with { SegmentDuration = (ulong)(end - edit.MediaTime) };
+        track.EditMovieTimescale = track.Timescale;
     }
 
     private static bool HasExplicitDecodeTimes(byte[] moof)

@@ -1066,7 +1066,10 @@ internal sealed class HlsTransfer(DownloadEngine engine, JobSession session, Htt
             if (lease is not null && knownLength is long declaredCapacity)
                 lease.Resize(SegmentBufferLimiter.ContentLengthReservation(limit, declaredCapacity, copies));
             await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
-            int initialCapacity = knownLength is > 0 ? checked((int)knownLength.Value) : (int)Math.Min(64 * 1024, limit);
+            if (knownLength is long fixedLength)
+                return await MediaBodyReader.ReadKnownAsync(body, checked((int)fixedLength), stall,
+                    engine.Options.StallTimeout, ct, "A segment ended early.", session.Limiter, engine.GlobalLimiter).ConfigureAwait(false);
+            int initialCapacity = (int)Math.Min(64 * 1024, limit);
             using var buffer = new MemoryStream(initialCapacity);
             byte[] chunk = ArrayPool<byte>.Shared.Rent(64 * 1024);
             try

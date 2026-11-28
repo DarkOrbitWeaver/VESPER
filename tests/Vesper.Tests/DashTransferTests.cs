@@ -73,6 +73,52 @@ public sealed class DashTransferTests
         MediaMerger.Validate(output, output.Length, tracks, CancellationToken.None);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void FragmentedMediaEditIsPreservedOnlyWhenRemuxing(int version)
+    {
+        byte[] init = Fixture("audio-init.mp4");
+        int moov = Tag(init, "moov") - 4;
+        int trak = Tag(init, "trak") - 4;
+        int trakSize = checked((int)BinaryPrimitives.ReadUInt32BigEndian(init.AsSpan(trak)));
+        int insert = trak + trakSize;
+        int entrySize = version == 0 ? 12 : 20;
+        byte[] edits = new byte[24 + entrySize];
+        BinaryPrimitives.WriteUInt32BigEndian(edits, (uint)edits.Length);
+        "edts"u8.CopyTo(edits.AsSpan(4));
+        BinaryPrimitives.WriteUInt32BigEndian(edits.AsSpan(8), (uint)(edits.Length - 8));
+        "elst"u8.CopyTo(edits.AsSpan(12));
+        edits[16] = (byte)version;
+        BinaryPrimitives.WriteUInt32BigEndian(edits.AsSpan(20), 1);
+        // Zero duration is an open-ended media edit. Skip one audio tick.
+        edits[24 + entrySize - 5] = 1;
+        edits[24 + entrySize - 3] = 1;
+        byte[] edited = [.. init.AsSpan(0, insert), .. edits, .. init.AsSpan(insert)];
+        BinaryPrimitives.WriteUInt32BigEndian(edited.AsSpan(trak), (uint)(trakSize + edits.Length));
+        BinaryPrimitives.WriteUInt32BigEndian(edited.AsSpan(moov),
+            BinaryPrimitives.ReadUInt32BigEndian(init.AsSpan(moov)) + (uint)edits.Length);
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(edited));
+        var remux = FragmentedMp4.Open(edited, captureSamples: true);
+        byte[] fragment = Fixture("audio-1.m4s");
+        remux.ValidateFragment(fragment, edited.Length);
+        remux.Finish(true, false);
+        var track = Assert.Single(remux.GetTracks());
+        var edit = Assert.Single(track.EditList!);
+        Assert.Equal(1, edit.MediaTime);
+        Assert.Equal((ulong)(track.Samples.Max(s => s.Dts + s.CtsOffset + s.Duration) - 1), edit.SegmentDuration);
+        Assert.Equal(track.Timescale, track.EditMovieTimescale);
+        using var source = new MemoryStream([.. edited, .. fragment]);
+        using var output = new MemoryStream();
+        var inputs = new[] { (Track: track, Source: (Stream)source) };
+        MediaMerger.Merge(inputs, "mp4", output, default);
+        MediaMerger.ValidateRemux(output, output.Length, inputs, default);
+
+        // A non-unit media rate still cannot be represented by this remux path.
+        edited[insert + edits.Length - 3] = 2;
+        Assert.Throws<MediaContainerException>(() => FragmentedMp4.Open(edited, captureSamples: true));
+    }
+
     [Fact]
     public void FragmentMetadataReaderPreservesEverySampleWithoutReadingPayloads()
     {

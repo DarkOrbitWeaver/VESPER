@@ -102,7 +102,9 @@ public class SequentialAndResumeTests
         string path = rejectRange ? "/reject-ranges" : "/norange";
         if (changed) path += "-same-tag-changed";
         string url = server.Url(path);
-        Guid id = h.Add(url, "sparse.bin", startNow: false);
+        AddResult added = h.Engine.Add(new AddRequest(url, FileName: "sparse.bin", InitiallyPaused: true));
+        Assert.True(added.Ok, added.Message);
+        Guid id = added.JobId;
         var job = ((Dictionary<Guid, DownloadJob>)typeof(DownloadEngine)
             .GetField("_jobs", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
             .GetValue(h.Engine)!)[id];

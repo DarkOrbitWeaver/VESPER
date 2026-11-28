@@ -418,6 +418,197 @@ public sealed class MediaMergeTests
         Assert.Equal((0, 0L), harness.Engine.MediaBufferUsage);
     }
 
+    public sealed class LongRenditionFactAttribute : FactAttribute
+    {
+        public LongRenditionFactAttribute()
+        {
+            if (Environment.GetEnvironmentVariable("VESPER_LONG_RENDITION_BENCHMARK") != "1")
+                Skip = "Set VESPER_LONG_RENDITION_BENCHMARK=1; requires development-only FFmpeg.";
+        }
+    }
+
+    [LongRenditionFact]
+    [Trait("Category", "LongRenditionBenchmark")]
+    public async Task Long_independent_renditions_resume_with_bounded_buffers_and_exact_samples()
+    {
+        const int seconds = 600;
+        string root = Path.Combine(Path.GetTempPath(), "vesper-long-renditions-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(8));
+        CancellationToken ct = deadline.Token;
+        try
+        {
+            var assets = new Dictionary<string, (byte[] Init, string Playlist, string[] Names, byte[][] Segments, string Reference)>();
+            foreach (string role in new[] { "video", "audio" })
+            {
+                string folder = Path.Combine(root, role);
+                Directory.CreateDirectory(folder);
+                var start = new ProcessStartInfo("ffmpeg")
+                {
+                    WorkingDirectory = folder, UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardError = true, RedirectStandardOutput = true
+                };
+                foreach (string arg in new[] { "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i",
+                    role == "video" ? "testsrc2=size=320x180:rate=24" : "sine=frequency=880:sample_rate=48000",
+                    "-t", seconds.ToString(System.Globalization.CultureInfo.InvariantCulture) })
+                    start.ArgumentList.Add(arg);
+                foreach (string arg in role == "video"
+                    ? new[] { "-an", "-c:v", "libx264", "-preset", "ultrafast", "-g", "96", "-keyint_min", "96",
+                        "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-threads", "2" }
+                    : new[] { "-vn", "-c:a", "aac", "-b:a", "96k" })
+                    start.ArgumentList.Add(arg);
+                foreach (string arg in new[] { "-f", "hls", "-hls_segment_type", "fmp4", "-hls_time", "4",
+                    "-hls_list_size", "0", "-hls_playlist_type", "vod", "-hls_fmp4_init_filename", "init.mp4",
+                    "-hls_segment_filename", "segment-%04d.m4s", "index.m3u8" })
+                    start.ArgumentList.Add(arg);
+                using Process process = Process.Start(start)!;
+                Task<string> errors = process.StandardError.ReadToEndAsync(ct);
+                Task<string> stdout = process.StandardOutput.ReadToEndAsync(ct);
+                try { await process.WaitForExitAsync(ct); }
+                finally { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+                Assert.True(process.ExitCode == 0, (await errors) + (await stdout));
+                byte[] init = await File.ReadAllBytesAsync(Path.Combine(folder, "init.mp4"), ct);
+                string[] paths = Directory.GetFiles(folder, "segment-*.m4s").Order(StringComparer.Ordinal).ToArray();
+                Assert.InRange(paths.Length, 140, 160);
+                byte[][] segments = new byte[paths.Length][];
+                string reference = Path.Combine(folder, "reference.mp4");
+                await using (var file = File.Create(reference))
+                {
+                    await file.WriteAsync(init, ct);
+                    for (int i = 0; i < paths.Length; i++)
+                    {
+                        segments[i] = await File.ReadAllBytesAsync(paths[i], ct);
+                        await file.WriteAsync(segments[i], ct);
+                    }
+                }
+                assets.Add(role, (init, await File.ReadAllTextAsync(Path.Combine(folder, "index.m3u8"), ct),
+                    paths.Select(path => Path.GetFileName(path)).ToArray(), segments, reference));
+            }
+
+            foreach (string protocol in new[] { "hls", "dash" })
+            {
+                await using var server = new FaultServer();
+                await server.StartAsync();
+                var tracks = new List<MergeTrack>();
+                foreach (var (role, asset) in assets)
+                {
+                    string prefix = $"/{protocol}/long-rendition/{role}";
+                    string url;
+                    MergeMediaSource source;
+                    var entities = protocol == "hls" ? server.HlsFiles : server.Extra;
+                    entities[prefix + "/init.mp4"] = asset.Init;
+                    for (int i = 0; i < asset.Names.Length; i++)
+                        entities[prefix + "/" + asset.Names[i]] = asset.Segments[i];
+                    if (protocol == "hls")
+                    {
+                        server.HlsPlaylists[prefix + "/index.m3u8"] = asset.Playlist;
+                        url = server.Url(prefix + "/index.m3u8");
+                        source = new MergeMediaSource("hls", PlaylistUrl: url);
+                    }
+                    else
+                    {
+                        url = server.Url("/manifest.mpd");
+                        source = new MergeMediaSource("dash", Dash: new DashDownloadPlan
+                        {
+                            RepresentationId = role + "-long",
+                            Initialization = new DashFragment(server.Url(prefix + "/init.mp4")),
+                            Fragments = asset.Names.Select(name => new DashFragment(server.Url(prefix + "/" + name))).ToArray(),
+                            RequireAudio = role == "audio", RequireVideo = role == "video"
+                        });
+                    }
+                    tracks.Add(new MergeTrack(role, role + "-long", url, 0,
+                        role == "video" ? "mp4" : "m4a", role == "video" ? "h264" : "aac", Source: source));
+                }
+                var plan = new MediaMergePlan { Version = 2, OutputContainer = "mp4", RequireAudio = true,
+                    RequireVideo = true, Tracks = tracks };
+
+                int hold = 1;
+                var midway = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                server.BeforeResponse = async (path, token) =>
+                {
+                    if (Volatile.Read(ref hold) == 1 && path.EndsWith("/video/segment-0075.m4s", StringComparison.Ordinal))
+                    {
+                        midway.TrySetResult();
+                        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                    }
+                    else await Task.Delay(10, token);
+                };
+                using var harness = new Harness(tweak: options =>
+                {
+                    options.MaxConnectionsPerHost = 4;
+                    options.MaxConnectionsPerJob = 4;
+                });
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                using var process = Process.GetCurrentProcess();
+                process.Refresh();
+                long baseline = process.WorkingSet64, peak = baseline, peakReserved = 0;
+                int peakSlots = 0;
+                void Sample()
+                {
+                    process.Refresh();
+                    peak = Math.Max(peak, process.WorkingSet64);
+                    var usage = harness.Engine.MediaBufferUsage;
+                    peakReserved = Math.Max(peakReserved, usage.Bytes);
+                    peakSlots = Math.Max(peakSlots, usage.Slots);
+                }
+                async Task AwaitSampled(Task task)
+                {
+                    while (!task.IsCompleted)
+                    {
+                        Sample();
+                        await Task.WhenAny(task, Task.Delay(20, ct));
+                        ct.ThrowIfCancellationRequested();
+                    }
+                    await task;
+                    Sample();
+                }
+                var watch = Stopwatch.StartNew();
+                AddResult added = harness.Engine.Add(new AddRequest(plan.Tracks[0].Url,
+                    FileName: $"{protocol}-long.mp4", Kind: JobKind.Merge, MediaPlanJson: plan.ToJson()));
+                Assert.True(added.Ok, added.Message);
+                await AwaitSampled(midway.Task.WaitAsync(TimeSpan.FromSeconds(90), ct));
+                harness.Engine.Pause(added.JobId);
+                Task<JobSnapshot> stopping = harness.WaitForStateAsync(added.JobId, JobState.Paused, seconds: 30);
+                await AwaitSampled(stopping);
+                JobSnapshot paused = await stopping;
+                Assert.True(paused.CommittedBytes > 0);
+                Assert.Null(paused.FinalPath);
+                Assert.Equal((0, 0L), harness.Engine.MediaBufferUsage);
+                Assert.Equal(paused.CommittedBytes, new FileInfo(paused.PartialPath).Length);
+                Interlocked.Exchange(ref hold, 0);
+                harness.Restart();
+                harness.Engine.Resume(added.JobId);
+                Task<JobSnapshot> completing = harness.WaitAsync(added.JobId,
+                    job => job.State is JobState.Completed or JobState.NeedsAttention or JobState.Failed or JobState.NeedsLink, seconds: 120);
+                await AwaitSampled(completing);
+                JobSnapshot done = await completing;
+                watch.Stop();
+                Assert.True(done.State == JobState.Completed, $"{done.State}: {done.Reason} {done.Message}");
+                Assert.Equal((0, 0L), harness.Engine.MediaBufferUsage);
+                Assert.InRange(peakReserved, 1, 256L * 1024 * 1024);
+                Assert.InRange(peakSlots, 1, SegmentBufferLimiter.MaxRetainedSegments);
+                using var video = File.OpenRead(assets["video"].Reference);
+                using var audio = File.OpenRead(assets["audio"].Reference);
+                using var output = File.OpenRead(done.FinalPath!);
+                var expected = new[] { Track(video, TrackKind.Video), Track(audio, TrackKind.Audio) };
+                MediaMerger.Validate(output, output.Length, expected, default);
+                var actual = MediaMerger.Demux(output, output.Length, default);
+                Assert.Equal(2, actual.Count);
+                AssertSamePayloads(expected[0], video, actual.Single(t => t.Kind == TrackKind.Video), output);
+                AssertSamePayloads(expected[1], audio, actual.Single(t => t.Kind == TrackKind.Audio), output);
+                foreach (var track in actual) Assert.InRange(track.DurationSeconds, seconds - 1, seconds + 1);
+                _output.WriteLine(JsonSerializer.Serialize(new { protocol, seconds, elapsedMs = watch.Elapsed.TotalMilliseconds,
+                    committedBeforeRestart = paused.CommittedBytes, outputBytes = output.Length,
+                    packets = actual.Sum(t => t.Samples.Count), requests = server.Requests.Values.Sum(queue => queue.Count),
+                    peakSlots, peakReservedBytes = peakReserved, peakCombinedWorkingSetDeltaBytes = peak - baseline,
+                    verified = true }));
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
     [Fact]
     [Trait("Category", "SegmentedMergeBenchmark")]
     public async Task Measure_local_hls_and_dash_rendition_merges()

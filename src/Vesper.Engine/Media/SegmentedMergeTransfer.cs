@@ -550,8 +550,15 @@ internal sealed class SegmentedMergeTransfer(DownloadEngine engine, JobSession s
             try
             {
                 await using Stream body = await response.Content.ReadAsStreamAsync(stall.Token).ConfigureAwait(false);
-                int initialCapacity = response.Content.Headers.ContentLength is > 0 and <= int.MaxValue
-                    ? (int)response.Content.Headers.ContentLength.Value : (int)Math.Min(64 * 1024, limit);
+                if (response.Content.Headers.ContentLength is long fixedLength)
+                {
+                    if (length is long expectedRange && expectedRange != fixedLength)
+                        throw new TransientNetworkException("A rendition object ended before its declared size.");
+                    return await MediaBodyReader.ReadKnownAsync(body, checked((int)fixedLength), stall,
+                        engine.Options.StallTimeout, ct, "A rendition object ended before its declared size.",
+                        session.Limiter, engine.GlobalLimiter).ConfigureAwait(false);
+                }
+                int initialCapacity = (int)Math.Min(64 * 1024, limit);
                 using var result = new MemoryStream(initialCapacity);
                 byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
                 try

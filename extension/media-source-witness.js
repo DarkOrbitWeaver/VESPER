@@ -409,8 +409,34 @@
     // 3. XMLHttpRequest hook
     if (typeof XMLHttpRequest === 'function') {
       replace(XMLHttpRequest.prototype, 'open', original => function (method, url, ...rest) {
-        try { requestMeta.set(this, { method: String(method || 'GET'), url: String(url || ''), rangeHeader: '' }); } catch {}
-        return apply(original, this, [method, url, ...rest]);
+        const prior = requestMeta.get(this);
+        let meta;
+        try { meta = { method: String(method || 'GET'), url: String(url || ''), rangeHeader: '' }; }
+        catch { return apply(original, this, [method, url, ...rest]); }
+        requestMeta.set(this, meta);
+        try { return apply(original, this, [method, url, ...rest]); }
+        catch (error) {
+          if (requestMeta.get(this) === meta) {
+            if (prior) requestMeta.set(this, prior);
+            else requestMeta.delete(this);
+          }
+          throw error;
+        }
+      });
+      replace(XMLHttpRequest.prototype, 'send', original => function (...args) {
+        const meta = requestMeta.get(this);
+        const finished = () => {
+          if (requestMeta.get(this) === meta && meta) meta.completedAt ??= now();
+        };
+        try { if (meta) this.addEventListener('loadend', finished, { once: true }); } catch {}
+        try {
+          const result = apply(original, this, args);
+          if (this.readyState === 4) finished(); // synchronous XHR
+          return result;
+        } catch (error) {
+          try { this.removeEventListener('loadend', finished); } catch {}
+          throw error;
+        }
       });
       replace(XMLHttpRequest.prototype, 'setRequestHeader', original => function (name, value) {
         try {
@@ -433,6 +459,12 @@
                   const ct = this.getResponseHeader('content-type') || '';
                   if (this.responseType === 'arraybuffer' || this.responseType === 'blob') {
                     const meta = requestMeta.get(this);
+                    // Reading the same completed XHR again is not new traffic.
+                    // Never re-sample a page-mutated response or renew its TTL.
+                    if (!meta || meta.observed || !val) return val;
+                    meta.observed = true;
+                    meta.completedAt ??= now();
+                    if (now() - meta.completedAt > TTL) return val;
                     const desc = describeNetworkSource(
                       this.responseURL || meta?.url || '',
                       ct,
@@ -440,7 +472,7 @@
                       meta?.rangeHeader || '',
                       this.getResponseHeader('content-length')
                     );
-                    if (desc) rememberBuffer(val, desc);
+                    if (desc) rememberBuffer(val, desc, undefined, meta.completedAt);
                   }
                 }
               } catch {}
@@ -806,7 +838,7 @@
       const observed = new Map();
       const collect = entries => {
         for (const item of entries) {
-          if (at - item.seen > TTL) continue;
+          if (at - item.seen > TTL || at - item.evidence.at > TTL) continue;
           const previous = observed.get(item.evidence.address);
           if (!previous || previous.seen <= item.seen) observed.set(item.evidence.address, item);
         }
